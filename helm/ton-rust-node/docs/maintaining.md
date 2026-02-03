@@ -4,9 +4,51 @@ Notes for chart maintainers.
 
 ## Table of contents
 
+- [Publishing the chart](#publishing-the-chart)
 - [Documentation guidelines](#documentation-guidelines)
 - [Updating the Parameters table in README](#updating-the-parameters-table-in-readme)
 - [Formatting conventions](#formatting-conventions)
+
+---
+
+## Publishing the chart
+
+The chart is published as an OCI artifact to GitHub Container Registry (GHCR).
+
+### Prerequisites
+
+Login to GHCR with a token that has `write:packages` scope:
+
+```bash
+# Using gh CLI
+echo $(gh auth token) | helm registry login ghcr.io -u $(gh auth status --json login -q .login) --password-stdin
+
+# Using a personal access token
+echo $GITHUB_TOKEN | helm registry login ghcr.io -u <your-github-username> --password-stdin
+```
+
+### Publishing a new version
+
+1. Update `version` in `Chart.yaml`.
+2. Package and push:
+
+```bash
+# From the repository root
+helm package helm/ton-rust-node
+helm push ton-rust-node-<version>.tgz oci://ghcr.io/rsquad/helm
+```
+
+3. Verify the published chart:
+
+```bash
+helm show chart oci://ghcr.io/rsquad/helm/ton-rust-node --version <version>
+```
+
+### Installing from the registry
+
+```bash
+helm install my-node oci://ghcr.io/rsquad/helm/ton-rust-node --version <version> -f values.yaml
+```
 
 ---
 
