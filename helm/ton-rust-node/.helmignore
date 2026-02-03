@@ -1,0 +1,21 @@
+# VCS
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation sources (docs/ is for humans, not for the chart package)
+docs/
+
+# CI
+.github/
+.gitlab-ci.yml

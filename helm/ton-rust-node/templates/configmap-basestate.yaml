@@ -1,0 +1,10 @@
+{{- if and .Values.basestate (not .Values.existingBasestateConfigMapName) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ton-rust-node.fullname" . }}-basestate
+  labels:
+    {{- include "ton-rust-node.labels" . | nindent 4 }}
+binaryData:
+  basestate.boc: {{ .Values.basestate }}
+{{- end }}

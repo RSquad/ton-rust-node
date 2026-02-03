@@ -1,0 +1,175 @@
+{{- include "ton-rust-node.validateNodeConfigs" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ton-rust-node.fullname" . }}
+  labels:
+    {{- include "ton-rust-node.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ton-rust-node.fullname" . }}
+  replicas: {{ .Values.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "ton-rust-node.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ton-rust-node.selectorLabels" . | nindent 8 }}
+      annotations:
+        rsquad.io/config-checksum: {{ include "ton-rust-node.configChecksum" . }}
+    spec:
+      securityContext:
+        fsGroup: 1000
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostDNS
+      {{- end }}
+      initContainers:
+        - name: init-bootstrap
+          image: alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-euc"]
+          args:
+            - |
+              {{- .Files.Get "files/init-script.sh" | nindent 14 }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: main
+              mountPath: /main
+            - name: global-config
+              mountPath: /seed/global-config
+              readOnly: true
+            - name: logs-config
+              mountPath: /seed/logs-config
+              readOnly: true
+            - name: node-configs
+              mountPath: /seed/node-configs
+              readOnly: true
+            {{- if include "ton-rust-node.hasBasestate" . }}
+            - name: basestate
+              mountPath: /seed/basestate
+              readOnly: true
+            {{- end }}
+            {{- if include "ton-rust-node.hasZerostate" . }}
+            - name: zerostate
+              mountPath: /seed/zerostate
+              readOnly: true
+            {{- end }}
+      containers:
+        - name: ton-node
+          {{- if .Values.debug.sleep }}
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          {{- else }}
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.command }}
+          command:
+            {{- toYaml .Values.command | nindent 12 }}
+          {{- else if and (include "ton-rust-node.hasZerostate" .) (include "ton-rust-node.hasBasestate" .) }}
+          command: ["node", "-c", "/main", "-z", "/main/static"]
+          {{- else }}
+          command: ["node", "-c", "/main"]
+          {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          ports:
+            - name: adnl
+              containerPort: {{ .Values.ports.adnl }}
+              protocol: UDP
+            {{- if .Values.ports.control }}
+            - name: control
+              containerPort: {{ .Values.ports.control }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.ports.liteserver }}
+            - name: liteserver
+              containerPort: {{ .Values.ports.liteserver }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.ports.jsonRpc }}
+            - name: json-rpc
+              containerPort: {{ .Values.ports.jsonRpc }}
+              protocol: TCP
+            {{- end }}
+          {{- with .Values.probes.liveness }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.probes.readiness }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.probes.startup }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.debug.securityContext }}
+          securityContext:
+            {{- toYaml .Values.debug.securityContext | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: main
+              mountPath: /main
+            - name: db
+              mountPath: /db
+            {{- if .Values.storage.logs.enabled }}
+            - name: logs
+              mountPath: /logs
+            {{- end }}
+            - name: keys
+              mountPath: /keys
+      volumes:
+        - name: global-config
+          configMap:
+            name: {{ include "ton-rust-node.globalConfigMapName" . }}
+        - name: logs-config
+          configMap:
+            name: {{ include "ton-rust-node.logsConfigMapName" . }}
+        - name: node-configs
+          secret:
+            secretName: {{ include "ton-rust-node.nodeConfigsSecretName" . }}
+        {{- if include "ton-rust-node.hasBasestate" . }}
+        - name: basestate
+          configMap:
+            name: {{ include "ton-rust-node.basestateConfigMapName" . }}
+        {{- end }}
+        {{- if include "ton-rust-node.hasZerostate" . }}
+        - name: zerostate
+          configMap:
+            name: {{ include "ton-rust-node.zerostateConfigMapName" . }}
+        {{- end }}
+  volumeClaimTemplates:
+    {{- $volumes := list "main" "db" "keys" -}}
+    {{- if $.Values.storage.logs.enabled }}
+    {{- $volumes = append $volumes "logs" -}}
+    {{- end }}
+    {{- range $vol := $volumes }}
+    - metadata:
+        name: {{ $vol }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ index $.Values.storage $vol "storageClassName" }}
+        resources:
+          requests:
+            storage: {{ index $.Values.storage $vol "size" }}
+    {{- end }}

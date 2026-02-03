@@ -1,0 +1,15 @@
+{{- if not .Values.existingLogsConfigMapName }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ton-rust-node.fullname" . }}-logs-config
+  labels:
+    {{- include "ton-rust-node.labels" . | nindent 4 }}
+data:
+  logs.config.yml: |
+    {{- if .Values.logsConfig }}
+    {{- .Values.logsConfig | nindent 4 }}
+    {{- else }}
+    {{- .Files.Get "files/logs.config.yml" | nindent 4 }}
+    {{- end }}
+{{- end }}
