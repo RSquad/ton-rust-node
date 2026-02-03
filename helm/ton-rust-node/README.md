@@ -2,6 +2,8 @@
 
 Helm chart for deploying TON Rust Node on Kubernetes.
 
+> **Current status:** Only a **mainnet fullnode** image is published (`ghcr.io/rsquad/ton-rust-node:mainnet`). Validator support is planned but not yet available.
+
 ## Table of contents
 
 - [Node roles](#node-roles)
@@ -174,7 +176,7 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | Name               | Description                | Value                          |
 | ------------------ | -------------------------- | ------------------------------ |
 | `image.repository` | Container image repository | `ghcr.io/rsquad/ton-rust-node` |
-| `image.tag`        | Image tag                  | `master`                       |
+| `image.tag`        | Image tag                  | `mainnet`                      |
 | `image.pullPolicy` | Pull policy                | `Always`                       |
 
 ### Resource parameters

@@ -16,7 +16,7 @@ command: []
 ##
 image:
   repository: ghcr.io/rsquad/ton-rust-node
-  tag: master
+  tag: mainnet
   pullPolicy: Always
 
 ## @section Resource parameters
