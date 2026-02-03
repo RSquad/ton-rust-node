@@ -1,0 +1,15 @@
+{{- if not .Values.existingGlobalConfigMapName }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ton-rust-node.fullname" . }}-global-config
+  labels:
+    {{- include "ton-rust-node.labels" . | nindent 4 }}
+data:
+  global.config.json: |
+    {{- if .Values.globalConfig }}
+    {{- .Values.globalConfig | nindent 4 }}
+    {{- else }}
+    {{- .Files.Get "files/global.config.json" | nindent 4 }}
+    {{- end }}
+{{- end }}

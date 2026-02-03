@@ -1,0 +1,227 @@
+## @section General parameters
+
+## @param replicas Number of node instances in the StatefulSet. Each replica is an independent TON node with its own config, keys, and IP — not replication for redundancy. You need a matching nodeConfigs entry (node-N.json) and a perReplica service entry for each replica.
+##
+replicas: 1
+
+## @param command [array] Override container command. Auto-detected: adds `-z /main/static` when zerostate+basestate are provided. Change only if you know what you are doing.
+##
+command: []
+
+## @section Image parameters
+
+## @param image.repository Container image repository
+## @param image.tag Image tag
+## @param image.pullPolicy Pull policy
+##
+image:
+  repository: ghcr.io/rsquad/ton-rust-node
+  tag: master
+  pullPolicy: Always
+
+## @section Resource parameters
+## Defaults are for a fullnode/liteserver. For validators, use 16/32 CPU and 64Gi/128Gi.
+## See docs/resources.md for details.
+
+## @param resources.requests.cpu CPU request
+## @param resources.requests.memory Memory request
+## @param resources.limits.cpu CPU limit
+## @param resources.limits.memory Memory limit
+##
+resources:
+  requests:
+    cpu: "8"
+    memory: 32Gi
+  limits:
+    cpu: "16"
+    memory: 64Gi
+
+## @section Storage parameters
+## IMPORTANT: The db volume requires up to 64k IOPS. Use NVMe/SSD with local storage.
+## See README.md "Storage recommendations" for details.
+
+## @param storage.main.size Main volume size
+## @param storage.main.storageClassName Storage class for main volume
+## @param storage.db.size Database volume size (hundreds of GB for mainnet)
+## @param storage.db.storageClassName Storage class for database volume
+## @param storage.logs.enabled Create a PVC for logs. Set to false if you log to stdout only.
+## @param storage.logs.size Logs volume size
+## @param storage.logs.storageClassName Storage class for logs volume
+## @param storage.keys.size Keys volume size
+## @param storage.keys.storageClassName Storage class for keys volume
+##
+storage:
+  main:
+    size: 1Gi
+    storageClassName: local-path
+  db:
+    size: 1Ti
+    storageClassName: local-path
+  logs:
+    enabled: true
+    size: 150Gi
+    storageClassName: local-path
+  keys:
+    size: 1Gi
+    storageClassName: local-path
+
+## @section Port parameters
+
+## @param ports.adnl ADNL port (UDP)
+## @param ports.control Control port (TCP). Set to null to disable.
+## @param ports.liteserver [nullable] Liteserver port (TCP). Set to enable.
+## @param ports.jsonRpc [nullable] JSON-RPC port (TCP). Set to enable.
+##
+ports:
+  adnl: 30303
+  control: 50000
+  liteserver: null
+  jsonRpc: null
+
+## @section Service parameters
+
+## @param services.type Service type
+## @param services.externalTrafficPolicy Traffic policy
+## @param services.annotations [object] Annotations applied to ALL per-replica services
+## @param services.perReplica [array] Per-replica service overrides. List index = replica index. Annotations are merged with the shared ones (per-replica wins on conflict).
+##
+services:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  annotations: {}
+  perReplica: []
+  # Example — MetalLB static IPs:
+  #   perReplica:
+  #     - annotations:
+  #         metallb.universe.tf/loadBalancerIPs: "192.168.1.100"
+  #     - annotations:
+  #         metallb.universe.tf/loadBalancerIPs: "192.168.1.101"
+  #
+  # Example — AWS Elastic IPs:
+  #   perReplica:
+  #     - annotations:
+  #         service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "eipalloc-aaa"
+  #     - annotations:
+  #         service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "eipalloc-bbb"
+  #
+  # Example — GCP static IPs:
+  #   perReplica:
+  #     - annotations:
+  #         networking.gke.io/load-balancer-ip-addresses: "my-ip-ref-0"
+  #     - annotations:
+  #         networking.gke.io/load-balancer-ip-addresses: "my-ip-ref-1"
+
+## @section Configuration parameters
+
+## @param nodeConfigs [object] Per-node JSON configs (one node-N.json per replica). See docs/node-config.md.
+## @param existingNodeConfigsSecretName Use an existing Secret for node configs instead of inline
+##
+nodeConfigs: {}
+# Example:
+#   node-0.json: |
+#     { "log_config_name": "/main/logs.config.yml", ... }
+existingNodeConfigsSecretName: ""
+
+## @param globalConfig [default: bundled mainnet] Global TON network config (JSON string). A mainnet default is bundled in files/global.config.json. See docs/global-config.md.
+## @param existingGlobalConfigMapName Use an existing ConfigMap for global config instead of inline
+##
+globalConfig: ""
+existingGlobalConfigMapName: ""
+
+## @param logsConfig [default: bundled default] Logging configuration (log4rs YAML). A default is bundled in files/logs.config.yml. See docs/logging.md.
+## @param existingLogsConfigMapName Use an existing ConfigMap for logs config instead of inline
+##
+logsConfig: ""
+existingLogsConfigMapName: ""
+
+## @param basestate Base64-encoded basestate.boc. Only needed when bootstrapping a brand new network.
+## @param existingBasestateConfigMapName Use an existing ConfigMap for basestate
+## @param zerostate Base64-encoded zerostate.boc. Only needed when bootstrapping a brand new network.
+## @param existingZerostateConfigMapName Use an existing ConfigMap for zerostate
+##
+basestate: ""
+existingBasestateConfigMapName: ""
+zerostate: ""
+existingZerostateConfigMapName: ""
+
+## @section Probe parameters
+
+## @param probes [object] Liveness, readiness, and startup probes. The TON node has no built-in health endpoint; if jsonRpc is enabled you can use /getMasterchainInfo as a basic check. Disabled by default.
+##
+probes: {}
+# Example:
+#   probes:
+#     startup:
+#       httpGet:
+#         path: /getMasterchainInfo
+#         port: json-rpc
+#       failureThreshold: 60
+#       periodSeconds: 30
+#     liveness:
+#       httpGet:
+#         path: /getMasterchainInfo
+#         port: json-rpc
+#       periodSeconds: 30
+#     readiness:
+#       httpGet:
+#         path: /getMasterchainInfo
+#         port: json-rpc
+#       periodSeconds: 10
+
+## @section Networking parameters
+
+## @param hostNetwork Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md.
+##
+hostNetwork: false
+
+## @section Scheduling parameters
+
+## @param nodeSelector [object] Node selector for pod scheduling
+##
+nodeSelector: {}
+# Example:
+#   nodeSelector:
+#     dedicated: ton-nodes
+
+## @param tolerations [array] Tolerations for pod scheduling
+##
+tolerations: []
+# Example:
+#   tolerations:
+#     - key: dedicated
+#       value: ton
+#       effect: NoSchedule
+
+## @param affinity [object] Affinity rules for pod scheduling
+##
+affinity: {}
+# Example:
+#   affinity:
+#     podAntiAffinity:
+#       requiredDuringSchedulingIgnoredDuringExecution:
+#         - labelSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: ton-rust-node
+#           topologyKey: kubernetes.io/hostname
+
+## @section PodDisruptionBudget parameters
+## Useful when replicas > 1 to prevent Kubernetes from evicting all pods at once
+## during voluntary disruptions (node drain, cluster upgrades, etc.).
+
+## @param podDisruptionBudget.enabled Create a PodDisruptionBudget
+## @param podDisruptionBudget.minAvailable Minimum available pods during disruption. Only one of minAvailable or maxUnavailable should be set.
+## @skip podDisruptionBudget.maxUnavailable
+##
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
+
+## @section Debug parameters
+
+## @param debug.sleep Replace node with sleep infinity for debugging
+## @param debug.securityContext [object] Security context overrides for debugging (e.g. SYS_PTRACE)
+##
+debug:
+  sleep: false
+  securityContext: {}

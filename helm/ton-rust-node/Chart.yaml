@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ton-rust-node
+description: TON Rust Node deployment
+type: application
+version: 0.1.0
+appVersion: "latest"

@@ -1,0 +1,10 @@
+{{- if and .Values.zerostate (not .Values.existingZerostateConfigMapName) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ton-rust-node.fullname" . }}-zerostate
+  labels:
+    {{- include "ton-rust-node.labels" . | nindent 4 }}
+binaryData:
+  zerostate.boc: {{ .Values.zerostate }}
+{{- end }}

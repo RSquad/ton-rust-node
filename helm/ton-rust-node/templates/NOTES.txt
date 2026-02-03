@@ -1,0 +1,54 @@
+TON Rust Node has been deployed.
+
+  Release:  {{ .Release.Name }}
+  Replicas: {{ .Values.replicas }}
+  Image:    {{ .Values.image.repository }}:{{ .Values.image.tag }}
+
+Check pod status:
+
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+{{- if .Values.hostNetwork }}
+
+Networking: hostNetwork
+Pods are bound directly to host IPs. No services are needed for external access.
+{{- else if eq .Values.services.type "LoadBalancer" }}
+
+Get external IPs (may take a moment to provision):
+
+  kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- else if eq .Values.services.type "NodePort" }}
+
+Get NodePort assignments:
+
+  kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- end }}
+
+View logs:
+
+  kubectl logs {{ include "ton-rust-node.fullname" . }}-0 -c ton-node
+
+Exec into pod:
+
+  kubectl exec -it {{ include "ton-rust-node.fullname" . }}-0 -c ton-node -- /bin/sh
+
+Ports:
+  ADNL (UDP):    {{ .Values.ports.adnl }}
+{{- if .Values.ports.control }}
+  Control (TCP): {{ .Values.ports.control }}
+{{- end }}
+{{- if .Values.ports.liteserver }}
+  Liteserver:    {{ .Values.ports.liteserver }}
+{{- end }}
+{{- if .Values.ports.jsonRpc }}
+  JSON-RPC:      {{ .Values.ports.jsonRpc }}
+{{- end }}
+
+Documentation: https://github.com/rsquad/ton-devops/tree/master/helm/ton-rust-node/docs
+
+{{- if .Values.debug.sleep }}
+
+WARNING: debug.sleep is enabled — the node is NOT running.
+The pod is running "sleep infinity" for debugging purposes.
+Set debug.sleep=false and upgrade to start the node.
+{{- end }}

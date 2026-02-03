@@ -1,0 +1,48 @@
+{{- $root := . -}}
+{{- $fullname := include "ton-rust-node.fullname" . -}}
+{{- range $i, $_ := until (int .Values.replicas) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-{{ $i }}
+  labels:
+    {{- include "ton-rust-node.labels" $root | nindent 4 }}
+  {{- $shared := $root.Values.services.annotations | default dict }}
+  {{- $perReplica := dict }}
+  {{- if and $root.Values.services.perReplica (lt $i (len $root.Values.services.perReplica)) }}
+  {{-   $perReplica = (index $root.Values.services.perReplica $i).annotations | default dict }}
+  {{- end }}
+  {{- $merged := mustMergeOverwrite (deepCopy $shared) $perReplica }}
+  {{- if $merged }}
+  annotations:
+    {{- $merged | toYaml | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $root.Values.services.type }}
+  {{- if ne $root.Values.services.type "ClusterIP" }}
+  externalTrafficPolicy: {{ $root.Values.services.externalTrafficPolicy }}
+  {{- end }}
+  selector:
+    {{- include "ton-rust-node.selectorLabels" $root | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ $fullname }}-{{ $i }}
+  ports:
+    - name: adnl
+      port: {{ $root.Values.ports.adnl }}
+      protocol: UDP
+    {{- if $root.Values.ports.control }}
+    - name: control
+      port: {{ $root.Values.ports.control }}
+      protocol: TCP
+    {{- end }}
+    {{- if $root.Values.ports.liteserver }}
+    - name: liteserver
+      port: {{ $root.Values.ports.liteserver }}
+      protocol: TCP
+    {{- end }}
+    {{- if $root.Values.ports.jsonRpc }}
+    - name: json-rpc
+      port: {{ $root.Values.ports.jsonRpc }}
+      protocol: TCP
+    {{- end }}
+{{- end }}

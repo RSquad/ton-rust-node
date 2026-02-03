@@ -1,0 +1,76 @@
+# Default logging configuration for TON Rust Node.
+#
+# Uses rolling_file appender with size-based rotation.
+# See docs/logging.md for a full reference of all fields and options.
+
+refresh_rate: 30 seconds
+
+appenders:
+  rolling_logfile:
+    kind: rolling_file
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S.%f)} {l} [{t}] {I}: {m}{n}"
+    path: /logs/output.log
+    policy:
+      kind: compound
+      trigger:
+        kind: size
+        limit: 25 gb
+      roller:
+        kind: fixed_window
+        pattern: "/logs/output_{}.log"
+        base: 1
+        count: 4
+
+root:
+  level: error
+  appenders:
+    - rolling_logfile
+
+loggers:
+  node:
+    level: info
+  node::network::neighbours:
+    level: error
+  node::network::liteserver:
+    level: info
+  node::validator::collator:
+    level: info
+  boot:
+    level: info
+  sync:
+    level: info
+  adnl:
+    level: info
+  overlay:
+    level: error
+  rldp:
+    level: warn
+  dht:
+    level: warn
+  ton_block:
+    level: "off"
+  executor:
+    level: "off"
+  tvm:
+    level: "off"
+  validator:
+    level: info
+  catchain:
+    level: info
+  validator_session:
+    level: info
+  validate_query:
+    level: info
+  consensus_common:
+    level: warn
+  storage:
+    level: info
+  index:
+    level: info
+  telemetry:
+    level: info
+  validator_manager:
+    level: info
+  ext_messages:
+    level: info
