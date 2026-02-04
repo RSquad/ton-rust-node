@@ -12,11 +12,11 @@ In this chart, per-node configs are provided via the `nodeConfigs` map in values
 - [Providing configs](#providing-configs)
 - [Minimal example (fullnode / liteserver)](#minimal-example-fullnode--liteserver)
 - [Minimal example (validator)](#minimal-example-validator)
+- [Generating keys](#generating-keys)
 - [Archival node](#archival-node)
 - [Field reference](#field-reference)
 - [Validator-specific sections](#validator-specific-sections)
 - [Advanced fields](#advanced-fields)
-- [Key type reference](#key-type-reference)
 
 ## Helm integration constraints
 
@@ -148,6 +148,74 @@ A validator needs `control_server` for key management and election participation
   }
 }
 ```
+
+## Generating keys
+
+Each node needs several Ed25519 key pairs. The config references them as base64-encoded 32-byte private keys. You generate a separate key pair for every purpose: DHT, overlay, liteserver, control server, and control client.
+
+All keys in the config use the same structure:
+
+```json
+{ "type_id": 1209251014, "pvt_key": "<base64-encoded-32-byte-private-key>" }
+```
+
+The `type_id` value `1209251014` means Ed25519 — this is the only supported key type. Public keys (e.g. in `control_server.clients`) use the same format but with `pub_key` instead of `pvt_key`.
+
+### Step-by-step
+
+1. **Generate a raw 32-byte Ed25519 private key** using OpenSSL:
+
+   ```bash
+   openssl genpkey -algorithm ed25519 -outform DER | tail -c 32 | base64
+   ```
+
+   This outputs a base64 string like `GnEN3s5t2Z3W1e...==` — this is your `pvt_key`.
+
+2. **Derive the public key** from the same private key (needed for `control_server.clients` and for publishing the liteserver key in the global config):
+
+   ```bash
+   openssl genpkey -algorithm ed25519 -outform DER > /tmp/ed25519.der
+   # private key (base64):
+   tail -c 32 /tmp/ed25519.der | base64
+   # public key (base64):
+   openssl pkey -inform DER -in /tmp/ed25519.der -pubout -outform DER | tail -c 32 | base64
+   ```
+
+3. **Repeat** for each key you need. A typical fullnode with liteserver needs 3 key pairs:
+
+   | Key | Used in | Field |
+   |-----|---------|-------|
+   | DHT private key | `adnl_node.keys[0]` (tag 1) | `pvt_key` |
+   | Overlay private key | `adnl_node.keys[1]` (tag 2) | `pvt_key` |
+   | Liteserver private key | `lite_server.server_key` | `pvt_key` |
+
+   A validator additionally needs:
+
+   | Key | Used in | Field |
+   |-----|---------|-------|
+   | Control server private key | `control_server.server_key` | `pvt_key` |
+   | Control client key pair | `control_server.clients.list[0]` | `pub_key` (public part only) |
+
+### Quick generation script
+
+Generate all keys at once for a fullnode with liteserver:
+
+```bash
+#!/bin/bash
+for name in dht overlay liteserver; do
+  openssl genpkey -algorithm ed25519 -outform DER > /tmp/${name}.der
+  pvt=$(tail -c 32 /tmp/${name}.der | base64)
+  pub=$(openssl pkey -inform DER -in /tmp/${name}.der -pubout -outform DER | tail -c 32 | base64)
+  echo "${name}:"
+  echo "  pvt_key: ${pvt}"
+  echo "  pub_key: ${pub}"
+  rm /tmp/${name}.der
+done
+```
+
+For a validator, add `control-server` and `control-client` to the loop.
+
+> **Important:** Each key must be unique. Do not reuse the same key for different purposes (e.g. DHT and overlay). Do not share keys between different nodes.
 
 ## Archival node
 
@@ -650,14 +718,4 @@ The following fields exist in the config but are not needed for normal operation
 | `default_rldp_roundtrip_ms` | u32 \| null | `null` | Initial RTT estimate for the RLDP protocol (ms) |
 | `unsafe_catchain_patches_path` | string \| null | `null` | Path to catchain emergency patch files. **Only for emergency situations** |
 
----
 
-## Key type reference
-
-All keys in the config use Ed25519:
-
-| `type_id` | Algorithm |
-|------------|-----------|
-| `1209251014` | Ed25519 |
-
-This is the only supported key type.
