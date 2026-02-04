@@ -275,7 +275,7 @@ The chart creates:
 
 - **StatefulSet** named after the release, with `podManagementPolicy: Parallel` and `fsGroup: 1000`
 - **One LoadBalancer Service per replica** with `externalTrafficPolicy: Local` and optional static IPs
-- **Init container** (`alpine:3.20`, pinned by digest) that seeds configs from volumes into the main PVC
+- **Init container** (`alpine:3.23`, pinned by digest) that seeds configs from volumes into the main PVC
 - **PersistentVolumeClaims**: `main`, `db`, `keys`, and optionally `logs` (see `storage.logs.enabled`)
 - **ConfigMaps** for global config, logs config, and optionally basestate/zerostate
 - **Secret** for per-node JSON configs
@@ -310,7 +310,7 @@ For `main` and `keys` volumes the I/O load is minimal — any storage provider w
 
 ### Init container
 
-Before the node starts, an init container (`alpine:3.20`, pinned by digest) runs a bootstrap script that prepares the `/main` volume:
+Before the node starts, an init container (`alpine:3.23`, pinned by digest) runs a bootstrap script that prepares the `/main` volume:
 
 1. Copies `global.config.json` and `logs.config.yml` from seed ConfigMaps into `/main`
 2. If basestate/zerostate are provided — hashes them with SHA-256 and places as `/main/static/{hash}.boc`
