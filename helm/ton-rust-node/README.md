@@ -160,9 +160,9 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 > **Why no file path option?** Helm's `.Files.Get` can only read files bundled inside the chart package — it cannot access files from your filesystem at install time. That's why we offer three modes instead of a simple file path. If you prefer to keep configs as local files, use `--set-file` (mode 2) or clone the chart and place files inside the chart directory.
 
-## Parameters
+> **Do not edit the Parameters section by hand.** It is auto-generated from `@param` annotations in [values.yaml](values.yaml). To make changes, edit `values.yaml` and regenerate — see [docs/maintaining.md](docs/maintaining.md#updating-the-parameters-table-in-readme).
 
-> **Do not edit this section by hand.** It is auto-generated from `@param` annotations in [values.yaml](values.yaml). To make changes, edit `values.yaml` and regenerate — see [docs/maintaining.md](docs/maintaining.md#updating-the-parameters-table-in-readme).
+## Parameters
 
 ### General parameters
 
