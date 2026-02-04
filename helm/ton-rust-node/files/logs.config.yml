@@ -33,15 +33,15 @@ loggers:
   node::network::neighbours:
     level: error
   node::network::liteserver:
-    level: info
+    level: warn
   node::validator::collator:
-    level: info
+    level: warn
   boot:
     level: info
   sync:
     level: info
   adnl:
-    level: info
+    level: warn
   overlay:
     level: error
   rldp:
@@ -55,22 +55,22 @@ loggers:
   tvm:
     level: "off"
   validator:
-    level: info
+    level: warn
   catchain:
-    level: info
+    level: warn
   validator_session:
-    level: info
+    level: warn
   validate_query:
-    level: info
+    level: warn
   consensus_common:
     level: warn
   storage:
-    level: info
+    level: warn
   index:
-    level: info
+    level: warn
   telemetry:
     level: info
   validator_manager:
-    level: info
+    level: warn
   ext_messages:
     level: info
