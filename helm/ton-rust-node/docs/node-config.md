@@ -18,6 +18,7 @@ In this chart, per-node configs are provided via the `nodeConfigs` map in values
 - [Validator-specific sections](#validator-specific-sections)
 - [Advanced fields](#advanced-fields)
 
+
 ## Helm integration constraints
 
 Several fields in the node config must be consistent with Helm values:
@@ -216,6 +217,7 @@ done
 For a validator, add `control-server` and `control-client` to the loop.
 
 > **Important:** Each key must be unique. Do not reuse the same key for different purposes (e.g. DHT and overlay). Do not share keys between different nodes.
+
 
 ## Archival node
 
