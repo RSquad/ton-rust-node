@@ -16,8 +16,19 @@ command: []
 ##
 image:
   repository: ghcr.io/rsquad/ton-rust-node
-  tag: mainnet
-  pullPolicy: Always
+  tag: v0.1.2-mainnet
+  pullPolicy: IfNotPresent
+
+## @section Init container image parameters
+
+## @param initImage.repository Init container image repository
+## @param initImage.tag Init container image tag
+## @param initImage.pullPolicy Init container pull policy
+##
+initImage:
+  repository: alpine
+  tag: "3.21"
+  pullPolicy: IfNotPresent
 
 ## @section Resource parameters
 ## Defaults are for a fullnode/liteserver. For validators, use 16/32 CPU and 64Gi/128Gi.
@@ -71,12 +82,14 @@ storage:
 ## @param ports.control Control port (TCP). Set to null to disable.
 ## @param ports.liteserver [nullable] Liteserver port (TCP). Set to enable.
 ## @param ports.jsonRpc [nullable] JSON-RPC port (TCP). Set to enable.
+## @param ports.metrics [nullable] Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable.
 ##
 ports:
   adnl: 30303
   control: 50000
   liteserver: null
   jsonRpc: null
+  metrics: null
 
 ## @section Service parameters
 
@@ -146,27 +159,28 @@ existingZerostateConfigMapName: ""
 
 ## @section Probe parameters
 
-## @param probes [object] Liveness, readiness, and startup probes. The TON node has no built-in health endpoint; if jsonRpc is enabled you can use /getMasterchainInfo as a basic check. Disabled by default.
+## @param probes [object] Liveness, readiness, and startup probes. Requires ports.metrics to be set (the node serves /healthz and /readyz on the metrics port). See docs/probes.md. Disabled by default.
 ##
 probes: {}
-# Example:
-#   probes:
-#     startup:
-#       httpGet:
-#         path: /getMasterchainInfo
-#         port: json-rpc
-#       failureThreshold: 60
-#       periodSeconds: 30
-#     liveness:
-#       httpGet:
-#         path: /getMasterchainInfo
-#         port: json-rpc
-#       periodSeconds: 30
-#     readiness:
-#       httpGet:
-#         path: /getMasterchainInfo
-#         port: json-rpc
-#       periodSeconds: 10
+# Example (requires ports.metrics to be set):
+#   startup:
+#     httpGet:
+#       path: /healthz
+#       port: metrics
+#     failureThreshold: 60
+#     periodSeconds: 10
+#   liveness:
+#     httpGet:
+#       path: /healthz
+#       port: metrics
+#     periodSeconds: 30
+#     failureThreshold: 3
+#   readiness:
+#     httpGet:
+#       path: /readyz
+#       port: metrics
+#     periodSeconds: 10
+#     failureThreshold: 3
 
 ## @section Networking parameters
 
@@ -225,3 +239,24 @@ podDisruptionBudget:
 debug:
   sleep: false
   securityContext: {}
+
+## @section Metrics parameters
+## Prometheus integration for metrics scraping. Requires ports.metrics to be set.
+## See docs/monitoring.md for setup instructions.
+
+## @param metrics.serviceMonitor.enabled Create a ServiceMonitor for kube-prometheus-stack (recommended)
+## @param metrics.serviceMonitor.namespace [nullable] Namespace for ServiceMonitor (defaults to release namespace)
+## @param metrics.serviceMonitor.interval [nullable] Scrape interval (e.g. "30s"). Uses Prometheus default if null.
+## @param metrics.serviceMonitor.scrapeTimeout [nullable] Scrape timeout. Uses Prometheus default if null.
+## @param metrics.serviceMonitor.labels [object] Extra labels for ServiceMonitor (for Prometheus selector matching)
+## @param metrics.annotations.enabled Add prometheus.io annotations to per-replica services (alternative to ServiceMonitor)
+##
+metrics:
+  serviceMonitor:
+    enabled: false
+    namespace: null
+    interval: null
+    scrapeTimeout: null
+    labels: {}
+  annotations:
+    enabled: false

@@ -18,6 +18,8 @@ In this chart, per-node configs are provided via the `nodeConfigs` map in values
 - [Validator-specific sections](#validator-specific-sections)
 - [Advanced fields](#advanced-fields)
 
+> **See also:** The metrics endpoint exposes 57 Prometheus metrics and Kubernetes health probes. For the full catalog of metrics, naming convention, and PromQL examples see [metrics.md](metrics.md).
+
 
 ## Helm integration constraints
 
@@ -29,6 +31,7 @@ Several fields in the node config must be consistent with Helm values:
 | `control_server.address` | Port must match `ports.control` (if enabled) |
 | `lite_server.address` | Port must match `ports.liteserver` (if enabled) |
 | `json_rpc_server.address` | Port must match `ports.jsonRpc` (if enabled) |
+| `metrics.address` | Port must match `ports.metrics` (if enabled) |
 | `log_config_name` | Must be `/main/logs.config.yml` (where the chart mounts the logs config) |
 | `ton_global_config_name` | Must be `/main/global.config.json` (where the chart mounts the global config) |
 | `internal_db_path` | Must be `/db` (where the chart mounts the db PVC) |
@@ -80,6 +83,9 @@ A typical fullnode exposes `lite_server` for lite-client queries and `json_rpc_s
   "json_rpc_server": {
     "address": "0.0.0.0:8081"
   },
+  "metrics": {
+    "address": "0.0.0.0:9100"
+  },
   "gc": {
     "enable_for_archives": true,
     "archives_life_time_hours": 48,
@@ -123,6 +129,9 @@ A validator needs `control_server` for key management and election participation
         { "type_id": 1209251014, "pub_key": "<control-client-public-key-base64>" }
       ]
     }
+  },
+  "metrics": {
+    "address": "0.0.0.0:9100"
   },
   "collator_config": {
     "cutoff_timeout_ms": 1000,
@@ -644,6 +653,30 @@ Address and port for lite client connections. The port must match `ports.liteser
 
 Server private key. Same format as `control_server.server_key`.
 
+#### `lite_server.max_parallel_fast_queries`
+
+Maximum number of concurrent "fast" queries (queries that read from cache or perform simple lookups). Limits concurrency to prevent resource exhaustion under high load.
+
+| Type | Required | Default |
+|------|----------|---------|
+| u64 \| null | no | `256` |
+
+#### `lite_server.max_parallel_slow_queries`
+
+Maximum number of concurrent "slow" queries (queries that require disk reads, state traversal, or proof generation). These are more resource-intensive, so the default is significantly lower.
+
+| Type | Required | Default |
+|------|----------|---------|
+| u64 \| null | no | `16` |
+
+#### `lite_server.account_state_cache_size_mb`
+
+Size of the in-memory cache for account states in megabytes. Caches recently queried account states to avoid repeated disk lookups.
+
+| Type | Required | Default |
+|------|----------|---------|
+| u64 \| null | no | `256` (MB) |
+
 ---
 
 ### `json_rpc_server`
@@ -657,6 +690,85 @@ Address and port for the HTTP API. The port must match `ports.jsonRpc` in Helm v
 | Type | Format |
 |------|--------|
 | string | `"IP:PORT"` |
+
+---
+
+### `metrics`
+
+Prometheus metrics and Kubernetes health probe HTTP server. When present, the node starts an HTTP server with three endpoints:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /metrics` | Prometheus scrape endpoint (57 metrics) |
+| `GET /healthz` | Kubernetes liveness probe |
+| `GET /readyz` | Kubernetes readiness probe |
+
+If the `metrics` section is absent from the config, the metrics server is **not started** — no metrics, no probes.
+
+For the full metrics catalog see [metrics.md](metrics.md).
+
+#### `metrics.address`
+
+Address and port for the metrics/probes HTTP server. The port must match `ports.metrics` in Helm values.
+
+| Type | Required | Format |
+|------|----------|--------|
+| string | yes | `"IP:PORT"` |
+
+Recommended: `"0.0.0.0:9100"`.
+
+#### `metrics.histogram_buckets`
+
+Custom histogram bucket boundaries, keyed by metric name suffix. If a key matches the end of a histogram metric name, those buckets are used.
+
+| Type | Required | Default |
+|------|----------|---------|
+| map\<string, float[]\> | no | `{}` (default duration buckets applied to all `*_seconds` metrics) |
+
+When empty (or absent), the following default buckets are applied to all histograms whose name ends with `seconds`:
+
+```
+[0.000001, 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 60.0, 120.0, 300.0, 600.0, 3600.0]
+```
+
+Example — override buckets for all `*_seconds` histograms and add custom ones for `gas_used`:
+
+```json
+"histogram_buckets": {
+  "seconds": [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 30.0, 60.0],
+  "gas_used": [1000, 10000, 100000, 500000, 1000000]
+}
+```
+
+#### `metrics.global_labels`
+
+Key-value pairs added to every metric. Useful for distinguishing nodes when multiple instances report to the same Prometheus.
+
+| Type | Required | Default |
+|------|----------|---------|
+| map\<string, string\> | no | `{}` |
+
+Example:
+
+```json
+"global_labels": {
+  "network": "mainnet",
+  "node_id": "validator-01"
+}
+```
+
+#### Full example
+
+```json
+"metrics": {
+  "address": "0.0.0.0:9100",
+  "histogram_buckets": {},
+  "global_labels": {
+    "network": "mainnet",
+    "node_id": "validator-01"
+  }
+}
+```
 
 ---
 

@@ -43,6 +43,23 @@ Ports:
 {{- if .Values.ports.jsonRpc }}
   JSON-RPC:      {{ .Values.ports.jsonRpc }}
 {{- end }}
+{{- if .Values.ports.metrics }}
+  Metrics (TCP): {{ .Values.ports.metrics }}
+{{- end }}
+{{- if .Values.ports.metrics }}
+
+Metrics & monitoring:
+  Metrics:  http://<pod-ip>:{{ .Values.ports.metrics }}/metrics
+  Health:   http://<pod-ip>:{{ .Values.ports.metrics }}/healthz
+  Ready:    http://<pod-ip>:{{ .Values.ports.metrics }}/readyz
+{{- if .Values.metrics.serviceMonitor.enabled }}
+  ServiceMonitor "{{ include "ton-rust-node.fullname" . }}" created for kube-prometheus-stack.
+{{- end }}
+{{- if .Values.metrics.annotations.enabled }}
+  Prometheus annotations added to per-replica services.
+{{- end }}
+  See docs/monitoring.md for setup instructions.
+{{- end }}
 
 Documentation: https://github.com/rsquad/ton-devops/tree/master/helm/ton-rust-node/docs
 

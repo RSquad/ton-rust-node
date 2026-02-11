@@ -1,0 +1,16 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "ton-node-dashboard",
+      "dependencies": {
+        "@grafana/grafana-foundation-sdk": "~0.0.6",
+      },
+    },
+  },
+  "packages": {
+    "@grafana/grafana-foundation-sdk": ["@grafana/grafana-foundation-sdk@0.0.6", "", { "dependencies": { "tslib": "^2.6.2" } }, "sha512-+ysHuLfi+psdZRy5p/9SLDg69HwCi2m+bIjkQ1n8NKT0FoJbBd664Isz86jBaezlesbKBIi+a5/AtlPXNwpa3g=="],
+
+    "tslib": ["tslib@2.8.1", "", {}, "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="],
+  }
+}
