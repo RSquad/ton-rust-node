@@ -5,6 +5,7 @@ Setting up Prometheus and Grafana for TON node metrics. We recommend [kube-prome
 ## Table of contents
 
 - [Prerequisites](#prerequisites)
+- [Network security](#network-security)
 - [Quick start](#quick-start)
 - [ServiceMonitor configuration](#servicemonitor-configuration) (recommended)
 - [Alternative: Prometheus annotations](#alternative-prometheus-annotations)
@@ -34,6 +35,51 @@ ports:
 ```
 
 The port number must match the `metrics.address` port in the node config.
+
+## Network security
+
+By default, the metrics port is **not exposed on the public LoadBalancer** per-replica services. It is only accessible inside the cluster (Prometheus scrapes pods directly via their internal IPs).
+
+This is intentional — the metrics endpoint serves Prometheus data, health, and readiness probes without any authentication. Exposing it to the internet is a security risk.
+
+### If you need external access
+
+Use a Kubernetes Ingress with authentication (basic auth, OAuth2 proxy, etc.) pointed at the per-replica service. Example with nginx-ingress and basic auth:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ton-metrics
+  annotations:
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: metrics-basic-auth
+spec:
+  rules:
+    - host: metrics.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-node-0
+                port:
+                  number: 9100
+```
+
+> **Note:** The per-replica service must have the metrics port exposed — set `debug.exposeMetrics: true` (see below).
+
+The chart intentionally does not embed authentication into the metrics port — that is the responsibility of your ingress controller or service mesh.
+
+### Debug override
+
+A `debug.exposeMetrics` flag exists to expose the metrics port on the main LoadBalancer services. This is **strongly discouraged** in production and exists only for debugging:
+
+```yaml
+debug:
+  exposeMetrics: true   # NOT recommended — no authentication
+```
 
 ## Quick start
 

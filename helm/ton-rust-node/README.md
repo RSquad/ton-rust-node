@@ -273,10 +273,11 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Debug parameters
 
-| Name                    | Description                                                | Value   |
-| ----------------------- | ---------------------------------------------------------- | ------- |
-| `debug.sleep`           | Replace node with sleep infinity for debugging             | `false` |
-| `debug.securityContext` | Security context overrides for debugging (e.g. SYS_PTRACE) | `{}`    |
+| Name                    | Description                                                                                                                                                                     | Value   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `debug.sleep`           | Replace node with sleep infinity for debugging                                                                                                                                  | `false` |
+| `debug.exposeMetrics`   | Expose metrics port on the public LoadBalancer per-replica services. **Strongly discouraged** — use an Ingress with authentication for external access. See docs/monitoring.md. | `false` |
+| `debug.securityContext` | Security context overrides for debugging (e.g. SYS_PTRACE)                                                                                                                      | `{}`    |
 
 ### Metrics parameters
 

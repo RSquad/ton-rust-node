@@ -52,11 +52,20 @@ Metrics & monitoring:
   Metrics:  http://<pod-ip>:{{ .Values.ports.metrics }}/metrics
   Health:   http://<pod-ip>:{{ .Values.ports.metrics }}/healthz
   Ready:    http://<pod-ip>:{{ .Values.ports.metrics }}/readyz
+
+  The metrics port is only accessible inside the cluster by default.
+  To expose externally, use an Ingress with authentication (see docs/monitoring.md).
 {{- if .Values.metrics.serviceMonitor.enabled }}
   ServiceMonitor "{{ include "ton-rust-node.fullname" . }}" created for kube-prometheus-stack.
 {{- end }}
 {{- if .Values.metrics.annotations.enabled }}
   Prometheus annotations added to per-replica services.
+{{- end }}
+{{- if .Values.debug.exposeMetrics }}
+
+  WARNING: debug.exposeMetrics is enabled — port {{ .Values.ports.metrics }} is exposed on
+  the public LoadBalancer services WITHOUT authentication. This is strongly
+  discouraged in production. Use an Ingress with authentication instead.
 {{- end }}
   See docs/monitoring.md for setup instructions.
 {{- end }}

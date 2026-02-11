@@ -234,10 +234,12 @@ podDisruptionBudget:
 ## @section Debug parameters
 
 ## @param debug.sleep Replace node with sleep infinity for debugging
+## @param debug.exposeMetrics Expose metrics port on the public LoadBalancer per-replica services. **Strongly discouraged** — use an Ingress with authentication for external access. See docs/monitoring.md.
 ## @param debug.securityContext [object] Security context overrides for debugging (e.g. SYS_PTRACE)
 ##
 debug:
   sleep: false
+  exposeMetrics: false
   securityContext: {}
 
 ## @section Metrics parameters

@@ -51,7 +51,7 @@ spec:
       port: {{ $root.Values.ports.jsonRpc }}
       protocol: TCP
     {{- end }}
-    {{- if $root.Values.ports.metrics }}
+    {{- if and $root.Values.ports.metrics $root.Values.debug.exposeMetrics }}
     - name: metrics
       port: {{ $root.Values.ports.metrics }}
       protocol: TCP
