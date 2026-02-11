@@ -43,7 +43,7 @@ helm install fullnode ./helm/ton-rust-node -f fullnode-values.yaml
 helm install my-node ./helm/ton-rust-node -f values.yaml
 
 # From OCI registry
-helm install my-node oci://ghcr.io/rsquad/helm/ton-rust-node --version 0.1.0 -f values.yaml
+helm install my-node oci://ghcr.io/rsquad/helm/ton-rust-node -f values.yaml
 ```
 
 ## Quick start
