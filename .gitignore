@@ -1,2 +1,5 @@
 *.tgz
 .claude/
+external/
+node_modules/
+grafana/ton-node-overview.json

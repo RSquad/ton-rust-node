@@ -39,8 +39,8 @@ spec:
       {{- end }}
       initContainers:
         - name: init-bootstrap
-          image: alpine:3.23@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
-          imagePullPolicy: IfNotPresent
+          image: {{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}
+          imagePullPolicy: {{ .Values.initImage.pullPolicy }}
           command: ["/bin/sh", "-euc"]
           args:
             - |
@@ -109,6 +109,11 @@ spec:
             {{- if .Values.ports.jsonRpc }}
             - name: json-rpc
               containerPort: {{ .Values.ports.jsonRpc }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.ports.metrics }}
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
               protocol: TCP
             {{- end }}
           {{- with .Values.probes.liveness }}

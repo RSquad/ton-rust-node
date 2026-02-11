@@ -1,0 +1,12 @@
+{
+  "name": "ton-node-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "generate": "bun run src/index.ts > ton-node-overview.json",
+    "preview": "bun run src/index.ts | jq ."
+  },
+  "dependencies": {
+    "@grafana/grafana-foundation-sdk": "~0.0.6"
+  }
+}

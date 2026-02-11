@@ -164,7 +164,6 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ## Parameters
 
-
 ### General parameters
 
 | Name       | Description                                                                                                                                                                                                                                                   | Value |
@@ -177,8 +176,16 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | Name               | Description                | Value                          |
 | ------------------ | -------------------------- | ------------------------------ |
 | `image.repository` | Container image repository | `ghcr.io/rsquad/ton-rust-node` |
-| `image.tag`        | Image tag                  | `mainnet`                      |
-| `image.pullPolicy` | Pull policy                | `Always`                       |
+| `image.tag`        | Image tag                  | `v0.1.2-mainnet`               |
+| `image.pullPolicy` | Pull policy                | `IfNotPresent`                 |
+
+### Init container image parameters
+
+| Name                   | Description                     | Value          |
+| ---------------------- | ------------------------------- | -------------- |
+| `initImage.repository` | Init container image repository | `alpine`       |
+| `initImage.tag`        | Init container image tag        | `3.21`         |
+| `initImage.pullPolicy` | Init container pull policy      | `IfNotPresent` |
 
 ### Resource parameters
 
@@ -205,12 +212,13 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Port parameters
 
-| Name               | Description                                 | Value   |
-| ------------------ | ------------------------------------------- | ------- |
-| `ports.adnl`       | ADNL port (UDP)                             | `30303` |
-| `ports.control`    | Control port (TCP). Set to null to disable. | `50000` |
-| `ports.liteserver` | Liteserver port (TCP). Set to enable.       | `nil`   |
-| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.         | `nil`   |
+| Name               | Description                                                                        | Value   |
+| ------------------ | ---------------------------------------------------------------------------------- | ------- |
+| `ports.adnl`       | ADNL port (UDP)                                                                    | `30303` |
+| `ports.control`    | Control port (TCP). Set to null to disable.                                        | `50000` |
+| `ports.liteserver` | Liteserver port (TCP). Set to enable.                                              | `nil`   |
+| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.                                                | `nil`   |
+| `ports.metrics`    | Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable. | `nil`   |
 
 ### Service parameters
 
@@ -238,9 +246,9 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Probe parameters
 
-| Name     | Description                                                                                                                                                                         | Value |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| `probes` | Liveness, readiness, and startup probes. The TON node has no built-in health endpoint; if jsonRpc is enabled you can use /getMasterchainInfo as a basic check. Disabled by default. | `{}`  |
+| Name     | Description                                                                                                                                                                    | Value |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- |
+| `probes` | Liveness, readiness, and startup probes. Requires ports.metrics to be set (the node serves /healthz and /readyz on the metrics port). See docs/probes.md. Disabled by default. | `{}`  |
 
 ### Networking parameters
 
@@ -269,6 +277,17 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | ----------------------- | ---------------------------------------------------------- | ------- |
 | `debug.sleep`           | Replace node with sleep infinity for debugging             | `false` |
 | `debug.securityContext` | Security context overrides for debugging (e.g. SYS_PTRACE) | `{}`    |
+
+### Metrics parameters
+
+| Name                                   | Description                                                                           | Value   |
+| -------------------------------------- | ------------------------------------------------------------------------------------- | ------- |
+| `metrics.serviceMonitor.enabled`       | Create a ServiceMonitor for kube-prometheus-stack (recommended)                       | `false` |
+| `metrics.serviceMonitor.namespace`     | Namespace for ServiceMonitor (defaults to release namespace)                          | `nil`   |
+| `metrics.serviceMonitor.interval`      | Scrape interval (e.g. "30s"). Uses Prometheus default if null.                        | `nil`   |
+| `metrics.serviceMonitor.scrapeTimeout` | Scrape timeout. Uses Prometheus default if null.                                      | `nil`   |
+| `metrics.serviceMonitor.labels`        | Extra labels for ServiceMonitor (for Prometheus selector matching)                    | `{}`    |
+| `metrics.annotations.enabled`          | Add prometheus.io annotations to per-replica services (alternative to ServiceMonitor) | `false` |
 
 ## Architecture
 
