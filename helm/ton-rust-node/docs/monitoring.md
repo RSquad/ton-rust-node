@@ -20,12 +20,18 @@ Setting up Prometheus and Grafana for TON node metrics. We recommend [kube-prome
 ```json
 {
   "metrics": {
-    "address": "0.0.0.0:9100"
+    "address": "0.0.0.0:9100",
+    "global_labels": {
+      "network": "mainnet",
+      "node_id": "my-node-0"
+    }
   }
 }
 ```
 
 The server exposes `/metrics` (Prometheus format), `/healthz` (liveness), and `/readyz` (readiness). If the `metrics` section is absent, the server is not started. See [node-config.md](node-config.md) for all options.
+
+> **Note:** `global_labels` with `network` and `node_id` are required for the bundled [Grafana dashboard](../../../grafana/) to work. Without them, dashboard variables will be empty and panels will show no data.
 
 2. **Set `ports.metrics`** in your Helm values:
 

@@ -84,7 +84,8 @@ A typical fullnode exposes `lite_server` for lite-client queries and `json_rpc_s
     "address": "0.0.0.0:8081"
   },
   "metrics": {
-    "address": "0.0.0.0:9100"
+    "address": "0.0.0.0:9100",
+    "global_labels": { "network": "mainnet", "node_id": "lite-0" }
   },
   "gc": {
     "enable_for_archives": true,
@@ -131,7 +132,8 @@ A validator needs `control_server` for key management and election participation
     }
   },
   "metrics": {
-    "address": "0.0.0.0:9100"
+    "address": "0.0.0.0:9100",
+    "global_labels": { "network": "mainnet", "node_id": "validator-0" }
   },
   "collator_config": {
     "cutoff_timeout_ms": 1000,
@@ -747,6 +749,8 @@ Key-value pairs added to every metric. Useful for distinguishing nodes when mult
 | Type | Required | Default |
 |------|----------|---------|
 | map\<string, string\> | no | `{}` |
+
+> **Note:** The bundled [Grafana dashboard](../../../grafana/) uses `network` and `node_id` labels for filtering. If `global_labels` is missing or empty, the dashboard variables will be empty and panels will show no data. Always set both labels.
 
 Example:
 
