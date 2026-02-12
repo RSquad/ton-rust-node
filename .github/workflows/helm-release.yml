@@ -1,0 +1,51 @@
+name: Helm Chart Release
+
+on:
+  push:
+    tags:
+      - "helm/v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          # Tag format: helm/v0.2.2 → version: 0.2.2
+          VERSION="${GITHUB_REF_NAME#helm/v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Chart version: ${VERSION}"
+
+      - name: Set chart version
+        run: |
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" helm/ton-rust-node/Chart.yaml
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Package chart
+        run: |
+          helm package helm/ton-rust-node --destination .helm-pkg
+
+      - name: Push to OCI registry
+        run: |
+          helm push .helm-pkg/ton-rust-node-${{ steps.version.outputs.version }}.tgz oci://ghcr.io/rsquad/helm
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Helm Chart v${{ steps.version.outputs.version }}"
+          files: .helm-pkg/ton-rust-node-${{ steps.version.outputs.version }}.tgz
+          make_latest: false
