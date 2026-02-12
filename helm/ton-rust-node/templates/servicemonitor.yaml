@@ -15,6 +15,7 @@ spec:
   selector:
     matchLabels:
       {{- include "ton-rust-node.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: metrics
   {{- if .Values.metrics.serviceMonitor.namespace }}
   namespaceSelector:
     matchNames:

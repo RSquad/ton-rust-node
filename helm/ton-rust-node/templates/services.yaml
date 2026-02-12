@@ -8,18 +8,12 @@ metadata:
   name: {{ $fullname }}-{{ $i }}
   labels:
     {{- include "ton-rust-node.labels" $root | nindent 4 }}
-  {{- $prometheus := dict }}
-  {{- if and $root.Values.metrics.annotations.enabled $root.Values.ports.metrics }}
-  {{-   $_ := set $prometheus "prometheus.io/scrape" "true" }}
-  {{-   $_ := set $prometheus "prometheus.io/port" ($root.Values.ports.metrics | toString) }}
-  {{-   $_ := set $prometheus "prometheus.io/path" "/metrics" }}
-  {{- end }}
   {{- $shared := $root.Values.services.annotations | default dict }}
   {{- $perReplica := dict }}
   {{- if and $root.Values.services.perReplica (lt $i (len $root.Values.services.perReplica)) }}
   {{-   $perReplica = (index $root.Values.services.perReplica $i).annotations | default dict }}
   {{- end }}
-  {{- $merged := mustMergeOverwrite (deepCopy $prometheus) (deepCopy $shared) $perReplica }}
+  {{- $merged := mustMergeOverwrite (deepCopy $shared) $perReplica }}
   {{- if $merged }}
   annotations:
     {{- $merged | toYaml | nindent 4 }}
@@ -51,9 +45,5 @@ spec:
       port: {{ $root.Values.ports.jsonRpc }}
       protocol: TCP
     {{- end }}
-    {{- if and $root.Values.ports.metrics $root.Values.debug.exposeMetrics }}
-    - name: metrics
-      port: {{ $root.Values.ports.metrics }}
-      protocol: TCP
-    {{- end }}
+
 {{- end }}

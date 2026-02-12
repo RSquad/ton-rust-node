@@ -234,12 +234,10 @@ podDisruptionBudget:
 ## @section Debug parameters
 
 ## @param debug.sleep Replace node with sleep infinity for debugging
-## @param debug.exposeMetrics Expose metrics port on the public LoadBalancer per-replica services. **Strongly discouraged** — use an Ingress with authentication for external access. See docs/monitoring.md.
 ## @param debug.securityContext [object] Security context overrides for debugging (e.g. SYS_PTRACE)
 ##
 debug:
   sleep: false
-  exposeMetrics: false
   securityContext: {}
 
 ## @section Metrics parameters
@@ -251,7 +249,7 @@ debug:
 ## @param metrics.serviceMonitor.interval [nullable] Scrape interval (e.g. "30s"). Uses Prometheus default if null.
 ## @param metrics.serviceMonitor.scrapeTimeout [nullable] Scrape timeout. Uses Prometheus default if null.
 ## @param metrics.serviceMonitor.labels [object] Extra labels for ServiceMonitor (for Prometheus selector matching)
-## @param metrics.annotations.enabled Add prometheus.io annotations to per-replica services (alternative to ServiceMonitor)
+## @param metrics.annotations.enabled Add prometheus.io annotations to the metrics ClusterIP service (alternative to ServiceMonitor)
 ##
 metrics:
   serviceMonitor:

@@ -273,22 +273,21 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Debug parameters
 
-| Name                    | Description                                                                                                                                                                     | Value   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `debug.sleep`           | Replace node with sleep infinity for debugging                                                                                                                                  | `false` |
-| `debug.exposeMetrics`   | Expose metrics port on the public LoadBalancer per-replica services. **Strongly discouraged** — use an Ingress with authentication for external access. See docs/monitoring.md. | `false` |
-| `debug.securityContext` | Security context overrides for debugging (e.g. SYS_PTRACE)                                                                                                                      | `{}`    |
+| Name                    | Description                                                | Value   |
+| ----------------------- | ---------------------------------------------------------- | ------- |
+| `debug.sleep`           | Replace node with sleep infinity for debugging             | `false` |
+| `debug.securityContext` | Security context overrides for debugging (e.g. SYS_PTRACE) | `{}`    |
 
 ### Metrics parameters
 
-| Name                                   | Description                                                                           | Value   |
-| -------------------------------------- | ------------------------------------------------------------------------------------- | ------- |
-| `metrics.serviceMonitor.enabled`       | Create a ServiceMonitor for kube-prometheus-stack (recommended)                       | `false` |
-| `metrics.serviceMonitor.namespace`     | Namespace for ServiceMonitor (defaults to release namespace)                          | `nil`   |
-| `metrics.serviceMonitor.interval`      | Scrape interval (e.g. "30s"). Uses Prometheus default if null.                        | `nil`   |
-| `metrics.serviceMonitor.scrapeTimeout` | Scrape timeout. Uses Prometheus default if null.                                      | `nil`   |
-| `metrics.serviceMonitor.labels`        | Extra labels for ServiceMonitor (for Prometheus selector matching)                    | `{}`    |
-| `metrics.annotations.enabled`          | Add prometheus.io annotations to per-replica services (alternative to ServiceMonitor) | `false` |
+| Name                                   | Description                                                                                    | Value   |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------- | ------- |
+| `metrics.serviceMonitor.enabled`       | Create a ServiceMonitor for kube-prometheus-stack (recommended)                                | `false` |
+| `metrics.serviceMonitor.namespace`     | Namespace for ServiceMonitor (defaults to release namespace)                                   | `nil`   |
+| `metrics.serviceMonitor.interval`      | Scrape interval (e.g. "30s"). Uses Prometheus default if null.                                 | `nil`   |
+| `metrics.serviceMonitor.scrapeTimeout` | Scrape timeout. Uses Prometheus default if null.                                               | `nil`   |
+| `metrics.serviceMonitor.labels`        | Extra labels for ServiceMonitor (for Prometheus selector matching)                             | `{}`    |
+| `metrics.annotations.enabled`          | Add prometheus.io annotations to the metrics ClusterIP service (alternative to ServiceMonitor) | `false` |
 
 ## Architecture
 

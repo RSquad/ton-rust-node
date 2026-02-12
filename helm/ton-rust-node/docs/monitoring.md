@@ -44,48 +44,9 @@ The port number must match the `metrics.address` port in the node config.
 
 ## Network security
 
-By default, the metrics port is **not exposed on the public LoadBalancer** per-replica services. It is only accessible inside the cluster (Prometheus scrapes pods directly via their internal IPs).
+The metrics port is **never exposed on the public LoadBalancer** per-replica services. A dedicated internal `<release>-metrics` ClusterIP service is created instead — accessible only inside the cluster.
 
-This is intentional — the metrics endpoint serves Prometheus data, health, and readiness probes without any authentication. Exposing it to the internet is a security risk.
-
-### If you need external access
-
-Use a Kubernetes Ingress with authentication (basic auth, OAuth2 proxy, etc.) pointed at the per-replica service. Example with nginx-ingress and basic auth:
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: ton-metrics
-  annotations:
-    nginx.ingress.kubernetes.io/auth-type: basic
-    nginx.ingress.kubernetes.io/auth-secret: metrics-basic-auth
-spec:
-  rules:
-    - host: metrics.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-node-0
-                port:
-                  number: 9100
-```
-
-> **Note:** The per-replica service must have the metrics port exposed — set `debug.exposeMetrics: true` (see below).
-
-The chart intentionally does not embed authentication into the metrics port — that is the responsibility of your ingress controller or service mesh.
-
-### Debug override
-
-A `debug.exposeMetrics` flag exists to expose the metrics port on the main LoadBalancer services. This is **strongly discouraged** in production and exists only for debugging:
-
-```yaml
-debug:
-  exposeMetrics: true   # NOT recommended — no authentication
-```
+If you need external access to metrics, you can create your own LoadBalancer service pointed at the metrics port. However, the recommended approach is to set up an Ingress with authentication (basic auth, OAuth2 proxy, etc.) that proxies to the `<release>-metrics` ClusterIP service. The chart does not provide external access out of the box — securing an unauthenticated HTTP endpoint is your responsibility.
 
 ## Quick start
 
@@ -177,11 +138,11 @@ metrics:
     enabled: true
 ```
 
-This adds `prometheus.io/scrape`, `prometheus.io/port`, and `prometheus.io/path` to per-replica services. Shared and per-replica service annotations take priority over these on conflict.
+This adds `prometheus.io/scrape`, `prometheus.io/port`, and `prometheus.io/path` to the `<release>-metrics` ClusterIP service.
 
 ## Alternative: static scrape config
 
-For any other Prometheus setup, the metrics endpoint is available at `<service>:<metrics-port>/metrics` on each per-replica service. Service DNS: `<release>-<index>.<namespace>.svc.cluster.local`.
+For any other Prometheus setup, the metrics endpoint is available via the internal ClusterIP service. Service DNS: `<release>-metrics.<namespace>.svc.cluster.local`.
 
 ## Grafana dashboard
 

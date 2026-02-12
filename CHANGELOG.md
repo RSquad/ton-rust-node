@@ -8,11 +8,11 @@ Versions follow the TON Rust Node release tags (e.g. `v0.1.2-mainnet`).
 ## [v0.1.2-mainnet] - 2026-02-12
 
 Image: `ghcr.io/rsquad/ton-rust-node:v0.1.2-mainnet`
-Chart: `0.2.1`
+Chart: `0.2.2`
 
 ### Fixed
 
-- Metrics port no longer exposed on public LoadBalancer services by default (security hardening). Prometheus scrapes internally via ServiceMonitor or annotations. A `debug.exposeMetrics` flag is available for debugging only. See [docs/monitoring.md](helm/ton-rust-node/docs/monitoring.md) for details.
+- Metrics port is no longer exposed on public LoadBalancer services. A dedicated `<release>-metrics` ClusterIP service is created instead for internal scraping via ServiceMonitor or annotations. See [docs/monitoring.md](helm/ton-rust-node/docs/monitoring.md) for details.
 
 ## [v0.1.2-mainnet] - 2026-02-11
 

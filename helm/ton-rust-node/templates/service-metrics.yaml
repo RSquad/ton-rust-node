@@ -1,0 +1,23 @@
+{{- if .Values.ports.metrics }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ton-rust-node.fullname" . }}-metrics
+  labels:
+    {{- include "ton-rust-node.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+  {{- if .Values.metrics.annotations.enabled }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.ports.metrics | quote }}
+    prometheus.io/path: "/metrics"
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ton-rust-node.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.ports.metrics }}
+      protocol: TCP
+{{- end }}
