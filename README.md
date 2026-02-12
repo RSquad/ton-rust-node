@@ -7,3 +7,4 @@ TON blockchain node implementation in Rust.
 ## Documentation
 
 - [Helm chart](helm/ton-rust-node/README.md) — deploying ton-rust-node on Kubernetes
+- [Release guidelines](RELEASE.md) — versioning, branching, and release process
