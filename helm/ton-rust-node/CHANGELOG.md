@@ -20,15 +20,18 @@ Huge thanks to [Kiln](https://www.kiln.fi/) ([@kilnfi](https://github.com/kilnfi
 - `extraEnv` — environment variables for the main container (Downward API, ConfigMap/Secret refs)
 - `extraEnvFrom` — inject all keys from a Secret or ConfigMap as environment variables
 - `serviceAccount` — create and bind a dedicated ServiceAccount (for Vault auth, cloud IAM)
-- `hostPort` — expose ADNL on the host IP without full `hostNetwork` access
 - `networkPolicy` — optional NetworkPolicy with public ADNL ingress and configurable TCP CIDRs
 
 ### Changed
 
+- **BREAKING:** `services` restructured to per-port configuration. Each port (adnl, control, liteserver, jsonRpc) gets its own Service with independent type, annotations, and perReplica overrides. Migration: `services.type` → `services.adnl.type`, `services.perReplica` → `services.adnl.perReplica`, etc.
+- **BREAKING:** `hostPort.enabled` replaced with per-port booleans: `hostPort.adnl`, `hostPort.control`, `hostPort.liteserver`, `hostPort.jsonRpc`. Migration: `hostPort.enabled: true` → `hostPort.adnl: true`.
+- Default service type for liteserver and jsonRpc changed to LoadBalancer (was implicitly LoadBalancer via shared `services.type`, now explicit per-port)
 - `serviceAccount.create` renamed to `serviceAccount.enabled` for consistency with other feature toggles
 
 ### Fixed
 
+- Control port defaults to ClusterIP instead of sharing the LoadBalancer with other ports
 - Missing logger targets in documentation (`overlay_broadcast`, `adnl_query`, `validate_reject`, `catchain_network`, `block`)
 - Added note about HTTP request logging not being available
 

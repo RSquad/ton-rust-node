@@ -126,37 +126,42 @@ ports:
   metrics: null
 
 ## @section Service parameters
+## Each port gets its own per-replica Service with independent type, annotations, and perReplica overrides.
+## A Service is only created when the corresponding port is enabled (non-null in ports.*).
+## See docs/networking.md for examples.
 
-## @param services.type Service type
-## @param services.externalTrafficPolicy Traffic policy
-## @param services.annotations [object] Annotations applied to ALL per-replica services
-## @param services.perReplica [array] Per-replica service overrides. List index = replica index. Annotations are merged with the shared ones (per-replica wins on conflict).
+## @param services.adnl.type ADNL service type
+## @param services.adnl.externalTrafficPolicy ADNL service traffic policy
+## @param services.adnl.annotations [object] Annotations applied to all ADNL per-replica services
+## @param services.adnl.perReplica [array] Per-replica ADNL service overrides (list index = replica index)
+##
+## @param services.control.type Control service type
+##
+## @param services.liteserver.type Liteserver service type
+##
+## @param services.jsonRpc.type JSON-RPC service type
 ##
 services:
-  type: LoadBalancer
-  externalTrafficPolicy: Local
-  annotations: {}
-  perReplica: []
-  # Example — MetalLB static IPs:
-  #   perReplica:
-  #     - annotations:
-  #         metallb.universe.tf/loadBalancerIPs: "192.168.1.100"
-  #     - annotations:
-  #         metallb.universe.tf/loadBalancerIPs: "192.168.1.101"
-  #
-  # Example — AWS Elastic IPs:
-  #   perReplica:
-  #     - annotations:
-  #         service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "eipalloc-aaa"
-  #     - annotations:
-  #         service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "eipalloc-bbb"
-  #
-  # Example — GCP static IPs:
-  #   perReplica:
-  #     - annotations:
-  #         networking.gke.io/load-balancer-ip-addresses: "my-ip-ref-0"
-  #     - annotations:
-  #         networking.gke.io/load-balancer-ip-addresses: "my-ip-ref-1"
+  adnl:
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+    annotations: {}
+    perReplica: []
+  control:
+    type: ClusterIP
+  liteserver:
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+  jsonRpc:
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+  # Example — MetalLB static IPs for ADNL:
+  #   adnl:
+  #     perReplica:
+  #       - annotations:
+  #           metallb.universe.tf/loadBalancerIPs: "192.168.1.100"
+  #       - annotations:
+  #           metallb.universe.tf/loadBalancerIPs: "192.168.1.101"
 
 ## @section Configuration parameters
 
@@ -256,14 +261,20 @@ extraEnvFrom: []
 ##
 hostNetwork: false
 
-## @param hostPort.enabled Expose the ADNL port on the host IP via hostPort. A lighter alternative to hostNetwork — only the ADNL UDP port is bound to the host, network policies still work. See docs/networking.md.
+## @param hostPort.adnl Expose the ADNL port on the host IP via hostPort
+## @param hostPort.control Expose the control port on the host IP via hostPort
+## @param hostPort.liteserver Expose the liteserver port on the host IP via hostPort
+## @param hostPort.jsonRpc Expose the JSON-RPC port on the host IP via hostPort
 ##
 hostPort:
-  enabled: false
+  adnl: false
+  control: false
+  liteserver: false
+  jsonRpc: false
 # Example — expose ADNL on the host without hostNetwork.
 # Anti-affinity is required: two pods on the same node would compete for the same host port.
 #   hostPort:
-#     enabled: true
+#     adnl: true
 #   affinity:
 #     podAntiAffinity:
 #       requiredDuringSchedulingIgnoredDuringExecution:

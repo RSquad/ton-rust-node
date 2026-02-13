@@ -112,6 +112,27 @@ Validation: require nodeConfigs or existingNodeConfigsSecretName.
 {{- end }}
 
 {{/*
+Merge service annotations: shared annotations from svcConfig.annotations
+plus per-replica overrides from svcConfig.perReplica[replicaIndex].annotations.
+Per-replica annotations win on conflict.
+Usage: {{ include "ton-rust-node.serviceAnnotations" (dict "svcConfig" .Values.services.adnl "replicaIndex" $i) }}
+*/}}
+{{- define "ton-rust-node.serviceAnnotations" -}}
+{{- $svcConfig := .svcConfig -}}
+{{- $i := int .replicaIndex -}}
+{{- $shared := $svcConfig.annotations | default dict -}}
+{{- $perReplica := dict -}}
+{{- if and (hasKey $svcConfig "perReplica") $svcConfig.perReplica (lt $i (len $svcConfig.perReplica)) -}}
+{{-   $perReplica = (index $svcConfig.perReplica $i).annotations | default dict -}}
+{{- end -}}
+{{- $merged := mustMergeOverwrite (deepCopy $shared) $perReplica -}}
+{{- if $merged }}
+annotations:
+  {{- $merged | toYaml | nindent 2 }}
+{{- end -}}
+{{- end }}
+
+{{/*
 Config checksum — SHA-256 of all configuration data concatenated.
 Forces pod restart when any config changes.
 For globalConfig and logsConfig, includes bundled file content when no inline
