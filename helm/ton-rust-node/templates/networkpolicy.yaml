@@ -1,0 +1,43 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ton-rust-node.fullname" . }}
+  labels:
+    {{- include "ton-rust-node.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ton-rust-node.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: {{ .Values.ports.adnl }}
+          protocol: UDP
+      from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+    {{- $tcpPorts := list }}
+    {{- if .Values.ports.control }}{{ $tcpPorts = append $tcpPorts .Values.ports.control }}{{ end }}
+    {{- if .Values.ports.liteserver }}{{ $tcpPorts = append $tcpPorts .Values.ports.liteserver }}{{ end }}
+    {{- if .Values.ports.jsonRpc }}{{ $tcpPorts = append $tcpPorts .Values.ports.jsonRpc }}{{ end }}
+    {{- if .Values.ports.metrics }}{{ $tcpPorts = append $tcpPorts .Values.ports.metrics }}{{ end }}
+    {{- if $tcpPorts }}
+    - ports:
+      {{- range $port := $tcpPorts }}
+        - port: {{ $port }}
+          protocol: TCP
+      {{- end }}
+      {{- if .Values.networkPolicy.allowCIDRs }}
+      from:
+        {{- range .Values.networkPolicy.allowCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

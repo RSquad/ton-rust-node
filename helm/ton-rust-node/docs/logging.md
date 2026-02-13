@@ -218,20 +218,26 @@ These are the targets you can configure in the `loggers` section:
 | `node::network::liteserver` | Liteserver request handling |
 | `node::validator::collator` | Block collation |
 | `adnl` | ADNL network protocol |
+| `adnl_query` | ADNL query processing |
 | `overlay` | Overlay networks |
+| `overlay_broadcast` | Overlay broadcast messages (very noisy — set to `warn` or `off` in production) |
 | `rldp` | RLDP protocol (reliable large datagrams) |
 | `dht` | Distributed Hash Table |
-| `ton_block` | Block parsing and serialization |
+| `block` | Block structure and config parsing |
 | `executor` | Transaction execution |
 | `tvm` | TON Virtual Machine |
 | `validator` | Validation (general) |
 | `validator_manager` | Validator management |
+| `validate_query` | Individual block/query validation |
+| `validate_reject` | Rejected block/query validation |
 | `catchain` | Catchain consensus protocol |
 | `catchain_adnl_overlay` | ADNL overlay for catchain |
+| `catchain_network` | Catchain network transport |
 | `validator_session` | Validator sessions |
-| `validate_query` | Individual block/query validation |
 | `consensus_common` | Common consensus logic |
 | `storage` | Data storage |
 | `index` | Data indexing |
 | `ext_messages` | External message handling |
 | `telemetry` | Telemetry and metrics |
+
+> **Note:** HTTP requests (JSON-RPC, metrics endpoints) are not logged by the node. There is no logger target for HTTP request tracing.

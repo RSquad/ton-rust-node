@@ -187,6 +187,25 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | `initImage.tag`        | Init container image tag        | `3.21`         |
 | `initImage.pullPolicy` | Init container pull policy      | `IfNotPresent` |
 
+### Extra init containers
+
+| Name                  | Description                                                                                                                                                                  | Value |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `extraInitContainers` | Additional init containers to run before the node starts. Runs after the built-in init-bootstrap container. Useful for downloading global config, fetching external IP, etc. | `[]`  |
+
+### Extra containers
+
+| Name              | Description                                                                                               | Value |
+| ----------------- | --------------------------------------------------------------------------------------------------------- | ----- |
+| `extraContainers` | Additional sidecar containers to run alongside the node. Useful for monitoring agents, log shippers, etc. | `[]`  |
+
+### Extra volumes
+
+| Name                | Description                                                                               | Value |
+| ------------------- | ----------------------------------------------------------------------------------------- | ----- |
+| `extraVolumes`      | Additional volumes for the pod. Use with extraVolumeMounts to mount them into containers. | `[]`  |
+| `extraVolumeMounts` | Additional volume mounts for the main node container.                                     | `[]`  |
+
 ### Resource parameters
 
 | Name                        | Description    | Value  |
@@ -250,11 +269,42 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- |
 | `probes` | Liveness, readiness, and startup probes. Requires ports.metrics to be set (the node serves /healthz and /readyz on the metrics port). See docs/probes.md. Disabled by default. | `{}`  |
 
+### Pod metadata parameters
+
+| Name             | Description                                                                           | Value |
+| ---------------- | ------------------------------------------------------------------------------------- | ----- |
+| `podAnnotations` | Additional annotations for pods. Useful for Vault agent injection, service mesh, etc. | `{}`  |
+| `podLabels`      | Additional labels for pods. Useful for cost allocation, policy enforcement, etc.      | `{}`  |
+
+### Extra environment variables
+
+| Name           | Description                                                                                                                  | Value |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `extraEnv`     | Additional environment variables for the main node container. Supports Downward API, ConfigMap/Secret refs, etc.             | `[]`  |
+| `extraEnvFrom` | Additional envFrom sources for the main node container. Inject all keys from a Secret or ConfigMap as environment variables. | `[]`  |
+
 ### Networking parameters
 
-| Name          | Description                                                                                                                                                                                            | Value   |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
-| `hostNetwork` | Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md. | `false` |
+| Name               | Description                                                                                                                                                                                            | Value   |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| `hostNetwork`      | Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md. | `false` |
+| `hostPort.enabled` | Expose the ADNL port on the host IP via hostPort. A lighter alternative to hostNetwork — only the ADNL UDP port is bound to the host, network policies still work. See docs/networking.md.             | `false` |
+
+### NetworkPolicy parameters
+
+| Name                         | Description                                                                                                                                                                       | Value   |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `networkPolicy.enabled`      | Create a NetworkPolicy. ADNL is always allowed from 0.0.0.0/0. TCP ports (control, liteserver, jsonRpc, metrics) get rules automatically when enabled — restrict with allowCIDRs. | `false` |
+| `networkPolicy.allowCIDRs`   | Source CIDRs for TCP port rules (control, liteserver, jsonRpc, metrics). Defaults to cluster-only if empty.                                                                       | `[]`    |
+| `networkPolicy.extraIngress` | Additional raw ingress rules appended to the policy.                                                                                                                              | `[]`    |
+
+### ServiceAccount parameters
+
+| Name                         | Description                                                                   | Value   |
+| ---------------------------- | ----------------------------------------------------------------------------- | ------- |
+| `serviceAccount.enabled`     | Create a ServiceAccount for the pods                                          | `false` |
+| `serviceAccount.name`        | ServiceAccount name. Defaults to the release fullname if not set.             | `""`    |
+| `serviceAccount.annotations` | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding) | `{}`    |
 
 ### Scheduling parameters
 
