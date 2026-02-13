@@ -23,6 +23,10 @@ Huge thanks to [Kiln](https://www.kiln.fi/) ([@kilnfi](https://github.com/kilnfi
 - `hostPort` — expose ADNL on the host IP without full `hostNetwork` access
 - `networkPolicy` — optional NetworkPolicy with public ADNL ingress and configurable TCP CIDRs
 
+### Changed
+
+- `serviceAccount.create` renamed to `serviceAccount.enabled` for consistency with other feature toggles
+
 ### Fixed
 
 - Missing logger targets in documentation (`overlay_broadcast`, `adnl_query`, `validate_reject`, `catchain_network`, `block`)
