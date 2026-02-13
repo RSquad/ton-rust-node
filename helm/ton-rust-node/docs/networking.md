@@ -90,7 +90,7 @@ The node's ADNL port listens on `<host-ip>:<ports.adnl>` directly, while all oth
 
 ### Trade-offs
 
-- Only the ADNL port is exposed on the host — minimal attack surface.
+- Only the ADNL port is exposed on the host — other ports stay in the pod network and are accessed via Services.
 - Network policies still work (unlike `hostNetwork`).
 - **One pod per node per port.** Same constraint as `hostNetwork` — use `podAntiAffinity` or `nodeSelector`.
 - The `adnl_node.ip_address` in the node config must match the host's external IP.
