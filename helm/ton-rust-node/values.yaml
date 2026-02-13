@@ -242,6 +242,14 @@ extraEnv: []
 #         fieldRef:
 #           fieldPath: metadata.name
 
+## @param extraEnvFrom [array] Additional envFrom sources for the main node container. Inject all keys from a Secret or ConfigMap as environment variables.
+##
+extraEnvFrom: []
+# Example — inject all keys from a Secret:
+#   extraEnvFrom:
+#     - secretRef:
+#         name: my-node-secrets
+
 ## @section Networking parameters
 
 ## @param hostNetwork Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md.

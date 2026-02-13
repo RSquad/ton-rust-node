@@ -278,9 +278,10 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Extra environment variables
 
-| Name       | Description                                                                                                      | Value |
-| ---------- | ---------------------------------------------------------------------------------------------------------------- | ----- |
-| `extraEnv` | Additional environment variables for the main node container. Supports Downward API, ConfigMap/Secret refs, etc. | `[]`  |
+| Name           | Description                                                                                                                  | Value |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `extraEnv`     | Additional environment variables for the main node container. Supports Downward API, ConfigMap/Secret refs, etc.             | `[]`  |
+| `extraEnvFrom` | Additional envFrom sources for the main node container. Inject all keys from a Secret or ConfigMap as environment variables. | `[]`  |
 
 ### Networking parameters
 

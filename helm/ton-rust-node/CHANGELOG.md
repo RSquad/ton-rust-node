@@ -18,6 +18,7 @@ Huge thanks to [Kiln](https://www.kiln.fi/) ([@kilnfi](https://github.com/kilnfi
 - `extraVolumes` and `extraVolumeMounts` — mount additional volumes into the pod and main container
 - `podAnnotations` and `podLabels` — custom pod metadata for Vault injection, service mesh, cost tracking, etc.
 - `extraEnv` — environment variables for the main container (Downward API, ConfigMap/Secret refs)
+- `extraEnvFrom` — inject all keys from a Secret or ConfigMap as environment variables
 - `serviceAccount` — create and bind a dedicated ServiceAccount (for Vault auth, cloud IAM)
 - `hostPort` — expose ADNL on the host IP without full `hostNetwork` access
 - `networkPolicy` — optional NetworkPolicy with public ADNL ingress and configurable TCP CIDRs
