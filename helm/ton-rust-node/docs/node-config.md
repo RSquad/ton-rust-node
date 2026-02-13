@@ -98,6 +98,7 @@ A typical fullnode exposes `lite_server` for lite-client queries and `json_rpc_s
   },
   "cells_db_config": {
     "states_db_queue_len": 1000,
+    "prefill_cells_counters": false,
     "cells_cache_size_bytes": 4000000000,
     "counters_cache_size_bytes": 4000000000
   }
@@ -155,6 +156,7 @@ A validator needs `control_server` for key management and election participation
   },
   "cells_db_config": {
     "states_db_queue_len": 1000,
+    "prefill_cells_counters": false,
     "cells_cache_size_bytes": 4000000000,
     "counters_cache_size_bytes": 4000000000
   }
@@ -464,7 +466,7 @@ This lifetime only affects cells used for serving external queries (e.g. when a 
 
 ### `cells_db_config`
 
-Cell database tuning.
+Cell database tuning. If omitted entirely, the node uses built-in defaults for all fields. **If the section is present, all fields must be specified** — partial configs will fail to deserialize.
 
 #### `cells_db_config.states_db_queue_len`
 
