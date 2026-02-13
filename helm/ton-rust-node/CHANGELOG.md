@@ -20,12 +20,14 @@ Huge thanks to [Kiln](https://www.kiln.fi/) ([@kilnfi](https://github.com/kilnfi
 - `extraEnv` — environment variables for the main container (Downward API, ConfigMap/Secret refs)
 - `extraEnvFrom` — inject all keys from a Secret or ConfigMap as environment variables
 - `serviceAccount` — create and bind a dedicated ServiceAccount (for Vault auth, cloud IAM)
-- `hostPort` — expose ADNL on the host IP without full `hostNetwork` access
 - `networkPolicy` — optional NetworkPolicy with public ADNL ingress and configurable TCP CIDRs
 
 ### Changed
 
 - `serviceAccount.create` renamed to `serviceAccount.enabled` for consistency with other feature toggles
+- `services` restructured to per-port configuration — each port (adnl, control, liteserver, jsonRpc) gets its own Service with independent type, annotations, and perReplica overrides
+- `hostPort` is now per-port: `hostPort.adnl`, `hostPort.control`, `hostPort.liteserver`, `hostPort.jsonRpc`, `hostPort.metrics`
+- Control port defaults to ClusterIP; liteserver and jsonRpc default to LoadBalancer
 
 ### Fixed
 

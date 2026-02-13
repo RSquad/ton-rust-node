@@ -116,28 +116,40 @@ spec:
             - name: adnl
               containerPort: {{ .Values.ports.adnl }}
               protocol: UDP
-              {{- if .Values.hostPort.enabled }}
+              {{- if .Values.hostPort.adnl }}
               hostPort: {{ .Values.ports.adnl }}
               {{- end }}
             {{- if .Values.ports.control }}
             - name: control
               containerPort: {{ .Values.ports.control }}
               protocol: TCP
+              {{- if .Values.hostPort.control }}
+              hostPort: {{ .Values.ports.control }}
+              {{- end }}
             {{- end }}
             {{- if .Values.ports.liteserver }}
             - name: liteserver
               containerPort: {{ .Values.ports.liteserver }}
               protocol: TCP
+              {{- if .Values.hostPort.liteserver }}
+              hostPort: {{ .Values.ports.liteserver }}
+              {{- end }}
             {{- end }}
             {{- if .Values.ports.jsonRpc }}
             - name: json-rpc
               containerPort: {{ .Values.ports.jsonRpc }}
               protocol: TCP
+              {{- if .Values.hostPort.jsonRpc }}
+              hostPort: {{ .Values.ports.jsonRpc }}
+              {{- end }}
             {{- end }}
             {{- if .Values.ports.metrics }}
             - name: metrics
               containerPort: {{ .Values.ports.metrics }}
               protocol: TCP
+              {{- if .Values.hostPort.metrics }}
+              hostPort: {{ .Values.ports.metrics }}
+              {{- end }}
             {{- end }}
           {{- with .Values.probes.liveness }}
           livenessProbe:
