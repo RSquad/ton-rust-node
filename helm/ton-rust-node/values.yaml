@@ -290,12 +290,12 @@ networkPolicy:
 
 ## @section ServiceAccount parameters
 
-## @param serviceAccount.create Create a ServiceAccount for the pods
+## @param serviceAccount.enabled Create a ServiceAccount for the pods
 ## @param serviceAccount.name [nullable] ServiceAccount name. Defaults to the release fullname if not set.
 ## @param serviceAccount.annotations [object] Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding)
 ##
 serviceAccount:
-  create: false
+  enabled: false
   name: ""
   annotations: {}
 

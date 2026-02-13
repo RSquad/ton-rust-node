@@ -301,7 +301,7 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 | Name                         | Description                                                                   | Value   |
 | ---------------------------- | ----------------------------------------------------------------------------- | ------- |
-| `serviceAccount.create`      | Create a ServiceAccount for the pods                                          | `false` |
+| `serviceAccount.enabled`     | Create a ServiceAccount for the pods                                          | `false` |
 | `serviceAccount.name`        | ServiceAccount name. Defaults to the release fullname if not set.             | `""`    |
 | `serviceAccount.annotations` | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding) | `{}`    |
 

@@ -25,7 +25,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      {{- if .Values.serviceAccount.create }}
+      {{- if .Values.serviceAccount.enabled }}
       serviceAccountName: {{ include "ton-rust-node.serviceAccountName" . }}
       {{- end }}
       securityContext:
