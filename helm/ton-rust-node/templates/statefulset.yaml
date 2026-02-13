@@ -16,9 +16,18 @@ spec:
     metadata:
       labels:
         {{- include "ton-rust-node.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       annotations:
         rsquad.io/config-checksum: {{ include "ton-rust-node.configChecksum" . }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ include "ton-rust-node.serviceAccountName" . }}
+      {{- end }}
       securityContext:
         fsGroup: 1000
       {{- with .Values.nodeSelector }}
@@ -72,6 +81,9 @@ spec:
               mountPath: /seed/zerostate
               readOnly: true
             {{- end }}
+      {{- with .Values.extraInitContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: ton-node
           {{- if .Values.debug.sleep }}
@@ -90,12 +102,19 @@ spec:
           command: ["node", "-c", "/main"]
           {{- end }}
           {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           ports:
             - name: adnl
               containerPort: {{ .Values.ports.adnl }}
               protocol: UDP
+              {{- if .Values.hostPort.enabled }}
+              hostPort: {{ .Values.ports.adnl }}
+              {{- end }}
             {{- if .Values.ports.control }}
             - name: control
               containerPort: {{ .Values.ports.control }}
@@ -143,6 +162,12 @@ spec:
             {{- end }}
             - name: keys
               mountPath: /keys
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       volumes:
         - name: global-config
           configMap:
@@ -162,6 +187,9 @@ spec:
         - name: zerostate
           configMap:
             name: {{ include "ton-rust-node.zerostateConfigMapName" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
   volumeClaimTemplates:
     {{- $volumes := list "main" "db" "keys" -}}

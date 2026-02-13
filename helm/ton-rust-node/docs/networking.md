@@ -6,6 +6,7 @@ A TON node needs a stable, publicly reachable IP address — other nodes in the 
 
 - [LoadBalancer with static IP (recommended)](#loadbalancer-with-static-ip-recommended)
 - [NodePort](#nodeport)
+- [hostPort](#hostport)
 - [hostNetwork](#hostnetwork)
 - [Ingress-nginx stream proxy](#ingress-nginx-stream-proxy)
 - [Comparison](#comparison)
@@ -76,6 +77,40 @@ With `externalTrafficPolicy: Local` the traffic is only routed to pods on the no
 - The `adnl_node.ip_address` in the node config must be set to the node's external IP and the NodePort (not the container port).
 - You need to ensure the pod is scheduled on the node whose IP you configured — use `nodeSelector` or `nodeAffinity`.
 
+## hostPort
+
+Binds only the ADNL UDP port to the host's network interface. The pod stays in the pod network — only the specified port is exposed on the host IP. A lighter alternative to `hostNetwork` that preserves network policy enforcement.
+
+```yaml
+hostPort:
+  enabled: true
+```
+
+The node's ADNL port listens on `<host-ip>:<ports.adnl>` directly, while all other traffic (control, liteserver, metrics) stays in the pod network.
+
+### Trade-offs
+
+- Only the ADNL port is exposed on the host — minimal attack surface.
+- Network policies still work (unlike `hostNetwork`).
+- **One pod per node per port.** Same constraint as `hostNetwork` — use `podAntiAffinity` or `nodeSelector`.
+- The `adnl_node.ip_address` in the node config must match the host's external IP.
+- Slight NAT overhead compared to `hostNetwork`, but negligible for UDP traffic.
+
+### Example with anti-affinity
+
+```yaml
+hostPort:
+  enabled: true
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: ton-rust-node
+        topologyKey: kubernetes.io/hostname
+```
+
 ## hostNetwork
 
 The pod binds directly to the host's network interface. No NAT, no Service abstraction — the pod IS the endpoint.
@@ -145,11 +180,31 @@ data:
 
 ## Comparison
 
-| Mode | NAT overhead | LB required | Port management | Complexity |
-|------|-------------|-------------|-----------------|------------|
-| LoadBalancer + annotations | DNAT | yes (cloud LB / MetalLB) | automatic | low |
-| NodePort | kube-proxy | no | manual (one port range per replica) | medium |
-| hostNetwork | none | no | manual (one pod per node) | medium |
-| Ingress-nginx stream | proxy hop | no (reuses ingress) | manual (ingress ConfigMaps) | medium |
+| Mode | NAT overhead | LB required | Port management | Network policies | Complexity |
+|------|-------------|-------------|-----------------|-----------------|------------|
+| LoadBalancer + annotations | DNAT | yes (cloud LB / MetalLB) | automatic | yes | low |
+| NodePort | kube-proxy | no | manual (one port range per replica) | yes | medium |
+| hostPort | minimal | no | manual (one pod per node) | yes | medium |
+| hostNetwork | none | no | manual (one pod per node) | no | medium |
+| Ingress-nginx stream | proxy hop | no (reuses ingress) | manual (ingress ConfigMaps) | yes | medium |
 
-For most deployments, **LoadBalancer with static IP** is the recommended approach. Use hostNetwork when you need zero NAT overhead on bare-metal. Use NodePort or ingress-nginx when you don't have a LoadBalancer controller available.
+For most deployments, **LoadBalancer with static IP** is the recommended approach. Use hostPort when you need the ADNL port on the host IP without exposing the full host network. Use hostNetwork when you need zero NAT overhead on bare-metal. Use NodePort or ingress-nginx when you don't have a LoadBalancer controller available.
+
+## NetworkPolicy
+
+The chart can optionally create a NetworkPolicy that allows inbound ADNL UDP traffic from the public internet and restricts TCP ports to specified CIDRs.
+
+```yaml
+networkPolicy:
+  enabled: true
+  allowCIDRs:
+    - 10.0.0.0/8
+```
+
+When `networkPolicy.enabled` is `true`:
+
+- **ADNL (UDP)** is always allowed from `0.0.0.0/0` — required for peer-to-peer connectivity.
+- **TCP ports** (control, liteserver, jsonRpc, metrics) get a single ingress rule. If `allowCIDRs` is set, only those CIDRs are allowed. If empty, traffic is not restricted by source.
+- **extraIngress** allows appending arbitrary raw ingress rules for custom requirements.
+
+> **Note:** This policy only covers ingress. If your cluster enforces egress policies, you need to allow outbound UDP to `0.0.0.0/0` for ADNL separately.

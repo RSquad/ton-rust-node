@@ -30,6 +30,40 @@ initImage:
   tag: "3.21"
   pullPolicy: IfNotPresent
 
+## @section Extra init containers
+
+## @param extraInitContainers [array] Additional init containers to run before the node starts. Runs after the built-in init-bootstrap container. Useful for downloading global config, fetching external IP, etc.
+##
+extraInitContainers: []
+# Example — download global config dynamically:
+#   extraInitContainers:
+#     - name: download-config
+#       image: alpine/curl:latest
+#       command:
+#         - sh
+#         - -c
+#         - |
+#           curl -sL https://ton.org/global-config.json -o /config/global.config.json
+#       volumeMounts:
+#         - name: main
+#           mountPath: /config
+
+## @section Extra containers
+
+## @param extraContainers [array] Additional sidecar containers to run alongside the node. Useful for monitoring agents, log shippers, etc.
+##
+extraContainers: []
+
+## @section Extra volumes
+
+## @param extraVolumes [array] Additional volumes for the pod. Use with extraVolumeMounts to mount them into containers.
+##
+extraVolumes: []
+
+## @param extraVolumeMounts [array] Additional volume mounts for the main node container.
+##
+extraVolumeMounts: []
+
 ## @section Resource parameters
 ## Defaults are for a fullnode/liteserver. For validators, use 16/32 CPU and 64Gi/128Gi.
 ## See docs/resources.md for details.
@@ -182,11 +216,88 @@ probes: {}
 #     periodSeconds: 10
 #     failureThreshold: 3
 
+## @section Pod metadata parameters
+
+## @param podAnnotations [object] Additional annotations for pods. Useful for Vault agent injection, service mesh, etc.
+##
+podAnnotations: {}
+
+## @param podLabels [object] Additional labels for pods. Useful for cost allocation, policy enforcement, etc.
+##
+podLabels: {}
+
+## @section Extra environment variables
+
+## @param extraEnv [array] Additional environment variables for the main node container. Supports Downward API, ConfigMap/Secret refs, etc.
+##
+extraEnv: []
+# Example — Kubernetes Downward API:
+#   extraEnv:
+#     - name: K8S_NODE_IP
+#       valueFrom:
+#         fieldRef:
+#           fieldPath: status.hostIP
+#     - name: K8S_POD_NAME
+#       valueFrom:
+#         fieldRef:
+#           fieldPath: metadata.name
+
 ## @section Networking parameters
 
 ## @param hostNetwork Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md.
 ##
 hostNetwork: false
+
+## @param hostPort.enabled Expose the ADNL port on the host IP via hostPort. A lighter alternative to hostNetwork — only the ADNL UDP port is bound to the host, network policies still work. See docs/networking.md.
+##
+hostPort:
+  enabled: false
+# Example — expose ADNL on the host without hostNetwork.
+# Anti-affinity is required: two pods on the same node would compete for the same host port.
+#   hostPort:
+#     enabled: true
+#   affinity:
+#     podAntiAffinity:
+#       requiredDuringSchedulingIgnoredDuringExecution:
+#         - labelSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: ton-rust-node
+#           topologyKey: kubernetes.io/hostname
+
+## @section NetworkPolicy parameters
+
+## @param networkPolicy.enabled Create a NetworkPolicy. ADNL is always allowed from 0.0.0.0/0. TCP ports (control, liteserver, jsonRpc, metrics) get rules automatically when enabled — restrict with allowCIDRs.
+## @param networkPolicy.allowCIDRs [array] Source CIDRs for TCP port rules (control, liteserver, jsonRpc, metrics). Defaults to cluster-only if empty.
+## @param networkPolicy.extraIngress [array] Additional raw ingress rules appended to the policy.
+##
+networkPolicy:
+  enabled: false
+  allowCIDRs: []
+  extraIngress: []
+# Example — restrict TCP ports to internal network, add a custom rule:
+#   networkPolicy:
+#     enabled: true
+#     allowCIDRs:
+#       - 10.0.0.0/8
+#     extraIngress:
+#       - ports:
+#           - port: 8080
+#             protocol: TCP
+#         from:
+#           - namespaceSelector:
+#               matchLabels:
+#                 name: monitoring
+
+## @section ServiceAccount parameters
+
+## @param serviceAccount.create Create a ServiceAccount for the pods
+## @param serviceAccount.name [nullable] ServiceAccount name. Defaults to the release fullname if not set.
+## @param serviceAccount.annotations [object] Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding)
+##
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
 
 ## @section Scheduling parameters
 

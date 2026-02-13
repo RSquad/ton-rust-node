@@ -81,6 +81,17 @@ Resolve resource names: use existing*Name if set, otherwise use the chart-manage
 {{- end }}
 
 {{/*
+ServiceAccount name: use serviceAccount.name if set, otherwise fall back to fullname.
+*/}}
+{{- define "ton-rust-node.serviceAccountName" -}}
+{{- if .Values.serviceAccount.name -}}
+  {{- .Values.serviceAccount.name -}}
+{{- else -}}
+  {{- include "ton-rust-node.fullname" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Boolean helpers: whether basestate/zerostate are enabled (either inline or external).
 */}}
 {{- define "ton-rust-node.hasBasestate" -}}
