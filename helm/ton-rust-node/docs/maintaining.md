@@ -63,7 +63,7 @@ All documentation lives in the `docs/` directory:
 | `global-config.md` | Global network config overview |
 | `networking.md` | Networking modes (LoadBalancer, NodePort, hostPort, hostNetwork), NetworkPolicy |
 | `resources.md` | CPU and memory recommendations |
-| `metrics.md` | Prometheus metrics reference (all 51 metrics, labels) |
+| `metrics.md` | Prometheus metrics reference |
 | `monitoring.md` | Prometheus/Grafana setup (ServiceMonitor, annotations, alerts) |
 | `probes.md` | Kubernetes health probes (/healthz, /readyz) |
 

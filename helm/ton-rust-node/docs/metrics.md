@@ -1,6 +1,6 @@
 # Metrics reference
 
-The TON node exposes 51 Prometheus metrics across 8 subsystems. All metrics are served at `GET /metrics` on the metrics port (set via `ports.metrics` in the Helm chart) in standard Prometheus text format.
+All metrics are served at `GET /metrics` on the metrics port (set via `ports.metrics` in the Helm chart) in standard Prometheus text format.
 
 ## Table of contents
 
