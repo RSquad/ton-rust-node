@@ -2,7 +2,7 @@
 
 TON Node uses [log4rs](https://docs.rs/log4rs/1.3.0/log4rs/) for logging. The config is a YAML file passed to the node via the `log_config_name` field in the node config (`config.json`). In this chart it is mounted as `/main/logs.config.yml`.
 
-A sensible default is bundled with the chart at [files/logs.config.yml](../files/logs.config.yml) and used automatically if no override is given. You can override it inline, via `--set-file logsConfig=path`, or by pointing to an existing ConfigMap (see README for details).
+A sensible default is bundled with the chart at [files/logs.config.yml](../files/logs.config.yml) and used automatically if no override is given. You can override it inline, via `--set-file logsConfig=path`, or by pointing to an existing ConfigMap (see [README](../README.md) for details).
 
 ## Table of contents
 
@@ -218,20 +218,26 @@ These are the targets you can configure in the `loggers` section:
 | `node::network::liteserver` | Liteserver request handling |
 | `node::validator::collator` | Block collation |
 | `adnl` | ADNL network protocol |
+| `adnl_query` | ADNL query processing |
 | `overlay` | Overlay networks |
+| `overlay_broadcast` | Overlay broadcast messages (very noisy — set to `warn` or `off` in production) |
 | `rldp` | RLDP protocol (reliable large datagrams) |
 | `dht` | Distributed Hash Table |
-| `ton_block` | Block parsing and serialization |
+| `block` | Block structure and config parsing |
 | `executor` | Transaction execution |
 | `tvm` | TON Virtual Machine |
 | `validator` | Validation (general) |
 | `validator_manager` | Validator management |
+| `validate_query` | Individual block/query validation |
+| `validate_reject` | Rejected block/query validation |
 | `catchain` | Catchain consensus protocol |
 | `catchain_adnl_overlay` | ADNL overlay for catchain |
+| `catchain_network` | Catchain network transport |
 | `validator_session` | Validator sessions |
-| `validate_query` | Individual block/query validation |
 | `consensus_common` | Common consensus logic |
 | `storage` | Data storage |
 | `index` | Data indexing |
 | `ext_messages` | External message handling |
 | `telemetry` | Telemetry and metrics |
+
+> **Note:** HTTP requests (JSON-RPC, metrics endpoints) are not logged by the node. There is no logger target for HTTP request tracing.

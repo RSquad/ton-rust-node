@@ -12,17 +12,21 @@ Check pod status:
 
 Networking: hostNetwork
 Pods are bound directly to host IPs. No services are needed for external access.
-{{- else if eq .Values.services.type "LoadBalancer" }}
+{{- else if eq .Values.services.adnl.type "LoadBalancer" }}
 
 Get external IPs (may take a moment to provision):
 
-  kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }}
-{{- else if eq .Values.services.type "NodePort" }}
+  kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=adnl
+{{- else if eq .Values.services.adnl.type "NodePort" }}
 
 Get NodePort assignments:
 
-  kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=adnl
 {{- end }}
+
+List all services:
+
+  kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }}
 
 View logs:
 

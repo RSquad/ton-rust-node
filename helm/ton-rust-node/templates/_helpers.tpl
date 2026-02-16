@@ -81,6 +81,17 @@ Resolve resource names: use existing*Name if set, otherwise use the chart-manage
 {{- end }}
 
 {{/*
+ServiceAccount name: use serviceAccount.name if set, otherwise fall back to fullname.
+*/}}
+{{- define "ton-rust-node.serviceAccountName" -}}
+{{- if .Values.serviceAccount.name -}}
+  {{- .Values.serviceAccount.name -}}
+{{- else -}}
+  {{- include "ton-rust-node.fullname" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Boolean helpers: whether basestate/zerostate are enabled (either inline or external).
 */}}
 {{- define "ton-rust-node.hasBasestate" -}}
@@ -97,6 +108,27 @@ Validation: require nodeConfigs or existingNodeConfigsSecretName.
 {{- define "ton-rust-node.validateNodeConfigs" -}}
 {{- if not (or .Values.nodeConfigs .Values.existingNodeConfigsSecretName) -}}
   {{- fail "nodeConfigs is required: set nodeConfigs (inline JSON map), use --set-file nodeConfigs.node-0\\.json=path, or provide existingNodeConfigsSecretName" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Merge service annotations: shared annotations from svcConfig.annotations
+plus per-replica overrides from svcConfig.perReplica[replicaIndex].annotations.
+Per-replica annotations win on conflict.
+Usage: {{ include "ton-rust-node.serviceAnnotations" (dict "svcConfig" .Values.services.adnl "replicaIndex" $i) }}
+*/}}
+{{- define "ton-rust-node.serviceAnnotations" -}}
+{{- $svcConfig := .svcConfig -}}
+{{- $i := int .replicaIndex -}}
+{{- $shared := $svcConfig.annotations | default dict -}}
+{{- $perReplica := dict -}}
+{{- if and (hasKey $svcConfig "perReplica") $svcConfig.perReplica (lt $i (len $svcConfig.perReplica)) -}}
+{{-   $perReplica = (index $svcConfig.perReplica $i).annotations | default dict -}}
+{{- end -}}
+{{- $merged := mustMergeOverwrite (deepCopy $shared) $perReplica -}}
+{{- if $merged }}
+annotations:
+  {{- $merged | toYaml | nindent 2 }}
 {{- end -}}
 {{- end }}
 

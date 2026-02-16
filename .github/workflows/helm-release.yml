@@ -22,7 +22,16 @@ jobs:
           # Tag format: helm/v0.2.2 → version: 0.2.2
           VERSION="${GITHUB_REF_NAME#helm/v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Chart version: ${VERSION}"
+
+          APP_VERSION=$(grep '^appVersion:' helm/ton-rust-node/Chart.yaml | sed 's/appVersion: *"\(.*\)"/\1/')
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Detect pre-release (rc, alpha, beta)
+          if echo "$VERSION" | grep -qE '(rc|alpha|beta)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set chart version
         run: |
@@ -46,6 +55,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "Helm Chart v${{ steps.version.outputs.version }}"
+          name: "helm/v${{ steps.version.outputs.version }}"
+          body: |
+            Helm chart v${{ steps.version.outputs.version }} for ton-rust-node.
+
+            App version: `${{ steps.version.outputs.app_version }}`
+            OCI: `oci://ghcr.io/rsquad/helm/ton-rust-node --version ${{ steps.version.outputs.version }}`
           files: .helm-pkg/ton-rust-node-${{ steps.version.outputs.version }}.tgz
+          prerelease: ${{ steps.version.outputs.prerelease }}
           make_latest: false
