@@ -2,7 +2,7 @@
 
 TON Node uses [log4rs](https://docs.rs/log4rs/1.3.0/log4rs/) for logging. The config is a YAML file passed to the node via the `log_config_name` field in the node config (`config.json`). In this chart it is mounted as `/main/logs.config.yml`.
 
-A sensible default is bundled with the chart at [files/logs.config.yml](../files/logs.config.yml) and used automatically if no override is given. You can override it inline, via `--set-file logsConfig=path`, or by pointing to an existing ConfigMap (see README for details).
+A sensible default is bundled with the chart at [files/logs.config.yml](../files/logs.config.yml) and used automatically if no override is given. You can override it inline, via `--set-file logsConfig=path`, or by pointing to an existing ConfigMap (see [README](../README.md) for details).
 
 ## Table of contents
 

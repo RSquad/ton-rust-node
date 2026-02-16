@@ -18,7 +18,7 @@ In this chart, per-node configs are provided via the `nodeConfigs` map in values
 - [Validator-specific sections](#validator-specific-sections)
 - [Advanced fields](#advanced-fields)
 
-> **See also:** The metrics endpoint exposes 57 Prometheus metrics and Kubernetes health probes. For the full catalog of metrics, naming convention, and PromQL examples see [metrics.md](metrics.md).
+> **See also:** The metrics endpoint exposes 51 Prometheus metrics and Kubernetes health probes. For the full catalog of metrics and naming convention see [metrics.md](metrics.md).
 
 
 ## Helm integration constraints
@@ -703,7 +703,7 @@ Prometheus metrics and Kubernetes health probe HTTP server. When present, the no
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /metrics` | Prometheus scrape endpoint (57 metrics) |
+| `GET /metrics` | Prometheus scrape endpoint (51 metrics) |
 | `GET /healthz` | Kubernetes liveness probe |
 | `GET /readyz` | Kubernetes readiness probe |
 

@@ -221,4 +221,4 @@ spec:
             summary: "Shard state processing queue backlog: {{ $value }}"
 ```
 
-Adjust thresholds and `for` durations to match your SLA requirements. See [metrics.md](metrics.md) for the full metrics reference and PromQL examples.
+Adjust thresholds and `for` durations to match your SLA requirements. See [metrics.md](metrics.md) for the full metrics reference.

@@ -138,8 +138,10 @@ ports:
 ## @param services.control.type Control service type
 ##
 ## @param services.liteserver.type Liteserver service type
+## @param services.liteserver.externalTrafficPolicy Liteserver service traffic policy
 ##
 ## @param services.jsonRpc.type JSON-RPC service type
+## @param services.jsonRpc.externalTrafficPolicy JSON-RPC service traffic policy
 ##
 services:
   adnl:
@@ -288,7 +290,7 @@ hostPort:
 ## @section NetworkPolicy parameters
 
 ## @param networkPolicy.enabled Create a NetworkPolicy. ADNL is always allowed from 0.0.0.0/0. TCP ports (control, liteserver, jsonRpc, metrics) get rules automatically when enabled — restrict with allowCIDRs.
-## @param networkPolicy.allowCIDRs [array] Source CIDRs for TCP port rules (control, liteserver, jsonRpc, metrics). Defaults to cluster-only if empty.
+## @param networkPolicy.allowCIDRs [array] Source CIDRs for TCP port rules (control, liteserver, jsonRpc, metrics). If empty, traffic is not restricted by source.
 ## @param networkPolicy.extraIngress [array] Additional raw ingress rules appended to the policy.
 ##
 networkPolicy:
