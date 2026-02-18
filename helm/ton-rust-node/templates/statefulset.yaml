@@ -28,6 +28,10 @@ spec:
       {{- if .Values.serviceAccount.enabled }}
       serviceAccountName: {{ include "ton-rust-node.serviceAccountName" . }}
       {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         fsGroup: 1000
       {{- with .Values.nodeSelector }}
