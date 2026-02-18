@@ -173,11 +173,12 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Image parameters
 
-| Name               | Description                | Value                          |
-| ------------------ | -------------------------- | ------------------------------ |
-| `image.repository` | Container image repository | `ghcr.io/rsquad/ton-rust-node` |
-| `image.tag`        | Image tag                  | `v0.1.2-mainnet`               |
-| `image.pullPolicy` | Pull policy                | `IfNotPresent`                 |
+| Name               | Description                               | Value                          |
+| ------------------ | ----------------------------------------- | ------------------------------ |
+| `image.repository` | Container image repository                | `ghcr.io/rsquad/ton-rust-node` |
+| `image.tag`        | Image tag                                 | `v0.1.2-mainnet`               |
+| `image.pullPolicy` | Pull policy                               | `IfNotPresent`                 |
+| `imagePullSecrets` | Image pull secrets for private registries | `[]`                           |
 
 ### Init container image parameters
 

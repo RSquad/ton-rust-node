@@ -5,6 +5,18 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.3.1] - 2026-02-18
+
+appVersion: `v0.1.2-mainnet`
+
+### Added
+
+- `imagePullSecrets` — support for private container registries
+
+### Fixed
+
+- Documentation link in NOTES.txt pointed to the old `ton-devops` repository
+
 ## [0.3.0] - 2026-02-13
 
 appVersion: `v0.1.2-mainnet`
