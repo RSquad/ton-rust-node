@@ -4,7 +4,7 @@ Each TON node replica requires its own `config.json` — the main configuration 
 
 In this chart, per-node configs are provided via the `nodeConfigs` map in values (or an existing Secret). The keys must follow the naming convention `node-N.json` where N matches the StatefulSet replica index (0-based). At startup, the init container copies `node-<pod-index>.json` into `/main/config.json`.
 
-> **Note on keys:** All keys in the config are 256-bit Ed25519 keys encoded as base64 strings. During the current beta, private keys (ADNL, control server, liteserver) are stored as plaintext in `config.json`. This is acceptable for development and fullnode deployments. With the validator release, additional mechanisms will be provided — including external secrets vault integration (e.g. HashiCorp Vault) and the built-in `secrets_vault_config` option.
+> **Note on keys:** All keys in the config are 256-bit Ed25519 keys encoded as base64 strings. Private keys (ADNL, control server, liteserver) are stored as plaintext in `config.json`. This is acceptable for fullnode deployments. For validators, [nodectl](../../nodectl/README.md) provides an encrypted vault for key management.
 
 ## Table of contents
 
@@ -792,17 +792,30 @@ Optional network extensions.
 
 ### `secrets_vault_config`
 
-External secrets vault for storing private keys outside of `config.json`.
+External secrets vault for storing private keys outside of `config.json`. When configured, the node stores private keys (ADNL, control server, liteserver) in an encrypted vault file instead of plaintext in `config.json`.
+
+This is the same vault used by [nodectl](../../nodectl/README.md) — both the node and nodectl share the same vault format and encryption. The difference is how the vault URL is provided:
+
+| Component | How vault is configured | HashiCorp Vault support |
+|-----------|------------------------|------------------------|
+| **Node** | `secrets_vault_config` in `config.json` | Planned (next release) |
+| **nodectl** | `VAULT_URL` environment variable | Planned (next release) |
+
+Currently only the file-based backend is available:
 
 ```json
 "secrets_vault_config": {
-  "url": "file:///path/to/vault"
+  "url": "file:///path/to/vault.json&master_key=<64-char-hex>"
 }
 ```
+
+The master key is a 32-byte AES-256 encryption key (64 hex characters). Store it securely — anyone with the key can decrypt the vault file.
 
 | Type | Default |
 |------|---------|
 | object \| null | `null` |
+
+> **Note:** When `secrets_vault_config` is `null` (default), private keys remain in `config.json` as plaintext. This is acceptable for fullnodes and liteservers. For validators, configuring a vault is recommended.
 
 ---
 
@@ -821,7 +834,7 @@ In practice these fields are only relevant for testing. During validator electio
 
 ## Validator-specific sections
 
-> **TODO:** Validator setup documentation is not yet available. The sections below are needed for running a validator node and will be documented in detail later.
+> Validator election management is handled by [nodectl](../../nodectl/docs/setup.md) (alpha). The sections below cover node-level config needed for validation.
 
 The `collator_config` section controls block assembly (timeouts, threading, message queue limits). See the [field reference](#collator_config) and the [validator example](#minimal-example-validator) for typical values.
 

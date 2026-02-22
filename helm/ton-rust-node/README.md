@@ -2,7 +2,7 @@
 
 Helm chart for deploying TON Rust Node on Kubernetes.
 
-> **Current status:** Only a **mainnet fullnode** image is published (`ghcr.io/rsquad/ton-rust-node:mainnet`). Validator support is planned but not yet available.
+> **Current status:** Fullnode and validator images are published. For validator election management, see the [nodectl Helm chart](../nodectl/README.md) (alpha).
 
 ## Table of contents
 
