@@ -1,0 +1,66 @@
+name: nodectl Helm Chart Release
+
+on:
+  push:
+    tags:
+      - "helm/nodectl/v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          # Tag format: helm/nodectl/v0.1.0 → version: 0.1.0
+          VERSION="${GITHUB_REF_NAME#helm/nodectl/v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          APP_VERSION=$(grep '^appVersion:' helm/nodectl/Chart.yaml | sed 's/appVersion: *"\(.*\)"/\1/')
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Detect pre-release (rc, alpha, beta)
+          if echo "$VERSION" | grep -qE '(rc|alpha|beta)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set chart version
+        run: |
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.version }}/" helm/nodectl/Chart.yaml
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Package chart
+        run: |
+          helm package helm/nodectl --destination .helm-pkg
+
+      - name: Push to OCI registry
+        run: |
+          helm push .helm-pkg/nodectl-${{ steps.version.outputs.version }}.tgz oci://ghcr.io/rsquad/ton-rust-node/helm
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "helm/nodectl/v${{ steps.version.outputs.version }}"
+          body: |
+            nodectl Helm chart v${{ steps.version.outputs.version }}.
+
+            App version: `${{ steps.version.outputs.app_version }}`
+            OCI: `oci://ghcr.io/rsquad/ton-rust-node/helm/nodectl --version ${{ steps.version.outputs.version }}`
+          files: .helm-pkg/nodectl-${{ steps.version.outputs.version }}.tgz
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          make_latest: false
