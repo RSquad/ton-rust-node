@@ -478,7 +478,9 @@ Maximum queue length for state write operations. Controls backpressure during as
 
 #### `cells_db_config.prefill_cells_counters`
 
-If `true`, pre-fill the cell counter cache on startup. Improves performance after start but increases startup time.
+If `true`, pre-fill the cell counter cache on startup. This loads all cell reference counters into memory, which allows state saves to complete without any disk reads — theoretically very fast. However, this consumes a large amount of RAM and significantly increases startup time.
+
+**Always set to `false` unless you have a specific, well-understood reason to enable it.** It is not required for normal full node or validator operation.
 
 | Type | Default |
 |------|---------|
