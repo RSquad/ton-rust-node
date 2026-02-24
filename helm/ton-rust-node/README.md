@@ -222,13 +222,21 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | ------------------------------- | -------------------------------------------------------------- | ------------ |
 | `storage.main.size`             | Main volume size                                               | `1Gi`        |
 | `storage.main.storageClassName` | Storage class for main volume                                  | `local-path` |
+| `storage.main.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation. Set to `keep` to prevent PVC deletion on `helm uninstall`. Set to empty string to omit. | `keep` |
+| `storage.main.annotations`      | Extra annotations for the main PVC                             | `{}`         |
 | `storage.db.size`               | Database volume size (hundreds of GB for mainnet)              | `1Ti`        |
 | `storage.db.storageClassName`   | Storage class for database volume                              | `local-path` |
+| `storage.db.resourcePolicy`     | Value for the `helm.sh/resource-policy` annotation on the db PVC | `""`       |
+| `storage.db.annotations`        | Extra annotations for the db PVC                               | `{}`         |
 | `storage.logs.enabled`          | Create a PVC for logs. Set to false if you log to stdout only. | `true`       |
 | `storage.logs.size`             | Logs volume size                                               | `150Gi`      |
 | `storage.logs.storageClassName` | Storage class for logs volume                                  | `local-path` |
+| `storage.logs.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation on the logs PVC | `""`     |
+| `storage.logs.annotations`      | Extra annotations for the logs PVC                             | `{}`         |
 | `storage.keys.size`             | Keys volume size                                               | `1Gi`        |
 | `storage.keys.storageClassName` | Storage class for keys volume                                  | `local-path` |
+| `storage.keys.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation on the keys PVC | `keep`   |
+| `storage.keys.annotations`      | Extra annotations for the keys PVC                             | `{}`         |
 
 ### Port parameters
 

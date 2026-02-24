@@ -5,6 +5,15 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.3.2] - 2026-02-24
+
+appVersion: `v0.1.2-mainnet`
+
+### Added
+
+- `storage.<volume>.resourcePolicy` — configurable `helm.sh/resource-policy` annotation on volumeClaimTemplates. Defaults: `keep` for main/keys, omitted for db/logs
+- `storage.<volume>.annotations` — extra annotations per volume PVC
+
 ## [0.3.1] - 2026-02-18
 
 appVersion: `v0.1.2-mainnet`

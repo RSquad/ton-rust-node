@@ -91,28 +91,44 @@ resources:
 
 ## @param storage.main.size Main volume size
 ## @param storage.main.storageClassName Storage class for main volume
+## @param storage.main.resourcePolicy Value for the `helm.sh/resource-policy` annotation. Set to `keep` to prevent PVC deletion on `helm uninstall`. Set to empty string to omit.
+## @param storage.main.annotations [object] Extra annotations for the main PVC
 ## @param storage.db.size Database volume size (hundreds of GB for mainnet)
 ## @param storage.db.storageClassName Storage class for database volume
+## @param storage.db.resourcePolicy Value for the `helm.sh/resource-policy` annotation on the db PVC
+## @param storage.db.annotations [object] Extra annotations for the db PVC
 ## @param storage.logs.enabled Create a PVC for logs. Set to false if you log to stdout only.
 ## @param storage.logs.size Logs volume size
 ## @param storage.logs.storageClassName Storage class for logs volume
+## @param storage.logs.resourcePolicy Value for the `helm.sh/resource-policy` annotation on the logs PVC
+## @param storage.logs.annotations [object] Extra annotations for the logs PVC
 ## @param storage.keys.size Keys volume size
 ## @param storage.keys.storageClassName Storage class for keys volume
+## @param storage.keys.resourcePolicy Value for the `helm.sh/resource-policy` annotation on the keys PVC
+## @param storage.keys.annotations [object] Extra annotations for the keys PVC
 ##
 storage:
   main:
     size: 1Gi
     storageClassName: local-path
+    resourcePolicy: keep
+    annotations: {}
   db:
     size: 1Ti
     storageClassName: local-path
+    resourcePolicy: ""
+    annotations: {}
   logs:
     enabled: true
     size: 150Gi
     storageClassName: local-path
+    resourcePolicy: ""
+    annotations: {}
   keys:
     size: 1Gi
     storageClassName: local-path
+    resourcePolicy: keep
+    annotations: {}
 
 ## @section Port parameters
 

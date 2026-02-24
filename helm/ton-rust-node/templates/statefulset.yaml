@@ -217,8 +217,18 @@ spec:
     {{- $volumes = append $volumes "logs" -}}
     {{- end }}
     {{- range $vol := $volumes }}
+    {{- $volConfig := index $.Values.storage $vol }}
     - metadata:
         name: {{ $vol }}
+        {{- if or $volConfig.resourcePolicy (gt (len $volConfig.annotations) 0) }}
+        annotations:
+          {{- with $volConfig.annotations }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- if $volConfig.resourcePolicy }}
+          helm.sh/resource-policy: {{ $volConfig.resourcePolicy | quote }}
+          {{- end }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ index $.Values.storage $vol "storageClassName" }}
