@@ -4,13 +4,13 @@ metadata:
   name: {{ include "nodectl.fullname" . }}-data
   labels:
     {{- include "nodectl.labels" . | nindent 4 }}
-  {{- if or .Values.storage.resourcePolicy .Values.storage.annotations }}
+  {{- if or .Values.storage.resourcePolicy (gt (len .Values.storage.annotations) 0) }}
   annotations:
-    {{- if .Values.storage.resourcePolicy }}
-    helm.sh/resource-policy: {{ .Values.storage.resourcePolicy | quote }}
-    {{- end }}
     {{- with .Values.storage.annotations }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.storage.resourcePolicy }}
+    helm.sh/resource-policy: {{ .Values.storage.resourcePolicy | quote }}
     {{- end }}
   {{- end }}
 spec:
