@@ -116,13 +116,13 @@ storage:
   db:
     size: 1Ti
     storageClassName: local-path
-    resourcePolicy: delete
+    resourcePolicy: ""
     annotations: {}
   logs:
     enabled: true
     size: 150Gi
     storageClassName: local-path
-    resourcePolicy: delete
+    resourcePolicy: ""
     annotations: {}
   keys:
     size: 1Gi

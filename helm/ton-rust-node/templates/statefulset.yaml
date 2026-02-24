@@ -220,13 +220,13 @@ spec:
     {{- $volConfig := index $.Values.storage $vol }}
     - metadata:
         name: {{ $vol }}
-        {{- if or $volConfig.resourcePolicy $volConfig.annotations }}
+        {{- if or $volConfig.resourcePolicy (gt (len $volConfig.annotations) 0) }}
         annotations:
-          {{- if $volConfig.resourcePolicy }}
-          helm.sh/resource-policy: {{ $volConfig.resourcePolicy | quote }}
-          {{- end }}
           {{- with $volConfig.annotations }}
           {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- if $volConfig.resourcePolicy }}
+          helm.sh/resource-policy: {{ $volConfig.resourcePolicy | quote }}
           {{- end }}
         {{- end }}
       spec:
