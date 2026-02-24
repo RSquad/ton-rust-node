@@ -141,6 +141,8 @@ The chart sets these environment variables on the nodectl container:
 | `storage.size` | PVC size for nodectl data | `1Gi` |
 | `storage.storageClassName` | Storage class name. Empty string uses cluster default. | `""` |
 | `storage.accessMode` | PVC access mode | `ReadWriteOnce` |
+| `storage.resourcePolicy` | Value for the `helm.sh/resource-policy` annotation. Set to `keep` (default) to prevent PVC deletion on `helm uninstall`. Set to empty string to omit the annotation. | `keep` |
+| `storage.annotations` | Extra annotations for the PVC | `{}` |
 
 ### Data directory
 
