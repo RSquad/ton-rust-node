@@ -50,11 +50,15 @@ service:
 ## @param storage.size PVC size for nodectl data
 ## @param storage.storageClassName [nullable] Storage class name. Empty string uses cluster default.
 ## @param storage.accessMode PVC access mode
+## @param storage.resourcePolicy Value for the `helm.sh/resource-policy` annotation. Set to `keep` (default) to prevent PVC deletion on `helm uninstall`. Set to empty string to omit the annotation.
+## @param storage.annotations [object] Extra annotations for the PVC
 ##
 storage:
   size: 1Gi
   storageClassName: ""
   accessMode: ReadWriteOnce
+  resourcePolicy: keep
+  annotations: {}
 
 ## @section Data directory
 
