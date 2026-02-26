@@ -7,7 +7,7 @@ Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
 ## [0.4.0] - 2026-02-27
 
-appVersion: `v0.2.0-mainnet`
+appVersion: `v0.2.1-mainnet`
 
 ### Added
 
@@ -26,7 +26,7 @@ appVersion: `v0.2.0-mainnet`
 - **Breaking:** Chart OCI registry moved from `oci://ghcr.io/rsquad/helm/ton-rust-node` to `oci://ghcr.io/rsquad/ton-rust-node/helm/node`
 - **Breaking:** Default image repository changed from `ghcr.io/rsquad/ton-rust-node` to `ghcr.io/rsquad/ton-rust-node/node`
 - `app.kubernetes.io/name` label changed from `ton-rust-node` to `node`
-- Default image tag updated to `v0.2.0-mainnet`
+- Default image tag updated to `v0.2.1-mainnet`
 
 ## [0.3.2] - 2026-02-24
 
