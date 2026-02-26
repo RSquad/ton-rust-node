@@ -1,9 +1,9 @@
 apiVersion: v2
-name: ton-rust-node
+name: node
 description: TON Rust Node deployment
 type: application
-version: 0.3.2
-appVersion: "v0.1.2-mainnet"
+version: 0.4.0
+appVersion: "v0.2.0-mainnet"
 
 sources:
   - https://github.com/rsquad/ton-rust-node

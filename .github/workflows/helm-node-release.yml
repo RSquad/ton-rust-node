@@ -3,7 +3,7 @@ name: Helm Chart Release
 on:
   push:
     tags:
-      - "helm/v*"
+      - "helm/node/v*"
 
 permissions:
   contents: write
@@ -19,8 +19,8 @@ jobs:
       - name: Extract version from tag
         id: version
         run: |
-          # Tag format: helm/v0.2.2 → version: 0.2.2
-          VERSION="${GITHUB_REF_NAME#helm/v}"
+          # Tag format: helm/node/v0.2.2 → version: 0.2.2
+          VERSION="${GITHUB_REF_NAME#helm/node/v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
           APP_VERSION=$(grep '^appVersion:' helm/ton-rust-node/Chart.yaml | sed 's/appVersion: *"\(.*\)"/\1/')
@@ -50,17 +50,17 @@ jobs:
 
       - name: Push to OCI registry
         run: |
-          helm push .helm-pkg/ton-rust-node-${{ steps.version.outputs.version }}.tgz oci://ghcr.io/rsquad/helm
+          helm push .helm-pkg/node-${{ steps.version.outputs.version }}.tgz oci://ghcr.io/rsquad/ton-rust-node/helm
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "helm/v${{ steps.version.outputs.version }}"
+          name: "helm/node/v${{ steps.version.outputs.version }}"
           body: |
-            Helm chart v${{ steps.version.outputs.version }} for ton-rust-node.
+            Helm chart v${{ steps.version.outputs.version }} for node.
 
             App version: `${{ steps.version.outputs.app_version }}`
-            OCI: `oci://ghcr.io/rsquad/helm/ton-rust-node --version ${{ steps.version.outputs.version }}`
-          files: .helm-pkg/ton-rust-node-${{ steps.version.outputs.version }}.tgz
+            OCI: `oci://ghcr.io/rsquad/ton-rust-node/helm/node --version ${{ steps.version.outputs.version }}`
+          files: .helm-pkg/node-${{ steps.version.outputs.version }}.tgz
           prerelease: ${{ steps.version.outputs.prerelease }}
           make_latest: false

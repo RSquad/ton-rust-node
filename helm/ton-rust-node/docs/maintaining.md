@@ -35,19 +35,19 @@ echo $GITHUB_TOKEN | helm registry login ghcr.io -u <your-github-username> --pas
 ```bash
 # From the repository root
 helm package helm/ton-rust-node
-helm push ton-rust-node-<version>.tgz oci://ghcr.io/rsquad/helm
+helm push node-<version>.tgz oci://ghcr.io/rsquad/ton-rust-node/helm
 ```
 
 3. Verify the published chart:
 
 ```bash
-helm show chart oci://ghcr.io/rsquad/helm/ton-rust-node --version <version>
+helm show chart oci://ghcr.io/rsquad/ton-rust-node/helm/node --version <version>
 ```
 
 ### Installing from the registry
 
 ```bash
-helm install my-node oci://ghcr.io/rsquad/helm/ton-rust-node --version <version> -f values.yaml
+helm install my-node oci://ghcr.io/rsquad/ton-rust-node/helm/node --version <version> -f values.yaml
 ```
 
 ---

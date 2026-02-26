@@ -30,11 +30,11 @@ List all services:
 
 View logs:
 
-  kubectl logs {{ include "ton-rust-node.fullname" . }}-0 -c ton-node
+  kubectl logs {{ include "node.fullname" . }}-0 -c ton-node
 
 Exec into pod:
 
-  kubectl exec -it {{ include "ton-rust-node.fullname" . }}-0 -c ton-node -- /bin/sh
+  kubectl exec -it {{ include "node.fullname" . }}-0 -c ton-node -- /bin/sh
 
 Ports:
   ADNL (UDP):    {{ .Values.ports.adnl }}
@@ -53,12 +53,12 @@ Ports:
 {{- if .Values.ports.metrics }}
 
 Metrics & monitoring:
-  Service:  {{ include "ton-rust-node.fullname" . }}-metrics (ClusterIP)
-  Metrics:  http://{{ include "ton-rust-node.fullname" . }}-metrics:{{ .Values.ports.metrics }}/metrics
-  Health:   http://{{ include "ton-rust-node.fullname" . }}-metrics:{{ .Values.ports.metrics }}/healthz
-  Ready:    http://{{ include "ton-rust-node.fullname" . }}-metrics:{{ .Values.ports.metrics }}/readyz
+  Service:  {{ include "node.fullname" . }}-metrics (ClusterIP)
+  Metrics:  http://{{ include "node.fullname" . }}-metrics:{{ .Values.ports.metrics }}/metrics
+  Health:   http://{{ include "node.fullname" . }}-metrics:{{ .Values.ports.metrics }}/healthz
+  Ready:    http://{{ include "node.fullname" . }}-metrics:{{ .Values.ports.metrics }}/readyz
 {{- if .Values.metrics.serviceMonitor.enabled }}
-  ServiceMonitor "{{ include "ton-rust-node.fullname" . }}" created for kube-prometheus-stack.
+  ServiceMonitor "{{ include "node.fullname" . }}" created for kube-prometheus-stack.
 {{- end }}
 {{- if .Values.metrics.annotations.enabled }}
   Prometheus annotations added to the metrics service.

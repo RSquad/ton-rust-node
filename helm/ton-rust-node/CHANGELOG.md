@@ -5,6 +5,29 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.4.0] - 2026-02-27
+
+appVersion: `v0.2.0-mainnet`
+
+### Added
+
+- `vault.url` / `vault.secretName` / `vault.secretKey` — secrets vault configuration via `VAULT_URL` env var. The `secrets_vault_config` field in `config.json` is no longer supported; use the chart's vault values instead. See [docs/vault.md](docs/vault.md)
+- `services.<port>.labels` — custom labels for all service types (adnl, control, liteserver, jsonRpc). ADNL also supports per-replica label overrides via `perReplica[].labels`
+
+### Fixed
+
+- `extraContainers` and `extraInitContainers` now support Helm templating (`.Release.Name`, `.Values.*`, named templates)
+- `nodeConfigs` values now support Helm templating
+
+### Changed
+
+- **Breaking:** NetworkPolicy redesigned with per-port ingress rules. `networkPolicy.allowCIDRs` removed — use per-port `allowFrom` instead. TCP ports (control, liteserver, jsonRpc, metrics) now require explicit `.enabled: true`. ADNL remains always open (public by default)
+- **Breaking:** Chart renamed from `ton-rust-node` to `node`. This is a monorepo consolidation — all artifacts now live under the `ton-rust-node/*` namespace
+- **Breaking:** Chart OCI registry moved from `oci://ghcr.io/rsquad/helm/ton-rust-node` to `oci://ghcr.io/rsquad/ton-rust-node/helm/node`
+- **Breaking:** Default image repository changed from `ghcr.io/rsquad/ton-rust-node` to `ghcr.io/rsquad/ton-rust-node/node`
+- `app.kubernetes.io/name` label changed from `ton-rust-node` to `node`
+- Default image tag updated to `v0.2.0-mainnet`
+
 ## [0.3.2] - 2026-02-24
 
 appVersion: `v0.1.2-mainnet`

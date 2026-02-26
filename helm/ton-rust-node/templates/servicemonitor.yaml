@@ -2,19 +2,19 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "ton-rust-node.fullname" . }}
+  name: {{ include "node.fullname" . }}
   {{- if .Values.metrics.serviceMonitor.namespace }}
   namespace: {{ .Values.metrics.serviceMonitor.namespace }}
   {{- end }}
   labels:
-    {{- include "ton-rust-node.labels" . | nindent 4 }}
+    {{- include "node.labels" . | nindent 4 }}
     {{- with .Values.metrics.serviceMonitor.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
   selector:
     matchLabels:
-      {{- include "ton-rust-node.selectorLabels" . | nindent 6 }}
+      {{- include "node.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: metrics
   {{- if .Values.metrics.serviceMonitor.namespace }}
   namespaceSelector:
