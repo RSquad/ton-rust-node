@@ -173,7 +173,7 @@ affinity:
     requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
           matchLabels:
-            app.kubernetes.io/name: ton-rust-node
+            app.kubernetes.io/name: node
         topologyKey: kubernetes.io/hostname
 ```
 
@@ -208,7 +208,7 @@ affinity:
     requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
           matchLabels:
-            app.kubernetes.io/name: ton-rust-node
+            app.kubernetes.io/name: node
         topologyKey: kubernetes.io/hostname
 ```
 

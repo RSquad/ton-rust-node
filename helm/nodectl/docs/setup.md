@@ -43,14 +43,12 @@ If nodectl runs in a different cluster than the validators, the Control Server p
 
 ### Create a vault secret
 
-Generate a file-based vault with a random master key:
+See [Secrets Vault](../../ton-rust-node/docs/vault.md) for vault setup, URL formats, and security details.
 
 ```bash
 kubectl create secret generic nodectl-vault \
   --from-literal=VAULT_URL="file:///nodectl/data/vault.json&master_key=$(openssl rand -hex 32)"
 ```
-
-> **Note:** The master key is a 32-byte AES-256 encryption key (64 hex chars). Store it securely — anyone with the key can decrypt the vault file.
 
 ### Install the chart
 
@@ -349,11 +347,7 @@ kubectl rollout restart deploy/my-nodectl
 
 ### Service fails: "vault is not set"
 
-`VAULT_URL` environment variable is not set. Check that `vault.secretName` or `vault.url` is configured in Helm values and the K8s Secret exists.
-
-### Service fails: vault set in both config and ENV
-
-Vault is set in both `config.json` and `VAULT_URL` env. Remove the `vault` section from `config.json` (set it to `null`).
+`VAULT_URL` environment variable is not set. Check that `vault.secretName` or `vault.url` is configured in Helm values and the K8s Secret exists. See [vault.md](../../ton-rust-node/docs/vault.md).
 
 ### Secret not found in vault
 

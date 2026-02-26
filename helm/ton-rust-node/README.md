@@ -43,7 +43,7 @@ helm install fullnode ./helm/ton-rust-node -f fullnode-values.yaml
 helm install my-node ./helm/ton-rust-node -f values.yaml
 
 # From OCI registry
-helm install my-node oci://ghcr.io/rsquad/helm/ton-rust-node -f values.yaml
+helm install my-node oci://ghcr.io/rsquad/ton-rust-node/helm/node -f values.yaml
 ```
 
 ## Quick start
@@ -175,7 +175,7 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 | Name               | Description                               | Value                          |
 | ------------------ | ----------------------------------------- | ------------------------------ |
-| `image.repository` | Container image repository                | `ghcr.io/rsquad/ton-rust-node` |
+| `image.repository` | Container image repository                | `ghcr.io/rsquad/ton-rust-node/node` |
 | `image.tag`        | Image tag                                 | `v0.1.2-mainnet`               |
 | `image.pullPolicy` | Pull policy                               | `IfNotPresent`                 |
 | `imagePullSecrets` | Image pull secrets for private registries | `[]`                           |
@@ -452,10 +452,10 @@ For chart maintainers: [docs/maintaining.md](docs/maintaining.md) documents how 
 
 ```bash
 # Check pod status (replace "my-node" with your release name)
-kubectl get pods -l app.kubernetes.io/name=ton-rust-node,app.kubernetes.io/instance=my-node
+kubectl get pods -l app.kubernetes.io/name=node,app.kubernetes.io/instance=my-node
 
 # Get external service IPs
-kubectl get svc -l app.kubernetes.io/name=ton-rust-node,app.kubernetes.io/instance=my-node
+kubectl get svc -l app.kubernetes.io/name=node,app.kubernetes.io/instance=my-node
 
 # View logs
 kubectl logs my-node-0 -c ton-node

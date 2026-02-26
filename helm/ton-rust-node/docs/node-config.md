@@ -794,30 +794,7 @@ Optional network extensions.
 
 ### `secrets_vault_config`
 
-External secrets vault for storing private keys outside of `config.json`. When configured, the node stores private keys (ADNL, control server, liteserver) in an encrypted vault file instead of plaintext in `config.json`.
-
-This is the same vault used by [nodectl](../../nodectl/README.md) — both the node and nodectl share the same vault format and encryption. The difference is how the vault URL is provided:
-
-| Component | How vault is configured | HashiCorp Vault support |
-|-----------|------------------------|------------------------|
-| **Node** | `secrets_vault_config` in `config.json` | Planned (next release) |
-| **nodectl** | `VAULT_URL` environment variable | Planned (next release) |
-
-Currently only the file-based backend is available:
-
-```json
-"secrets_vault_config": {
-  "url": "file:///path/to/vault.json&master_key=<64-char-hex>"
-}
-```
-
-The master key is a 32-byte AES-256 encryption key (64 hex characters). Store it securely — anyone with the key can decrypt the vault file.
-
-| Type | Default |
-|------|---------|
-| object \| null | `null` |
-
-> **Note:** When `secrets_vault_config` is `null` (default), private keys remain in `config.json` as plaintext. This is acceptable for fullnodes and liteservers. For validators, configuring a vault is recommended.
+> **Removed in v0.2.0-mainnet.** This field is no longer supported. The node reads the vault URL exclusively from the `VAULT_URL` environment variable. Use the chart's `vault.*` values instead. See [vault.md](vault.md) for setup.
 
 ---
 

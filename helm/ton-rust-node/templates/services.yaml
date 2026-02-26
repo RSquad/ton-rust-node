@@ -1,5 +1,5 @@
 {{- $root := . -}}
-{{- $fullname := include "ton-rust-node.fullname" . -}}
+{{- $fullname := include "node.fullname" . -}}
 {{- range $i, $_ := until (int .Values.replicas) }}
 ---
 apiVersion: v1
@@ -7,16 +7,17 @@ kind: Service
 metadata:
   name: {{ $fullname }}-{{ $i }}
   labels:
-    {{- include "ton-rust-node.labels" $root | nindent 4 }}
+    {{- include "node.labels" $root | nindent 4 }}
     app.kubernetes.io/component: adnl
-  {{- include "ton-rust-node.serviceAnnotations" (dict "svcConfig" $root.Values.services.adnl "replicaIndex" $i) | nindent 2 }}
+    {{- include "node.serviceLabels" (dict "svcConfig" $root.Values.services.adnl "replicaIndex" $i) | nindent 4 }}
+  {{- include "node.serviceAnnotations" (dict "svcConfig" $root.Values.services.adnl "replicaIndex" $i) | nindent 2 }}
 spec:
   type: {{ $root.Values.services.adnl.type }}
   {{- if ne $root.Values.services.adnl.type "ClusterIP" }}
   externalTrafficPolicy: {{ $root.Values.services.adnl.externalTrafficPolicy | default "Local" }}
   {{- end }}
   selector:
-    {{- include "ton-rust-node.selectorLabels" $root | nindent 4 }}
+    {{- include "node.selectorLabels" $root | nindent 4 }}
     statefulset.kubernetes.io/pod-name: {{ $fullname }}-{{ $i }}
   ports:
     - name: adnl
@@ -30,16 +31,19 @@ kind: Service
 metadata:
   name: {{ $fullname }}-{{ $i }}-control
   labels:
-    {{- include "ton-rust-node.labels" $root | nindent 4 }}
+    {{- include "node.labels" $root | nindent 4 }}
     app.kubernetes.io/component: control
-  {{- include "ton-rust-node.serviceAnnotations" (dict "svcConfig" $root.Values.services.control "replicaIndex" $i) | nindent 2 }}
+    {{- with $root.Values.services.control.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- include "node.serviceAnnotations" (dict "svcConfig" $root.Values.services.control "replicaIndex" $i) | nindent 2 }}
 spec:
   type: {{ $root.Values.services.control.type }}
   {{- if ne $root.Values.services.control.type "ClusterIP" }}
   externalTrafficPolicy: {{ $root.Values.services.control.externalTrafficPolicy | default "Local" }}
   {{- end }}
   selector:
-    {{- include "ton-rust-node.selectorLabels" $root | nindent 4 }}
+    {{- include "node.selectorLabels" $root | nindent 4 }}
     statefulset.kubernetes.io/pod-name: {{ $fullname }}-{{ $i }}
   ports:
     - name: control
@@ -54,16 +58,19 @@ kind: Service
 metadata:
   name: {{ $fullname }}-{{ $i }}-liteserver
   labels:
-    {{- include "ton-rust-node.labels" $root | nindent 4 }}
+    {{- include "node.labels" $root | nindent 4 }}
     app.kubernetes.io/component: liteserver
-  {{- include "ton-rust-node.serviceAnnotations" (dict "svcConfig" $root.Values.services.liteserver "replicaIndex" $i) | nindent 2 }}
+    {{- with $root.Values.services.liteserver.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- include "node.serviceAnnotations" (dict "svcConfig" $root.Values.services.liteserver "replicaIndex" $i) | nindent 2 }}
 spec:
   type: {{ $root.Values.services.liteserver.type }}
   {{- if ne $root.Values.services.liteserver.type "ClusterIP" }}
   externalTrafficPolicy: {{ $root.Values.services.liteserver.externalTrafficPolicy | default "Local" }}
   {{- end }}
   selector:
-    {{- include "ton-rust-node.selectorLabels" $root | nindent 4 }}
+    {{- include "node.selectorLabels" $root | nindent 4 }}
     statefulset.kubernetes.io/pod-name: {{ $fullname }}-{{ $i }}
   ports:
     - name: liteserver
@@ -78,16 +85,19 @@ kind: Service
 metadata:
   name: {{ $fullname }}-{{ $i }}-jsonrpc
   labels:
-    {{- include "ton-rust-node.labels" $root | nindent 4 }}
+    {{- include "node.labels" $root | nindent 4 }}
     app.kubernetes.io/component: jsonrpc
-  {{- include "ton-rust-node.serviceAnnotations" (dict "svcConfig" $root.Values.services.jsonRpc "replicaIndex" $i) | nindent 2 }}
+    {{- with $root.Values.services.jsonRpc.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- include "node.serviceAnnotations" (dict "svcConfig" $root.Values.services.jsonRpc "replicaIndex" $i) | nindent 2 }}
 spec:
   type: {{ $root.Values.services.jsonRpc.type }}
   {{- if ne $root.Values.services.jsonRpc.type "ClusterIP" }}
   externalTrafficPolicy: {{ $root.Values.services.jsonRpc.externalTrafficPolicy | default "Local" }}
   {{- end }}
   selector:
-    {{- include "ton-rust-node.selectorLabels" $root | nindent 4 }}
+    {{- include "node.selectorLabels" $root | nindent 4 }}
     statefulset.kubernetes.io/pod-name: {{ $fullname }}-{{ $i }}
   ports:
     - name: json-rpc

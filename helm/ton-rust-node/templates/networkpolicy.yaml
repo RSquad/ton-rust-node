@@ -2,13 +2,13 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "ton-rust-node.fullname" . }}
+  name: {{ include "node.fullname" . }}
   labels:
-    {{- include "ton-rust-node.labels" . | nindent 4 }}
+    {{- include "node.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "ton-rust-node.selectorLabels" . | nindent 6 }}
+      {{- include "node.selectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
   ingress:
@@ -16,25 +16,46 @@ spec:
         - port: {{ .Values.ports.adnl }}
           protocol: UDP
       from:
+        {{- if .Values.networkPolicy.adnl.allowFrom }}
+        {{- toYaml .Values.networkPolicy.adnl.allowFrom | nindent 8 }}
+        {{- else }}
         - ipBlock:
             cidr: 0.0.0.0/0
-    {{- $tcpPorts := list }}
-    {{- if .Values.ports.control }}{{ $tcpPorts = append $tcpPorts .Values.ports.control }}{{ end }}
-    {{- if .Values.ports.liteserver }}{{ $tcpPorts = append $tcpPorts .Values.ports.liteserver }}{{ end }}
-    {{- if .Values.ports.jsonRpc }}{{ $tcpPorts = append $tcpPorts .Values.ports.jsonRpc }}{{ end }}
-    {{- if .Values.ports.metrics }}{{ $tcpPorts = append $tcpPorts .Values.ports.metrics }}{{ end }}
-    {{- if $tcpPorts }}
-    - ports:
-      {{- range $port := $tcpPorts }}
-        - port: {{ $port }}
-          protocol: TCP
-      {{- end }}
-      {{- if .Values.networkPolicy.allowCIDRs }}
-      from:
-        {{- range .Values.networkPolicy.allowCIDRs }}
-        - ipBlock:
-            cidr: {{ . }}
         {{- end }}
+    {{- if and .Values.ports.control .Values.networkPolicy.control.enabled }}
+    - ports:
+        - port: {{ .Values.ports.control }}
+          protocol: TCP
+      {{- with .Values.networkPolicy.control.allowFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- if and .Values.ports.liteserver .Values.networkPolicy.liteserver.enabled }}
+    - ports:
+        - port: {{ .Values.ports.liteserver }}
+          protocol: TCP
+      {{- with .Values.networkPolicy.liteserver.allowFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- if and .Values.ports.jsonRpc .Values.networkPolicy.jsonRpc.enabled }}
+    - ports:
+        - port: {{ .Values.ports.jsonRpc }}
+          protocol: TCP
+      {{- with .Values.networkPolicy.jsonRpc.allowFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- if and .Values.ports.metrics .Values.networkPolicy.metrics.enabled }}
+    - ports:
+        - port: {{ .Values.ports.metrics }}
+          protocol: TCP
+      {{- with .Values.networkPolicy.metrics.allowFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
     {{- with .Values.networkPolicy.extraIngress }}
