@@ -6,6 +6,14 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.2.1-mainnet] - 2026-02-27
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.2.1-mainnet`
+
+### Fixed
+
+- Secrets vault: backward compatibility for vault files created by v0.1.x (path separator changed from `/` to `.`)
+
 ## [v0.2.0-mainnet] - 2026-02-27
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.2.0-mainnet`
