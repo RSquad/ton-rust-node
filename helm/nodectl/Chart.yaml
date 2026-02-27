@@ -2,8 +2,8 @@ apiVersion: v2
 name: nodectl
 description: TON Node Control Tool — validator elections, voting, and monitoring
 type: application
-version: 0.1.1
-appVersion: "v0.1.0"
+version: 0.1.2
+appVersion: "v0.1.1"
 
 sources:
   - https://github.com/rsquad/ton-rust-node
