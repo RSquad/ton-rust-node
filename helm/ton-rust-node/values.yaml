@@ -15,8 +15,8 @@ command: []
 ## @param image.pullPolicy Pull policy
 ##
 image:
-  repository: ghcr.io/rsquad/ton-rust-node
-  tag: v0.1.2-mainnet
+  repository: ghcr.io/rsquad/ton-rust-node/node
+  tag: v0.2.1-mainnet
   pullPolicy: IfNotPresent
 
 ## @param imagePullSecrets [array] Image pull secrets for private registries
@@ -152,33 +152,43 @@ ports:
 
 ## @param services.adnl.type ADNL service type
 ## @param services.adnl.externalTrafficPolicy ADNL service traffic policy
+## @param services.adnl.labels [object] Extra labels applied to all ADNL per-replica services
 ## @param services.adnl.annotations [object] Annotations applied to all ADNL per-replica services
 ## @param services.adnl.perReplica [array] Per-replica ADNL service overrides (list index = replica index)
 ##
 ## @param services.control.type Control service type
+## @param services.control.labels [object] Extra labels for control services
 ##
 ## @param services.liteserver.type Liteserver service type
 ## @param services.liteserver.externalTrafficPolicy Liteserver service traffic policy
+## @param services.liteserver.labels [object] Extra labels for liteserver services
 ##
 ## @param services.jsonRpc.type JSON-RPC service type
 ## @param services.jsonRpc.externalTrafficPolicy JSON-RPC service traffic policy
+## @param services.jsonRpc.labels [object] Extra labels for JSON-RPC services
 ##
 services:
   adnl:
     type: LoadBalancer
     externalTrafficPolicy: Local
+    labels: {}
     annotations: {}
     perReplica: []
   control:
     type: ClusterIP
+    labels: {}
   liteserver:
     type: LoadBalancer
     externalTrafficPolicy: Local
+    labels: {}
   jsonRpc:
     type: LoadBalancer
     externalTrafficPolicy: Local
-  # Example — MetalLB static IPs for ADNL:
+    labels: {}
+  # Example — Cilium L2 IP pool via labels:
   #   adnl:
+  #     labels:
+  #       io.cilium/l2-announcements: "true"
   #     perReplica:
   #       - annotations:
   #           metallb.universe.tf/loadBalancerIPs: "192.168.1.100"
@@ -277,6 +287,22 @@ extraEnvFrom: []
 #     - secretRef:
 #         name: my-node-secrets
 
+## @section Vault parameters
+## Secrets vault for storing private keys outside config.json.
+## Passed as VAULT_URL env var. Do NOT set secrets_vault_config in config.json — the node
+## ignores it when VAULT_URL is set.
+## Provide either vault.url (plain text) or vault.secretName (recommended).
+## See docs/vault.md for details.
+
+## @param vault.url Vault URL (plain text). Example: `file:///keys/vault.json&master_key=<hex>`
+## @param vault.secretName Name of an existing Secret containing the vault URL. Takes precedence over vault.url.
+## @param vault.secretKey Key inside the Secret that holds the vault URL.
+##
+vault:
+  url: ""
+  secretName: ""
+  secretKey: "VAULT_URL"
+
 ## @section Networking parameters
 
 ## @param hostNetwork Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md.
@@ -304,32 +330,56 @@ hostPort:
 #       requiredDuringSchedulingIgnoredDuringExecution:
 #         - labelSelector:
 #             matchLabels:
-#               app.kubernetes.io/name: ton-rust-node
+#               app.kubernetes.io/name: node
 #           topologyKey: kubernetes.io/hostname
 
 ## @section NetworkPolicy parameters
+## Per-port ingress rules. ADNL is always allowed (public by default).
+## TCP ports require explicit `.enabled: true` and support custom `allowFrom` sources.
 
-## @param networkPolicy.enabled Create a NetworkPolicy. ADNL is always allowed from 0.0.0.0/0. TCP ports (control, liteserver, jsonRpc, metrics) get rules automatically when enabled — restrict with allowCIDRs.
-## @param networkPolicy.allowCIDRs [array] Source CIDRs for TCP port rules (control, liteserver, jsonRpc, metrics). If empty, traffic is not restricted by source.
+## @param networkPolicy.enabled Create a NetworkPolicy
+## @param networkPolicy.adnl.allowFrom [array] ADNL ingress sources. Default allows all traffic (0.0.0.0/0). Each entry is a raw NetworkPolicy `from` item.
+## @param networkPolicy.control.enabled Create an ingress rule for the control port
+## @param networkPolicy.control.allowFrom [array] Control port ingress sources. If empty, allows all.
+## @param networkPolicy.liteserver.enabled Create an ingress rule for the liteserver port
+## @param networkPolicy.liteserver.allowFrom [array] Liteserver port ingress sources. If empty, allows all.
+## @param networkPolicy.jsonRpc.enabled Create an ingress rule for the JSON-RPC port
+## @param networkPolicy.jsonRpc.allowFrom [array] JSON-RPC port ingress sources. If empty, allows all.
+## @param networkPolicy.metrics.enabled Create an ingress rule for the metrics port
+## @param networkPolicy.metrics.allowFrom [array] Metrics port ingress sources. If empty, allows all.
 ## @param networkPolicy.extraIngress [array] Additional raw ingress rules appended to the policy.
 ##
 networkPolicy:
   enabled: false
-  allowCIDRs: []
+  adnl:
+    allowFrom: []
+  control:
+    enabled: false
+    allowFrom: []
+  liteserver:
+    enabled: false
+    allowFrom: []
+  jsonRpc:
+    enabled: false
+    allowFrom: []
+  metrics:
+    enabled: false
+    allowFrom: []
   extraIngress: []
-# Example — restrict TCP ports to internal network, add a custom rule:
+# Example — restrict control to cluster network, metrics to monitoring namespace:
 #   networkPolicy:
 #     enabled: true
-#     allowCIDRs:
-#       - 10.0.0.0/8
-#     extraIngress:
-#       - ports:
-#           - port: 8080
-#             protocol: TCP
-#         from:
-#           - namespaceSelector:
-#               matchLabels:
-#                 name: monitoring
+#     control:
+#       enabled: true
+#       allowFrom:
+#         - ipBlock:
+#             cidr: 10.0.0.0/8
+#     metrics:
+#       enabled: true
+#       allowFrom:
+#         - namespaceSelector:
+#             matchLabels:
+#               name: monitoring
 
 ## @section ServiceAccount parameters
 
@@ -369,7 +419,7 @@ affinity: {}
 #       requiredDuringSchedulingIgnoredDuringExecution:
 #         - labelSelector:
 #             matchLabels:
-#               app.kubernetes.io/name: ton-rust-node
+#               app.kubernetes.io/name: node
 #           topologyKey: kubernetes.io/hostname
 
 ## @section PodDisruptionBudget parameters

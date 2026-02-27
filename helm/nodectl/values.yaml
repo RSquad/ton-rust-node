@@ -70,6 +70,7 @@ dataPath: /nodectl/data
 ## Secrets vault configuration. Passed as VAULT_URL env var (required).
 ## Do NOT set vault in config.json — the service bails if both are set.
 ## Provide either vault.url (plain text) or vault.secretName (recommended).
+## See ../../ton-rust-node/docs/vault.md for details.
 
 ## @param vault.url Vault URL (plain text). Examples: `file:///nodectl/data/vault.json&master_key=<hex>`, `hashicorp://<addr>?api_key=<token>&namespace=<ns>`
 ## @param vault.secretName Name of an existing Secret containing the vault URL. Takes precedence over vault.url.

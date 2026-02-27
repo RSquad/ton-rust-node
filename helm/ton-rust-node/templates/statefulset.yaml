@@ -1,32 +1,32 @@
-{{- include "ton-rust-node.validateNodeConfigs" . -}}
+{{- include "node.validateNodeConfigs" . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "ton-rust-node.fullname" . }}
+  name: {{ include "node.fullname" . }}
   labels:
-    {{- include "ton-rust-node.labels" . | nindent 4 }}
+    {{- include "node.labels" . | nindent 4 }}
 spec:
-  serviceName: {{ include "ton-rust-node.fullname" . }}
+  serviceName: {{ include "node.fullname" . }}
   replicas: {{ .Values.replicas }}
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      {{- include "ton-rust-node.selectorLabels" . | nindent 6 }}
+      {{- include "node.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "ton-rust-node.selectorLabels" . | nindent 8 }}
+        {{- include "node.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        rsquad.io/config-checksum: {{ include "ton-rust-node.configChecksum" . }}
+        rsquad.io/config-checksum: {{ include "node.configChecksum" . }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
       {{- if .Values.serviceAccount.enabled }}
-      serviceAccountName: {{ include "ton-rust-node.serviceAccountName" . }}
+      serviceAccountName: {{ include "node.serviceAccountName" . }}
       {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -75,18 +75,18 @@ spec:
             - name: node-configs
               mountPath: /seed/node-configs
               readOnly: true
-            {{- if include "ton-rust-node.hasBasestate" . }}
+            {{- if include "node.hasBasestate" . }}
             - name: basestate
               mountPath: /seed/basestate
               readOnly: true
             {{- end }}
-            {{- if include "ton-rust-node.hasZerostate" . }}
+            {{- if include "node.hasZerostate" . }}
             - name: zerostate
               mountPath: /seed/zerostate
               readOnly: true
             {{- end }}
       {{- with .Values.extraInitContainers }}
-        {{- toYaml . | nindent 8 }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
       {{- end }}
       containers:
         - name: ton-node
@@ -100,15 +100,18 @@ spec:
           {{- if .Values.command }}
           command:
             {{- toYaml .Values.command | nindent 12 }}
-          {{- else if and (include "ton-rust-node.hasZerostate" .) (include "ton-rust-node.hasBasestate" .) }}
+          {{- else if and (include "node.hasZerostate" .) (include "node.hasBasestate" .) }}
           command: ["node", "-c", "/main", "-z", "/main/static"]
           {{- else }}
           command: ["node", "-c", "/main"]
           {{- end }}
           {{- end }}
-          {{- with .Values.extraEnv }}
+          {{- if or (include "node.hasVault" .) .Values.extraEnv }}
           env:
+            {{- include "node.vaultEnv" . | nindent 12 }}
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           {{- with .Values.extraEnvFrom }}
           envFrom:
@@ -186,27 +189,27 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
       {{- with .Values.extraContainers }}
-        {{- toYaml . | nindent 8 }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
       {{- end }}
       volumes:
         - name: global-config
           configMap:
-            name: {{ include "ton-rust-node.globalConfigMapName" . }}
+            name: {{ include "node.globalConfigMapName" . }}
         - name: logs-config
           configMap:
-            name: {{ include "ton-rust-node.logsConfigMapName" . }}
+            name: {{ include "node.logsConfigMapName" . }}
         - name: node-configs
           secret:
-            secretName: {{ include "ton-rust-node.nodeConfigsSecretName" . }}
-        {{- if include "ton-rust-node.hasBasestate" . }}
+            secretName: {{ include "node.nodeConfigsSecretName" . }}
+        {{- if include "node.hasBasestate" . }}
         - name: basestate
           configMap:
-            name: {{ include "ton-rust-node.basestateConfigMapName" . }}
+            name: {{ include "node.basestateConfigMapName" . }}
         {{- end }}
-        {{- if include "ton-rust-node.hasZerostate" . }}
+        {{- if include "node.hasZerostate" . }}
         - name: zerostate
           configMap:
-            name: {{ include "ton-rust-node.zerostateConfigMapName" . }}
+            name: {{ include "node.zerostateConfigMapName" . }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
