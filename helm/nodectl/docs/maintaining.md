@@ -99,7 +99,7 @@ Modifiers:
 |----------|------------|---------|
 | `[object]` | Default is `{}` | `## @param probes [object] Probes config` |
 | `[array]` | Default is `[]` | `## @param extraEnv [array] Extra env vars` |
-| `[nullable]` | Default is `null` | `## @param logFile [nullable] Log file path` |
+| `[nullable]` | Default is `null` | `## @param storage.storageClassName [nullable] Storage class` |
 | `[default: text]` | Custom display text | `## @param config [default: ""] Config JSON` |
 
 Exclude a parameter with `## @skip`:

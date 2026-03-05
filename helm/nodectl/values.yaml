@@ -12,22 +12,12 @@ replicas: 1
 ##
 image:
   repository: ghcr.io/rsquad/ton-rust-node/nodectl
-  tag: "v0.1.1"
+  tag: "v0.2.0"
   pullPolicy: IfNotPresent
 
 ## @param imagePullSecrets [array] Registry pull secrets for private container images
 ##
 imagePullSecrets: []
-
-## @section Container parameters
-
-## @param logLevel Logging level: trace, debug, info, warn, error
-##
-logLevel: info
-
-## @param logFile [nullable] Path to log file inside the container. Null means stdout only.
-##
-logFile: null
 
 ## @section Port parameters
 
