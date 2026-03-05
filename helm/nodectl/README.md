@@ -23,7 +23,7 @@ Helm chart for deploying nodectl on Kubernetes.
 nodectl works in two modes:
 
 - **Daemon** (`nodectl service`) — runs as the main container process, manages elections and contracts automatically
-- **CLI** (`nodectl config ...`, `nodectl key ...`, `nodectl api ...`) — accessible via `kubectl exec` for configuration and diagnostics
+- **CLI** (`nodectl config ...`, `nodectl config log ...`, `nodectl key ...`, `nodectl api ...`) — accessible via `kubectl exec` for configuration, log management, and diagnostics
 
 ## Key concepts
 
@@ -101,154 +101,154 @@ The chart sets these environment variables on the nodectl container:
 
 ### General parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `replicas` | Number of nodectl instances. Each replica shares the same PVC — do not scale beyond 1 unless using ReadWriteMany storage. | `1` |
+| Name       | Description                                                                                                               | Value |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `replicas` | Number of nodectl instances. Each replica shares the same PVC — do not scale beyond 1 unless using ReadWriteMany storage. | `1`   |
 
 ### Image parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `image.repository` | Container image repository | `ghcr.io/rsquad/ton-rust-node/nodectl` |
-| `image.tag` | Image tag | `v0.2.0` |
-| `image.pullPolicy` | Pull policy | `IfNotPresent` |
-| `imagePullSecrets` | Registry pull secrets for private container images | `[]` |
+| Name               | Description                                        | Value                                  |
+| ------------------ | -------------------------------------------------- | -------------------------------------- |
+| `image.repository` | Container image repository                         | `ghcr.io/rsquad/ton-rust-node/nodectl` |
+| `image.tag`        | Image tag                                          | `v0.2.0`                               |
+| `image.pullPolicy` | Pull policy                                        | `IfNotPresent`                         |
+| `imagePullSecrets` | Registry pull secrets for private container images | `[]`                                   |
 
 ### Port parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
+| Name   | Description                                                      | Value  |
+| ------ | ---------------------------------------------------------------- | ------ |
 | `port` | HTTP API port. Used for health probes, REST API, and Swagger UI. | `8080` |
 
 ### Service parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `service.type` | Service type for the HTTP API | `ClusterIP` |
-| `service.annotations` | Annotations for the Service | `{}` |
+| Name                  | Description                   | Value       |
+| --------------------- | ----------------------------- | ----------- |
+| `service.type`        | Service type for the HTTP API | `ClusterIP` |
+| `service.annotations` | Annotations for the Service   | `{}`        |
 
 ### Storage parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `storage.size` | PVC size for nodectl data | `1Gi` |
-| `storage.storageClassName` | Storage class name. Empty string uses cluster default. | `""` |
-| `storage.accessMode` | PVC access mode | `ReadWriteOnce` |
-| `storage.resourcePolicy` | Value for the `helm.sh/resource-policy` annotation. Set to `keep` (default) to prevent PVC deletion on `helm uninstall`. Set to empty string to omit the annotation. | `keep` |
-| `storage.annotations` | Extra annotations for the PVC | `{}` |
+| Name                       | Description                                                                                                                                                          | Value           |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+| `storage.size`             | PVC size for nodectl data                                                                                                                                            | `1Gi`           |
+| `storage.storageClassName` | Storage class name. Empty string uses cluster default.                                                                                                               | `""`            |
+| `storage.accessMode`       | PVC access mode                                                                                                                                                      | `ReadWriteOnce` |
+| `storage.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation. Set to `keep` (default) to prevent PVC deletion on `helm uninstall`. Set to empty string to omit the annotation. | `keep`          |
+| `storage.annotations`      | Extra annotations for the PVC                                                                                                                                        | `{}`            |
 
 ### Data directory
 
-| Name | Description | Value |
-|------|-------------|-------|
+| Name       | Description                                                                                          | Value           |
+| ---------- | ---------------------------------------------------------------------------------------------------- | --------------- |
 | `dataPath` | Directory inside the container where the PVC is mounted. Config, vault, and runtime state live here. | `/nodectl/data` |
 
 ### Vault parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `vault.url` | Vault URL (plain text). Use `vault.secretName` instead for production. | `""` |
-| `vault.secretName` | Name of an existing K8s Secret containing the vault URL. Takes precedence over `vault.url`. | `""` |
-| `vault.secretKey` | Key inside the Secret that holds the vault URL. | `"VAULT_URL"` |
+| Name               | Description                                                                                                                               | Value       |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `vault.url`        | Vault URL (plain text). Examples: `file:///nodectl/data/vault.json&master_key=<hex>`, `hashicorp://<addr>?api_key=<token>&namespace=<ns>` | `""`        |
+| `vault.secretName` | Name of an existing Secret containing the vault URL. Takes precedence over vault.url.                                                     | `""`        |
+| `vault.secretKey`  | Key inside the Secret that holds the vault URL.                                                                                           | `VAULT_URL` |
 
-### Initial config parameters
+### Initial config (optional)
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `initConfig.enabled` | Enable the init container that seeds config on first deploy | `true` |
-| `initConfig.secretName` | Name of a Secret containing initial config (key: `config.json`). Leave empty to auto-generate. | `""` |
+| Name                    | Description                                                                                    | Value  |
+| ----------------------- | ---------------------------------------------------------------------------------------------- | ------ |
+| `initConfig.enabled`    | Enable the init container that seeds config on first deploy                                    | `true` |
+| `initConfig.secretName` | Name of the Secret containing initial config (key: config.json). Leave empty to auto-generate. | `""`   |
 
 ### Security parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `securityContext` | Security context for the nodectl container. Optionally add IPC_LOCK capability for file-based vault mlock() support. | `{}` |
+| Name              | Description                                                                                                          | Value |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------- | ----- |
+| `securityContext` | Security context for the nodectl container. Optionally add IPC_LOCK capability for file-based vault mlock() support. | `{}`  |
 
 ### Resource parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `resources.requests.cpu` | CPU request | `100m` |
+| Name                        | Description    | Value   |
+| --------------------------- | -------------- | ------- |
+| `resources.requests.cpu`    | CPU request    | `100m`  |
 | `resources.requests.memory` | Memory request | `128Mi` |
-| `resources.limits.cpu` | CPU limit | `500m` |
-| `resources.limits.memory` | Memory limit | `256Mi` |
+| `resources.limits.cpu`      | CPU limit      | `500m`  |
+| `resources.limits.memory`   | Memory limit   | `256Mi` |
 
 ### Probe parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `probes` | Liveness, readiness, and startup probes. Set to {} to disable all probes. | `{}` |
+| Name     | Description                                                               | Value |
+| -------- | ------------------------------------------------------------------------- | ----- |
+| `probes` | Liveness, readiness, and startup probes. Set to {} to disable all probes. | `{}`  |
 
 ### Extra init containers
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `extraInitContainers` | Additional init containers to run before nodectl starts. | `[]` |
+| Name                  | Description                                              | Value |
+| --------------------- | -------------------------------------------------------- | ----- |
+| `extraInitContainers` | Additional init containers to run before nodectl starts. | `[]`  |
 
 ### Extra containers
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `extraContainers` | Additional sidecar containers to run alongside nodectl. | `[]` |
+| Name              | Description                                             | Value |
+| ----------------- | ------------------------------------------------------- | ----- |
+| `extraContainers` | Additional sidecar containers to run alongside nodectl. | `[]`  |
 
 ### Extra volumes
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `extraVolumes` | Additional volumes for the pod. | `[]` |
-| `extraVolumeMounts` | Additional volume mounts for the nodectl container. | `[]` |
+| Name                | Description                                         | Value |
+| ------------------- | --------------------------------------------------- | ----- |
+| `extraVolumes`      | Additional volumes for the pod.                     | `[]`  |
+| `extraVolumeMounts` | Additional volume mounts for the nodectl container. | `[]`  |
 
 ### Extra environment variables
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `extraEnv` | Additional environment variables for the nodectl container. | `[]` |
-| `extraEnvFrom` | Additional envFrom sources for the nodectl container. | `[]` |
+| Name           | Description                                                 | Value |
+| -------------- | ----------------------------------------------------------- | ----- |
+| `extraEnv`     | Additional environment variables for the nodectl container. | `[]`  |
+| `extraEnvFrom` | Additional envFrom sources for the nodectl container.       | `[]`  |
 
 ### Pod metadata parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `podAnnotations` | Additional annotations for pods. Useful for Vault agent injection, service mesh, etc. | `{}` |
-| `podLabels` | Additional labels for pods. | `{}` |
+| Name             | Description                                                                           | Value |
+| ---------------- | ------------------------------------------------------------------------------------- | ----- |
+| `podAnnotations` | Additional annotations for pods. Useful for Vault agent injection, service mesh, etc. | `{}`  |
+| `podLabels`      | Additional labels for pods.                                                           | `{}`  |
 
 ### Scheduling parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `nodeSelector` | Node selector for pod scheduling | `{}` |
-| `tolerations` | Tolerations for pod scheduling | `[]` |
-| `affinity` | Affinity rules for pod scheduling | `{}` |
+| Name           | Description                       | Value |
+| -------------- | --------------------------------- | ----- |
+| `nodeSelector` | Node selector for pod scheduling  | `{}`  |
+| `tolerations`  | Tolerations for pod scheduling    | `[]`  |
+| `affinity`     | Affinity rules for pod scheduling | `{}`  |
 
 ### ServiceAccount parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `serviceAccount.enabled` | Create a ServiceAccount for the pods | `false` |
-| `serviceAccount.name` | ServiceAccount name. Defaults to the release fullname if not set. | `""` |
-| `serviceAccount.annotations` | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding) | `{}` |
+| Name                         | Description                                                                   | Value   |
+| ---------------------------- | ----------------------------------------------------------------------------- | ------- |
+| `serviceAccount.enabled`     | Create a ServiceAccount for the pods                                          | `false` |
+| `serviceAccount.name`        | ServiceAccount name. Defaults to the release fullname if not set.             | `""`    |
+| `serviceAccount.annotations` | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding) | `{}`    |
 
 ### NetworkPolicy parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `networkPolicy.enabled` | Create a NetworkPolicy. Restricts ingress to the HTTP API port. | `false` |
-| `networkPolicy.allowCIDRs` | Source CIDRs allowed to reach the HTTP API. If empty, not restricted by source. | `[]` |
-| `networkPolicy.extraIngress` | Additional raw ingress rules appended to the policy. | `[]` |
+| Name                         | Description                                                                     | Value   |
+| ---------------------------- | ------------------------------------------------------------------------------- | ------- |
+| `networkPolicy.enabled`      | Create a NetworkPolicy. Restricts ingress to the HTTP API port.                 | `false` |
+| `networkPolicy.allowCIDRs`   | Source CIDRs allowed to reach the HTTP API. If empty, not restricted by source. | `[]`    |
+| `networkPolicy.extraIngress` | Additional raw ingress rules appended to the policy.                            | `[]`    |
 
 ### PodDisruptionBudget parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `podDisruptionBudget.enabled` | Create a PodDisruptionBudget | `false` |
-| `podDisruptionBudget.minAvailable` | Minimum available pods during disruption. Only one of minAvailable or maxUnavailable should be set. | `1` |
+| Name                               | Description                                                                                         | Value   |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------- | ------- |
+| `podDisruptionBudget.enabled`      | Create a PodDisruptionBudget                                                                        | `false` |
+| `podDisruptionBudget.minAvailable` | Minimum available pods during disruption. Only one of minAvailable or maxUnavailable should be set. | `1`     |
 
 ### Debug parameters
 
-| Name | Description | Value |
-|------|-------------|-------|
-| `debug.sleep` | Replace nodectl with sleep infinity for debugging | `false` |
-| `debug.securityContext` | Security context overrides for debugging (e.g. SYS_PTRACE) | `{}` |
+| Name                    | Description                                                | Value   |
+| ----------------------- | ---------------------------------------------------------- | ------- |
+| `debug.sleep`           | Replace nodectl with sleep infinity for debugging          | `false` |
+| `debug.securityContext` | Security context overrides for debugging (e.g. SYS_PTRACE) | `{}`    |
 
 ## Architecture
 

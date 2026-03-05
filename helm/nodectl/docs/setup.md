@@ -101,8 +101,22 @@ nodectl needs access to a TON HTTP API endpoint for blockchain queries (elector 
 - A TON Rust fullnode with JSON-RPC enabled (see [node-config.md](../../ton-rust-node/docs/node-config.md))
 - A public endpoint such as `https://toncenter.com/api/v2/`
 
+Set the primary endpoint:
+
 ```bash
 nodectl config ton-http-api set -u "http://<fullnode-ip>:8081"
+```
+
+Optionally add failover endpoints. nodectl tries them in order if the primary is unreachable:
+
+```bash
+nodectl config ton-http-api add -u "http://<backup-ip>:8081"
+```
+
+Each endpoint can have its own API key:
+
+```bash
+nodectl config ton-http-api add -u "https://toncenter.com/api/v2/" -k "<API_KEY>"
 ```
 
 ### Add wallets
@@ -119,7 +133,7 @@ nodectl config wallet add -n wallet2 -s wallet-key-2
 |------|-------------|---------|
 | `-n` | Wallet name | — |
 | `-s` | Vault secret name for the wallet key | — |
-| `-v` | Wallet contract version | `V3R2` |
+| `-v` | Wallet contract version (`V1R3`, `V3R2`, `V4R2`, `V5R1`) | `V3R2` |
 | `-i` | Subwallet ID | `42` |
 | `-w` | Workchain | `-1` |
 
