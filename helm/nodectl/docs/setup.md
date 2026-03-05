@@ -381,8 +381,6 @@ helm upgrade my-nodectl oci://ghcr.io/rsquad/ton-rust-node/helm/nodectl \
   --set debug.sleep=true
 ```
 
-### Verbose logging
+### Logging
 
-```yaml
-logLevel: debug
-```
+nodectl uses its built-in defaults when started by this chart. Use `kubectl logs` for runtime diagnostics.

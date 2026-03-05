@@ -110,16 +110,9 @@ The chart sets these environment variables on the nodectl container:
 | Name | Description | Value |
 |------|-------------|-------|
 | `image.repository` | Container image repository | `ghcr.io/rsquad/ton-rust-node/nodectl` |
-| `image.tag` | Image tag | `v0.1.0` |
+| `image.tag` | Image tag | `v0.2.0` |
 | `image.pullPolicy` | Pull policy | `IfNotPresent` |
 | `imagePullSecrets` | Registry pull secrets for private container images | `[]` |
-
-### Container parameters
-
-| Name | Description | Value |
-|------|-------------|-------|
-| `logLevel` | Logging level: trace, debug, info, warn, error | `info` |
-| `logFile` | Path to log file inside the container. Null means stdout only. | `nil` |
 
 ### Port parameters
 
@@ -297,7 +290,7 @@ On first deploy, the init container prepares the PVC:
 | Condition | Command |
 |-----------|---------|
 | `debug.sleep: true` | `sleep infinity` |
-| default | `nodectl --verbose=<logLevel> service --config=<dataPath>/config.json` |
+| default | `nodectl service --config=<dataPath>/config.json` |
 
 ## Documentation
 

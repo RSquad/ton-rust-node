@@ -96,10 +96,6 @@ spec:
           {{- else }}
           command: ["nodectl"]
           args:
-            - "--verbose={{ .Values.logLevel }}"
-            {{- if .Values.logFile }}
-            - "--log-file={{ .Values.logFile }}"
-            {{- end }}
             - "service"
             - "--config={{ .Values.dataPath }}/config.json"
           {{- end }}
