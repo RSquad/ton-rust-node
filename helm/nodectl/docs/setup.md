@@ -185,6 +185,61 @@ nodectl config stake-policy --fixed 100000000000000 --node node0
 
 See [elections.md](elections.md) for details on stake policies.
 
+### Configure logging
+
+The generated config includes a `log` section with these defaults:
+
+```json
+{
+  "log": {
+    "level": "info",
+    "output": "console",
+    "rotation": "daily",
+    "max_size_mb": 50,
+    "max_files": 10
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `level` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `output` | `console` | Where to write: `console`, `file`, or `all` (both) |
+| `path` | — | Log file path (required if `output` is `file` or `all`) |
+| `max_size_mb` | `50` | Max size of a single log file in MB before rotation |
+| `max_files` | `10` | Number of rotated log files to keep |
+| `rotation` | `daily` | Rotation schedule: `daily`, `hourly`, or `never` |
+
+View current settings:
+
+```bash
+nodectl config log ls
+```
+
+Update one or more settings with `nodectl config log set`:
+
+```bash
+# Set log level
+nodectl config log set --level debug
+
+# Enable file logging (path is required for 'file' and 'all' output modes)
+nodectl config log set --output all --path /var/log/nodectl/service.log
+
+# Adjust rotation policy and limits
+nodectl config log set --rotation hourly --max-size-mb 100 --max-files 20
+```
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--level` | `-l` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `--output` | `-o` | Output mode: `console`, `file`, or `all` |
+| `--path` | `-p` | Log file path |
+| `--rotation` | `-r` | Rotation policy: `daily`, `hourly`, or `never` |
+| `--max-size-mb` | `-s` | Max log file size in MB |
+| `--max-files` | `-f` | Max number of rotated log files to keep |
+
+> **Note:** At least one option must be specified. If `--output` is set to `file` or `all`, a log file path must be configured via `--path` (either in the same command or previously).
+
 ---
 
 ## Step 3: Set up keys
@@ -397,4 +452,4 @@ helm upgrade my-nodectl oci://ghcr.io/rsquad/ton-rust-node/helm/nodectl \
 
 ### Logging
 
-nodectl uses its built-in defaults when started by this chart. Use `kubectl logs` for runtime diagnostics.
+nodectl uses its built-in defaults when started by this chart. Use `kubectl logs` for runtime diagnostics. To adjust log level or enable file logging, see [Configure logging](#configure-logging).
