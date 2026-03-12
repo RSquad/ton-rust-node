@@ -110,9 +110,23 @@ resources:
     memory: 256Mi
 
 ## @section Probe parameters
-## nodectl exposes GET /health for health checks. Probes are enabled by default.
+## nodectl exposes GET /health for health checks. Probes are disabled by default — set liveness/readiness/startup to enable.
 
-## @param probes [object] Liveness, readiness, and startup probes. Set to {} to disable all probes.
+## @param probes [object] Liveness, readiness, and startup probes. Disabled by default. See example below.
+## Example:
+##   probes:
+##     liveness:
+##       httpGet:
+##         path: /health
+##         port: http
+##       initialDelaySeconds: 10
+##       periodSeconds: 30
+##     readiness:
+##       httpGet:
+##         path: /health
+##         port: http
+##       initialDelaySeconds: 5
+##       periodSeconds: 10
 ##
 probes: {}
 

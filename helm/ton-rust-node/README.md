@@ -17,9 +17,9 @@ Helm chart for deploying TON Rust Node on Kubernetes.
 
 ## Node roles
 
-A TON node can run in two roles — **validator** or **fullnode** — using the same binary and the same chart. The difference is in configuration and how you use the node.
+A TON node can run in two roles — **validator** or **fullnode** — using the same binary and the same chart. The difference is in configuration and how you use the node. The node supports both **mainnet** and **testnet** networks.
 
-**Validator** participates in network consensus: it validates blocks, votes in elections, and earns rewards. A validator is a critical infrastructure component, so:
+**Validator** participates in network consensus: it validates blocks, votes in elections, and earns rewards. Validator is currently supported on **mainnet** only — testnet validator support is not yet available. A validator is a critical infrastructure component, so:
 
 - Never expose `liteserver` or `jsonRpc` ports on a validator. Every open port is an attack surface and adds unnecessary load to a machine that must stay performant and stable.
 - Allocate more resources (see [docs/resources.md](docs/resources.md) for recommended values).

@@ -175,9 +175,9 @@ The chart sets these environment variables on the nodectl container:
 
 ### Probe parameters
 
-| Name     | Description                                                               | Value |
-| -------- | ------------------------------------------------------------------------- | ----- |
-| `probes` | Liveness, readiness, and startup probes. Set to {} to disable all probes. | `{}`  |
+| Name     | Description                                                                      | Value |
+| -------- | -------------------------------------------------------------------------------- | ----- |
+| `probes` | Liveness, readiness, and startup probes. Disabled by default. See example below. | `{}`  |
 
 ### Extra init containers
 
