@@ -6,6 +6,41 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.3.0] - 2026-03-12
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.3.0`
+
+### Added
+
+- Simplex consensus implementation (feature-gated)
+- JSON-RPC: `getAccount` and `getBlock` methods, updated OpenAPI spec
+- State downloads limit
+- Applied blocks metric
+- TPS measurement tool (test tooling)
+
+### Changed
+
+- ADNL broadcast improvements: randomized neighbour selection, reduced wave size, FEC timeout tuning, wider GetRandomPeers spreading
+- ADNL send buffer limits increased
+- Telemetry: switch to `current_average` for throughput calculations
+- Disabled validation/collation task await for non-accelerated consensus
+
+### Fixed
+
+- Slot bounds: receiver-level checks before signature verification, sanity checks to prevent unbounded window allocation
+- Diagnostic dump no longer lists self in inactive nodes
+- LDX primitives: fix load 0 bits
+- Base gas check before execute to prevent out-of-gas on commit
+- Message stat calculation and storage stat update after balance change
+- Collation error handling: reset `is_collating` on error, cross-check notarize/finalize hashes
+- Earliest collation time handling for simplex consensus
+- Session restart: preserve DB on stop, register overlay before bootstrap, replace dead overlay clients
+- ADNL packet parse and multipart handling
+- Two-step broadcast ID validation
+- `LITESERVER_PUBLIC_KEY` parsing
+- Overlay listener leak on failed `start_overlay`
+- FinalCert: broadcast only on local creation, not on external ingest
+
 ## [v0.2.1-mainnet] - 2026-02-27
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.2.1-mainnet`
