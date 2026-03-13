@@ -338,6 +338,14 @@ Shard state caching strategy.
 | `"Off"` | States are saved synchronously and not cached |
 | `"Moderate"` | States are saved asynchronously (recommended) |
 
+#### `pss_downloading_threads`
+
+Maximum number of persistent states that the node can download in parallel during boot. If equal to 0, the number of parallel downloads is not limited.
+
+| Type | Required | Default |
+|------|----------|---------|
+| uint | no | `0` (unlimited) |
+
 #### `accelerated_consensus_disabled`
 
 If `true`, use the standard (slower) consensus procedure instead of the accelerated one.

@@ -12,7 +12,7 @@ When configured, private keys (ADNL, control server, liteserver) are stored in a
 
 ```bash
 kubectl create secret generic ton-node-vault \
-  --from-literal=VAULT_URL="file:///keys/vault.json&master_key=$(openssl rand -hex 32)"
+  --from-literal=VAULT_URL="file:///keys/vault.json?master_key=$(openssl rand -hex 32)"
 ```
 
 The master key is a 32-byte AES-256 encryption key (64 hex characters). Store it securely — anyone with the key can decrypt the vault file.
@@ -30,7 +30,7 @@ Alternatively, pass the URL directly (not recommended for production):
 
 ```yaml
 vault:
-  url: "file:///keys/vault.json&master_key=<64-char-hex>"
+  url: "file:///keys/vault.json?master_key=<64-char-hex>"
 ```
 
 ## Values reference
@@ -47,7 +47,7 @@ When `vault.secretName` is set, it takes precedence over `vault.url`.
 
 | Backend | URL format |
 |---------|------------|
-| File | `file:///keys/vault.json&master_key=<64-char-hex>` |
+| File | `file:///keys/vault.json?master_key=<64-char-hex>` |
 
 ## Troubleshooting
 
