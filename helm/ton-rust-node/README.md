@@ -173,12 +173,12 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Image parameters
 
-| Name               | Description                               | Value                          |
-| ------------------ | ----------------------------------------- | ------------------------------ |
+| Name               | Description                               | Value                               |
+| ------------------ | ----------------------------------------- | ----------------------------------- |
 | `image.repository` | Container image repository                | `ghcr.io/rsquad/ton-rust-node/node` |
-| `image.tag`        | Image tag                                 | `v0.1.2-mainnet`               |
-| `image.pullPolicy` | Pull policy                               | `IfNotPresent`                 |
-| `imagePullSecrets` | Image pull secrets for private registries | `[]`                           |
+| `image.tag`        | Image tag                                 | `v0.3.0`                            |
+| `image.pullPolicy` | Pull policy                               | `IfNotPresent`                      |
+| `imagePullSecrets` | Image pull secrets for private registries | `[]`                                |
 
 ### Init container image parameters
 
@@ -218,35 +218,36 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Storage parameters
 
-| Name                            | Description                                                    | Value        |
-| ------------------------------- | -------------------------------------------------------------- | ------------ |
-| `storage.main.size`             | Main volume size                                               | `1Gi`        |
-| `storage.main.storageClassName` | Storage class for main volume                                  | `local-path` |
-| `storage.main.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation. Set to `keep` to prevent PVC deletion on `helm uninstall`. Set to empty string to omit. | `keep` |
-| `storage.main.annotations`      | Extra annotations for the main PVC                             | `{}`         |
-| `storage.db.size`               | Database volume size (hundreds of GB for mainnet)              | `1Ti`        |
-| `storage.db.storageClassName`   | Storage class for database volume                              | `local-path` |
-| `storage.db.resourcePolicy`     | Value for the `helm.sh/resource-policy` annotation on the db PVC | `""`       |
-| `storage.db.annotations`        | Extra annotations for the db PVC                               | `{}`         |
-| `storage.logs.enabled`          | Create a PVC for logs. Set to false if you log to stdout only. | `true`       |
-| `storage.logs.size`             | Logs volume size                                               | `150Gi`      |
-| `storage.logs.storageClassName` | Storage class for logs volume                                  | `local-path` |
-| `storage.logs.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation on the logs PVC | `""`     |
-| `storage.logs.annotations`      | Extra annotations for the logs PVC                             | `{}`         |
-| `storage.keys.size`             | Keys volume size                                               | `1Gi`        |
-| `storage.keys.storageClassName` | Storage class for keys volume                                  | `local-path` |
-| `storage.keys.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation on the keys PVC | `keep`   |
-| `storage.keys.annotations`      | Extra annotations for the keys PVC                             | `{}`         |
+| Name                            | Description                                                                                                                                 | Value        |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `storage.main.size`             | Main volume size                                                                                                                            | `1Gi`        |
+| `storage.main.storageClassName` | Storage class for main volume                                                                                                               | `local-path` |
+| `storage.main.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation. Set to `keep` to prevent PVC deletion on `helm uninstall`. Set to empty string to omit. | `keep`       |
+| `storage.main.annotations`      | Extra annotations for the main PVC                                                                                                          | `{}`         |
+| `storage.db.size`               | Database volume size (hundreds of GB for mainnet)                                                                                           | `1Ti`        |
+| `storage.db.storageClassName`   | Storage class for database volume                                                                                                           | `local-path` |
+| `storage.db.resourcePolicy`     | Value for the `helm.sh/resource-policy` annotation on the db PVC                                                                            | `""`         |
+| `storage.db.annotations`        | Extra annotations for the db PVC                                                                                                            | `{}`         |
+| `storage.logs.enabled`          | Create a PVC for logs. Set to false if you log to stdout only.                                                                              | `true`       |
+| `storage.logs.size`             | Logs volume size                                                                                                                            | `150Gi`      |
+| `storage.logs.storageClassName` | Storage class for logs volume                                                                                                               | `local-path` |
+| `storage.logs.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation on the logs PVC                                                                          | `""`         |
+| `storage.logs.annotations`      | Extra annotations for the logs PVC                                                                                                          | `{}`         |
+| `storage.keys.size`             | Keys volume size                                                                                                                            | `1Gi`        |
+| `storage.keys.storageClassName` | Storage class for keys volume                                                                                                               | `local-path` |
+| `storage.keys.resourcePolicy`   | Value for the `helm.sh/resource-policy` annotation on the keys PVC                                                                          | `keep`       |
+| `storage.keys.annotations`      | Extra annotations for the keys PVC                                                                                                          | `{}`         |
 
 ### Port parameters
 
-| Name               | Description                                                                        | Value   |
-| ------------------ | ---------------------------------------------------------------------------------- | ------- |
-| `ports.adnl`       | ADNL port (UDP)                                                                    | `30303` |
-| `ports.control`    | Control port (TCP). Set to null to disable.                                        | `50000` |
-| `ports.liteserver` | Liteserver port (TCP). Set to enable.                                              | `nil`   |
-| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.                                                | `nil`   |
-| `ports.metrics`    | Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable. | `nil`   |
+| Name               | Description                                                                                                                                                                 | Value   |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `ports.adnl`       | ADNL port (UDP)                                                                                                                                                             | `30303` |
+| `ports.simplex`    | Simplex consensus port (UDP). Only needed for validators after switching to simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port. | `false` |
+| `ports.control`    | Control port (TCP). Set to null to disable.                                                                                                                                 | `50000` |
+| `ports.liteserver` | Liteserver port (TCP). Set to enable.                                                                                                                                       | `nil`   |
+| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.                                                                                                                                         | `nil`   |
+| `ports.metrics`    | Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable.                                                                                          | `nil`   |
 
 ### Service parameters
 
@@ -254,13 +255,20 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | ------------------------------------------- | --------------------------------------------------------------- | -------------- |
 | `services.adnl.type`                        | ADNL service type                                               | `LoadBalancer` |
 | `services.adnl.externalTrafficPolicy`       | ADNL service traffic policy                                     | `Local`        |
+| `services.adnl.labels`                      | Extra labels applied to all ADNL per-replica services           | `{}`           |
 | `services.adnl.annotations`                 | Annotations applied to all ADNL per-replica services            | `{}`           |
 | `services.adnl.perReplica`                  | Per-replica ADNL service overrides (list index = replica index) | `[]`           |
+| `services.simplex.type`                     | Simplex service type                                            | `LoadBalancer` |
+| `services.simplex.externalTrafficPolicy`    | Simplex service traffic policy                                  | `Local`        |
+| `services.simplex.labels`                   | Extra labels for simplex services                               | `{}`           |
 | `services.control.type`                     | Control service type                                            | `ClusterIP`    |
+| `services.control.labels`                   | Extra labels for control services                               | `{}`           |
 | `services.liteserver.type`                  | Liteserver service type                                         | `LoadBalancer` |
 | `services.liteserver.externalTrafficPolicy` | Liteserver service traffic policy                               | `Local`        |
+| `services.liteserver.labels`                | Extra labels for liteserver services                            | `{}`           |
 | `services.jsonRpc.type`                     | JSON-RPC service type                                           | `LoadBalancer` |
 | `services.jsonRpc.externalTrafficPolicy`    | JSON-RPC service traffic policy                                 | `Local`        |
+| `services.jsonRpc.labels`                   | Extra labels for JSON-RPC services                              | `{}`           |
 
 ### Configuration parameters
 
@@ -297,12 +305,21 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | `extraEnv`     | Additional environment variables for the main node container. Supports Downward API, ConfigMap/Secret refs, etc.             | `[]`  |
 | `extraEnvFrom` | Additional envFrom sources for the main node container. Inject all keys from a Secret or ConfigMap as environment variables. | `[]`  |
 
+### Vault parameters
+
+| Name               | Description                                                                           | Value       |
+| ------------------ | ------------------------------------------------------------------------------------- | ----------- |
+| `vault.url`        | Vault URL (plain text). Example: `file:///keys/vault.json?master_key=<hex>`           | `""`        |
+| `vault.secretName` | Name of an existing Secret containing the vault URL. Takes precedence over vault.url. | `""`        |
+| `vault.secretKey`  | Key inside the Secret that holds the vault URL.                                       | `VAULT_URL` |
+
 ### Networking parameters
 
 | Name                  | Description                                                                                                                                                                                            | Value   |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
 | `hostNetwork`         | Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md. | `false` |
 | `hostPort.adnl`       | Expose the ADNL port on the host IP via hostPort                                                                                                                                                       | `false` |
+| `hostPort.simplex`    | Expose the simplex port on the host IP via hostPort                                                                                                                                                    | `false` |
 | `hostPort.control`    | Expose the control port on the host IP via hostPort                                                                                                                                                    | `false` |
 | `hostPort.liteserver` | Expose the liteserver port on the host IP via hostPort                                                                                                                                                 | `false` |
 | `hostPort.jsonRpc`    | Expose the JSON-RPC port on the host IP via hostPort                                                                                                                                                   | `false` |
@@ -310,11 +327,20 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### NetworkPolicy parameters
 
-| Name                         | Description                                                                                                                                                                       | Value   |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `networkPolicy.enabled`      | Create a NetworkPolicy. ADNL is always allowed from 0.0.0.0/0. TCP ports (control, liteserver, jsonRpc, metrics) get rules automatically when enabled — restrict with allowCIDRs. | `false` |
-| `networkPolicy.allowCIDRs`   | Source CIDRs for TCP port rules (control, liteserver, jsonRpc, metrics). If empty, traffic is not restricted by source.                                                           | `[]`    |
-| `networkPolicy.extraIngress` | Additional raw ingress rules appended to the policy.                                                                                                                              | `[]`    |
+| Name                                 | Description                                                                                                     | Value   |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------- | ------- |
+| `networkPolicy.enabled`              | Create a NetworkPolicy                                                                                          | `false` |
+| `networkPolicy.adnl.allowFrom`       | ADNL ingress sources. Default allows all traffic (0.0.0.0/0). Each entry is a raw NetworkPolicy `from` item.    | `[]`    |
+| `networkPolicy.simplex.allowFrom`    | Simplex ingress sources. Default allows all traffic (0.0.0.0/0). Each entry is a raw NetworkPolicy `from` item. | `[]`    |
+| `networkPolicy.control.enabled`      | Create an ingress rule for the control port                                                                     | `false` |
+| `networkPolicy.control.allowFrom`    | Control port ingress sources. If empty, allows all.                                                             | `[]`    |
+| `networkPolicy.liteserver.enabled`   | Create an ingress rule for the liteserver port                                                                  | `false` |
+| `networkPolicy.liteserver.allowFrom` | Liteserver port ingress sources. If empty, allows all.                                                          | `[]`    |
+| `networkPolicy.jsonRpc.enabled`      | Create an ingress rule for the JSON-RPC port                                                                    | `false` |
+| `networkPolicy.jsonRpc.allowFrom`    | JSON-RPC port ingress sources. If empty, allows all.                                                            | `[]`    |
+| `networkPolicy.metrics.enabled`      | Create an ingress rule for the metrics port                                                                     | `false` |
+| `networkPolicy.metrics.allowFrom`    | Metrics port ingress sources. If empty, allows all.                                                             | `[]`    |
+| `networkPolicy.extraIngress`         | Additional raw ingress rules appended to the policy.                                                            | `[]`    |
 
 ### ServiceAccount parameters
 

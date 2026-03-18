@@ -153,6 +153,22 @@ Usage: {{ include "node.serviceLabels" (dict "svcConfig" .Values.services.adnl "
 {{- end }}
 
 {{/*
+Simplex port resolver.
+  null / false → disabled (empty string)
+  true         → adnl + 1000
+  <number>     → that number
+*/}}
+{{- define "node.simplexPort" -}}
+{{- if kindIs "bool" .Values.ports.simplex -}}
+  {{- if .Values.ports.simplex -}}
+    {{- add .Values.ports.adnl 1000 -}}
+  {{- end -}}
+{{- else if .Values.ports.simplex -}}
+  {{- .Values.ports.simplex -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Boolean helper: whether vault is configured.
 */}}
 {{- define "node.hasVault" -}}
