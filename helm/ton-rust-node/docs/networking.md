@@ -16,11 +16,12 @@ A TON node needs a stable, publicly reachable IP address — other nodes connect
 
 ## Ports and services
 
-The chart manages five ports. Each port is optional (set to `null` to disable) except ADNL which is always enabled.
+The chart manages six ports. Each port is optional (set to `null` to disable) except ADNL which is always enabled.
 
 | Port | Protocol | Default | Purpose |
 |------|----------|---------|---------|
 | `ports.adnl` | UDP | `30303` | Peer-to-peer protocol. Must be publicly reachable. |
+| `ports.simplex` | UDP | `false` | Simplex consensus protocol. Only needed for validators after switching to simplex consensus. `true` = adnl + 1000, or set an explicit port number. |
 | `ports.control` | TCP | `50000` | Node management (stop, restart, elections). Recommended to keep internal. |
 | `ports.liteserver` | TCP | `null` | Liteserver API for external consumers. |
 | `ports.jsonRpc` | TCP | `null` | JSON-RPC API for external consumers. |
@@ -33,6 +34,7 @@ Each enabled port gets its own per-replica Kubernetes Service. This allows indep
 | Port | Service name | Default type | Rationale |
 |------|-------------|-------------|-----------|
 | ADNL | `<release>-<i>` | LoadBalancer | Must be publicly reachable for P2P |
+| simplex | `<release>-<i>-simplex` | LoadBalancer | Simplex consensus — must be publicly reachable for validators |
 | control | `<release>-<i>-control` | ClusterIP | Node management — recommended to keep internal |
 | liteserver | `<release>-<i>-liteserver` | LoadBalancer | Serves external API consumers |
 | jsonRpc | `<release>-<i>-jsonrpc` | LoadBalancer | Serves external API consumers |
@@ -147,6 +149,7 @@ Each port can be independently enabled:
 ```yaml
 hostPort:
   adnl: true
+  simplex: false
   control: false
   liteserver: false
   jsonRpc: false

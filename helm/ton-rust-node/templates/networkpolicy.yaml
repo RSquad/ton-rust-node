@@ -22,6 +22,18 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
         {{- end }}
+    {{- with (include "node.simplexPort" .) }}
+    - ports:
+        - port: {{ . }}
+          protocol: UDP
+      from:
+        {{- if $.Values.networkPolicy.simplex.allowFrom }}
+        {{- toYaml $.Values.networkPolicy.simplex.allowFrom | nindent 8 }}
+        {{- else }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        {{- end }}
+    {{- end }}
     {{- if and .Values.ports.control .Values.networkPolicy.control.enabled }}
     - ports:
         - port: {{ .Values.ports.control }}

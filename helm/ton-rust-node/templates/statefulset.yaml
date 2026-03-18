@@ -126,6 +126,14 @@ spec:
               {{- if .Values.hostPort.adnl }}
               hostPort: {{ .Values.ports.adnl }}
               {{- end }}
+            {{- with (include "node.simplexPort" .) }}
+            - name: simplex
+              containerPort: {{ . }}
+              protocol: UDP
+              {{- if $.Values.hostPort.simplex }}
+              hostPort: {{ . }}
+              {{- end }}
+            {{- end }}
             {{- if .Values.ports.control }}
             - name: control
               containerPort: {{ .Values.ports.control }}

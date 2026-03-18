@@ -133,6 +133,7 @@ storage:
 ## @section Port parameters
 
 ## @param ports.adnl ADNL port (UDP)
+## @param ports.simplex [nullable] Simplex consensus port (UDP). Only needed for validators after switching to simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port.
 ## @param ports.control Control port (TCP). Set to null to disable.
 ## @param ports.liteserver [nullable] Liteserver port (TCP). Set to enable.
 ## @param ports.jsonRpc [nullable] JSON-RPC port (TCP). Set to enable.
@@ -140,6 +141,7 @@ storage:
 ##
 ports:
   adnl: 30303
+  simplex: false
   control: 50000
   liteserver: null
   jsonRpc: null
@@ -155,6 +157,10 @@ ports:
 ## @param services.adnl.labels [object] Extra labels applied to all ADNL per-replica services
 ## @param services.adnl.annotations [object] Annotations applied to all ADNL per-replica services
 ## @param services.adnl.perReplica [array] Per-replica ADNL service overrides (list index = replica index)
+##
+## @param services.simplex.type Simplex service type
+## @param services.simplex.externalTrafficPolicy Simplex service traffic policy
+## @param services.simplex.labels [object] Extra labels for simplex services
 ##
 ## @param services.control.type Control service type
 ## @param services.control.labels [object] Extra labels for control services
@@ -174,6 +180,10 @@ services:
     labels: {}
     annotations: {}
     perReplica: []
+  simplex:
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+    labels: {}
   control:
     type: ClusterIP
     labels: {}
@@ -294,7 +304,7 @@ extraEnvFrom: []
 ## Provide either vault.url (plain text) or vault.secretName (recommended).
 ## See docs/vault.md for details.
 
-## @param vault.url Vault URL (plain text). Example: `file:///keys/vault.json&master_key=<hex>`
+## @param vault.url Vault URL (plain text). Example: `file:///keys/vault.json?master_key=<hex>`
 ## @param vault.secretName Name of an existing Secret containing the vault URL. Takes precedence over vault.url.
 ## @param vault.secretKey Key inside the Secret that holds the vault URL.
 ##
@@ -310,6 +320,7 @@ vault:
 hostNetwork: false
 
 ## @param hostPort.adnl Expose the ADNL port on the host IP via hostPort
+## @param hostPort.simplex Expose the simplex port on the host IP via hostPort
 ## @param hostPort.control Expose the control port on the host IP via hostPort
 ## @param hostPort.liteserver Expose the liteserver port on the host IP via hostPort
 ## @param hostPort.jsonRpc Expose the JSON-RPC port on the host IP via hostPort
@@ -317,6 +328,7 @@ hostNetwork: false
 ##
 hostPort:
   adnl: false
+  simplex: false
   control: false
   liteserver: false
   jsonRpc: false
@@ -339,6 +351,7 @@ hostPort:
 
 ## @param networkPolicy.enabled Create a NetworkPolicy
 ## @param networkPolicy.adnl.allowFrom [array] ADNL ingress sources. Default allows all traffic (0.0.0.0/0). Each entry is a raw NetworkPolicy `from` item.
+## @param networkPolicy.simplex.allowFrom [array] Simplex ingress sources. Default allows all traffic (0.0.0.0/0). Each entry is a raw NetworkPolicy `from` item.
 ## @param networkPolicy.control.enabled Create an ingress rule for the control port
 ## @param networkPolicy.control.allowFrom [array] Control port ingress sources. If empty, allows all.
 ## @param networkPolicy.liteserver.enabled Create an ingress rule for the liteserver port
@@ -352,6 +365,8 @@ hostPort:
 networkPolicy:
   enabled: false
   adnl:
+    allowFrom: []
+  simplex:
     allowFrom: []
   control:
     enabled: false

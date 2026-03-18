@@ -24,6 +24,34 @@ spec:
       port: {{ $root.Values.ports.adnl }}
       protocol: UDP
 
+{{- $simplexPort := (include "node.simplexPort" $root) }}
+{{- if $simplexPort }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-{{ $i }}-simplex
+  labels:
+    {{- include "node.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: simplex
+    {{- with $root.Values.services.simplex.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- include "node.serviceAnnotations" (dict "svcConfig" $root.Values.services.simplex "replicaIndex" $i) | nindent 2 }}
+spec:
+  type: {{ $root.Values.services.simplex.type }}
+  {{- if ne $root.Values.services.simplex.type "ClusterIP" }}
+  externalTrafficPolicy: {{ $root.Values.services.simplex.externalTrafficPolicy | default "Local" }}
+  {{- end }}
+  selector:
+    {{- include "node.selectorLabels" $root | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ $fullname }}-{{ $i }}
+  ports:
+    - name: simplex
+      port: {{ $simplexPort }}
+      protocol: UDP
+{{- end }}
+
 {{- if $root.Values.ports.control }}
 ---
 apiVersion: v1

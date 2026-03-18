@@ -5,6 +5,18 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.4.2] - 2026-03-18
+
+appVersion: `v0.3.0`
+
+### Added
+
+- `ports.simplex` — simplex consensus port (UDP). Disabled by default; only needed for validators after switching to simplex consensus. Set to `true` (adnl + 1000) or an explicit port number to enable. Includes per-replica Service, hostPort, and NetworkPolicy support
+
+### Fixed
+
+- Vault URL example in values.yaml used `&` separator instead of `?`
+
 ## [0.4.1] - 2026-03-12
 
 appVersion: `v0.3.0`
