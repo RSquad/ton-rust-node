@@ -47,7 +47,7 @@ See [Secrets Vault](../../ton-rust-node/docs/vault.md) for vault setup, URL form
 
 ```bash
 kubectl create secret generic nodectl-vault \
-  --from-literal=VAULT_URL="file:///nodectl/data/vault.json&master_key=$(openssl rand -hex 32)"
+  --from-literal=VAULT_URL="file:///nodectl/data/vault.json?master_key=$(openssl rand -hex 32)"
 ```
 
 ### Install the chart
@@ -388,7 +388,7 @@ kubectl create secret generic nodectl-config \
 
 # Recreate the vault secret with the same master key as the original
 kubectl create secret generic nodectl-vault \
-  --from-literal=VAULT_URL="file:///nodectl/data/vault.json&master_key=<ORIGINAL_MASTER_KEY>"
+  --from-literal=VAULT_URL="file:///nodectl/data/vault.json?master_key=<ORIGINAL_MASTER_KEY>"
 ```
 
 ### 3. Deploy with initConfig

@@ -70,7 +70,7 @@ Vault stores private keys (wallet keys, control client keys). Currently only the
 
 | Backend | URL format | Use case |
 |---------|-----------|----------|
-| File-based | `file:///nodectl/data/vault.json&master_key=<hex>` | All setups |
+| File-based | `file:///nodectl/data/vault.json?master_key=<hex>` | All setups |
 
 Vault is configured via the **`VAULT_URL` environment variable**, not in `config.json`. The Helm chart passes this from a K8s Secret or plain value.
 
@@ -110,7 +110,7 @@ The chart sets these environment variables on the nodectl container:
 | Name               | Description                                        | Value                                  |
 | ------------------ | -------------------------------------------------- | -------------------------------------- |
 | `image.repository` | Container image repository                         | `ghcr.io/rsquad/ton-rust-node/nodectl` |
-| `image.tag`        | Image tag                                          | `v0.2.0`                               |
+| `image.tag`        | Image tag                                          | `v0.2.1`                               |
 | `image.pullPolicy` | Pull policy                                        | `IfNotPresent`                         |
 | `imagePullSecrets` | Registry pull secrets for private container images | `[]`                                   |
 
@@ -147,7 +147,7 @@ The chart sets these environment variables on the nodectl container:
 
 | Name               | Description                                                                                                                               | Value       |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| `vault.url`        | Vault URL (plain text). Examples: `file:///nodectl/data/vault.json&master_key=<hex>`, `hashicorp://<addr>?api_key=<token>&namespace=<ns>` | `""`        |
+| `vault.url`        | Vault URL (plain text). Examples: `file:///nodectl/data/vault.json?master_key=<hex>`, `hashicorp://<addr>?api_key=<token>&namespace=<ns>` | `""`        |
 | `vault.secretName` | Name of an existing Secret containing the vault URL. Takes precedence over vault.url.                                                     | `""`        |
 | `vault.secretKey`  | Key inside the Secret that holds the vault URL.                                                                                           | `VAULT_URL` |
 

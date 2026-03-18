@@ -12,7 +12,7 @@ replicas: 1
 ##
 image:
   repository: ghcr.io/rsquad/ton-rust-node/nodectl
-  tag: "v0.2.0"
+  tag: "v0.2.1"
   pullPolicy: IfNotPresent
 
 ## @param imagePullSecrets [array] Registry pull secrets for private container images
@@ -62,7 +62,7 @@ dataPath: /nodectl/data
 ## Provide either vault.url (plain text) or vault.secretName (recommended).
 ## See ../../ton-rust-node/docs/vault.md for details.
 
-## @param vault.url Vault URL (plain text). Examples: `file:///nodectl/data/vault.json&master_key=<hex>`, `hashicorp://<addr>?api_key=<token>&namespace=<ns>`
+## @param vault.url Vault URL (plain text). Examples: `file:///nodectl/data/vault.json?master_key=<hex>`, `hashicorp://<addr>?api_key=<token>&namespace=<ns>`
 ## @param vault.secretName Name of an existing Secret containing the vault URL. Takes precedence over vault.url.
 ## @param vault.secretKey Key inside the Secret that holds the vault URL.
 ##
