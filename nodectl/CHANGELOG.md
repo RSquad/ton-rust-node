@@ -5,6 +5,14 @@ All notable changes to nodectl will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the nodectl release tags (e.g. `nodectl/v0.1.0`).
 
+## [v0.2.1] - 2026-03-18
+
+Image: `ghcr.io/rsquad/ton-rust-node/nodectl:v0.2.1`
+
+### Added
+
+- **Manual election stake command** — new `wallet stake` command for manual election participation via nominator pool
+
 ## [v0.2.0] - 2026-03-05
 
 Image: `ghcr.io/rsquad/ton-rust-node/nodectl:v0.2.0`
