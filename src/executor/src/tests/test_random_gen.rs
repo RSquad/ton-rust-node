@@ -18,9 +18,9 @@ use rand::prelude::{Rng, StdRng};
 use std::panic;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    accounts::Account, AccountId, BuilderData, CurrencyCollection, ExternalInboundMessageHeader,
-    Grams, InternalMessageHeader, MsgAddressInt, Serializable, SliceData, StateInit, UInt256,
-    VarUInteger16,
+    accounts::Account, AccountId, BuilderData, Coins, CurrencyCollection,
+    ExternalInboundMessageHeader, InternalMessageHeader, MsgAddressInt, Serializable, SliceData,
+    StateInit, UInt256, VarUInteger16,
 };
 
 fn gen_bool(rng: &mut StdRng) -> bool {
@@ -167,7 +167,7 @@ fn test_rand_1() {
                 state_init = Some(gen_state(&mut rng, acc_id, workchain_id));
                 Account::active(
                     MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
-                    CurrencyCollection::with_grams(gen_int(&mut rng, 19)),
+                    CurrencyCollection::with_coins(gen_int(&mut rng, 19)),
                     0,
                     BLOCK_UT - std::cmp::min(gen_int(&mut rng, 11) as u32, BLOCK_UT),
                     state_init.clone().unwrap(),
@@ -178,17 +178,17 @@ fn test_rand_1() {
             1 => Account::default(),
             2 => Account::uninit(
                 MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
-                CurrencyCollection::with_grams(gen_int(&mut rng, 19)),
+                CurrencyCollection::with_coins(gen_int(&mut rng, 19)),
                 BLOCK_LT,
                 BLOCK_UT - std::cmp::min(gen_int(&mut rng, 11) as u32, BLOCK_UT),
             ),
             3 => {
                 state_init = Some(gen_state(&mut rng, acc_id, workchain_id));
                 let state_hash = state_init.clone().unwrap().serialize().unwrap().repr_hash();
-                let due = Grams::from(gen_int(&mut rng, 19));
+                let due = Coins::from(gen_int(&mut rng, 19));
                 Account::frozen(
                     MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
-                    CurrencyCollection::with_grams(gen_int(&mut rng, 19)),
+                    CurrencyCollection::with_coins(gen_int(&mut rng, 19)),
                     BLOCK_LT,
                     BLOCK_UT - std::cmp::min(gen_int(&mut rng, 11) as u32, BLOCK_UT),
                     if due.is_zero() { None } else { Some(due) },
@@ -212,13 +212,13 @@ fn test_rand_1() {
                 MsgAddressInt::with_standart(None, workchain_id_sender, THIRD_ACCOUNT.clone())
                     .unwrap(),
                 MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
-                CurrencyCollection::with_grams(gen_int(&mut rng, 19)),
+                CurrencyCollection::with_coins(gen_int(&mut rng, 19)),
             );
             hdr.bounce = gen_bool(&mut rng);
             hdr.ihr_disabled = gen_bool(&mut rng);
             hdr.created_lt = PREV_BLOCK_LT;
             hdr.created_at = 0;
-            hdr.fwd_fee = Grams::from(gen_int(&mut rng, 10));
+            hdr.fwd_fee = Coins::from(gen_int(&mut rng, 10));
             hdr.extra_flags = VarUInteger16::from(gen_int(&mut rng, 10));
             Message::with_int_header(hdr)
         };
@@ -369,7 +369,7 @@ fn test_rand_reverse_and_messages() {
 
         let mut acc = Account::active(
             MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
-            CurrencyCollection::with_grams(gen_int(&mut rng, 19)),
+            CurrencyCollection::with_coins(gen_int(&mut rng, 19)),
             0,
             BLOCK_UT,
             gen_state_reserve_and_sendmsgs(&mut rng, acc_id, workchain_id),
@@ -387,7 +387,7 @@ fn test_rand_reverse_and_messages() {
             let mut hdr = InternalMessageHeader::with_addresses(
                 MsgAddressInt::with_standart(None, workchain_id, THIRD_ACCOUNT.clone()).unwrap(),
                 MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
-                CurrencyCollection::with_grams(gen_int(&mut rng, 19)),
+                CurrencyCollection::with_coins(gen_int(&mut rng, 19)),
             );
             hdr.bounce = gen_bool(&mut rng);
             hdr.ihr_disabled = true;

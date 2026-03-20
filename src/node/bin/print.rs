@@ -258,7 +258,7 @@ async fn main() -> Result<()> {
                         "id": addr.to_string(),
                         "last_paid": account.storage_info().unwrap().last_paid(),
                         "last_trans_lt": account.last_tr_time().unwrap_or_default(),
-                        "balance": balance.grams.as_u128(),
+                        "balance": balance.coins.as_u128(),
                     });
                     if !balance.other.is_empty() {
                         let mut other = serde_json::Map::new();

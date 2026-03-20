@@ -17,7 +17,7 @@ use crate::{
     merkle_proof::MerkleProof,
     read_boc_root,
     shard::MASTERCHAIN_ID,
-    types::{CurrencyCollection, Grams, Number5, Number9},
+    types::{Coins, CurrencyCollection, Number5, Number9},
     AccountId, BlockError, BuilderData, Cell, ChildCell, Deserializable, GasConsumer,
     GetRepresentationHash, IBitstring, Mask, Result, Serializable, SliceData, UInt256, UsageTree,
     VarUInteger16, MAX_DATA_BITS, MAX_REFERENCES_COUNT,
@@ -523,7 +523,7 @@ Known limitations:
     * anycast is not supported (is supposed to be `nothing`);
     * only standard 256-bit addresses are supported.
 
-2. Instead of CurrencyCollection, Grams type is used.
+2. Instead of CurrencyCollection, Coins type is used.
 
 3. In Message X format, only the info field is parsed.
 
@@ -631,7 +631,7 @@ pub struct InternalMessageHeader {
     pub dst: MsgAddressInt,
     pub value: CurrencyCollection,
     pub extra_flags: VarUInteger16,
-    pub fwd_fee: Grams,
+    pub fwd_fee: Coins,
     pub created_lt: u64,
     pub created_at: u32,
 }
@@ -646,7 +646,7 @@ impl Default for InternalMessageHeader {
             dst: MsgAddressInt::default(),
             value: CurrencyCollection::new(),
             extra_flags: VarUInteger16::zero(),
-            fwd_fee: Grams::zero(),
+            fwd_fee: Coins::zero(),
             created_lt: 0, // Logical Time will be set on block builder
             created_at: 0, // UNIX time too
         }
@@ -693,7 +693,7 @@ impl InternalMessageHeader {
     ///
     /// Get forwarding fee for message transfer
     ///
-    pub fn fwd_fee(&self) -> &Grams {
+    pub fn fwd_fee(&self) -> &Coins {
         &self.fwd_fee
     }
 
@@ -773,12 +773,12 @@ impl fmt::Display for ExternalInboundMessageHeader {
 pub struct ExternalInboundMessageHeader {
     pub src: MsgAddressExt,
     pub dst: MsgAddressInt,
-    pub import_fee: Grams,
+    pub import_fee: Coins,
 }
 
 impl ExternalInboundMessageHeader {
     pub const fn new(src: MsgAddressExt, dst: MsgAddressInt) -> Self {
-        let import_fee = Grams::zero();
+        let import_fee = Coins::zero();
         Self { src, dst, import_fee }
     }
 }
@@ -871,10 +871,10 @@ impl Deserializable for ExtOutMessageHeader {
 ///
 /// int_msg_info$0 ihr_disabled:Bool bounce:Bool
 /// src:MsgAddressInt dest:MsgAddressInt
-/// value:CurrencyCollection ihr_fee:Grams fwd_fee:Grams
+/// value:CurrencyCollection ihr_fee:Coins fwd_fee:Coins
 /// created_lt:uint64 created_at:uint32 = CommonMsgInfo;
 /// ext_in_msg_info$10 src:MsgAddressExt dest:MsgAddressInt
-/// import_fee:Grams = CommonMsgInfo;
+/// import_fee:Coins = CommonMsgInfo;
 /// ext_out_msg_info$11 src:MsgAddressInt dest:MsgAddressExt
 /// created_lt:uint64 created_at:uint32 = CommonMsgInfo;
 ///
@@ -956,7 +956,7 @@ impl CommonMsgInfo {
     /// Fee collected only for transfer internal and external outbound messages.
     /// for other types of messages, function returned None
     ///
-    pub fn fee(&self) -> Result<Option<Grams>> {
+    pub fn fee(&self) -> Result<Option<Coins>> {
         match self {
             CommonMsgInfo::IntMsgInfo(header) => Ok(Some(header.fwd_fee)),
             CommonMsgInfo::ExtInMsgInfo(header) => Ok(Some(header.import_fee)),
@@ -1398,7 +1398,7 @@ impl Message {
     /// Only Internal and External outbound messages has a fee
     /// If the transmittal of a message it is necessary to collect a fee. Otherwise None
     ///
-    pub fn get_fee(&self) -> Result<Option<Grams>> {
+    pub fn get_fee(&self) -> Result<Option<Coins>> {
         self.header.fee()
     }
 
@@ -1694,7 +1694,7 @@ impl Message {
             fail!("Only external inbound messages are supported")
         };
         header.src = MsgAddressExt::default();
-        header.import_fee = Grams::default();
+        header.import_fee = Coins::default();
         self.init = None;
         self.body_to_ref = Some(true);
         self.init_to_ref = Some(true);

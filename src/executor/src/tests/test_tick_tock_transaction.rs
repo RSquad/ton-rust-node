@@ -24,7 +24,7 @@ use ton_block::{
         AccStatusChange, TrActionPhase, TrComputePhase, TrComputePhaseVm, TrStoragePhase,
         Transaction, TransactionDescr, TransactionDescrTickTock, TransactionTickTock,
     },
-    types::Grams,
+    types::Coins,
     AccountId, BuilderData, Cell, CurrencyCollection, GetRepresentationHash, Serializable,
     StateInit, StorageUsed, TickTock, DICT_HASH_MIN_CELLS,
 };
@@ -64,7 +64,7 @@ fn create_int_msg(src: AccountId, dest: AccountId, value: u64, bounce: bool, lt:
     let cell = dest.serialize().unwrap();
     let builder = BuilderData::with_raw_and_refs(vec![1, 2, 3, 4], 15, [cell]).unwrap();
     let body = SliceData::load_builder(builder).unwrap();
-    let balance = CurrencyCollection::with_grams(value);
+    let balance = CurrencyCollection::with_coins(value);
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, -1, src).unwrap(),
         MsgAddressInt::with_standart(None, -1, dest).unwrap(),
@@ -98,7 +98,7 @@ fn create_test_account(amount: u64, address: AccountId, code: Cell, data: Cell) 
     let mut account = Account::with_storage(
         &MsgAddressInt::with_standart(None, -1, address).unwrap(),
         &StorageInfo::with_values(ACCOUNT_UT, None),
-        &AccountStorage::active(0, CurrencyCollection::with_grams(amount), state),
+        &AccountStorage::active(0, CurrencyCollection::with_coins(amount), state),
     );
     account.set_code(code);
     account.set_data(data);
@@ -136,8 +136,8 @@ fn test_tick_tock_executor_active_acc_with_code1() {
     actions.push_back(OutAction::new_send(SENDMSG_ORDINARY, msg1.clone()));
     actions.push_back(OutAction::new_send(SENDMSG_ORDINARY, msg2.clone()));
     let hash = actions.hash().unwrap();
-    msg1.value_mut().unwrap().grams = Grams::from(MSG1_BALANCE - msg_fwd_fee);
-    msg2.value_mut().unwrap().grams = Grams::from(MSG2_BALANCE - msg_fwd_fee);
+    msg1.value_mut().unwrap().coins = Coins::from(MSG1_BALANCE - msg_fwd_fee);
+    msg2.value_mut().unwrap().coins = Coins::from(MSG2_BALANCE - msg_fwd_fee);
     if let CommonMsgInfo::IntMsgInfo(int_header) = msg1.header_mut() {
         if let CommonMsgInfo::IntMsgInfo(int_header2) = msg2.header_mut() {
             int_header.fwd_fee = msg_remain_fee.into();
@@ -248,7 +248,7 @@ fn test_light_wallet_contract() {
     //transfer_value is reduced by fwd_fees:
     //new transfer_value = transfer_value - msg.fwd.fee
     let newbalance1 = start_balance1 - fwd_fee - transfer - storage_fee1 - gas_fee1;
-    assert_eq!(shard_acc1.clone().unwrap().read_account().unwrap().balance().unwrap().clone(), CurrencyCollection::with_grams(newbalance1));
+    assert_eq!(shard_acc1.clone().unwrap().read_account().unwrap().balance().unwrap().clone(), CurrencyCollection::with_coins(newbalance1));
     assert_ne!(shard_acc1.clone().unwrap().last_trans_lt(), 0);
     assert_ne!(shard_acc1.unwrap().last_trans_hash(), &UInt256::default());
 
@@ -258,7 +258,7 @@ fn test_light_wallet_contract() {
 
     //new acc.balance = acc.balance + transfer_value - fwd_fee - storage_fee - gas_fee
     let newbalance2 = start_balance2 + transfer - fwd_fee - storage_fee2 - gas_fee2;
-    assert_eq!(shard_acc2.clone().unwrap().read_account().unwrap().balance().unwrap().clone(), CurrencyCollection::with_grams(newbalance2));
+    assert_eq!(shard_acc2.clone().unwrap().read_account().unwrap().balance().unwrap().clone(), CurrencyCollection::with_coins(newbalance2));
     assert_ne!(shard_acc2.clone().unwrap().last_trans_lt(), 0);
     assert_ne!(shard_acc2.unwrap().last_trans_hash(), &UInt256::default());
 
@@ -305,7 +305,7 @@ fn create_test_transfer_account_with_ending(amount: u64, mode: u8, ending: &str)
         ),
         &AccountStorage {
             last_trans_lt: 0,
-            balance: CurrencyCollection::with_grams(amount),
+            balance: CurrencyCollection::with_coins(amount),
             state: AccountState::with_state(state),
         }
     )
@@ -315,7 +315,7 @@ fn create_test_external_msg_with_int(transfer_value: u64) -> Message {
     let acc_id = SENDER_ACCOUNT.clone();
     let mut hdr = ExternalInboundMessageHeader::default();
     hdr.dst = MsgAddressInt::with_standart(None, -1, acc_id.clone()).unwrap();
-    hdr.import_fee = Grams::zero();
+    hdr.import_fee = Coins::zero();
     let mut msg = Message::with_ext_in_header(hdr);
 
     let int_msg = create_int_msg(
@@ -454,13 +454,13 @@ fn test_trexecutor_active_acc_with_zero_balance() {
     assert_eq!(vm_phase_success, true);
     assert_eq!(
         shard_acc.unwrap().read_account().unwrap().balance().unwrap(),
-        &CurrencyCollection::with_grams(transfer - storage_fee - gas_fee));
+        &CurrencyCollection::with_coins(transfer - storage_fee - gas_fee));
 }
 
 //contract send all its balance to another account using special mode in SENDRAWMSG.
 //contract balance must equal to zero after transaction.
 fn active_acc_send_all_balance(ending: &str) {
-    let start_balance = 10_000_000_000; //10 grams
+    let start_balance = 10_000_000_000; //10 coins
     let acc = create_test_transfer_account_with_ending(start_balance, SENDMSG_ALL_BALANCE, ending);
 
     let mut shard_acc = Some(ShardAccount::with_params(acc, UInt256::from(SENDER_ACCOUNT.clone().get_bytestring(0)), 0).unwrap());
@@ -472,7 +472,7 @@ fn active_acc_send_all_balance(ending: &str) {
     assert_eq!(trans.read_description().unwrap().is_aborted(), false);
     let vm_phase_success = trans.read_description().unwrap().compute_phase_ref().unwrap().clone().get_vmphase_mut().unwrap().success;
     assert_eq!(vm_phase_success, true);
-    assert_eq!(shard_acc.unwrap().read_account().unwrap().balance().unwrap(), &CurrencyCollection::with_grams(0));
+    assert_eq!(shard_acc.unwrap().read_account().unwrap().balance().unwrap(), &CurrencyCollection::with_coins(0));
     assert!(trans.get_out_msg(0).unwrap().is_some());
     assert!(trans.get_out_msg(1).unwrap().is_none());
 }

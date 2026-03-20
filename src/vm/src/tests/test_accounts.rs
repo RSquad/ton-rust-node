@@ -13,13 +13,13 @@ use crate::executor::accounts::{
 };
 use num::BigUint;
 use rand::{prelude::SliceRandom, thread_rng};
-use ton_block::Grams;
+use ton_block::Coins;
 use ton_block::UInt256;
 
 impl Validator {
     fn with_stake(stake: u64) -> Validator {
         let key = ValidatorKey {
-            stake: Grams::from(stake),
+            stake: Coins::from(stake),
             time: 0,
             pub_key: UInt256::ZERO,
         };
@@ -34,7 +34,7 @@ impl Validator {
     }
     fn with_params(stake: u64, time: u32, pub_key: [u8; 32]) -> Validator {
         let key = ValidatorKey {
-            stake: Grams::from(stake),
+            stake: Coins::from(stake),
             time: !time,
             pub_key: UInt256::with_array(pub_key),
         };

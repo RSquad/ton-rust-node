@@ -62,29 +62,29 @@ mod test_bintree {
 
     #[test]
     fn test_bintreeaug_new_simple() {
-        let mut tree = BinTreeAug::with_item(&11u8, &CurrencyCollection::with_grams(1)).unwrap();
+        let mut tree = BinTreeAug::with_item(&11u8, &CurrencyCollection::with_coins(1)).unwrap();
         assert_eq!(tree.get(SliceData::default()).unwrap(), Some(11));
-        assert_eq!(tree.root_extra(), &CurrencyCollection::with_grams(1));
+        assert_eq!(tree.root_extra(), &CurrencyCollection::with_coins(1));
 
-        assert!(tree.split(SliceData::default(), &22, &CurrencyCollection::with_grams(2)).unwrap());
+        assert!(tree.split(SliceData::default(), &22, &CurrencyCollection::with_coins(2)).unwrap());
         let tree2 = tree.get_data();
         println!("{}", tree2);
         assert_eq!(tree.get(prepare_key(0, 1)).unwrap(), Some(11));
         assert_eq!(tree.get(prepare_key(1, 1)).unwrap(), Some(22));
-        assert_eq!(tree.root_extra(), &CurrencyCollection::with_grams(3));
+        assert_eq!(tree.root_extra(), &CurrencyCollection::with_coins(3));
 
-        assert!(tree.split(prepare_key(0, 1), &33, &CurrencyCollection::with_grams(4)).unwrap());
+        assert!(tree.split(prepare_key(0, 1), &33, &CurrencyCollection::with_coins(4)).unwrap());
         let tree3 = tree.get_data();
         println!("{}", tree3);
         assert_eq!(tree.get(prepare_key(0, 1)).unwrap(), None);
         assert_eq!(tree.get(prepare_key(0, 2)).unwrap(), Some(11));
         assert_eq!(tree.get(prepare_key(1, 2)).unwrap(), Some(33));
         assert_eq!(tree.get(prepare_key(1, 1)).unwrap(), Some(22));
-        assert_eq!(tree.root_extra(), &CurrencyCollection::with_grams(7));
+        assert_eq!(tree.root_extra(), &CurrencyCollection::with_coins(7));
 
-        assert!(!tree.split(prepare_key(0, 1), &34, &CurrencyCollection::with_grams(5)).unwrap());
+        assert!(!tree.split(prepare_key(0, 1), &34, &CurrencyCollection::with_coins(5)).unwrap());
         assert_eq!(tree3, tree.get_data());
-        assert_eq!(tree.root_extra(), &CurrencyCollection::with_grams(7));
+        assert_eq!(tree.root_extra(), &CurrencyCollection::with_coins(7));
     }
 
     #[test]

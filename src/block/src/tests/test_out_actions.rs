@@ -43,11 +43,11 @@ fn test_setcode_action_serde() {
 fn test_reserve_action_serde() {
     test_action_serde_equality(OutAction::new_reserve(
         RESERVE_EXACTLY,
-        CurrencyCollection::with_grams(12345),
+        CurrencyCollection::with_coins(12345),
     ));
     test_action_serde_equality(OutAction::new_reserve(
         RESERVE_EXACTLY | RESERVE_IGNORE_ERROR,
-        CurrencyCollection::with_grams(54321),
+        CurrencyCollection::with_coins(54321),
     ));
 }
 
@@ -61,8 +61,8 @@ fn get_out_actions() -> OutActions {
     oa.push_back(OutAction::new_set(Cell::default()));
     oa.push_back(OutAction::new_set(Cell::default()));
     oa.push_back(OutAction::new_set(Cell::default()));
-    oa.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_grams(12345678)));
-    oa.push_back(OutAction::new_reserve(RESERVE_ALL_BUT, CurrencyCollection::with_grams(87654321)));
+    oa.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_coins(12345678)));
+    oa.push_back(OutAction::new_reserve(RESERVE_ALL_BUT, CurrencyCollection::with_coins(87654321)));
     oa.push_back(OutAction::new_change_library(CHANGE_LIB_MODE, None, Some(code.repr_hash())));
     oa.push_back(OutAction::new_change_library(SET_LIB_CODE_MODE, Some(code), None));
     oa
@@ -98,7 +98,7 @@ fn test_outactions_serialization() {
 fn test_unpack_out_action_slices_valid_list() {
     let mut actions = OutActions::new();
     actions.push_back(OutAction::new_set(Cell::default()));
-    actions.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_grams(1)));
+    actions.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_coins(1)));
 
     let actions_cell = actions.serialize().unwrap();
     let slices = unpack_out_action_slices(SliceData::load_cell(actions_cell).unwrap()).unwrap();
@@ -155,13 +155,13 @@ fn test_deserialize_out_action_slices_returns_indexed_error() {
 // TODO: move to anythere
 // #[test]
 // fn test_tvm_serialize_currency_collection() {
-//     let grams = 1u64<<63;
-//     let grams1 = int!(grams).as_grams().unwrap();
-//     let grams1 = serialize_currency_collection(grams1, None).unwrap();
-//     let grams1: CurrencyCollection = CurrencyCollection::construct_from(&mut grams1.into()).unwrap();
-//     let grams2 = CurrencyCollection::with_grams(grams);
-//     assert_eq!(grams1, grams2);
+//     let coins = 1u64<<63;
+//     let coins1 = int!(coins).as_coins().unwrap();
+//     let coins1 = serialize_currency_collection(coins1, None).unwrap();
+//     let coins1: CurrencyCollection = CurrencyCollection::construct_from(&mut coins1.into()).unwrap();
+//     let coins2 = CurrencyCollection::with_coins(coins);
+//     assert_eq!(coins1, coins2);
 
-//     assert_eq!(int!(1u128<<120).as_grams().expect_err("Expect range check error").code,
+//     assert_eq!(int!(1u128<<120).as_coins().expect_err("Expect range check error").code,
 //         ExceptionCode::RangeCheckError);
 // }

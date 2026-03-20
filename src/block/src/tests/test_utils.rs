@@ -180,7 +180,7 @@ fn generate_test_account(big: bool, options: AccountTestOptions) -> Account {
     }
 
     let balance = options.balance.unwrap_or_else(|| {
-        let mut balance = CurrencyCollection::with_grams(100000000000);
+        let mut balance = CurrencyCollection::with_coins(100000000000);
         balance.set_other(1, 100).unwrap();
         balance.set_other(2, 200).unwrap();
         balance.set_other(3, 300).unwrap();

@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use ton_block::{BuilderData, Cell, Grams as Coins, IBitstring, MsgAddressInt, Serializable};
+use ton_block::{BuilderData, Cell, Coins, IBitstring, MsgAddressInt, Serializable};
 
 /// Opcodes for single-nominator contract messages
 pub mod opcodes {

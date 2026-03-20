@@ -62,7 +62,7 @@ impl ToFromTL for GetAccountRqRs {
                 let account = shard_account.read_account()?;
                 let sas = ShardAccountState {
                     status: account.status(),
-                    balance: account.balance().map_or(0, |val| val.grams.as_u128()),
+                    balance: account.balance().map_or(0, |val| val.coins.as_u128()),
                     last_paid: account.last_paid(),
                     last_trans: shard_account.last_trans_lt(),
                     data: write_boc(&shard_account.account_cell())?,

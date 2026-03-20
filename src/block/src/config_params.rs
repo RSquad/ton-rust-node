@@ -16,7 +16,7 @@ use crate::{
     shard_accounts::ShardAccounts,
     signature::{CryptoSignature, SigPubKey},
     types::{
-        ChildCell, ExtraCurrencyCollection, Grams, Number12, Number13, Number16, Number32, Number8,
+        ChildCell, Coins, ExtraCurrencyCollection, Number12, Number13, Number16, Number32, Number8,
     },
     validators::{ValidatorDescr, ValidatorSet},
     AccountId, BlockError, BuilderData, Cell, Deserializable, HashmapE, HashmapIterator,
@@ -231,7 +231,7 @@ impl ConfigParams {
             .ok_or_else(|| error!("No config for base workchain"))
     }
     // TODO 13 compliant pricing
-    pub fn block_create_fees(&self, masterchain: bool) -> Result<Grams> {
+    pub fn block_create_fees(&self, masterchain: bool) -> Result<Coins> {
         match self.config(14)? {
             Some(ConfigParamEnum::ConfigParam14(param)) => {
                 if masterchain {
@@ -967,8 +967,8 @@ impl Serializable for BurningConfig {
 ///
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct ConfigParam6 {
-    pub mint_new_price: Grams,
-    pub mint_add_price: Grams,
+    pub mint_new_price: Coins,
+    pub mint_add_price: Coins,
 }
 
 impl ConfigParam6 {
@@ -1153,14 +1153,14 @@ impl Serializable for ConfigParam10 {
 ///
 /// Config Param 14 structure
 ///
-// block_grams_created#6b masterchain_block_fee:Grams basechain_block_fee:Grams
+// block_coins_created#6b masterchain_block_fee:Coins basechain_block_fee:Coins
 //   = BlockCreateFees;
 // _ BlockCreateFees = ConfigParam 14;
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct BlockCreateFees {
-    pub masterchain_block_fee: Grams,
-    pub basechain_block_fee: Grams,
+    pub masterchain_block_fee: Coins,
+    pub basechain_block_fee: Coins,
 }
 
 impl BlockCreateFees {
@@ -1298,9 +1298,9 @@ impl Serializable for ConfigParam16 {
 
 /*
 _
-    min_stake: Grams
-    max_stake: Grams
-    min_total_stake: Grams
+    min_stake: Coins
+    max_stake: Coins
+    min_total_stake: Coins
     max_stake_factor: uint32
 = ConfigParam 17;
 */
@@ -1310,9 +1310,9 @@ _
 ///
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct ConfigParam17 {
-    pub min_stake: Grams,
-    pub max_stake: Grams,
-    pub min_total_stake: Grams,
+    pub min_stake: Coins,
+    pub max_stake: Coins,
+    pub min_total_stake: Coins,
     pub max_stake_factor: u32,
 }
 
@@ -1542,12 +1542,12 @@ impl GasLimitsPrices {
         (gas_used as u128 * self.gas_price as u128 + 0xffff) >> 16
     }
 
-    /// Get gas price in nanograms
+    /// Get gas price in nanocoins
     pub fn get_real_gas_price(&self) -> u64 {
         self.gas_price >> 16
     }
 
-    /// Calculate gas by grams balance
+    /// Calculate gas by coins balance
     pub fn calc_gas(&self, value: u128, gas_limit: u64, max_gas_threshold: u128) -> u64 {
         if value >= max_gas_threshold {
             return gas_limit;
@@ -1640,8 +1640,8 @@ config_gas_prices#_ GasLimitsPrices = ConfigParam 21;
 
 /*
 
-// msg_fwd_fees = (lump_price + ceil((bit_price * msg.bits + cell_price * msg.cells)/2^16)) nanograms
-// ihr_fwd_fees = ceil((msg_fwd_fees * ihr_price_factor)/2^16) nanograms
+// msg_fwd_fees = (lump_price + ceil((bit_price * msg.bits + cell_price * msg.cells)/2^16)) nanocoins
+// ihr_fwd_fees = ceil((msg_fwd_fees * ihr_price_factor)/2^16) nanocoins
 // bits in the root cell of a message are not included in msg.bits (lump_price pays for them)
 msg_forward_prices#ea
     lump_price:uint64
@@ -1672,7 +1672,7 @@ impl MsgForwardPrices {
     // It is needed because `ihr_factor`, `first_frac` and `next_frac` are not integer values
     // but calculations are performed in integers, so prices are multiplied to some big
     // number (0xffff) and fee calculation uses such values. At the end result is divided by
-    // 0xffff with ceil rounding to obtain nanograms (add 0xffff and then `>> 16`)
+    // 0xffff with ceil rounding to obtain nanocoins (add 0xffff and then `>> 16`)
     pub fn calc_fwd_fee(&self, bits: u64, cells: u64) -> u128 {
         let res = (bits as u128 * self.bit_price as u128
             + cells as u128 * self.cell_price as u128
@@ -1687,8 +1687,8 @@ impl MsgForwardPrices {
 
     /// Calculate message IHR fee
     /// IHR fee is calculated as `(msg_forward_fee * ihr_factor) >> 16`
-    pub fn ihr_fee_checked(&self, fwd_fee: &Grams) -> Result<Grams> {
-        Grams::try_from((fwd_fee.as_u128() * self.ihr_price_factor as u128) >> 16)
+    pub fn ihr_fee_checked(&self, fwd_fee: &Coins) -> Result<Coins> {
+        Coins::try_from((fwd_fee.as_u128() * self.ihr_price_factor as u128) >> 16)
     }
 
     /// Calculate mine part of forward fee
@@ -1697,12 +1697,12 @@ impl MsgForwardPrices {
     /// `int_msg_mine_fee` is a part of transaction `total_fees` and will go validators of account's shard
     /// `int_msg_remain_fee` is placed in header of internal message and will go to validators
     /// of shard to which message destination address is belong.
-    pub fn mine_fee_checked(&self, fwd_fee: &Grams) -> Result<Grams> {
-        Grams::try_from((fwd_fee.as_u128() * self.first_frac as u128) >> 16)
+    pub fn mine_fee_checked(&self, fwd_fee: &Coins) -> Result<Coins> {
+        Coins::try_from((fwd_fee.as_u128() * self.first_frac as u128) >> 16)
     }
 
-    pub fn next_fee_checked(&self, fwd_fee: &Grams) -> Result<Grams> {
-        Grams::try_from((fwd_fee.as_u128() * self.next_frac as u128) >> 16)
+    pub fn next_fee_checked(&self, fwd_fee: &Coins) -> Result<Coins> {
+        Coins::try_from((fwd_fee.as_u128() * self.next_frac as u128) >> 16)
     }
 }
 
@@ -3310,7 +3310,7 @@ type ConfigParam23 = BlockLimits;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MisbehaviourPunishmentConfig {
-    pub default_flat_fine: Grams,
+    pub default_flat_fine: Coins,
     pub default_proportional_fine: u32,
     pub severity_flat_mult: u16,
     pub severity_proportional_mult: u16,
@@ -3651,12 +3651,12 @@ impl Deserializable for OracleBridgeParams {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct JettonBridgePrices {
-    pub bridge_burn_fee: Grams,
-    pub bridge_mint_fee: Grams,
-    pub wallet_min_tons_for_storage: Grams,
-    pub wallet_gas_consumption: Grams,
-    pub minter_min_tons_for_storage: Grams,
-    pub discover_gas_consumption: Grams,
+    pub bridge_burn_fee: Coins,
+    pub bridge_mint_fee: Coins,
+    pub wallet_min_tons_for_storage: Coins,
+    pub wallet_gas_consumption: Coins,
+    pub minter_min_tons_for_storage: Coins,
+    pub discover_gas_consumption: Coins,
 }
 
 impl Serializable for JettonBridgePrices {
@@ -3673,12 +3673,12 @@ impl Serializable for JettonBridgePrices {
 
 impl Deserializable for JettonBridgePrices {
     fn construct_from(slice: &mut SliceData) -> Result<Self> {
-        let bridge_burn_fee = Grams::construct_from(slice)?;
-        let bridge_mint_fee = Grams::construct_from(slice)?;
-        let wallet_min_tons_for_storage = Grams::construct_from(slice)?;
-        let wallet_gas_consumption = Grams::construct_from(slice)?;
-        let minter_min_tons_for_storage = Grams::construct_from(slice)?;
-        let discover_gas_consumption = Grams::construct_from(slice)?;
+        let bridge_burn_fee = Coins::construct_from(slice)?;
+        let bridge_mint_fee = Coins::construct_from(slice)?;
+        let wallet_min_tons_for_storage = Coins::construct_from(slice)?;
+        let wallet_gas_consumption = Coins::construct_from(slice)?;
+        let minter_min_tons_for_storage = Coins::construct_from(slice)?;
+        let discover_gas_consumption = Coins::construct_from(slice)?;
         Ok(Self {
             bridge_burn_fee,
             bridge_mint_fee,
@@ -3909,7 +3909,7 @@ impl Deserializable for JettonBridgeParams {
         let oracles = Oracles::construct_from(slice)?;
         let state_flags = slice.get_next_byte()?;
         if tag == JETTON_BRIDGE_PARAMS_TAG_V0 {
-            let bridge_burn_fee = Grams::construct_from(slice)?;
+            let bridge_burn_fee = Coins::construct_from(slice)?;
             return Ok(Self {
                 bridge_address,
                 oracles_address,

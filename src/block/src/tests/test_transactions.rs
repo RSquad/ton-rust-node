@@ -30,7 +30,7 @@ pub fn create_test_transaction_set() -> TestTransactionSet {
     let in_msg = Message::with_int_header(crate::InternalMessageHeader::with_addresses_and_bounce(
         MsgAddressInt::with_standart(None, 0, [0x55; 32].into()).unwrap(),
         MsgAddressInt::with_standart(None, 0, [0x66; 32].into()).unwrap(),
-        CurrencyCollection::from_grams(5_000_000_000.into()),
+        CurrencyCollection::from_coins(5_000_000_000.into()),
         true,
     ));
 
@@ -40,7 +40,7 @@ pub fn create_test_transaction_set() -> TestTransactionSet {
     let hdr = crate::InternalMessageHeader::with_addresses_and_bounce(
         int_addr1,
         int_addr2,
-        CurrencyCollection::from_grams(1_000_000_000.into()),
+        CurrencyCollection::from_coins(1_000_000_000.into()),
         true,
     );
     let int_msg = Message::with_int_header(hdr);
@@ -74,14 +74,14 @@ fn test_account_block_serde() {
 
     // let mut cell = BuilderData::new();
     // acc_block.transactions.write_hashmap_data(&mut cell).unwrap();
-    // let mut hmp = HashmapAugE::<Grams>::with_data(64, &mut SliceData::from(cell));
+    // let mut hmp = HashmapAugE::<Coins>::with_data(64, &mut SliceData::from(cell));
 
     // assert_eq!(acc_block.transactions, hmp);
 
     // let mut cell = BuilderData::new();
     // acc_block.transactions.write_hashmap_root(&mut cell).unwrap();
 
-    // let mut hmp = HashmapAugE::<Grams>::with_bit_len(64);
+    // let mut hmp = HashmapAugE::<Coins>::with_bit_len(64);
     // hmp.read_hashmap_root::<InRefValue<Transaction>>(&mut cell.into());
 
     // assert_eq!(acc_block.transactions.get_data(), hmp.get_data());
@@ -100,7 +100,7 @@ fn test_account_block_serde_max() {
     acc_block.write_state_update(&s_status_update).unwrap();
 
     let mut transaction = generate_tranzaction(address);
-    let mut fees = CurrencyCollection::with_grams(u64::MAX);
+    let mut fees = CurrencyCollection::with_coins(u64::MAX);
     fees.set_other(1, 111).unwrap();
     transaction.set_total_fees(fees);
     acc_block.add_transaction(&transaction).unwrap();
@@ -204,14 +204,14 @@ fn test_bounce_phase() {
 
     write_read_and_assert(TrBouncePhase::Ok(TrBouncePhaseOk {
         msg_size: StorageUsed::with_values_checked(4, 5).unwrap(),
-        msg_fees: Grams::one(),
+        msg_fees: Coins::one(),
         fwd_fees: 456.into(),
     }));
 }
 
 #[test]
 fn test_credit_phase() {
-    let mut credit = CurrencyCollection::with_grams(1);
+    let mut credit = CurrencyCollection::with_coins(1);
     credit.set_other(500, 9_000_000 + 777).unwrap();
     credit.set_other(1005001, 8_000_000 + 1005700).unwrap();
     credit.set_other(1005002, 555_000_000 + 1070500).unwrap();
@@ -234,7 +234,7 @@ fn test_credit_phase() {
 
     write_read_and_assert(TrCreditPhase { due_fees_collected: Some(123600079553.into()), credit });
 
-    let mut credit = CurrencyCollection::with_grams(1);
+    let mut credit = CurrencyCollection::with_coins(1);
     credit.set_other(500, 9_000_000 + 777).unwrap();
     credit.set_other(1005001, 8_000_000 + 1005700).unwrap();
     credit.set_other(1005002, 555_000_000 + 1070500).unwrap();
@@ -332,7 +332,7 @@ fn test_tr_descr_order() {
     };
 
     // TrCreditPhase //
-    let mut credit = CurrencyCollection::with_grams(1);
+    let mut credit = CurrencyCollection::with_coins(1);
     credit.set_other(500, 9_000_000 + 777).unwrap();
     credit.set_other(1005001, 8_000_000 + 1005700).unwrap();
     credit.set_other(1005002, 555_000_000 + 1070500).unwrap();
@@ -600,7 +600,7 @@ fn test_tr_descr_mege_prepare() {
 #[test]
 fn test_tr_descr_mege_install() {
     // TrCreditPhase //
-    let mut credit = CurrencyCollection::with_grams(1);
+    let mut credit = CurrencyCollection::with_coins(1);
     credit.set_other(500, 9_000_000 + 777).unwrap();
     credit.set_other(1005001, 8_000_000 + 1005700).unwrap();
     credit.set_other(1005002, 555_000_000 + 1070500).unwrap();
@@ -708,7 +708,7 @@ pub fn generate_tranzaction(address: AccountId) -> Transaction {
     }
     tr.set_logical_time(data.lt);
     tr.set_end_status(AccountStatus::AccStateFrozen);
-    tr.set_total_fees(CurrencyCollection::with_grams(653));
+    tr.set_total_fees(CurrencyCollection::with_coins(653));
     tr.write_state_update(&s_status_update).unwrap();
     tr.write_description(&s_tr_desc).unwrap();
     tr

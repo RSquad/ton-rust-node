@@ -14,7 +14,7 @@ use crate::{
     fail,
     messages::{Message, MsgAddressInt},
     shard::{AccountIdPrefixFull, ShardIdent},
-    types::{AddSub, ChildCell, Grams},
+    types::{AddSub, ChildCell, Coins},
     BuilderData, Cell, Deserializable, IBitstring, Result, Serializable, SliceData, UInt256,
 };
 use std::cmp::Ordering;
@@ -410,11 +410,11 @@ const MSG_ENVELOPE_TAG2: usize = 0x5;
 
 // msg_envelope#4
 //   cur_addr:IntnveloMsgEnvelope;
-//   next_addr:IntermediateAddress fwd_fee_remaining:Grams
+//   next_addr:IntermediateAddress fwd_fee_remaining:Coins
 //   msg:^(Message Any)
 // msg_envelope#5
 //   cur_addr:IntnveloMsgEnvelope;
-//   next_addr:IntermediateAddress fwd_fee_remaining:Grams
+//   next_addr:IntermediateAddress fwd_fee_remaining:Coins
 //   msg:^(Message Any)
 //   emitted_lt:(Maybe uint64)
 //   metadata:(Maybe MsgMetadata) = MsgEnvelope;
@@ -422,7 +422,7 @@ const MSG_ENVELOPE_TAG2: usize = 0x5;
 pub struct MsgEnvelope {
     cur_addr: IntermediateAddress,
     next_addr: IntermediateAddress,
-    fwd_fee_remaining: Grams,
+    fwd_fee_remaining: Coins,
     msg: ChildCell<Message>,
     emitted_lt: u64,
     metadata: Option<MsgMetadata>,
@@ -433,7 +433,7 @@ impl MsgEnvelope {
     /// Create Envelope with message and remainig_fee
     ///
     #[cfg(test)]
-    pub fn with_message_and_fee(msg: &Message, fwd_fee_remaining: Grams) -> Result<Self> {
+    pub fn with_message_and_fee(msg: &Message, fwd_fee_remaining: Coins) -> Result<Self> {
         if !msg.is_internal() {
             fail!("MsgEnvelope can be made only for internal messages");
         }
@@ -452,7 +452,7 @@ impl MsgEnvelope {
     ///
     pub fn with_routing(
         msg: ChildCell<Message>,
-        fwd_fee_remaining: Grams,
+        fwd_fee_remaining: Coins,
         cur_addr: IntermediateAddress,
         next_addr: IntermediateAddress,
         emitted_lt: u64,
@@ -467,7 +467,7 @@ impl MsgEnvelope {
     pub fn hypercube_routing(
         msg: &Message,
         src_shard: &ShardIdent,
-        fwd_fee_remaining: Grams,
+        fwd_fee_remaining: Coins,
     ) -> Result<Self> {
         let msg_cell = msg.serialize()?;
         let src = msg.src_ref().ok_or_else(|| {
@@ -544,14 +544,14 @@ impl MsgEnvelope {
     ///
     /// Get remaining fee of envelope
     ///
-    pub fn fwd_fee_remaining(&self) -> &Grams {
+    pub fn fwd_fee_remaining(&self) -> &Coins {
         &self.fwd_fee_remaining
     }
 
     ///
     /// Collect transfer fee from envelope
     ///
-    pub fn collect_fee(&mut self, fee: Grams) -> bool {
+    pub fn collect_fee(&mut self, fee: Coins) -> bool {
         self.fwd_fee_remaining.sub(&fee).unwrap() // no excpetion here
     }
 

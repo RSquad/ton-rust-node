@@ -23,15 +23,15 @@ use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
     base64_decode, read_single_root_boc, AccStatusChange, Account, AccountId, AccountStatus,
-    AccountStorage, AddSub, BuilderData, Cell, ComputeSkipReason, ConfigParam8, ConfigParamEnum,
-    ConfigParams, CurrencyCollection, Deserializable, ExternalInboundMessageHeader,
-    GetRepresentationHash, Grams, HashmapAugType, HashmapType, InRefValue, InternalMessageHeader,
-    KeyExtBlkRef, McStateExtra, MerkleProof, Message, MsgAddressInt, OutAction, OutActions, Result,
-    Serializable, ShardAccount, ShardIdent, ShardStateUnsplit, SimpleLib, SliceData, StateInit,
-    StorageInfo, StorageUsageCalc, StorageUsed, TickTock, TrActionPhase, TrBouncePhase,
-    TrComputePhase, TrComputePhaseSkipped, TrComputePhaseVm, TrCreditPhase, TrStoragePhase,
-    Transaction, TransactionDescr, TransactionDescrOrdinary, TransactionTickTock, UInt15, UInt256,
-    VarUInteger32, VarUInteger7, DICT_HASH_MIN_CELLS,
+    AccountStorage, AddSub, BuilderData, Cell, Coins, ComputeSkipReason, ConfigParam8,
+    ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable,
+    ExternalInboundMessageHeader, GetRepresentationHash, HashmapAugType, HashmapType, InRefValue,
+    InternalMessageHeader, KeyExtBlkRef, McStateExtra, MerkleProof, Message, MsgAddressInt,
+    OutAction, OutActions, Result, Serializable, ShardAccount, ShardIdent, ShardStateUnsplit,
+    SimpleLib, SliceData, StateInit, StorageInfo, StorageUsageCalc, StorageUsed, TickTock,
+    TrActionPhase, TrBouncePhase, TrComputePhase, TrComputePhaseSkipped, TrComputePhaseVm,
+    TrCreditPhase, TrStoragePhase, Transaction, TransactionDescr, TransactionDescrOrdinary,
+    TransactionTickTock, UInt15, UInt256, VarUInteger32, VarUInteger7, DICT_HASH_MIN_CELLS,
 };
 use ton_vm::{smart_contract_info::PrevBlocksInfo, stack::read_stack_item};
 
@@ -189,14 +189,14 @@ pub fn create_int_msg_workchain(
     w_id: i8,
     src: AccountId,
     dest: AccountId,
-    value: impl Into<Grams>,
+    value: impl Into<Coins>,
     bounce: bool,
     lt: u64,
 ) -> Message {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, w_id, src).unwrap(),
         MsgAddressInt::with_standart(None, w_id, dest).unwrap(),
-        CurrencyCollection::from_grams(value.into()),
+        CurrencyCollection::from_coins(value.into()),
     );
     hdr.bounce = bounce;
     hdr.created_lt = lt;
@@ -206,7 +206,7 @@ pub fn create_int_msg_workchain(
 pub fn create_int_msg(
     src: AccountId,
     dest: AccountId,
-    value: impl Into<Grams>,
+    value: impl Into<Coins>,
     bounce: bool,
     lt: u64,
 ) -> Message {
@@ -231,7 +231,7 @@ pub fn create_send_two_messages_code() -> Cell {
 }
 
 pub fn create_test_account_workchain(
-    amount: impl Into<Grams>,
+    amount: impl Into<Coins>,
     w_id: i8,
     address: AccountId,
     code: Cell,
@@ -242,7 +242,7 @@ pub fn create_test_account_workchain(
         &StorageInfo::with_values(ACCOUNT_UT, None),
         &AccountStorage::active(
             0,
-            CurrencyCollection::from_grams(amount.into()),
+            CurrencyCollection::from_coins(amount.into()),
             StateInit::default(),
         ),
     );
@@ -253,7 +253,7 @@ pub fn create_test_account_workchain(
 }
 
 pub fn create_test_account(
-    amount: impl Into<Grams>,
+    amount: impl Into<Coins>,
     address: AccountId,
     code: Cell,
     data: Cell,
@@ -297,7 +297,7 @@ pub fn check_account_and_transaction_balances(
         .iterate_out_msgs(|out_msg| {
             if let Some(header) = out_msg.int_header() {
                 right.add(header.value())?;
-                right.grams.add(header.fwd_fee())?;
+                right.coins.add(header.fwd_fee())?;
             }
             Ok(true)
         })
@@ -310,30 +310,30 @@ pub fn check_account_and_transaction_balances(
         let total_fee = trans.total_fees().clone();
 
         let mut fees = CurrencyCollection::default();
-        fees.grams += descr.storage_ph.as_ref().map_or(0, |st| st.storage_fees_collected.as_u128());
+        fees.coins += descr.storage_ph.as_ref().map_or(0, |st| st.storage_fees_collected.as_u128());
         if let Some(storage) = descr.storage_ph.as_ref() {
             if storage.status_change == AccStatusChange::Deleted {
                 if descr.credit_first {
                     fees.add(&msg.get_value().cloned().unwrap_or_default()).unwrap();
-                    fees.grams -= msg.get_value().cloned().unwrap_or_default().grams;
+                    fees.coins -= msg.get_value().cloned().unwrap_or_default().coins;
                 }
                 fees.add(&acc_before.balance().cloned().unwrap_or_default()).unwrap();
-                fees.grams -= acc_before.balance().map_or(0, |cc| cc.grams.as_u128());
+                fees.coins -= acc_before.balance().map_or(0, |cc| cc.coins.as_u128());
             }
         }
         if let Some(cr) = descr.credit_ph.as_ref() {
             if let Some(g) = cr.due_fees_collected.as_ref() {
-                fees.grams += *g
+                fees.coins += *g
             }
         }
         if let TrComputePhase::Vm(cp) = &descr.compute_ph {
-            fees.grams += cp.gas_fees
+            fees.coins += cp.gas_fees
         }
         if let Some(ap) = descr.action.as_ref() {
-            fees.grams += ap.total_action_fees()
+            fees.coins += ap.total_action_fees()
         }
         if let Some(TrBouncePhase::Ok(bp)) = descr.bounce.as_ref() {
-            fees.grams += bp.msg_fees
+            fees.coins += bp.msg_fees
         }
         let addr = msg.dst().unwrap();
         let is_special =
@@ -346,13 +346,13 @@ pub fn check_account_and_transaction_balances(
             calc.append_cell(&in_msg_cell, false, &mut 0).unwrap();
             let fwd_prices = config.fwd_prices(msg.is_masterchain()).unwrap();
             let in_fwd_fee = fwd_prices.calc_fwd_fee(calc.bits(), calc.cells());
-            fees.grams += in_fwd_fee;
+            fees.coins += in_fwd_fee;
         }
         pretty_assertions::assert_eq!(fees, total_fee);
     }
 
     // check messages fees
-    let mut fwd_fees = Grams::zero();
+    let mut fwd_fees = Coins::zero();
     trans
         .iterate_out_msgs(|out_msg| {
             if let Some(header) = out_msg.int_header() {
@@ -364,7 +364,7 @@ pub fn check_account_and_transaction_balances(
 
     let descr = trans.read_description().unwrap();
     if let TransactionDescr::Ordinary(descr) = descr {
-        let mut trans_fwd_fee = Grams::zero();
+        let mut trans_fwd_fee = Coins::zero();
         if let Some(ap) = descr.action.as_ref() {
             if ap.success {
                 trans_fwd_fee += ap.total_fwd_fees() - ap.total_action_fees()
@@ -397,13 +397,13 @@ pub fn check_account_and_transaction(
     acc_after: &Account,
     msg: &Message,
     trans: Option<&Transaction>,
-    result_account_balance: impl Into<Grams>,
+    result_account_balance: impl Into<Coins>,
     count_out_msgs: usize,
 ) {
     if let Some(trans) = trans {
         pretty_assertions::assert_eq!(
             (trans.out_msgs.len().unwrap(), acc_after.balance().cloned().unwrap_or_default()),
-            (count_out_msgs, CurrencyCollection::from_grams(result_account_balance.into()))
+            (count_out_msgs, CurrencyCollection::from_coins(result_account_balance.into()))
         );
     }
     check_account_and_transaction_balances(acc_before, acc_after, msg, trans);
@@ -474,7 +474,7 @@ pub fn execute_c(
     msg: &Message,
     acc: &mut Account,
     tr_lt: u64,
-    result_account_balance: impl Into<Grams>,
+    result_account_balance: impl Into<Coins>,
     count_out_msgs: usize,
 ) -> Result<Transaction> {
     let msg_cell = msg.serialize()?;
@@ -500,7 +500,7 @@ pub struct ExecutionCaseResult {
 impl ExecutionCaseResult {
     pub fn expect_balance(&self, expect_balance: u64) -> &Self {
         pretty_assertions::assert_eq!(
-            self.acc.balance().map_or(0, |cc| cc.grams.as_u128()),
+            self.acc.balance().map_or(0, |cc| cc.coins.as_u128()),
             expect_balance as u128,
             "expected balance {expect_balance}"
         );
@@ -619,7 +619,7 @@ impl ExecutionCaseResult {
         let descr = self.read_ordinary_description();
         pretty_assertions::assert_eq!(
             descr.credit_ph.unwrap().credit,
-            CurrencyCollection::with_grams(credit),
+            CurrencyCollection::with_coins(credit),
             "credit mismatch"
         );
         self
@@ -679,7 +679,7 @@ pub fn execute_custom_transaction(
     data: Cell,
     msg_balance: u64,
     bounce: bool,
-    result_account_balance: impl Into<Grams>,
+    result_account_balance: impl Into<Coins>,
     count_out_msgs: usize,
 ) -> (Account, Transaction) {
     let acc_id = SENDER_ACCOUNT.clone();
@@ -717,7 +717,7 @@ pub fn execute_custom_transaction_with_extra_balance(
     let trans = execute(&msg, &mut acc, tr_lt).unwrap();
 
     pretty_assertions::assert_eq!(trans.out_msgs.len().unwrap(), count_out_msgs);
-    let mut answer = CurrencyCollection::with_grams(result_account_balance);
+    let mut answer = CurrencyCollection::with_coins(result_account_balance);
     answer
         .other
         .set(
@@ -808,10 +808,10 @@ pub fn replay_transaction(
     let msg_cell = transaction.in_msg_cell();
     let account_after = Account::construct_from_file(acc_after).unwrap_or_else(|_| account.clone());
 
-    let mut left = account.balance().cloned().unwrap_or_default().grams;
+    let mut left = account.balance().cloned().unwrap_or_default().coins;
     if let Some(msg) = message.as_ref() {
         if let Some(value) = msg.get_value() {
-            left.add(&value.grams).unwrap();
+            left.add(&value.coins).unwrap();
         }
     }
 
@@ -852,12 +852,12 @@ pub fn replay_transaction(
     let mut our_transaction =
         execute_with_params(mc_state_proof.clone(), msg_cell, &mut account, &params).unwrap();
 
-    let mut right = account.balance().cloned().unwrap_or_default().grams;
-    right.add(&our_transaction.total_fees().grams).unwrap();
+    let mut right = account.balance().cloned().unwrap_or_default().coins;
+    right.add(&our_transaction.total_fees().coins).unwrap();
     our_transaction
         .iterate_out_msgs(|out_msg| {
             if let Some(header) = out_msg.int_header() {
-                right.add(&header.value().grams)?;
+                right.add(&header.value().coins)?;
                 right.add(header.fwd_fee())?;
             }
             Ok(true)
@@ -1081,11 +1081,11 @@ impl TransactionTestCase {
         self.out_actions.push_back(OutAction::new_send(mode, msg2.clone()));
         let msg_remain_fee = MSG_FWD_FEE - MSG_MINE_FEE;
         let int_header = msg1.int_header_mut().unwrap();
-        int_header.value.grams = (MSG1_BALANCE - MSG_FWD_FEE).into();
+        int_header.value.coins = (MSG1_BALANCE - MSG_FWD_FEE).into();
         int_header.fwd_fee = msg_remain_fee.into();
         int_header.created_at = BLOCK_UT.into();
         let int_header = msg2.int_header_mut().unwrap();
-        int_header.value.grams = (MSG2_BALANCE - MSG_FWD_FEE).into();
+        int_header.value.coins = (MSG2_BALANCE - MSG_FWD_FEE).into();
         int_header.fwd_fee = msg_remain_fee.into();
         int_header.created_at = BLOCK_UT.into();
         (msg1, msg2)
@@ -1167,7 +1167,7 @@ impl TransactionTestContext {
             &self.acc,
             &self.msg,
             trans.as_ref().ok(),
-            self.new_acc.balance().unwrap().grams,
+            self.new_acc.balance().unwrap().coins,
             count_out_msgs,
         );
         self.new_acc.set_last_paid(BLOCK_UT);
@@ -1177,7 +1177,7 @@ impl TransactionTestContext {
     pub(crate) fn create_sample_transaction(self, test_case: TransactionTestCase) -> Transaction {
         let mut trans =
             Transaction::with_account_and_message(&self.new_acc, &self.msg, self.tr_lt).unwrap();
-        trans.set_total_fees(CurrencyCollection::with_grams(test_case.total_fees));
+        trans.set_total_fees(CurrencyCollection::with_coins(test_case.total_fees));
         trans.set_now(BLOCK_UT);
         let mut description = TransactionDescrOrdinary::default();
         description.storage_ph = Some(TrStoragePhase {
@@ -1190,7 +1190,7 @@ impl TransactionTestContext {
         } else {
             Some(TrCreditPhase {
                 due_fees_collected: None,
-                credit: CurrencyCollection::with_grams(test_case.msg_income),
+                credit: CurrencyCollection::with_coins(test_case.msg_income),
             })
         };
         description.compute_ph = TrComputePhase::Vm(test_case.phase_compute_vm);

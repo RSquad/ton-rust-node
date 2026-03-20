@@ -45,7 +45,7 @@ fn create_transation() -> Transaction {
         AccountStatus::AccStateActive,
     );
     t.set_logical_time(1111);
-    t.set_total_fees(CurrencyCollection::with_grams(2222));
+    t.set_total_fees(CurrencyCollection::with_coins(2222));
     t
 }
 
@@ -212,7 +212,7 @@ fn transaction() -> Transaction {
 
     tr.set_logical_time(123423);
     tr.set_end_status(AccountStatus::AccStateFrozen);
-    tr.set_total_fees(CurrencyCollection::with_grams(653));
+    tr.set_total_fees(CurrencyCollection::with_coins(653));
     tr.write_in_msg(Some(&s_in_msg)).unwrap();
     tr.add_out_message(&s_out_msg1).unwrap();
     tr.add_out_message(&s_out_msg2).unwrap();
@@ -248,16 +248,16 @@ fn test_work_with_in_msg_desc() {
     // test InMsg::IHR
     let msg = get_message_with_addrs(create_account_id(3), create_account_id(4));
 
-    let in_msg_ihr = InMsg::ihr(chcell!(msg), tr_cell.clone(), Grams::one(), Cell::default());
+    let in_msg_ihr = InMsg::ihr(chcell!(msg), tr_cell.clone(), Coins::one(), Cell::default());
 
     msg_desc.insert(&in_msg_ihr).unwrap();
     assert_eq!(msg_desc.len().unwrap(), 3);
 
     // test InMsg::Final
     let msg = get_message_with_addrs(create_account_id(4), create_account_id(5));
-    let msg = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let msg = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
 
-    let in_msg_final = InMsg::final_msg(chcell!(msg), tr_cell.clone(), Grams::one());
+    let in_msg_final = InMsg::final_msg(chcell!(msg), tr_cell.clone(), Coins::one());
 
     msg_desc.insert(&in_msg_final).unwrap();
     assert_eq!(msg_desc.len().unwrap(), 4);
@@ -267,9 +267,9 @@ fn test_work_with_in_msg_desc() {
     let msg1 = get_message_with_addrs(create_account_id(6), create_account_id(4));
 
     let in_msg_transit = InMsg::transit(
-        chcell!(MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap()),
-        chcell!(MsgEnvelope::with_message_and_fee(&msg1, Grams::one()).unwrap()),
-        Grams::one(),
+        chcell!(MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap()),
+        chcell!(MsgEnvelope::with_message_and_fee(&msg1, Coins::one()).unwrap()),
+        Coins::one(),
     );
 
     msg_desc.insert(&in_msg_transit).unwrap();
@@ -277,9 +277,9 @@ fn test_work_with_in_msg_desc() {
 
     // test InMsg::DiscardedFinal
     let msg = get_message_with_addrs(create_account_id(6), create_account_id(7));
-    let msg = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let msg = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
 
-    let in_msg_final = InMsg::discarded_final(chcell!(msg), 453453, Grams::one());
+    let in_msg_final = InMsg::discarded_final(chcell!(msg), 453453, Coins::one());
 
     msg_desc.insert(&in_msg_final).unwrap();
     assert_eq!(msg_desc.len().unwrap(), 6);
@@ -288,9 +288,9 @@ fn test_work_with_in_msg_desc() {
     let msg = get_message_with_addrs(create_account_id(7), create_account_id(8));
 
     let in_msg_transit = InMsg::DiscardedTransit(InMsgDiscardedTransit::with_cells(
-        chcell!(MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap()),
+        chcell!(MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap()),
         453453,
-        Grams::one(),
+        Coins::one(),
         SliceData::new_empty().into_cell().unwrap(),
     ));
 
@@ -299,9 +299,9 @@ fn test_work_with_in_msg_desc() {
 
     // test InMsg::InMsgDeferredFinal
     let msg = get_message_with_addrs(create_account_id(9), create_account_id(10));
-    let msg = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let msg = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
 
-    let in_msg_final = InMsg::deferred_final(chcell!(msg), tr_cell.clone(), Grams::one());
+    let in_msg_final = InMsg::deferred_final(chcell!(msg), tr_cell.clone(), Coins::one());
 
     msg_desc.insert(&in_msg_final).unwrap();
     assert_eq!(msg_desc.len().unwrap(), 8);
@@ -311,8 +311,8 @@ fn test_work_with_in_msg_desc() {
     let msg1 = get_message_with_addrs(create_account_id(13), create_account_id(14));
 
     let in_msg_transit = InMsg::deferred_transit(
-        chcell!(MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap()),
-        chcell!(MsgEnvelope::with_message_and_fee(&msg1, Grams::one()).unwrap()),
+        chcell!(MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap()),
+        chcell!(MsgEnvelope::with_message_and_fee(&msg1, Coins::one()).unwrap()),
     );
 
     msg_desc.insert(&in_msg_transit).unwrap();

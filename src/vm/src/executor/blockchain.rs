@@ -124,9 +124,9 @@ pub(super) fn execute_send_msg(engine: &mut Engine) -> Status {
 
     if let Some(hdr) = msg.int_header_mut() {
         if x & SENDMSG_ALL_BALANCE != 0 {
-            hdr.value.grams = engine.smci_extra_param(7, 0)?.as_grams()?.try_into()?
+            hdr.value.coins = engine.smci_extra_param(7, 0)?.as_coins()?.try_into()?
         } else if x & SENDMSG_REMAINING_MSG_BALANCE != 0 {
-            hdr.value.grams += engine.smci_extra_param(11, 0)?.as_grams()?
+            hdr.value.coins += engine.smci_extra_param(11, 0)?.as_coins()?
         }
         let fwd_full_fees = prices.lump_price.into();
         let fwd_mine_fees = prices.mine_fee_checked(&fwd_full_fees)?;
@@ -182,7 +182,7 @@ pub(super) fn execute_rawreserve(engine: &mut Engine) -> Status {
     fetch_stack(engine, 2)?;
     let y = engine.cmd.var(0).as_integer_value(0..=0b0001_1111)?;
     let mut suffix = BuilderData::with_raw(vec![y], 8)?;
-    let x = engine.cmd.var(1).as_grams()?;
+    let x = engine.cmd.var(1).as_coins()?;
     suffix.append_builder(&serialize_currency_collection(x, None)?)?;
     add_action(engine, ACTION_RESERVE, None, suffix)
 }
@@ -194,7 +194,7 @@ pub(super) fn execute_rawreservex(engine: &mut Engine) -> Status {
     let y = engine.cmd.var(0).as_integer_value(0..=0b0001_1111)?;
     let mut suffix = BuilderData::with_raw(vec![y], 8)?;
     let other = engine.cmd.var(1).as_dict()?;
-    let x = engine.cmd.var(2).as_grams()?;
+    let x = engine.cmd.var(2).as_coins()?;
     suffix.append_builder(&serialize_currency_collection(x, other.cloned())?)?;
     add_action(engine, ACTION_RESERVE, None, suffix)
 }

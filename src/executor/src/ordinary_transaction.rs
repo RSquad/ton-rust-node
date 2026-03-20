@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "timings")]
 use std::time::Instant;
 use ton_block::{
-    error, fail, AccStatusChange, Account, AddSub, Cell, CommonMsgInfo, ComputeSkipReason,
-    Deserializable, Grams, Message, MsgAddressInt, Result, Serializable, StorageUsageCalc,
-    TrBouncePhase, TrComputePhase, Transaction, TransactionDescr, TransactionDescrOrdinary,
-    MASTERCHAIN_ID, MAX_MSG_MERKLE_DEPTH,
+    error, fail, AccStatusChange, Account, AddSub, Cell, Coins, CommonMsgInfo, ComputeSkipReason,
+    Deserializable, Message, MsgAddressInt, Result, Serializable, StorageUsageCalc, TrBouncePhase,
+    TrComputePhase, Transaction, TransactionDescr, TransactionDescrOrdinary, MASTERCHAIN_ID,
+    MAX_MSG_MERKLE_DEPTH,
 };
 use ton_vm::{
     boolean, int,
@@ -122,7 +122,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         log::debug!(
             target: "executor",
             "acc_balance: {}, msg_balance: {}, credit_first: {}, is_special: {}",
-            acc_balance.grams, msg_balance.grams, !bounce, is_special);
+            acc_balance.coins, msg_balance.coins, !bounce, is_special);
 
         log::debug!(target: "executor", "account_last_tr_lt: {}, last_tr_lt: {}, msg_lt: {}, now: {}",
             account.last_tr_time().unwrap_or_default(),
@@ -169,13 +169,13 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             }
             let fwd_prices = self.config.get_fwd_prices(in_msg.is_masterchain());
             let in_fwd_fee = fwd_prices.calc_fwd_fee(calc.bits(), calc.cells());
-            log::debug!(target: "executor", "import message fee: {}, acc_balance: {}", in_fwd_fee, acc_balance.grams);
+            log::debug!(target: "executor", "import message fee: {}, acc_balance: {}", in_fwd_fee, acc_balance.coins);
 
-            let in_fwd_fee = Grams::try_from(in_fwd_fee)?;
-            if !acc_balance.grams.sub(&in_fwd_fee)? {
+            let in_fwd_fee = Coins::try_from(in_fwd_fee)?;
+            if !acc_balance.coins.sub(&in_fwd_fee)? {
                 fail!(ExecutorError::NoFundsToImportMsg)
             }
-            tr.add_fee_grams(&in_fwd_fee)?;
+            tr.add_fee_coins(&in_fwd_fee)?;
         }
 
         if description.credit_first && !is_ext_msg {
@@ -208,8 +208,8 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             ))),
         };
 
-        if description.credit_first && msg_balance.grams > acc_balance.grams {
-            msg_balance.grams = acc_balance.grams;
+        if description.credit_first && msg_balance.coins > acc_balance.coins {
+            msg_balance.coins = acc_balance.coins;
         }
 
         log::debug!(target: "executor",
@@ -255,8 +255,8 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         smc_info.calc_rand_seed(params.seed_block.clone(), &account_id.get_bytestring(0));
         let mut stack = Stack::new();
         stack
-            .push(int!(acc_balance.grams.as_u128()))
-            .push(int!(msg_balance.grams.as_u128()))
+            .push(int!(acc_balance.coins.as_u128()))
+            .push(int!(msg_balance.coins.as_u128()))
             .push(StackItem::Cell(in_msg_cell))
             .push(StackItem::Slice(in_msg.body().cloned().unwrap_or_default()))
             .push(boolean!(is_ext_msg));
@@ -309,7 +309,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         description.compute_ph = compute_ph;
         description.action = match &description.compute_ph {
             TrComputePhase::Vm(phase) => {
-                tr.add_fee_grams(&phase.gas_fees)?;
+                tr.add_fee_coins(&phase.gas_fees)?;
                 if phase.success {
                     log::debug!(target: "executor", "compute_phase: success");
                     log::debug!(target: "executor", "action_phase: lt={}", lt);
@@ -403,7 +403,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             // if money can be returned to sender
             // restore account balance - storage fee
             if let Some(TrBouncePhase::Ok(_)) = description.bounce {
-                log::debug!(target: "executor", "restore balance {} => {}", acc_balance.grams, original_acc_balance.grams);
+                log::debug!(target: "executor", "restore balance {} => {}", acc_balance.coins, original_acc_balance.coins);
                 acc_balance = original_acc_balance;
             }
         }
@@ -424,7 +424,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 account.uninit_account();
             }
         }
-        log::debug!(target: "executor", "set balance {}", acc_balance.grams);
+        log::debug!(target: "executor", "set balance {}", acc_balance.coins);
         account.set_balance(acc_balance);
         log::debug!(target: "executor", "add messages {}, start_lt {}", out_msgs.len(), lt);
         let lt = self.add_messages(&mut tr, out_msgs, lt)?;
@@ -447,8 +447,8 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             Some(in_msg) => in_msg,
             None => return Ok(stack),
         };
-        let acc_balance = int!(account.balance().map_or(0, |value| value.grams.as_u128()));
-        let msg_balance = int!(in_msg.get_value().map_or(0, |value| value.grams.as_u128()));
+        let acc_balance = int!(account.balance().map_or(0, |value| value.coins.as_u128()));
+        let msg_balance = int!(in_msg.get_value().map_or(0, |value| value.coins.as_u128()));
         let function_selector = boolean!(in_msg.is_inbound_external());
         let body_slice = in_msg.body().cloned().unwrap_or_default();
         let in_msg_cell = in_msg.serialize().unwrap_or_default();

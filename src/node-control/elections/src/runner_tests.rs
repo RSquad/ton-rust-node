@@ -20,7 +20,7 @@ use contracts::{
 use mockall::mock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use ton_block::{
-    BuilderData, Cell, ConfigParam15, Deserializable, Grams as Coins, MsgAddressInt, SliceData,
+    BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, SliceData,
     ValidatorSet, read_single_root_boc,
 };
 

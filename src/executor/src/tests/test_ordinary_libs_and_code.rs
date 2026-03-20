@@ -15,7 +15,7 @@ use pretty_assertions::assert_eq;
 use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    AccountId, AccountStatus, BuilderData, Cell, CurrencyCollection, GetRepresentationHash, Grams,
+    AccountId, AccountStatus, BuilderData, Cell, Coins, CurrencyCollection, GetRepresentationHash,
     HashmapE, MsgAddressInt, Serializable, SliceData, StateInit, Status, TrComputePhase,
     Transaction, DICT_HASH_MIN_CELLS, SENDMSG_ORDINARY, SET_LIB_CODE_ADD_PRIVATE,
 };
@@ -406,7 +406,7 @@ fn storage_fee_instruction(
     let data = in_msg.serialize().unwrap();
 
     let mut acc = create_test_account(start_balance, acc_id.clone(), code, data);
-    acc.set_due_payment(Some(Grams::from(begin_due)));
+    acc.set_due_payment(Some(Coins::from(begin_due)));
 
     let msg = create_int_msg(SENDER_ACCOUNT.clone(), acc_id, 200_000_000, bounce, BLOCK_LT - 2);
 
@@ -425,7 +425,7 @@ fn storage_fee_instruction(
     let storage_ph = get_tr_descr(&trans).storage_ph.unwrap();
     assert_eq!(storage_ph.storage_fees_due.is_some(), storage_phase_due);
     assert_eq!(
-        Grams::from(storage_fees_collected),
+        Coins::from(storage_fees_collected),
         storage_ph.storage_fees_collected + storage_ph.storage_fees_due.unwrap_or_default()
     );
 }
@@ -453,7 +453,7 @@ fn account_uninit_with_libs_disabled() {
 
     let mut acc = Account::uninit(
         MsgAddressInt::with_standart(None, -1, acc_id.clone()).unwrap(),
-        CurrencyCollection::with_grams(10000000000000000000),
+        CurrencyCollection::with_coins(10000000000000000000),
         10,
         10,
     );
@@ -610,7 +610,7 @@ fn run_account_non_zero_level_stateinit(
         ),
         Mode::Uninit => Account::uninit(
             acc_addr,
-            CurrencyCollection::with_grams(1_000_000_000_000),
+            CurrencyCollection::with_coins(1_000_000_000_000),
             BLOCK_LT + 3,
             BLOCK_UT - 300000000,
         ),

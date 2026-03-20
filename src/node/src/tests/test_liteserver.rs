@@ -616,7 +616,7 @@ impl EngineOperations for LiteServerTestEngine {
 
 //     let account = Account::active(
 //         address,
-//         CurrencyCollection::with_grams(1000000),
+//         CurrencyCollection::with_coins(1000000),
 //         1,
 //         1640995200,
 //         state_init,
@@ -1349,7 +1349,7 @@ fn create_test_internal_message(src: &UInt256, dst: &UInt256) -> Message {
     let hdr = InternalMessageHeader::with_addresses(
         src_addr,
         dst_addr,
-        CurrencyCollection::with_grams(100),
+        CurrencyCollection::with_coins(100),
     );
     Message::with_int_header(hdr)
 }

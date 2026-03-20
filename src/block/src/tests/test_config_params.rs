@@ -50,9 +50,9 @@ fn test_config_param_16() {
 
 fn get_config_param17() -> ConfigParam17 {
     ConfigParam17 {
-        min_stake: Grams::zero(),
-        max_stake: Grams::one(),
-        min_total_stake: Grams::from(100_000_000),
+        min_stake: Coins::zero(),
+        max_stake: Coins::one(),
+        min_total_stake: Coins::from(100_000_000),
         max_stake_factor: 12121,
     }
 }
@@ -361,8 +361,8 @@ fn test_config_params() {
     write_read_and_assert(cp.clone());
 
     let c6 = ConfigParamEnum::ConfigParam6(ConfigParam6 {
-        mint_new_price: Grams::new(123),
-        mint_add_price: Grams::new(1458347523),
+        mint_new_price: Coins::new(123),
+        mint_add_price: Coins::new(1458347523),
     });
     cp.set_config(c6.clone()).unwrap();
     let c = cp.config(6).unwrap().unwrap();
@@ -659,7 +659,7 @@ fn get_config_param_39() -> ConfigParam39 {
 fn get_config_param_40() -> MisbehaviourPunishmentConfig {
     let mut rng = rand::thread_rng();
     MisbehaviourPunishmentConfig {
-        default_flat_fine: Grams::new(rng.gen()),
+        default_flat_fine: Coins::new(rng.gen()),
         default_proportional_fine: rng.gen(),
         severity_flat_mult: rng.gen(),
         severity_proportional_mult: rng.gen(),
@@ -815,8 +815,8 @@ fn get_config_param10() -> ConfigParam10 {
 fn get_config_param14() -> ConfigParam14 {
     ConfigParam14 {
         block_create_fees: BlockCreateFees {
-            masterchain_block_fee: Grams::new(1458347523),
-            basechain_block_fee: Grams::new(145800000000003),
+            masterchain_block_fee: Coins::new(1458347523),
+            basechain_block_fee: Coins::new(145800000000003),
         },
     }
 }

@@ -10,8 +10,8 @@
  */
 use num::BigInt;
 use ton_block::{
-    fail, AccountId, ConfigParam18, ConfigParams, FundamentalSmcAddresses, GasLimitsPrices,
-    GlobalCapabilities, Grams, Mask, MsgAddressInt, MsgForwardPrices, Result, SizeLimitsConfig,
+    fail, AccountId, Coins, ConfigParam18, ConfigParams, FundamentalSmcAddresses, GasLimitsPrices,
+    GlobalCapabilities, Mask, MsgAddressInt, MsgForwardPrices, Result, SizeLimitsConfig,
     StorageInfo, StoragePrices, UInt256, SUPPORTED_VERSION,
 };
 
@@ -254,7 +254,7 @@ impl BlockchainConfig {
         storage: &StorageInfo,
         is_masterchain: bool,
         now: u32,
-    ) -> Result<Grams> {
+    ) -> Result<Coins> {
         let storage_fee = self.storage_prices.calc_storage_fees(
             storage.used().cells(),
             storage.used().bits(),
@@ -262,7 +262,7 @@ impl BlockchainConfig {
             now,
             is_masterchain,
         )?;
-        Grams::try_from(storage_fee)
+        Coins::try_from(storage_fee)
     }
 
     /// Check if account is special account

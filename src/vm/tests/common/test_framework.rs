@@ -499,7 +499,7 @@ impl TestCase {
                 if let Some(data) = account.data() {
                     args.ctrls.put(4, StackItem::Cell(data.clone())).unwrap();
                 }
-                account.balance().map_or(0, |value| value.grams.as_u128())
+                account.balance().map_or(0, |value| value.coins.as_u128())
             } else {
                 0
             };
@@ -510,7 +510,7 @@ impl TestCase {
                         libraries.push(state_init.libraries().clone().inner());
                     }
                 }
-                let value = message.value().map_or(0, |value| value.grams.as_u128());
+                let value = message.value().map_or(0, |value| value.coins.as_u128());
                 assert!(args.stack.is_empty(), "Stack must be empty when using real data");
                 args.stack
                     .push(StackItem::int(balance))

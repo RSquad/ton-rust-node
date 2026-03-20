@@ -184,7 +184,7 @@ impl<'m, 'a> PathMap<'m, 'a> {
         fail!("{}/{} must be the integer or a string with the integer", self.path.join("/"), name)
     }
 
-    pub fn get_grams(&self, name: &'a str) -> Result<Grams> {
+    pub fn get_coins(&self, name: &'a str) -> Result<Coins> {
         if let Ok(value) = self.get_item(name) {
             if let Some(v) = value.as_u64() {
                 return Ok(v.into());
@@ -192,7 +192,7 @@ impl<'m, 'a> PathMap<'m, 'a> {
         }
         if let Ok(value) = self.get_item(&(name.to_string() + "_dec")) {
             if let Some(v) = value.as_str() {
-                return Grams::from_str(v).map_err(|err| {
+                return Coins::from_str(v).map_err(|err| {
                     error!(
                         "{}/{} must be the integer or a string with the integer {}: {}",
                         self.path.join("/"),
@@ -205,7 +205,7 @@ impl<'m, 'a> PathMap<'m, 'a> {
         }
         if let Ok(value) = self.get_item(name) {
             if let Some(v) = value.as_str() {
-                return Grams::from_str(v).map_err(|err| {
+                return Coins::from_str(v).map_err(|err| {
                     error!(
                         "{}/{} must be the integer or a string with the integer {}: {}",
                         self.path.join("/"),
@@ -636,12 +636,12 @@ impl StateParser {
     pub fn parse_jetton_bridge_params(p: &PathMap) -> Result<JettonBridgeParams> {
         let oracles = Self::parse_oracles(p)?;
         let prices = JettonBridgePrices {
-            bridge_burn_fee: p.get_grams("bridge_burn_fee")?,
-            bridge_mint_fee: p.get_grams("bridge_mint_fee")?,
-            wallet_min_tons_for_storage: p.get_grams("wallet_min_tons_for_storage")?,
-            wallet_gas_consumption: p.get_grams("wallet_gas_consumption")?,
-            minter_min_tons_for_storage: p.get_grams("minter_min_tons_for_storage")?,
-            discover_gas_consumption: p.get_grams("discover_gas_consumption")?,
+            bridge_burn_fee: p.get_coins("bridge_burn_fee")?,
+            bridge_mint_fee: p.get_coins("bridge_mint_fee")?,
+            wallet_min_tons_for_storage: p.get_coins("wallet_min_tons_for_storage")?,
+            wallet_gas_consumption: p.get_coins("wallet_gas_consumption")?,
+            minter_min_tons_for_storage: p.get_coins("minter_min_tons_for_storage")?,
+            discover_gas_consumption: p.get_coins("discover_gas_consumption")?,
         };
         Ok(JettonBridgeParams {
             prices,
@@ -709,8 +709,8 @@ impl StateParser {
 
         self.parse_parameter(config, 6, |value| {
             Ok(ConfigParamEnum::ConfigParam6(ConfigParam6 {
-                mint_new_price: value.get_grams("mint_new_price")?,
-                mint_add_price: value.get_grams("mint_add_price")?,
+                mint_new_price: value.get_coins("mint_new_price")?,
+                mint_add_price: value.get_coins("mint_add_price")?,
             }))
         })?;
 
@@ -748,8 +748,8 @@ impl StateParser {
         self.parse_parameter(config, 14, |p14| {
             Ok(ConfigParamEnum::ConfigParam14(ConfigParam14 {
                 block_create_fees: BlockCreateFees {
-                    masterchain_block_fee: p14.get_grams("masterchain_block_fee")?,
-                    basechain_block_fee: p14.get_grams("basechain_block_fee")?,
+                    masterchain_block_fee: p14.get_coins("masterchain_block_fee")?,
+                    basechain_block_fee: p14.get_coins("basechain_block_fee")?,
                 },
             }))
         })?;
@@ -773,9 +773,9 @@ impl StateParser {
 
         self.parse_parameter(config, 17, |p17| {
             Ok(ConfigParamEnum::ConfigParam17(ConfigParam17 {
-                min_stake: p17.get_grams("min_stake")?,
-                max_stake: p17.get_grams("max_stake")?,
-                min_total_stake: p17.get_grams("min_total_stake")?,
+                min_stake: p17.get_coins("min_stake")?,
+                max_stake: p17.get_coins("max_stake")?,
+                min_total_stake: p17.get_coins("min_total_stake")?,
                 max_stake_factor: p17.get_num32("max_stake_factor")?,
             }))
         })?;
@@ -879,7 +879,7 @@ impl StateParser {
 
         self.parse_parameter(config, 40, |p40| {
             Ok(ConfigParamEnum::ConfigParam40(MisbehaviourPunishmentConfig {
-                default_flat_fine: p40.get_grams("default_flat_fine")?,
+                default_flat_fine: p40.get_coins("default_flat_fine")?,
                 default_proportional_fine: p40.get_num32("default_proportional_fine")?,
                 severity_flat_mult: p40.get_num16("severity_flat_mult")?,
                 severity_proportional_mult: p40.get_num16("severity_proportional_mult")?,
@@ -990,8 +990,8 @@ impl StateParser {
             }
         }
 
-        match map_path.get_grams("total_balance") {
-            Ok(balance) => self.state.set_total_balance(CurrencyCollection::from_grams(balance)),
+        match map_path.get_coins("total_balance") {
+            Ok(balance) => self.state.set_total_balance(CurrencyCollection::from_coins(balance)),
             Err(err) => {
                 if self.mandatory_params != 0 {
                     return Err(err);
@@ -1035,8 +1035,8 @@ impl StateParser {
                         }
                     }
                 }
-                match master.get_grams("global_balance") {
-                    Ok(balance) => self.extra.global_balance.grams = balance,
+                match master.get_coins("global_balance") {
+                    Ok(balance) => self.extra.global_balance.coins = balance,
                     Err(err) => {
                         if self.mandatory_params != 0 {
                             return Err(err);

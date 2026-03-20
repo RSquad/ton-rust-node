@@ -123,7 +123,7 @@ pub fn generate_transaction(address: AccountId) -> Transaction {
     let mut tr = Transaction::with_address_and_status(address, AccountStatus::AccStateActive);
     tr.set_logical_time(123423);
     tr.set_end_status(AccountStatus::AccStateFrozen);
-    tr.set_total_fees(CurrencyCollection::with_grams(653));
+    tr.set_total_fees(CurrencyCollection::with_coins(653));
     tr.write_in_msg(Some(&s_in_msg)).unwrap();
     tr.add_out_message(&s_out_msg1).unwrap();
     tr.add_out_message(&s_out_msg2).unwrap();

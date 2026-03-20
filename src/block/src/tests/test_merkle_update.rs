@@ -19,7 +19,7 @@ use std::{fs::read, path::Path, time::Instant};
 fn test_merkle_update() {
     let mut acc = generate_test_account(true, AccountTestOptions::with_default_setup(true));
     let old_cell = acc.serialize().unwrap();
-    let f = CurrencyCollection::with_grams(20);
+    let f = CurrencyCollection::with_coins(20);
     acc.add_funds(&f).unwrap();
 
     let mut data = SliceData::new(vec![
@@ -59,7 +59,7 @@ fn test_merkle_update() {
 fn test_merkle_update_serialization() {
     let mut acc = generate_test_account(true, AccountTestOptions::with_default_setup(true));
     let old_cell = acc.serialize().unwrap();
-    let f = CurrencyCollection::with_grams(20);
+    let f = CurrencyCollection::with_coins(20);
     acc.add_funds(&f).unwrap();
     let data = SliceData::new(vec![
         0b00011111, 0b11111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111,
@@ -110,7 +110,7 @@ fn test_merkle_update_with_hasmaps() {
     let gen = |a: u32| {
         let mut acc = generate_test_account(true, AccountTestOptions::with_default_setup(true));
         let old_cell = acc.serialize().unwrap();
-        let f = CurrencyCollection::with_grams(a as u64);
+        let f = CurrencyCollection::with_coins(a as u64);
         acc.add_funds(&f).unwrap();
         let data = SliceData::new(vec![
             (a & 0xff) as u8,

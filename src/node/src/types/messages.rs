@@ -10,9 +10,9 @@
  */
 use std::fmt::{self, Display, Formatter};
 use ton_block::{
-    error, fail, AccountId, AccountIdPrefixFull, AddSub, Cell, ChildCell, Deserializable,
-    EnqueuedMsg, Grams, IntermediateAddress, Message, MsgEnvelope, MsgMetadata, OutMsgQueueKey,
-    Result, ShardIdent, SliceData, UInt256,
+    error, fail, AccountId, AccountIdPrefixFull, AddSub, Cell, ChildCell, Coins, Deserializable,
+    EnqueuedMsg, IntermediateAddress, Message, MsgEnvelope, MsgMetadata, OutMsgQueueKey, Result,
+    ShardIdent, SliceData, UInt256,
 };
 use ton_executor::BlockchainConfig;
 
@@ -52,7 +52,7 @@ impl MsgEnvelopeStuff {
         msg: Message,
         msg_cell: Cell,
         shard: &ShardIdent,
-        fwd_fee: Grams,
+        fwd_fee: Coins,
         use_hypercube: bool,
     ) -> Result<Self> {
         let src = msg.src_ref().ok_or_else(|| {
@@ -83,7 +83,7 @@ impl MsgEnvelopeStuff {
         shard: &ShardIdent,
         config: &BlockchainConfig,
         from_dispatch_queue: bool,
-    ) -> Result<(Self, Grams)> {
+    ) -> Result<(Self, Coins)> {
         let mut fwd_fee_remaining = *self.fwd_fee_remaining();
         let transit_fee = if from_dispatch_queue {
             Default::default()
@@ -150,7 +150,7 @@ impl MsgEnvelopeStuff {
     pub fn metadata(&self) -> Option<&MsgMetadata> {
         self.env.metadata()
     }
-    pub fn fwd_fee_remaining(&self) -> &Grams {
+    pub fn fwd_fee_remaining(&self) -> &Coins {
         self.env.fwd_fee_remaining()
     }
     pub fn msg_metadata_add_depth(&self) -> Option<MsgMetadata> {
@@ -207,7 +207,7 @@ impl MsgEnqueueStuff {
         enqueued_lt: u64,
         config: &BlockchainConfig,
         from_dispatch_queue: bool,
-    ) -> Result<(MsgEnqueueStuff, Grams)> {
+    ) -> Result<(MsgEnqueueStuff, Coins)> {
         let (env, transit_fee) = self.env.next_hop(shard, config, from_dispatch_queue)?;
         let enq = EnqueuedMsg::with_param(enqueued_lt, env.inner())?;
         let enq = MsgEnqueueStuff::checked_new(enq, env, self.lt(), "next_hop")?;
@@ -221,7 +221,7 @@ impl MsgEnqueueStuff {
         msg: Message,
         msg_cell: Cell,
         shard: &ShardIdent,
-        fwd_fee: Grams,
+        fwd_fee: Coins,
         use_hypercube: bool,
         metadata: Option<MsgMetadata>,
     ) -> Result<MsgEnqueueStuff> {
@@ -291,7 +291,7 @@ impl MsgEnqueueStuff {
     pub fn next_prefix(&self) -> &AccountIdPrefixFull {
         self.env.next_prefix()
     }
-    pub fn fwd_fee_remaining(&self) -> &Grams {
+    pub fn fwd_fee_remaining(&self) -> &Coins {
         self.env.fwd_fee_remaining()
     }
     pub fn metadata(&self) -> Option<&MsgMetadata> {

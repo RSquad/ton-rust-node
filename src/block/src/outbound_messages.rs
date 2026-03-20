@@ -875,35 +875,35 @@ impl Augmentation<CurrencyCollection> for OutMsg {
                 let msg = env.read_message()?;
                 // exported value = msg.value + msg.ihr_fee + fwd_fee_remaining
                 exported.add(msg.header().get_value().unwrap())?;
-                exported.grams.add(env.fwd_fee_remaining())?;
+                exported.coins.add(env.fwd_fee_remaining())?;
             }
             OutMsg::Transit(x) => {
                 let env = x.read_out_message()?;
                 let msg = env.read_message()?;
                 // exported value = msg.value + msg.ihr_fee + fwd_fee_remaining
                 exported.add(msg.header().get_value().unwrap())?;
-                exported.grams.add(env.fwd_fee_remaining())?;
+                exported.coins.add(env.fwd_fee_remaining())?;
             }
             OutMsg::TransitRequeued(x) => {
                 let env = x.read_out_message()?;
                 let msg = env.read_message()?;
                 // exported value = msg.value + msg.ihr_fee + fwd_fee_remaining
                 exported.add(msg.header().get_value().unwrap())?;
-                exported.grams.add(env.fwd_fee_remaining())?;
+                exported.coins.add(env.fwd_fee_remaining())?;
             }
             OutMsg::NewDefer(x) => {
                 let env = x.read_out_message()?;
                 let msg = env.read_message()?;
                 // exported value = msg.value + msg.ihr_fee + fwd_fee_remaining
                 exported.add(msg.header().get_value().unwrap())?;
-                exported.grams.add(env.fwd_fee_remaining())?;
+                exported.coins.add(env.fwd_fee_remaining())?;
             }
             OutMsg::DeferredTransit(x) => {
                 let env = x.read_out_message()?;
                 let msg = env.read_message()?;
                 // exported value = msg.value + msg.ihr_fee + fwd_fee_remaining
                 exported.add(msg.header().get_value().unwrap())?;
-                exported.grams.add(env.fwd_fee_remaining())?;
+                exported.coins.add(env.fwd_fee_remaining())?;
             }
             OutMsg::None => fail!("wrong OutMsg type"),
             // for other types - no value exported

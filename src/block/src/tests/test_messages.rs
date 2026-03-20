@@ -118,7 +118,7 @@ fn test_check_message_output() {
             [55; 32].into(),
         )
         .unwrap(),
-        CurrencyCollection::with_grams(79),
+        CurrencyCollection::with_coins(79),
         false,
     ));
     let mut stinit = StateInit::default();
@@ -369,7 +369,7 @@ fn test_external_inbound_message_normalize() {
     let h = ExternalInboundMessageHeader {
         src: MsgAddressExt::with_extern(SliceData::new(vec![77, 0x80])).unwrap(),
         dst: MsgAddressInt::standard(-1, [0x55; 32]),
-        import_fee: Grams::new(12345678),
+        import_fee: Coins::new(12345678),
     };
     let body = SliceData::new(vec![0xde, 0xad, 0xbe, 0xef, 0x80]);
     let mut msg = Message::with_ext_in_header_and_body(h, body);

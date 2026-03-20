@@ -23,7 +23,7 @@ use ton_block::{
         AccStatusChange, TrActionPhase, TrComputePhase, TrComputePhaseVm, TrCreditPhase,
         TrStoragePhase, Transaction, TransactionDescr,
     },
-    CurrencyCollection, GetRepresentationHash, Grams, DICT_HASH_MIN_CELLS,
+    Coins, CurrencyCollection, GetRepresentationHash, DICT_HASH_MIN_CELLS,
 };
 
 #[test]
@@ -73,7 +73,7 @@ fn test_trexecutor_active_acc_with_rawreserve_and_sendmsg() {
     let tr_lt = BLOCK_LT + 1;
     new_acc.set_last_tr_time(tr_lt + 3);
     new_acc.set_last_paid(BLOCK_UT);
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 2).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 2).unwrap();
     acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc, new_acc);
@@ -84,14 +84,14 @@ fn test_trexecutor_active_acc_with_rawreserve_and_sendmsg() {
     let mut actions = OutActions::default();
     actions.push_back(OutAction::new_reserve(
         RESERVE_EXACTLY,
-        CurrencyCollection::with_grams(reserve),
+        CurrencyCollection::with_coins(reserve),
     ));
     actions.push_back(OutAction::new_send(SENDMSG_ORDINARY, msg1.clone()));
     actions.push_back(OutAction::new_send(SENDMSG_ALL_BALANCE, msg2.clone()));
     if let CommonMsgInfo::IntMsgInfo(int_header) = msg1.header_mut() {
         if let CommonMsgInfo::IntMsgInfo(int_header2) = msg2.header_mut() {
-            int_header.value.grams = Grams::from(MSG1_BALANCE - msg_fwd_fee);
-            int_header2.value.grams = Grams::from(
+            int_header.value.coins = Coins::from(MSG1_BALANCE - msg_fwd_fee);
+            int_header2.value.coins = Coins::from(
                 start_balance + msg_income
                     - reserve
                     - MSG1_BALANCE
@@ -115,7 +115,7 @@ fn test_trexecutor_active_acc_with_rawreserve_and_sendmsg() {
         Some(TrStoragePhase::with_params(storage_fees.into(), None, AccStatusChange::Unchanged));
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;

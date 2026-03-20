@@ -12,7 +12,7 @@ use anyhow::Context;
 use common::tvm_stack_parser::TvmStackParser;
 use std::{collections::HashMap, sync::Arc};
 use ton_api::ton::tvm::StackEntry;
-use ton_block::{Deserializable, Grams, HashmapE, HashmapType, MsgAddressInt};
+use ton_block::{Coins, Deserializable, HashmapE, HashmapType, MsgAddressInt};
 
 pub struct ElectorWrapperImpl {
     provider: Arc<dyn ContractProvider>,
@@ -147,7 +147,7 @@ fn parse_past_elections_stack(stack: &TvmStackParser) -> anyhow::Result<Vec<Past
             let mut wallet_addr = [0u8; 32];
             wallet_addr.copy_from_slice(&value.get_next_bytes(32)?);
             let weight = value.get_next_u64()?;
-            let mut amount = Grams::default();
+            let mut amount = Coins::default();
             amount.read_from(&mut value)?;
             let stake = amount.as_u64().unwrap_or(0);
             let banned = value.get_next_bit()?;
@@ -182,7 +182,7 @@ mod tests {
         stackentry::{StackEntryCell, StackEntryList, StackEntryNumber, StackEntryTuple},
         tuple,
     };
-    use ton_block::{BuilderData, Cell, Grams, IBitstring, Serializable, SliceData};
+    use ton_block::{BuilderData, Cell, Coins, IBitstring, Serializable, SliceData};
 
     fn create_number_entry(value: &str) -> StackEntry {
         StackEntry::Tvm_StackEntryNumber(StackEntryNumber {
@@ -228,7 +228,7 @@ mod tests {
         let mut value_b = BuilderData::new();
         value_b.append_raw(&participant.wallet_addr, 256).unwrap();
         value_b.append_u64(participant.weight).unwrap();
-        Grams::from(participant.stake).write_to(&mut value_b).unwrap();
+        Coins::from(participant.stake).write_to(&mut value_b).unwrap();
         value_b.append_bit_bool(participant.banned).unwrap();
         let key_slice = SliceData::load_builder(key_b).unwrap();
         hashmap.set_builder(key_slice, &value_b).unwrap();

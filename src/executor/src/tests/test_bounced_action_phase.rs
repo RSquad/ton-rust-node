@@ -15,7 +15,7 @@ mod common;
 use common::*;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    AccStatusChange, AccountStatus, AnycastInfo, CurrencyCollection, Grams, InternalMessageHeader,
+    AccStatusChange, AccountStatus, AnycastInfo, Coins, CurrencyCollection, InternalMessageHeader,
     Message, MsgAddressInt, MsgAddressIntOrNone, Serializable, SliceData, StorageUsed,
     TrBouncePhase, TrBouncePhase::Nofunds, TrBouncePhaseNofunds, TrBouncePhaseOk,
     SENDMSG_BOUNCE_IF_FAIL, SENDMSG_ORDINARY,
@@ -57,7 +57,7 @@ fn test_action_phase_failed_with_flag_16_but_unsuccess_bounce() {
     let mut test_case = TransactionTestCase {
         bounce: Some(Nofunds(TrBouncePhaseNofunds {
             msg_size: StorageUsed::default(),
-            req_fwd_fees: Grams::from(MSG_FWD_FEE),
+            req_fwd_fees: Coins::from(MSG_FWD_FEE),
         })),
         gas_used: 1323,
         msg_income: 1_000_000,
@@ -100,7 +100,7 @@ fn test_action_phase_failed_with_flag_16_but_unsuccess_bounce() {
         &test_ctx.acc,
         &test_ctx.msg,
         Some(&trans),
-        test_ctx.new_acc.balance().unwrap().grams,
+        test_ctx.new_acc.balance().unwrap().coins,
         0,
     );
     pretty_assertions::assert_eq!(test_ctx.acc, test_ctx.new_acc);
@@ -114,8 +114,8 @@ fn test_action_phase_failed_with_flag_16() {
     let mut test_case = TransactionTestCase {
         bounce: Some(TrBouncePhase::Ok(TrBouncePhaseOk {
             msg_size: StorageUsed::default(),
-            msg_fees: Grams::from(MSG_MINE_FEE),
-            fwd_fees: Grams::from(MSG_FWD_FEE - MSG_MINE_FEE),
+            msg_fees: Coins::from(MSG_MINE_FEE),
+            fwd_fees: Coins::from(MSG_FWD_FEE - MSG_MINE_FEE),
         })),
         gas_limit: Some(15000),
         gas_used: 1323,
@@ -155,7 +155,7 @@ fn test_action_phase_failed_with_flag_16() {
         &test_ctx.acc,
         &test_ctx.msg,
         Some(&trans),
-        test_ctx.new_acc.balance().unwrap().grams,
+        test_ctx.new_acc.balance().unwrap().coins,
         1,
     );
     pretty_assertions::assert_eq!(test_ctx.acc, test_ctx.new_acc);
@@ -169,9 +169,9 @@ fn test_action_phase_failed_with_flag_16() {
             MsgAddressInt::with_standart(None, -1, SENDER_ACCOUNT.clone()).unwrap(),
         ),
         dst: MsgAddressInt::with_standart(None, -1, THIRD_ACCOUNT.clone()).unwrap(),
-        value: CurrencyCollection::with_grams(126_770_000),
+        value: CurrencyCollection::with_coins(126_770_000),
         extra_flags: Default::default(),
-        fwd_fee: Grams::from(6_666_718),
+        fwd_fee: Coins::from(6_666_718),
         created_lt: 2000000002,
         created_at: BLOCK_UT.into(),
     });
@@ -187,8 +187,8 @@ fn test_message_with_anycast_output_address_bounced_action() {
     let mut test_case = TransactionTestCase {
         bounce: Some(TrBouncePhase::Ok(TrBouncePhaseOk {
             msg_size: StorageUsed::default(),
-            msg_fees: Grams::from(333_328),
-            fwd_fees: Grams::from(666_672),
+            msg_fees: Coins::from(333_328),
+            fwd_fees: Coins::from(666_672),
         })),
         gas_fees: Some(583_000),
         gas_limit: Some(1_000_000),
@@ -236,7 +236,7 @@ fn test_message_with_anycast_output_address_bounced_action() {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, 0, SENDER_ACCOUNT.clone()).unwrap(),
         dst,
-        CurrencyCollection::with_grams(test_case.msg_income),
+        CurrencyCollection::with_coins(test_case.msg_income),
     );
     hdr.bounce = false;
     hdr.ihr_disabled = true;
@@ -257,9 +257,9 @@ fn test_message_with_anycast_output_address_bounced_action() {
             MsgAddressInt::with_standart(None, 0, SENDER_ACCOUNT.clone()).unwrap(),
         ),
         dst: MsgAddressInt::with_standart(None, 0, THIRD_ACCOUNT.clone()).unwrap(),
-        value: CurrencyCollection::with_grams(99_998_417_000),
+        value: CurrencyCollection::with_coins(99_998_417_000),
         extra_flags: Default::default(),
-        fwd_fee: Grams::from(666_672),
+        fwd_fee: Coins::from(666_672),
         created_lt: 2000000002,
         created_at: BLOCK_UT.into(),
     });

@@ -221,7 +221,7 @@ async fn get_address_information_reads_account_state() {
     pretty_assertions::assert_eq!(response["@type"], "raw.fullAccountState");
     pretty_assertions::assert_eq!(
         response["balance"],
-        serde_json::json!(account.balance().unwrap().grams.to_string())
+        serde_json::json!(account.balance().unwrap().coins.to_string())
     );
     pretty_assertions::assert_eq!(response["state"], "active");
     pretty_assertions::assert_eq!(

@@ -93,8 +93,8 @@ fn get_config_param16() -> ConfigParam16 {
 
 fn get_config_param17() -> ConfigParam17 {
     let mut c = ConfigParam17::new();
-    c.min_stake = Grams::zero();
-    c.max_stake = Grams::one();
+    c.min_stake = Coins::zero();
+    c.max_stake = Coins::one();
     c.max_stake_factor = 12121;
     c
 }
@@ -235,8 +235,8 @@ fn get_config_param10() -> ConfigParam10 {
 fn get_config_param14() -> ConfigParam14 {
     ConfigParam14 {
         block_create_fees: BlockCreateFees {
-            masterchain_block_fee: Grams::from(1458347523u64),
-            basechain_block_fee: Grams::from(145800000000003u64),
+            masterchain_block_fee: Coins::from(1458347523u64),
+            basechain_block_fee: Coins::from(145800000000003u64),
         },
     }
 }
@@ -389,8 +389,8 @@ fn prepare_config_params() -> ConfigParams {
     cp.set_config(c5).unwrap();
 
     let c6 = ConfigParamEnum::ConfigParam6(ConfigParam6 {
-        mint_new_price: Grams::from(123u64),
-        mint_add_price: Grams::from(1458347523u64),
+        mint_new_price: Coins::from(123u64),
+        mint_add_price: Coins::from(1458347523u64),
     });
     cp.set_config(c6).unwrap();
 

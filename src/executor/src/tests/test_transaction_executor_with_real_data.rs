@@ -122,7 +122,7 @@ fn try_replay_contract_as_transaction(
 
     let account_id = message.int_dst_account_id().expect("must be external inbound message");
     let addr = MsgAddressInt::with_standart(None, 0, account_id.clone())?;
-    let balance = CurrencyCollection::with_grams(100_000_000_000);
+    let balance = CurrencyCollection::with_coins(100_000_000_000);
 
     let mut account = Account::with_storage(
         &addr,

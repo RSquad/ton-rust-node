@@ -19,10 +19,10 @@ mod common;
 use common::*;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    AccStatusChange, Account, AccountId, AccountStatus, BuilderData, ComputeSkipReason,
+    AccStatusChange, Account, AccountId, AccountStatus, BuilderData, Coins, ComputeSkipReason,
     ConfigParamEnum, CurrencyCollection, ExtOutMessageHeader, ExternalInboundMessageHeader,
-    GetRepresentationHash, Grams, InternalMessageHeader, Message, MsgAddressExt, MsgAddressInt,
-    OutAction, OutActions, Serializable, SliceData, StateInit, StorageUsed, SuspendedAddressList,
+    GetRepresentationHash, InternalMessageHeader, Message, MsgAddressExt, MsgAddressInt, OutAction,
+    OutActions, Serializable, SliceData, StateInit, StorageUsed, SuspendedAddressList,
     TrActionPhase, TrComputePhase, TrComputePhaseVm, Transaction, VarUInteger32,
     DICT_HASH_MIN_CELLS, RESERVE_ALL_BUT, RESERVE_EXACTLY, RESERVE_IGNORE_ERROR,
     SENDMSG_ALL_BALANCE, SENDMSG_IGNORE_ERROR, SENDMSG_ORDINARY, SENDMSG_PAY_FEE_SEPARATELY,
@@ -48,12 +48,12 @@ fn create_int_msg(
     value: u64,
     bounce: bool,
     lt: u64,
-    fwd_fee: impl Into<Grams>,
+    fwd_fee: impl Into<Coins>,
 ) -> Message {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, -1, src).unwrap(),
         MsgAddressInt::with_standart(None, -1, dest).unwrap(),
-        CurrencyCollection::with_grams(value),
+        CurrencyCollection::with_coins(value),
     );
     hdr.bounce = bounce;
     hdr.ihr_disabled = true;
@@ -185,7 +185,7 @@ fn test_computing_phase_acc_uninit_extmsg_nostate() {
     //create uninitialized account
     let mut acc = Account::with_address_and_ballance(
         &MsgAddressInt::with_standart(None, -1, SENDER_ACCOUNT.clone()).unwrap(),
-        &CurrencyCollection::with_grams(1000),
+        &CurrencyCollection::with_coins(1000),
     );
     let phase = ordinary_compute_phase(&msg, &mut acc).unwrap();
     pretty_assertions::assert_eq!(phase, TrComputePhase::skipped(ComputeSkipReason::NoGas));
@@ -203,7 +203,7 @@ fn test_computing_phase_acc_uninit_extmsg_with_state() {
     let balance = 5000000;
     let mut acc = Account::with_address_and_ballance(
         &MsgAddressInt::with_standart(None, -1, addr).unwrap(),
-        &CurrencyCollection::with_grams(balance),
+        &CurrencyCollection::with_coins(balance),
     );
     let phase = ordinary_compute_phase(&msg, &mut acc).unwrap();
 
@@ -226,12 +226,12 @@ fn test_computing_phase_acc_uninit_extmsg_with_state() {
 fn test_computing_phase_acc_uninit_intmsg_with_nostate() {
     let mut acc = Account::with_address_and_ballance(
         &MsgAddressInt::with_standart(None, -1, RECEIVER_ACCOUNT.clone()).unwrap(),
-        &CurrencyCollection::with_grams(5_000_000),
+        &CurrencyCollection::with_coins(5_000_000),
     );
     let msg = create_int_msg(
         SENDER_ACCOUNT.clone(),
         RECEIVER_ACCOUNT.clone(),
-        1_000_000, // it is enough grams by config to buy gas for uninit account
+        1_000_000, // it is enough coins by config to buy gas for uninit account
         // but message has no state
         false,
         5,
@@ -265,7 +265,7 @@ fn test_computing_phase_acc_uninit_intmsg_no_state_has_priority_over_suspended()
 
     let mut acc = Account::with_address_and_ballance(
         &MsgAddressInt::with_standart(None, -1, RECEIVER_ACCOUNT.clone()).unwrap(),
-        &CurrencyCollection::with_grams(5_000_000),
+        &CurrencyCollection::with_coins(5_000_000),
     );
     let msg =
         create_int_msg(SENDER_ACCOUNT.clone(), RECEIVER_ACCOUNT.clone(), 1_000_000, false, 5, 0);
@@ -369,7 +369,7 @@ fn test_computing_phase_activeacc_gas_consumed_after_accept() {
     vm_phase.gas_fees = gas_fees.into();
     vm_phase.vm_steps = 6;
     pretty_assertions::assert_eq!(phase, TrComputePhase::Vm(vm_phase));
-    pretty_assertions::assert_eq!(acc.balance().unwrap().grams, Grams::from(balance - gas_fees));
+    pretty_assertions::assert_eq!(acc.balance().unwrap().coins, Coins::from(balance - gas_fees));
 }
 
 fn call_action_phase(
@@ -378,7 +378,7 @@ fn call_action_phase(
     must_succeded: bool,
     no_funds: bool,
     fwd_fees: u64,
-    action_fees: impl Into<Grams>,
+    action_fees: impl Into<Coins>,
     res: i32,
     res_arg: Option<i32>,
 ) {
@@ -412,7 +412,7 @@ fn call_action_phase(
     let config = BLOCKCHAIN_CONFIG.to_owned();
     let executor = OrdinaryTransactionExecutor::new(config.clone());
     let fwd_prices = config.get_fwd_prices(ctor_msg.is_masterchain());
-    let msg_fwd_fees = Grams::from(fwd_prices.lump_price)
+    let msg_fwd_fees = Coins::from(fwd_prices.lump_price)
         - fwd_prices.mine_fee_checked(&fwd_prices.lump_price.into()).unwrap();
     let mut msg = create_int_msg(
         SENDER_ACCOUNT.clone(),
@@ -425,7 +425,7 @@ fn call_action_phase(
     let mut msg_remaining_balance = msg.get_value().cloned().unwrap_or_default();
     actions.push_back(OutAction::new_send(SENDMSG_ORDINARY, msg.clone()));
     if must_succeded {
-        msg.value_mut().unwrap().grams = (out_msg_value - fwd_prices.lump_price).into();
+        msg.value_mut().unwrap().coins = (out_msg_value - fwd_prices.lump_price).into();
         append_message(&mut storage, &msg).unwrap();
     }
 
@@ -436,7 +436,7 @@ fn call_action_phase(
     }
     actions.push_back(OutAction::new_send(SENDMSG_ORDINARY, msg));
     let actions_hash = actions.hash().unwrap();
-    let mut acc_balance = CurrencyCollection::with_grams(start_acc_balance);
+    let mut acc_balance = CurrencyCollection::with_coins(start_acc_balance);
     let original_acc_balance = acc_balance.clone();
 
     let my_addr = acc.get_addr().unwrap().clone();
@@ -448,7 +448,7 @@ fn call_action_phase(
             &original_acc_balance,
             &mut acc_balance,
             &mut msg_remaining_balance,
-            &Grams::zero(),
+            &Coins::zero(),
             actions.serialize().unwrap(),
             None,
             &my_addr,
@@ -474,7 +474,7 @@ fn call_action_phase(
     pretty_assertions::assert_eq!(phase, phase2);
     if !no_funds {
         let balance = start_acc_balance - out_msg_value - 2 * fwd_prices.lump_price;
-        pretty_assertions::assert_eq!(acc_balance.grams.as_u128(), balance.into());
+        pretty_assertions::assert_eq!(acc_balance.coins.as_u128(), balance.into());
     }
 }
 
@@ -490,7 +490,7 @@ fn test_action_phase_active_acc_with_actions_nofunds() {
         true,
         fwd_fee,
         fwd_fee,
-        RESULT_CODE_NOT_ENOUGH_GRAMS,
+        RESULT_CODE_NOT_ENOUGH_COINS,
         Some(1),
     );
 }
@@ -499,7 +499,7 @@ fn test_action_phase_active_acc_with_actions_nofunds() {
 fn test_action_phase_active_acc_with_actions_success() {
     let fwd_config = BLOCKCHAIN_CONFIG.get_fwd_prices(true);
     let fwd_fee = fwd_config.lump_price * 3;
-    let mine_fee = Grams::from(fwd_config.lump_price * 2)
+    let mine_fee = Coins::from(fwd_config.lump_price * 2)
         + fwd_config.mine_fee_checked(&fwd_config.lump_price.into()).unwrap();
     call_action_phase(5000000000, 100000000, true, false, fwd_fee, mine_fee, 0, None);
 }
@@ -558,32 +558,32 @@ mod actions {
     struct TestCase {
         check_balance_enough: bool,
         expected_remains: Option<CurrencyCollection>,
-        expected_reserve: Option<std::result::Result<Grams, i32>>,
+        expected_reserve: Option<std::result::Result<Coins, i32>>,
         fee_value: Option<u64>,
-        msg_grams_balance: Option<u64>,
+        msg_coins_balance: Option<u64>,
         msg_other_balance: Option<u128>,
-        src_grams_balance: u64,
+        src_coins_balance: u64,
         src_other_balance: Option<u128>,
-        sub_grams_balance: u64,
+        sub_coins_balance: u64,
         sub_other_balance: Option<u128>,
     }
 
     fn check(mode: u8, test_case: &TestCase) {
-        let mut sub = CurrencyCollection::with_grams(test_case.sub_grams_balance);
+        let mut sub = CurrencyCollection::with_coins(test_case.sub_coins_balance);
         if let Some(other_balance) = test_case.sub_other_balance {
             sub.other
                 .set(&11111111u32, &VarUInteger32::from_two_u128(0, other_balance).unwrap())
                 .unwrap()
         }
-        let mut src = CurrencyCollection::with_grams(test_case.src_grams_balance);
+        let mut src = CurrencyCollection::with_coins(test_case.src_coins_balance);
         if let Some(other_balance) = test_case.src_other_balance {
             src.other
                 .set(&11111111u32, &VarUInteger32::from_two_u128(0, other_balance).unwrap())
                 .unwrap()
         }
         let mut dst = src.clone();
-        let msg = if let Some(msg_balance) = test_case.msg_grams_balance {
-            let mut msg = CurrencyCollection::with_grams(msg_balance);
+        let msg = if let Some(msg_balance) = test_case.msg_coins_balance {
+            let mut msg = CurrencyCollection::with_coins(msg_balance);
             if let Some(msg_balance) = test_case.msg_other_balance {
                 msg.other
                     .set(&11111111u32, &VarUInteger32::from_two_u128(0, msg_balance).unwrap())
@@ -595,7 +595,7 @@ mod actions {
             None
         };
         if let Some(fee) = test_case.fee_value {
-            let fee = CurrencyCollection::with_grams(fee);
+            let fee = CurrencyCollection::with_coins(fee);
             dst.sub(&fee).unwrap();
         }
         let result = reserve_action_handler(mode, &sub, &src, &mut dst);
@@ -617,9 +617,9 @@ mod actions {
         let mode = RESERVE_EXACTLY;
         let mut test_case = TestCase {
             check_balance_enough: true,
-            src_grams_balance: 500,
+            src_coins_balance: 500,
             src_other_balance: Some(500),
-            sub_grams_balance: 123,
+            sub_coins_balance: 123,
             sub_other_balance: Some(123),
             ..Default::default()
         };
@@ -627,12 +627,12 @@ mod actions {
         check(mode, &test_case);
         // not enough balance
         test_case.check_balance_enough = false;
-        test_case.src_grams_balance = 100;
+        test_case.src_coins_balance = 100;
         test_case.src_other_balance = Some(100);
         check(mode, &test_case);
         // not enough extra
-        test_case.src_grams_balance = 123;
-        test_case.sub_grams_balance = 100;
+        test_case.src_coins_balance = 123;
+        test_case.sub_coins_balance = 100;
         check(mode, &test_case);
     }
 
@@ -642,9 +642,9 @@ mod actions {
         let mode = RESERVE_ALL_BUT;
         let mut test_case = TestCase {
             check_balance_enough: true,
-            src_grams_balance: 500,
+            src_coins_balance: 500,
             src_other_balance: Some(500),
-            sub_grams_balance: 123,
+            sub_coins_balance: 123,
             sub_other_balance: Some(123),
             ..Default::default()
         };
@@ -652,7 +652,7 @@ mod actions {
         check(mode, &test_case);
         // not enough balance and extra
         test_case.check_balance_enough = false;
-        test_case.src_grams_balance = 100;
+        test_case.src_coins_balance = 100;
         test_case.src_other_balance = Some(100);
         check(mode, &test_case);
     }
@@ -662,10 +662,10 @@ mod actions {
         // reserve = min(value, remaining_balance)
         let mode = RESERVE_IGNORE_ERROR;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(0)),
-            expected_reserve: Some(Ok(Grams::new(100))),
-            src_grams_balance: 100,
-            sub_grams_balance: 123,
+            expected_remains: Some(CurrencyCollection::with_coins(0)),
+            expected_reserve: Some(Ok(Coins::new(100))),
+            src_coins_balance: 100,
+            sub_coins_balance: 123,
             ..Default::default()
         };
         // reserved less than needed
@@ -677,9 +677,9 @@ mod actions {
         test_case.sub_other_balance = Some(123);
         check(mode, &test_case);
         // balance and extra enough
-        test_case.src_grams_balance = 123;
+        test_case.src_coins_balance = 123;
         test_case.src_other_balance = Some(123);
-        test_case.sub_grams_balance = 100;
+        test_case.sub_coins_balance = 100;
         test_case.sub_other_balance = Some(100);
         check(mode, &test_case);
     }
@@ -689,10 +689,10 @@ mod actions {
         // reserve = remaining_balance - min(value, remaining_balance)
         let mode = RESERVE_ALL_BUT | RESERVE_IGNORE_ERROR;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(100)),
-            expected_reserve: Some(Ok(Grams::new(0))),
-            src_grams_balance: 100,
-            sub_grams_balance: 123,
+            expected_remains: Some(CurrencyCollection::with_coins(100)),
+            expected_reserve: Some(Ok(Coins::new(0))),
+            src_coins_balance: 100,
+            sub_coins_balance: 123,
             ..Default::default()
         };
         // reserved become less than needed
@@ -704,9 +704,9 @@ mod actions {
         test_case.sub_other_balance = Some(123);
         check(mode, &test_case);
         // balance and extra enough
-        test_case.src_grams_balance = 123;
+        test_case.src_coins_balance = 123;
         test_case.src_other_balance = Some(123);
-        test_case.sub_grams_balance = 100;
+        test_case.sub_coins_balance = 100;
         test_case.sub_other_balance = Some(100);
         check(mode, &test_case);
     }
@@ -716,16 +716,16 @@ mod actions {
         // reserve = original_balance + value
         let mode = RESERVE_PLUS_ORIG;
         let mut test_case = TestCase {
-            src_grams_balance: 100,
+            src_coins_balance: 100,
             src_other_balance: Some(100),
-            sub_grams_balance: 123,
+            sub_coins_balance: 123,
             sub_other_balance: Some(123),
             ..Default::default()
         };
         // reserve exceed balance
         check(mode, &test_case);
         // message added money, so reserve don't exceed balance
-        test_case.msg_grams_balance = Some(300);
+        test_case.msg_coins_balance = Some(300);
         test_case.msg_other_balance = Some(300);
         check(mode, &test_case);
     }
@@ -735,16 +735,16 @@ mod actions {
         // reserve = remaining_balance - (original_balance + value)
         let mode = RESERVE_PLUS_ORIG | RESERVE_ALL_BUT;
         let mut test_case = TestCase {
-            src_grams_balance: 100,
+            src_coins_balance: 100,
             src_other_balance: Some(100),
-            sub_grams_balance: 123,
+            sub_coins_balance: 123,
             sub_other_balance: Some(123),
             ..Default::default()
         };
         // not enough balance and extra
         check(mode, &test_case);
         // message added money, so balance is enough
-        test_case.msg_grams_balance = Some(300);
+        test_case.msg_coins_balance = Some(300);
         test_case.msg_other_balance = Some(300);
         check(mode, &test_case);
     }
@@ -754,10 +754,10 @@ mod actions {
         // reserve = min(original_balance + value, remaining_balance)
         let mode = RESERVE_PLUS_ORIG | RESERVE_IGNORE_ERROR;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(0)),
-            expected_reserve: Some(Ok(Grams::new(100))),
-            src_grams_balance: 100,
-            sub_grams_balance: 123,
+            expected_remains: Some(CurrencyCollection::with_coins(0)),
+            expected_reserve: Some(Ok(Coins::new(100))),
+            src_coins_balance: 100,
+            sub_coins_balance: 123,
             ..Default::default()
         };
         // reserved become less than needed
@@ -769,7 +769,7 @@ mod actions {
         test_case.sub_other_balance = Some(123);
         check(mode, &test_case);
         // message added money, so balance is enough
-        test_case.msg_grams_balance = Some(300);
+        test_case.msg_coins_balance = Some(300);
         test_case.msg_other_balance = Some(300);
         check(mode, &test_case);
     }
@@ -779,25 +779,25 @@ mod actions {
         // reserve = remaining_balance - min(original_balance + value, remaining_balance)
         let mode = RESERVE_PLUS_ORIG | RESERVE_IGNORE_ERROR | RESERVE_ALL_BUT;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(100)),
-            expected_reserve: Some(Ok(Grams::new(0))),
-            src_grams_balance: 100,
-            sub_grams_balance: 123,
+            expected_remains: Some(CurrencyCollection::with_coins(100)),
+            expected_reserve: Some(Ok(Coins::new(0))),
+            src_coins_balance: 100,
+            sub_coins_balance: 123,
             ..Default::default()
         };
         // reserved without message balance
         check(mode, &test_case);
         // reserved with message balance
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(223));
-        test_case.expected_reserve = Some(Ok(Grams::new(177)));
-        test_case.msg_grams_balance = Some(300);
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(223));
+        test_case.expected_reserve = Some(Ok(Coins::new(177)));
+        test_case.msg_coins_balance = Some(300);
         check(mode, &test_case);
     }
 
     #[test]
     fn test_reserve_unsupported_mode() {
         let mut test_case =
-            TestCase { src_grams_balance: 100, sub_grams_balance: 123, ..Default::default() };
+            TestCase { src_coins_balance: 100, sub_coins_balance: 123, ..Default::default() };
         test_case.expected_reserve = Some(Err(RESULT_CODE_UNKNOWN_OR_INVALID_ACTION));
         for mode in 8..=11 {
             check(mode, &test_case);
@@ -810,10 +810,10 @@ mod actions {
         // reserve = original_balance - value
         let mode = RESERVE_REVERSE | RESERVE_PLUS_ORIG;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(10)),
-            expected_reserve: Some(Ok(Grams::new(90))),
-            src_grams_balance: 100,
-            sub_grams_balance: 10,
+            expected_remains: Some(CurrencyCollection::with_coins(10)),
+            expected_reserve: Some(Ok(Coins::new(90))),
+            src_coins_balance: 100,
+            sub_coins_balance: 10,
             ..Default::default()
         };
         // balance enough
@@ -821,20 +821,20 @@ mod actions {
         // balance not enough
         test_case.expected_remains = None;
         test_case.expected_reserve = None;
-        test_case.src_grams_balance = 10;
-        test_case.sub_grams_balance = 100;
+        test_case.src_coins_balance = 10;
+        test_case.sub_coins_balance = 100;
         check(mode, &test_case);
         // balance not enough despite message balance
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(310));
-        test_case.msg_grams_balance = Some(300);
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(310));
+        test_case.msg_coins_balance = Some(300);
         check(mode, &test_case);
         // balance not enough because of fee
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(1));
-        test_case.expected_reserve = Some(Err(RESULT_CODE_NOT_ENOUGH_GRAMS));
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(1));
+        test_case.expected_reserve = Some(Err(RESULT_CODE_NOT_ENOUGH_COINS));
         test_case.fee_value = Some(99);
-        test_case.msg_grams_balance = None;
-        test_case.src_grams_balance = 100;
-        test_case.sub_grams_balance = 10;
+        test_case.msg_coins_balance = None;
+        test_case.src_coins_balance = 100;
+        test_case.sub_coins_balance = 10;
         check(mode, &test_case);
     }
 
@@ -843,28 +843,28 @@ mod actions {
         // reserve = remaining_balance - (original_balance - value)
         let mode = RESERVE_REVERSE | RESERVE_PLUS_ORIG | RESERVE_ALL_BUT;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(23)),
-            expected_reserve: Some(Ok(Grams::new(400))),
-            msg_grams_balance: Some(300),
-            src_grams_balance: 123,
-            sub_grams_balance: 100,
+            expected_remains: Some(CurrencyCollection::with_coins(23)),
+            expected_reserve: Some(Ok(Coins::new(400))),
+            msg_coins_balance: Some(300),
+            src_coins_balance: 123,
+            sub_coins_balance: 100,
             ..Default::default()
         };
         // Balance enough
         check(mode, &test_case);
         // Balance not enough
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(400));
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(400));
         test_case.expected_reserve = None;
-        test_case.src_grams_balance = 100;
-        test_case.sub_grams_balance = 123;
+        test_case.src_coins_balance = 100;
+        test_case.sub_coins_balance = 123;
         check(mode, &test_case);
         // With fee
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(100));
-        test_case.expected_reserve = Some(Err(RESULT_CODE_NOT_ENOUGH_GRAMS));
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(100));
+        test_case.expected_reserve = Some(Err(RESULT_CODE_NOT_ENOUGH_COINS));
         test_case.fee_value = Some(23);
-        test_case.msg_grams_balance = None;
-        test_case.src_grams_balance = 123;
-        test_case.sub_grams_balance = 10;
+        test_case.msg_coins_balance = None;
+        test_case.src_coins_balance = 123;
+        test_case.sub_coins_balance = 10;
         check(mode, &test_case);
     }
 
@@ -873,28 +873,28 @@ mod actions {
         // reserve = min(original_balance - value, remaining_balance)
         let mode = RESERVE_REVERSE | RESERVE_PLUS_ORIG | RESERVE_IGNORE_ERROR;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(400)),
-            expected_reserve: Some(Ok(Grams::new(23))),
-            msg_grams_balance: Some(300),
-            src_grams_balance: 123,
-            sub_grams_balance: 100,
+            expected_remains: Some(CurrencyCollection::with_coins(400)),
+            expected_reserve: Some(Ok(Coins::new(23))),
+            msg_coins_balance: Some(300),
+            src_coins_balance: 123,
+            sub_coins_balance: 100,
             ..Default::default()
         };
         // Balance enough
         check(mode, &test_case);
         // With message
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(400));
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(400));
         test_case.expected_reserve = None;
-        test_case.src_grams_balance = 100;
-        test_case.sub_grams_balance = 123;
+        test_case.src_coins_balance = 100;
+        test_case.sub_coins_balance = 123;
         check(mode, &test_case);
         // With fee
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(0));
-        test_case.expected_reserve = Some(Ok(Grams::new(100)));
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(0));
+        test_case.expected_reserve = Some(Ok(Coins::new(100)));
         test_case.fee_value = Some(23);
-        test_case.msg_grams_balance = None;
-        test_case.src_grams_balance = 123;
-        test_case.sub_grams_balance = 10;
+        test_case.msg_coins_balance = None;
+        test_case.src_coins_balance = 123;
+        test_case.sub_coins_balance = 10;
         check(mode, &test_case);
     }
 
@@ -903,28 +903,28 @@ mod actions {
         // reserve = remaining_balance - min(original_balance - value, remaining_balance)
         let mode = RESERVE_REVERSE | RESERVE_PLUS_ORIG | RESERVE_IGNORE_ERROR | RESERVE_ALL_BUT;
         let mut test_case = TestCase {
-            expected_remains: Some(CurrencyCollection::with_grams(23)),
-            expected_reserve: Some(Ok(Grams::new(400))),
-            msg_grams_balance: Some(300),
-            src_grams_balance: 123,
-            sub_grams_balance: 100,
+            expected_remains: Some(CurrencyCollection::with_coins(23)),
+            expected_reserve: Some(Ok(Coins::new(400))),
+            msg_coins_balance: Some(300),
+            src_coins_balance: 123,
+            sub_coins_balance: 100,
             ..Default::default()
         };
         // Balance enough
         check(mode, &test_case);
         // With message
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(400));
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(400));
         test_case.expected_reserve = None;
-        test_case.src_grams_balance = 100;
-        test_case.sub_grams_balance = 123;
+        test_case.src_coins_balance = 100;
+        test_case.sub_coins_balance = 123;
         check(mode, &test_case);
         // With fee
-        test_case.expected_remains = Some(CurrencyCollection::with_grams(100));
-        test_case.expected_reserve = Some(Ok(Grams::new(0)));
+        test_case.expected_remains = Some(CurrencyCollection::with_coins(100));
+        test_case.expected_reserve = Some(Ok(Coins::new(0)));
         test_case.fee_value = Some(23);
-        test_case.msg_grams_balance = None;
-        test_case.src_grams_balance = 123;
-        test_case.sub_grams_balance = 10;
+        test_case.msg_coins_balance = None;
+        test_case.src_coins_balance = 123;
+        test_case.sub_coins_balance = 10;
         check(mode, &test_case);
     }
 
@@ -937,9 +937,9 @@ mod actions {
         mine_fee: u64,
         error: Option<i32>,
     ) {
-        let mut balance = CurrencyCollection::with_grams(bal);
+        let mut balance = CurrencyCollection::with_coins(bal);
         let mut acc_remaining_balance = balance.clone();
-        let mut msg_remaining_balance = CurrencyCollection::with_grams(val);
+        let mut msg_remaining_balance = CurrencyCollection::with_coins(val);
         let mut phase = TrActionPhase::default();
         phase.add_fwd_fees(&3.into());
         phase.add_action_fees(&5.into());
@@ -960,7 +960,7 @@ mod actions {
             &mut msg,
             &mut acc_remaining_balance,
             &mut msg_remaining_balance,
-            &Grams::zero(),
+            &Coins::zero(),
             &BLOCKCHAIN_CONFIG,
             false,
             &address,
@@ -968,11 +968,11 @@ mod actions {
             &mut false,
         );
 
-        let mut res_val = CurrencyCollection::with_grams(val);
+        let mut res_val = CurrencyCollection::with_coins(val);
         if (mode & SENDMSG_ALL_BALANCE) != 0 {
-            res_val = CurrencyCollection::with_grams(bal);
+            res_val = CurrencyCollection::with_coins(bal);
         } else if (mode & SENDMSG_PAY_FEE_SEPARATELY) != 0 {
-            res_val.add(&CurrencyCollection::with_grams(fwd_fee)).unwrap();
+            res_val.add(&CurrencyCollection::with_coins(fwd_fee)).unwrap();
         }
 
         if error.is_some() {
@@ -988,15 +988,15 @@ mod actions {
         pretty_assertions::assert_eq!(msg.at_and_lt().unwrap(), (0, msg_lt));
         pretty_assertions::assert_eq!(msg.get_fee().unwrap(), Some((fwd_fee - mine_fee).into()));
 
-        res_val.sub(&CurrencyCollection::with_grams(fwd_fee)).unwrap();
+        res_val.sub(&CurrencyCollection::with_coins(fwd_fee)).unwrap();
         pretty_assertions::assert_eq!(msg.get_value().unwrap().clone(), res_val);
 
-        let mut total_fwd_fees = Grams::zero();
+        let mut total_fwd_fees = Coins::zero();
         total_fwd_fees.add(&3u64.into()).unwrap();
         total_fwd_fees.add(&fwd_fee.into()).unwrap();
         pretty_assertions::assert_eq!(phase.total_fwd_fees(), total_fwd_fees);
 
-        let mut total_action_fees = Grams::zero();
+        let mut total_action_fees = Coins::zero();
         total_action_fees.add(&5u64.into()).unwrap();
         total_action_fees.add(&mine_fee.into()).unwrap();
         pretty_assertions::assert_eq!(phase.total_action_fees(), total_action_fees);
@@ -1055,7 +1055,7 @@ mod actions {
             12,
             10000000,
             3333282,
-            Some(RESULT_CODE_NOT_ENOUGH_GRAMS),
+            Some(RESULT_CODE_NOT_ENOUGH_COINS),
         )
     }
 
@@ -1256,7 +1256,7 @@ fn test_account_from_message_any() {
     );
 
     // message without StateInit and with bounce
-    let value = CurrencyCollection::with_grams(0);
+    let value = CurrencyCollection::with_coins(0);
     let hdr =
         InternalMessageHeader::with_addresses_and_bounce(src.clone(), dst.clone(), value, true);
     let msg = Message::with_int_header(hdr);
@@ -1266,7 +1266,7 @@ fn test_account_from_message_any() {
     );
 
     // message without code
-    let value = CurrencyCollection::with_grams(0);
+    let value = CurrencyCollection::with_coins(0);
     let hdr =
         InternalMessageHeader::with_addresses_and_bounce(src.clone(), dst.clone(), value, true);
     let mut msg = Message::with_int_header(hdr);
@@ -1295,7 +1295,7 @@ fn test_account_from_message_any() {
     );
 
     // message without StateInit and without bounce
-    let value = CurrencyCollection::with_grams(100);
+    let value = CurrencyCollection::with_coins(100);
     let hdr = InternalMessageHeader::with_addresses_and_bounce(src, dst, value, false);
     let mut msg = Message::with_int_header(hdr);
     pretty_assertions::assert_eq!(
