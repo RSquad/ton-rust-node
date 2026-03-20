@@ -1,0 +1,6 @@
+{
+  "target_rate_ms": 500,
+  "slots_per_leader_window": 4,
+  "first_block_timeout_ms": 1000,
+  "max_leader_window_desync": 2
+}

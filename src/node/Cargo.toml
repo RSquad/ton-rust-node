@@ -1,0 +1,131 @@
+[package]
+build = '../common/build/build.rs'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'node'
+version = '0.3.0'
+
+[[bin]]
+name = 'adnl_resolve'
+path = 'bin/adnl_resolve.rs'
+
+[[bin]]
+name = 'adnl_ping'
+path = 'bin/adnl_ping.rs'
+
+[[bin]]
+name = 'benchmark'
+path = 'bin/benchmark.rs'
+
+[[bin]]
+name = 'console'
+path = 'bin/console.rs'
+
+[[bin]]
+name = 'dhtscan'
+path = 'bin/dhtscan.rs'
+
+[[bin]]
+name = 'crypto'
+path = 'bin/crypto.rs'
+
+[[bin]]
+name = 'print'
+path = 'bin/print.rs'
+
+[[bin]]
+name = 'zerostate'
+path = 'bin/zerostate.rs'
+
+[[bin]]
+name = 'hardfork'
+path = 'bin/hardfork.rs'
+
+[dependencies]
+ahash = "0.8.11"
+anyhow = '1.0'
+async-recursion = '1.1'
+async-trait = '0.1'
+bitflags = '2.6'
+chrono = '0.4'
+clap = { version = "4.5", features = ["derive"] }
+colored = '2.0'
+crossbeam-channel = '0.5'
+ctrlc = { features = ['termination'], version = '3.4' }
+dashmap = '5.4'
+deflate = '1.0'
+dirs = '2.0'
+enum-as-inner = '0.6'
+env_logger = '0.11'
+futures = '0.3'
+futures-timer = '3.0'
+hex = '0.4'
+http = "1.3.1"
+inflate = '0.4'
+lazy_static = '1.4'
+log = '0.4'
+log4rs = { features = ['rolling_file_appender'], version = '1.3' }
+lru = '0.16'
+metrics = '0.24'
+metrics-exporter-prometheus = '0.18'
+num-bigint = '0.4'
+num_cpus = '1.13'
+openssl = '0.10'
+parking_lot = '0.12'
+rand = '0.8'
+regex = '1.10'
+serde = '1.0'
+serde_derive = '1.0'
+serde_json = '1.0'
+shell-words = '1.0'
+smallvec = { features = ['const_new', 'union', 'write'], version = '1.10' }
+spin = '0.7'
+stream-cancel = '0.8'
+string-builder = '0.2'
+thiserror = '1.0'
+tokio = { features = ['rt-multi-thread'], version = '1.40' }
+tokio-util = '0.7'
+warp = { version = "0.4", features = ["server"] }
+adnl = { features = ['client', 'node', 'server'], path = '../adnl' }
+catchain = { path = 'catchain' }
+consensus-common = { path = 'consensus-common' }
+simplex = { path = 'simplex' }
+ton_block = { path = '../block' }
+ton_block_json = { path = '../block-json' }
+ton_executor = { path = '../executor' }
+ton_vm = { path = '../vm' }
+lockfree = { path = '../lockfree' }
+secrets-vault = { path = '../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "crypto-default",
+    "crypto-block",
+] }
+storage = { path = 'storage' }
+ton_api = { path = '../tl/ton_api' }
+validator_session = { path = 'validator-session' }
+
+[[bench]]
+name = "liteserver_pipeline"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+difference = '2.0'
+external-ip = '6.0'
+http-body-util = "0.1"
+pretty_assertions = '1.3'
+reqwest = { version = "0.12.24" }
+tokio = { features = ['macros'], version = '1.40' }
+
+[features]
+default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key']
+cell_counter = ['ton_block/cell_counter']
+ci_run = []
+export_key = ['catchain/export_key', 'ton_block/export_key']
+only_sorted_clean = []
+simplex = []
+telemetry = ['adnl/telemetry', 'storage/telemetry']
+trace_alloc = []
+trace_alloc_detail = ['trace_alloc']
+xp25 = ['ton_block/xp25', 'adnl/xp25']
+mirrornet = ['ton_block/mirrornet']

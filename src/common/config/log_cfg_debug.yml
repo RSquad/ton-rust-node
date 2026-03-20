@@ -1,0 +1,54 @@
+# Scan this file for changes every 5 seconds
+# https://docs.rs/log4rs/0.8.3/log4rs/encode/pattern/index.html
+refresh_rate: 5 seconds
+
+appenders:
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S.%f)} {h({l})} [{t}] {I}: {m}{n}"
+
+root:
+  level: error
+  appenders:
+    - stdout
+
+loggers:
+
+  telemetry:
+    level: debug
+  node:
+    level: debug
+  boot:
+    level: info
+  sync:
+    level: info
+  validator:
+    level: info
+  catchain:
+    level: info
+  validator_session:
+    level: info
+  validate_query:
+    level: info
+  storage:
+    level: info
+
+  index:
+    level: info
+
+  adnl:
+    level: info
+  dht:
+    level: debug
+  overlay:
+    level: debug
+  rldp:
+    level: info
+
+  ton_block:
+    level: off
+  executor:
+    level: off
+  tvm:
+    level: off

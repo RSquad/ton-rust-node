@@ -1,0 +1,40 @@
+[package]
+name = "commands"
+version = "0.2.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+serde = { features = ["derive", "rc"], version = "1.0" }
+serde_json = "1.0"
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.4", features = ["derive", "env"] }
+tracing = "0.1"
+hex = { version = "0.4" }
+base64 = "0.22.1"
+colored = "2.0"
+reqwest = { version = "0.12.24", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+common = { path = "../common" }
+control-client = { path = "../control-client" }
+ton-http-api-client = { path = "../ton-http-api-client" }
+adnl = { features = ["client"], path = "../../adnl" }
+ton_block = { path = "../../block" }
+elections = { path = "../elections" }
+contracts = { path = "../contracts" }
+ton_block_json = { version = "0.9.41", path = "../../block-json" }
+service = { path = "../service" }
+secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "crypto-default",
+    "hashicorp-storage",
+    "with-base64",
+] }
+scopeguard = "1"
+rpassword = "7"
+
+# TODO: remove after debug
+tokio = { version = "1.48.0", features = ["full"] }

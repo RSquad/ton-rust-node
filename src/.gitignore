@@ -1,0 +1,13 @@
+*target
+/tl/ton_api/src/ton
+*.DS_Store
+/.vscode
+.env
+.cursor
+node/tests/test_run_net/tmp
+node/tests/test_run_net_py/tmp
+node/tests/test_run_net_py/test_run_net.json
+node/tests/test_run_net_py/.ruff_cache
+.claude
+node/tests/mirrornet/mirrornet.json
+node/tests/mirrornet/mirrornet_global_config.json

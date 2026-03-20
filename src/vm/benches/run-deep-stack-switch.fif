@@ -1,0 +1,12 @@
+"Asm.fif" include
+<{ NULL
+   10000 PUSHINT
+   REPEAT:<{
+     15 0 BLKPUSH
+   }>
+   ZERO ONLYX
+}>s
+1000000000
+8
+runvmx
+310129 <> abort"consumed gas mismatch"

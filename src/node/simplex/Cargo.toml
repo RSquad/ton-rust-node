@@ -1,0 +1,34 @@
+[package]
+name = 'simplex'
+version = '0.4.0'
+edition = '2021'
+authors = ['RSquad']
+description = 'Simplex consensus protocol implementation for TON blockchain'
+license = 'GPL-3.0'
+
+[dependencies]
+anyhow = '1.0'
+lazy_static = '1.4'
+log = '0.4'
+hex = '0.4'
+rand = '0.8'
+crossbeam = '0.8'
+metrics = '0.24'
+tokio = { features = [ 'rt-multi-thread' ], version = '1.40' }
+
+adnl = { features = [ 'node' ], path = '../../adnl' }
+consensus-common = { path = '../consensus-common' }
+ton_block = { path = '../../block' }
+ton_api = { path = '../../tl/ton_api' }
+
+[dev-dependencies]
+bincode = '1.3'
+chrono = '0.4'
+colored = '2.0'
+env_logger = '0.11'
+serde = { version = '1.0', features = ['derive'] }
+spin = '0.7'
+consensus-common = { path = '../consensus-common', features = ['test-utils'] }
+
+[features]
+default = []

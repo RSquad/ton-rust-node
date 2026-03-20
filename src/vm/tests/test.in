@@ -1,0 +1,29 @@
+NOP
+PUSHINT 1
+PUSHINT 2
+SWAP
+
+; comment
+PUSHINT -2
+XCHG s2
+XCHG s1, s2 ; i < j by spec
+XCHG s1, s2
+PUSH s1
+OVER
+
+; no comments
+DUP
+DUP
+PUSH s1
+OVER
+PUSH s1
+POP s0
+
+; more comments
+ADD
+MULCONST 12
+ADDCONST -11
+SWAP
+DIVMOD
+
+NOP

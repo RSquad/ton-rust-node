@@ -1,0 +1,140 @@
+#include "imports/stdlib.fc";
+
+const op::start = 1;
+const op::ping = 2;
+const op::pong = 3;
+
+
+global int g::last_sent;
+global int g::expected;
+global int g::last_call; 
+global int g::salt;
+global int g::error;
+
+() load_globals() impure {
+    var ds = get_data().begin_parse();
+    g::last_sent = ds~load_uint(64);
+    g::expected = ds~load_uint(64);
+    g::last_call = ds~load_uint(32);
+    g::salt = ds~load_uint(32);
+    g::error = ds~load_uint(1);
+    ds.end_parse();
+}
+
+() store_globals() impure {
+    builder data = begin_cell()
+    .store_uint(g::last_sent, 64)
+    .store_uint(g::expected, 64)
+    .store_uint(g::last_call, 32)
+    .store_uint(g::salt, 32)
+    .store_uint(g::error, 1);
+    set_data(data.end_cell());
+}
+
+() send(slice address, int op, int n) impure {
+    g::last_sent = n;
+    cell c = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(address)
+        .store_coins(100000000)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; default message headers (see sending messages page)
+        .store_uint(op, 32)
+        .store_uint(n, 64)
+        .end_cell();
+
+    send_raw_message(c, 3);
+}
+
+() recv_external(slice in_msg_body) impure {
+
+    load_globals();
+    var new_call = in_msg_body~load_uint(32);
+    if (new_call != g::last_call) {
+        throw(101); 
+    }
+    accept_message();
+
+    var op = in_msg_body~load_uint(32);
+
+    if op == op::start {
+        ;; start
+        slice second_contract_address = in_msg_body~load_msg_addr();
+        var n = in_msg_body~load_uint(8);
+        if (g::last_sent == 0) & (g::expected >= n) {                          
+            int i = g::expected;
+            repeat (n) {
+                send(second_contract_address, op::ping, i);
+                i -= 1;
+            }
+        }
+
+    }
+
+    g::last_call += 1;
+    store_globals();
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; ignore all empty messages
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+
+    load_globals();
+
+    if g::error == 1 {
+        return ();
+    }
+
+    ;; by convention, the first 32 bits of incoming message is the op
+    int op = in_msg_body~load_uint(32);
+
+    if (op == op::start) {
+        slice addr = in_msg_body~load_msg_addr();
+        var n = in_msg_body~load_uint(8);
+        if (g::last_sent == 0) & (g::expected >= n) {
+            int i = g::expected;
+            repeat (n) {
+                send(addr, op::ping, i);
+                i -= 1;
+            }
+        }
+    } else {
+        slice addr = cs~load_msg_addr();
+        int n = in_msg_body~load_uint(64);
+
+        if g::expected == n {
+            g::expected -= 1;
+            if (op == op::ping) {
+                send(addr, op::pong, n);
+            }
+            if (op == op::pong) & (g::last_sent > 0) {
+                send(addr, op::ping, g::last_sent - 1);
+            }
+        } else {
+            g::error = 1;
+        }
+    }
+
+    store_globals();
+}
+
+int get_last_sent() method_id {
+    load_globals();
+    return g::last_sent;
+}
+
+int get_expected() method_id {
+    load_globals();
+    return g::expected;
+}
+
+int get_error() method_id {
+    load_globals();
+    return g::error;
+}

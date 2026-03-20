@@ -1,0 +1,35 @@
+[package]
+build = '../../common/build/build.rs'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'validator_session'
+version = '0.0.3'
+
+[dependencies]
+anyhow = '1.0'
+backtrace = '0.3'
+crossbeam = '0.8'
+hex = '0.4'
+lazy_static = '1.4'
+log = '0.4'
+metrics = '0.24'
+num-derive = '0.4'
+num-traits = '0.2'
+rand = '0.8'
+adnl = { path = '../../adnl' }
+catchain = { path = '../catchain' }
+consensus-common = { path = '../consensus-common' }
+ton_block = { path = '../../block' }
+storage = { path = '../storage' }
+ton_api = { path = '../../tl/ton_api' }
+
+[dev-dependencies]
+bincode = "1.3"
+chrono = '0.4'
+colored = '2.0'
+env_logger = '0.11'
+spin = '0.7'
+serde = { version = "1.0", features = ["derive"] }
+
+[features]
+export_key = [  ]

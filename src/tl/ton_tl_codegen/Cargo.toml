@@ -1,0 +1,20 @@
+[package]
+description = 'Code generator for TL-schema'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'ton_tl_codegen'
+version = '0.1.0'
+
+[dependencies]
+crc = '3.3'
+pom = '1.1'
+proc-macro2 = '1.0'
+quote = '1.0'
+serde = '1.0'
+serde_derive = '1.0'
+syn = '1.0'
+
+[features]
+default = [  ]
+reformat = [  ]
+

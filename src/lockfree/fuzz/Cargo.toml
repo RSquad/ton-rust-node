@@ -1,0 +1,50 @@
+[package]
+name = "lockfree-fuzz"
+version = "0.0.1"
+authors = ["Automatically generated"]
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies.lockfree]
+path = ".."
+[dependencies.fuzzsuite]
+path = "fuzzsuite"
+[dependencies.libfuzzer-sys]
+git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = [".", "fuzzsuite"]
+
+[[bin]]
+name = "queue"
+path = "fuzz_targets/queue.rs"
+
+[[bin]]
+name = "stack"
+path = "fuzz_targets/stack.rs"
+
+[[bin]]
+name = "map"
+path = "fuzz_targets/map.rs"
+
+[[bin]]
+name = "mpsc"
+path = "fuzz_targets/mpsc.rs"
+
+[[bin]]
+name = "spsc"
+path = "fuzz_targets/spsc.rs"
+
+[[bin]]
+name = "spmc"
+path = "fuzz_targets/spmc.rs"
+
+[[bin]]
+name = "mpmc"
+path = "fuzz_targets/mpmc.rs"
+
+[profile.release]
+lto = "off"

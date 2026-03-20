@@ -1,0 +1,2 @@
+"elector-data.boc" file>B
+{ dup B>boc drop } 1000 times

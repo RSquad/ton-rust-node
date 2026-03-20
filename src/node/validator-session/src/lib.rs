@@ -1,0 +1,1599 @@
+/*
+ * Copyright (C) 2019-2024 EverX. All Rights Reserved.
+ * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ *
+ * This file has been modified from its original version.
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
+//const TELEGRAM_NODE_COMPATIBILITY_HASHES_BUG: bool = false; //compatibility with Telegram Node: bug in hashes computation for attempt and round
+const TELEGRAM_NODE_COMPATIBILITY_HASHES_BUG: bool = true; //compatibility with Telegram Node: bug in hashes computation for attempt and round
+
+mod block_candidate;
+mod block_candidate_serializer;
+mod cache;
+
+mod old_round;
+mod round;
+mod round_attempt;
+mod sent_block;
+mod session;
+mod session_description;
+mod session_processor;
+mod session_state;
+mod task_queue;
+pub mod tests;
+pub mod utils;
+mod vector;
+mod vector_bool;
+mod vote_candidate;
+
+pub use cache::*;
+use catchain::CatchainPtr;
+// Re-export common types from consensus-common
+pub use consensus_common::{
+    // Session types
+    AsyncRequest,
+    AsyncRequestPtr,
+    BlockCandidatePriority,
+    // Core types
+    BlockHash,
+    BlockSignature,
+    BlockSourceInfo,
+    CollationParentHint,
+    PrivateKey,
+    PublicKey,
+    PublicKeyHash,
+    RawBuffer,
+    Result,
+    // Base Session trait
+    Session as ConsensusSession,
+    SessionId,
+    SessionListener,
+    SessionListenerPtr,
+    SessionNode,
+    SessionStats,
+    ValidatorBlockCandidate,
+    ValidatorBlockCandidateCallback,
+    ValidatorBlockCandidateDecisionCallback,
+    ValidatorBlockCandidatePtr,
+    ValidatorBlockId,
+    ValidatorWeight,
+};
+use std::{
+    any::Any,
+    cell::RefCell,
+    fmt,
+    rc::Rc,
+    sync::{Arc, LazyLock},
+};
+use task_queue::{CallbackTaskQueuePtr, CompletionHandlerProcessor, TaskQueuePtr};
+
+pub mod ton {
+    pub use ton_api::ton::{int, rpc::validator_session::*, validator_session::*};
+
+    pub mod blockid {
+        pub use ton_api::ton::ton::blockid::*;
+    }
+
+    pub mod hashable {
+        pub use ton_api::ton::hashable::hashable::*;
+    }
+
+    pub type Message = ::ton_api::ton::validator_session::round::Message;
+
+    pub mod message {
+        pub use ton_api::ton::validator_session::round::validator_session::message::message::*;
+    }
+}
+
+/// Hash of the object
+pub type HashType = u32;
+
+/// Block payload
+pub type BlockPayloadPtr = ::catchain::BlockPayloadPtr;
+
+/// Catchain node
+pub type CatchainNode = ::catchain::CatchainNode;
+
+/// Pointer to overlay API for the Catchain
+pub type CatchainOverlayPtr = ::catchain::CatchainOverlayPtr;
+
+/// Block ID
+pub type BlockId = BlockHash;
+
+/// Block candidate identifier for skip round (optional case to identify candidate as empty)
+pub static SKIP_ROUND_CANDIDATE_BLOCKID: LazyLock<BlockId> = LazyLock::new(Default::default);
+/// Default block ID for internal use
+pub static DEFAULT_BLOCKID: LazyLock<BlockId> = LazyLock::new(Default::default);
+
+/// Overlay manager
+pub type CatchainOverlayManagerPtr = catchain::CatchainOverlayManagerPtr;
+
+/// Log replay options
+pub type LogReplayOptions = catchain::LogReplayOptions;
+
+/// Log replay listener pointer
+pub type SessionReplayListenerPtr = catchain::CatchainReplayListenerPtr;
+
+/// Backward compatibility alias for SessionStats
+/// TODO: Remove once all usages are migrated to SessionStats
+pub type ValidatorSessionStats = SessionStats;
+
+/// Pool type
+#[derive(Clone, Copy, PartialEq)]
+pub enum SessionPool {
+    /// Persistent storage
+    Persistent,
+
+    /// Temporary pool
+    Temp,
+}
+
+/// Trait to obtain hash of the object
+pub trait HashableObject {
+    /// Get object hash
+    fn get_hash(&self) -> HashType;
+
+    /// Get object hash in TON API format
+    fn get_ton_hash(&self) -> ton::int {
+        self.get_hash() as ton::int
+    }
+}
+
+/// Pool control for the object
+pub trait PoolObject {
+    /// Set pool of the object
+    fn set_pool(&mut self, pool: SessionPool);
+
+    /// Get pool of the object
+    fn get_pool(&self) -> SessionPool;
+}
+
+/// Movable pool object
+pub trait MovablePoolObject<T> {
+    /// Move object to pool
+    fn move_to_persistent(&self, cache: &mut dyn SessionCache) -> T;
+}
+
+/// Pool pointer
+pub type PoolPtr<T> = Rc<T>;
+
+/// Pointer to SentBlock
+pub type SentBlockPtr = Option<PoolPtr<dyn SentBlock>>;
+
+/// Pointer to BlockCandidate
+pub type BlockCandidatePtr = PoolPtr<dyn BlockCandidate>;
+
+/// Pointer to BlockCandidateSignature
+pub type BlockCandidateSignaturePtr = Option<PoolPtr<dyn BlockCandidateSignature>>;
+
+/// Pointer to BoolVector
+pub type BoolVectorPtr = PoolPtr<dyn BoolVector>;
+
+/// Vector of block candidate signatures
+pub type BlockCandidateSignatureVector = dyn Vector<BlockCandidateSignaturePtr>;
+
+/// Pointer to BlockCandidateSignatureVector
+pub type BlockCandidateSignatureVectorPtr = PoolPtr<BlockCandidateSignatureVector>;
+
+/// Pointer to VoteCandidate
+pub type VoteCandidatePtr = PoolPtr<dyn VoteCandidate>;
+
+/// Vector of vote candidates
+pub type VoteCandidateVector =
+    dyn SortedVector<PoolPtr<dyn VoteCandidate>, VoteCandidateComparator>;
+
+/// Pointer to VoteCandidateVector
+pub type VoteCandidateVectorPtr = Option<PoolPtr<VoteCandidateVector>>;
+
+/// Pointer to RoundAttemptState
+pub type RoundAttemptStatePtr = PoolPtr<dyn RoundAttemptState>;
+
+/// Pointer to RoundState
+pub type RoundStatePtr = PoolPtr<dyn RoundState>;
+
+/// Pointer to OldRoundState
+pub type OldRoundStatePtr = PoolPtr<dyn OldRoundState>;
+
+/// Pointer to SessionState
+pub type SessionStatePtr = PoolPtr<dyn SessionState>;
+
+/// Pointer to SessionProcessor
+pub type SessionProcessorPtr = Rc<RefCell<dyn SessionProcessor>>;
+
+/// Pointer to CatchainSession
+pub type SessionPtr = Arc<dyn Session + Send + Sync>;
+
+/// Validator session options
+#[derive(Clone, Copy, Debug)]
+pub struct SessionOptions {
+    /// Protocol version
+    pub proto_version: u32,
+
+    /// Catchain processing timeout
+    /// (will be ignored for single-node sessions)
+    pub catchain_idle_timeout: std::time::Duration,
+
+    /// Maximum number of dependencies to merge
+    pub catchain_max_deps: u32,
+
+    /// Maximum serialized block size
+    pub catchain_max_serialized_block_size: u32,
+
+    /// Block hash covers data
+    pub catchain_block_hash_covers_data: bool,
+
+    /// Maximum block height coefficient
+    pub catchain_max_block_height_coeff: u64,
+
+    /// Disable database for catchain
+    pub catchain_disable_db: bool,
+
+    /// Use Catchain in receive only mode (for debugging and log replay)
+    pub catchain_skip_processed_blocks: bool,
+
+    /// Receiver: max number of neighbours to synchronize
+    pub catchain_receiver_max_neighbours_count: usize,
+
+    /// Receiver: min time for catchain sync with neighbour nodes
+    pub catchain_receiver_neighbours_sync_min_period: std::time::Duration,
+
+    /// Receiver: max time for catchain sync with neighbour nodes
+    pub catchain_receiver_neighbours_sync_max_period: std::time::Duration,
+
+    /// Receiver: max number of attempts to find a source to synchronize
+    pub catchain_receiver_max_sources_sync_attempts: usize,
+
+    /// Receiver: min time for catchain neighbours rotation
+    pub catchain_receiver_neighbours_rotate_min_period: std::time::Duration,
+
+    /// Receiver: max time for catchain neighbours rotation
+    pub catchain_receiver_neighbours_rotate_max_period: std::time::Duration,
+
+    /// Number of block candidates per round
+    pub round_candidates: u32,
+
+    /// Delay before proposing new candidate
+    pub next_candidate_delay: std::time::Duration,
+
+    /// Duration of one round attempt
+    pub round_attempt_duration: std::time::Duration,
+
+    /// Maximum number of attempts per round
+    pub max_round_attempts: u32,
+
+    /// Maximum block size
+    pub max_block_size: u32,
+
+    /// Maximum size of collated data
+    pub max_collated_data_size: u32,
+
+    /// Allow new catchain IDs
+    pub new_catchain_ids: bool,
+
+    /// Skip validations for single node sessions
+    pub skip_single_node_session_validations: bool,
+
+    /// Accelerated consensus mode
+    pub accelerated_consensus_enabled: bool,
+
+    /// Accelerated consensus collation retry timeout
+    pub accelerated_consensus_collation_retry_timeout: std::time::Duration,
+
+    /// Accelerated consensus skip rounds count for collator rotation
+    pub accelerated_consensus_skip_rounds_count_for_collator_rotation: u32,
+
+    /// Accelerated consensus max number of precollated blocks
+    pub accelerated_consensus_max_precollated_blocks: u32,
+
+    /// Number of validation retry attempts (both for normal and accelerated consensus; 0 by default)
+    pub validation_retry_attempts: u32,
+
+    /// Timeout between validation retry attempts (1s by default)
+    pub validation_retry_timeout: std::time::Duration,
+
+    /// Timeout between block candidate sending retry attempts
+    pub block_candidate_sending_retry_timeout: std::time::Duration,
+
+    /// Number of block candidate sending retry attempts (0 by default)
+    pub block_candidate_sending_retry_attempts: u32,
+
+    /// Use callback thread for validator session callbacks (true by default)
+    pub use_callback_thread: bool,
+}
+
+/// Merge wrapper
+pub trait Merge<Ptr> {
+    /// Merge two state objects in one
+    fn merge(&self, right: &Ptr, desc: &mut dyn SessionDescription) -> Ptr;
+}
+
+/// Vector merge wrapper
+pub trait VectorMerge<T: std::cmp::PartialEq, Ptr: Clone> {
+    /// Merge two state objects in one with default merger
+    fn merge(&self, right: &Ptr, desc: &mut dyn SessionDescription) -> Ptr
+    where
+        T: Merge<T>,
+    {
+        self.merge_impl(right, desc, false, &|left: &T, right: &T, desc| left.merge(right, desc))
+    }
+
+    /// Merge two state objects in one
+    fn merge_custom(
+        &self,
+        right: &Ptr,
+        desc: &mut dyn SessionDescription,
+        merge_fn: &dyn Fn(&T, &T, &mut dyn SessionDescription) -> T,
+    ) -> Ptr {
+        self.merge_impl(right, desc, false, merge_fn)
+    }
+
+    /// Merge two state objects in one
+    fn merge_impl(
+        &self,
+        right: &Ptr,
+        desc: &mut dyn SessionDescription,
+        merge_all: bool,
+        merge_fn: &dyn Fn(&T, &T, &mut dyn SessionDescription) -> T,
+    ) -> Ptr;
+}
+
+/// Vector of elements
+pub trait Vector<T: Clone + HashableObject + TypeDesc + MovablePoolObject<T> + fmt::Debug>:
+    HashableObject + PoolObject + fmt::Display + fmt::Debug
+{
+    /// Size of vector
+    fn len(&self) -> usize;
+
+    /// IsEmpty of vector
+    fn is_empty(&self) -> bool;
+
+    /// Access to an item
+    fn at(&self, index: usize) -> &T;
+
+    /// Iterator
+    fn iter(&self) -> std::slice::Iter<'_, T>;
+
+    /// Iterator (avoid rust bug with iter implementation in several traits)
+    fn get_iter(&self) -> std::slice::Iter<'_, T> {
+        self.iter()
+    }
+
+    /// Push new element
+    fn push(&self, desc: &mut dyn SessionDescription, value: T) -> PoolPtr<dyn Vector<T>>;
+
+    /// Change element
+    fn change(
+        &self,
+        desc: &mut dyn SessionDescription,
+        index: usize,
+        value: T,
+    ) -> PoolPtr<dyn Vector<T>>;
+
+    /// Modify whole vector
+    fn modify(
+        &self,
+        desc: &mut dyn SessionDescription,
+        modifier: &dyn Fn(&T) -> T,
+    ) -> PoolPtr<dyn Vector<T>>;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn Vector<T>>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Option based array trait
+pub trait VectorWrapper<T: Clone + HashableObject + TypeDesc + MovablePoolObject<T> + fmt::Debug> {
+    /// Size of vector
+    fn len(&self) -> usize;
+
+    /// IsEmpty of vector
+    fn is_empty(&self) -> bool;
+
+    /// Access to an item
+    fn at(&self, index: usize) -> &T;
+
+    /// Iterator
+    fn iter(&self) -> std::slice::Iter<'_, T>;
+
+    /// Iterator (avoid rust bug with iter implementation in several traits)
+    fn get_iter(&self) -> std::slice::Iter<'_, T> {
+        self.iter()
+    }
+
+    /// Push new element
+    fn push(&self, desc: &mut dyn SessionDescription, value: T) -> Option<PoolPtr<dyn Vector<T>>>;
+
+    /// Change element
+    fn change(
+        &self,
+        desc: &mut dyn SessionDescription,
+        index: usize,
+        value: T,
+    ) -> Option<PoolPtr<dyn Vector<T>>>;
+
+    /// Modify whole vector
+    fn modify(
+        &self,
+        desc: &mut dyn SessionDescription,
+        modifier: &dyn Fn(&T) -> T,
+    ) -> Option<PoolPtr<dyn Vector<T>>>;
+}
+
+/// Vector of bools
+pub trait BoolVector: HashableObject + PoolObject + fmt::Display + fmt::Debug {
+    /// Size of vector
+    fn len(&self) -> usize;
+
+    /// IsEmpty of vector
+    fn is_empty(&self) -> bool;
+
+    /// Access to an item
+    fn at(&self, index: usize) -> bool;
+
+    /// Change element
+    fn change(
+        &self,
+        desc: &mut dyn SessionDescription,
+        index: usize,
+        value: bool,
+    ) -> PoolPtr<dyn BoolVector>;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn BoolVector>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Sorting predicate for vector items
+pub trait SortingPredicate<T> {
+    /// Should return true if first item is less than second item
+    fn less(first: &T, second: &T) -> bool;
+}
+
+/// Sorted vector of elements
+pub trait SortedVector<
+    T: Clone + HashableObject + TypeDesc + MovablePoolObject<T> + fmt::Debug + std::cmp::PartialEq,
+    Compare: SortingPredicate<T>,
+>: HashableObject + PoolObject + fmt::Display + fmt::Debug
+{
+    /// Size of vector
+    fn len(&self) -> usize;
+
+    /// IsEmpty of vector
+    fn is_empty(&self) -> bool;
+
+    /// Access to an item
+    fn at(&self, index: usize) -> &T;
+
+    /// Iterator
+    fn iter(&self) -> std::slice::Iter<'_, T>;
+
+    /// Iterator (avoid rust bug with iter implementation in several traits)
+    fn get_iter(&self) -> std::slice::Iter<'_, T> {
+        self.iter()
+    }
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(
+        &self,
+        cache: &mut dyn SessionCache,
+    ) -> PoolPtr<dyn SortedVector<T, Compare>>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Option based array trait
+pub trait SortedVectorWrapper<
+    T: Clone + HashableObject + TypeDesc + MovablePoolObject<T> + std::cmp::PartialEq + fmt::Debug,
+    Compare: SortingPredicate<T>,
+>
+{
+    /// Size of vector
+    fn len(&self) -> usize;
+
+    /// IsEmpty of vector
+    fn is_empty(&self) -> bool;
+
+    /// Access to an item
+    fn at(&self, index: usize) -> &T;
+
+    /// Iterator
+    fn iter(&self) -> std::slice::Iter<'_, T>;
+
+    /// Iterator (avoid rust bug with iter implementation in several traits)
+    fn get_iter(&self) -> std::slice::Iter<'_, T> {
+        self.iter()
+    }
+
+    /// Push new element
+    fn push(
+        &self,
+        desc: &mut dyn SessionDescription,
+        value: T,
+    ) -> Option<PoolPtr<dyn SortedVector<T, Compare>>>;
+}
+
+/// Trait for type
+pub trait TypeDesc {
+    /// Returns instance counter for this type
+    fn get_vector_instance_counter(desc: &dyn SessionDescription) -> &CachedInstanceCounter;
+}
+
+/// Block which has been sent to validator session
+pub trait SentBlock: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Block identifier
+    fn get_id(&self) -> &BlockId;
+
+    /// Source validator index
+    fn get_source_index(&self) -> u32;
+
+    /// Hash of the root for this block
+    fn get_root_hash(&self) -> &BlockHash;
+
+    /// File data hash
+    fn get_file_hash(&self) -> &BlockHash;
+
+    /// Collated data file hash
+    fn get_collated_data_file_hash(&self) -> &BlockHash;
+
+    /// Timestamp of source block creation (when the block and all its dependencies are resolved)
+    fn get_source_block_creation_time(&self) -> std::time::SystemTime;
+
+    /// Timestamp of source block creation itself (without dependencies resolving)
+    fn get_source_block_payload_creation_time(&self) -> std::time::SystemTime;
+
+    /// Timestamp of sent block creation
+    fn get_creation_time(&self) -> std::time::SystemTime;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn SentBlock>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Block wrapper (for operations on top of Rc<SentBlock>)
+pub trait SentBlockWrapper {
+    /// Block identifier
+    fn get_id(&self) -> &BlockId;
+}
+
+/// Signature of a block candidate
+pub trait BlockCandidateSignature: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Block signature
+    fn get_signature(&self) -> &BlockSignature;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(
+        &self,
+        cache: &mut dyn SessionCache,
+    ) -> PoolPtr<dyn BlockCandidateSignature>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Block candidate
+pub trait BlockCandidate: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Block ID
+    fn get_id(&self) -> &BlockId;
+
+    /// Get attached block
+    fn get_block(&self) -> &SentBlockPtr;
+
+    /// Source validator index
+    fn get_source_index(&self) -> u32;
+
+    /// Check if block is approved by specified validator
+    fn check_block_is_approved_by(&self, source_index: u32) -> bool;
+
+    /// Check if block is approved by cutoff weights
+    fn check_block_is_approved(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Get list of approvers
+    fn get_approvers_list(&self) -> &BlockCandidateSignatureVectorPtr;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn BlockCandidate>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Block candidate wrapper (for operations on top of Rc<BlockCandidate>)
+pub trait BlockCandidateWrapper {
+    /// Push signature of a new block candidate
+    fn push(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        signature: BlockCandidateSignaturePtr,
+    ) -> BlockCandidatePtr;
+}
+
+/// Block vote candidate
+pub trait VoteCandidate: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Block ID
+    fn get_id(&self) -> &BlockId;
+
+    /// Get attached block
+    fn get_block(&self) -> &SentBlockPtr;
+
+    /// Source validator index
+    fn get_source_index(&self) -> u32;
+
+    /// Voters list
+    fn get_voters_list(&self) -> &BoolVectorPtr;
+
+    /// Check if block is voted
+    fn check_block_is_voted(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Check if block is voted by specific vlidator
+    fn check_block_is_voted_by(&self, src_idx: u32) -> bool;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn VoteCandidate>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Vote candidate wrapper (for operations on top of Rc<VoteCandidate>)
+pub trait VoteCandidateWrapper {
+    /// Push vote for candidate
+    fn push(&self, desc: &mut dyn SessionDescription, src_idx: u32) -> VoteCandidatePtr;
+}
+
+/// Comparator for voting candidates
+pub struct VoteCandidateComparator {}
+
+impl SortingPredicate<PoolPtr<dyn VoteCandidate>> for VoteCandidateComparator {
+    fn less(first: &PoolPtr<dyn VoteCandidate>, second: &PoolPtr<dyn VoteCandidate>) -> bool {
+        first.get_id() < second.get_id()
+    }
+}
+
+/// Attempt state
+pub trait RoundAttemptState: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Sequence number of the attempt
+    fn get_sequence_number(&self) -> u32;
+
+    /// Votes
+    fn get_votes(&self) -> &VoteCandidateVectorPtr;
+
+    /// Precommits
+    fn get_precommits(&self) -> &BoolVectorPtr;
+
+    /// Get voted block
+    fn get_voted_block(&self, desc: &dyn SessionDescription) -> Option<SentBlockPtr>;
+
+    /// Get "vote-for" block
+    fn get_vote_for_block(&self) -> &Option<SentBlockPtr>;
+
+    /// Check if attempt is precommitted
+    fn check_attempt_is_precommitted(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Check vote is received from validator
+    fn check_vote_received_from(&self, src_idx: u32) -> bool;
+
+    /// Check precommit is received from validator
+    fn check_precommit_received_from(&self, src_idx: u32) -> bool;
+
+    /// Create action according to a current state
+    fn create_action(
+        &self,
+        desc: &dyn SessionDescription,
+        round: &dyn RoundState,
+        src_idx: u32,
+        attempt_id: u32,
+    ) -> Option<ton::Message>;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn RoundAttemptState>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+
+    /// Dump state
+    fn dump(&self, desc: &dyn SessionDescription) -> String;
+}
+
+/// Round attempt wrapper (for operations on top of Rc<RoundAttemptState>)
+pub trait RoundAttemptStateWrapper {
+    /// Apply action to a state
+    fn apply_action(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+        message: &ton::Message,
+        round_state: &dyn RoundState,
+    ) -> RoundAttemptStatePtr;
+
+    /// Consensus iteration actualization
+    fn make_one(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+        round_state: &dyn RoundState,
+    ) -> (RoundAttemptStatePtr, bool);
+}
+
+/// Round state
+pub trait RoundState: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Round sequence number
+    fn get_sequence_number(&self) -> u32;
+
+    /// Get accelerated consensus collator index
+    fn get_accelerated_consensus_collator_index(&self) -> Option<u32>;
+
+    /// Node priority in a round
+    fn get_node_priority(&self, desc: &dyn SessionDescription, src_idx: u32) -> i32;
+
+    /// Get precommitted block
+    fn get_precommitted_block(&self) -> Option<SentBlockPtr>;
+
+    /// Does the round have precommitted block
+    fn has_precommitted_block(&self) -> bool;
+
+    /// First attempt for the specified validator
+    fn get_first_attempt(&self, src_idx: u32) -> u32;
+
+    /// Last precommit for the sspecified validator
+    fn get_last_precommit(&self, src_idx: u32) -> u32;
+
+    /// Get block by id
+    fn get_block(&self, block_id: &BlockId) -> Option<BlockCandidatePtr>;
+
+    /// Does the round have approved block
+    fn has_approved_block(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Validators which approved the block
+    fn get_block_approvers(&self, desc: &dyn SessionDescription, block_id: &BlockId) -> Vec<u32>;
+
+    /// Block approved by validator
+    fn get_blocks_approved_by(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+    ) -> Vec<SentBlockPtr>;
+
+    /// Check if block is signed
+    fn check_block_is_signed(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Check if block is signed by specific validator
+    fn check_block_is_signed_by(&self, src_idx: u32) -> bool;
+
+    /// Check if block is approved by specific validator
+    fn check_block_is_approved_by(&self, src_idx: u32, block_id: &BlockId) -> bool;
+
+    /// Check if block was sent by a specific validator
+    fn check_block_is_sent_by(&self, src_idx: u32) -> bool;
+
+    /// Does the round have voted block
+    fn has_voted_block(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Check if we need to generate vote for block
+    fn check_need_generate_vote_for(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+        attempt: u32,
+    ) -> bool;
+
+    /// Generate vote for
+    fn generate_vote_for(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+    ) -> ton::Message;
+
+    /// Choose block to sign
+    fn choose_block_to_sign(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+    ) -> Option<SentBlockPtr>;
+
+    /// Choose blocks to approve
+    fn choose_blocks_to_approve(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+    ) -> Vec<SentBlockPtr>;
+
+    /// Choose block to vote
+    fn choose_block_to_vote(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+        attempt: u32,
+        vote_for: Option<SentBlockPtr>,
+    ) -> Option<SentBlockPtr>;
+
+    /// List of signatures
+    fn get_signatures(&self) -> &BlockCandidateSignatureVectorPtr;
+
+    /// Create action according to a current state
+    fn create_action(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+    ) -> Option<ton::Message>;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn RoundState>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+
+    /// Dump state
+    fn dump(&self, desc: &dyn SessionDescription) -> String;
+}
+
+/// Round wrapper (for operations on top of Rc<RoundState>)
+pub trait RoundStateWrapper {
+    /// Apply action to a state
+    fn apply_action(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+        message: &ton::Message,
+        block_creation_time: std::time::SystemTime,
+        block_payload_creation_time: std::time::SystemTime,
+    ) -> RoundStatePtr;
+
+    /// Consensus iteration actualization
+    fn make_one(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+    ) -> (RoundStatePtr, bool);
+}
+
+/// Old round state
+pub trait OldRoundState: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Signed block
+    fn get_block(&self) -> &SentBlockPtr;
+
+    /// ID of signed block
+    fn get_block_id(&self) -> &BlockId;
+
+    /// Round sequence number
+    fn get_sequence_number(&self) -> u32;
+
+    /// Accelerated consensus collator index
+    fn get_accelerated_consensus_collator_index(&self) -> Option<u32>;
+
+    /// Check if block is signed by specific validator
+    fn check_block_is_signed_by(&self, src_idx: u32) -> bool;
+
+    /// Check if block is approved by specific validator
+    fn check_block_is_approved_by(&self, src_idx: u32) -> bool;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn OldRoundState>;
+
+    /// Commit signatures
+    fn get_signatures(&self) -> &BlockCandidateSignatureVectorPtr;
+
+    /// Approval signatures
+    fn get_approve_signatures(&self) -> &BlockCandidateSignatureVectorPtr;
+
+    /// Merge round to old round
+    fn merge_round(
+        &self,
+        round: &dyn RoundState,
+        desc: &mut dyn SessionDescription,
+    ) -> PoolPtr<dyn OldRoundState>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+}
+
+/// Old round wrapper (for operations on top of Rc<OldRoundState>)
+pub trait OldRoundStateWrapper {
+    /// Apply action to a state
+    fn apply_action(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+        message: &ton::Message,
+    ) -> OldRoundStatePtr;
+}
+
+/// Session state
+pub trait SessionState: fmt::Display + fmt::Debug + PoolObject + HashableObject {
+    /// Current round sequence id
+    fn get_current_round_sequence_number(&self) -> u32;
+
+    /// Get accelerated consensus collator for round
+    fn get_current_accelerated_consensus_collator_index(&self) -> Option<u32>;
+
+    /// Node priority in the current round
+    fn get_current_round_node_priority(&self, desc: &dyn SessionDescription, src_idx: u32) -> i32;
+
+    /// Attempt global number (timestamp) for specified validator
+    fn get_ts(&self, src_idx: u32) -> u32;
+
+    /// Choose block to sign
+    fn choose_block_to_sign(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+    ) -> Option<SentBlockPtr>;
+
+    /// Committed block for specified round
+    fn get_committed_block(
+        &self,
+        desc: &dyn SessionDescription,
+        round_seqno: u32,
+    ) -> Option<SentBlockPtr>;
+
+    /// Get block by id
+    fn get_block(&self, desc: &dyn SessionDescription, block_id: &BlockId) -> Option<SentBlockPtr>;
+
+    /// Does the round have approved block
+    fn has_approved_block(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Block approved by validator
+    fn get_blocks_approved_by(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+    ) -> Vec<SentBlockPtr>;
+
+    /// Choose blocks to approve
+    fn choose_blocks_to_approve(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+    ) -> Vec<SentBlockPtr>;
+
+    /// Check if block is signed by specific validator
+    fn check_block_is_signed_by(&self, src_idx: u32) -> bool;
+
+    /// Check if block is approved by specific validator
+    fn check_block_is_approved_by(&self, src_idx: u32, block_id: &BlockId) -> bool;
+
+    /// Check if block was sent by a specific validator
+    fn check_block_is_sent_by(&self, src_idx: u32) -> bool;
+
+    /// Does the round have precommitted block
+    fn has_precommitted_block(&self) -> bool;
+
+    /// Does the round have voted block
+    fn has_voted_block(&self, desc: &dyn SessionDescription) -> bool;
+
+    /// Current round's attempt number
+    fn get_current_round_attempt_number(&self, desc: &dyn SessionDescription) -> u32;
+
+    /// Return precommitted block for current round
+    fn get_current_round_precommitted_block(&self) -> Option<SentBlockPtr>;
+
+    /// Return signatures for current round
+    fn get_current_round_signatures(&self) -> BlockCandidateSignatureVectorPtr;
+
+    /// Check if we need to generate vote for block
+    fn check_need_generate_vote_for(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+        attempt: u32,
+    ) -> bool;
+
+    /// Generate vote for
+    fn generate_vote_for(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+    ) -> ton::Message;
+
+    /// Validators which approved the block
+    fn get_block_approvers(&self, desc: &dyn SessionDescription, block_id: &BlockId) -> Vec<u32>;
+
+    /// Get commited block signatures
+    fn get_committed_block_signatures(
+        &self,
+        sequence_number: u32,
+    ) -> Option<BlockCandidateSignatureVectorPtr>;
+
+    /// Get commited block approve signatures
+    fn get_committed_block_approve_signatures(
+        &self,
+        sequence_number: u32,
+    ) -> Option<BlockCandidateSignatureVectorPtr>;
+
+    /// Clone object to persistent pool
+    fn clone_to_persistent(&self, cache: &mut dyn SessionCache) -> PoolPtr<dyn SessionState>;
+
+    /// Apply action to a state
+    fn apply_action(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+        message: &ton::Message,
+        block_creation_time: std::time::SystemTime,
+        block_payload_creation_time: std::time::SystemTime,
+    ) -> SessionStatePtr;
+
+    /// Create action according to a current state
+    fn create_action(
+        &self,
+        desc: &dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+    ) -> Option<ton::Message>;
+
+    /// Get implementation details object
+    fn get_impl(&self) -> &dyn Any;
+
+    /// Dump state
+    fn dump(&self, desc: &dyn SessionDescription) -> String;
+}
+
+/// State wrapper (for operations on top of Rc<SessionState>)
+pub trait SessionStateWrapper {
+    /// Return actualized session (returns state and marker than session has been changed during actualization)
+    fn make_all(
+        &self,
+        desc: &mut dyn SessionDescription,
+        src_idx: u32,
+        attempt_id: u32,
+    ) -> SessionStatePtr;
+}
+
+/// Validator session description
+pub trait SessionDescription: fmt::Display + fmt::Debug + cache::SessionCache {
+    /// Source public key hash
+    fn get_source_public_key_hash(&self, src_idx: u32) -> &PublicKeyHash;
+
+    /// Source public key
+    fn get_source_public_key(&self, src_idx: u32) -> &PublicKey;
+
+    /// ADNL id
+    fn get_source_adnl_id(&self, src_idx: u32) -> &PublicKeyHash;
+
+    /// Get source index by public key hash
+    fn get_source_index(&self, public_key_hash: &PublicKeyHash) -> Result<u32>;
+
+    /// Validator weight
+    fn get_node_weight(&self, src_idx: u32) -> ValidatorWeight;
+
+    /// Nodes count
+    fn get_total_nodes(&self) -> u32;
+
+    /// Cutoff weight for decision making
+    fn get_cutoff_weight(&self) -> ValidatorWeight;
+
+    /// Reverse cutoff weight for decision making (rejections)
+    fn get_reverse_cutoff_weight(&self) -> ValidatorWeight;
+
+    /// Total aggregated weight of validators
+    fn get_total_weight(&self) -> ValidatorWeight;
+
+    /// Get index of this validator
+    fn get_self_idx(&self) -> u32;
+
+    /// Node priority in a round (for non-accelerated consensus mode)
+    fn get_normal_node_priority(&self, src_idx: u32, round: u32) -> i32;
+
+    /// Maximum priority of the node
+    fn get_max_priority(&self) -> u32;
+
+    /// Convert timestamp to unix-time (returns seconds only without fractional part)
+    fn get_unixtime(&self, ts: u64) -> u32;
+
+    /// Attempt sequence number
+    fn get_attempt_sequence_number(&self, ts: u64) -> u32;
+
+    /// Current timestamp in fixed point format 32.32 (bits [32;64) - seconds, [0..32) - seconds fraction)
+    fn get_ts(&self) -> u64;
+
+    /// Make candidate id
+    fn candidate_id(
+        &self,
+        src_idx: u32,
+        root_hash: &BlockHash,
+        file_hash: &BlockHash,
+        collated_data_hash: &BlockHash,
+    ) -> BlockId;
+
+    /// Check signature
+    fn check_signature(
+        &self,
+        root_hash: &BlockHash,
+        file_hash: &BlockHash,
+        src_idx: u32,
+        signature: &BlockSignature,
+    ) -> Result<()>;
+
+    /// Check signature of approval
+    fn check_approve_signature(
+        &self,
+        root_hash: &BlockHash,
+        file_hash: &BlockHash,
+        src_idx: u32,
+        signature: &BlockSignature,
+    ) -> Result<()>;
+
+    /// Get delay in seconds for specified priority
+    fn get_delay(&self, priority: u32) -> std::time::Duration;
+
+    /// Get delay to commit empty block
+    fn get_empty_block_delay(&self) -> std::time::Duration;
+
+    /// "Vote-for" validator index for specified attempt
+    fn get_vote_for_author(&self, attempt: u32) -> u32;
+
+    /// Validators public key hashes
+    fn export_nodes(&self) -> Vec<PublicKeyHash>;
+
+    /// Validators public keys
+    fn export_full_nodes(&self) -> Vec<PublicKey>;
+
+    /// Catchain nodes of the validators
+    fn export_catchain_nodes(&self) -> Vec<CatchainNode>;
+
+    /// Options
+    fn opts(&self) -> &SessionOptions;
+
+    /// Accelerated consensus enabled
+    fn is_accelerated_consensus_enabled(&self) -> bool;
+
+    /// Get accelerated consensus initial collator index
+    fn get_accelerated_consensus_initial_collator_index(&self) -> u32;
+
+    /// Get cache
+    fn get_cache(&mut self) -> &mut dyn SessionCache;
+
+    /// Generate random usize value
+    fn generate_random_usize(&mut self) -> usize;
+
+    /// Get next attempt start time
+    fn get_attempt_start_at(&self, attempt: u32) -> std::time::SystemTime;
+
+    /// Set time for log replaying
+    fn set_time(&mut self, time: std::time::SystemTime);
+
+    /// Get time for log replaying (SystemTime::now() for realtime processing)
+    fn get_time(&self) -> std::time::SystemTime;
+
+    /// Check if time is in future
+    fn is_in_future(&self, time: std::time::SystemTime) -> bool;
+
+    /// Check if time is in past
+    fn is_in_past(&self, time: std::time::SystemTime) -> bool;
+
+    /// Receiver for metrics
+    fn get_metrics_receiver(&self) -> &catchain::utils::MetricsHandle;
+
+    /// Sent block instance counter
+    fn get_sent_blocks_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Block candindate signature instance counter
+    fn get_block_candidate_signatures_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Block candindate instance counter
+    fn get_block_candidates_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Vote candindate instance counter
+    fn get_vote_candidates_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Round attempt instance counter
+    fn get_round_attempts_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Round instance counter
+    fn get_rounds_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Old round instance counter
+    fn get_old_rounds_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// State instance counter
+    fn get_session_states_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Integer vectors instance counter
+    fn get_integer_vectors_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Bool vectors instance counter
+    fn get_bool_vectors_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Block candidate vectors instance counter
+    fn get_block_candidate_vectors_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Block candidate signature vectors instance counter
+    fn get_block_candidate_signature_vectors_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Vote candidate vectors instance counter
+    fn get_vote_candidate_vectors_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Round attempt vectors instance counter
+    fn get_round_attempt_vectors_instance_counter(&self) -> &CachedInstanceCounter;
+
+    /// Old round vectors instance counter
+    fn get_old_round_vectors_instance_counter(&self) -> &CachedInstanceCounter;
+}
+
+/// Validator session processor
+pub trait SessionProcessor: CompletionHandlerProcessor + fmt::Display {
+    /// Session description
+    fn get_description(&self) -> &dyn SessionDescription;
+
+    /// Preprocess block
+    fn preprocess_block(&mut self, block: catchain::BlockPtr);
+
+    /// Process blocks
+    fn process_blocks(&mut self, blocks: Vec<catchain::BlockPtr>);
+
+    /// Notify about finished of blocks processing
+    fn finished_catchain_processing(&mut self);
+
+    /// Notify about catchain start
+    fn catchain_started(&mut self);
+
+    /// Notify about incoming broadcasts
+    fn process_broadcast(
+        &mut self,
+        source_id: PublicKeyHash,
+        data: BlockPayloadPtr,
+        expected_id: Option<BlockId>,
+        is_overlay_broadcast: bool,
+    );
+
+    /// Notify about incoming query
+    fn process_query(
+        &mut self,
+        source_id: PublicKeyHash,
+        data: BlockPayloadPtr,
+        callback: catchain::QueryResponseCallback,
+    );
+
+    /// Set timestamp for all further events
+    fn set_time(&mut self, timestamp: std::time::SystemTime);
+
+    /// Check & update session state
+    fn check_all(&mut self);
+
+    /// Configure delays for blocks waiting during normal and slow attempts
+    fn set_catchain_max_block_delay(
+        &mut self,
+        delay: std::time::Duration,
+        delay_slow: std::time::Duration,
+    );
+
+    /// Set next awake time
+    fn set_next_awake_time(&mut self, timestamp: std::time::SystemTime);
+
+    /// Reset next awake time
+    fn reset_next_awake_time(&mut self);
+
+    /// Get next awake time
+    fn get_next_awake_time(&self) -> std::time::SystemTime;
+
+    /// Stop all further session processing
+    fn stop(&mut self, destroy_catchain_db: bool);
+
+    /// Returns implementation specific details
+    fn get_impl(&self) -> &dyn Any;
+
+    /// Returns implementation specific details
+    fn get_mut_impl(&mut self) -> &mut dyn Any;
+}
+
+/// Catchain-based validator session (wrapper on top of SessionProcessor for multi-threaded use)
+///
+/// This trait extends the base `ConsensusSession` interface with catchain-specific
+/// functionality for configuring block delays.
+pub trait Session: ConsensusSession {
+    /// Configure delays for blocks waiting during normal and slow attempts
+    fn set_catchain_max_block_delay(
+        &self,
+        delay: std::time::Duration,
+        delay_slow: std::time::Duration,
+    );
+}
+
+/// Validator session factory
+pub struct SessionFactory;
+
+impl SessionFactory {
+    /// Create vector from rust vector
+    pub fn create_vector<T>(
+        desc: &mut dyn SessionDescription,
+        data: Vec<T>,
+    ) -> PoolPtr<dyn Vector<T>>
+    where
+        T: Clone
+            + MovablePoolObject<T>
+            + HashableObject
+            + TypeDesc
+            + fmt::Debug
+            + std::cmp::PartialEq
+            + 'static,
+    {
+        vector::VectorImpl::<T>::create(desc, data)
+    }
+
+    /// Create bool vector from rust vector
+    pub fn create_bool_vector(
+        desc: &mut dyn SessionDescription,
+        data: Vec<bool>,
+    ) -> PoolPtr<dyn BoolVector> {
+        vector_bool::BoolVectorImpl::create(desc, data)
+    }
+
+    /// Create vector wrapper from rust vector
+    pub fn create_vector_wrapper<T>(
+        desc: &mut dyn SessionDescription,
+        data: Vec<T>,
+    ) -> Option<PoolPtr<dyn Vector<T>>>
+    where
+        T: Clone
+            + MovablePoolObject<T>
+            + HashableObject
+            + TypeDesc
+            + fmt::Debug
+            + std::cmp::PartialEq
+            + 'static,
+    {
+        vector::VectorImpl::<T>::create_wrapper(desc, data)
+    }
+
+    /// Create empty sorted vector
+    pub fn create_empty_sorted_vector<T, Compare>(
+        desc: &mut dyn SessionDescription,
+    ) -> PoolPtr<dyn SortedVector<T, Compare>>
+    where
+        T: Clone
+            + std::cmp::PartialEq
+            + MovablePoolObject<T>
+            + HashableObject
+            + fmt::Debug
+            + TypeDesc
+            + 'static,
+        Compare: SortingPredicate<T> + 'static,
+    {
+        vector::SortedVectorImpl::<T>::create_empty(desc)
+    }
+
+    /// Create sent block
+    pub fn create_sent_block(
+        desc: &mut dyn SessionDescription,
+        source_id: u32,
+        root_hash: BlockHash,
+        file_hash: BlockHash,
+        collated_data_file_hash: BlockHash,
+        block_creation_time: std::time::SystemTime,
+        block_payload_creation_time: std::time::SystemTime,
+    ) -> SentBlockPtr {
+        sent_block::SentBlockImpl::create(
+            desc,
+            source_id,
+            root_hash,
+            file_hash,
+            collated_data_file_hash,
+            block_creation_time,
+            block_payload_creation_time,
+        )
+    }
+
+    /// Create empty sent block
+    pub fn create_empty_sent_block(desc: &mut dyn SessionDescription) -> SentBlockPtr {
+        sent_block::SentBlockImpl::create_empty(desc)
+    }
+
+    /// Create candidate signature
+    pub fn create_block_candidate_signature(
+        desc: &mut dyn SessionDescription,
+        signature: BlockSignature,
+    ) -> BlockCandidateSignaturePtr {
+        block_candidate::BlockCandidateSignatureImpl::create(desc, signature)
+    }
+
+    /// Create block candidate with approvers
+    pub fn create_block_candidate(
+        desc: &mut dyn SessionDescription,
+        block: SentBlockPtr,
+        approved_by: BlockCandidateSignatureVectorPtr,
+    ) -> BlockCandidatePtr {
+        block_candidate::BlockCandidateImpl::create(desc, block, approved_by)
+    }
+
+    /// Create block candidate without approvers
+    pub fn create_unapproved_block_candidate(
+        desc: &mut dyn SessionDescription,
+        block: SentBlockPtr,
+    ) -> BlockCandidatePtr {
+        block_candidate::BlockCandidateImpl::create_unapproved(desc, block)
+    }
+
+    /// Create vote candidate
+    pub fn create_vote_candidate(
+        desc: &mut dyn SessionDescription,
+        block: SentBlockPtr,
+    ) -> VoteCandidatePtr {
+        vote_candidate::VoteCandidateImpl::create_unvoted(desc, block)
+    }
+
+    /// Create attempt
+    pub fn create_attempt(
+        desc: &mut dyn SessionDescription,
+        sequence_number: u32,
+    ) -> RoundAttemptStatePtr {
+        round_attempt::RoundAttemptStateImpl::create_empty(desc, sequence_number)
+    }
+
+    /// Create attempt
+    pub(crate) fn create_attempt_with_votes(
+        desc: &mut dyn SessionDescription,
+        sequence_number: u32,
+        votes: VoteCandidateVectorPtr,
+        precommitted: BoolVectorPtr,
+        vote_for: Option<SentBlockPtr>,
+    ) -> RoundAttemptStatePtr {
+        round_attempt::RoundAttemptStateImpl::create(
+            desc,
+            sequence_number,
+            votes,
+            precommitted,
+            vote_for,
+        )
+    }
+
+    /// Create current round
+    pub fn create_round(
+        desc: &mut dyn SessionDescription,
+        sequence_number: u32,
+        accelerated_consensus_collator_idx: Option<u32>,
+    ) -> RoundStatePtr {
+        round::RoundStateImpl::create_current_round(
+            desc,
+            sequence_number,
+            accelerated_consensus_collator_idx,
+        )
+    }
+
+    /// Create current round
+    pub(crate) fn create_round_with_attempts(
+        desc: &mut dyn SessionDescription,
+        precommitted_block: Option<SentBlockPtr>,
+        sequence_number: u32,
+        accelerated_consensus_collator_idx: Option<u32>,
+        first_attempt: crate::round::AttemptIdVector,
+        last_precommit: crate::round::AttemptIdVector,
+        sent_blocks: crate::round::ApproveVector,
+        signatures: BlockCandidateSignatureVectorPtr,
+        attempts: crate::round::AttemptVector,
+    ) -> RoundStatePtr {
+        round::RoundStateImpl::create(
+            desc,
+            precommitted_block,
+            sequence_number,
+            accelerated_consensus_collator_idx,
+            first_attempt,
+            last_precommit,
+            sent_blocks,
+            signatures,
+            attempts,
+        )
+    }
+
+    /// Create old round
+    pub fn create_old_round(
+        desc: &mut dyn SessionDescription,
+        round: RoundStatePtr,
+    ) -> OldRoundStatePtr {
+        old_round::OldRoundStateImpl::create_from_round(desc, round)
+    }
+
+    /// Create state
+    pub fn create_state(desc: &mut dyn SessionDescription) -> SessionStatePtr {
+        session_state::SessionStateImpl::create_empty(desc)
+    }
+
+    /// Create session callbacks task queue
+    pub fn create_callback_task_queue(
+        metrics_receiver: catchain::utils::MetricsHandle,
+    ) -> CallbackTaskQueuePtr {
+        session::SessionImpl::create_callback_task_queue(metrics_receiver)
+    }
+
+    /// Create session
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        ids: Vec<SessionNode>,
+        local_key: &PrivateKey,
+        db_path: String,
+        db_suffix: String,
+        allow_unsafe_self_blocks_resync: bool,
+        overlay_manager: CatchainOverlayManagerPtr,
+        listener: SessionListenerPtr,
+    ) -> Result<SessionPtr> {
+        session::SessionImpl::create(
+            options,
+            session_id,
+            ids,
+            local_key,
+            db_path,
+            db_suffix,
+            allow_unsafe_self_blocks_resync,
+            overlay_manager,
+            listener,
+        )
+    }
+
+    /// Create session
+    pub fn create_single_node_session(
+        options: &SessionOptions,
+        session_id: &SessionId,
+        local_key: &PrivateKey,
+        db_path: String,
+        db_suffix: String,
+        listener: SessionListenerPtr,
+    ) -> Result<SessionPtr> {
+        session::SessionImpl::create_single(
+            options, session_id, local_key, db_path, db_suffix, listener,
+        )
+    }
+
+    /// Create session replay
+    pub fn create_session_replay(
+        options: &SessionOptions,
+        log_replay_options: &LogReplayOptions,
+        session_listener: SessionListenerPtr,
+        replay_listener: SessionReplayListenerPtr,
+    ) -> Result<SessionPtr> {
+        session::SessionImpl::create_replay(
+            options,
+            log_replay_options,
+            session_listener,
+            replay_listener,
+        )
+    }
+
+    /// Create session processor
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_processor(
+        options: SessionOptions,
+        session_id: SessionId,
+        ids: Vec<SessionNode>,
+        local_key: PrivateKey,
+        listener: SessionListenerPtr,
+        catchain: CatchainPtr,
+        completion_task_queue: TaskQueuePtr,
+        callbacks_task_queue: CallbackTaskQueuePtr,
+        session_creation_time: std::time::SystemTime,
+        metrics: Option<catchain::utils::MetricsHandle>,
+    ) -> SessionProcessorPtr {
+        session_processor::SessionProcessorImpl::create(
+            options,
+            session_id,
+            ids,
+            local_key,
+            listener,
+            catchain,
+            completion_task_queue,
+            callbacks_task_queue,
+            session_creation_time,
+            metrics,
+        )
+    }
+}

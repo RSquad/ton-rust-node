@@ -1,0 +1,57 @@
+[package]
+authors = [ 'Christopher Berner <christopherberner@gmail.com>' ]
+description = 'RaptorQ (RFC6330)'
+edition = '2021'
+homepage = 'https://github.com/cberner/raptorq'
+license = 'Apache-2.0'
+name = 'raptorq'
+readme = 'README.md'
+repository = 'https://github.com/cberner/raptorq'
+version = '1.7.0'
+
+[dependencies]
+js-sys = { optional = true, version = '0.3.60' }
+pyo3 = { features = [ 'extension-module', 'abi3-py37' ], optional = true, version = '0.28' }
+serde = { features = [ 'std', 'derive' ], optional = true, version = '1.0.102' }
+wasm-bindgen = { optional = true, version = '0.2' }
+
+[dev-dependencies]
+criterion = '0.3'
+primal = '0.3'
+rand = '0.8'
+threadpool = '1.7'
+
+[features]
+benchmarking = [ 'std' ]
+default = [ 'std' ]
+dummy_code = [  ]
+python = [ 'pyo3', 'std' ]
+serde_support = [ 'serde', 'std' ]
+std = [  ]
+wasm = [ 'wasm-bindgen', 'js-sys', 'std' ]
+
+[[bench]]
+harness = false
+name = 'codec_benchmark'
+required-features = [ 'benchmarking' ]
+
+[[bench]]
+harness = false
+name = 'matrix_sparsity'
+required-features = [ 'benchmarking' ]
+
+[[bench]]
+harness = false
+name = 'encode_benchmark'
+
+[[bench]]
+harness = false
+name = 'decode_benchmark'
+
+[[example]]
+name = 'main'
+required-features = [ 'std' ]
+
+[lib]
+crate-type = [ 'lib' ]
+

@@ -1,0 +1,22 @@
+FROM rust:slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev
+
+COPY . /nodectl
+WORKDIR /nodectl
+
+RUN cargo build --release --package nodectl --locked
+
+FROM debian:stable-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /nodectl/target/release/nodectl /usr/local/bin/
+
+WORKDIR /nodectl
+

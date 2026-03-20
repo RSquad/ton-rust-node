@@ -1,0 +1,8 @@
+Profiling for the hashmap benchmark
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Enable debug info generation in Cargo.toml
+2. Run
+    cargo bench hashmap -- --profile-time 20
+3. Look for a flamegraph at
+    target/criterion/hashmap/profile/flamegraph.svg

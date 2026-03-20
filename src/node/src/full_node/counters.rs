@@ -1,0 +1,81 @@
+/*
+ * Copyright (C) 2019-2024 EverX. All Rights Reserved.
+ * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ *
+ * This file has been modified from its original version.
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
+use adnl::common::add_unbound_object_to_map_with_update;
+use std::sync::atomic::{AtomicU32, Ordering};
+use ton_block::{fail, Result, UnixTime};
+
+const CLEAR_STAT_INTERVAL_BLOCKS: u32 = 10_000;
+const MAX_TPS_PERIOD_SEC: u64 = 3600;
+const TPS_PERIOD_LAG: u64 = 30;
+
+#[derive(Default)]
+pub struct TpsCounter {
+    transactions: lockfree::map::Map<u64, AtomicU32>, // unix time - transactions
+    gc_counter: AtomicU32,
+}
+
+impl TpsCounter {
+    pub fn submit_transactions(&self, block_time: u64, tr_count: usize) {
+        let now = UnixTime::now();
+        if now >= block_time && now - block_time <= MAX_TPS_PERIOD_SEC + TPS_PERIOD_LAG {
+            add_unbound_object_to_map_with_update(&self.transactions, block_time, |found| {
+                if let Some(a) = found {
+                    a.fetch_add(tr_count as u32, Ordering::Relaxed);
+                    Ok(None)
+                } else {
+                    Ok(Some(AtomicU32::new(tr_count as u32)))
+                }
+            })
+            .expect("Can't return error");
+        }
+
+        if self
+            .gc_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                if c >= CLEAR_STAT_INTERVAL_BLOCKS {
+                    Some(0)
+                } else {
+                    Some(c + 1)
+                }
+            })
+            .unwrap_or(0)
+            >= CLEAR_STAT_INTERVAL_BLOCKS
+        {
+            self.gc();
+        }
+    }
+
+    pub fn calc_tps(&self, period: u64) -> Result<u32> {
+        let mut tr_count = 0;
+        if period == 0 {
+            fail!("period can't be zero");
+        }
+        if period > MAX_TPS_PERIOD_SEC {
+            fail!("period is too big (max is {})", MAX_TPS_PERIOD_SEC);
+        }
+        let time = UnixTime::now() - TPS_PERIOD_LAG;
+        for guard in self.transactions.iter() {
+            if time > *guard.key() && time <= guard.key() + period {
+                tr_count += guard.val().load(Ordering::Relaxed);
+            }
+        }
+        Ok(tr_count / period as u32)
+    }
+
+    fn gc(&self) {
+        let time = UnixTime::now();
+        for guard in self.transactions.iter() {
+            if time > guard.key() + MAX_TPS_PERIOD_SEC + TPS_PERIOD_LAG {
+                self.transactions.remove(guard.key());
+            }
+        }
+    }
+}

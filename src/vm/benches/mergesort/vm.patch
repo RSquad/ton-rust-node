@@ -1,0 +1,35 @@
+diff --git a/crypto/vm/debugops.cpp b/crypto/vm/debugops.cpp
+index 3f27de2..4cec487 100644
+--- a/crypto/vm/debugops.cpp
++++ b/crypto/vm/debugops.cpp
+@@ -32,8 +32,30 @@ void set_debug_enabled(bool enable_debug) {
+   vm_debug_enabled = enable_debug;
+ }
+ 
++static void bench(VmState* st) {
++  using Clock = std::chrono::high_resolution_clock;
++  using TimePoint = std::chrono::time_point<Clock>;
++  static std::unique_ptr<TimePoint> time_point(nullptr);
++  static auto gas = st->gas_consumed();
++
++  if (time_point) {
++    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
++      Clock::now() - *time_point
++    );
++    std::cerr << "\033[93m";
++    std::cerr << "elapsed time: " << duration.count() << " ms" << std::endl;
++    std::cerr << "consumed gas: " << st->gas_consumed() - gas << std::endl;
++    std::cerr << "\033[0m";
++  }
++  time_point.reset(new TimePoint(Clock::now()));
++  gas = st->gas_consumed();
++}
++
+ int exec_dummy_debug(VmState* st, int args) {
+   VM_LOG(st) << "execute DEBUG " << (args & 0xff);
++  if ((args & 0xff) == 0xed) {
++    bench(st);
++  }
+   return 0;
+ }
+ 

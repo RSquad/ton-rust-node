@@ -1,0 +1,89 @@
+{
+    "tick_interval": 20,
+    "master_wallet": {
+        "key": {
+            "secret_id": "master-wallet-secret"
+        },
+        "version": "V3R2",
+        "subwallet_id": 42,
+        "workchain": 0
+    },
+    "vault": {
+        "url": "file://vault.json&master_key=aca0c994447b9cf66b875dd94a239da69fdd6e9de5144ef88ae5edb96f17841e"
+    },
+    "ton_center": {
+        "network": {
+            "Custom": "http://127.0.0.1:3301/"
+        },
+        "api_key": ""
+    },
+    "wallets": {
+        "node1": {
+            "key": {
+                "secret_id": "wallets.node1"
+            },
+            "version": "V3R2",
+            "subwallet_id": 42
+        },
+        "node2": {
+            "key": {
+                "secret_id": "wallets.node2"
+            },
+            "version": "V3R2",
+            "subwallet_id": 42
+        },
+        "node3": {
+            "key": {
+                "secret_id": "wallets.node3"
+            },
+            "version": "V3R2",
+            "subwallet_id": 42
+        },
+        "node4": {
+            "key": {
+                "secret_id": "wallets.node4"
+            },
+            "version": "V3R2",
+            "subwallet_id": 42
+        },
+        "node5": {
+            "key": {
+                "secret_id": "wallets.node5"
+            },
+            "version": "V3R2",
+            "subwallet_id": 42
+        }
+    },
+    "elections": {
+        "pools": {
+            "node1": {
+                "kind": "snp",
+                "address": "-1:7707ec8e946ca1415385552a78d2774ce55f50b507ee64a1de4f9043657b3a2c",
+                "owner": "Ef8egvmDjR3lzRrGKKO3ExiJG5ZMOhtSAzHvtAoSvkTi4ZPA"
+            },
+            "node2": {
+                "kind": "snp",
+                "address": "-1:aba47a1417f1bf737fcc054803dace721fee8521ed05d5321ed419d5a13b0d6b",
+                "owner": "Ef8egvmDjR3lzRrGKKO3ExiJG5ZMOhtSAzHvtAoSvkTi4ZPA"
+            },
+            "node3": {
+                "kind": "snp",
+                "address": "-1:d03a9457de27e89586cf3282cc2f9b496c30cc0d57973f85c3651617b1b8ac62",
+                "owner": "Ef8egvmDjR3lzRrGKKO3ExiJG5ZMOhtSAzHvtAoSvkTi4ZPA"
+            },
+            "node4": {
+                "kind": "snp",
+                "address": "-1:7dede0fc19a2eb5ed813cc4c58aad4cdbaf381aeaafd4745a74db518c86c6f79",
+                "owner": "Ef8egvmDjR3lzRrGKKO3ExiJG5ZMOhtSAzHvtAoSvkTi4ZPA"
+            },
+            "node5": {
+                "kind": "snp",
+                "address": "-1:fe0ee0261dcf8deb31322839775ddf10e6fd131a8d83102b18075dbc2505cb41",
+                "owner": "Ef8egvmDjR3lzRrGKKO3ExiJG5ZMOhtSAzHvtAoSvkTi4ZPA"
+            }
+        },
+        "policy": "split50",
+        "max_factor": 196608,
+        "tick_interval": 30
+    }
+}

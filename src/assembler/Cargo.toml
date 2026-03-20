@@ -1,0 +1,22 @@
+[package]
+build = 'build.rs'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'ton_assembler'
+version = '1.9.3'
+
+[dependencies]
+anyhow = '1.0'
+clap = { features = [ 'derive' ], version = '4.3' }
+hex = '0.4'
+log = '0.4'
+num = '0.4'
+num-traits = '0.2'
+serde = { features = [ 'derive' ], version = '1.0' }
+serde_json = '1.0'
+ton_block = { path = '../block' }
+ton_vm = { path = '../vm' }
+
+[features]
+groth = [  ]
+

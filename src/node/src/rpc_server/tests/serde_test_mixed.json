@@ -1,0 +1,194 @@
+{
+  "stack": [
+    [
+      "tuple",
+      {
+        "@type": "tvm.tuple",
+        "elements": [
+          {
+            "@type": "tvm.stackEntryTuple",
+            "tuple": {
+              "@type": "tvm.tuple",
+              "elements": [
+                {
+                  "@type": "tvm.stackEntryTuple",
+                  "tuple": {
+                    "@type": "tvm.tuple",
+                    "elements": [
+                      {
+                        "@type": "tvm.stackEntryTuple",
+                        "tuple": {
+                          "@type": "tvm.tuple",
+                          "elements": [
+                            {
+                              "@type": "tvm.stackEntryTuple",
+                              "tuple": {
+                                "@type": "tvm.tuple",
+                                "elements": [
+                                  {
+                                    "@type": "tvm.stackEntryList",
+                                    "list": {
+                                      "@type": "tvm.list",
+                                      "elements": []
+                                    }
+                                  },
+                                  {
+                                    "@type": "tvm.stackEntryNumber",
+                                    "number": {
+                                      "@type": "tvm.numberDecimal",
+                                      "number": "0"
+                                    }
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "@type": "tvm.stackEntryNumber",
+                              "number": {
+                                "@type": "tvm.numberDecimal",
+                                "number": "1"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "@type": "tvm.stackEntryNumber",
+                        "number": {
+                          "@type": "tvm.numberDecimal",
+                          "number": "2"
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "@type": "tvm.stackEntryNumber",
+                  "number": {
+                    "@type": "tvm.numberDecimal",
+                    "number": "3"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+              "@type": "tvm.numberDecimal",
+              "number": "4"
+            }
+          }
+        ]
+      }
+    ],
+    [
+      "list",
+      {
+        "@type": "tvm.list",
+        "elements": [
+          {
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+              "@type": "tvm.numberDecimal",
+              "number": "4"
+            }
+          },
+          {
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+              "@type": "tvm.numberDecimal",
+              "number": "3"
+            }
+          },
+          {
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+              "@type": "tvm.numberDecimal",
+              "number": "2"
+            }
+          },
+          {
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+              "@type": "tvm.numberDecimal",
+              "number": "1"
+            }
+          },
+          {
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+              "@type": "tvm.numberDecimal",
+              "number": "0"
+            }
+          }
+        ]
+      }
+    ],
+    [
+      "cell",
+      {
+        "bytes": "te6cckEBBQEAIgABCAAAAAQBAQgAAAADAgEIAAAAAgMBCAAAAAEEAAgAAAAAjYbhpw==",
+        "object": {
+          "data": {
+            "b64": "AAAABA==",
+            "len": 32
+          },
+          "refs": [
+            {
+              "data": {
+                "b64": "AAAAAw==",
+                "len": 32
+              },
+              "refs": [
+                {
+                  "data": {
+                    "b64": "AAAAAg==",
+                    "len": 32
+                  },
+                  "refs": [
+                    {
+                      "data": {
+                        "b64": "AAAAAQ==",
+                        "len": 32
+                      },
+                      "refs": [
+                        {
+                          "data": {
+                            "b64": "AAAAAA==",
+                            "len": 32
+                          },
+                          "refs": [],
+                          "special": false
+                        }
+                      ],
+                      "special": false
+                    }
+                  ],
+                  "special": false
+                }
+              ],
+              "special": false
+            }
+          ],
+          "special": false
+        }
+      }
+    ],
+    [
+      "cell",
+      {
+        "bytes": "te6cckEBAQEADgAAGEhlbGxvIHRoZXJlIT7Mi1o=",
+        "object": {
+          "data": {
+            "b64": "SGVsbG8gdGhlcmUh",
+            "len": 96
+          },
+          "refs": [],
+          "special": false
+        }
+      }
+    ],
+    ["num", "0x2a"]
+  ]
+}

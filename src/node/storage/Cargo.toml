@@ -1,0 +1,60 @@
+[package]
+edition = '2021'
+license = 'GPL-3.0'
+name = 'storage'
+version = '0.6.1'
+
+[dependencies]
+ahash = '0.8'
+anyhow = '1.0'
+async-trait = '0.1'
+bytes = '1.11'
+fnv = '1.0'
+futures = '0.3'
+hex = '0.4'
+log = '0.4'
+log4rs = '1.2'
+lru = '0.16'
+metrics = '0.24'
+parking_lot = '0.12'
+quick_cache = '0.4'
+rand = { features = [ 'small_rng' ], version = '0.8' }
+rocksdb = '0.23'
+serde = '1.0'
+serde_cbor = '0.11'
+serde_derive = '1.0'
+smallvec = { features = [ 'const_new', 'union', 'write' ], version = '1.10' }
+strum = '0.18'
+strum_macros = '0.18'
+thiserror = '1.0'
+tokio = { features = [ 'fs', 'rt-multi-thread' ], version = '1.5' }
+tokio-util = '0.7'
+adnl = { path = '../../adnl' }
+ton_block = { path = '../../block' }
+lockfree = { path = '../../lockfree' }
+ton_api = { path = '../../tl/ton_api' }
+
+[build-dependencies]
+cc = { features = [ 'parallel' ], version = '1.0.61' }
+
+[dev-dependencies]
+zip = '2.2'
+
+[features]
+default = []
+telemetry = []
+
+[[bench]]
+harness = false
+name = 'shardstate_db1'
+path = 'benches/shardstate_db1.rs'
+
+[[bench]]
+harness = false
+name = 'shardstate_db2'
+path = 'benches/shardstate_db2.rs'
+
+[[bench]]
+harness = false
+name = 'shardstate_db3'
+path = 'benches/shardstate_db3.rs'

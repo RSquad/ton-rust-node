@@ -1,0 +1,15 @@
+To benchmark:
+  cargo bench
+
+To profile:
+  sudo sh -c "echo -1 >/proc/sys/kernel/perf_event_paranoid"
+  sudo sh -c "echo 0 >/proc/sys/kernel/kptr_restrict"
+  flamegraph -c "record -F 19997 --call-graph=lbr" -- target/release/deps/benchmarks-84d4e175e6371b32 -n tiny-loop
+
+  -or-
+
+  cargo bench <bench-name> -- --profile-time 20
+  (output is at target/criterion/<bench-name>/profile/flamegraph.svg)
+
+To benchmark the original VM:
+  TON=/tonlabs/ton hyperfine --warmup 10 "./run-fift.sh run-tiny-loop.fif"

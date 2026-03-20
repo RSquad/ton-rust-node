@@ -1,0 +1,37 @@
+[package]
+build = '../common/build/build.rs'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'ton_executor'
+version = '1.18.31'
+
+[dependencies]
+anyhow = '1.0'
+log = '0.4'
+num = '0.4'
+thiserror = '1.0'
+ton_block = { path = '../block' }
+ton_block_json = { path = '../block-json' }
+ton_vm = { path = '../vm' }
+
+[dev-dependencies]
+criterion = { features = [ 'html_reports' ], version = '0.3' }
+libloading = '0.6'
+log4rs = '1.2'
+pretty_assertions = '1.4'
+rand = '0.8'
+serde = { features = [ 'derive' ], version = '1.0' }
+serde_json = '1.0'
+ton_assembler = { path = '../assembler' }
+
+[features]
+ci_run = [  ]
+cross_check = [ 'ton_vm/fift_check' ]
+timings = [  ]
+
+[[bench]]
+harness = false
+name = 'benchmarks'
+
+[lib]
+bench = false

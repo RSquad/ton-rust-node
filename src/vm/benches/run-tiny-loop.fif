@@ -1,0 +1,24 @@
+1000000000 0 0 -2 // initial stack
+
+"tiny-code.boc" file>B B>boc <s
+"tiny-data.boc" file>B B>boc
+
+0x76ef1ea                 // magic number
+0                         // actions
+0                         // messages
+1633458077                // now
+0                         // blocklt
+0                         // ltime
+0                         // randseed
+1000000000 null 2 tuple   // balance
+x{8_}                     // myaddr
+dictnew                   // config dict
+null                      // mycode
+0                         // init code hash
+12 tuple 1 tuple          // c7 tuple
+
+1000000000                // gas limit
+4 8 16 32 + + +           // mode: +4 load c4, +8 load gas, +16 load c7, +32 return c5 (actions)
+
+runvmx
+34000891 <> abort"consumed gas mismatch"

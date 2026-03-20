@@ -1,0 +1,52 @@
+{
+    "name": "jetton",
+    "description": "",
+    "version": "2.0.0",
+    "scripts": {
+        "build": "npx blueprint build",
+        "test": "jest",
+        "deploy": "npx blueprint run",
+        "prettier": "npx prettier --write '{test,contracts,build}/**/*.{ts,js,json}'",
+        "deploy:wallets": "bun scripts/nodectl-deploy-wallets.ts",
+        "deploy:pools": "bun scripts/nodectl-deploy-pools.ts",
+        "topup:pools": "bun scripts/nodectl-topup-pools.ts",
+        "topup": "bun scripts/topup.ts",
+        "proposals:create": "bun blueprint run create-proposal --custom http://127.0.0.1:80/jsonRPC --mnemonic",
+        "proposals:list": "bun blueprint run list-proposals --custom http://127.0.0.1:80/jsonRPC --mnemonic"
+    },
+    "devDependencies": {
+        "@ton/blueprint": "^0.40.0",
+        "@ton/core": "^0.61.0",
+        "@ton/crypto": "^3.3.0",
+        "@ton/sandbox": "^0.36.0",
+        "@ton/test-utils": "^0.10.0",
+        "@ton/ton": "^15.2.1",
+        "@types/jest": "^29.5.14",
+        "@types/node": "^22.15.24",
+        "bip39": "^3.1.0",
+        "dotenv": "^16.0.0",
+        "jest": "^29.7.0",
+        "node-vault": "^0.10.9",
+        "prettier": "^3.5.3",
+        "simple-statistics": "^7.8.8",
+        "ts-jest": "^29.3.4",
+        "ts-node": "^10.9.2",
+        "typescript": "^4.9.5"
+    },
+    "prettier": {
+        "printWidth": 180
+    },
+    "mocha": {
+        "require": [
+            "chai",
+            "ts-node/register"
+        ],
+        "timeout": 20000
+    },
+    "engines": {
+        "node": ">=16.0.0"
+    },
+    "dependencies": {
+        "help": "^3.0.2"
+    }
+}

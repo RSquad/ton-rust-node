@@ -1,0 +1,39 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+.cursor/
+
+# Documentation
+README.md
+*.md
+
+# Target directory (we build in container)
+target/
+**/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+*.tmp
+*.temp
+
+# Development configs that might contain secrets
+*.local
+.env.local

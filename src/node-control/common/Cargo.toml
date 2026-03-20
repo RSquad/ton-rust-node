@@ -1,0 +1,39 @@
+[package]
+name = "common"
+version = "0.2.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0" }
+serde_json = "1.0"
+utoipa = { version = "4", optional = true }
+hex = { version = "0.4" }
+base64 = "0.22"
+tokio = { version = "1.40", features = ["signal"] }
+tokio-util = "0.7"
+tracing = "0.1"
+libc = "0.2"
+yaml-rust2 = "0.10"
+serde_yaml2 = "0.1"
+async-trait = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+rolling-file = "0.2"
+ton_api = { version = "0.4.32", path = "../../tl/ton_api" }
+adnl = { features = ["client"], path = "../../adnl" }
+ton_block = { path = "../../block" }
+num = "0.4"
+chrono = "0.4"
+secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "crypto-default",
+    "hashicorp-storage",
+    "with-base64",
+] }
+argon2 = "0.5.3"
+
+[features]
+default = []
+openapi = ["dep:utoipa"]

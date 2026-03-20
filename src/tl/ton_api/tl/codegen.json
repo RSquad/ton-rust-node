@@ -1,0 +1,8 @@
+{
+  "exclude_types": [],
+  "need_box": ["ConfirmValidation"],
+  "need_determiner": [],
+  "replace_with_bytes": [],
+  "additional_derives": {
+  }
+}

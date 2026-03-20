@@ -1,0 +1,68 @@
+{
+    "log_config_name": "log_cfg.yml",
+    "ton_global_config_name": "ton-global.config-sample.json",
+    "internal_db_path": "node_db",
+    "ip_address": "0.0.0.0:30303",
+    "control_server_port": 3031,
+    "validation_countdown_mode": null,
+    "unsafe_catchain_patches_path": null,
+    "validator_keys": null,
+    "default_rldp_roundtrip_ms": null,
+    "json_rpc_server": {
+        "address": "0.0.0.0:8082"
+    },
+    "test_bundles_config": {
+        "collator": {
+            "build_for_unknown_errors": false,
+            "known_errors": [],
+            "build_for_errors": false,
+            "errors": [],
+            "path": ""
+        },
+        "validator": {
+            "build_for_unknown_errors": false,
+            "known_errors": [],
+            "build_for_errors": false,
+            "errors": [],
+            "path": ""
+        }
+    },
+    "connectivity_check_config": {
+        "enabled": true,
+        "long_len": 2048,
+        "short_period_ms": 1000,
+        "long_mult": 5
+    },
+    "gc": {
+        "enable_for_archives": true,
+        "archives_life_time_hours": 48,
+        "enable_for_shard_state_persistent": true,
+        "cells_gc_config": {
+            "gc_interval_sec": 900,
+            "cells_lifetime_sec": 1800
+        }
+    },
+    "validator_key_ring": null,
+    "restore_db": true,
+    "low_memory_mode": true,
+    "cells_db_config": {
+        "states_db_queue_len": 1000,
+        "prefill_cells_counters": false,
+        "cells_cache_size_bytes": 4000000000,
+        "counters_cache_size_bytes": 4000000000
+    },
+    "collator_config": {
+        "cutoff_timeout_ms": 1000,
+        "stop_timeout_ms": 1500,
+        "clean_timeout_percentage_points": 150,
+        "optimistic_clean_percentage_points": 1000,
+        "max_secondary_clean_timeout_percentage_points": 350,
+        "max_collate_threads": 1,
+        "retry_if_empty": false,
+        "finalize_empty_after_ms": 800,
+        "empty_collation_sleep_ms": 100
+    },
+    "skip_saving_persistent_states": false,
+    "states_cache_mode": "Moderate",
+    "states_cache_cleanup_diff": 1000
+}

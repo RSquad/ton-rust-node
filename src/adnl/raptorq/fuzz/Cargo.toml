@@ -1,0 +1,23 @@
+[package]
+authors = [ 'Automatically generated' ]
+edition = '2018'
+metadata = { cargo-fuzz = true }
+name = 'raptorq-fuzz'
+publish = false
+version = '0.0.0'
+
+[workspace]
+members = [ '.' ]
+
+[[bin]]
+doc = false
+name = 'fuzz_raptorq'
+path = 'fuzz_targets/fuzz_raptorq.rs'
+test = false
+
+[dependencies]
+arbitrary = { features = [ 'derive' ], version = '1.1.0' }
+libfuzzer-sys = { features = [ 'arbitrary-derive' ], version = '0.4.0' }
+rand = '0.8.5'
+raptorq = { path = '..' }
+
