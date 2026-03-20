@@ -1,0 +1,809 @@
+/*
+ * Copyright (C) 2019-2024 EverX. All Rights Reserved.
+ * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ *
+ * This file has been modified from its original version.
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
+use crate::{shard_state::ShardStateStuff, validator::validator_utils::compute_validator_set_cc};
+#[cfg(feature = "xp25")]
+use std::collections::HashMap;
+use std::{collections::HashSet, io::Cursor};
+use ton_api::{serialize_boxed, Deserializer, IntoBoxed};
+use ton_block::{
+    error, fail, sha256_digest, Block, BlockIdExt, BlockSignaturesSimplex, BlockSignaturesVariant,
+    ConfigParams, GlobalCapabilities, McShardRecord, McStateExtra, Result, ShardHashes, ShardIdent,
+    ValidatorDescr, ValidatorSet, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, SUPPORTED_VERSION,
+};
+#[cfg(feature = "xp25")]
+use ton_block::{RefShardBlocks, ShardBlockRef};
+
+#[cfg(feature = "xp25")]
+pub const UNREGISTERED_CHAIN_MAX_LEN: u32 = 32;
+#[cfg(not(feature = "xp25"))]
+pub const UNREGISTERED_CHAIN_MAX_LEN: u32 = 8;
+
+pub fn supported_capabilities() -> u64 {
+    // TODO: need 0x1ee
+    GlobalCapabilities::CapCreateStatsEnabled as u64
+        | GlobalCapabilities::CapBounceMsgBody as u64
+        | GlobalCapabilities::CapReportVersion as u64
+        | GlobalCapabilities::CapShortDequeue as u64
+        | GlobalCapabilities::CapStoreOutMsgQueueSize as u64
+        | GlobalCapabilities::CapMsgMetadata as u64
+        | GlobalCapabilities::CapDeferMessages as u64
+        | GlobalCapabilities::CapFullCollatedData as u64
+}
+
+pub fn supported_version() -> u32 {
+    SUPPORTED_VERSION
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn check_this_shard_mc_info(
+    shard: &ShardIdent,
+    block_id: &BlockIdExt,
+    after_merge: bool,
+    after_split: bool,
+    mut before_split: bool,
+    prev_blocks: &[BlockIdExt],
+    config_params: &ConfigParams,
+    mc_state_extra: &McStateExtra,
+    is_validate: bool,
+    now: u32,
+) -> Result<(u32, bool, bool)> {
+    let next_block_descr = fmt_next_block_descr(block_id);
+
+    let mut now_upper_limit = u32::MAX;
+    // let mut before_split = false;
+    // let mut accept_msgs = false;
+
+    let wc_info = config_params.workchains()?.get(&shard.workchain_id())?.ok_or_else(|| {
+        error!(
+            "cannot create new block for workchain {} absent \
+            from workchain configuration",
+            shard.workchain_id()
+        )
+    })?;
+    if !wc_info.active() {
+        fail!("cannot create new block for disabled workchain {}", shard.workchain_id());
+    }
+    if !wc_info.basic() {
+        fail!("cannot create new block for non-basic workchain {}", shard.workchain_id());
+    }
+    if wc_info.enabled_since != 0 && wc_info.enabled_since > now {
+        fail!(
+            "cannot create new block for workchain {} which is not enabled yet",
+            shard.workchain_id()
+        )
+    }
+    // if !is_validate {
+    //     if wc_info.min_addr_len != 0x100 || wc_info.max_addr_len != 0x100 {
+    //         fail!("wc_info.min_addr_len == 0x100 || wc_info.max_addr_len == 0x100");
+    //     }
+    // }
+    let accept_msgs = wc_info.accept_msgs;
+    let mut split_allowed = false;
+    if !mc_state_extra.shards().contains(&shard.workchain_id())? {
+        // creating first block for a new workchain
+        log::debug!(target: "validator", "({}): creating first block for workchain {}", next_block_descr, shard.workchain_id());
+        fail!(
+            "cannot create first block for workchain {} after previous block {} \
+            because no shard for this workchain is declared yet",
+            shard.workchain_id(),
+            prev_blocks[0]
+        )
+    }
+    let left =
+        mc_state_extra.shards().find_shard(&shard.left_ancestor_mask()?)?.ok_or_else(|| {
+            error!(
+                "cannot create new block for shard {} because there is no \
+            similar shard in existing masterchain configuration",
+                shard
+            )
+        })?;
+    // log::info!(target: "validator", "left for {} is {:?}", block_id(), left.descr());
+    if left.shard() == shard {
+        log::trace!(
+            "({}): check_this_shard_mc_info, block: {} left: {:?}",
+            next_block_descr,
+            block_id,
+            left
+        );
+
+        // no split/merge
+        if after_merge || after_split {
+            fail!("cannot generate new shardchain block for {} after a supposed split or merge event \
+                because this event is not reflected in the masterchain", shard)
+        }
+        check_prev_block(&left.block_id, &prev_blocks[0], true)?;
+        if left.descr().before_split {
+            fail!(
+                "cannot generate new unsplit shardchain block for {} \
+                after previous block {} with before_split set",
+                shard,
+                left.block_id()
+            )
+        }
+        if left.descr().before_merge {
+            let sib = mc_state_extra
+                .shards()
+                .get_shard(&shard.sibling())?
+                .ok_or_else(|| error!("No sibling for {}", shard))?;
+            if sib.descr().before_merge {
+                fail!(
+                    "cannot generate new unmerged shardchain block for {} after both {} \
+                    and {} set before_merge flags",
+                    shard,
+                    left.block_id(),
+                    sib.block_id()
+                )
+            }
+        }
+        if left.descr().is_fsm_split() {
+            if is_validate {
+                if now >= left.descr().fsm_utime() && now < left.descr().fsm_utime_end() {
+                    split_allowed = true;
+                }
+            } else {
+                // t-node's collator contains next code:
+                // auto tmp_now = std::max<td::uint32>(config_->utime, (unsigned)std::time(nullptr));
+                // but `now` parameter passed to this function is already initialized same way.
+                // `13` and `11` is a magic from t-node
+                if now >= left.descr().fsm_utime() && now + 13 < left.descr().fsm_utime_end() {
+                    now_upper_limit = left.descr().fsm_utime_end() - 11; // ultimate value of now_ must be at most now_upper_limit_
+                    before_split = true;
+                    log::info!(
+                        "({}): BEFORE_SPLIT set for the new block of shard {}",
+                        next_block_descr,
+                        shard
+                    );
+                }
+            }
+        }
+    } else if shard.is_parent_for(left.shard()) {
+        // after merge
+        if !left.descr().before_merge {
+            fail!(
+                "cannot create new merged block for shard {} \
+                because its left ancestor {} has no before_merge flag",
+                shard,
+                left.block_id()
+            )
+        }
+        let right = match mc_state_extra.shards().find_shard(&shard.right_ancestor_mask()?)? {
+            Some(right) => right,
+            None => fail!(
+                "cannot create new block for shard {} after a preceding merge \
+                because there is no right ancestor shard in existing masterchain configuration",
+                shard
+            ),
+        };
+        if !shard.is_parent_for(right.shard()) {
+            fail!(
+                "cannot create new block for shard {} after a preceding merge \
+                because its right ancestor appears to be {}",
+                shard,
+                right.block_id()
+            );
+        }
+        if !right.descr().before_merge {
+            fail!(
+                "cannot create new merged block for shard {} \
+                because its right ancestor {} has no before_merge flag",
+                shard,
+                right.block_id()
+            )
+        }
+        if after_split {
+            fail!(
+                "cannot create new block for shard {} after a purported split \
+                because existing shard configuration suggests a merge",
+                shard
+            )
+        } else if after_merge {
+            check_prev_block_exact(shard, left.block_id(), &prev_blocks[0])?;
+            check_prev_block_exact(shard, right.block_id(), &prev_blocks[1])?;
+        } else {
+            let cseqno = std::cmp::max(left.descr().seq_no, right.descr.seq_no);
+            if prev_blocks[0].seq_no <= cseqno {
+                fail!(
+                    "cannot create new block for shard {} after previous block {} \
+                    because masterchain contains newer possible ancestors {} and {}",
+                    shard,
+                    prev_blocks[0],
+                    left.block_id(),
+                    right.block_id()
+                )
+            }
+            if prev_blocks[0].seq_no >= cseqno + UNREGISTERED_CHAIN_MAX_LEN {
+                fail!(
+                    "cannot create new block for shard {} after previous block {} \
+                    because this would lead to an unregistered chain of length > {} \
+                    (masterchain contains only {} and {})",
+                    shard,
+                    prev_blocks[0],
+                    UNREGISTERED_CHAIN_MAX_LEN,
+                    left.block_id(),
+                    right.block_id()
+                )
+            }
+        }
+    } else if left.shard().is_parent_for(shard) {
+        // after split
+        if !left.descr().before_split {
+            fail!(
+                "cannot generate new split shardchain block for {} \
+                after previous block {} without before_split",
+                shard,
+                left.block_id()
+            )
+        }
+        if after_merge {
+            fail!(
+                "cannot create new block for shard {} \
+                after a purported merge because existing shard configuration suggests a split",
+                shard
+            )
+        } else if after_split {
+            check_prev_block_exact(shard, left.block_id(), &prev_blocks[0])?;
+        } else {
+            check_prev_block(left.block_id(), &prev_blocks[0], true)?;
+        }
+    } else {
+        fail!(
+            "masterchain configuration contains only block {} \
+            which belongs to a different shard from ours {}",
+            left.block_id(),
+            shard
+        )
+    }
+    if is_validate && before_split && !split_allowed {
+        fail!(
+            "new block {} has before_split set, \
+            but this is forbidden by masterchain configuration",
+            block_id
+        )
+    }
+    Ok((now_upper_limit, before_split, accept_msgs))
+}
+
+pub fn check_prev_block_exact(
+    shard: &ShardIdent,
+    listed: &BlockIdExt,
+    prev: &BlockIdExt,
+) -> Result<()> {
+    if listed != prev {
+        fail!(
+            "cannot generate shardchain block for shard {} \
+            after previous block {} because masterchain configuration expects \
+            another previous block {} and we are immediately after a split/merge event",
+            shard,
+            prev,
+            listed
+        )
+    }
+    Ok(())
+}
+
+pub fn check_prev_block(listed: &BlockIdExt, prev: &BlockIdExt, chk_chain_len: bool) -> Result<()> {
+    if listed.seq_no > prev.seq_no {
+        fail!(
+            "cannot generate a shardchain block after previous block {} \
+            because masterchain configuration already contains a newer block {}",
+            prev,
+            listed
+        )
+    }
+    if listed.seq_no == prev.seq_no && listed != prev {
+        fail!(
+            "cannot generate a shardchain block after previous block {} \
+            because masterchain configuration lists another block {} of the same height",
+            prev,
+            listed
+        )
+    }
+    if chk_chain_len && prev.seq_no >= listed.seq_no + UNREGISTERED_CHAIN_MAX_LEN {
+        fail!(
+            "cannot generate next block after {} because this would lead to \
+            an unregistered chain of length > {} (only {} is registered in the masterchain)",
+            prev,
+            UNREGISTERED_CHAIN_MAX_LEN,
+            listed
+        )
+    }
+    Ok(())
+}
+
+pub fn check_cur_validator_set(
+    validator_set: &ValidatorSet,
+    block_id: &BlockIdExt,
+    shard: &ShardIdent,
+    mc_state_extra: &McStateExtra,
+    old_mc_shards: &ShardHashes,
+    mc_state: &ShardStateStuff,
+    is_fake: bool,
+) -> Result<bool> {
+    if is_fake {
+        return Ok(true);
+    }
+
+    let mut cc_seqno_with_delta = 0; // cc_seqno delta = 0
+    let cc_seqno_from_state = if shard.is_masterchain() {
+        mc_state_extra.validator_info.catchain_seqno
+    } else {
+        old_mc_shards.calc_shard_cc_seqno(shard)?
+    };
+    let nodes = compute_validator_set_cc(
+        mc_state,
+        block_id.shard(),
+        block_id.seq_no(),
+        cc_seqno_from_state,
+        &mut cc_seqno_with_delta,
+    )?;
+    if nodes.is_empty() {
+        fail!("Cannot compute masterchain validator set from old masterchain state")
+    }
+    if validator_set.catchain_seqno() != cc_seqno_with_delta {
+        fail!(
+            "Current validator set catchain seqno mismatch: this validator set has cc_seqno={}, \
+            only validator set with cc_seqno={} is entitled to create block {}",
+            validator_set.catchain_seqno(),
+            cc_seqno_with_delta,
+            block_id
+        );
+    }
+
+    // TODO: check compute_validator_set
+    let nodes_set = ValidatorSet::new(0, 0, 0, nodes)?;
+    let export_nodes = validator_set.list();
+    // log::debug!(target: "validator", "block candidate validator set {:?}", export_nodes);
+    // log::debug!(target: "validator", "current validator set {:?}", nodes);
+    // CHECK!(export_nodes, &nodes);
+    if export_nodes != nodes_set.list()
+    /* && !is_fake */
+    {
+        fail!(
+            "current validator set mismatch: this validator set is not \
+            entitled to create block {}",
+            block_id
+        )
+    }
+    Ok(true)
+}
+
+pub fn may_update_shard_block_info(
+    shards: &ShardHashes,
+    new_info: &McShardRecord,
+    old_blkids: &[BlockIdExt],
+    lt_limit: u64,
+    shards_updated: Option<&HashSet<ShardIdent>>,
+) -> Result<(bool, Option<McShardRecord>)> {
+    log::trace!("may_update_shard_block_info new_info.block_id(): {}", new_info.block_id());
+
+    let wc = new_info.shard().workchain_id();
+    if wc == INVALID_WORKCHAIN_ID || wc == MASTERCHAIN_ID {
+        fail!("new top shard block description belongs to an invalid workchain {}", wc)
+    }
+
+    if !shards.contains(&wc)? {
+        fail!("new top shard block belongs to an unknown or disabled workchain {}", wc)
+    }
+
+    if old_blkids.len() != 1 && old_blkids.len() != 2 {
+        fail!("`old_blkids` must have either one or two start blocks in a top shard block update")
+    }
+
+    let before_split = old_blkids[0].shard().is_parent_for(new_info.shard());
+    let before_merge = old_blkids.len() == 2;
+    if before_merge {
+        if old_blkids[0].shard().sibling() != *old_blkids[1].shard() {
+            fail!("the two start blocks of a top shard block update must be siblings")
+        }
+        if !new_info.shard().is_parent_for(old_blkids[0].shard()) {
+            fail!(
+                "the two start blocks of a top shard block update do not merge into expected \
+                final shard {}",
+                old_blkids[0].shard()
+            )
+        }
+    } else if (new_info.shard() != old_blkids[0].shard()) && !before_split {
+        fail!(
+            "the start block of a top shard block update must either coincide with the final\
+            shard or be its parent"
+        )
+    }
+
+    let mut ancestor = None;
+    let mut old_cc_seqno = 0;
+    for ob in old_blkids {
+        let old_info = shards.get_shard(ob.shard()).unwrap_or_default().ok_or_else(|| {
+            error!(
+                "the start block's shard {} of a top shard block update is not contained \
+                    in the previous shard configuration",
+                ob,
+            )
+        })?;
+
+        if old_info.block_id().seq_no() != ob.seq_no()
+            || &old_info.block_id().root_hash != ob.root_hash()
+            || &old_info.block_id().file_hash != ob.file_hash()
+        {
+            fail!(
+                "the start block {} of a top shard block update is not contained \
+                in the previous shard configuration",
+                ob,
+            )
+        }
+
+        old_cc_seqno = old_cc_seqno.max(old_info.descr.next_catchain_seqno);
+
+        if let Some(shards_updated) = shards_updated {
+            if shards_updated.contains(ob.shard()) {
+                fail!(
+                    "the shard of the start block {} of a top shard block update has been \
+                    already updated in the current shard configuration",
+                    ob
+                )
+            }
+        }
+
+        if old_info.descr.before_split != before_split {
+            fail!(
+                "the shard of the start block {} has before_split={} \
+                but the top shard block update is valid only if before_split={}",
+                ob,
+                old_info.descr.before_split,
+                before_split,
+            )
+        }
+
+        if old_info.descr.before_merge != before_merge {
+            fail!(
+                "the shard of the start block {} has before_merge={} \
+                but the top shard block update is valid only if before_merge={}",
+                ob,
+                old_info.descr.before_merge,
+                before_merge,
+            )
+        }
+
+        if new_info.descr.before_split {
+            if before_merge || before_split {
+                fail!(
+                    "cannot register a before-split block {} at the end of a chain that itself \
+                    starts with a split/merge event",
+                    new_info.block_id()
+                )
+            }
+            if old_info.descr.is_fsm_merge() || old_info.descr.is_fsm_none() {
+                fail!(
+                    "cannot register a before-split block {} because fsm_split state was not \
+                    set for this shard beforehand",
+                    new_info.block_id()
+                )
+            }
+
+            if new_info.descr.gen_utime < old_info.descr.fsm_utime()
+                || new_info.descr.gen_utime
+                    >= old_info.descr.fsm_utime() + old_info.descr.fsm_interval()
+            {
+                fail!(
+                    "cannot register a before-split block {} because fsm_split state was \
+                    enabled for unixtime {} .. {} but the block is generated at {}",
+                    new_info.block_id(),
+                    old_info.descr.fsm_utime(),
+                    old_info.descr.fsm_utime() + old_info.descr.fsm_interval(),
+                    new_info.descr.gen_utime
+                )
+            }
+        }
+        if before_merge {
+            if old_info.descr.is_fsm_split() || old_info.descr.is_fsm_none() {
+                fail!(
+                    "cannot register a merged block {} because fsm_merge state was not \
+                    set for shard {} beforehand",
+                    new_info.block_id(),
+                    old_info.block_id().shard()
+                )
+            }
+            if new_info.descr.gen_utime < old_info.descr.fsm_utime()
+                || new_info.descr.gen_utime
+                    >= old_info.descr.fsm_utime() + old_info.descr.fsm_interval()
+            {
+                fail!(
+                    "cannot register merged block {} because fsm_merge state was \
+                    enabled for shard {} for unixtime {} .. {} but the block is generated at {}",
+                    new_info.block_id(),
+                    old_info.block_id().shard(),
+                    old_info.descr.fsm_utime(),
+                    old_info.descr.fsm_utime() + old_info.descr.fsm_interval(),
+                    new_info.descr.gen_utime
+                )
+            }
+        }
+
+        if !before_merge && !before_split {
+            ancestor = Some(old_info);
+        }
+    }
+
+    let expected_next_catchain_seqno = old_cc_seqno + if before_merge { 1 } else { 0 };
+
+    if expected_next_catchain_seqno != new_info.descr.next_catchain_seqno {
+        fail!(
+            "the top shard block update is generated with catchain_seqno={} but previous shard \
+            configuration expects {}",
+            new_info.descr.next_catchain_seqno,
+            expected_next_catchain_seqno
+        )
+    }
+    if new_info.descr.end_lt >= lt_limit {
+        fail!(
+            "the top shard block update has end_lt {} which is larger than the current limit {}",
+            new_info.descr.end_lt,
+            lt_limit
+        )
+    }
+
+    log::trace!("after may_update_shard_block_info new_info.block_id(): {}", new_info.block_id());
+    Ok((before_split, ancestor))
+}
+
+pub fn fmt_block_id_short(block_id: &BlockIdExt) -> String {
+    let rh_part = &block_id.root_hash().as_slice()[0..2];
+    let rh_part = hex::encode(rh_part);
+    format!(
+        "{}:{}, {}, rh {}",
+        block_id.shard().workchain_id(),
+        block_id.shard().shard_prefix_as_str_with_tag(),
+        block_id.seq_no(),
+        rh_part,
+    )
+}
+
+pub fn fmt_next_block_descr(next_block_id: &BlockIdExt) -> String {
+    let rh_part = &next_block_id.root_hash().as_slice()[0..2];
+    let rh_part = hex::encode(rh_part);
+    format!(
+        "{}:{}, {}, rh {}",
+        next_block_id.shard().workchain_id(),
+        next_block_id.shard().shard_prefix_as_str_with_tag(),
+        next_block_id.seq_no(),
+        rh_part,
+    )
+}
+
+#[cfg(feature = "xp25")]
+// TODO: need to refactor update one hashmaptree to another with using intermidiate structures
+pub fn extend_ref_shard_blocks(ref_shard_blocks: &RefShardBlocks) -> Result<ShardHashes> {
+    let mut shard_top_blocks = HashMap::<i32, HashMap<u64, _>>::default();
+
+    ref_shard_blocks.iterate_shard_block_refs(|block_id, end_lt| {
+        let shard_top_blocks = shard_top_blocks.entry(block_id.shard().workchain_id()).or_default();
+
+        shard_top_blocks.insert(
+            block_id.shard().shard_prefix_with_tag(),
+            ShardBlockRef {
+                seq_no: block_id.seq_no,
+                root_hash: block_id.root_hash,
+                file_hash: block_id.file_hash,
+                end_lt,
+            },
+        );
+
+        Ok(true)
+    })?;
+
+    build_shard_hashes_tree(shard_top_blocks)
+}
+
+#[cfg(feature = "xp25")]
+pub fn build_shard_hashes_tree(
+    ref_shard_blocks: HashMap<i32, HashMap<u64, ShardBlockRef>>,
+) -> Result<ShardHashes> {
+    use ton_block::{BinTree, InRefValue, ShardDescr};
+
+    fn make_shard_descr_stub(block_ref: &ShardBlockRef) -> ShardDescr {
+        ShardDescr {
+            seq_no: block_ref.seq_no,
+            root_hash: block_ref.root_hash.clone(),
+            file_hash: block_ref.file_hash.clone(),
+            end_lt: block_ref.end_lt,
+            ..Default::default()
+        }
+    }
+
+    type ShardsTree = BinTree<ShardDescr>;
+
+    let mut result = ShardHashes::default();
+    for (workchain_id, ref_shard_blocks) in ref_shard_blocks {
+        let key = ShardIdent::full(workchain_id);
+
+        let mut bintree;
+        match ref_shard_blocks.get(&key.shard_prefix_with_tag()) {
+            Some(descr) => {
+                bintree = ShardsTree::with_item(&make_shard_descr_stub(descr))?;
+            }
+            None => {
+                bintree = ShardsTree::with_item(&Default::default())?;
+                let mut stack = vec![key];
+                while let Some(key) = stack.pop() {
+                    bintree.split(key.shard_key(false), |_| {
+                        let (left, right) = key.split()?;
+
+                        let left_val = ref_shard_blocks
+                            .get(&left.shard_prefix_with_tag())
+                            .map(make_shard_descr_stub)
+                            .unwrap_or_else(|| {
+                                stack.push(left);
+                                Default::default()
+                            });
+
+                        let right_val = ref_shard_blocks
+                            .get(&right.shard_prefix_with_tag())
+                            .map(make_shard_descr_stub)
+                            .unwrap_or_else(|| {
+                                stack.push(right);
+                                Default::default()
+                            });
+
+                        Ok((left_val, right_val))
+                    })?;
+                }
+            }
+        };
+
+        result.set(&workchain_id, &InRefValue(bintree))?;
+    }
+
+    Ok(result)
+}
+
+// ============================================================================
+// Simplex Signature Verification Utilities
+//
+// C++ uses polymorphism: BlockSignatureSetBase::check_signatures_impl()
+// calls virtual to_sign(block_id), which dispatches to:
+//
+// BlockSignatureSetOrdinary::to_sign() → ton_blockId(root_hash, file_hash)
+// BlockSignatureSetSimplex::to_sign()  → dataToSign(session_id, vote(candidateId))
+//
+// In Rust, we use BlockSignaturesVariant and dispatch here.
+// ============================================================================
+
+/// Build TL-serialized bytes for Simplex signature verification
+///
+/// C++ reference (signature-set.cpp:262-283):
+/// ```cpp
+/// td::Result<td::BufferSlice> to_sign(ton::BlockIdExt block_id) const override {
+///   auto candidate_id = ton::create_tl_object<ton::ton_api::consensus_candidateId>(
+///       slot_, td::Bits256{ton::get_tl_object_sha256(candidate_).raw});
+///   td::BufferSlice data;
+///   if (final_) {
+///     data = create_serialize_tl_object<consensus_simplex_finalizeVote>(move(candidate_id));
+///   } else {
+///     data = create_serialize_tl_object<consensus_simplex_notarizeVote>(move(candidate_id));
+///   }
+///   return create_serialize_tl_object<consensus_dataToSign>(session_id_, move(data));
+/// }
+/// ```
+pub fn simplex_to_sign(sigs: &BlockSignaturesSimplex) -> Result<Vec<u8>> {
+    let candidate_data_bytes = sigs.candidate_data_bytes()?;
+    simplex_to_sign_from_candidate_bytes(sigs, &candidate_data_bytes)
+}
+
+/// Build data to sign for Simplex signatures and validate that the embedded candidate refers to
+/// the expected `block_id` (matches C++ `BlockSignatureSetSimplex::to_sign`).
+pub fn simplex_to_sign_checked(
+    sigs: &BlockSignaturesSimplex,
+    block_id: &BlockIdExt,
+) -> Result<Vec<u8>> {
+    let candidate_data_bytes = sigs.candidate_data_bytes()?;
+    let expected_block_id = simplex_candidate_block_id(&candidate_data_bytes)?;
+    if &expected_block_id != block_id {
+        fail!("block id mismatch");
+    }
+    simplex_to_sign_from_candidate_bytes(sigs, &candidate_data_bytes)
+}
+
+fn simplex_candidate_block_id(candidate_data_bytes: &[u8]) -> Result<BlockIdExt> {
+    let candidate = Deserializer::new(&mut Cursor::new(candidate_data_bytes))
+        .read_boxed::<ton_api::ton::consensus::CandidateHashData>()?;
+    Ok(candidate.block().clone())
+}
+
+fn simplex_to_sign_from_candidate_bytes(
+    sigs: &BlockSignaturesSimplex,
+    candidate_data_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    use ton_api::ton::consensus::{
+        candidateid::CandidateId,
+        datatosign::DataToSign,
+        simplex::unsignedvote::{FinalizeVote, NotarizeVote},
+    };
+
+    // Compute candidate hash (C++: get_tl_object_sha256(candidate_))
+    let candidate_hash = sha256_digest(candidate_data_bytes);
+
+    // Build CandidateId
+    let candidate_id =
+        CandidateId { slot: sigs.slot as i32, hash: candidate_hash.into() }.into_boxed();
+
+    // Build vote (FinalizeVote or NotarizeVote)
+    let vote_bytes = if sigs.is_final() {
+        serialize_boxed(&FinalizeVote { id: candidate_id }.into_boxed())?
+    } else {
+        serialize_boxed(&NotarizeVote { id: candidate_id }.into_boxed())?
+    };
+
+    // Wrap in DataToSign
+    let data_to_sign = DataToSign { session_id: sigs.session_id.clone(), data: vote_bytes };
+
+    serialize_boxed(&data_to_sign.into_boxed())
+}
+
+/// Build checked_data for signature verification based on signature variant
+///
+/// For Ordinary signatures: uses Block::build_data_for_sign(root_hash, file_hash)
+/// For Simplex signatures: uses simplex_to_sign() to reconstruct the signed data
+pub fn build_checked_data(
+    signatures: &BlockSignaturesVariant,
+    block_id: &BlockIdExt,
+) -> Result<Vec<u8>> {
+    match signatures {
+        BlockSignaturesVariant::Ordinary(_) => {
+            Ok(Block::build_data_for_sign(&block_id.root_hash, &block_id.file_hash).to_vec())
+        }
+        BlockSignaturesVariant::Simplex(simplex) => simplex_to_sign_checked(simplex, block_id),
+    }
+}
+
+/// Check FINALIZED signatures using appropriate scheme
+///
+/// For Ordinary signatures, uses the standard block hash verification.
+/// For Simplex signatures, uses the reconstructed signed data.
+///
+/// Reference: C++ BlockSignatureSet::check_signatures() - signature-set.h
+#[allow(dead_code)]
+pub fn check_signatures(
+    signatures: &BlockSignaturesVariant,
+    validators_list: &[ValidatorDescr],
+    block_id: &BlockIdExt,
+) -> Result<u64> {
+    match signatures {
+        BlockSignaturesVariant::Ordinary(sigs) => {
+            let data = Block::build_data_for_sign(&block_id.root_hash, &block_id.file_hash);
+            sigs.pure_signatures.check_signatures(validators_list, &data)
+        }
+        BlockSignaturesVariant::Simplex(sigs) => {
+            if !sigs.is_final() {
+                fail!(
+                    "not final signatures - use check_approve_signatures() for notarize signatures"
+                );
+            }
+            let data = simplex_to_sign_checked(sigs, block_id)?;
+            sigs.pure_signatures.check_signatures(validators_list, &data)
+        }
+    }
+}
+
+/// Check NOTARIZED (approve) signatures for Simplex
+///
+/// This is only valid for Simplex signatures with is_final == false.
+///
+/// Reference: C++ BlockSignatureSet::check_approve_signatures() - signature-set.h
+#[allow(dead_code)]
+pub fn check_approve_signatures(
+    signatures: &BlockSignaturesSimplex,
+    validators_list: &[ValidatorDescr],
+) -> Result<u64> {
+    if signatures.is_final() {
+        fail!("not approve signatures - use check_signatures() for finalize signatures");
+    }
+    let data = simplex_to_sign(signatures)?;
+    signatures.pure_signatures.check_signatures(validators_list, &data)
+}

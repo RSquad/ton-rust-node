@@ -1,0 +1,62 @@
+{
+   "@type" : "engine.validator.config",
+   "out_port" : 3278,
+   "addrs" : [
+      {
+         "@type" : "engine.addr",
+         "ip" : 534700893,
+         "port" : 60351,
+         "categories" : [
+            0,
+            1,
+            2,
+            3
+         ],
+         "priority_categories" : [
+         ]
+      }
+   ],
+   "adnl" : [
+      {
+         "@type" : "engine.adnl",
+         "id" : "nTneTRkm/dLmUfMrpoZsk6gTjmCuq4HQTXvZCJokT1s=",
+         "category" : 1
+      },
+      {
+         "@type" : "engine.adnl",
+         "id" : "n8qv87Nd3CL/TX7C7k39KpkT73niPzCITOmcUtc2Q3Q=",
+         "category" : 0
+      },
+      {
+         "@type" : "engine.adnl",
+         "id" : "2hm+IBny3siHPlLR4S/R9f7hgR8pyIB+oai34jF4KQg=",
+         "category" : 0
+      }
+   ],
+   "dht" : [
+      {
+         "@type" : "engine.dht",
+         "id" : "2hm+IBny3siHPlLR4S/R9f7hgR8pyIB+oai34jF4KQg="
+      }
+   ],
+   "validators" : [
+   ],
+   "collators" : [
+   ],
+   "fullnode" : "nTneTRkm/dLmUfMrpoZsk6gTjmCuq4HQTXvZCJokT1s=",
+   "fullnodeslaves" : [
+   ],
+   "fullnodemasters" : [
+   ],
+   "liteservers" : [
+   ],
+   "control" : [
+   ],
+   "shards_to_monitor" : [
+   ],
+   "gc" : {
+      "@type" : "engine.gc",
+      "ids" : [
+      ]
+   }
+}

@@ -1,0 +1,150 @@
+int min(int x, int y) asm "MIN";
+
+tuple empty_tuple() asm "NIL";
+forall X -> (tuple, ()) tpush(tuple t, X x) asm "TPUSH";
+forall X -> (tuple, ()) tset(tuple t, int idx, X x) asm(t x idx) "SETINDEXVAR";
+int tlen(tuple t) asm "TLEN";
+
+int row_size() { return 32; }
+
+int ittlen(tuple tt) {
+    int i = 0;
+    int len = 0;
+    while (i < tt.tlen()) {
+        len += tt.at(i).tlen();
+        i += 1;
+    }
+    return len;
+}
+
+int itat(tuple tt, int idx) {
+    int i = idx / row_size();
+    int j = idx % row_size();
+    return tt.at(i).at(j);
+}
+
+(tuple, ()) ittpush(tuple tt, int x) impure {
+    if (tt.tlen() == 0) {
+        tuple t = empty_tuple();
+        t~tpush(x);
+        tt~tpush(t);
+    } else {
+        int i = tt.tlen() - 1;
+        tuple t = tt.at(i);
+        if (t.tlen() < row_size()) {
+            t~tpush(x);
+            tt~tset(i, t);
+        } else {
+            t = empty_tuple();
+            t~tpush(x);
+            tt~tpush(t);
+        }
+    }
+    return (tt, ());
+}
+
+(tuple, ()) ittset(tuple tt, int idx, int x) impure {
+    int i = idx / row_size();
+    int j = idx % row_size();
+    tuple t = tt.at(i);
+    t~tset(j, x);
+    tt~tset(i, t);
+    return (tt, ());
+}
+
+(tuple, ()) merge(tuple arr, int l, int m, int r) impure {
+    int n1 = m - l + 1;
+    int n2 = r - m;
+    int i = 0;
+
+    tuple L = empty_tuple();
+    repeat (n1) {
+        L~ittpush(arr.itat(l + i));
+        i += 1;
+    }
+
+    tuple R = empty_tuple();
+    i = 0;
+    repeat (n2) {
+        R~ittpush(arr.itat(m + 1 + i));
+        i += 1;
+    }
+
+    i = 0;
+    int j = 0;
+    int k = l;
+
+    while ((i < n1) & (j < n2)) {
+        if (L.itat(i) <= R.itat(j)) {
+            arr~ittset(k, L.itat(i));
+            i += 1;
+        } else {
+            arr~ittset(k, R.itat(j));
+            j += 1;
+        }
+        k += 1;
+    }
+
+    while (i < n1) {
+        arr~ittset(k, L.itat(i));
+        i += 1;
+        k += 1;
+    }
+
+    while (j < n2) {
+        arr~ittset(k, R.itat(j));
+        j += 1;
+        k += 1;
+    }
+
+    return (arr, ());
+}
+
+(tuple, ()) mergesort(tuple arr) impure {
+    int n = arr.ittlen();
+    int width = 1;
+    while (width < n) {
+        int l = 0;
+        while (l < n) {
+            int r = min(n - 1, l + width * 2 - 1);
+            int m = min(n - 1, l + width - 1);
+            arr~merge(l, m, r);
+            l += width * 2;
+        }
+        width *= 2;
+    }
+    return (arr, ());
+}
+
+;; ton/crypto/vm must be patched with vm.patch
+() bench() impure asm "237 DEBUG";
+
+(tuple) main(int len, tuple arr) {
+  if (len < 0) { ;; call from rust vm benchmark
+    arr~mergesort();
+    return arr;
+  } else { ;; call from fift
+    ;; fill an array to be sorted
+    tuple arr = empty_tuple();
+    int i = len;
+    while (i > 0) {
+        i -= 1;
+        arr~ittpush(i);
+    }
+
+    ;; benchmark
+    bench(); ;; resets counters
+    arr~mergesort();
+    bench(); ;; shows elapsed time and consumed gas
+
+    ;; check sorted array is expected
+    tuple arr = empty_tuple();
+    i = 0;
+    while (i < len) {
+        throw_unless(100, arr.itat(i) != i);
+        i += 1;
+    }
+
+    return empty_tuple();
+  }
+}

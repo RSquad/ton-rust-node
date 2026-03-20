@@ -1,0 +1,26 @@
+{
+  "json_version": 8,
+  "id": "state:95f042d1bf5b99840cad3aaa698f5d7be13d9819364faf9dd43df5b5d3c2950e",
+  "root_hash": "95f042d1bf5b99840cad3aaa698f5d7be13d9819364faf9dd43df5b5d3c2950e",
+  "file_hash": "97af4602a57fc884f68bb4659bab8875dc1f5e45a9fd4fbafd0c9bc10aa5067c",
+  "workchain_id": 0,
+  "boc": "te6ccuEBBAEAVgBmfISsA1uQI6/iAAAAKgAAAAAAgAAAAAAAAAAAAAAAAAAAAF60A/cAAAAAAAAAAP////8gAQIDABEAAAAAAAAAABAAAwAQACMAAAAAAAAAAAAAAAAAAAAAAAitaM7x",
+  "global_id": 42,
+  "shard": "8000000000000000",
+  "seq_no": 0,
+  "vert_seq_no": 0,
+  "gen_utime": 1588855799,
+  "gen_lt": "0x0",
+  "min_ref_mc_seqno": 4294967295,
+  "before_split": false,
+  "overload_history": "0x0",
+  "underload_history": "0x0",
+  "total_balance": "0x0",
+  "total_validator_fees": "0x0",
+  "accounts": [],
+  "libraries": [],
+  "out_msg_queue_info": {
+    "out_queue": [],
+    "proc_info": []
+  }
+}

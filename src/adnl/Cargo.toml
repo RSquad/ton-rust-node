@@ -1,0 +1,56 @@
+[package]
+build = '../common/build/build.rs'
+description = 'ADNL stack library'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'adnl'
+version = '0.11.38'
+
+[dependencies]
+anyhow = '1.0'
+async-trait = '0.1'
+chrono = { optional = true, version = '0.4' }
+enum-as-inner = '=0.5.1'
+external-ip = { optional = true, version = '6.0' }
+futures = '0.3.1'
+quinn = '0.11'
+hex = '0.4'
+libc = '0.2'
+log = '0.4'
+mio = '1.0'
+num-traits = '0.2'
+num_cpus = '1.13'
+rand = { features = [ 'small_rng' ], version = '0.8' }
+rcgen = '0.13'
+ring = '0.17'
+rustls = { version = '0.23', features = [ 'ring' ] }
+serde = { features = [ 'derive', 'rc' ], version = '1.0.105' }
+serde_json = '1.0'
+socket2 = { version = '0.6', features = [ 'all' ] }
+stream-cancel = '0.8.0'
+tokio = { features = [ 'io-util', 'macros', 'net', 'rt-multi-thread' ], version = '1.5' }
+tokio-io-timeout = '1.1.1'
+tokio-stream = { features = [ 'net' ], version = '0.1.4' }
+tokio-util = '0.7'
+ton_block = { path = '../block', features = [ 'export_key' ] }
+lockfree = { path = '../lockfree' }
+raptorq = { path = 'raptorq', version = '1.2.1' }
+ton_api = { path = '../tl/ton_api' }
+
+[dev-dependencies]
+log4rs = '1.2'
+
+[features]
+client = [  ]
+debug = [  ]
+default = [ 'node', 'static_workers' ]
+dump = [ 'chrono' ]
+node = [ 'external-ip' ]
+server = [  ]
+static_workers = [  ]
+telemetry = [  ]
+xp25 = [  ]
+
+[[bench]]
+harness = false
+name = 'bench_rldp'

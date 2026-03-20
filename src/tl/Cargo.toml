@@ -1,0 +1,4 @@
+[workspace]
+members = [ 'ton_api', 'ton_tl_codegen' ]
+resolver = '2'
+

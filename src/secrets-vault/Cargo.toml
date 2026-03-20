@@ -1,0 +1,90 @@
+[package]
+build = '../common/build/build.rs'
+description = 'Key/Secrets Vault library'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'secrets-vault'
+version = '0.1.0'
+
+[[bin]]
+name = 'secrets-vault-cli'
+path = 'cli/main.rs'
+required-features = ["secrets-vault-cli"]
+
+[features]
+secrets-vault-cli = ["dep:clap", "dep:colored", "with-base64"]
+with-base64 = ["dep:base64"]
+
+# Storages
+file-storage-json = []
+hashicorp-storage = [
+    "dep:rsa",
+    "dep:aes-kw",
+    "dep:aes",
+    "dep:ed25519-dalek",
+    "dep:urlencoding",
+]
+
+# Crypto algorithms
+crypto-default = ["dep:ed25519-dalek", "dep:aes-gcm"]
+crypto-block = ["dep:ton_block", "dep:aes-gcm"]
+
+default = ["file-storage-json", "crypto-default", "with-base64"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+downcast-rs = "2"
+hex = "0.4"
+libc = '0.2'
+rand = "0.8"
+rand_chacha = { version = "0.9", features = ["os_rng"] }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = [
+    "sync",
+    "fs",
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "time",
+] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1.8"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = { version = "0.22", optional = true }
+scopeguard = "1"
+rsa = { version = "0.9", features = ["sha2"], optional = true }
+urlencoding = { version = "2", optional = true }
+
+# secrets_valut_cli dependencies
+clap = { version = "4.4", features = ["derive"], optional = true }
+colored = { version = "2.1", optional = true }
+
+# Crypto
+aes-gcm = { version = "0.10", features = ["aes"], optional = true }
+aes-kw = { version = "0.2", optional = true }
+aes = { version = "0.8", optional = true }
+ed25519-dalek = { version = "2", features = [
+    "rand_core",
+    "pkcs8",
+], optional = true }
+ton_block = { path = '../block', optional = true }
+
+
+# Memory protection (Unix)
+[target.'cfg(unix)'.dependencies]
+memsec = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["memoryapi", "winnt"] }
+
+[dev-dependencies]
+scopeguard = "1"
+serial_test = "3"

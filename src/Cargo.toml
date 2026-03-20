@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    'adnl',
+    'assembler',
+    'block',
+    'block-json',
+    'executor',
+    'emulator',
+    'lockfree',
+    'node/catchain',
+    'node/consensus-common',
+    'node/simplex',
+    'node/storage',
+    'node/validator-session',
+    'node',
+    'node-control/commands',
+    'node-control/common',
+    'node-control/contracts',
+    'node-control/control-client',
+    'node-control/elections',
+    'node-control/nodectl', 
+    'node-control/service',
+    'node-control/ton-http-api-client',
+    'secrets-vault',
+    'tl/ton_api',
+    'vm',
+]
+resolver = '2'
+
+[profile.bench]
+debug = true
+
+#Uncomment for profiling
+#[profile.release]
+#debug = 1

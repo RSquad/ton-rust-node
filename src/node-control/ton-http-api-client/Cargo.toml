@@ -1,0 +1,26 @@
+[package]
+name = "ton-http-api-client"
+version = "0.2.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+serde = { version = "1.0" }
+serde_json = "1.0.145"
+base64 = "0.22"
+anyhow = "1.0"
+async-trait = "0.1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+ton_block = { path = "../../block" }
+ton_api = { path = "../../tl/ton_api" }
+common = { path = "../common" }
+toncenter-rs = { git = "https://github.com/RSquad/toncenter-rs.git", branch = "main" }
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+] }

@@ -1,0 +1,99 @@
+{
+  "json_version": 8,
+  "id": "82ab7823409ba116039196e835f088da57b17d7373943c3f82263e7beb4bf9ef",
+  "file_hash": "18afcdd25be0989ce516504263eb351818a0ff8f6ab3689501c8e3b767ef413c",
+  "status": 1,
+  "boc": "te6ccuECGQEAA/YAABwAxADeAXACBAKgAzwDZgN4A94ERASQBKoE9gVCBVoFdAZSBsIHDwclBywHNAc6B+wEEBHvVar///8RAQIDBAKgm8ephwAAAACEAQBAlgYAAAAAAgAAAAAAAAAAAAAAAF6Nxe0AAARuIt+1gAAABG4i37WB2/q8jwAAwVMAL7y1AC+6hsQAAAABAAAAAAAAAA4FBgIRuOSN+0DuaygEBwgKigSOW5pU3ZjUruAT91T5Wfz4LKe2hpOz29AP3pCSFrKRsY6ZY8KMU6Pubr23hiOn/HE/gksHugdJC87pA25FTkmxAC4ALgkKA4lKM/b9f+hMkAdalSV2jtF0B+WdhUWhReICGWvpteSyKYgSHGmfhcpR1dsLAtUmU+n4//taF+/cxEFbNQcrNtiuy76owkAVFhcAmAAABG4iwTEEAC+8tVL8cAFh1JlkTaGLevm1CqXtT2ossCL3EZ+jsHRQZcZgNsEkXocy9s4aSOigDudhciQ0Mggs5grsx+87DxJzwngAmAAABG4i0HNBAECWBZSCLwNZi8xMFc+TIyelrtgqFCXOHMJa7d13icBrHj7erHHC283a7LjMMqJoCOyhKvc5TzfymB4vRems9lxrZgQCIXAbfRK+Wy1LgNvolfLZakAIFBQADQAQO5rKAAgjW5Ajr+L///8RAgAAAAAAAAAAAAAAAABAlgUAAAAAXo3F6wAABG4i0HNBAC+8tCALDA0jW5Ajr+L///8RAgAAAAAAAAAAAAAAAABAlgYAAAAAXo3F7QAABG4i37WBAC+8tSAPEBEoSAEByhMbWqpWOhYDVVWx74BiXblOtEEMqvlA1jykNF0eTuEAAyIRgcBt9Er5bLUwEw4oSAEBnOEAFABCtqJxi8zHcsqCuebXocwZOQOgZp7JXO4kNogAAShIAQEbLNBRy8vut4ObClv/qbSE9JxQN9e3Z8SsULgI2iYF/AAAAREAAAAAAAAAAFASIhGBwG30SvlstTATFAHXAAAAAAAAAAD//////////3AbfRK+Wy1LgeIMdq6CDxAAAEbiLBMQQAL7y1UvxwAWHUmWRNoYt6+bUKpe1PaiywIvcRn6OwdFBlxmA2wSRehzL2zhpI6KAO52FyJDQyCCzmCuzH7zsPEnPCeIFABrsBAAAAAAAAAAABfeWoAAAjcRYJiB///////////////////////////////////////////AKEgBASm2Fbm/bJHpyPQG4uJMsZDK6F2UKjwESQYA2hZX+X51ACwAEaAAAADvGilzXAADACABAYIYAAECAK2gH32GZygTv9Tm5/43ARv23dv+jGnHPd7n7Hr2s7kJNBeg3b4cszzdIJ34EP1/2v5SNeQ6xA9LSZTPXW6XFVDBsr1QAAAABRExM2BRl7MAAABG4ioqyCjMlt6S",
+  "global_id": -239,
+  "version": 0,
+  "after_merge": false,
+  "before_split": false,
+  "after_split": false,
+  "want_split": false,
+  "want_merge": true,
+  "key_block": false,
+  "vert_seqno_incr": 0,
+  "seq_no": 4232710,
+  "vert_seq_no": 0,
+  "gen_utime": 1586349549,
+  "start_lt_dec": "4871078000000",
+  "start_lt": "a46e22dfb580",
+  "end_lt_dec": "4871078000001",
+  "end_lt": "a46e22dfb581",
+  "gen_validator_list_hash_short": 3690642575,
+  "gen_catchain_seqno": 49491,
+  "min_ref_mc_seqno": 3128501,
+  "prev_key_block_seqno": 3127942,
+  "workchain_id": 0,
+  "shard": "2000000000000000",
+  "gen_software_version": 1,
+  "gen_software_capabilities_dec": "14",
+  "gen_software_capabilities": "0e",
+  "prev_seq_no": 4232709,
+  "master_ref": {
+    "end_lt_dec": "4871076000004",
+    "end_lt": "a46e22c13104",
+    "seq_no": 3128501,
+    "root_hash": "52fc700161d499644da18b7af9b50aa5ed4f6a2cb022f7119fa3b0745065c660",
+    "file_hash": "36c1245e8732f6ce1a48e8a00ee76172243432082ce60aecc7ef3b0f1273c278"
+  },
+  "prev_ref": {
+    "end_lt_dec": "4871077000001",
+    "end_lt": "a46e22d07341",
+    "seq_no": 4232709,
+    "root_hash": "94822f03598bcc4c15cf932327a5aed82a1425ce1cc25aeddd7789c06b1e3ede",
+    "file_hash": "ac71c2dbcddaecb8cc32a26808eca12af7394f37f2981e2f45e9acf65c6b6604"
+  },
+  "value_flow": {
+    "from_prev_blk_dec": "483583989232340",
+    "from_prev_blk": "0c1b7d12be5b2d4",
+    "from_prev_blk_other": [
+      {
+        "currency": 239,
+        "value_dec": "4533867",
+        "value": "05452e6b"
+      }
+    ],
+    "to_next_blk_dec": "483583989232340",
+    "to_next_blk": "0c1b7d12be5b2d4",
+    "to_next_blk_other": [
+      {
+        "currency": 239,
+        "value_dec": "4533867",
+        "value": "05452e6b"
+      }
+    ],
+    "imported_dec": "0",
+    "imported": "000",
+    "exported_dec": "0",
+    "exported": "000",
+    "fees_collected_dec": "250000000",
+    "fees_collected": "06ee6b280",
+    "fees_imported_dec": "0",
+    "fees_imported": "000",
+    "recovered_dec": "0",
+    "recovered": "000",
+    "created_dec": "250000000",
+    "created": "06ee6b280",
+    "minted_dec": "0",
+    "minted": "000"
+  },
+  "old_hash": "8e5b9a54dd98d4aee013f754f959fcf82ca7b68693b3dbd00fde909216b291b1",
+  "new_hash": "8e9963c28c53a3ee6ebdb78623a7fc713f824b07ba07490bcee9036e454e49b1",
+  "old_depth": 46,
+  "new_depth": 46,
+  "in_msg_descr": [],
+  "out_msg_descr": [
+    {
+      "msg_env_hash": "dbe1cb33cdd209df810fd7fdafe5235e43ac40f4b4994cf5d6e971550c1b2bd5",
+      "next_workchain": 0,
+      "next_addr_pfx": "5113133605197b30",
+      "import_block_lt_dec": "4871074000002",
+      "import_block_lt": "a46e22a2ac82",
+      "msg_type": 7
+    }
+  ],
+  "tr_count": 0,
+  "rand_seed": "7fe84c90075a9525768ed17407e59d8545a145e202196be9b5e4b22988121c69",
+  "created_by": "9f85ca51d5db0b02d52653e9f8fffb5a17efdcc4415b35072b36d8aecbbea8c2"
+}

@@ -1,0 +1,32 @@
+1000000000 0 0 -2 // initial stack
+
+"elector-code.boc" file>B B>boc <s
+"elector-data.boc" file>B B>boc
+"config-data.boc" file>B B>boc <s ref@
+
+0x76ef1ea                 // magic number
+0                         // actions
+0                         // messages
+1633458077                // now
+0                         // blocklt
+0                         // ltime
+0                         // randseed
+1000000000 null 2 tuple   // balance
+x{9fe0000000000000000000000000000000000000000000000000000000000000001_} // myaddr
+9 roll                    // config dict
+null                      // mycode
+0                         // init code hash
+12 tuple 1 tuple          // c7 tuple
+
+1000000000                // gas limit
+4 8 16 32 + + +           // mode: +4 load c4, +8 load gas, +16 load c7, +32 return c5 (actions)
+
+runvmx
+82386791 <> abort"consumed gas mismatch"
+
+hashB
+"elector-actions.boc" file>B B>boc hashB B= not abort"actions mismatch"
+
+hashB
+"elector-data-output.boc" file>B B>boc hashB
+B= not abort"output data mismatch"

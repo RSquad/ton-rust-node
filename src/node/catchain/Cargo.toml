@@ -1,0 +1,43 @@
+[package]
+build = '../../common/build/build.rs'
+edition = '2021'
+license = 'GPL-3.0'
+name = 'catchain'
+version = '0.1.1'
+
+[dependencies]
+anyhow = '1.0'
+async-trait = '0.1'
+chrono = '0.4'
+crossbeam = '0.8'
+crossbeam-channel = "0.5"
+futures = '0.3'
+hex = '0.4'
+lazy_static = '1.4'
+log = '0.4'
+metrics = '0.24'
+metrics-util = '0.20'
+quanta = '0.12'
+rand = '0.8'
+regex = '1.10'
+spin = '0.7'
+tokio = { features = [ 'rt-multi-thread' ], version = '1.40' }
+adnl = { features = [ 'node' ], path = '../../adnl' }
+#adnl = { features = [ 'client', 'node', 'server' ], path = '../../adnl' }
+consensus-common = { path = '../consensus-common' }
+ton_block = { path = '../../block' }
+storage = { path = '../storage' }
+ton_api = { path = '../../tl/ton_api' }
+
+[dev-dependencies]
+log4rs = { features = [ 'rolling_file_appender' ], version = '1.3' }
+pretty_assertions = '1.3'
+env_logger = '0.11'
+external-ip = '6.0'
+serde_json = '1.0'
+consensus-common = { path = '../consensus-common', features = ['test-utils'] }
+
+[features]
+default = [ 'telemetry'  ]
+telemetry = [ 'adnl/telemetry', 'storage/telemetry' ]
+export_key = [ 'ton_block/export_key' ]

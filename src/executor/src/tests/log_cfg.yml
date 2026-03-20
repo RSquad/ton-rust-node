@@ -1,0 +1,38 @@
+# Scan this file for changes every 30 seconds
+# https://docs.rs/log4rs/0.12.0/log4rs/encode/pattern/index.html
+refresh_rate: 30 seconds
+
+appenders:
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d(%s.%f)} {l} [{h({t})}] {I}: {m}{n}"
+
+  stdout_ref:
+    kind: console
+    encoder:
+      pattern: "{d(%H:%M:%S)}|{f:>45.45}:{L:<4.4}| {l:<5.5}: {m}{n}"
+
+  logfile:
+    kind: file
+    path: "../target/check/output.log"
+    encoder:
+      pattern: "{d(%H:%M:%S)}|{h({t:<20})}|{l:<5.5}: {m}{n}"
+
+  tvm_logfile:
+    kind: file
+    path: "../target/check/tvm.log"
+    encoder:
+      pattern: "{m}{n}"
+
+loggers:
+
+  executor:
+    level: debug
+    appenders:
+      - stdout_ref
+
+  tvm:
+    level: off
+    appenders:
+      - tvm_logfile

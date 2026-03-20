@@ -1,0 +1,38 @@
+#include "imports/stdlib.fc";
+
+global int g::last_call; 
+global int g::count;
+global int g::salt;
+
+() load_globals() impure {
+  var ds = get_data().begin_parse();
+  g::count = ds~load_uint(32);
+  g::last_call = ds~load_uint(32);
+  g::salt = ds~load_uint(32);
+  ds.end_parse();
+}
+
+() store_globals() impure {
+  builder data = begin_cell()
+    .store_uint(g::count, 32)
+    .store_uint(g::last_call, 32)
+    .store_uint(g::salt, 32);
+  set_data(data.end_cell());
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  return ();
+}
+
+() recv_external(slice in_msg) impure {
+  load_globals();
+  var new_call = in_msg~load_uint(32);
+  if (new_call != g::last_call) {
+    throw(101); 
+  }
+  accept_message();
+
+  g::last_call += 1;
+  g::count += 1;
+  store_globals();
+}

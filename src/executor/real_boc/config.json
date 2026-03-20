@@ -1,0 +1,325 @@
+{
+  "config_addr": "5555555555555555555555555555555555555555555555555555555555555555",
+  "config": {
+    "p0": "5555555555555555555555555555555555555555555555555555555555555555",
+    "p1": "3333333333333333333333333333333333333333333333333333333333333333",
+    "p2": "0000000000000000000000000000000000000000000000000000000000000000",
+    "p5": {
+      "blackhole_addr": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "fee_burn_num": 1,
+      "fee_burn_denom": 2
+    },
+    "p7": [
+      {
+        "currency": 239,
+        "value": "666666666666"
+      },
+      {
+        "currency": 4294967279,
+        "value": "1000000000000"
+      }
+    ],
+    "p8": {
+      "version": 10,
+      "capabilities": "494"
+    },
+    "p9": [
+      0,
+      1,
+      9,
+      10,
+      12,
+      14,
+      15,
+      16,
+      17,
+      18,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      28,
+      34
+    ],
+    "p10": [
+      0,
+      1,
+      9,
+      10,
+      12,
+      14,
+      15,
+      16,
+      17,
+      32,
+      34,
+      36,
+      4294966295,
+      4294966296,
+      4294966297
+    ],
+    "p11": {
+      "normal_params": {
+        "min_tot_rounds": 2,
+        "max_tot_rounds": 3,
+        "min_wins": 2,
+        "max_losses": 2,
+        "min_store_sec": 1000000,
+        "max_store_sec": 10000000,
+        "bit_price": 1,
+        "cell_price": 500
+      },
+      "critical_params": {
+        "min_tot_rounds": 4,
+        "max_tot_rounds": 7,
+        "min_wins": 4,
+        "max_losses": 2,
+        "min_store_sec": 5000000,
+        "max_store_sec": 20000000,
+        "bit_price": 2,
+        "cell_price": 1000
+      }
+    },
+    "p12": [
+      {
+        "workchain_id": 0,
+        "enabled_since": 1593639410,
+        "monitor_min_split": 2,
+        "min_split": 2,
+        "max_split": 4,
+        "active": true,
+        "accept_msgs": true,
+        "flags": 0,
+        "zerostate_root_hash": "58277424ba5d0b3517b92f53a7cab373baf877bd11ef4b0498dee1a5315c99cd",
+        "zerostate_file_hash": "40165518385e945852d5954c95f2a38e0640bb1fb062735afab621293684c753",
+        "version": 0,
+        "basic": true,
+        "vm_version": -1,
+        "vm_mode": 0
+      }
+    ],
+    "p13": {
+      "boc": "te6ccgEBAQEADQAAFRpRdIdugAEBIB9I"
+    },
+    "p14": {
+      "masterchain_block_fee": "1700000000",
+      "basechain_block_fee": "1000000000"
+    },
+    "p15": {
+      "validators_elected_for": 65536,
+      "elections_start_before": 32768,
+      "elections_end_before": 8192,
+      "stake_held_for": 32768
+    },
+    "p16": {
+      "max_validators": 1000,
+      "max_main_validators": 100,
+      "min_validators": 5
+    },
+    "p17": {
+      "min_stake": "10000000000000",
+      "max_stake": "10000000000000000",
+      "min_total_stake": "100000000000000",
+      "max_stake_factor": 196608
+    },
+    "p18": [
+      {
+        "utime_since": 0,
+        "bit_price_ps": "1",
+        "cell_price_ps": "500",
+        "mc_bit_price_ps": "1000",
+        "mc_cell_price_ps": "500000"
+      }
+    ],
+    "p20": {
+      "flat_gas_limit": "100",
+      "flat_gas_price": "1000000",
+      "gas_price": "655360000",
+      "gas_limit": "1000000",
+      "special_gas_limit": "70000000",
+      "gas_credit": "10000",
+      "block_gas_limit": "2500000",
+      "freeze_due_limit": "100000000",
+      "delete_due_limit": "1000000000"
+    },
+    "p21": {
+      "flat_gas_limit": "100",
+      "flat_gas_price": "40000",
+      "gas_price": "26214400",
+      "gas_limit": "1000000",
+      "special_gas_limit": "1000000",
+      "gas_credit": "10000",
+      "block_gas_limit": "10000000",
+      "freeze_due_limit": "100000000",
+      "delete_due_limit": "1000000000"
+    },
+    "p22": {
+      "bytes": {
+        "underload": 131072,
+        "soft_limit": 524288,
+        "hard_limit": 1048576
+      },
+      "gas": {
+        "underload": 2000000,
+        "soft_limit": 10000000,
+        "hard_limit": 20000000
+      },
+      "lt_delta": {
+        "underload": 1000,
+        "soft_limit": 5000,
+        "hard_limit": 10000
+      }
+    },
+    "p23": {
+      "bytes": {
+        "underload": 131072,
+        "soft_limit": 524288,
+        "hard_limit": 1048576
+      },
+      "gas": {
+        "underload": 2000000,
+        "soft_limit": 10000000,
+        "hard_limit": 20000000
+      },
+      "lt_delta": {
+        "underload": 1000,
+        "soft_limit": 5000,
+        "hard_limit": 10000
+      }
+    },
+    "p24": {
+      "lump_price": "10000000",
+      "bit_price": "655360000",
+      "cell_price": "65536000000",
+      "ihr_price_factor": 98304,
+      "first_frac": 21845,
+      "next_frac": 21845
+    },
+    "p25": {
+      "lump_price": "400000",
+      "bit_price": "26214400",
+      "cell_price": "2621440000",
+      "ihr_price_factor": 98304,
+      "first_frac": 21845,
+      "next_frac": 21845
+    },
+    "p28": {
+      "shuffle_mc_validators": true,
+      "isolate_mc_validators": false,
+      "mc_catchain_lifetime": 250,
+      "shard_catchain_lifetime": 250,
+      "shard_validators_lifetime": 1000,
+      "shard_validators_num": 7
+    },
+    "p29": {
+      "new_catchain_ids": true,
+      "round_candidates": 3,
+      "next_candidate_delay_ms": 2000,
+      "consensus_timeout_ms": 16000,
+      "fast_attempts": 3,
+      "attempt_duration": 8,
+      "catchain_max_deps": 4,
+      "max_block_bytes": 2097152,
+      "max_collated_bytes": 2097152,
+      "catchain_max_blocks_coeff": 0,
+      "proto_version": 0
+    },
+    "p31": [
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "04f64c6afbff3dd10d8ba6707790ac9670d540f37a9448b0337baa6a5a92acac",
+      "3333333333333333333333333333333333333333333333333333333333333333",
+      "7777777777777777777777777777777777777777777777777777777777777777",
+      "8888888888888888888888888888888888888888888888888888888888888888",
+      "9999999999999999999999999999999999999999999999999999999999999999"
+    ],
+    "p32": {
+      "utime_since": 1593823221,
+      "utime_until": 1593888757,
+      "total": 5,
+      "main": 5,
+      "total_weight": "1152921504606846975",
+      "list": [
+        {
+          "public_key": "1e4497059a4c9854710486ed061699ee482e059ca095f38077ef5536641e89b2",
+          "weight": "230584300921369395",
+          "adnl_addr": "35c3aac571414e8cc22cd6cb9691837d4489cb44fe41c70f299c323e00dbddff"
+        },
+        {
+          "public_key": "3e04f9101779cdbbaf6c109599dd4038cc634f68de264f062ffd7bd25d94720c",
+          "weight": "230584300921369395",
+          "adnl_addr": "3d03eb3139ceb434c955837932c28b3efd6add68a2fb2e0a82a435d03062b0d6"
+        },
+        {
+          "public_key": "2850a6f1f3867f48cfff493b180e355a9bdbee61d5d373c7c26fdbcb1589ad50",
+          "weight": "230584300921369395",
+          "adnl_addr": "9544b802efcdd4d49e368fdd89b879535696d15280a718297c0fa3f9f70fbb6f"
+        },
+        {
+          "public_key": "c4930ad7275d5ddf4107e231bbec337b0dd4610224e43f7744f73d660a09efc3",
+          "weight": "230584300921369395",
+          "adnl_addr": "bde838908f16cb5875e67b98316c06bd5082f2d234f8ffb2666187d319732db7"
+        },
+        {
+          "public_key": "3259a32efc2f47fc71fcd35cd42dcb84afab9e6d76f972b6fc03a4adf3518036",
+          "weight": "230584300921369395",
+          "adnl_addr": "e12ae8d5f2e885e07a4674aa462e13df09177253923b7f44bec0c3cc061ce385"
+        }
+      ]
+    },
+    "p34": {
+      "utime_since": 1593888757,
+      "utime_until": 1593954293,
+      "total": 5,
+      "main": 5,
+      "total_weight": "1152921504606846975",
+      "list": [
+        {
+          "public_key": "c4319070e1cac9f777b19377a01ccae4dd803579022073d79bf3eb761c73338f",
+          "weight": "329406144173384850",
+          "adnl_addr": "4343214d85f1cdea5663151001bce9a5794d5780d53f0e4a7164cb20cf24a0f9"
+        },
+        {
+          "public_key": "2c901a08531cc1f5918f9b3e8b69ce060d7dc7d1e82e776220475ec57e753cd5",
+          "weight": "329406144173384850",
+          "adnl_addr": "a73c2e823de8c466b87d24440d13e2062ae3edaa00849ff3a36205b7b739e9f3"
+        },
+        {
+          "public_key": "e8cc17da9ada5eca4f1a98bad82f1a599f35b1c73995bf443dae0ce9eb3dc386",
+          "weight": "164703072086692425",
+          "adnl_addr": "6b25af56150e77ffc8c2b7e5279fa0c54c1e910eac555636989cf7f155d11fa7"
+        },
+        {
+          "public_key": "7f89f047b927adaa26099f2e4028e48a9c5d5c4e8ac68c78aeb924c9b2bf790d",
+          "weight": "164703072086692425",
+          "adnl_addr": "49656e3861712736dd292436597093c0af16956711b8123777548a840b83ef5a"
+        },
+        {
+          "public_key": "940a2fc654895adac111f8f443dad2cc3f6703dcd6f4dbfa6493f3bbaacd36d2",
+          "weight": "164703072086692425",
+          "adnl_addr": "7243e081035c836a8fda11ee4b18bad3b15809626c7de5fda0e871eeb885b223"
+        }
+      ]
+    },
+    "p43": {
+      "max_msg_bits": 2097152,
+      "max_msg_cells": 8192,
+      "max_library_cells": 1000,
+      "max_vm_data_depth": 512,
+      "max_ext_msg_size": 65535,
+      "max_ext_msg_depth": 512,
+      "max_acc_state_cells": 65536,
+      "max_acc_state_bits": 67043328,
+      "max_acc_public_libraries": 256,
+      "defer_out_queue_size_limit": 256,
+      "max_msg_extra_currencies": 2,
+      "max_acc_fixed_prefix_length": 8
+    },
+    "p45": {
+      "precompiled_contracts_list": {
+        "89468f02c78e570802e39979c8516fc38df07ea76a48357e0536f2ba7b3ee37b": 1000
+      }
+    }
+  }
+}

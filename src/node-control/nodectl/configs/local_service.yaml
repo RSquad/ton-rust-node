@@ -1,0 +1,13 @@
+# nodectl service config (local): ton_http_api=http://127.0.0.1:8082, api=http://127.0.0.1:8080
+
+http:
+    bind: "127.0.0.1:8080"
+    enable_swagger: true
+
+ton_http_api:
+    url: "http://127.0.0.1:8082"
+    api_key: null
+
+nodes_adnl: {}
+wallets: {}
+elections: {}

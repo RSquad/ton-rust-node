@@ -1,0 +1,38 @@
+[package]
+name = "service"
+version = "0.2.0"
+edition = "2024"
+license = 'GPL-3.0'
+
+[dependencies]
+adnl = { path = "../../adnl" }
+anyhow = "1.0.100"
+async-trait = "0.1"
+common = { path = "../common", features = ["openapi"] }
+contracts = { path = "../contracts" }
+control-client = { path = "../control-client" }
+elections = { path = "../elections" }
+hex = "0.4.3"
+scopeguard = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+ton_block = { path = "../../block" }
+ton-http-api-client = { path = "../ton-http-api-client" }
+secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "crypto-default",
+    "hashicorp-storage",
+    "with-base64",
+] }
+tracing = "0.1"
+utoipa = "4"
+axum = "0.8"
+jsonwebtoken = "9"
+base64 = "0.22"
+
+[dev-dependencies]
+argon2 = "0.5"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

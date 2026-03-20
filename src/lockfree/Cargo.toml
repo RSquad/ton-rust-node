@@ -1,0 +1,13 @@
+[package]
+name = "lockfree"
+version = "0.5.2"
+edition = '2021'
+authors = ["Bruno Corrêa Zimmermann <brunoczim@gmail.com>"]
+description = "This crate provides concurrent data structures and a solution to the ABA problem as an alternative of hazard pointers"
+keywords = ["concurrency", "lock-free", "atomics", "data-structures"]
+categories = ["concurrency", "data-structures", "algorithms"]
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+owned-alloc = "0.2"

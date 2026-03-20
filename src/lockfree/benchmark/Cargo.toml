@@ -1,0 +1,57 @@
+[package]
+name = "lockfree-benchmark"
+version = "0.1.0"
+authors = ["Bruno Corrêa Zimmermann <brunoczim@gmail.com>"]
+publish = false
+
+[dependencies]
+lockfree = { path = "../" }
+benchsuite = { path = "benchsuite" }
+thread_local = "*"
+
+[workspace]
+members = ["benchsuite", "."]
+
+[[bin]]
+name = "stack"
+path = "src/stack.rs"
+
+[[bin]]
+name = "queue"
+path = "src/queue.rs"
+
+[[bin]]
+name = "map"
+path = "src/map.rs"
+
+[[bin]]
+name = "tls"
+path = "src/tls.rs"
+
+[[bin]]
+name = "request"
+path = "src/request.rs"
+
+[[bin]]
+name = "reverb"
+path = "src/reverb.rs"
+
+[[bin]]
+name = "mining"
+path = "src/mining.rs"
+
+[[bin]]
+name = "mpsc"
+path = "src/mpsc.rs"
+
+[[bin]]
+name = "spsc"
+path = "src/spsc.rs"
+
+[[bin]]
+name = "spmc"
+path = "src/spmc.rs"
+
+[[bin]]
+name = "mpmc"
+path = "src/mpmc.rs"

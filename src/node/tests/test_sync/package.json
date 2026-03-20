@@ -1,0 +1,15 @@
+{
+  "name": "node-watcher",
+  "version": "1.0.0",
+  "description": "Simple HTTP server for node watcher endpoints",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["http", "server", "watcher"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "form-data": "^4.0.0"
+  }
+}

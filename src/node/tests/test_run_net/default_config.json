@@ -1,0 +1,44 @@
+{
+    "log_config_name": "log_cfg_nodenumber.yml",
+    "ton_global_config_name": "ton-global.config.json",
+    "internal_db_path": "node_db_nodenumber",
+    "ip_address": "0.0.0.0:main_port",
+    "control_server_port": control_port,
+    workchain_id
+    "shard_keeper": {
+        "get_peer_attempt_timeout_ms": 1000,
+        "download_next_block_full_timeout_ms": 1000,
+        "download_block_full_timeout_ms": 1000
+    },
+    "lite_server_port": lite_port,
+    "validation_countdown_mode": "except-zerostate",
+    "collator_config": {
+        "cutoff_timeout_ms": 1000,
+        "stop_timeout_ms": 1500,
+        "clean_timeout_percentage_points": 150,
+        "optimistic_clean_percentage_points": 1000,
+        "max_secondary_clean_timeout_percentage_points": 350,
+        "max_collate_threads": 10,
+        "retry_if_empty": true,
+        "finalize_empty_after_ms": 800,
+        "empty_collation_sleep_ms": 300,
+        "external_messages_timeout_percentage_points": 100,
+        "external_messages_maximum_queue_length": 25600
+    },
+    "test_bundles_config": {
+        "collator": {
+            "build_for_unknown_errors": false,
+            "known_errors": [],
+            "build_for_errors": false,
+            "errors": [],
+            "path": "./collation_bundles"
+        },
+        "validator": {
+            "build_for_unknown_errors": false,
+            "known_errors": [],
+            "build_for_errors": false,
+            "errors": [],
+            "path": "./validation_bundles"
+        }
+    }
+}
