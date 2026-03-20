@@ -133,8 +133,8 @@ fn transform_mc_state(
         if let Ok(id_bytes) = <[u8; 32]>::try_from(id.get_bytestring(0).as_slice()) {
             if let Some(&bal) = balance_overrides.get(&id_bytes) {
                 log_stage("balance", &format!("{} → {bal} nanotons", hex::encode(id_bytes)));
-                let grams: ton_block::Grams = bal.to_string().parse().expect("balance overflow");
-                acc.set_balance(CurrencyCollection::from_grams(grams));
+                let coins: ton_block::Coins = bal.to_string().parse().expect("balance overflow");
+                acc.set_balance(CurrencyCollection::from_coins(coins));
             }
         }
         patches.push((id, ShardAccount::with_params(&acc, UInt256::ZERO, 0)?, acc.aug()?));

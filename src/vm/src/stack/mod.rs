@@ -332,8 +332,8 @@ impl StackItem {
         }
     }
 
-    /// Returns integer as grams and checks range 0..2^120
-    pub fn as_grams(&self) -> Result<u128> {
+    /// Returns integer as coins and checks range 0..2^120
+    pub fn as_coins(&self) -> Result<u128> {
         self.as_integer_value(0..=(1u128 << 120) - 1)
     }
 

@@ -54,7 +54,7 @@ use ton_block::{
     AccountStatus, AccountStorageDictProof, AddSub, Block, BlockCreateStats, BlockError,
     BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, ConfigParamEnum, ConfigParams,
     Counters, CreatorStats, CurrencyCollection, DepthBalanceInfo, Deserializable, EnqueuedMsg,
-    FundamentalSmcAddresses, GlobalCapabilities, Grams, HashmapAugType, HashmapType, InMsg,
+    FundamentalSmcAddresses, GlobalCapabilities, Coins, HashmapAugType, HashmapType, InMsg,
     InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries, McBlockExtra, McShardRecord,
     McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope, MsgMetadata,
     OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable, ShardAccount, ShardAccountBlocks,
@@ -988,9 +988,9 @@ impl ValidateQuery {
             base.prev_state_accounts.split_for(&base.shard().shard_key(false))?;
             base.prev_state_accounts.update_root_extra()?;
             if base.shard().is_right_child() {
-                base.prev_validator_fees.grams += 1;
+                base.prev_validator_fees.coins += 1;
             }
-            base.prev_validator_fees.grams /= 2;
+            base.prev_validator_fees.coins /= 2;
         }
         Ok(())
     }
@@ -2233,7 +2233,7 @@ impl ValidateQuery {
         }
         let create_fee =
             base.config_params.block_create_fees(base.shard().is_masterchain()).unwrap_or_default();
-        let create_fee = CurrencyCollection::from_grams(create_fee >> base.shard().prefix_len());
+        let create_fee = CurrencyCollection::from_coins(create_fee >> base.shard().prefix_len());
         if base.value_flow.created != create_fee {
             reject_query!(
                 "ValueFlow of block {} declares block creation fee {}, \
@@ -2280,7 +2280,7 @@ impl ValidateQuery {
                 cc.value_imported
             );
         }
-        let fees_import = CurrencyCollection::from_grams(cc.fees_collected);
+        let fees_import = CurrencyCollection::from_coins(cc.fees_collected);
         let cc = base.out_msg_descr.full_exported();
         if cc != &base.value_flow.exported {
             reject_query!(
@@ -2303,12 +2303,12 @@ impl ValidateQuery {
                 creation fee for this block is {} and the total imported fees from shards \
                 are {} with a total of {}",
                 base.block_id(),
-                base.value_flow.fees_collected.grams,
+                base.value_flow.fees_collected.coins,
                 fees_import,
-                transaction_fees.grams,
-                base.value_flow.created.grams,
-                base.value_flow.fees_imported.grams,
-                expected_fees.grams
+                transaction_fees.coins,
+                base.value_flow.created.coins,
+                base.value_flow.fees_imported.coins,
+                expected_fees.coins
             )
         }
         Ok(())
@@ -3185,7 +3185,7 @@ impl ValidateQuery {
             }
         }
         let mut from_dispatch_queue = false;
-        let mut fwd_fee = Grams::zero();
+        let mut fwd_fee = Coins::zero();
         match in_msg {
             // msg_import_ext$000 msg:^(Message Any) transaction:^Transaction
             // importing an inbound external message
@@ -3199,7 +3199,7 @@ impl ValidateQuery {
                 }
                 return Ok(()); // nothing to check more
             }
-            // msg_import_imm$011 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Grams
+            // msg_import_imm$011 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Coins
             // importing and processing an internal message generated in this very block
             InMsg::Immediate(info) => {
                 let emitted_lt = if env.emitted_lt() == 0 { created_lt } else { env.emitted_lt() };
@@ -3208,31 +3208,31 @@ impl ValidateQuery {
                 }
                 fwd_fee = info.fwd_fee;
             }
-            // msg_import_fin$100 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Grams
+            // msg_import_fin$100 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Coins
             // importing and processing an internal message with destination in this shard
             InMsg::Final(info) => {
                 fwd_fee = info.fwd_fee;
                 base.total_imported_msgs.fetch_add(1, Ordering::Relaxed);
             }
-            // msg_import_tr$101 in_msg:^MsgEnvelope out_msg:^MsgEnvelope transit_fee:Grams
+            // msg_import_tr$101 in_msg:^MsgEnvelope out_msg:^MsgEnvelope transit_fee:Coins
             // importing and relaying a (transit) internal message with destination outside this shard
             InMsg::Transit(info) => {
                 fwd_fee = info.transit_fee;
                 base.total_imported_msgs.fetch_add(1, Ordering::Relaxed);
             }
-            // msg_import_ihr$010 msg:^(Message Any) transaction:^Transaction ihr_fee:Grams proof_created:^Cell
+            // msg_import_ihr$010 msg:^(Message Any) transaction:^Transaction ihr_fee:Coins proof_created:^Cell
             InMsg::IHR(_) => reject_query!(
                 "InMsg with key {:x} \
                 is a msg_import_ihr, but IHR messages are not enabled in this version",
                 key
             ),
-            // msg_discard_tr$111 in_msg:^MsgEnvelope transaction_id:uint64 fwd_fee:Grams proof_delivered:^Cell
+            // msg_discard_tr$111 in_msg:^MsgEnvelope transaction_id:uint64 fwd_fee:Coins proof_delivered:^Cell
             InMsg::DiscardedTransit(_) => reject_query!(
                 "InMsg with key {:x} \
                 is a msg_discard_tr, but IHR messages are not enabled in this version",
                 key
             ),
-            // msg_discard_fin$110 in_msg:^MsgEnvelope transaction_id:uint64 fwd_fee:Grams
+            // msg_discard_fin$110 in_msg:^MsgEnvelope transaction_id:uint64 fwd_fee:Coins
             InMsg::DiscardedFinal(_) => reject_query!(
                 "InMsg with key {:x} \
                 is a msg_discard_fin, but IHR messages are not enabled in this version",
@@ -3385,7 +3385,7 @@ impl ValidateQuery {
         // continue checking inbound message
         match in_msg {
             InMsg::Immediate(_) => {
-                // msg_import_imm$011 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Grams
+                // msg_import_imm$011 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Coins
                 // importing and processing an internal message generated in this very block
                 if cur_prefix != dest_prefix {
                     reject_query!(
@@ -3427,7 +3427,7 @@ impl ValidateQuery {
                 // ...
             }
             InMsg::Final(info) => {
-                // msg_import_fin$100 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Grams
+                // msg_import_fin$100 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Coins
                 // importing and processing an internal message with destination in this shard
                 CHECK!(trans_cell.is_some());
                 CHECK!(base.shard().contains_full_prefix(&next_prefix));
@@ -3484,7 +3484,7 @@ impl ValidateQuery {
                 }
             }
             InMsg::Transit(_) => {
-                // msg_import_tr$101 in_msg:^MsgEnvelope out_msg:^MsgEnvelope transit_fee:Grams
+                // msg_import_tr$101 in_msg:^MsgEnvelope out_msg:^MsgEnvelope transit_fee:Coins
                 // importing and relaying a (transit) internal message with destination outside this shard
                 if cur_prefix == dest_prefix {
                     reject_query!(
@@ -3634,7 +3634,7 @@ impl ValidateQuery {
             }
             // check the amount of the transit fee
             let transit_fee = if from_dispatch_queue {
-                Grams::zero()
+                Coins::zero()
             } else {
                 base.config_params.fwd_prices(false)?.next_fee_checked(env.fwd_fee_remaining())?
             };
@@ -4952,7 +4952,7 @@ impl ValidateQuery {
                         )
                     };
                     money_exported.add(&header.value)?;
-                    money_exported.grams.add(msg_env.fwd_fee_remaining())?;
+                    money_exported.coins.add(msg_env.fwd_fee_remaining())?;
                     let msg_metadata = msg_env.metadata();
                     if msg_metadata != new_msg_metadata.as_ref() {
                         reject_query!(
@@ -5413,11 +5413,11 @@ impl ValidateQuery {
                     {} + total_fees={}",
                     lt,
                     account_addr,
-                    old_balance.grams,
-                    money_imported.grams,
-                    new_balance.grams,
-                    money_exported.grams,
-                    trans.total_fees().grams
+                    old_balance.coins,
+                    money_imported.coins,
+                    new_balance.coins,
+                    money_exported.coins,
+                    trans.total_fees().coins
                 ));
             }
         }

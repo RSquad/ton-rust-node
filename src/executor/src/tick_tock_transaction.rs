@@ -13,7 +13,7 @@ use crate::{
     TransactionExecutor,
 };
 use ton_block::{
-    error, fail, Account, Cell, CurrencyCollection, Grams, Message, Result, Serializable,
+    error, fail, Account, Cell, CurrencyCollection, Coins, Message, Result, Serializable,
     SliceData, TrComputePhase, Transaction, TransactionDescr, TransactionDescrTickTock,
     TransactionTickTock,
 };
@@ -109,7 +109,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
         );
         let mut stack = Stack::new();
         stack
-            .push(int!(account.balance().map_or(0, |value| value.grams.as_u128())))
+            .push(int!(account.balance().map_or(0, |value| value.coins.as_u128())))
             .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(
                 account_id.get_bytestring(0),
             )))
@@ -150,7 +150,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
                         &original_acc_balance,
                         &mut acc_balance,
                         &mut CurrencyCollection::default(),
-                        &Grams::zero(),
+                        &Coins::zero(),
                         actions.unwrap_or_default(),
                         new_data,
                         &account_address,
@@ -209,7 +209,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
     }
     fn build_stack(&self, _in_msg: Option<&Message>, account: &Account) -> Result<Stack> {
         let account_balance =
-            account.balance().ok_or_else(|| error!("Can't get account balance."))?.grams.as_u128();
+            account.balance().ok_or_else(|| error!("Can't get account balance."))?.coins.as_u128();
         let account_id = account.get_id().ok_or_else(|| error!("Can't get account id."))?;
         let mut stack = Stack::new();
         stack

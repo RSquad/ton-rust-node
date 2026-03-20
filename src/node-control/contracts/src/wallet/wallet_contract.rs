@@ -138,7 +138,7 @@ impl WalletContract {
                 let header = InternalMessageHeader {
                     bounce,
                     dst: dest,
-                    value: CurrencyCollection::with_grams(value),
+                    value: CurrencyCollection::with_coins(value),
                     ..Default::default()
                 };
                 let mut internal_message =
@@ -218,7 +218,7 @@ impl WalletContract {
         let header = InternalMessageHeader {
             bounce,
             dst: dest,
-            value: CurrencyCollection::with_grams(value),
+            value: CurrencyCollection::with_coins(value),
             ..Default::default()
         };
         let mut internal_message =

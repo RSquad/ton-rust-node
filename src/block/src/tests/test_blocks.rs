@@ -13,7 +13,7 @@ use crate::{
     bintree::BinTreeType,
     read_boc, read_single_root_boc,
     transactions::tests::{create_test_transaction_set, generate_test_shard_account_block},
-    types::{AddSub, Grams},
+    types::{AddSub, Coins},
     write_read_and_assert, AccountBlock, Cell, HashmapAugType, HashmapE, Message, MsgEnvelope,
     OutMsg, TickTock, Transaction,
 };
@@ -39,7 +39,7 @@ fn test_blockinfo(block_info: BlockInfo) {
     let mut block_extra = BlockExtra::new();
     block_extra.write_account_blocks(&generate_test_shard_account_block()).unwrap();
 
-    let mut collection = CurrencyCollection::with_grams(3);
+    let mut collection = CurrencyCollection::with_coins(3);
     collection.set_other(1005004, 2_000_003).unwrap();
 
     let value_flow = ValueFlow {
@@ -159,7 +159,7 @@ fn test_blockinfo_some_some_none() {
 
 #[test]
 fn test_currency_collection() {
-    let mut cc = CurrencyCollection::from_grams(Grams::one());
+    let mut cc = CurrencyCollection::from_coins(Coins::one());
     cc.set_other(500, 9_000_000 + 777).unwrap();
     cc.set_other(1005001, 8_000_000 + 1005700).unwrap();
     cc.set_other(1005002, 555_000_000 + 1070500).unwrap();
@@ -185,16 +185,16 @@ fn test_currency_collection() {
 
 #[test]
 fn test_value_flow() {
-    let mut from_prev_blk = CurrencyCollection::with_grams(1);
-    let mut to_next_blk = CurrencyCollection::with_grams(1);
-    let mut imported = CurrencyCollection::with_grams(1);
-    let mut exported = CurrencyCollection::with_grams(1);
-    let mut fees_collected = CurrencyCollection::with_grams(1);
-    let mut fees_imported = CurrencyCollection::with_grams(1);
-    let mut recovered = CurrencyCollection::with_grams(1);
-    let mut created = CurrencyCollection::with_grams(1);
-    let mut minted = CurrencyCollection::with_grams(1);
-    let mut burned = CurrencyCollection::with_grams(1);
+    let mut from_prev_blk = CurrencyCollection::with_coins(1);
+    let mut to_next_blk = CurrencyCollection::with_coins(1);
+    let mut imported = CurrencyCollection::with_coins(1);
+    let mut exported = CurrencyCollection::with_coins(1);
+    let mut fees_collected = CurrencyCollection::with_coins(1);
+    let mut fees_imported = CurrencyCollection::with_coins(1);
+    let mut recovered = CurrencyCollection::with_coins(1);
+    let mut created = CurrencyCollection::with_coins(1);
+    let mut minted = CurrencyCollection::with_coins(1);
+    let mut burned = CurrencyCollection::with_coins(1);
 
     from_prev_blk.set_other(1001, 1_000_000 + 1).unwrap();
     from_prev_blk.set_other(100500, 9_000_000 + 777).unwrap();
@@ -518,7 +518,7 @@ fn calc_value_flow() {
     let boc = "src/tests/data/9C2B3FC5AD455917D374CFADBED8FC2343E31A27C1DF2EB29E84404FA96DE9F8.boc";
     let root_cell = read_file_de_and_serialise(Path::new(boc));
     let block = Block::construct_from_cell(root_cell).unwrap();
-    let mut new_transaction_fees = Grams::default();
+    let mut new_transaction_fees = Coins::default();
 
     block
         .read_extra()
@@ -526,7 +526,7 @@ fn calc_value_flow() {
         .read_account_blocks()
         .unwrap()
         .iterate_objects(|account_block: AccountBlock| {
-            new_transaction_fees.add(&account_block.transactions().root_extra().grams)?;
+            new_transaction_fees.add(&account_block.transactions().root_extra().coins)?;
             Ok(true)
         })
         .unwrap();
@@ -534,32 +534,32 @@ fn calc_value_flow() {
     let import_fees = block.read_extra().unwrap().read_in_msg_descr().unwrap().root_extra().clone();
     let mut fees_collected = import_fees.fees_collected;
     let value_imported = import_fees.value_imported;
-    let exported = block.read_extra().unwrap().read_out_msg_descr().unwrap().root_extra().grams;
+    let exported = block.read_extra().unwrap().read_out_msg_descr().unwrap().root_extra().coins;
 
     fees_collected.add(&new_transaction_fees).unwrap();
 
     let ethalon_value_flow = block.read_value_flow().unwrap();
 
-    println!("exported       = {:12}", ethalon_value_flow.exported.grams);
-    println!("fees_imported  = {:12}", ethalon_value_flow.fees_imported.grams);
-    println!("recovered      = {:12}", ethalon_value_flow.recovered.grams);
-    println!("created        = {:12}", ethalon_value_flow.created.grams);
-    println!("minted         = {:12}", ethalon_value_flow.minted.grams);
-    println!("imported       = {:12}", ethalon_value_flow.imported.grams);
-    println!("fees_collected = {:12}", ethalon_value_flow.fees_collected.grams);
+    println!("exported       = {:12}", ethalon_value_flow.exported.coins);
+    println!("fees_imported  = {:12}", ethalon_value_flow.fees_imported.coins);
+    println!("recovered      = {:12}", ethalon_value_flow.recovered.coins);
+    println!("created        = {:12}", ethalon_value_flow.created.coins);
+    println!("minted         = {:12}", ethalon_value_flow.minted.coins);
+    println!("imported       = {:12}", ethalon_value_flow.imported.coins);
+    println!("fees_collected = {:12}", ethalon_value_flow.fees_collected.coins);
 
-    let created = Grams::from(1_000_000_000 / 4); // 1G / 4 shards  // 1_700_000_000 for masterchain
+    let created = Coins::from(1_000_000_000 / 4); // 1G / 4 shards  // 1_700_000_000 for masterchain
 
-    fees_collected.add(&ethalon_value_flow.fees_imported.grams).unwrap(); // TODO calc it
+    fees_collected.add(&ethalon_value_flow.fees_imported.coins).unwrap(); // TODO calc it
     fees_collected.add(&created).unwrap(); // TODO calc it
 
-    assert_eq!(ethalon_value_flow.exported.grams, exported);
-    // assert_eq!(ethalon_value_flow.fees_imported.grams, // TODO
-    // assert_eq!(ethalon_value_flow.recovered.grams, // TODO
-    assert_eq!(ethalon_value_flow.created.grams, created);
-    // assert_eq!(ethalon_value_flow.minted.grams, // TODO
+    assert_eq!(ethalon_value_flow.exported.coins, exported);
+    // assert_eq!(ethalon_value_flow.fees_imported.coins, // TODO
+    // assert_eq!(ethalon_value_flow.recovered.coins, // TODO
+    assert_eq!(ethalon_value_flow.created.coins, created);
+    // assert_eq!(ethalon_value_flow.minted.coins, // TODO
     assert_eq!(ethalon_value_flow.imported, value_imported);
-    assert_eq!(ethalon_value_flow.fees_collected.grams, fees_collected);
+    assert_eq!(ethalon_value_flow.fees_collected.coins, fees_collected);
 }
 
 #[test]

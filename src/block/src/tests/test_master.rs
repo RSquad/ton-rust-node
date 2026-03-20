@@ -172,8 +172,8 @@ fn build_mc_block_extra() -> McBlockExtra {
         .fees
         .store_shard_fees(
             &ident,
-            CurrencyCollection::with_grams(1),
-            CurrencyCollection::with_grams(1),
+            CurrencyCollection::with_coins(1),
+            CurrencyCollection::with_coins(1),
         )
         .unwrap();
     extra.shards.split_shard(&ident, |_| Ok((shard1, shard1_1))).unwrap();
@@ -183,8 +183,8 @@ fn build_mc_block_extra() -> McBlockExtra {
         .fees
         .store_shard_fees(
             &ident,
-            CurrencyCollection::with_grams(1),
-            CurrencyCollection::with_grams(1),
+            CurrencyCollection::with_coins(1),
+            CurrencyCollection::with_coins(1),
         )
         .unwrap();
     extra.shards.split_shard(&ident, |_| Ok((shard2, shard2_2))).unwrap();
@@ -379,13 +379,13 @@ fn test_serialization_shard_fees() {
     //let mut summ = 0;
     for n in 1..12u32 {
         //summ += 2 * n * 100;
-        let mut cc = CurrencyCollection::with_grams(n as u64 * 100);
+        let mut cc = CurrencyCollection::with_coins(n as u64 * 100);
         cc.set_other(n, n as u128).unwrap();
         let fee = ShardFeeCreated::with_fee(cc);
         let ident = ShardIdentFull::new(n as i32, 0x8000_0000_0000_0000);
         shard_fees.set_augmentable(&ident, &fee).unwrap();
         assert!(!shard_fees.is_empty());
-        //assert_eq!(shard_fees.root_extra().fees.grams, summ.into());
+        //assert_eq!(shard_fees.root_extra().fees.coins, summ.into());
     }
 
     write_read_and_assert(shard_fees);

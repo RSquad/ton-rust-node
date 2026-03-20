@@ -117,7 +117,7 @@ fn test_contains_processed_up_to() {
     //  message from workchain to masterchain
     let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
     let dst = MsgAddressInt::with_standart(None, -1, [0x77; 32].into()).unwrap();
-    let value = CurrencyCollection::with_grams(30_000_000_000_000);
+    let value = CurrencyCollection::with_coins(30_000_000_000_000);
     let hdr = InternalMessageHeader::with_addresses_and_bounce(src, dst, value, false);
     let mut msg = Message::with_int_header(hdr);
     msg.set_at_and_lt(1600000000, 10_000_002);
@@ -126,7 +126,7 @@ fn test_contains_processed_up_to() {
         msg,
         msg_cell,
         &ShardIdent::with_workchain_id(0).unwrap(),
-        Grams::zero(),
+        Coins::zero(),
         true,
         Default::default(),
     )
@@ -156,7 +156,7 @@ fn test_contains_processed_up_to() {
     //  message from masterchain to workchain
     let src = MsgAddressInt::with_standart(None, -1, [0x77; 32].into()).unwrap();
     let dst = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
-    let value = CurrencyCollection::with_grams(30_000_000_000_000);
+    let value = CurrencyCollection::with_coins(30_000_000_000_000);
     let hdr = InternalMessageHeader::with_addresses_and_bounce(src, dst, value, false);
     let mut msg = Message::with_int_header(hdr);
     let msg_cell = msg.serialize().unwrap();
@@ -165,7 +165,7 @@ fn test_contains_processed_up_to() {
         msg,
         msg_cell,
         &ShardIdent::masterchain(),
-        Grams::default(),
+        Coins::default(),
         true,
         Default::default(),
     )

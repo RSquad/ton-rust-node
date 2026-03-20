@@ -76,7 +76,7 @@ containing level information and hash data.
 subtrees) representing state transitions.
 
 **Depth-Balance Elision**: An optimization for MerkleUpdate subtrees where
-a cell's grams value can be reconstructed from its children's differences,
+a cell's coins value can be reconstructed from its children's differences,
 allowing the cell data to be omitted.
 
 **Small Data**: Cell data with less than 128 bits (can be encoded in 7 bits).
@@ -405,9 +405,9 @@ during decompression from the paired left cell and children.
 
 **Vertex Difference Calculation:**
 
-For cells containing grams (currency amounts), the vertex difference is:
+For cells containing coins (currency amounts), the vertex difference is:
 ```
-vertex_diff = grams(right_cell) - grams(left_cell)
+vertex_diff = coins(right_cell) - coins(left_cell)
 ```
 
 For cells where the sum of child differences equals the vertex difference:
@@ -422,8 +422,8 @@ if sum_child_diff == vertex_diff:
 Cells eligible for depth-balance elision are encoded with Cell Type = 9.
 During decompression, these cells are reconstructed by:
 1. Looking up the paired cell in the left subtree
-2. Computing the expected grams value from children differences
-3. Reconstructing the cell data with the computed grams value
+2. Computing the expected coins value from children differences
+3. Reconstructing the cell data with the computed coins value
 
 ### 11.3. Cell Type Mapping
 
@@ -581,8 +581,8 @@ function build_graph_recursive(cell, left_cell, under_mu_right, sum_diff_out,
     if cell_hash in cell_map:
         idx = cell_map[cell_hash]
         if sum_diff_out is not None:
-            # Accumulate grams difference for parent
-            sum_diff_out += get_grams_diff(left_cell, cell)
+            # Accumulate coins difference for parent
+            sum_diff_out += get_coins_diff(left_cell, cell)
         return idx
 
     # Register new cell
@@ -623,7 +623,7 @@ function build_graph_recursive(cell, left_cell, under_mu_right, sum_diff_out,
                                                    cell_data, cell_type, pruned_level)
 
         # Check if depth-balance elision applies
-        vertex_diff = get_grams_diff(left_cell, cell)
+        vertex_diff = get_coins_diff(left_cell, cell)
         if vertex_diff is not None and sum_child_diff == vertex_diff:
             # Cell data can be elided - mark with cell_type=9
             pruned_level[idx] = 9
@@ -642,16 +642,16 @@ function build_graph_recursive(cell, left_cell, under_mu_right, sum_diff_out,
     return idx
 
 
-function get_grams_diff(left_cell, right_cell):
+function get_coins_diff(left_cell, right_cell):
     """
-    Compute grams difference between paired cells.
-    Returns None if cells don't contain grams values.
+    Compute coins difference between paired cells.
+    Returns None if cells don't contain coins values.
     """
-    left_grams = extract_grams(left_cell)
-    right_grams = extract_grams(right_cell)
-    if left_grams is None or right_grams is None:
+    left_coins = extract_coins(left_cell)
+    right_coins = extract_coins(right_cell)
+    if left_coins is None or right_coins is None:
         return None
-    return right_grams - left_grams
+    return right_coins - left_coins
 
     node_count = len(graph)
 
@@ -973,17 +973,17 @@ function decompress(data, max_size):
             # Reconstruct cell data from paired left cell and children differences
             paired_cell = paired_cells.get(i)
             if paired_cell is not None:
-                # Compute sum of children's grams differences
+                # Compute sum of children's coins differences
                 sum_child_diff = 0
                 for j in range(cells[i].refs_count):
                     child_right = nodes[graph[i][j]]
                     child_left = paired_cell.reference(j) if j < paired_cell.refs_count() else None
                     if child_left and child_right:
-                        sum_child_diff += get_grams(child_right) - get_grams(child_left)
+                        sum_child_diff += get_coins(child_right) - get_coins(child_left)
 
-                # Reconstruct cell data with adjusted grams value
-                new_grams = get_grams(paired_cell) + sum_child_diff
-                cell_builders[i] = reconstruct_cell_data(paired_cell, new_grams)
+                # Reconstruct cell data with adjusted coins value
+                new_coins = get_coins(paired_cell) + sum_child_diff
+                cell_builders[i] = reconstruct_cell_data(paired_cell, new_coins)
                 for j in range(cells[i].refs_count):
                     cell_builders[i].store_ref(nodes[graph[i][j]])
 
@@ -1003,13 +1003,13 @@ function track_paired_cells(left_root, right_root, paired_cells):
     pass
 
 
-function reconstruct_cell_data(paired_cell, new_grams):
+function reconstruct_cell_data(paired_cell, new_coins):
     """
     Create a CellBuilder with data copied from paired_cell but with
-    the grams value replaced by new_grams.
+    the coins value replaced by new_coins.
     """
     builder = CellBuilder()
-    # Copy cell structure from paired_cell, replacing grams value
+    # Copy cell structure from paired_cell, replacing coins value
     # Exact implementation depends on cell data format
     return builder
 ```
@@ -1224,14 +1224,14 @@ data size) was chosen to:
 The depth-balance elision optimization (cell_type=9) provides significant
 compression benefits for MerkleUpdate cells by exploiting the fact that
 many cells in the right subtree differ from their left subtree counterparts
-only in the grams (currency) value.
+only in the coins (currency) value.
 
 **When to Apply:**
 
 The optimization applies when:
 1. The cell is in the right subtree of a MerkleUpdate
 2. There is a corresponding paired cell in the left subtree
-3. The cell's vertex difference (grams_right - grams_left) equals the sum
+3. The cell's vertex difference (coins_right - coins_left) equals the sum
    of its children's vertex differences
 
 **Compression Savings:**
@@ -1248,7 +1248,7 @@ and right subtree cells during both compression and decompression:
 - **Compression**: Traverse MerkleUpdate subtrees in parallel, computing
   vertex differences and checking the sum condition
 - **Decompression**: Track cell correspondence and reconstruct elided cells
-  by copying the paired cell's data with adjusted grams value
+  by copying the paired cell's data with adjusted coins value
 
 **C++ Reference:**
 

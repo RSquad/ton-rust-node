@@ -17,7 +17,7 @@ use crate::{
     messages::{Message, MsgAddressInt, StateInit, StateInitLib, TickTock},
     shard::{ShardIdent, ShardStateUnsplit},
     shard_accounts::DepthBalanceInfo,
-    types::{AddSub, ChildCell, CurrencyCollection, Grams, Number5, VarUInteger7},
+    types::{AddSub, ChildCell, CurrencyCollection, Coins, Number5, VarUInteger7},
     AccountId, AccountStorageStat, BuilderData, Cell, ConfigParams, Deserializable, GasConsumer,
     GetRepresentationHash, HashmapType, IBitstring, Serializable, SliceData, UInt256, UsageTree,
     DICT_HASH_MIN_CELLS,
@@ -38,7 +38,7 @@ mod tests;
 // /// storage_extra_info$001 dict_hash:uint256 = StorageExtraInfo;
 // ///
 // /// storage_info$_ used:StorageUsed storage_extra:StorageExtraInfo last_paid:uint32
-// /// due_payment:(Maybe Grams) = StorageInfo;
+// /// due_payment:(Maybe Coins) = StorageInfo;
 // ///
 // /// 4.1.6. Account description.
 // ///
@@ -261,14 +261,14 @@ impl Deserializable for StorageExtraInfo {
 ///
 /// 4.1.5. Storage profile of an account.
 /// storage_info$_ used:StorageUsed storage_extra:StorageExtraInfo last_paid:uint32
-/// due_payment:(Maybe Grams) = StorageInfo;
+/// due_payment:(Maybe Coins) = StorageInfo;
 
 #[derive(PartialEq, Eq, Clone, Debug, Default)]
 pub struct StorageInfo {
     used: StorageUsed,
     storage_extra: StorageExtraInfo,
     last_paid: u32,
-    due_payment: Option<Grams>,
+    due_payment: Option<Coins>,
 }
 
 impl StorageInfo {
@@ -280,7 +280,7 @@ impl StorageInfo {
             due_payment: None,
         }
     }
-    pub fn with_values(last_paid: u32, due_payment: Option<Grams>) -> Self {
+    pub fn with_values(last_paid: u32, due_payment: Option<Coins>) -> Self {
         StorageInfo {
             used: StorageUsed::default(),
             storage_extra: StorageExtraInfo::default(),
@@ -297,7 +297,7 @@ impl StorageInfo {
     pub const fn last_paid(&self) -> u32 {
         self.last_paid
     }
-    pub const fn due_payment(&self) -> Option<&Grams> {
+    pub const fn due_payment(&self) -> Option<&Coins> {
         self.due_payment.as_ref()
     }
 }
@@ -679,7 +679,7 @@ impl Account {
     ) -> Self {
         Account::active(
             MsgAddressInt::standard(-1, addr),
-            CurrencyCollection::with_grams(balance),
+            CurrencyCollection::with_coins(balance),
             last_trans_lt,
             last_paid,
             state_init,
@@ -717,7 +717,7 @@ impl Account {
     ///
     pub fn from_message(msg: &Message) -> Option<Self> {
         let hdr = msg.int_header()?;
-        if hdr.value().grams.is_zero() {
+        if hdr.value().coins.is_zero() {
             return None;
         }
         let mut storage = AccountStorage { balance: hdr.value().clone(), ..Default::default() };
@@ -762,7 +762,7 @@ impl Account {
         balance: CurrencyCollection,
         last_trans_lt: u64,
         last_paid: u32,
-        due_payment: Option<Grams>,
+        due_payment: Option<Coins>,
         state_hash: UInt256,
     ) -> Self {
         let storage = AccountStorage::frozen(last_trans_lt, balance, state_hash);
@@ -788,7 +788,7 @@ impl Account {
     ) -> Self {
         Account::frozen(
             MsgAddressInt::standard(-1, addr),
-            CurrencyCollection::with_grams(balance),
+            CurrencyCollection::with_coins(balance),
             last_trans_lt,
             last_paid,
             if due_payment == 0 { None } else { Some(due_payment.into()) },
@@ -824,7 +824,7 @@ impl Account {
     ) -> Self {
         Account::uninit(
             MsgAddressInt::standard(-1, addr),
-            CurrencyCollection::with_grams(balance),
+            CurrencyCollection::with_coins(balance),
             last_trans_lt,
             last_paid,
         )
@@ -1085,12 +1085,12 @@ impl Account {
     }
 
     /// getting due payment
-    pub fn due_payment(&self) -> Option<&Grams> {
+    pub fn due_payment(&self) -> Option<&Coins> {
         self.stuff().and_then(|s| s.storage_info.due_payment.as_ref())
     }
 
     /// setting due payment
-    pub fn set_due_payment(&mut self, due_payment: Option<Grams>) {
+    pub fn set_due_payment(&mut self, due_payment: Option<Coins>) {
         if let Some(stuff) = self.stuff_mut() {
             stuff.storage_info.due_payment = due_payment
         } else {
@@ -1131,7 +1131,7 @@ impl Account {
             stuff.storage.balance.add(funds_to_add)?;
         } else {
             debug_assert!(
-                funds_to_add.grams.is_zero(),
+                funds_to_add.coins.is_zero(),
                 "Account is None, but funds to add is not zero"
             );
         }
@@ -1144,7 +1144,7 @@ impl Account {
             stuff.storage.balance.sub(funds_to_sub)
         } else {
             debug_assert!(
-                funds_to_sub.grams.is_zero(),
+                funds_to_sub.coins.is_zero(),
                 "Account is None, but funds to subtract is not zero"
             );
             Ok(false)

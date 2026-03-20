@@ -153,7 +153,7 @@ impl SmartContractInfo {
 
     fn cc2tuple(value: &CurrencyCollection) -> StackItem {
         StackItem::tuple(vec![
-            StackItem::int(value.grams.as_u128()),
+            StackItem::int(value.coins.as_u128()),
             StackItem::dict(value.other.root()),
         ])
     }
@@ -275,7 +275,7 @@ impl SmartContractInfo {
                 tuple.push(StackItem::int(0));
                 tuple.push(StackItem::int(int.created_lt));
                 tuple.push(StackItem::int(int.created_at));
-                tuple.push(StackItem::int(int.value.grams.as_u128()));
+                tuple.push(StackItem::int(int.value.coins.as_u128()));
             } else if let Some(ext) = msg.ext_in_header() {
                 tuple.push(StackItem::boolean(false));
                 tuple.push(StackItem::boolean(false));
@@ -285,7 +285,7 @@ impl SmartContractInfo {
                 tuple.push(StackItem::int(0));
                 tuple.push(StackItem::int(0));
             }
-            tuple.push(StackItem::int(self.incoming_value.grams.as_u128()));
+            tuple.push(StackItem::int(self.incoming_value.coins.as_u128()));
             tuple.push(StackItem::dict(self.incoming_value.other.root()));
             if let Some(init) = msg.state_init() {
                 tuple.push(StackItem::cell(init.serialize().unwrap_or_default()));

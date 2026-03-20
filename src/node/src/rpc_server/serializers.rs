@@ -92,7 +92,7 @@ pub(crate) fn serialize_uint256(id: &UInt256) -> serde_json::Value {
 
 pub(crate) fn serialize_transaction(tr: &Transaction, tr_cell: Cell, address: &str) -> JsonResult {
     let testnet = address.starts_with('k') || address.starts_with('0');
-    let fee = tr.total_fees().grams.as_u128();
+    let fee = tr.total_fees().coins.as_u128();
     let storage_fee = match tr.read_description()? {
         TransactionDescr::Ordinary(descr) => {
             descr.storage_ph.map_or(0, |ph| ph.storage_fees_collected.as_u128())
@@ -204,7 +204,7 @@ fn serialize_message(
         "hash": serialize_uint256(&hash),
         "source": source,
         "destination": destination,
-        "value": int_header.value.grams.to_string(),
+        "value": int_header.value.coins.to_string(),
         "extra_currencies": Vec::<String>::new(), // TODO: fill extra currencies,
         "fwd_fee": int_header.fwd_fee.to_string(),
         "extra_flags": int_header.extra_flags.to_string(),

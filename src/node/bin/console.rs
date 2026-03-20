@@ -562,7 +562,7 @@ impl<Q: ToString> SendReceive<Q> for GetAccount {
                 };
                 serde_json::json!({
                     "acc_type": account_type,
-                    "balance": account.balance().map_or(0, |val| val.grams.as_u128()),
+                    "balance": account.balance().map_or(0, |val| val.coins.as_u128()),
                     "last_paid": account.last_paid(),
                     "last_trans": format!("{:#x}", shard_account.last_trans_lt()),
                     "data(boc)": hex::encode(write_boc(&shard_account.account_cell())?)
@@ -1441,7 +1441,7 @@ mod test {
             let data = builder.into_cell()?;
             let mut state_init = StateInit::with_code_and_data(code, data);
             state_init.special = Some(TickTock::with_values(true, true));
-            let balance = CurrencyCollection::with_grams(1_000_000_000);
+            let balance = CurrencyCollection::with_coins(1_000_000_000);
             let mut config_smc = Account::active(
                 address,
                 balance,
@@ -1479,7 +1479,7 @@ mod test {
             let mut shard_accounts = ss.read_accounts()?;
             let mut account = shard_accounts.get(&config_addr)?.unwrap_or_default();
             let mut config_smc = account.read_account()?;
-            config_smc.set_balance(CurrencyCollection::with_grams(seq_no as u64 * 1_000_000_000));
+            config_smc.set_balance(CurrencyCollection::with_coins(seq_no as u64 * 1_000_000_000));
             config_smc.set_code(((seq_no * 100 + seq_no) * 100 + seq_no).serialize()?);
             account.write_account(&config_smc)?;
             let account = ShardAccount::with_params(&config_smc, UInt256::default(), 0).unwrap();
@@ -2057,7 +2057,7 @@ mod test {
         //     |result| {
         //         assert_eq!(result.len(), 235);
         //         let account = Account::construct_from_bytes(&result).unwrap();
-        //         assert_eq!(account.balance().unwrap().grams.as_u128(), 1_000_000_000);
+        //         assert_eq!(account.balance().unwrap().coins.as_u128(), 1_000_000_000);
         //         assert!(account.code().is_none());
         //         fs::remove_file(OUT_FILE).unwrap();
         //     }
@@ -2069,7 +2069,7 @@ mod test {
         test_one_cmd(&cmd, |result| {
             assert_eq!(result.len(), 1031);
             let account = Account::construct_from_bytes(&result).unwrap();
-            assert_eq!(account.balance().unwrap().grams.as_u128(), 17_000_000_000);
+            assert_eq!(account.balance().unwrap().coins.as_u128(), 17_000_000_000);
             let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
             assert_eq!(code, 171717);
             fs::remove_file(OUT_FILE).unwrap();
@@ -2082,7 +2082,7 @@ mod test {
         test_one_cmd(&cmd, |result| {
             assert_eq!(result.len(), 1031);
             let account = Account::construct_from_bytes(&result).unwrap();
-            assert_eq!(account.balance().unwrap().grams.as_u128(), 19_000_000_000);
+            assert_eq!(account.balance().unwrap().coins.as_u128(), 19_000_000_000);
             let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
             assert_eq!(code, 191919);
             fs::remove_file(OUT_FILE).unwrap();
@@ -2099,7 +2099,7 @@ mod test {
         test_one_cmd(&cmd, |result| {
             assert_eq!(result.len(), 1031);
             let account = Account::construct_from_bytes(&result).unwrap();
-            assert_eq!(account.balance().unwrap().grams.as_u128(), 19_000_000_000);
+            assert_eq!(account.balance().unwrap().coins.as_u128(), 19_000_000_000);
             let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
             assert_eq!(code, 191919);
             fs::remove_file(OUT_FILE).unwrap();
@@ -2219,7 +2219,7 @@ mod test {
             assert_eq!(result.len(), 1031);
             let account = Account::construct_from_bytes(&result).unwrap();
             assert_eq!(account.data().unwrap().bit_length(), 32 + 256 + 1);
-            assert_eq!(account.balance().unwrap().grams.as_u128(), 19_000_000_000);
+            assert_eq!(account.balance().unwrap().coins.as_u128(), 19_000_000_000);
             let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
             assert_eq!(code, 191919);
             std::fs::remove_file(OUT_FILE).unwrap();

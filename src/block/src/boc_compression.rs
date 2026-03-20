@@ -71,12 +71,12 @@
 //!
 //! Key C++ types and their Rust equivalents:
 //! - `td::BitSlice` / `td::BitString` → `BitSliceReader` / `BitStringWriter`
-//! - `td::RefInt256` for grams arithmetic → `i128` (sufficient for Grams ≤ 120 bits)
+//! - `td::RefInt256` for coins arithmetic → `i128` (sufficient for Coins ≤ 120 bits)
 //! - `vm::CellBuilder::finalize(is_special)` → `set_special_cell_type_from_data()` + `into_cell()`
 
 use crate::{
     error, fail, BocFlags, BocReader, BocWriter, BuilderData, Cell, CellType, CurrencyCollection,
-    Deserializable, Grams, IBitstring, Result, Serializable, SliceData, UInt256,
+    Deserializable, Coins, IBitstring, Result, Serializable, SliceData, UInt256,
 };
 use std::{collections::HashMap, io::Cursor, vec::Vec};
 
@@ -504,13 +504,13 @@ fn required_bits_for_delta(node_count: usize, i: usize) -> usize {
 // "Depth-Balance Elision" (cell_type = 9).
 //
 // In ShardAccounts Merkle updates, each node contains a DepthBalanceInfo with
-// the sum of grams in its subtree. When compressing:
-// - If a right-subtree node's grams can be derived from (left_grams + sum_of_child_diffs),
+// the sum of coins in its subtree. When compressing:
+// - If a right-subtree node's coins can be derived from (left_coins + sum_of_child_diffs),
 //   the encoder can emit cell_type=9 and skip the payload entirely.
 //
 // During decompression:
-// - When encountering cell_type=9, the decoder reconstructs the grams value
-//   by computing left_grams + sum_of_child_diffs.
+// - When encountering cell_type=9, the decoder reconstructs the coins value
+//   by computing left_coins + sum_of_child_diffs.
 // ============================================================================
 
 /// Detects if a partially-built cell is a MerkleUpdate based on the special flag
@@ -535,7 +535,7 @@ fn is_merkle_update_node(is_special: bool, builder: &BuilderData) -> bool {
     builder.data().first().copied() == Some(0x04)
 }
 
-/// Extracts grams value from a DepthBalanceInfo cell.
+/// Extracts coins value from a DepthBalanceInfo cell.
 ///
 /// # DepthBalanceInfo Format (TL-B)
 /// ```text
@@ -545,7 +545,7 @@ fn is_merkle_update_node(is_special: bool, builder: &BuilderData) -> bool {
 /// For the MerkleUpdate optimization, we only handle the simplified case:
 /// - Empty HmLabel prefix ('00' = 2 bits)
 /// - split_depth = 0 (5 bits)
-/// - CurrencyCollection with only grams (no extra currencies)
+/// - CurrencyCollection with only coins (no extra currencies)
 /// - No remaining bits
 ///
 /// # C++ Reference
@@ -554,12 +554,12 @@ fn is_merkle_update_node(is_special: bool, builder: &BuilderData) -> bool {
 /// ```
 ///
 /// # Returns
-/// `Some(grams)` if the cell matches the expected format, `None` otherwise.
+/// `Some(coins)` if the cell matches the expected format, `None` otherwise.
 ///
 /// # Note on Integer Size
-/// TON Grams is `VarUInteger 16` (up to 15 bytes = 120 bits), so `u128` is sufficient.
-/// Intermediate differences fit in `i128` since we only add/subtract grams values.
-fn extract_depth_balance_grams(cell: &Cell) -> Option<u128> {
+/// TON Coins is `VarUInteger 16` (up to 15 bytes = 120 bits), so `u128` is sufficient.
+/// Intermediate differences fit in `i128` since we only add/subtract coins values.
+fn extract_depth_balance_coins(cell: &Cell) -> Option<u128> {
     let mut cs = SliceData::load_cell_ref(cell).ok()?;
 
     // Check for empty HmLabel ('00' = 2 zero bits)
@@ -582,7 +582,7 @@ fn extract_depth_balance_grams(cell: &Cell) -> Option<u128> {
     // Parse CurrencyCollection
     let balance = CurrencyCollection::construct_from(&mut cs).ok()?;
 
-    // Must have only grams (no extra currencies)
+    // Must have only coins (no extra currencies)
     if !balance.other.is_empty() {
         return None;
     }
@@ -592,10 +592,10 @@ fn extract_depth_balance_grams(cell: &Cell) -> Option<u128> {
         return None;
     }
 
-    Some(balance.grams.as_u128())
+    Some(balance.coins.as_u128())
 }
 
-/// Computes the grams difference between paired left/right DepthBalanceInfo cells.
+/// Computes the coins difference between paired left/right DepthBalanceInfo cells.
 ///
 /// This is used during MerkleUpdate subtree reconstruction to accumulate diffs.
 ///
@@ -605,14 +605,14 @@ fn extract_depth_balance_grams(cell: &Cell) -> Option<u128> {
 /// ```
 ///
 /// # Returns
-/// `Some(right_grams - left_grams)` if both cells are valid DepthBalanceInfo, `None` otherwise.
+/// `Some(right_coins - left_coins)` if both cells are valid DepthBalanceInfo, `None` otherwise.
 fn process_shard_accounts_vertex(left: &Cell, right: &Cell) -> Option<i128> {
-    let left_grams = extract_depth_balance_grams(left)? as i128;
-    let right_grams = extract_depth_balance_grams(right)? as i128;
-    Some(right_grams - left_grams)
+    let left_coins = extract_depth_balance_coins(left)? as i128;
+    let right_coins = extract_depth_balance_coins(right)? as i128;
+    Some(right_coins - left_coins)
 }
 
-/// Writes a DepthBalanceInfo structure containing only grams.
+/// Writes a DepthBalanceInfo structure containing only coins.
 ///
 /// This is used to reconstruct cell_type=9 (depth-balance elision) nodes
 /// during decompression.
@@ -622,21 +622,21 @@ fn process_shard_accounts_vertex(left: &Cell, right: &Cell) -> Option<i128> {
 /// +--------+-------------+----------------------+
 /// | 2 bits | 5 bits      | Variable             |
 /// | '00'   | split_depth | CurrencyCollection   |
-/// | HmLabel| = 0         | (grams only)         |
+/// | HmLabel| = 0         | (coins only)         |
 /// +--------+-------------+----------------------+
 /// ```
 ///
 /// # C++ Reference
 /// ```cpp
-/// bool write_depth_balance_grams(vm::CellBuilder& cb, const td::RefInt256& grams)
+/// bool write_depth_balance_coins(vm::CellBuilder& cb, const td::RefInt256& coins)
 /// ```
-fn write_depth_balance_grams(builder: &mut BuilderData, grams: u128) -> Result<()> {
+fn write_depth_balance_coins(builder: &mut BuilderData, coins: u128) -> Result<()> {
     // Empty HmLabel ('00') + split_depth=0 (5 bits) = 7 zero bits
     builder.append_bits(0, 7)?;
 
-    // CurrencyCollection with only grams
-    let grams = Grams::try_from(grams)?;
-    CurrencyCollection::from_grams(grams).write_to(builder)?;
+    // CurrencyCollection with only coins
+    let coins = Coins::try_from(coins)?;
+    CurrencyCollection::from_coins(coins).write_to(builder)?;
     Ok(())
 }
 
@@ -1160,7 +1160,7 @@ pub fn boc_decompress_improved_structure_lz4(
     //
     // 3. build_right_under_mu(right_idx, left_idx, sum_diff_out):
     //    - Reconstruct depth-balance marker (cell_type=9) nodes
-    //    - Compute grams as: right_grams = left_grams + sum_child_diff
+    //    - Compute coins as: right_coins = left_coins + sum_child_diff
     //    - Propagate diffs upward for parent reconstruction
     //
     // C++ reference: Lines 673-770 in boc-compression.cpp
@@ -1203,13 +1203,13 @@ pub fn boc_decompress_improved_structure_lz4(
     // Algorithm:
     // 1. If node already built, just compute vertex diff for parent
     // 2. Recursively build children, accumulating sum_child_diff
-    // 3. If depth-balance marker: reconstruct grams = left_grams + sum_child_diff
+    // 3. If depth-balance marker: reconstruct coins = left_coins + sum_child_diff
     // 4. Finalize node and propagate diff upward
     //
     // C++ reference: Lambda `build_right_under_mu` at line 695 in boc-compression.cpp
     //
     // Note on integer types:
-    // C++ uses `td::RefInt256` for arbitrary precision, but since TON Grams
+    // C++ uses `td::RefInt256` for arbitrary precision, but since TON Coins
     // are limited to VarUInteger 16 (≤ 120 bits), we use `i128` which is
     // sufficient for sum/diff operations.
     // --------------------------------
@@ -1274,7 +1274,7 @@ pub fn boc_decompress_improved_structure_lz4(
         if is_depth_balance[right_idx] {
             // Depth-balance marker (ct=9): the right node's payload was elided on the wire.
             // Reconstruct it as:
-            //   right_grams = left_grams + sum_child_diff
+            //   right_coins = left_coins + sum_child_diff
             // and propagate `sum_child_diff` upward as the effective (right-left) diff.
             let left_idx = left_idx.ok_or_else(|| {
                 error!("BOC decompression failed: depth-balance left vertex is missing")
@@ -1282,20 +1282,20 @@ pub fn boc_decompress_improved_structure_lz4(
             let left_cell = nodes[left_idx]
                 .as_ref()
                 .ok_or_else(|| error!("BOC decompression failed: child cell not yet built"))?;
-            let left_grams = extract_depth_balance_grams(left_cell).ok_or_else(|| {
-                error!("BOC decompression failed: depth-balance left vertex has no grams")
+            let left_coins = extract_depth_balance_coins(left_cell).ok_or_else(|| {
+                error!("BOC decompression failed: depth-balance left vertex has no coins")
             })?;
-            let expected = (left_grams as i128)
+            let expected = (left_coins as i128)
                 .checked_add(sum_child_diff)
                 .ok_or_else(|| error!("BOC decompression failed: integer overflow"))?;
             if expected < 0 {
-                fail!("BOC decompression failed: depth-balance grams became negative");
+                fail!("BOC decompression failed: depth-balance coins became negative");
             }
             let expected_u128 = expected as u128;
             let builder = builders[right_idx]
                 .as_mut()
                 .ok_or_else(|| error!("BOC decompression failed: builder missing"))?;
-            write_depth_balance_grams(builder, expected_u128)?;
+            write_depth_balance_coins(builder, expected_u128)?;
             cur_right_left_diff = Some(sum_child_diff);
         }
 
@@ -1457,7 +1457,7 @@ pub fn boc_decompress_improved_structure_lz4(
 /// compares left and right subtrees. For right-subtree nodes where:
 ///   `sum_of_child_diffs == vertex_diff`
 /// the cell data can be elided (pruned_branch_level = 9) and reconstructed
-/// during decompression from left_grams + sum_child_diff.
+/// during decompression from left_coins + sum_child_diff.
 ///
 /// # C++ Reference
 /// ```cpp
@@ -1665,7 +1665,7 @@ fn build_graph_recursive(
 /// # Encoder Notes
 /// - This encoder is wire-compatible with C++ including the MerkleUpdate optimization
 /// - The encoder supports depth-balance elision (`cell_type = 9`) for ShardAccounts
-///   nodes where the grams value can be reconstructed from children's diffs.
+///   nodes where the coins value can be reconstructed from children's diffs.
 ///
 /// # Algorithm Overview
 /// 1. Build deduplicated cell DAG from roots

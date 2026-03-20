@@ -578,21 +578,21 @@ fn test_roundtrip_non_small_non_byte_aligned_cell() {
 #[test]
 fn test_decompress_depth_balance_marker_ct9_under_merkle_update() {
     // This crafts a valid inner stream that contains a C++-style depth-balance marker (cell_type = 9)
-    // under a MerkleUpdate right subtree, and verifies that the decoder reconstructs the missing grams.
+    // under a MerkleUpdate right subtree, and verifies that the decoder reconstructs the missing coins.
     //
     // Layout (topological ranks are literal indices here):
     //   0: MerkleUpdate (special, refs -> 1(old), 4(new_marker))
-    //   1: old_root (DepthBalanceInfo grams=100, refs -> 2, 3)
-    //   2: old_leaf1 (grams=30)
-    //   3: old_leaf2 (grams=70)
+    //   1: old_root (DepthBalanceInfo coins=100, refs -> 2, 3)
+    //   2: old_leaf1 (coins=30)
+    //   3: old_leaf2 (coins=70)
     //   4: new_root MARKER (cell_type=9, no payload on wire, refs -> 5, 6)
-    //   5: new_leaf1 (grams=40)
-    //   6: new_leaf2 (grams=60)
+    //   5: new_leaf1 (coins=40)
+    //   6: new_leaf2 (coins=60)
     //
-    // Child diffs: (40-30) + (60-70) = 0, so new_root grams can be reconstructed as 100 + 0 = 100.
-    fn build_depth_balance_cell(grams: u128, refs: &[Cell]) -> Cell {
+    // Child diffs: (40-30) + (60-70) = 0, so new_root coins can be reconstructed as 100 + 0 = 100.
+    fn build_depth_balance_cell(coins: u128, refs: &[Cell]) -> Cell {
         let mut b = BuilderData::new();
-        write_depth_balance_grams(&mut b, grams).unwrap();
+        write_depth_balance_coins(&mut b, coins).unwrap();
         for r in refs {
             b.checked_append_reference(r.clone()).unwrap();
         }

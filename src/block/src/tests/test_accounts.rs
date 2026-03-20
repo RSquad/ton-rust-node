@@ -50,7 +50,7 @@ fn test_storage_used_short() {
 #[test]
 fn test_serialize_storage_info() {
     let g = Some(111.into());
-    let g_none: Option<Grams> = None;
+    let g_none: Option<Coins> = None;
     let st_info = StorageInfo::with_values(123456789, g);
     let st_info1 = StorageInfo::with_values(123456789, g_none);
 
@@ -275,22 +275,22 @@ fn test_msg_addr_std() {
 
 #[test]
 fn test_currency_collection_addiction() {
-    let c1 = CurrencyCollection::with_grams(1000);
-    let c2 = CurrencyCollection::with_grams(2000);
+    let c1 = CurrencyCollection::with_coins(1000);
+    let c2 = CurrencyCollection::with_coins(2000);
     let mut c_res = c1;
     c_res.add(&c2).unwrap();
-    let c3 = CurrencyCollection::with_grams(3000);
+    let c3 = CurrencyCollection::with_coins(3000);
     assert_eq!(c_res, c3);
 
-    let mut c1 = CurrencyCollection::with_grams(1000);
+    let mut c1 = CurrencyCollection::with_coins(1000);
     c1.set_other(1, 100).unwrap();
     c1.set_other(2, 200).unwrap();
-    let mut c2 = CurrencyCollection::with_grams(2000);
+    let mut c2 = CurrencyCollection::with_coins(2000);
     c2.set_other(2, 300).unwrap();
     c2.set_other(3, 300).unwrap();
     let mut c_res = c1;
     c_res.add(&c2).unwrap();
-    let mut c3 = CurrencyCollection::with_grams(3000);
+    let mut c3 = CurrencyCollection::with_coins(3000);
     c3.set_other(1, 100).unwrap();
     c3.set_other(2, 500).unwrap();
     c3.set_other(3, 300).unwrap();
@@ -325,7 +325,7 @@ fn test_account_account() {
 
 #[test]
 fn test_account_account2() {
-    let mut balance = CurrencyCollection::with_grams(100000000000u64);
+    let mut balance = CurrencyCollection::with_coins(100000000000u64);
     balance.set_other(1, 100).unwrap();
     balance.set_other(2, 200).unwrap();
     balance.set_other(3, 300).unwrap();
@@ -392,11 +392,11 @@ fn test_account_account2() {
     lib.set(&library.repr_hash(), &SimpleLib::new(library, false)).unwrap();
     assert_eq!(lib, acc.libraries());
 
-    let mut f_to_add = CurrencyCollection::with_grams(12);
+    let mut f_to_add = CurrencyCollection::with_coins(12);
     f_to_add.set_other(3, 1005000).unwrap();
     acc.add_funds(&f_to_add).unwrap();
 
-    let mut result_f = CurrencyCollection::with_grams(100000000012u64);
+    let mut result_f = CurrencyCollection::with_coins(100000000012u64);
     result_f.set_other(1, 100).unwrap();
     result_f.set_other(2, 200).unwrap();
     result_f.set_other(3, 1005300).unwrap();
@@ -416,50 +416,50 @@ fn test_freeze_account() {
 
 #[test]
 fn test_compare_currency_collections() {
-    let c1 = CurrencyCollection::with_grams(10);
-    let c2 = CurrencyCollection::with_grams(20);
-    let c3 = CurrencyCollection::with_grams(20);
+    let c1 = CurrencyCollection::with_coins(10);
+    let c2 = CurrencyCollection::with_coins(20);
+    let c3 = CurrencyCollection::with_coins(20);
     assert!(c1 != c2);
     assert!(c2 == c3);
     assert!(c2 != c1);
 
-    let mut c1 = CurrencyCollection::with_grams(10);
+    let mut c1 = CurrencyCollection::with_coins(10);
     c1.set_other(1, 100).unwrap();
-    let c2 = CurrencyCollection::with_grams(20);
-    let c3 = CurrencyCollection::with_grams(20);
+    let c2 = CurrencyCollection::with_coins(20);
+    let c3 = CurrencyCollection::with_coins(20);
     assert!(c1 != c2);
     assert!(c2 == c3);
     assert!(c2 != c1);
 
-    let mut c1 = CurrencyCollection::with_grams(10);
+    let mut c1 = CurrencyCollection::with_coins(10);
     c1.set_other(1, 100).unwrap();
-    let mut c2 = CurrencyCollection::with_grams(20);
+    let mut c2 = CurrencyCollection::with_coins(20);
     c2.set_other(2, 200).unwrap();
-    let mut c3 = CurrencyCollection::with_grams(20);
+    let mut c3 = CurrencyCollection::with_coins(20);
     c3.set_other(2, 200).unwrap();
     assert!(c1 != c2);
     assert!(c2 == c3);
     assert!(c2 != c1);
 
-    let mut c1 = CurrencyCollection::with_grams(10);
+    let mut c1 = CurrencyCollection::with_coins(10);
     c1.set_other(1, 100).unwrap();
-    let mut c2 = CurrencyCollection::with_grams(20);
+    let mut c2 = CurrencyCollection::with_coins(20);
     c2.set_other(1, 200).unwrap();
-    let mut c3 = CurrencyCollection::with_grams(20);
+    let mut c3 = CurrencyCollection::with_coins(20);
     c3.set_other(2, 200).unwrap();
     assert!(c1 != c2);
     assert!(c2 != c3);
     assert!(c2 != c1);
 
-    let mut c1 = CurrencyCollection::with_grams(10);
+    let mut c1 = CurrencyCollection::with_coins(10);
     c1.set_other(1, 100).unwrap();
     c1.set_other(2, 200).unwrap();
     c1.set_other(3, 300).unwrap();
-    let mut c2 = CurrencyCollection::with_grams(20);
+    let mut c2 = CurrencyCollection::with_coins(20);
     c2.set_other(1, 200).unwrap();
     c2.set_other(2, 400).unwrap();
     c2.set_other(3, 600).unwrap();
-    let mut c3 = CurrencyCollection::with_grams(20);
+    let mut c3 = CurrencyCollection::with_coins(20);
     c3.set_other(2, 200).unwrap();
     assert!(c1 != c2);
     assert!(c2 != c3);
@@ -546,7 +546,7 @@ fn test_account_modify_state() {
     let hash = stinit.hash().unwrap();
     let now = 1600000000;
     let addr = MsgAddressInt::with_standart(None, 0, AccountId::from(hash)).unwrap();
-    let mut acc = Account::uninit(addr, CurrencyCollection::with_grams(10000000), 100, now);
+    let mut acc = Account::uninit(addr, CurrencyCollection::with_coins(10000000), 100, now);
     assert_eq!(acc.state_init(), None);
     assert_eq!(acc.status(), AccountStatus::AccStateUninit);
 
@@ -594,7 +594,7 @@ fn test_account_from_message() {
     );
 
     // message without StateInit and with bounce
-    let value = CurrencyCollection::with_grams(100);
+    let value = CurrencyCollection::with_coins(100);
     let hdr = crate::InternalMessageHeader::with_addresses_and_bounce(
         src.clone(),
         dst.clone(),
@@ -608,7 +608,7 @@ fn test_account_from_message() {
     );
 
     // message without code
-    let value = CurrencyCollection::with_grams(100);
+    let value = CurrencyCollection::with_coins(100);
     let hdr = crate::InternalMessageHeader::with_addresses_and_bounce(
         src.clone(),
         dst.clone(),
@@ -637,7 +637,7 @@ fn test_account_from_message() {
     );
 
     // message without StateInit and without bounce
-    let value = CurrencyCollection::with_grams(100);
+    let value = CurrencyCollection::with_coins(100);
     let hdr = crate::InternalMessageHeader::with_addresses_and_bounce(
         src.clone(),
         dst.clone(),
@@ -651,7 +651,7 @@ fn test_account_from_message() {
     );
 
     // message with code and without bounce
-    let value = CurrencyCollection::with_grams(100);
+    let value = CurrencyCollection::with_coins(100);
     let hdr = crate::InternalMessageHeader::with_addresses_and_bounce(
         src.clone(),
         dst.clone(),
@@ -668,7 +668,7 @@ fn test_account_from_message() {
     );
 
     // message with code and with bounce
-    let value = CurrencyCollection::with_grams(100);
+    let value = CurrencyCollection::with_coins(100);
     let hdr = crate::InternalMessageHeader::with_addresses_and_bounce(src, dst, value, true);
     let mut msg = Message::with_int_header(hdr);
     let mut init = StateInit::default();
@@ -694,7 +694,7 @@ fn test_generate_account_and_update() {
 #[test]
 fn test_non_usage_update() {
     let mut account = generate_test_account(true, AccountTestOptions::with_default_setup(true));
-    account.set_balance(CurrencyCollection::with_grams(1000));
+    account.set_balance(CurrencyCollection::with_coins(1000));
     let cell = account.serialize().unwrap();
     let usage_tree = UsageTree::with_params(cell, true);
     let mut account = Account::construct_from_cell(usage_tree.root_cell()).unwrap();

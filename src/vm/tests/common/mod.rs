@@ -65,7 +65,7 @@ pub static MC_STATE_PROOF: LazyLock<Cell> = LazyLock::new(|| {
 pub static ACCOUNT_ROOT: LazyLock<Cell> = LazyLock::new(|| SHARD_ACCOUNT.serialize().unwrap());
 pub static SHARD_ACCOUNT: LazyLock<ShardAccount> = LazyLock::new(|| {
     let addr = MsgAddressInt::standard(0, [0x55; 32]);
-    let balance = CurrencyCollection::with_grams(1234567);
+    let balance = CurrencyCollection::with_coins(1234567);
     let state_init = StateInit::default();
     let mut account =
         Account::active(addr.clone(), balance, 0, 0, state_init, DICT_HASH_MIN_CELLS).unwrap();

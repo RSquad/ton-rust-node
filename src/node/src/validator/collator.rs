@@ -52,7 +52,7 @@ use ton_block::{
     BlkPrevInfo, Block, BlockCreateStats, BlockExtra, BlockIdExt, BlockInfo, BocFlags, BocWriter,
     Cell, ChildCell, CommonMsgInfo, ConfigParamEnum, ConfigParams, CreatorStats,
     CurrencyCollection, Deserializable, Error, ExtBlkRef, FutureSplitMerge, GlobalCapabilities,
-    GlobalVersion, Grams, HashmapAugType, HashmapRemover, HashmapType, InMsg, InMsgDescr,
+    GlobalVersion, Coins, HashmapAugType, HashmapRemover, HashmapType, InMsg, InMsgDescr,
     InternalMessageHeader, KeyExtBlkRef, KeyMaxLt, Libraries, McBlockExtra, McShardRecord,
     McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgMetadata, OutMsg,
     OutMsgDescr, OutMsgQueueKey, ParamLimitIndex, ProcessedInfoKey, ProcessedUpto, Result,
@@ -143,9 +143,9 @@ impl PrevData {
         } else if let Some(subshard) = subshard {
             accounts.split_for(&subshard.shard_key(false))?;
             if subshard.is_right_child() {
-                total_validator_fees.grams += 1;
+                total_validator_fees.coins += 1;
             }
-            total_validator_fees.grams /= 2;
+            total_validator_fees.coins /= 2;
         } else {
             overload_history = states[0].state()?.overload_history();
             underload_history = states[0].state()?.underload_history();
@@ -532,8 +532,8 @@ impl CollatorData {
     pub fn store_shard_fees_zero(&mut self, shard: &ShardIdent) -> Result<()> {
         self.shard_fees.store_shard_fees(
             shard,
-            CurrencyCollection::with_grams(0),
-            CurrencyCollection::with_grams(0),
+            CurrencyCollection::with_coins(0),
+            CurrencyCollection::with_coins(0),
         )
     }
 
@@ -1098,13 +1098,13 @@ impl ExecutionManager {
                     msg.clone(),
                     tr.in_msg_cell().ok_or_else(|| error!("Transaction must have in_msg_cell"))?,
                     &ShardIdent::masterchain(),
-                    Grams::default(),
+                    Coins::default(),
                     false,
                 )?;
                 Some(InMsg::immediate(
                     ChildCell::with_struct(env.inner())?,
                     tr_cell.clone(),
-                    Grams::default(),
+                    Coins::default(),
                 ))
             }
             AsyncMessage::Ext(msg, _, _) => {
@@ -2937,7 +2937,7 @@ impl Collator {
         log::trace!("{}: update_value_flow", self.collated_block_descr);
 
         if self.shard.is_masterchain() {
-            collator_data.value_flow.created.grams = mc_data.config().block_create_fees(true)?;
+            collator_data.value_flow.created.coins = mc_data.config().block_create_fees(true)?;
 
             collator_data.value_flow.recovered = collator_data.value_flow.created.clone();
             collator_data.value_flow.recovered.add(&collator_data.value_flow.fees_collected)?;
@@ -2956,7 +2956,7 @@ impl Collator {
                     collator_data.value_flow.recovered = CurrencyCollection::default();
                 }
                 Ok(_addr) => {
-                    if collator_data.value_flow.recovered.grams.as_u128() < 1_000_000_000 {
+                    if collator_data.value_flow.recovered.coins.as_u128() < 1_000_000_000 {
                         log::debug!(
                             "{}: fee recovery skipped ({})",
                             self.collated_block_descr,
@@ -2980,8 +2980,8 @@ impl Collator {
                 collator_data.value_flow.minted = CurrencyCollection::default();
             }
         } else {
-            collator_data.value_flow.created.grams = mc_data.config().block_create_fees(false)?;
-            collator_data.value_flow.created.grams >>= self.shard.prefix_len();
+            collator_data.value_flow.created.coins = mc_data.config().block_create_fees(false)?;
+            collator_data.value_flow.created.coins >>= self.shard.prefix_len();
         }
         collator_data.value_flow.from_prev_blk = prev_data.total_balance().clone();
         Ok(())
@@ -3371,7 +3371,7 @@ impl Collator {
         log::trace!(
             "{}: create_special_transaction: recover {} to account {:x}",
             self.collated_block_descr,
-            amount.grams,
+            amount.coins,
             account_id
         );
         if amount.is_zero()? || !self.shard.is_masterchain() {
@@ -3912,9 +3912,9 @@ impl Collator {
         value_flow.imported = collator_data.in_msgs.root_extra().value_imported.clone();
         value_flow.exported = collator_data.out_msgs.root_extra().clone();
         value_flow.fees_collected = accounts.root_extra().clone();
-        value_flow.fees_collected.grams.add(&collator_data.in_msgs.root_extra().fees_collected)?;
+        value_flow.fees_collected.coins.add(&collator_data.in_msgs.root_extra().fees_collected)?;
 
-        // value_flow.fees_collected.grams.add(&out_msg_dscr.root_extra().grams)?; // TODO: Why only grams?
+        // value_flow.fees_collected.coins.add(&out_msg_dscr.root_extra().coins)?; // TODO: Why only coins?
 
         value_flow.fees_collected.add(&value_flow.fees_imported)?;
         value_flow.fees_collected.add(&value_flow.created)?;

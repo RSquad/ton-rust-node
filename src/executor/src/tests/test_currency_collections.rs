@@ -17,7 +17,7 @@ use pretty_assertions::assert_eq;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
     AccStatusChange, Account, AccountId, AccountStatus, ComputeSkipReason, CurrencyCollection,
-    GetRepresentationHash, Grams, InternalMessageHeader, Message, MsgAddressInt,
+    GetRepresentationHash, Coins, InternalMessageHeader, Message, MsgAddressInt,
     MsgAddressIntOrNone, OutAction, OutActions, Serializable, SliceData, StateInit, StorageUsed,
     TrActionPhase, TrBouncePhaseNofunds, TrBouncePhaseOk, TrComputePhase, TrComputePhaseVm,
     TrCreditPhase, TrStoragePhase, Transaction, TransactionDescr, VarUInteger32,
@@ -58,12 +58,12 @@ pub fn check_account_and_transaction_with_currencies(
         assert_eq!(
             (
                 trans.out_msgs.len().unwrap(),
-                &acc_after.balance().unwrap().grams,
+                &acc_after.balance().unwrap().coins,
                 acc_after.balance().unwrap().other.get(&11111111u32).unwrap()
             ),
             (
                 count_out_msgs,
-                &result_account_balance.grams,
+                &result_account_balance.coins,
                 result_account_balance.other.get(&11111111u32).unwrap()
             ),
             "balance after {:?}",
@@ -97,7 +97,7 @@ pub fn execute_currencies(
 fn test_currency_collection_uninit_account() {
     let mut acc = Account::default();
 
-    let mut currencies = CurrencyCollection::with_grams(1_400_200_000);
+    let mut currencies = CurrencyCollection::with_coins(1_400_200_000);
     currencies.other.set(&11111111u32, &VarUInteger32::from(123000)).unwrap();
 
     let msg = create_msg_currency(SENDER_ACCOUNT.clone(), &currencies, false);
@@ -113,7 +113,7 @@ fn test_currency_collection_uninit_account() {
 }
 
 #[test]
-fn test_currency_collection_message_with_zero_grams() {
+fn test_currency_collection_message_with_zero_coins() {
     let mut acc = Account::default();
 
     let mut currencies = CurrencyCollection::default();
@@ -143,7 +143,7 @@ fn test_currency_collection_activate_account() {
 
     let mut acc = Account::default();
 
-    let mut currencies = CurrencyCollection::with_grams(1_400_200_000);
+    let mut currencies = CurrencyCollection::with_coins(1_400_200_000);
     currencies.other.set(&11111111u32, &VarUInteger32::from(123000)).unwrap();
 
     let mut msg =
@@ -152,7 +152,7 @@ fn test_currency_collection_activate_account() {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_grams(1_400_100_000);
+    let mut result_currencies = CurrencyCollection::with_coins(1_400_100_000);
     result_currencies.other.set(&11111111u32, &VarUInteger32::from(123000)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, tr_lt, &result_currencies, 0).unwrap();
@@ -192,7 +192,7 @@ fn test_balance_instruction_with_currency() {
     let mut state_init = StateInit::default();
     state_init.set_code(code);
 
-    let mut begin_currencies = CurrencyCollection::with_grams(1_400_200_000);
+    let mut begin_currencies = CurrencyCollection::with_coins(1_400_200_000);
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
     let mut acc = Account::active(
@@ -205,7 +205,7 @@ fn test_balance_instruction_with_currency() {
     )
     .unwrap();
 
-    let mut currencies = CurrencyCollection::with_grams(1_000_000_000);
+    let mut currencies = CurrencyCollection::with_coins(1_000_000_000);
     currencies.other.set(&11111111u32, &VarUInteger32::from(message_extra)).unwrap();
 
     let mut msg =
@@ -214,7 +214,7 @@ fn test_balance_instruction_with_currency() {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_grams(2367739615);
+    let mut result_currencies = CurrencyCollection::with_coins(2367739615);
     result_currencies.other.set(&11111111u32, &VarUInteger32::from(223000)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, tr_lt, &result_currencies, 0).unwrap();
@@ -240,7 +240,7 @@ fn test_add_currency_collection_and_activate_account() {
     let mut state_init = StateInit::default();
     state_init.set_code(code);
 
-    let mut begin_currencies = CurrencyCollection::with_grams(1_400_200_000);
+    let mut begin_currencies = CurrencyCollection::with_coins(1_400_200_000);
     let begin_extra = 123000;
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
@@ -251,7 +251,7 @@ fn test_add_currency_collection_and_activate_account() {
         10,
     );
 
-    let mut currencies = CurrencyCollection::with_grams(1_000_000_000);
+    let mut currencies = CurrencyCollection::with_coins(1_000_000_000);
     let new_extra = 1230000;
     currencies.other.set(&11111111u32, &VarUInteger32::from(1230000)).unwrap();
 
@@ -261,7 +261,7 @@ fn test_add_currency_collection_and_activate_account() {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_grams(2385594300);
+    let mut result_currencies = CurrencyCollection::with_coins(2385594300);
     result_currencies
         .other
         .set(&11111111u32, &VarUInteger32::from(begin_extra + new_extra))
@@ -282,7 +282,7 @@ fn add_currency_collection_to_active_account_with_bounce_flag(bounce: bool) {
     let mut state_init = StateInit::default();
     state_init.set_code(code);
 
-    let mut begin_currencies = CurrencyCollection::with_grams(1_400_200_000);
+    let mut begin_currencies = CurrencyCollection::with_coins(1_400_200_000);
     let begin_extra = 123000;
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
@@ -296,7 +296,7 @@ fn add_currency_collection_to_active_account_with_bounce_flag(bounce: bool) {
     )
     .unwrap();
 
-    let mut currencies = CurrencyCollection::with_grams(1_000_000_000);
+    let mut currencies = CurrencyCollection::with_coins(1_000_000_000);
     let new_extra = 1230000;
     currencies.other.set(&11111111u32, &VarUInteger32::from(1230000)).unwrap();
 
@@ -306,7 +306,7 @@ fn add_currency_collection_to_active_account_with_bounce_flag(bounce: bool) {
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_grams(2373277687);
+    let mut result_currencies = CurrencyCollection::with_coins(2373277687);
     result_currencies
         .other
         .set(&11111111u32, &VarUInteger32::from(begin_extra + new_extra))
@@ -326,7 +326,7 @@ fn test_add_currency_collection_to_active_account() {
 
 #[test]
 fn test_cannot_delete_uninit_account_with_currency_collections_without_bounce() {
-    let mut begin_currencies = CurrencyCollection::with_grams(17);
+    let mut begin_currencies = CurrencyCollection::with_coins(17);
     let begin_extra = 123000;
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
@@ -338,12 +338,12 @@ fn test_cannot_delete_uninit_account_with_currency_collections_without_bounce() 
     );
 
     let acc_addr = acc.get_id().unwrap().clone();
-    let mut currencies = CurrencyCollection::with_grams(15);
+    let mut currencies = CurrencyCollection::with_coins(15);
     let add_extra = 456000;
     currencies.other.set(&11111111u32, &VarUInteger32::from(add_extra)).unwrap();
     let msg = create_msg_currency_workchain(-1, acc_addr, &currencies, false);
 
-    let acc_balance = acc.balance().unwrap().grams;
+    let acc_balance = acc.balance().unwrap().coins;
     let mut new_currencies = CurrencyCollection::default();
     new_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra + add_extra)).unwrap();
     let tr_lt = BLOCK_LT + 2;
@@ -351,8 +351,8 @@ fn test_cannot_delete_uninit_account_with_currency_collections_without_bounce() 
 
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph = Some(TrStoragePhase::with_params(
-        currencies.grams + acc_balance,
-        Some(Grams::from(2650451629)),
+        currencies.coins + acc_balance,
+        Some(Coins::from(2650451629)),
         AccStatusChange::Unchanged,
     ));
     description.credit_ph = Some(TrCreditPhase::new(currencies.clone()));
@@ -367,7 +367,7 @@ fn test_cannot_delete_uninit_account_with_currency_collections_without_bounce() 
 
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 3).unwrap();
 
-    let sum_fees = CurrencyCollection::from_grams(currencies.grams + acc_balance);
+    let sum_fees = CurrencyCollection::from_coins(currencies.coins + acc_balance);
     good_trans.set_total_fees(sum_fees);
     good_trans.orig_status = AccountStatus::AccStateUninit;
     good_trans.set_end_status(AccountStatus::AccStateUninit);
@@ -380,7 +380,7 @@ fn test_cannot_delete_uninit_account_with_currency_collections_without_bounce() 
 
 #[test]
 fn test_cannot_delete_uninit_account_with_currency_collections_with_bounce() {
-    let mut begin_currencies = CurrencyCollection::with_grams(17);
+    let mut begin_currencies = CurrencyCollection::with_coins(17);
     let begin_extra = 123000;
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
@@ -392,13 +392,13 @@ fn test_cannot_delete_uninit_account_with_currency_collections_with_bounce() {
     );
 
     let acc_addr = acc.get_id().unwrap().clone();
-    let mut currencies = CurrencyCollection::with_grams(15);
+    let mut currencies = CurrencyCollection::with_coins(15);
     let add_extra = 456000;
     currencies.other.set(&11111111u32, &VarUInteger32::from(add_extra)).unwrap();
     let msg = create_msg_currency_workchain(-1, acc_addr, &currencies, true);
 
-    let acc_balance = acc.balance().unwrap().grams;
-    let mut new_currencies = CurrencyCollection::with_grams(15);
+    let acc_balance = acc.balance().unwrap().coins;
+    let mut new_currencies = CurrencyCollection::with_coins(15);
     new_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra + add_extra)).unwrap();
     let tr_lt = BLOCK_LT + 2;
     let trans = execute_currencies(&msg, &mut acc, tr_lt, &new_currencies, 0).unwrap();
@@ -406,7 +406,7 @@ fn test_cannot_delete_uninit_account_with_currency_collections_with_bounce() {
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph = Some(TrStoragePhase::with_params(
         acc_balance,
-        Some(Grams::from(2650451644)),
+        Some(Coins::from(2650451644)),
         AccStatusChange::Unchanged,
     ));
     description.credit_ph = Some(TrCreditPhase::new(currencies.clone()));
@@ -416,7 +416,7 @@ fn test_cannot_delete_uninit_account_with_currency_collections_with_bounce() {
     description.credit_first = false;
     description.bounce = Some(TrBouncePhase::Nofunds(TrBouncePhaseNofunds {
         msg_size: StorageUsed::with_values_checked(1, 69).unwrap(),
-        req_fwd_fees: Grams::from(11690000),
+        req_fwd_fees: Coins::from(11690000),
     }));
     description.aborted = true;
     description.destroyed = false;
@@ -424,7 +424,7 @@ fn test_cannot_delete_uninit_account_with_currency_collections_with_bounce() {
 
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 3).unwrap();
 
-    let sum_fees = CurrencyCollection::from_grams(begin_currencies.grams);
+    let sum_fees = CurrencyCollection::from_coins(begin_currencies.coins);
     good_trans.set_total_fees(sum_fees);
     good_trans.orig_status = AccountStatus::AccStateUninit;
     good_trans.set_end_status(AccountStatus::AccStateUninit);
@@ -445,7 +445,7 @@ fn test_freeze_uninit_account_with_currency_collections() {
     let mut state_init = StateInit::default();
     state_init.set_code(code);
 
-    let mut begin_currencies = CurrencyCollection::with_grams(17);
+    let mut begin_currencies = CurrencyCollection::with_coins(17);
     let begin_extra = 123000;
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
@@ -460,23 +460,23 @@ fn test_freeze_uninit_account_with_currency_collections() {
     .unwrap();
 
     let acc_addr = acc.get_id().unwrap().clone();
-    let mut currencies = CurrencyCollection::with_grams(15);
+    let mut currencies = CurrencyCollection::with_coins(15);
     let new_extra = 1230000;
     currencies.other.set(&11111111u32, &VarUInteger32::from(new_extra)).unwrap();
     let msg = create_msg_currency_workchain(-1, acc_addr, &currencies, false);
 
-    let acc_balance = acc.balance().unwrap().grams;
+    let acc_balance = acc.balance().unwrap().coins;
     let tr_lt = BLOCK_LT + 2;
     let mut new_currency = begin_currencies.clone();
     new_currency.add(&currencies).unwrap();
-    new_currency.grams = Grams::default();
+    new_currency.coins = Coins::default();
     let trans = execute_currencies(&msg, &mut acc, tr_lt, &new_currency, 0).unwrap();
     assert_eq!(acc.status(), AccountStatus::AccStateFrozen);
 
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph = Some(TrStoragePhase::with_params(
-        currencies.grams + acc_balance,
-        Some(Grams::from(499420135)),
+        currencies.coins + acc_balance,
+        Some(Coins::from(499420135)),
         AccStatusChange::Frozen,
     ));
     description.credit_ph = Some(TrCreditPhase::new(currencies.clone()));
@@ -491,7 +491,7 @@ fn test_freeze_uninit_account_with_currency_collections() {
 
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 3).unwrap();
 
-    let sum_fees = CurrencyCollection::from_grams(begin_currencies.grams + currencies.grams);
+    let sum_fees = CurrencyCollection::from_coins(begin_currencies.coins + currencies.coins);
     good_trans.set_total_fees(sum_fees);
     good_trans.orig_status = AccountStatus::AccStateActive;
     good_trans.set_end_status(AccountStatus::AccStateFrozen);
@@ -504,7 +504,7 @@ fn test_freeze_uninit_account_with_currency_collections() {
 
 #[test]
 fn test_bounce_with_currency_collection() {
-    let mut begin_currencies = CurrencyCollection::with_grams(1_400_200_000);
+    let mut begin_currencies = CurrencyCollection::with_coins(1_400_200_000);
     let begin_extra = 123000;
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
@@ -515,14 +515,14 @@ fn test_bounce_with_currency_collection() {
         10,
     );
 
-    let mut currencies = CurrencyCollection::with_grams(1_000_000_000);
+    let mut currencies = CurrencyCollection::with_coins(1_000_000_000);
     currencies.other.set(&11111111u32, &VarUInteger32::from(1230000)).unwrap();
 
     let msg = create_msg_currency(SENDER_ACCOUNT.clone(), &currencies, true);
 
     let tr_lt = BLOCK_LT + 1;
 
-    let mut result_currencies = CurrencyCollection::with_grams(1385694300);
+    let mut result_currencies = CurrencyCollection::with_coins(1385694300);
     result_currencies.other.set(&11111111u32, &VarUInteger32::from(begin_extra)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, tr_lt, &result_currencies, 1).unwrap();
@@ -530,7 +530,7 @@ fn test_bounce_with_currency_collection() {
 
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph =
-        Some(TrStoragePhase::with_params(Grams::from(14505700), None, AccStatusChange::Unchanged));
+        Some(TrStoragePhase::with_params(Coins::from(14505700), None, AccStatusChange::Unchanged));
     description.credit_ph = Some(TrCreditPhase::new(currencies.clone()));
     description.compute_ph = TrComputePhase::skipped(ComputeSkipReason::NoState);
 
@@ -541,8 +541,8 @@ fn test_bounce_with_currency_collection() {
     let fwd_fees = 779340;
     description.bounce = Some(TrBouncePhase::Ok(TrBouncePhaseOk {
         msg_size: StorageUsed::with_values_checked(1, 69).unwrap(),
-        msg_fees: Grams::from(msg_fee),
-        fwd_fees: Grams::from(fwd_fees),
+        msg_fees: Coins::from(msg_fee),
+        fwd_fees: Coins::from(fwd_fees),
     }));
 
     description.aborted = true;
@@ -552,7 +552,7 @@ fn test_bounce_with_currency_collection() {
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 3).unwrap();
 
     let mut outmsg_currency = currencies.clone();
-    outmsg_currency.grams -= Grams::from(msg_fee + fwd_fees);
+    outmsg_currency.coins -= Coins::from(msg_fee + fwd_fees);
     let mut message = Message::with_int_header(InternalMessageHeader {
         ihr_disabled: true,
         bounce: false,
@@ -570,7 +570,7 @@ fn test_bounce_with_currency_collection() {
     message.set_body(SliceData::from_raw(vec![0xff; 4], 32));
     good_trans.add_out_message(&message).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(14895360));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(14895360));
     good_trans.orig_status = AccountStatus::AccStateUninit;
     good_trans.set_end_status(AccountStatus::AccStateUninit);
 
@@ -590,7 +590,7 @@ fn test_currencies_with_sendmsg() {
         SENDRAWMSG
     ";
 
-    let mut out_msg_currencies = CurrencyCollection::with_grams(1100000000);
+    let mut out_msg_currencies = CurrencyCollection::with_coins(1100000000);
     out_msg_currencies.other.set(&11111111u32, &VarUInteger32::from(120)).unwrap();
 
     let mut out_msg = create_msg_currency(THIRD_ACCOUNT.clone(), &out_msg_currencies, false);
@@ -606,7 +606,7 @@ fn test_currencies_with_sendmsg() {
     state_init.set_code(code);
     state_init.set_data(data);
 
-    let mut begin_currencies = CurrencyCollection::with_grams(2000000000);
+    let mut begin_currencies = CurrencyCollection::with_coins(2000000000);
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(100)).unwrap();
 
     let mut acc = Account::active(
@@ -619,12 +619,12 @@ fn test_currencies_with_sendmsg() {
     )
     .unwrap();
 
-    let mut in_msg_currencies = CurrencyCollection::with_grams(1000000000);
+    let mut in_msg_currencies = CurrencyCollection::with_coins(1000000000);
     in_msg_currencies.other.set(&11111111u32, &VarUInteger32::from(100)).unwrap();
 
     let msg = create_msg_currency(SENDER_ACCOUNT.clone(), &in_msg_currencies, false);
 
-    let mut currencies_result = CurrencyCollection::with_grams(1828709098);
+    let mut currencies_result = CurrencyCollection::with_coins(1828709098);
     currencies_result.other.set(&11111111u32, &VarUInteger32::from(80)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, BLOCK_LT + 1, &currencies_result, 1).unwrap();
@@ -632,7 +632,7 @@ fn test_currencies_with_sendmsg() {
     let mut description = TransactionDescrOrdinary::default();
     let storage_phase_fees = 69689902;
     description.storage_ph = Some(TrStoragePhase::with_params(
-        Grams::from(storage_phase_fees),
+        Coins::from(storage_phase_fees),
         None,
         AccStatusChange::Unchanged,
     ));
@@ -675,7 +675,7 @@ fn test_currencies_with_sendmsg() {
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 2).unwrap();
 
     good_trans.add_out_message(&out_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_grams(70624230));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(70624230));
     good_trans.orig_status = AccountStatus::AccStateActive;
     good_trans.set_end_status(AccountStatus::AccStateActive);
     good_trans.set_logical_time(BLOCK_LT + 1);
@@ -691,9 +691,9 @@ fn test_currencies_with_sendmsg() {
 /// expects to receive value and out message count
 fn execute_sendrawmsg_message(
     mode: u8,
-    send_value_grams: u64,
+    send_value_coins: u64,
     send_value_tokens: u128,
-    result_balance_grams: u64,
+    result_balance_coins: u64,
     result_balance_tokens: u128,
     count_out_msgs: usize,
 ) -> Account {
@@ -707,7 +707,7 @@ fn execute_sendrawmsg_message(
         mode
     );
 
-    let mut out_msg_currencies = CurrencyCollection::with_grams(1100000000);
+    let mut out_msg_currencies = CurrencyCollection::with_coins(1100000000);
     out_msg_currencies.other.set(&11111111u32, &VarUInteger32::from(120)).unwrap();
 
     let mut out_msg = create_msg_currency(THIRD_ACCOUNT.clone(), &out_msg_currencies, false);
@@ -721,7 +721,7 @@ fn execute_sendrawmsg_message(
     state_init.set_code(code);
     state_init.set_data(data);
 
-    let mut begin_currencies = CurrencyCollection::with_grams(2000000000);
+    let mut begin_currencies = CurrencyCollection::with_coins(2000000000);
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(100)).unwrap();
 
     let mut acc = Account::active(
@@ -734,14 +734,14 @@ fn execute_sendrawmsg_message(
     )
     .unwrap();
 
-    let mut in_msg_currencies = CurrencyCollection::from_grams(send_value_grams.into());
+    let mut in_msg_currencies = CurrencyCollection::from_coins(send_value_coins.into());
     if send_value_tokens != 0 {
         in_msg_currencies.other.set(&11111111u32, &VarUInteger32::from(send_value_tokens)).unwrap();
     }
 
     let msg = create_msg_currency(acc_id, &in_msg_currencies, false);
 
-    let mut currencies_result = CurrencyCollection::with_grams(result_balance_grams);
+    let mut currencies_result = CurrencyCollection::with_coins(result_balance_coins);
     currencies_result.other.set(&11111111u32, &VarUInteger32::from(result_balance_tokens)).unwrap();
 
     execute_currencies(&msg, &mut acc, BLOCK_LT + 1, &currencies_result, count_out_msgs).unwrap();
@@ -774,7 +774,7 @@ fn test_currencies_with_sendmsg_64_flag() {
     // input message with 1000000000ng and 11111111:100 extra
     // sends message with 1100000000ng and 11111111:240 extra (2101`000000ng)
 
-    let mut out_msg_currencies = CurrencyCollection::with_grams(1100000000);
+    let mut out_msg_currencies = CurrencyCollection::with_coins(1100000000);
     out_msg_currencies.other.set(&11111111u32, &VarUInteger32::from(240)).unwrap();
 
     let mut out_msg = create_msg_currency(THIRD_ACCOUNT.clone(), &out_msg_currencies, false);
@@ -790,7 +790,7 @@ fn test_currencies_with_sendmsg_64_flag() {
     state_init.set_code(code);
     state_init.set_data(data);
 
-    let mut begin_currencies = CurrencyCollection::with_grams(2000000000);
+    let mut begin_currencies = CurrencyCollection::with_coins(2000000000);
     begin_currencies.other.set(&11111111u32, &VarUInteger32::from(150)).unwrap();
 
     let mut acc = Account::active(
@@ -803,12 +803,12 @@ fn test_currencies_with_sendmsg_64_flag() {
     )
     .unwrap();
 
-    let mut in_msg_currencies = CurrencyCollection::with_grams(1000000000);
+    let mut in_msg_currencies = CurrencyCollection::with_coins(1000000000);
     in_msg_currencies.other.set(&11111111u32, &VarUInteger32::from(100)).unwrap();
 
     let msg = create_msg_currency(SENDER_ACCOUNT.clone(), &in_msg_currencies, false);
 
-    let mut currencies_result = CurrencyCollection::with_grams(828508651);
+    let mut currencies_result = CurrencyCollection::with_coins(828508651);
     currencies_result.other.set(&11111111u32, &VarUInteger32::from(10)).unwrap();
 
     let trans = execute_currencies(&msg, &mut acc, BLOCK_LT + 1, &currencies_result, 1).unwrap();
@@ -816,7 +816,7 @@ fn test_currencies_with_sendmsg_64_flag() {
     let mut description = TransactionDescrOrdinary::default();
     let storage_phase_fees = 69882349;
     description.storage_ph = Some(TrStoragePhase::with_params(
-        Grams::from(storage_phase_fees),
+        Coins::from(storage_phase_fees),
         None,
         AccStatusChange::Unchanged,
     ));
@@ -836,7 +836,7 @@ fn test_currencies_with_sendmsg_64_flag() {
         out_msg.clone(),
     ));
     if let Some(int_header) = out_msg.int_header_mut() {
-        int_header.value.grams.add(&in_msg_currencies.grams).unwrap();
+        int_header.value.coins.add(&in_msg_currencies.coins).unwrap();
         int_header.fwd_fee = 666672.into();
         int_header.created_lt = BLOCK_LT + 2;
         int_header.created_at = BLOCK_UT.into();
@@ -863,7 +863,7 @@ fn test_currencies_with_sendmsg_64_flag() {
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, BLOCK_LT + 2).unwrap();
 
     good_trans.add_out_message(&out_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_grams(70824677));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(70824677));
     good_trans.orig_status = AccountStatus::AccStateActive;
     good_trans.set_end_status(AccountStatus::AccStateActive);
     good_trans.set_logical_time(BLOCK_LT + 1);

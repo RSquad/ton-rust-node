@@ -29,7 +29,7 @@ use ton_block::{
     },
     AccountId, AccountStatus, AnycastInfo, BouncedByPhase, BuilderData, Cell, ComputeSkipReason,
     ConfigParam8, ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable, ExceptionCode,
-    GetRepresentationHash, GlobalVersion, Grams, IBitstring, InternalMessageHeader, MerkleProof,
+    GetRepresentationHash, GlobalVersion, Coins, IBitstring, InternalMessageHeader, MerkleProof,
     NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, Serializable, SliceData,
     StateInit, StorageUsed, TrBouncePhaseNofunds, UInt256, DICT_HASH_MIN_CELLS,
     SENDMSG_PAY_FEE_SEPARATELY,
@@ -78,7 +78,7 @@ fn test_simple_transaction() {
 
     let new_acc = Account::active(
         acc.get_addr().unwrap().clone(),
-        CurrencyCollection::with_grams(99849728119),
+        CurrencyCollection::with_coins(99849728119),
         BLOCK_LT + 4,
         BLOCK_UT,
         acc.state_init().unwrap().clone(),
@@ -87,16 +87,16 @@ fn test_simple_transaction() {
     .unwrap();
 
     let tr_lt = BLOCK_LT + 1;
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 2).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 2).unwrap();
 
     let mut description = TransactionDescrOrdinary::default();
     let storage_phase_fees = 271881;
     description.storage_ph = Some(TrStoragePhase::with_params(
-        Grams::from(storage_phase_fees),
+        Coins::from(storage_phase_fees),
         None,
         AccStatusChange::Unchanged,
     ));
-    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_grams(msg_income)));
+    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_coins(msg_income)));
 
     let gas_used = (compute_phase_gas_fees / 1000) as u32;
     let gas_fees = compute_phase_gas_fees;
@@ -114,9 +114,9 @@ fn test_simple_transaction() {
     actions.push_back(OutAction::new_send(SENDMSG_ORDINARY, msg2.clone()));
     if let Some(int_header) = msg1.int_header_mut() {
         if let Some(int_header2) = msg2.int_header_mut() {
-            int_header.value.grams =
-                Grams::from(MSG1_BALANCE + msg_income - compute_phase_gas_fees - MSG_FWD_FEE);
-            int_header2.value.grams = Grams::from(MSG2_BALANCE - MSG_FWD_FEE);
+            int_header.value.coins =
+                Coins::from(MSG1_BALANCE + msg_income - compute_phase_gas_fees - MSG_FWD_FEE);
+            int_header2.value.coins = Coins::from(MSG2_BALANCE - MSG_FWD_FEE);
             int_header.fwd_fee = msg_remain_fee.into();
             int_header2.fwd_fee = msg_remain_fee.into();
             int_header.created_at = BLOCK_UT.into();
@@ -148,7 +148,7 @@ fn test_simple_transaction() {
 
     good_trans.add_out_message(&msg1).unwrap();
     good_trans.add_out_message(&msg2).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_grams(
+    good_trans.set_total_fees(CurrencyCollection::with_coins(
         gas_fees + storage_phase_fees + MSG_MINE_FEE * 2,
     ));
     good_trans.orig_status = AccountStatus::AccStateActive;
@@ -188,7 +188,7 @@ fn test_trexecutor_with_bad_code() {
     );
     let msg = create_int_msg(acc_id.clone(), acc_id.clone(), 1000000, false, BLOCK_LT);
     let mut new_acc = create_test_account(
-        Grams::from(start_balance) + msg.value().unwrap().grams - Grams::from(total_fees),
+        Coins::from(start_balance) + msg.value().unwrap().coins - Coins::from(total_fees),
         acc_id,
         bad_code,
         create_two_messages_data(),
@@ -200,7 +200,7 @@ fn test_trexecutor_with_bad_code() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    let mut trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 0).unwrap();
+    let mut trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 0).unwrap();
     assert_eq!(acc, new_acc);
 
     good_trans.set_total_fees(total_fees.into());
@@ -291,7 +291,7 @@ fn test_trexecutor_with_code_without_accept() {
 
     let mut hdr = ExternalInboundMessageHeader::default();
     hdr.dst = MsgAddressInt::with_standart(None, -1, acc_id).unwrap();
-    hdr.import_fee = Grams::zero();
+    hdr.import_fee = Coins::zero();
     let mut msg_copy = Message::with_ext_in_header(hdr);
     msg_copy.set_body(SliceData::default());
 
@@ -378,8 +378,8 @@ fn test_trexecutor_active_acc_with_code1() {
     actions.push_back(OutAction::new_send(SENDMSG_ORDINARY, msg2.clone()));
     if let CommonMsgInfo::IntMsgInfo(int_header) = msg1.header_mut() {
         if let CommonMsgInfo::IntMsgInfo(int_header2) = msg2.header_mut() {
-            int_header.value.grams = Grams::from(MSG1_BALANCE - MSG_FWD_FEE);
-            int_header2.value.grams = Grams::from(MSG2_BALANCE - MSG_FWD_FEE);
+            int_header.value.coins = Coins::from(MSG1_BALANCE - MSG_FWD_FEE);
+            int_header2.value.coins = Coins::from(MSG2_BALANCE - MSG_FWD_FEE);
             int_header.fwd_fee = msg_remain_fee.into();
             int_header2.fwd_fee = msg_remain_fee.into();
             int_header.created_at = BLOCK_UT.into();
@@ -433,7 +433,7 @@ fn test_trexecutor_active_acc_with_code1() {
 fn create_transfer_ext_msg(src: AccountId, dest: AccountId, value: u64) -> Message {
     let mut hdr = ExternalInboundMessageHeader::default();
     hdr.dst = MsgAddressInt::with_standart(None, -1, src.clone()).unwrap();
-    hdr.import_fee = Grams::zero();
+    hdr.import_fee = Coins::zero();
 
     let int_msg = create_int_msg(src, dest, value, true, 0);
     let int_header = match int_msg.withdraw_header() {
@@ -533,7 +533,7 @@ fn create_test_transfer_account_with_ending(amount: u64, mode: u8, ending: &str)
     let mut acc = Account::with_storage(
         &MsgAddressInt::with_standart(None, -1, SENDER_ACCOUNT.clone()).unwrap(),
         &StorageInfo::with_values(ACCOUNT_UT, None),
-        &AccountStorage::active(0, CurrencyCollection::with_grams(amount), StateInit::default()),
+        &AccountStorage::active(0, CurrencyCollection::with_coins(amount), StateInit::default()),
     );
     acc.set_code(test_transfer_code(mode, ending));
     acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
@@ -548,7 +548,7 @@ fn create_test_external_msg_with_int_ex(
 ) -> Message {
     let mut hdr = ExternalInboundMessageHeader::default();
     hdr.dst = MsgAddressInt::with_standart(None, workchain_id, src.clone()).unwrap();
-    hdr.import_fee = Grams::zero();
+    hdr.import_fee = Coins::zero();
     let mut msg = Message::with_ext_in_header(hdr);
 
     let int_msg =
@@ -585,7 +585,7 @@ fn test_trexecutor_active_acc_with_code2() {
     let tr_lt = BLOCK_LT + 1;
     new_acc.set_last_tr_time(tr_lt + 2);
 
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 1).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 1).unwrap();
     acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
     new_acc.set_data(acc.get_data().unwrap());
     new_acc.set_last_paid(acc.last_paid());
@@ -696,7 +696,7 @@ fn test_trexecutor_active_acc_with_zero_balance() {
 //contract send all its balance to another account using special mode in SENDRAWMSG.
 //contract balance must equal to zero after transaction.
 fn active_acc_send_all_balance(ending: &str) {
-    let start_balance = 10_000_000_000; //10 grams
+    let start_balance = 10_000_000_000; //10 coins
     let mut acc =
         create_test_transfer_account_with_ending(start_balance, SENDMSG_ALL_BALANCE, ending);
 
@@ -865,7 +865,7 @@ fn test_drain_account() {
     new_acc.set_due_payment(Some(86774881.into()));
 
     let tr_lt = BLOCK_LT + 1;
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 0).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 0).unwrap();
     acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc, new_acc);
@@ -875,12 +875,12 @@ fn test_drain_account() {
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph = Some(TrStoragePhase {
         storage_fees_collected: total_balance.into(), // collect full balance as fee
-        storage_fees_due: Some(Grams::from(due_payment)), // also due_payment credit for next transaction
+        storage_fees_due: Some(Coins::from(due_payment)), // also due_payment credit for next transaction
         status_change: AccStatusChange::Unchanged,
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     description.compute_ph = TrComputePhase::skipped(ComputeSkipReason::NoGas);
 
@@ -891,7 +891,7 @@ fn test_drain_account() {
     description.destroyed = false;
     let description = TransactionDescr::Ordinary(description);
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(total_balance));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(total_balance));
     good_trans.orig_status = AccountStatus::AccStateActive;
     good_trans.set_now(BLOCK_UT);
 
@@ -940,7 +940,7 @@ fn test_send_value_to_account_without_money_without_bounce() {
     let tr_lt = BLOCK_LT + 1;
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 1).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 1).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
@@ -951,7 +951,7 @@ fn test_send_value_to_account_without_money_without_bounce() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -971,7 +971,7 @@ fn test_send_value_to_account_without_money_without_bounce() {
     }
 
     let mut account = acc.clone();
-    let mut acc_balance = CurrencyCollection::with_grams(start_balance + msg_income - storage_fee);
+    let mut acc_balance = CurrencyCollection::with_coins(start_balance + msg_income - storage_fee);
     account.set_balance(acc_balance.clone());
     let executor = OrdinaryTransactionExecutor::new(BLOCKCHAIN_CONFIG.to_owned());
     let smci = build_contract_info(&account, &msg, BLOCKCHAIN_CONFIG.raw_config());
@@ -981,7 +981,7 @@ fn test_send_value_to_account_without_money_without_bounce() {
             Some(&msg),
             &mut account,
             &mut acc_balance,
-            &CurrencyCollection::with_grams(msg_income),
+            &CurrencyCollection::with_coins(msg_income),
             smci,
             stack,
             msg.is_masterchain(),
@@ -1013,7 +1013,7 @@ fn test_send_value_to_account_without_money_without_bounce() {
     let description = TransactionDescr::Ordinary(description);
     let cmn_msg = out_msg;
     good_trans.add_out_message(&cmn_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_grams(total_fees));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(total_fees));
     // good_trans.orig_status = AccountStatus::AccStateActive;
     good_trans.set_now(BLOCK_UT);
 
@@ -1059,7 +1059,7 @@ fn test_outmsg_ihr_fee() {
     let tr_lt = BLOCK_LT + 1;
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 1).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 1).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
@@ -1070,7 +1070,7 @@ fn test_outmsg_ihr_fee() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -1083,7 +1083,7 @@ fn test_outmsg_ihr_fee() {
     let mut actions = OutActions::default();
     actions.push_back(OutAction::new_send(SENDMSG_PAY_FEE_SEPARATELY, out_msg.clone()));
     if let Some(int_header) = out_msg.int_header_mut() {
-        int_header.value = CurrencyCollection::with_grams(100);
+        int_header.value = CurrencyCollection::with_coins(100);
         int_header.fwd_fee = msg_remain_fee.into();
         int_header.created_lt = BLOCK_LT + 2;
         int_header.created_at = BLOCK_UT.into();
@@ -1109,7 +1109,7 @@ fn test_outmsg_ihr_fee() {
     let description = TransactionDescr::Ordinary(description);
     let cmn_msg = out_msg;
     good_trans.add_out_message(&cmn_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_grams(total_fees));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(total_fees));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -1156,17 +1156,17 @@ fn test_send_value_to_account_without_money_with_bounce() {
     let tr_lt = BLOCK_LT + 1;
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 1).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 1).unwrap();
 
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph = Some(TrStoragePhase {
-        storage_fees_collected: Grams::default(),
+        storage_fees_collected: Coins::default(),
         storage_fees_due: Some(storage_fee.into()),
         status_change: AccStatusChange::Unchanged,
     });
-    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_grams(msg_income)));
+    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_coins(msg_income)));
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
     vm_phase.gas_used = gas_used.into();
@@ -1186,7 +1186,7 @@ fn test_send_value_to_account_without_money_with_bounce() {
 
     let mut account = acc.clone();
     let acc_balance =
-        CurrencyCollection::with_grams(acc.balance().unwrap().grams.as_u128() as u64 + msg_income);
+        CurrencyCollection::with_coins(acc.balance().unwrap().coins.as_u128() as u64 + msg_income);
     account.set_balance(acc_balance);
     let executor = OrdinaryTransactionExecutor::new(BLOCKCHAIN_CONFIG.to_owned());
     let smci = build_contract_info(&account, &msg, BLOCKCHAIN_CONFIG.raw_config());
@@ -1228,7 +1228,7 @@ fn test_send_value_to_account_without_money_with_bounce() {
     let description = TransactionDescr::Ordinary(description);
     let cmn_msg = out_msg;
     good_trans.add_out_message(&cmn_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_grams(total_fees));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(total_fees));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -1273,18 +1273,18 @@ fn test_send_msg_value_to_account_without_money_with_bounce() {
     let tr_lt = BLOCK_LT + 1;
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 1).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 1).unwrap();
     acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph = Some(TrStoragePhase {
-        storage_fees_collected: Grams::from(start_balance),
+        storage_fees_collected: Coins::from(start_balance),
         storage_fees_due: None,
         status_change: AccStatusChange::Unchanged,
     });
-    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_grams(msg_income)));
+    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_coins(msg_income)));
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
     vm_phase.gas_used = gas_used.into();
@@ -1304,7 +1304,7 @@ fn test_send_msg_value_to_account_without_money_with_bounce() {
 
     let mut account = acc.clone();
     let acc_balance =
-        CurrencyCollection::from_grams(acc.balance().unwrap().grams + msg_income as u128);
+        CurrencyCollection::from_coins(acc.balance().unwrap().coins + msg_income as u128);
     account.set_balance(acc_balance);
     let executor = OrdinaryTransactionExecutor::new(BLOCKCHAIN_CONFIG.to_owned());
     let smci = build_contract_info(&account, &msg, BLOCKCHAIN_CONFIG.raw_config());
@@ -1346,7 +1346,7 @@ fn test_send_msg_value_to_account_without_money_with_bounce() {
     let description = TransactionDescr::Ordinary(description);
     let cmn_msg = out_msg;
     good_trans.add_out_message(&cmn_msg).unwrap();
-    good_trans.set_total_fees(CurrencyCollection::with_grams(total_fees));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(total_fees));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -1779,8 +1779,8 @@ fn test_change_128_flag() {
     assert!(!trans.read_description().unwrap().is_aborted());
     // check ordering messages
     assert_eq!(
-        trans.out_msgs.export_vector().unwrap()[1].0.get_value().unwrap().grams,
-        CurrencyCollection::with_grams(MSG2_BALANCE).grams,
+        trans.out_msgs.export_vector().unwrap()[1].0.get_value().unwrap().coins,
+        CurrencyCollection::with_coins(MSG2_BALANCE).coins,
     );
     for (i, msg) in trans.out_msgs.export_vector().unwrap().iter().enumerate() {
         assert_eq!(msg.0.int_header().unwrap().created_lt, 2000000002 + i as u64);
@@ -2519,8 +2519,8 @@ fn test_fail_bound_message_with_nonexist_account() {
 
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph =
-        Some(TrStoragePhase::with_params(Grams::zero(), None, AccStatusChange::Unchanged));
-    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_grams(msg_income)));
+        Some(TrStoragePhase::with_params(Coins::zero(), None, AccStatusChange::Unchanged));
+    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_coins(msg_income)));
     description.compute_ph = TrComputePhase::skipped(ComputeSkipReason::NoGas);
 
     description.bounce = Some(TrBouncePhase::Nofunds(TrBouncePhaseNofunds {
@@ -2537,7 +2537,7 @@ fn test_fail_bound_message_with_nonexist_account() {
     let mut good_trans =
         Transaction::with_account_and_message(&new_acc, &msg, BLOCK_LT + 2).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(0));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(0));
     good_trans.orig_status = AccountStatus::AccStateNonexist;
     good_trans.set_end_status(AccountStatus::AccStateUninit);
     good_trans.set_logical_time(BLOCK_LT + 2);
@@ -2563,8 +2563,8 @@ fn test_fail_bound_message_with_nonexist_account_2() {
 
     let mut description = TransactionDescrOrdinary::default();
     description.storage_ph =
-        Some(TrStoragePhase::with_params(Grams::zero(), None, AccStatusChange::Unchanged));
-    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_grams(msg_income)));
+        Some(TrStoragePhase::with_params(Coins::zero(), None, AccStatusChange::Unchanged));
+    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_coins(msg_income)));
     description.compute_ph = TrComputePhase::skipped(ComputeSkipReason::NoGas);
 
     description.bounce = Some(TrBouncePhase::Nofunds(TrBouncePhaseNofunds {
@@ -2581,7 +2581,7 @@ fn test_fail_bound_message_with_nonexist_account_2() {
     let mut good_trans =
         Transaction::with_account_and_message(&new_acc, &msg, BLOCK_LT + 2).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(msg_income));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(msg_income));
     good_trans.orig_status = AccountStatus::AccStateNonexist;
     good_trans.set_end_status(AccountStatus::AccStateNonexist);
     good_trans.set_logical_time(BLOCK_LT + 2);
@@ -2598,7 +2598,7 @@ fn account_without_code() {
 
     let mut acc = Account::uninit(
         MsgAddressInt::with_standart(None, -1, acc_id.clone()).unwrap(),
-        CurrencyCollection::with_grams(10000000000000000000),
+        CurrencyCollection::with_coins(10000000000000000000),
         10,
         10,
     );
@@ -2647,7 +2647,7 @@ fn account_without_data() {
 
     let mut acc = Account::uninit(
         MsgAddressInt::with_standart(None, -1, acc_id.clone()).unwrap(),
-        CurrencyCollection::with_grams(10000000000000000000),
+        CurrencyCollection::with_coins(10000000000000000000),
         10,
         10,
     );
@@ -2843,7 +2843,7 @@ fn test_message_with_anycast_output_address() {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, 0, SENDER_ACCOUNT.clone()).unwrap(),
         dst,
-        CurrencyCollection::with_grams(msg_income),
+        CurrencyCollection::with_coins(msg_income),
     );
     hdr.bounce = false;
     hdr.ihr_disabled = true;
@@ -2894,7 +2894,7 @@ fn test_message_with_anycast_output_address() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -2924,7 +2924,7 @@ fn test_message_with_anycast_output_address() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(575004));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(575004));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -2945,7 +2945,7 @@ fn test_message_with_anycast_output_address_2() {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, 0, SENDER_ACCOUNT.clone()).unwrap(),
         dst,
-        CurrencyCollection::with_grams(msg_income),
+        CurrencyCollection::with_coins(msg_income),
     );
     hdr.bounce = false;
     hdr.ihr_disabled = true;
@@ -2996,7 +2996,7 @@ fn test_message_with_anycast_output_address_2() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -3029,7 +3029,7 @@ fn test_message_with_anycast_output_address_2() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(575004));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(575004));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3050,7 +3050,7 @@ fn test_message_with_anycast_address() {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, 0, THIRD_ACCOUNT.clone()).unwrap(),
         dst,
-        CurrencyCollection::with_grams(msg_income),
+        CurrencyCollection::with_coins(msg_income),
     );
     hdr.bounce = false;
     hdr.ihr_disabled = true;
@@ -3066,7 +3066,7 @@ fn test_message_with_anycast_address() {
             .unwrap();
     let new_acc = Account::uninit(
         MsgAddressInt::with_standart(None, 0, address).unwrap(),
-        CurrencyCollection::with_grams(msg_income),
+        CurrencyCollection::with_coins(msg_income),
         BLOCK_LT + 2,
         BLOCK_UT,
     );
@@ -3075,7 +3075,7 @@ fn test_message_with_anycast_address() {
     let mut description = TransactionDescrOrdinary::default();
 
     description.credit_first = true;
-    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_grams(msg_income)));
+    description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_coins(msg_income)));
     description.storage_ph = Some(Default::default());
     description.bounce = None;
     description.aborted = true;
@@ -3085,7 +3085,7 @@ fn test_message_with_anycast_address() {
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
     good_trans.orig_status = AccountStatus::AccStateNonexist;
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(0));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(0));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3139,7 +3139,7 @@ fn test_action_phase_fields_with_unsuccess_action() {
     let tr_lt = BLOCK_LT + 1;
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().grams, 0).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 0).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
@@ -3150,7 +3150,7 @@ fn test_action_phase_fields_with_unsuccess_action() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -3186,7 +3186,7 @@ fn test_action_phase_fields_with_unsuccess_action() {
     description.destroyed = false;
     let description = TransactionDescr::Ordinary(description);
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(total_fees));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(total_fees));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3232,7 +3232,7 @@ fn test_message_with_var_address() {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, 0, SENDER_ACCOUNT.clone()).unwrap(),
         dst,
-        CurrencyCollection::with_grams(msg_income),
+        CurrencyCollection::with_coins(msg_income),
     );
     hdr.bounce = false;
     hdr.ihr_disabled = true;
@@ -3283,7 +3283,7 @@ fn test_message_with_var_address() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -3317,7 +3317,7 @@ fn test_message_with_var_address() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(575004));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(575004));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3333,7 +3333,7 @@ fn test_message_with_var_address_in_masterchain() {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, -1, SENDER_ACCOUNT.clone()).unwrap(),
         dst,
-        CurrencyCollection::with_grams(msg_income),
+        CurrencyCollection::with_coins(msg_income),
     );
     hdr.bounce = false;
     hdr.ihr_disabled = true;
@@ -3384,7 +3384,7 @@ fn test_message_with_var_address_in_masterchain() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -3418,7 +3418,7 @@ fn test_message_with_var_address_in_masterchain() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(5753612));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(5753612));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3434,7 +3434,7 @@ fn test_send_message_to_nonexisting_workchain() {
     let mut hdr = InternalMessageHeader::with_addresses(
         MsgAddressInt::with_standart(None, -1, SENDER_ACCOUNT.clone()).unwrap(),
         dst,
-        CurrencyCollection::with_grams(msg_income),
+        CurrencyCollection::with_coins(msg_income),
     );
     hdr.bounce = false;
     hdr.ihr_disabled = true;
@@ -3485,7 +3485,7 @@ fn test_send_message_to_nonexisting_workchain() {
     });
     description.credit_ph = Some(TrCreditPhase {
         due_fees_collected: None,
-        credit: CurrencyCollection::with_grams(msg_income),
+        credit: CurrencyCollection::with_coins(msg_income),
     });
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
@@ -3519,7 +3519,7 @@ fn test_send_message_to_nonexisting_workchain() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_grams(5753577));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(5753577));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3533,7 +3533,7 @@ fn bounced_message_with_special_account() {
 
     let mut acc = Account::uninit(
         MsgAddressInt::with_standart(None, -1, acc_id.clone()).unwrap(),
-        CurrencyCollection::with_grams(1_400_200_000),
+        CurrencyCollection::with_coins(1_400_200_000),
         10,
         10,
     );
@@ -3552,7 +3552,7 @@ fn bounced_message_with_special_account() {
     assert_eq!(acc.status(), AccountStatus::AccStateUninit);
     let descr = get_tr_descr(&trans);
     if let TrBouncePhase::Ok(bounce) = descr.bounce.unwrap() {
-        assert_eq!(bounce.fwd_fees, Grams::from(6666718));
+        assert_eq!(bounce.fwd_fees, Coins::from(6666718));
     } else {
         unreachable!()
     }
@@ -3599,8 +3599,8 @@ fn test_bouncable() -> Result<()> {
     let msg = tr.get_out_msg(0)?.unwrap();
     let hdr = msg.int_header().unwrap();
     assert!(!hdr.bounced);
-    assert_eq!(hdr.value().grams.as_u128(), 373_000);
-    assert_eq!(account.balance().unwrap().grams.as_u128(), 0);
+    assert_eq!(hdr.value().coins.as_u128(), 373_000);
+    assert_eq!(account.balance().unwrap().coins.as_u128(), 0);
     assert_eq!(account.due_payment().unwrap().as_u128(), 2_118_021);
 
     // account has enough value to send bounced message, but due payment is growing
@@ -3612,8 +3612,8 @@ fn test_bouncable() -> Result<()> {
     let msg = tr.get_out_msg(0)?.unwrap();
     let hdr = msg.int_header().unwrap();
     assert!(hdr.bounced);
-    assert_eq!(hdr.value().grams.as_u128(), 1_700_000);
-    assert_eq!(account.balance().unwrap().grams.as_u128(), 0);
+    assert_eq!(hdr.value().coins.as_u128(), 1_700_000);
+    assert_eq!(account.balance().unwrap().coins.as_u128(), 0);
     assert_eq!(account.due_payment().unwrap().as_u128(), 2_106_850);
 
     Ok(())
@@ -3798,7 +3798,7 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
     // uninit account
     let mut acc = Account::uninit(
         MsgAddressInt::standard(workchain_id, big_acc_id.clone()),
-        CurrencyCollection::with_grams(1000),
+        CurrencyCollection::with_coins(1000),
         BLOCK_LT,
         BLOCK_UT,
     );
@@ -3817,7 +3817,7 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
 
     let mut acc = Account::uninit(
         MsgAddressInt::standard(workchain_id, small_acc_id.clone()),
-        CurrencyCollection::with_grams(1000),
+        CurrencyCollection::with_coins(1000),
         BLOCK_LT,
         BLOCK_UT,
     );
@@ -3832,7 +3832,7 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
     // frozen account
     let mut acc = Account::frozen(
         MsgAddressInt::standard(workchain_id, big_acc_id.clone()),
-        CurrencyCollection::with_grams(1000),
+        CurrencyCollection::with_coins(1000),
         BLOCK_LT,
         BLOCK_UT,
         None,
@@ -3852,7 +3852,7 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
 
     let mut acc = Account::frozen(
         MsgAddressInt::standard(workchain_id, small_acc_id.clone()),
-        CurrencyCollection::with_grams(1000),
+        CurrencyCollection::with_coins(1000),
         BLOCK_LT,
         BLOCK_UT,
         None,
@@ -4010,7 +4010,7 @@ fn test_new_bounce() {
     assert_eq!(
         bounce_body.original_info.read_struct().unwrap(),
         NewBounceOriginalInfo {
-            value: CurrencyCollection::with_grams(balance),
+            value: CurrencyCollection::with_coins(balance),
             created_at: msg.at_and_lt().unwrap().0,
             created_lt: msg.at_and_lt().unwrap().1,
         }

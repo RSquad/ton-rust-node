@@ -13,21 +13,21 @@
 #![allow(clippy::vec_init_then_push)]
 use super::*;
 use crate::{
-    define_HashmapAugE, dictionary::HashmapTraverser, error, AddSub, Grams, HashmapFilterResult,
+    define_HashmapAugE, dictionary::HashmapTraverser, error, AddSub, Coins, HashmapFilterResult,
     HashmapSubtree, IBitstring, UInt256,
 };
 use std::fmt;
 
 #[derive(Eq, Clone, Debug, Default, PartialEq)]
-pub struct GramStruct(Grams);
+pub struct CoinStruct(Coins);
 
-impl GramStruct {
+impl CoinStruct {
     pub const fn with_value(value: u8) -> Self {
-        Self(Grams::new(value as u64))
+        Self(Coins::new(value as u64))
     }
 }
 
-impl Serializable for GramStruct {
+impl Serializable for CoinStruct {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
         self.0.write_to(cell)?;
         cell.checked_append_reference(self.0.serialize()?)?;
@@ -36,31 +36,31 @@ impl Serializable for GramStruct {
     }
 }
 
-impl Deserializable for GramStruct {
+impl Deserializable for CoinStruct {
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
         self.0.read_from(slice)?;
         let r = slice.checked_drain_reference()?;
-        let g = Grams::construct_from_cell(r)?;
+        let g = Coins::construct_from_cell(r)?;
         assert_eq!(self.0, g);
         let r = slice.checked_drain_reference()?;
-        let g = Grams::construct_from_cell(r)?;
+        let g = Coins::construct_from_cell(r)?;
         assert_eq!(self.0, g);
         Ok(())
     }
 }
 
-impl Augmentable for GramStruct {
+impl Augmentable for CoinStruct {
     fn calc(&mut self, other: &Self) -> Result<bool> {
         self.0.add(&other.0)
     }
 }
 
-define_HashmapAugE!(GramHashmap7, 7, u8, u32, GramStruct);
-define_HashmapAugE!(GramHashmap8, 8, u8, u32, GramStruct);
-impl HashmapSubtree for GramHashmap8 {}
+define_HashmapAugE!(CoinHashmap7, 7, u8, u32, CoinStruct);
+define_HashmapAugE!(CoinHashmap8, 8, u8, u32, CoinStruct);
+impl HashmapSubtree for CoinHashmap8 {}
 
-impl Augmentation<GramStruct> for u32 {
-    fn aug(&self) -> Result<GramStruct> {
+impl Augmentation<CoinStruct> for u32 {
+    fn aug(&self) -> Result<CoinStruct> {
         unreachable!()
     }
 }
@@ -68,69 +68,69 @@ impl Augmentation<GramStruct> for u32 {
 #[test]
 fn test_hashmapaug() {
     //construct empty 7 bit_len
-    let mut tree = GramHashmap7::default();
-    assert_eq!(&GramStruct::with_value(0), tree.root_extra());
+    let mut tree = CoinHashmap7::default();
+    assert_eq!(&CoinStruct::with_value(0), tree.root_extra());
     assert!(tree.is_empty());
     println!("empty {}", tree);
 
     // add first
     let key1 = SliceData::new(vec![0xFF]);
     let value1 = key1.clone();
-    let extra1 = GramStruct::with_value(1);
+    let extra1 = CoinStruct::with_value(1);
     tree.set_serialized(key1.clone(), &value1, &extra1).unwrap();
     println!("first {}", tree);
-    assert_eq!(&GramStruct::with_value(1), tree.root_extra());
+    assert_eq!(&CoinStruct::with_value(1), tree.root_extra());
     assert_eq!(tree.get_serialized_as_slice(key1.clone()).unwrap(), Some(value1.clone()));
 
     // replace single
     let value1 = SliceData::new(vec![0xFB]);
-    let extra1 = GramStruct::with_value(2);
+    let extra1 = CoinStruct::with_value(2);
     tree.set_serialized(key1.clone(), &value1, &extra1).unwrap();
     println!("replaced {}", tree);
     assert!(!tree.is_empty());
-    assert_eq!(&GramStruct::with_value(2), tree.root_extra());
+    assert_eq!(&CoinStruct::with_value(2), tree.root_extra());
     assert_eq!(tree.get_serialized_as_slice(key1.clone()).unwrap(), Some(value1.clone()));
 
     // add second with same first bit
     let key2 = SliceData::new(vec![0xF1]);
     let value2 = key2.clone();
-    let extra2 = GramStruct::with_value(3);
+    let extra2 = CoinStruct::with_value(3);
     tree.set_serialized(key2.clone(), &value2, &extra2).unwrap();
     println!("second {}", tree);
     assert!(!tree.is_empty());
-    assert_eq!(&GramStruct::with_value(5), tree.root_extra());
+    assert_eq!(&CoinStruct::with_value(5), tree.root_extra());
     assert_eq!(tree.get_serialized_as_slice(key1.clone()).unwrap(), Some(value1.clone()));
     assert_eq!(tree.get_serialized_as_slice(key2.clone()).unwrap(), Some(value2.clone()));
 
     // replace second
     let value2 = SliceData::new(vec![0xF2]);
-    let extra2 = GramStruct::with_value(4);
+    let extra2 = CoinStruct::with_value(4);
     tree.set_serialized(key2.clone(), &value2, &extra2).unwrap();
     println!("second replaced {}", tree);
     assert!(!tree.is_empty());
-    assert_eq!(&GramStruct::with_value(6), tree.root_extra());
+    assert_eq!(&CoinStruct::with_value(6), tree.root_extra());
     assert_eq!(tree.get_serialized_as_slice(key1.clone()).unwrap(), Some(value1.clone()));
     assert_eq!(tree.get_serialized_as_slice(key2.clone()).unwrap(), Some(value2.clone()));
 
     // add third with dif first bit
     let key3 = SliceData::new(vec![0x01]);
     let value3 = key3.clone();
-    let extra3 = GramStruct::with_value(5);
+    let extra3 = CoinStruct::with_value(5);
     tree.set_serialized(key3.clone(), &value3, &extra3).unwrap();
     println!("third added {}", tree);
     assert!(!tree.is_empty());
-    assert_eq!(&GramStruct::with_value(11), tree.root_extra());
+    assert_eq!(&CoinStruct::with_value(11), tree.root_extra());
     assert_eq!(tree.get_serialized_as_slice(key1.clone()).unwrap(), Some(value1.clone()));
     assert_eq!(tree.get_serialized_as_slice(key2.clone()).unwrap(), Some(value2.clone()));
     assert_eq!(tree.get_serialized_as_slice(key3.clone()).unwrap(), Some(value3.clone()));
 
     // replace third
     let value3 = SliceData::new(vec![0x0F]);
-    let extra3 = GramStruct::with_value(6);
+    let extra3 = CoinStruct::with_value(6);
     tree.set_serialized(key3.clone(), &value3, &extra3).unwrap();
     println!("third replaced {}", tree);
     assert!(!tree.is_empty());
-    assert_eq!(&GramStruct::with_value(12), tree.root_extra());
+    assert_eq!(&CoinStruct::with_value(12), tree.root_extra());
     assert_eq!(tree.get_serialized_as_slice(key1.clone()).unwrap(), Some(value1.clone()));
     assert_eq!(tree.get_serialized_as_slice(key2.clone()).unwrap(), Some(value2.clone()));
     assert_eq!(tree.get_serialized_as_slice(key3.clone()).unwrap(), Some(value3.clone()));
@@ -138,121 +138,121 @@ fn test_hashmapaug() {
     // add fourth with same 1 bit label
     let key4 = SliceData::new(vec![0x07]);
     let value4 = key4.clone();
-    let extra4 = GramStruct::with_value(7);
+    let extra4 = CoinStruct::with_value(7);
     tree.set_serialized(key4.clone(), &value4, &extra4).unwrap();
     println!("fourth added {}", tree);
     assert!(!tree.is_empty());
-    assert_eq!(&GramStruct::with_value(19), tree.root_extra());
+    assert_eq!(&CoinStruct::with_value(19), tree.root_extra());
     assert_eq!(tree.get_serialized_as_slice(key1).unwrap(), Some(value1));
     assert_eq!(tree.get_serialized_as_slice(key2).unwrap(), Some(value2));
     assert_eq!(tree.get_serialized_as_slice(key3).unwrap(), Some(value3));
     assert_eq!(tree.get_serialized_as_slice(key4).unwrap(), Some(value4));
 }
 
-fn make_tree_with_filled_root_label() -> GramHashmap8 {
-    let mut tree = GramHashmap8::default();
+fn make_tree_with_filled_root_label() -> CoinHashmap8 {
+    let mut tree = CoinHashmap8::default();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11111111], 8),
         &SliceData::new(vec![0b11111111]),
-        &GramStruct::with_value(1),
+        &CoinStruct::with_value(1),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11111100], 8),
         &SliceData::new(vec![0b11111100]),
-        &GramStruct::with_value(2),
+        &CoinStruct::with_value(2),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11110011], 8),
         &SliceData::new(vec![0b11110011]),
-        &GramStruct::with_value(3),
+        &CoinStruct::with_value(3),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11110000], 8),
         &SliceData::new(vec![0b11110000]),
-        &GramStruct::with_value(4),
+        &CoinStruct::with_value(4),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11001111], 8),
         &SliceData::new(vec![0b11001111]),
-        &GramStruct::with_value(5),
+        &CoinStruct::with_value(5),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11001100], 8),
         &SliceData::new(vec![0b11001100]),
-        &GramStruct::with_value(6),
+        &CoinStruct::with_value(6),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11000011], 8),
         &SliceData::new(vec![0b11000011]),
-        &GramStruct::with_value(7),
+        &CoinStruct::with_value(7),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11000000], 8),
         &SliceData::new(vec![0b11000000]),
-        &GramStruct::with_value(8),
+        &CoinStruct::with_value(8),
     )
     .unwrap();
-    assert_eq!(tree.root_extra(), &GramStruct::with_value(36));
+    assert_eq!(tree.root_extra(), &CoinStruct::with_value(36));
     tree
 }
-fn make_tree_with_empty_root_label() -> GramHashmap8 {
-    let mut tree = GramHashmap8::default();
+fn make_tree_with_empty_root_label() -> CoinHashmap8 {
+    let mut tree = CoinHashmap8::default();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11111100], 8),
         &SliceData::new(vec![0b11111100]),
-        &GramStruct::with_value(1),
+        &CoinStruct::with_value(1),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11110000], 8),
         &SliceData::new(vec![0b11110000]),
-        &GramStruct::with_value(2),
+        &CoinStruct::with_value(2),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11001100], 8),
         &SliceData::new(vec![0b11001100]),
-        &GramStruct::with_value(3),
+        &CoinStruct::with_value(3),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b11000000], 8),
         &SliceData::new(vec![0b11000000]),
-        &GramStruct::with_value(4),
+        &CoinStruct::with_value(4),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b00111100], 8),
         &SliceData::new(vec![0b00111100]),
-        &GramStruct::with_value(5),
+        &CoinStruct::with_value(5),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b00110000], 8),
         &SliceData::new(vec![0b00110000]),
-        &GramStruct::with_value(6),
+        &CoinStruct::with_value(6),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b00001100], 8),
         &SliceData::new(vec![0b00001100]),
-        &GramStruct::with_value(7),
+        &CoinStruct::with_value(7),
     )
     .unwrap();
     tree.set_serialized(
         SliceData::from_raw(vec![0b00000000], 8),
         &SliceData::new(vec![0b00000000]),
-        &GramStruct::with_value(8),
+        &CoinStruct::with_value(8),
     )
     .unwrap();
-    assert_eq!(tree.root_extra(), &GramStruct::with_value(36));
+    assert_eq!(tree.root_extra(), &CoinStruct::with_value(36));
     tree
 }
 
@@ -298,146 +298,146 @@ fn test_hashmap_split() {
 
 #[test]
 fn test_hashmap_merge() {
-    let mut left = GramHashmap8::default();
+    let mut left = CoinHashmap8::default();
     left.set_serialized(
         SliceData::from_raw(vec![0b11000000], 8),
         &SliceData::new(vec![0b11000000]),
-        &GramStruct::with_value(1),
+        &CoinStruct::with_value(1),
     )
     .unwrap();
-    let mut right = GramHashmap8::default();
+    let mut right = CoinHashmap8::default();
     right
         .set_serialized(
             SliceData::from_raw(vec![0b00000000], 8),
             &SliceData::new(vec![0b00000000]),
-            &GramStruct::with_value(2),
+            &CoinStruct::with_value(2),
         )
         .unwrap();
     left.merge(&right, &SliceData::new(vec![0x80])).unwrap();
     assert_eq!(left.len().unwrap(), 2);
-    let mut result = GramHashmap8::default();
+    let mut result = CoinHashmap8::default();
     result
         .set_serialized(
             SliceData::from_raw(vec![0b11000000], 8),
             &SliceData::new(vec![0b11000000]),
-            &GramStruct::with_value(1),
+            &CoinStruct::with_value(1),
         )
         .unwrap();
     result
         .set_serialized(
             SliceData::from_raw(vec![0b00000000], 8),
             &SliceData::new(vec![0b00000000]),
-            &GramStruct::with_value(2),
+            &CoinStruct::with_value(2),
         )
         .unwrap();
     assert_eq!(left, result);
 
-    let mut left = GramHashmap8::default();
-    let mut right = GramHashmap8::default();
+    let mut left = CoinHashmap8::default();
+    let mut right = CoinHashmap8::default();
     right
         .set_serialized(
             SliceData::from_raw(vec![0b00000000], 8),
             &SliceData::new(vec![0b00000000]),
-            &GramStruct::with_value(1),
+            &CoinStruct::with_value(1),
         )
         .unwrap();
     left.merge(&right, &SliceData::new(vec![0x80])).unwrap();
     assert_eq!(left.len().unwrap(), 1);
-    assert_eq!(left.root_extra(), &GramStruct::with_value(1));
+    assert_eq!(left.root_extra(), &CoinStruct::with_value(1));
     assert_eq!(left, right);
 
-    let mut left = GramHashmap8::default();
+    let mut left = CoinHashmap8::default();
     left.set_serialized(
         SliceData::from_raw(vec![0b11000000], 8),
         &SliceData::new(vec![0b11000000]),
-        &GramStruct::with_value(1),
+        &CoinStruct::with_value(1),
     )
     .unwrap();
-    let right = GramHashmap8::default();
+    let right = CoinHashmap8::default();
     left.merge(&right, &SliceData::new(vec![0x80])).unwrap();
     assert_eq!(left.len().unwrap(), 1);
-    let mut result = GramHashmap8::default();
+    let mut result = CoinHashmap8::default();
     result
         .set_serialized(
             SliceData::from_raw(vec![0b11000000], 8),
             &SliceData::new(vec![0b11000000]),
-            &GramStruct::with_value(1),
+            &CoinStruct::with_value(1),
         )
         .unwrap();
     assert_eq!(left, result);
 
     let tree = make_tree_with_empty_root_label();
-    let mut left = GramHashmap8::default();
+    let mut left = CoinHashmap8::default();
     left.set_serialized(
         SliceData::from_raw(vec![0b11111100], 8),
         &SliceData::new(vec![0b11111100]),
-        &GramStruct::with_value(1),
+        &CoinStruct::with_value(1),
     )
     .unwrap();
     left.set_serialized(
         SliceData::from_raw(vec![0b11110000], 8),
         &SliceData::new(vec![0b11110000]),
-        &GramStruct::with_value(2),
+        &CoinStruct::with_value(2),
     )
     .unwrap();
     left.set_serialized(
         SliceData::from_raw(vec![0b11001100], 8),
         &SliceData::new(vec![0b11001100]),
-        &GramStruct::with_value(3),
+        &CoinStruct::with_value(3),
     )
     .unwrap();
     left.set_serialized(
         SliceData::from_raw(vec![0b11000000], 8),
         &SliceData::new(vec![0b11000000]),
-        &GramStruct::with_value(4),
+        &CoinStruct::with_value(4),
     )
     .unwrap();
 
-    let mut right = GramHashmap8::default();
+    let mut right = CoinHashmap8::default();
     right
         .set_serialized(
             SliceData::from_raw(vec![0b00111100], 8),
             &SliceData::new(vec![0b00111100]),
-            &GramStruct::with_value(5),
+            &CoinStruct::with_value(5),
         )
         .unwrap();
     right
         .set_serialized(
             SliceData::from_raw(vec![0b00110000], 8),
             &SliceData::new(vec![0b00110000]),
-            &GramStruct::with_value(6),
+            &CoinStruct::with_value(6),
         )
         .unwrap();
     right
         .set_serialized(
             SliceData::from_raw(vec![0b00001100], 8),
             &SliceData::new(vec![0b00001100]),
-            &GramStruct::with_value(7),
+            &CoinStruct::with_value(7),
         )
         .unwrap();
     right
         .set_serialized(
             SliceData::from_raw(vec![0b00000000], 8),
             &SliceData::new(vec![0b00000000]),
-            &GramStruct::with_value(8),
+            &CoinStruct::with_value(8),
         )
         .unwrap();
 
     assert_eq!(left.len().unwrap(), 4);
     assert_eq!(right.len().unwrap(), 4);
-    assert_eq!(left.root_extra(), &GramStruct::with_value(10));
-    assert_eq!(right.root_extra(), &GramStruct::with_value(26));
+    assert_eq!(left.root_extra(), &CoinStruct::with_value(10));
+    assert_eq!(right.root_extra(), &CoinStruct::with_value(26));
 
     left.merge(&right, &SliceData::new(vec![0x80])).unwrap();
     assert_eq!(left.len().unwrap(), 8);
     assert_eq!(tree, left);
-    assert_eq!(left.root_extra(), &GramStruct::with_value(36));
+    assert_eq!(left.root_extra(), &CoinStruct::with_value(36));
 }
 
-define_HashmapAugE!(SimpleAugDict, 8, u8, u8, GramStruct);
+define_HashmapAugE!(SimpleAugDict, 8, u8, u8, CoinStruct);
 
-impl Augmentation<GramStruct> for u8 {
-    fn aug(&self) -> Result<GramStruct> {
+impl Augmentation<CoinStruct> for u8 {
+    fn aug(&self) -> Result<CoinStruct> {
         unreachable!()
     }
 }
@@ -447,17 +447,17 @@ fn test_scan_diff_empty() {
     let mut tree_1 = SimpleAugDict::default();
     let mut tree_2 = SimpleAugDict::default();
 
-    tree_1.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_1.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_1.set(&0b11001100u8, &0b11001100, &GramStruct::with_value(3)).unwrap();
+    tree_1.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_1.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_1.set(&0b11001100u8, &0b11001100, &CoinStruct::with_value(3)).unwrap();
 
-    tree_2.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_2.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_2.set(&0b11001100u8, &0b11001100, &GramStruct::with_value(3)).unwrap();
+    tree_2.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_2.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_2.set(&0b11001100u8, &0b11001100, &CoinStruct::with_value(3)).unwrap();
 
-    let mut correct_dif: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut correct_dif: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
-    let mut diff_vec: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut diff_vec: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
     tree_1
         .scan_diff_with_aug(&tree_2, |key, value1, value2| {
@@ -475,18 +475,18 @@ fn test_scan_diff_1() {
     let mut tree_1 = SimpleAugDict::default();
     let mut tree_2 = SimpleAugDict::default();
 
-    tree_1.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_1.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_1.set(&0b11001100u8, &0b11001100, &GramStruct::with_value(3)).unwrap();
+    tree_1.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_1.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_1.set(&0b11001100u8, &0b11001100, &CoinStruct::with_value(3)).unwrap();
 
-    tree_2.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_2.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
+    tree_2.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_2.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
 
-    let mut correct_dif: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut correct_dif: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
-    correct_dif.push((0b11001100, Some((0b11001100, GramStruct::with_value(3))), None));
+    correct_dif.push((0b11001100, Some((0b11001100, CoinStruct::with_value(3))), None));
 
-    let mut diff_vec: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut diff_vec: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
     tree_1
         .scan_diff_with_aug(&tree_2, |key, value1, value2| {
@@ -505,18 +505,18 @@ fn test_scan_diff_2() {
     let mut tree_1 = SimpleAugDict::default();
     let mut tree_2 = SimpleAugDict::default();
 
-    tree_1.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_1.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
+    tree_1.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_1.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
 
-    tree_2.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_2.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_2.set(&0b11001100u8, &0b11001100, &GramStruct::with_value(3)).unwrap();
+    tree_2.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_2.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_2.set(&0b11001100u8, &0b11001100, &CoinStruct::with_value(3)).unwrap();
 
-    let mut correct_dif: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut correct_dif: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
-    correct_dif.push((0b11001100, None, Some((0b11001100, GramStruct::with_value(3)))));
+    correct_dif.push((0b11001100, None, Some((0b11001100, CoinStruct::with_value(3)))));
 
-    let mut diff_vec: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut diff_vec: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
     tree_1
         .scan_diff_with_aug(&tree_2, |key, value1, value2| {
@@ -535,21 +535,21 @@ fn test_scan_diff_3() {
     let mut tree_1 = SimpleAugDict::default();
     let mut tree_2 = SimpleAugDict::default();
 
-    tree_1.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_1.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_1.set(&0b11001100u8, &0b11001101, &GramStruct::with_value(3)).unwrap();
+    tree_1.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_1.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_1.set(&0b11001100u8, &0b11001101, &CoinStruct::with_value(3)).unwrap();
 
-    tree_2.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_2.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_2.set(&0b11001100u8, &0b11001100, &GramStruct::with_value(3)).unwrap();
+    tree_2.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_2.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_2.set(&0b11001100u8, &0b11001100, &CoinStruct::with_value(3)).unwrap();
 
-    let mut correct_dif: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut correct_dif: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
     correct_dif.push((
         0b11001100,
-        Some((0b11001101, GramStruct::with_value(3))),
-        Some((0b11001100, GramStruct::with_value(3))),
+        Some((0b11001101, CoinStruct::with_value(3))),
+        Some((0b11001100, CoinStruct::with_value(3))),
     ));
-    let mut diff_vec: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut diff_vec: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
     tree_1
         .scan_diff_with_aug(&tree_2, |key, value1, value2| {
@@ -567,13 +567,13 @@ fn test_filter_simple() {
     let mut tree_1 = SimpleAugDict::default();
     let mut tree_2 = SimpleAugDict::default();
 
-    tree_1.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_1.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_1.set(&0b11001100u8, &0b11001101, &GramStruct::with_value(3)).unwrap();
+    tree_1.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_1.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_1.set(&0b11001100u8, &0b11001101, &CoinStruct::with_value(3)).unwrap();
 
-    tree_2.set(&0b11111100u8, &0b11111100, &GramStruct::with_value(1)).unwrap();
-    tree_2.set(&0b11110000u8, &0b11110000, &GramStruct::with_value(2)).unwrap();
-    tree_2.set(&0b11001100u8, &0b11001101, &GramStruct::with_value(3)).unwrap();
+    tree_2.set(&0b11111100u8, &0b11111100, &CoinStruct::with_value(1)).unwrap();
+    tree_2.set(&0b11110000u8, &0b11110000, &CoinStruct::with_value(2)).unwrap();
+    tree_2.set(&0b11001100u8, &0b11001101, &CoinStruct::with_value(3)).unwrap();
     tree_1
         .filter(|key, _value, _aug| {
             let key = key.data()[0];
@@ -585,9 +585,9 @@ fn test_filter_simple() {
         })
         .unwrap();
 
-    let mut correct_dif: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
-    correct_dif.push((0b11001100, Some((0b11001101, GramStruct::with_value(3))), None));
-    let mut diff_vec: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut correct_dif: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
+    correct_dif.push((0b11001100, Some((0b11001101, CoinStruct::with_value(3))), None));
+    let mut diff_vec: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
     tree_2
         .scan_diff_with_aug(&tree_1, |key, value1, value2| {
@@ -605,28 +605,28 @@ fn test_filter() {
     let mut tree_1 = SimpleAugDict::default();
     let mut tree_2 = SimpleAugDict::default();
 
-    tree_1.set(&0b11001100u8, &0b11001101, &GramStruct::with_value(1)).unwrap();
-    tree_1.set(&0b11010000u8, &0b11001101, &GramStruct::with_value(2)).unwrap();
-    tree_1.set(&0b11010100u8, &0b11001101, &GramStruct::with_value(3)).unwrap();
-    tree_1.set(&0b11011000u8, &0b11001101, &GramStruct::with_value(4)).unwrap();
-    tree_1.set(&0b11011100u8, &0b11001101, &GramStruct::with_value(5)).unwrap();
-    tree_1.set(&0b11100000u8, &0b11001101, &GramStruct::with_value(6)).unwrap();
-    tree_1.set(&0b11100100u8, &0b11001101, &GramStruct::with_value(7)).unwrap();
-    tree_1.set(&0b11101000u8, &0b11001101, &GramStruct::with_value(8)).unwrap();
+    tree_1.set(&0b11001100u8, &0b11001101, &CoinStruct::with_value(1)).unwrap();
+    tree_1.set(&0b11010000u8, &0b11001101, &CoinStruct::with_value(2)).unwrap();
+    tree_1.set(&0b11010100u8, &0b11001101, &CoinStruct::with_value(3)).unwrap();
+    tree_1.set(&0b11011000u8, &0b11001101, &CoinStruct::with_value(4)).unwrap();
+    tree_1.set(&0b11011100u8, &0b11001101, &CoinStruct::with_value(5)).unwrap();
+    tree_1.set(&0b11100000u8, &0b11001101, &CoinStruct::with_value(6)).unwrap();
+    tree_1.set(&0b11100100u8, &0b11001101, &CoinStruct::with_value(7)).unwrap();
+    tree_1.set(&0b11101000u8, &0b11001101, &CoinStruct::with_value(8)).unwrap();
 
-    tree_2.set(&0b11001100u8, &0b11001101, &GramStruct::with_value(1)).unwrap();
-    tree_2.set(&0b11010100u8, &0b11001101, &GramStruct::with_value(3)).unwrap();
-    tree_2.set(&0b11011100u8, &0b11001101, &GramStruct::with_value(5)).unwrap();
-    tree_2.set(&0b11100100u8, &0b11001101, &GramStruct::with_value(7)).unwrap();
+    tree_2.set(&0b11001100u8, &0b11001101, &CoinStruct::with_value(1)).unwrap();
+    tree_2.set(&0b11010100u8, &0b11001101, &CoinStruct::with_value(3)).unwrap();
+    tree_2.set(&0b11011100u8, &0b11001101, &CoinStruct::with_value(5)).unwrap();
+    tree_2.set(&0b11100100u8, &0b11001101, &CoinStruct::with_value(7)).unwrap();
 
     let mut correct_dif = vec![
-        (0b11010000, Some((0b11001101, GramStruct::with_value(2))), None),
-        (0b11011000, Some((0b11001101, GramStruct::with_value(4))), None),
-        (0b11100000, Some((0b11001101, GramStruct::with_value(6))), None),
-        (0b11101000, Some((0b11001101, GramStruct::with_value(8))), None),
+        (0b11010000, Some((0b11001101, CoinStruct::with_value(2))), None),
+        (0b11011000, Some((0b11001101, CoinStruct::with_value(4))), None),
+        (0b11100000, Some((0b11001101, CoinStruct::with_value(6))), None),
+        (0b11101000, Some((0b11001101, CoinStruct::with_value(8))), None),
     ];
 
-    let mut diff_vec: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut diff_vec: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
     tree_1
         .scan_diff_with_aug(&tree_2, |key, value1, value2| {
@@ -649,8 +649,8 @@ fn test_filter() {
         })
         .unwrap();
 
-    let mut correct_dif: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
-    let mut diff_vec: Vec<(u8, Option<(u8, GramStruct)>, Option<(u8, GramStruct)>)> = Vec::new();
+    let mut correct_dif: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
+    let mut diff_vec: Vec<(u8, Option<(u8, CoinStruct)>, Option<(u8, CoinStruct)>)> = Vec::new();
 
     tree_1
         .scan_diff_with_aug(&tree_2, |key, value1, value2| {
@@ -667,26 +667,26 @@ fn test_filter() {
 fn test_traverse() {
     let mut tree_1 = SimpleAugDict::default();
 
-    tree_1.set(&0b000u8, &0b000u8, &GramStruct::with_value(0)).unwrap();
-    tree_1.set(&0b001u8, &0b001u8, &GramStruct::with_value(1)).unwrap();
-    tree_1.set(&0b010u8, &0b010u8, &GramStruct::with_value(2)).unwrap();
-    tree_1.set(&0b011u8, &0b011u8, &GramStruct::with_value(3)).unwrap();
-    tree_1.set(&0b100u8, &0b100u8, &GramStruct::with_value(4)).unwrap();
-    tree_1.set(&0b101u8, &0b101u8, &GramStruct::with_value(5)).unwrap();
-    tree_1.set(&0b110u8, &0b110u8, &GramStruct::with_value(6)).unwrap();
-    tree_1.set(&0b111u8, &0b111u8, &GramStruct::with_value(7)).unwrap();
+    tree_1.set(&0b000u8, &0b000u8, &CoinStruct::with_value(0)).unwrap();
+    tree_1.set(&0b001u8, &0b001u8, &CoinStruct::with_value(1)).unwrap();
+    tree_1.set(&0b010u8, &0b010u8, &CoinStruct::with_value(2)).unwrap();
+    tree_1.set(&0b011u8, &0b011u8, &CoinStruct::with_value(3)).unwrap();
+    tree_1.set(&0b100u8, &0b100u8, &CoinStruct::with_value(4)).unwrap();
+    tree_1.set(&0b101u8, &0b101u8, &CoinStruct::with_value(5)).unwrap();
+    tree_1.set(&0b110u8, &0b110u8, &CoinStruct::with_value(6)).unwrap();
+    tree_1.set(&0b111u8, &0b111u8, &CoinStruct::with_value(7)).unwrap();
 
     let zero_way = vec![
-        GramStruct::with_value(28),
-        GramStruct::with_value(6),
-        GramStruct::with_value(1),
-        GramStruct::with_value(0),
+        CoinStruct::with_value(28),
+        CoinStruct::with_value(6),
+        CoinStruct::with_value(1),
+        CoinStruct::with_value(0),
     ];
     let mut way = vec![];
     let res = tree_1
         .traverse_slices(
             |_key_prefix, _key_prefix_len, mut label| -> Result<TraverseNextStep<()>> {
-                let aug = GramStruct::construct_from(&mut label).unwrap();
+                let aug = CoinStruct::construct_from(&mut label).unwrap();
                 way.push(aug);
                 Ok(TraverseNextStep::VisitZero)
             },
@@ -696,10 +696,10 @@ fn test_traverse() {
     assert_eq!(way, zero_way);
 
     let ones_way = vec![
-        GramStruct::with_value(28),
-        GramStruct::with_value(22),
-        GramStruct::with_value(13),
-        GramStruct::with_value(7),
+        CoinStruct::with_value(28),
+        CoinStruct::with_value(22),
+        CoinStruct::with_value(13),
+        CoinStruct::with_value(7),
     ];
     let mut way = vec![];
     let res = tree_1
@@ -716,7 +716,7 @@ fn test_traverse() {
     assert_eq!(way, ones_way);
 
     let high_way =
-        vec![GramStruct::with_value(28), GramStruct::with_value(6), GramStruct::with_value(22)];
+        vec![CoinStruct::with_value(28), CoinStruct::with_value(6), CoinStruct::with_value(22)];
     let mut way = vec![];
     let res = tree_1
         .traverse(|_key_prefix, key_prefix_len, aug, _value_opt| -> Result<TraverseNextStep<()>> {
@@ -948,12 +948,12 @@ fn test_multiset_aug() {
 
 #[test]
 fn test_find_leaf_hashmapaug() {
-    let mut hashmap = GramHashmap8::new();
+    let mut hashmap = CoinHashmap8::new();
 
-    hashmap.set(&10u8, &100u32, &GramStruct::with_value(1)).unwrap();
-    hashmap.set(&20u8, &200u32, &GramStruct::with_value(2)).unwrap();
-    hashmap.set(&30u8, &300u32, &GramStruct::with_value(3)).unwrap();
-    hashmap.set(&50u8, &500u32, &GramStruct::with_value(5)).unwrap();
+    hashmap.set(&10u8, &100u32, &CoinStruct::with_value(1)).unwrap();
+    hashmap.set(&20u8, &200u32, &CoinStruct::with_value(2)).unwrap();
+    hashmap.set(&30u8, &300u32, &CoinStruct::with_value(3)).unwrap();
+    hashmap.set(&50u8, &500u32, &CoinStruct::with_value(5)).unwrap();
 
     // Test find_leaf with next=true, eq=true (find >= key)
     let result = hashmap.find_leaf(&10u8, true, true, false).unwrap();

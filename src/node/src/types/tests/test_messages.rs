@@ -28,12 +28,12 @@ fn test_msg_envelope() {
     let msg = Message::with_int_header(hdr);
     let msg_cell = msg.serialize().unwrap();
     let env =
-        MsgEnvelopeStuff::new(msg.clone(), msg_cell.clone(), &src_shard, Grams::default(), false)
+        MsgEnvelopeStuff::new(msg.clone(), msg_cell.clone(), &src_shard, Coins::default(), false)
             .unwrap();
     assert!(src_shard.contains_full_prefix(env.cur_prefix()));
     assert!(dst_shard.contains_full_prefix(env.next_prefix()));
 
-    let env = MsgEnvelopeStuff::new(msg, msg_cell, &src_shard, Grams::default(), true).unwrap();
+    let env = MsgEnvelopeStuff::new(msg, msg_cell, &src_shard, Coins::default(), true).unwrap();
     assert!(src_shard.contains_full_prefix(env.cur_prefix()));
     assert!(!dst_shard.contains_full_prefix(env.next_prefix()));
     let shard = ShardIdent::with_tagged_prefix(0, 0x7400000000000000).unwrap();
@@ -62,7 +62,7 @@ fn test_msg_envelope_before_split() {
         msg.clone(),
         msg_cell.clone(),
         &src_shard.merge().unwrap(),
-        Grams::default(),
+        Coins::default(),
         true,
     )
     .unwrap();

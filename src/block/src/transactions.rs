@@ -19,7 +19,7 @@ use crate::{
     merkle_proof::MerkleProof,
     messages::Message,
     shard::ShardStateUnsplit,
-    types::{ChildCell, CurrencyCollection, Grams, InRefValue, VarUInteger3, VarUInteger7},
+    types::{ChildCell, CurrencyCollection, Coins, InRefValue, VarUInteger3, VarUInteger7},
     AccountId, BuilderData, Cell, Deserializable, HashmapType, IBitstring, Result, Serializable,
     SliceData, UInt256, UsageTree,
 };
@@ -124,7 +124,7 @@ tr_phase_compute_vm$1
     success:Bool
     msg_state_used:Bool
     account_activated:Bool
-    gas_fees:Grams
+    gas_fees:Coins
     _:^[
         gas_used:(VarUInteger 7)
         gas_limit:(VarUInteger 7)
@@ -148,7 +148,7 @@ pub struct TrComputePhaseVm {
     pub success: bool,
     pub msg_state_used: bool,
     pub account_activated: bool,
-    pub gas_fees: Grams,
+    pub gas_fees: Coins,
     pub gas_used: VarUInteger7,
     pub gas_limit: VarUInteger7,
     pub gas_credit: Option<VarUInteger3>,
@@ -227,10 +227,10 @@ impl TrComputePhase {
         }
     }
 
-    pub fn gas_fees(&self) -> Grams {
+    pub fn gas_fees(&self) -> Coins {
         match self {
             TrComputePhase::Vm(vm_phase) => vm_phase.gas_fees,
-            _ => Grams::zero(),
+            _ => Coins::zero(),
         }
     }
 }
@@ -252,7 +252,7 @@ impl Serializable for TrComputePhase {
                 .append_bit_bool(v.msg_state_used)? // msg_state_used:Bool
                 .append_bit_bool(v.account_activated)?; // account_activated:Bool
 
-            v.gas_fees.write_to(cell)?; // gas_fees:Gram
+            v.gas_fees.write_to(cell)?; // gas_fees:Coin
 
             // fields below are serialized into separate cell
             let mut sep_cell = BuilderData::new();
@@ -283,7 +283,7 @@ impl Deserializable for TrComputePhase {
             let success = cell.get_next_bit()?; // success:Bool
             let msg_state_used = cell.get_next_bit()?; // msg_state_used:Bool
             let account_activated = cell.get_next_bit()?; // account_activated:Bool
-            let gas_fees = Deserializable::construct_from(cell)?; // gas_fees:Gram
+            let gas_fees = Deserializable::construct_from(cell)?; // gas_fees:Coin
 
             // fields below are serialized into separate cell
             let sep_cell = &mut SliceData::load_cell(cell.checked_drain_reference()?)?;
@@ -319,22 +319,22 @@ impl Deserializable for TrComputePhase {
 
 /*
 tr_phase_storage$_
-  storage_fees_collected:Grams
-  storage_fees_due:(Maybe Grams)
+  storage_fees_collected:Coins
+  storage_fees_due:(Maybe Coins)
   status_change:AccStatusChange
 = TrStoragePhase;
 */
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TrStoragePhase {
-    pub storage_fees_collected: Grams,
-    pub storage_fees_due: Option<Grams>,
+    pub storage_fees_collected: Coins,
+    pub storage_fees_due: Option<Coins>,
     pub status_change: AccStatusChange,
 }
 
 impl TrStoragePhase {
     pub const fn with_params(
-        collected: Grams,
-        due: Option<Grams>,
+        collected: Coins,
+        due: Option<Coins>,
         status: AccStatusChange,
     ) -> Self {
         TrStoragePhase {
@@ -370,26 +370,26 @@ tr_phase_bounce_negfunds$00 = TrBouncePhase;
 
 tr_phase_bounce_nofunds$01
   msg_size:StorageUsed
-  req_fwd_fees:Grams
+  req_fwd_fees:Coins
 = TrBouncePhase;
 
 tr_phase_bounce_ok$1
   msg_size:StorageUsed
-  msg_fees:Grams
-  fwd_fees:Grams
+  msg_fees:Coins
+  fwd_fees:Coins
 = TrBouncePhase;
 */
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TrBouncePhaseNofunds {
     pub msg_size: StorageUsed,
-    pub req_fwd_fees: Grams,
+    pub req_fwd_fees: Coins,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TrBouncePhaseOk {
     pub msg_size: StorageUsed,
-    pub msg_fees: Grams,
-    pub fwd_fees: Grams,
+    pub msg_fees: Coins,
+    pub fwd_fees: Coins,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -401,10 +401,10 @@ pub enum TrBouncePhase {
 }
 
 impl TrBouncePhase {
-    pub const fn ok(msg_size: StorageUsed, msg_fees: Grams, fwd_fees: Grams) -> Self {
+    pub const fn ok(msg_size: StorageUsed, msg_fees: Coins, fwd_fees: Coins) -> Self {
         TrBouncePhase::Ok(TrBouncePhaseOk::with_params(msg_size, msg_fees, fwd_fees))
     }
-    pub const fn no_funds(msg_size: StorageUsed, req_fwd_fees: Grams) -> Self {
+    pub const fn no_funds(msg_size: StorageUsed, req_fwd_fees: Coins) -> Self {
         TrBouncePhase::Nofunds(TrBouncePhaseNofunds::with_params(msg_size, req_fwd_fees))
     }
 }
@@ -420,14 +420,14 @@ impl Serializable for TrBouncePhase {
                 // tr_phase_bounce_nofunds$01
                 cell.append_bits(0b01, 2)?;
                 bp.msg_size.write_to(cell)?; // msg_size:StorageUsed
-                bp.req_fwd_fees.write_to(cell)?; // req_fwd_fees:Grams
+                bp.req_fwd_fees.write_to(cell)?; // req_fwd_fees:Coins
             }
             TrBouncePhase::Ok(bp) => {
                 // tr_phase_bounce_ok$1
                 cell.append_bit_one()?;
                 bp.msg_size.write_to(cell)?; // msg_size:StorageUsed
-                bp.msg_fees.write_to(cell)?; // msg_fees:Grams
-                bp.fwd_fees.write_to(cell)?; // fwd_fees:Grams
+                bp.msg_fees.write_to(cell)?; // msg_fees:Coins
+                bp.fwd_fees.write_to(cell)?; // fwd_fees:Coins
             }
         };
         Ok(())
@@ -440,14 +440,14 @@ impl Deserializable for TrBouncePhase {
             // tr_phase_bounce_ok$1
             let mut bp = TrBouncePhaseOk::default();
             bp.msg_size.read_from(cell)?; // msg_size:StorageUsed
-            bp.msg_fees.read_from(cell)?; // msg_fees:Grams
-            bp.fwd_fees.read_from(cell)?; // fwd_fees:Grams
+            bp.msg_fees.read_from(cell)?; // msg_fees:Coins
+            bp.fwd_fees.read_from(cell)?; // fwd_fees:Coins
             *self = TrBouncePhase::Ok(bp);
         } else if cell.get_next_bit()? {
             // tr_phase_bounce_nofunds$01
             let mut bp = TrBouncePhaseNofunds::default();
             bp.msg_size.read_from(cell)?; // msg_size:StorageUsed
-            bp.req_fwd_fees.read_from(cell)?; // req_fwd_fees:Grams
+            bp.req_fwd_fees.read_from(cell)?; // req_fwd_fees:Coins
             *self = TrBouncePhase::Nofunds(bp);
         } else {
             //tr_phase_bounce_negfunds$00
@@ -458,26 +458,26 @@ impl Deserializable for TrBouncePhase {
 }
 
 impl TrBouncePhaseOk {
-    pub const fn with_params(msg_size: StorageUsed, msg_fees: Grams, fwd_fees: Grams) -> Self {
+    pub const fn with_params(msg_size: StorageUsed, msg_fees: Coins, fwd_fees: Coins) -> Self {
         TrBouncePhaseOk { msg_size, msg_fees, fwd_fees }
     }
 }
 
 impl TrBouncePhaseNofunds {
-    pub const fn with_params(msg_size: StorageUsed, req_fwd_fees: Grams) -> Self {
+    pub const fn with_params(msg_size: StorageUsed, req_fwd_fees: Coins) -> Self {
         TrBouncePhaseNofunds { msg_size, req_fwd_fees }
     }
 }
 
 /*
 tr_phase_credit$_
-    due_fees_collected:(Maybe Grams)
+    due_fees_collected:(Maybe Coins)
     credit:CurrencyCollection
 = TrCreditPhase;
 */
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TrCreditPhase {
-    pub due_fees_collected: Option<Grams>,
+    pub due_fees_collected: Option<Coins>,
     pub credit: CurrencyCollection,
 }
 
@@ -559,8 +559,8 @@ pub struct TrActionPhase {
     pub no_funds: bool,
     pub status_change: AccStatusChange,
     // TODO: remove two next Options and store if it is not zero
-    pub total_fwd_fees: Option<Grams>,
-    pub total_action_fees: Option<Grams>,
+    pub total_fwd_fees: Option<Coins>,
+    pub total_action_fees: Option<Coins>,
     pub result_code: i32,
     pub result_arg: Option<i32>,
     pub tot_actions: i16,
@@ -569,22 +569,22 @@ pub struct TrActionPhase {
     pub msgs_created: i16,
     pub action_list_hash: UInt256,
     pub tot_msg_size: StorageUsed,
-    pub action_fine: Grams,
+    pub action_fine: Coins,
 }
 
 impl TrActionPhase {
-    pub fn add_fwd_fees(&mut self, fees: &Grams) {
+    pub fn add_fwd_fees(&mut self, fees: &Coins) {
         if !fees.is_zero() {
             self.total_fwd_fees.get_or_insert_default().add_checked(fees);
         }
     }
-    pub fn total_fwd_fees(&self) -> Grams {
+    pub fn total_fwd_fees(&self) -> Coins {
         self.total_fwd_fees.unwrap_or_default()
     }
     pub fn del_action_fees(&mut self) {
         self.total_action_fees = None;
     }
-    pub fn add_action_fees(&mut self, fees: &Grams) {
+    pub fn add_action_fees(&mut self, fees: &Coins) {
         if !fees.is_zero() {
             self.total_action_fees.get_or_insert_default().add_checked(fees);
         }
@@ -594,7 +594,7 @@ impl TrActionPhase {
             self.total_action_fees.get_or_insert_default().add_checked(&self.action_fine);
         }
     }
-    pub fn total_action_fees(&self) -> Grams {
+    pub fn total_action_fees(&self) -> Coins {
         self.total_action_fees.unwrap_or_default()
     }
 }
@@ -605,8 +605,8 @@ impl Serializable for TrActionPhase {
             .append_bit_bool(self.valid)? // valid:Bool
             .append_bit_bool(self.no_funds)?; // no_funds:Bool
         self.status_change.write_to(cell)?; // status_change:AccStatusChange
-        self.total_fwd_fees.write_to(cell)?; // total_fwd_fees:(Maybe Grams)
-        self.total_action_fees.write_to(cell)?; // total_action_fees:(Maybe Grams)
+        self.total_fwd_fees.write_to(cell)?; // total_fwd_fees:(Maybe Coins)
+        self.total_action_fees.write_to(cell)?; // total_action_fees:(Maybe Coins)
         self.result_code.write_to(cell)?; // result_code:int32
         self.result_arg.write_to(cell)?; // result_arg:(Maybe int32)
         self.tot_actions.write_to(cell)?; // tot_actions:uint16
@@ -625,8 +625,8 @@ impl Deserializable for TrActionPhase {
         self.valid = cell.get_next_bit()?; // valid:Bool
         self.no_funds = cell.get_next_bit()?; // no_funds:Bool
         self.status_change.read_from(cell)?; // status_change:AccStatusChange
-        self.total_fwd_fees.read_from(cell)?; // total_fwd_fees:(Maybe Grams)
-        self.total_action_fees.read_from(cell)?; // total_action_fees:(Maybe Grams)
+        self.total_fwd_fees.read_from(cell)?; // total_fwd_fees:(Maybe Coins)
+        self.total_action_fees.read_from(cell)?; // total_action_fees:(Maybe Coins)
         self.result_code.read_from(cell)?; // result_code:int32
         self.result_arg.read_from(cell)?; // result_arg:(Maybe int32)
         self.tot_actions.read_from(cell)?; // tot_actions:uint16
@@ -1352,8 +1352,8 @@ impl Transaction {
     }
 
     /// add fee
-    pub fn add_fee_grams(&mut self, fee: &Grams) -> Result<bool> {
-        crate::types::AddSub::add(&mut self.total_fees.grams, fee)
+    pub fn add_fee_coins(&mut self, fee: &Coins) -> Result<bool> {
+        crate::types::AddSub::add(&mut self.total_fees.coins, fee)
     }
 
     /// set total fees

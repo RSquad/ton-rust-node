@@ -97,7 +97,7 @@ fn test_find_shards_by_routing_custom() {
     let hdr = InternalMessageHeader::with_addresses_and_bounce(
         MsgAddressInt::with_standart(None, 0, src).unwrap(),
         MsgAddressInt::with_standart(None, 0, dst).unwrap(),
-        CurrencyCollection::with_grams(3000000000),
+        CurrencyCollection::with_coins(3000000000),
         true,
     );
     let msg = Message::with_int_header(hdr);

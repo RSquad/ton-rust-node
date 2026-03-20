@@ -44,13 +44,13 @@ impl SerializationMode {
 }
 
 struct SignedCurrencyCollection {
-    pub grams: BigInt,
+    pub coins: BigInt,
     pub other: HashMap<u32, BigInt>,
 }
 
 impl SignedCurrencyCollection {
     pub fn new() -> Self {
-        SignedCurrencyCollection { grams: 0.into(), other: HashMap::new() }
+        SignedCurrencyCollection { coins: 0.into(), other: HashMap::new() }
     }
 
     pub fn from_cc(cc: &CurrencyCollection) -> Result<Self> {
@@ -60,11 +60,11 @@ impl SignedCurrencyCollection {
             Ok(true)
         })?;
 
-        Ok(SignedCurrencyCollection { grams: cc.grams.as_u128().into(), other })
+        Ok(SignedCurrencyCollection { coins: cc.coins.as_u128().into(), other })
     }
 
     pub fn add(&mut self, other: &Self) {
-        self.grams += &other.grams;
+        self.coins += &other.coins;
         for (key, value) in self.other.iter_mut() {
             if let Some(other_value) = other.other.get(key) {
                 *value += other_value;
@@ -78,7 +78,7 @@ impl SignedCurrencyCollection {
     }
 
     pub fn sub(&mut self, other: &Self) {
-        self.grams -= &other.grams;
+        self.coins -= &other.coins;
         for (key, value) in self.other.iter_mut() {
             if let Some(other_value) = other.other.get(key) {
                 *value -= other_value;
@@ -92,7 +92,7 @@ impl SignedCurrencyCollection {
     }
 }
 
-fn get_msg_fees(msg: &Message) -> Option<&Grams> {
+fn get_msg_fees(msg: &Message) -> Option<&Coins> {
     match msg.header() {
         CommonMsgInfo::IntMsgInfo(header) => Some(&header.fwd_fee),
         _ => None,
@@ -139,10 +139,10 @@ pub fn block_order(block: &Block, mc_seq_no: u32) -> Result<String> {
     }
 }
 
-fn serialize_grams(
+fn serialize_coins(
     map: &mut Map<String, Value>,
     id_str: &'static str,
-    value: &Grams,
+    value: &Coins,
     mode: SerializationMode,
 ) {
     let string = match mode {
@@ -299,12 +299,12 @@ fn serialize_storage_phase<'a>(
     map: &mut Map<String, Value>,
     ph: Option<&'a TrStoragePhase>,
     mode: SerializationMode,
-) -> Option<&'a Grams> {
+) -> Option<&'a Coins> {
     if let Some(ph) = ph {
         let mut ph_map = serde_json::Map::new();
-        serialize_grams(&mut ph_map, "storage_fees_collected", &ph.storage_fees_collected, mode);
-        if let Some(grams) = &ph.storage_fees_due {
-            serialize_grams(&mut ph_map, "storage_fees_due", grams, mode);
+        serialize_coins(&mut ph_map, "storage_fees_collected", &ph.storage_fees_collected, mode);
+        if let Some(coins) = &ph.storage_fees_due {
+            serialize_coins(&mut ph_map, "storage_fees_due", coins, mode);
         }
         let status_change = match ph.status_change {
             AccStatusChange::Unchanged => 0,
@@ -331,7 +331,7 @@ fn serialize_compute_phase<'a>(
     map: &mut Map<String, Value>,
     ph: Option<&'a TrComputePhase>,
     mode: SerializationMode,
-) -> Option<&'a Grams> {
+) -> Option<&'a Coins> {
     let mut ph_map = serde_json::Map::new();
     let mut fees = None;
     let (type_, type_name) = match ph {
@@ -358,7 +358,7 @@ fn serialize_compute_phase<'a>(
             ph_map.insert("success".to_string(), ph.success.into());
             ph_map.insert("msg_state_used".to_string(), ph.msg_state_used.into());
             ph_map.insert("account_activated".to_string(), ph.account_activated.into());
-            serialize_grams(&mut ph_map, "gas_fees", &ph.gas_fees, mode);
+            serialize_coins(&mut ph_map, "gas_fees", &ph.gas_fees, mode);
             fees = Some(&ph.gas_fees);
             ph_map.insert("gas_used".to_string(), ph.gas_used.as_u64().into());
             ph_map.insert("gas_limit".to_string(), ph.gas_limit.as_u64().into());
@@ -391,8 +391,8 @@ fn serialize_credit_phase(
 ) -> Result<()> {
     if let Some(ph) = ph {
         let mut ph_map = serde_json::Map::new();
-        if let Some(grams) = &ph.due_fees_collected {
-            serialize_grams(&mut ph_map, "due_fees_collected", grams, mode);
+        if let Some(coins) = &ph.due_fees_collected {
+            serialize_coins(&mut ph_map, "due_fees_collected", coins, mode);
         }
         serialize_cc(&mut ph_map, "credit", &ph.credit, mode)?;
         serialize_field(map, "credit", ph_map);
@@ -404,7 +404,7 @@ fn serialize_action_phase<'a>(
     map: &mut Map<String, Value>,
     ph: Option<&'a TrActionPhase>,
     mode: SerializationMode,
-) -> Option<&'a Grams> {
+) -> Option<&'a Coins> {
     if let Some(ph) = ph {
         let mut ph_map = serde_json::Map::new();
         ph_map.insert("success".to_string(), ph.success.into());
@@ -416,11 +416,11 @@ fn serialize_action_phase<'a>(
             AccStatusChange::Deleted => 2,
         };
         serialize_field(&mut ph_map, "status_change", status_change);
-        if let Some(grams) = ph.total_fwd_fees.as_ref() {
-            serialize_grams(&mut ph_map, "total_fwd_fees", grams, mode);
+        if let Some(coins) = ph.total_fwd_fees.as_ref() {
+            serialize_coins(&mut ph_map, "total_fwd_fees", coins, mode);
         }
-        if let Some(grams) = ph.total_action_fees.as_ref() {
-            serialize_grams(&mut ph_map, "total_action_fees", grams, mode);
+        if let Some(coins) = ph.total_action_fees.as_ref() {
+            serialize_coins(&mut ph_map, "total_action_fees", coins, mode);
         }
         let fees = ph.total_action_fees.as_ref();
         ph_map.insert("result_code".to_string(), ph.result_code.into());
@@ -443,7 +443,7 @@ fn serialize_bounce_phase<'a>(
     map: &mut Map<String, Value>,
     ph: Option<&'a TrBouncePhase>,
     mode: SerializationMode,
-) -> Option<&'a Grams> {
+) -> Option<&'a Coins> {
     let mut ph_map = serde_json::Map::new();
     let mut fees = None;
     let (bounce_type, type_name) = match ph {
@@ -451,15 +451,15 @@ fn serialize_bounce_phase<'a>(
         Some(TrBouncePhase::Nofunds(ph)) => {
             ph_map.insert("msg_size_cells".to_string(), ph.msg_size.cells().into());
             ph_map.insert("msg_size_bits".to_string(), ph.msg_size.bits().into());
-            serialize_grams(&mut ph_map, "req_fwd_fees", &ph.req_fwd_fees, mode);
+            serialize_coins(&mut ph_map, "req_fwd_fees", &ph.req_fwd_fees, mode);
             (1, "noFunds")
         }
         Some(TrBouncePhase::Ok(ph)) => {
             ph_map.insert("msg_size_cells".to_string(), ph.msg_size.cells().into());
             ph_map.insert("msg_size_bits".to_string(), ph.msg_size.bits().into());
             fees = Some(&ph.msg_fees);
-            serialize_grams(&mut ph_map, "msg_fees", &ph.msg_fees, mode);
-            serialize_grams(&mut ph_map, "fwd_fees", &ph.fwd_fees, mode);
+            serialize_coins(&mut ph_map, "msg_fees", &ph.msg_fees, mode);
+            serialize_coins(&mut ph_map, "fwd_fees", &ph.fwd_fees, mode);
             (2, "ok")
         }
         None => return None,
@@ -478,7 +478,7 @@ fn serialize_cc(
     cc: &CurrencyCollection,
     mode: SerializationMode,
 ) -> Result<()> {
-    serialize_grams(map, prefix, &cc.grams, mode);
+    serialize_coins(map, prefix, &cc.coins, mode);
     let other = serialize_ecc(&cc.other, mode)?;
     if !other.is_empty() {
         map.insert(format!("{}_other", prefix), other.into());
@@ -507,7 +507,7 @@ fn serialize_scc(
     scc: &SignedCurrencyCollection,
     mode: SerializationMode,
 ) {
-    serialize_bigint(map, prefix, &scc.grams, mode);
+    serialize_bigint(map, prefix, &scc.coins, mode);
     let mut other = Vec::new();
     for (key, value) in &scc.other {
         let mut other_map = Map::new();
@@ -565,7 +565,7 @@ fn serialize_envelope_msg(env: &MsgEnvelope, mode: SerializationMode) -> Map<Str
     }
     serialize_intermidiate_address(&mut map, "cur_addr", env.cur_addr());
     serialize_intermidiate_address(&mut map, "next_addr", env.next_addr());
-    serialize_grams(&mut map, "fwd_fee_remaining", env.fwd_fee_remaining(), mode);
+    serialize_coins(&mut map, "fwd_fee_remaining", env.fwd_fee_remaining(), mode);
     map
 }
 
@@ -580,7 +580,7 @@ fn serialize_in_msg(msg: &InMsg, mode: SerializationMode) -> Result<Value> {
         InMsg::IHR(msg) => {
             serialize_id(&mut map, "msg_id", Some(&msg.message_cell().repr_hash()));
             serialize_id(&mut map, "transaction_id", Some(&msg.transaction_cell().repr_hash()));
-            serialize_grams(&mut map, "ihr_fee", msg.ihr_fee(), mode);
+            serialize_coins(&mut map, "ihr_fee", msg.ihr_fee(), mode);
             serialize_cell(&mut map, "proof_created", Some(msg.proof_created()), false)?;
             (1, "ihr")
         }
@@ -590,7 +590,7 @@ fn serialize_in_msg(msg: &InMsg, mode: SerializationMode) -> Result<Value> {
                 serialize_envelope_msg(&msg.read_envelope_message()?, mode).into(),
             );
             serialize_id(&mut map, "transaction_id", Some(&msg.transaction_cell().repr_hash()));
-            serialize_grams(&mut map, "fwd_fee", &msg.fwd_fee, mode);
+            serialize_coins(&mut map, "fwd_fee", &msg.fwd_fee, mode);
             (2, "immediately")
         }
         InMsg::Final(msg) => {
@@ -599,7 +599,7 @@ fn serialize_in_msg(msg: &InMsg, mode: SerializationMode) -> Result<Value> {
                 serialize_envelope_msg(&msg.read_envelope_message()?, mode).into(),
             );
             serialize_id(&mut map, "transaction_id", Some(&msg.transaction_cell().repr_hash()));
-            serialize_grams(&mut map, "fwd_fee", &msg.fwd_fee, mode);
+            serialize_coins(&mut map, "fwd_fee", &msg.fwd_fee, mode);
             (3, "final")
         }
         InMsg::DeferredFinal(msg) => {
@@ -608,7 +608,7 @@ fn serialize_in_msg(msg: &InMsg, mode: SerializationMode) -> Result<Value> {
                 serialize_envelope_msg(&msg.read_envelope_message()?, mode).into(),
             );
             serialize_id(&mut map, "transaction_id", Some(&msg.transaction_cell().repr_hash()));
-            serialize_grams(&mut map, "fwd_fee", &msg.fwd_fee, mode);
+            serialize_coins(&mut map, "fwd_fee", &msg.fwd_fee, mode);
             (8, "deferred final")
         }
         InMsg::Transit(msg) => {
@@ -620,7 +620,7 @@ fn serialize_in_msg(msg: &InMsg, mode: SerializationMode) -> Result<Value> {
                 "out_msg".to_string(),
                 serialize_envelope_msg(&msg.read_out_message()?, mode).into(),
             );
-            serialize_grams(&mut map, "transit_fee", &msg.transit_fee, mode);
+            serialize_coins(&mut map, "transit_fee", &msg.transit_fee, mode);
             (4, "transit")
         }
         InMsg::DeferredTransit(msg) => {
@@ -640,7 +640,7 @@ fn serialize_in_msg(msg: &InMsg, mode: SerializationMode) -> Result<Value> {
                 serialize_envelope_msg(&msg.read_envelope_message()?, mode).into(),
             );
             serialize_u64(&mut map, "transaction_id", &msg.transaction_id(), mode);
-            serialize_grams(&mut map, "fwd_fee", &msg.fwd_fee, mode);
+            serialize_coins(&mut map, "fwd_fee", &msg.fwd_fee, mode);
             (5, "discardedFinal")
         }
         InMsg::DiscardedTransit(msg) => {
@@ -649,7 +649,7 @@ fn serialize_in_msg(msg: &InMsg, mode: SerializationMode) -> Result<Value> {
                 serialize_envelope_msg(&msg.read_envelope_message()?, mode).into(),
             );
             serialize_u64(&mut map, "transaction_id", &msg.transaction_id(), mode);
-            serialize_grams(&mut map, "fwd_fee", msg.fwd_fee(), mode);
+            serialize_coins(&mut map, "fwd_fee", msg.fwd_fee(), mode);
             serialize_cell(&mut map, "proof_delivered", Some(msg.proof_delivered()), false)?;
             (6, "discardedTransit")
         }
@@ -993,7 +993,7 @@ fn serialize_misbehaviour_punishment_config(
     mode: SerializationMode,
 ) -> Result<Value> {
     let mut map = Map::new();
-    serialize_grams(&mut map, "default_flat_fine", &config.default_flat_fine, mode);
+    serialize_coins(&mut map, "default_flat_fine", &config.default_flat_fine, mode);
     serialize_field(&mut map, "default_proportional_fine", config.default_proportional_fine);
     serialize_field(&mut map, "severity_flat_mult", config.severity_flat_mult);
     serialize_field(&mut map, "severity_proportional_mult", config.severity_proportional_mult);
@@ -1122,22 +1122,22 @@ fn serialize_jetton_bridge_params(
     serialize_field(&mut map, "oracles_address", pl.oracles_address.as_hex_string());
     serialize_field(&mut map, "external_chain_address", pl.external_chain_address.as_hex_string());
     serialize_field(&mut map, "state_flags", pl.state_flags);
-    serialize_grams(&mut map, "bridge_burn_fee", &pl.prices.bridge_burn_fee, mode);
-    serialize_grams(&mut map, "bridge_mint_fee", &pl.prices.bridge_mint_fee, mode);
-    serialize_grams(
+    serialize_coins(&mut map, "bridge_burn_fee", &pl.prices.bridge_burn_fee, mode);
+    serialize_coins(&mut map, "bridge_mint_fee", &pl.prices.bridge_mint_fee, mode);
+    serialize_coins(
         &mut map,
         "wallet_min_tons_for_storage",
         &pl.prices.wallet_min_tons_for_storage,
         mode,
     );
-    serialize_grams(&mut map, "wallet_gas_consumption", &pl.prices.wallet_gas_consumption, mode);
-    serialize_grams(
+    serialize_coins(&mut map, "wallet_gas_consumption", &pl.prices.wallet_gas_consumption, mode);
+    serialize_coins(
         &mut map,
         "minter_min_tons_for_storage",
         &pl.prices.minter_min_tons_for_storage,
         mode,
     );
-    serialize_grams(
+    serialize_coins(
         &mut map,
         "discover_gas_consumption",
         &pl.prices.discover_gas_consumption,
@@ -1186,8 +1186,8 @@ pub fn serialize_known_config_param(
             serialize_field(&mut map, "fee_burn_denom", c.fee_burn_denom);
         }
         ConfigParamEnum::ConfigParam6(c) => {
-            serialize_grams(&mut map, "mint_new_price", &c.mint_new_price, mode);
-            serialize_grams(&mut map, "mint_add_price", &c.mint_add_price, mode);
+            serialize_coins(&mut map, "mint_new_price", &c.mint_new_price, mode);
+            serialize_coins(&mut map, "mint_add_price", &c.mint_add_price, mode);
         }
         ConfigParamEnum::ConfigParam7(c) => {
             return Ok(Some(serialize_ecc(&c.to_mint, mode)?.into()));
@@ -1222,13 +1222,13 @@ pub fn serialize_known_config_param(
             serialize_field(&mut map, "boc", base64_encode(boc));
         }
         ConfigParamEnum::ConfigParam14(c) => {
-            serialize_grams(
+            serialize_coins(
                 &mut map,
                 "masterchain_block_fee",
                 &c.block_create_fees.masterchain_block_fee,
                 mode,
             );
-            serialize_grams(
+            serialize_coins(
                 &mut map,
                 "basechain_block_fee",
                 &c.block_create_fees.basechain_block_fee,
@@ -1247,9 +1247,9 @@ pub fn serialize_known_config_param(
             serialize_field(&mut map, "min_validators", c.min_validators.as_u32());
         }
         ConfigParamEnum::ConfigParam17(c) => {
-            serialize_grams(&mut map, "min_stake", &c.min_stake, mode);
-            serialize_grams(&mut map, "max_stake", &c.max_stake, mode);
-            serialize_grams(&mut map, "min_total_stake", &c.min_total_stake, mode);
+            serialize_coins(&mut map, "min_stake", &c.min_stake, mode);
+            serialize_coins(&mut map, "max_stake", &c.max_stake, mode);
+            serialize_coins(&mut map, "min_total_stake", &c.min_total_stake, mode);
             serialize_field(&mut map, "max_stake_factor", c.max_stake_factor);
         }
         ConfigParamEnum::ConfigParam18(c) => {
@@ -2002,7 +2002,7 @@ pub fn db_serialize_transaction_ex<'a>(
     let mut ext_in_msg_fee = None;
     let (tr_type, tr_type_name) = match &set.transaction.read_description()? {
         TransactionDescr::Ordinary(tr) => {
-            let mut fees = set.transaction.total_fees().grams;
+            let mut fees = set.transaction.total_fees().coins;
             if let Some(fee) = serialize_storage_phase(&mut map, tr.storage_ph.as_ref(), mode) {
                 fees.sub(fee)?;
             }
@@ -2098,7 +2098,7 @@ pub fn db_serialize_transaction_ex<'a>(
         address_from_message = msg.dst_ref().cloned();
 
         if msg.is_inbound_external() {
-            serialize_grams(&mut map, "ext_in_msg_fee", &ext_in_msg_fee.unwrap_or_default(), mode);
+            serialize_coins(&mut map, "ext_in_msg_fee", &ext_in_msg_fee.unwrap_or_default(), mode);
         }
     }
     let mut out_ids = vec![];
@@ -2110,7 +2110,7 @@ pub fn db_serialize_transaction_ex<'a>(
                 balance_delta.sub(&SignedCurrencyCollection::from_cc(value)?);
             }
             if let Some(fwd_fee) = get_msg_fees(&msg) {
-                balance_delta.grams -= fwd_fee.as_u128();
+                balance_delta.coins -= fwd_fee.as_u128();
             }
             if address_from_message.is_none() {
                 address_from_message = msg.src_ref().cloned();
@@ -2209,8 +2209,8 @@ pub fn db_serialize_account_ex(
         serialize_u64(&mut map, "bits", &storage_stat.used().bits(), mode);
         serialize_u64(&mut map, "cells", &storage_stat.used().cells(), mode);
         serialize_id(&mut map, "dict_hash", storage_stat.dict_hash());
-        if let Some(grams) = storage_stat.due_payment() {
-            serialize_grams(&mut map, "due_payment", grams, mode);
+        if let Some(coins) = storage_stat.due_payment() {
+            serialize_coins(&mut map, "due_payment", coins, mode);
         }
     }
     serialize_lt(&mut map, "last_trans_lt", set.account.last_tr_time().unwrap_or_default(), mode);
@@ -2370,8 +2370,8 @@ pub fn db_serialize_message_ex(
             serialize_field(&mut map, "dst", header.dst.to_string());
             serialize_field(&mut map, "dst_workchain_id", header.dst.workchain_id());
             serialize_field(&mut map, "ihr_disabled", header.ihr_disabled);
-            serialize_grams(&mut map, "extra_flags", &header.extra_flags, mode);
-            serialize_grams(&mut map, "fwd_fee", &header.fwd_fee, mode);
+            serialize_coins(&mut map, "extra_flags", &header.extra_flags, mode);
+            serialize_coins(&mut map, "fwd_fee", &header.fwd_fee, mode);
             serialize_field(&mut map, "bounce", header.bounce);
             serialize_field(&mut map, "bounced", header.bounced);
             serialize_cc(&mut map, "value", &header.value, mode)?;
@@ -2386,7 +2386,7 @@ pub fn db_serialize_message_ex(
             serialize_field(&mut map, "src", header.src.to_string());
             serialize_field(&mut map, "dst", header.dst.to_string());
             serialize_field(&mut map, "dst_workchain_id", header.dst.workchain_id());
-            serialize_grams(&mut map, "import_fee", &header.import_fee, mode);
+            serialize_coins(&mut map, "import_fee", &header.import_fee, mode);
             if let Some(now) = set.transaction_now {
                 serialize_field(&mut map, "created_at", now);
             }

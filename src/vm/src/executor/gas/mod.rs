@@ -22,9 +22,9 @@ use ton_block::{fail, ExceptionCode, Result, Status};
 
 pub mod gas_state;
 
-fn gramtogas(engine: &Engine, nanograms: &IntegerData) -> Result<i64> {
+fn gramtogas(engine: &Engine, nanocoins: &IntegerData) -> Result<i64> {
     let gas_price = IntegerData::from_i64(engine.get_gas().get_gas_price());
-    let gas = nanograms.div::<Quiet>(&gas_price, Round::FloorToZero)?.0;
+    let gas = nanocoins.div::<Quiet>(&gas_price, Round::FloorToZero)?.0;
     let ret = gas.take_value_of(|x| i64::from_int(x).ok()).unwrap_or(i64::MAX);
     Ok(ret)
 }
@@ -56,8 +56,8 @@ pub fn execute_setgaslimit(engine: &mut Engine) -> Status {
 pub fn execute_buygas(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("BUYGAS"))?;
     fetch_stack(engine, 1)?;
-    let nanograms = engine.cmd.var(0).as_integer()?;
-    let gas_limit = gramtogas(engine, nanograms)?;
+    let nanocoins = engine.cmd.var(0).as_integer()?;
+    let gas_limit = gramtogas(engine, nanocoins)?;
     setgaslimit(engine, gas_limit)
 }
 // Application-specific primitives - A.11; Gas-related primitives - A.11.2
@@ -65,12 +65,12 @@ pub fn execute_buygas(engine: &mut Engine) -> Status {
 pub fn execute_gramtogas(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("GRAMTOGAS"))?;
     fetch_stack(engine, 1)?;
-    let nanograms_input = engine.cmd.var(0);
-    let gas = if nanograms_input.as_integer()?.is_neg() {
+    let nanocoins_input = engine.cmd.var(0);
+    let gas = if nanocoins_input.as_integer()?.is_neg() {
         0
     } else {
-        let nanograms = nanograms_input.as_integer()?;
-        gramtogas(engine, nanograms)?
+        let nanocoins = nanocoins_input.as_integer()?;
+        gramtogas(engine, nanocoins)?
     };
     engine.cc.stack.push(int!(gas));
     Ok(())
@@ -91,8 +91,8 @@ pub fn execute_gastogram(engine: &mut Engine) -> Status {
     fetch_stack(engine, 1)?;
     let gas = engine.cmd.var(0).as_integer()?;
     let gas_price = engine.get_gas().get_gas_price();
-    let nanogram_output = gas.mul::<Quiet>(&IntegerData::from_i64(gas_price))?;
-    engine.cc.stack.push(StackItem::int(nanogram_output));
+    let nanocoin_output = gas.mul::<Quiet>(&IntegerData::from_i64(gas_price))?;
+    engine.cc.stack.push(StackItem::int(nanocoin_output));
     Ok(())
 }
 

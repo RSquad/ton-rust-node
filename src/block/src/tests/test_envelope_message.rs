@@ -132,7 +132,7 @@ fn prepare_test_env_message(
     let hdr = InternalMessageHeader::with_addresses(
         src,
         dst,
-        CurrencyCollection::with_grams(1_000_000_000),
+        CurrencyCollection::with_coins(1_000_000_000),
     );
     let mut msg = Message::with_int_header(hdr);
     msg.set_at_and_lt(at, lt);

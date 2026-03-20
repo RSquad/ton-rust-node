@@ -123,7 +123,7 @@ pub enum OutAction {
     ///
     /// Action for reserving some account balance.
     /// It is roughly equivalent to creating an output
-    /// message carrying x nanograms to oneself,so that
+    /// message carrying x nanocoins to oneself,so that
     /// the subsequent output actions would not be able
     /// to spend more money than the remainder.
     ///

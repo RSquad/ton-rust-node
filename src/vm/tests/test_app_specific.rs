@@ -610,12 +610,12 @@ fn test_send_msg() {
     }
     let src = MsgAddressInt::standard(0, [0x11; 32]);
     let dst = MsgAddressInt::standard(0, [0x22; 32]);
-    let h = InternalMessageHeader::with_addresses(src, dst, CurrencyCollection::with_grams(6789));
+    let h = InternalMessageHeader::with_addresses(src, dst, CurrencyCollection::with_coins(6789));
     let msg = Message::with_int_header(h);
     let msg_cell = msg.serialize().unwrap();
     for len in [201, 501, 921, 1023] {
         let fee = if len < 320 { 1812000 } else { 2017000 + len * 1000 };
-        let mut value = CurrencyCollection::with_grams(357);
+        let mut value = CurrencyCollection::with_coins(357);
         value.set_other(11, 123).unwrap();
         let h = InternalMessageHeader {
             dst: MsgAddressInt::standard(0, [0x22; 32]),
@@ -655,14 +655,14 @@ fn test_send_msg() {
 
 #[test]
 fn test_rawreserve_with_parsing() {
-    let reserved_grams = 123456789u128;
+    let reserved_coins = 123456789u128;
     let flags = 3u8;
     let mut out_actions = BuilderData::new();
     out_actions
         .append_u32(ACTION_RESERVE)
         .and_then(|b| b.append_u8(flags))
         .and_then(|b| {
-            b.append_builder(&serialize_currency_collection(reserved_grams, None).unwrap())
+            b.append_builder(&serialize_currency_collection(reserved_coins, None).unwrap())
         })
         .unwrap();
     out_actions.checked_append_reference(Cell::default()).unwrap();
@@ -674,14 +674,14 @@ fn test_rawreserve_with_parsing() {
         RAWRESERVE
         PUSHCTR c5
         ",
-        reserved_grams, flags
+        reserved_coins, flags
     ))
     .expect_item(StackItem::Cell(out_actions.into_cell().unwrap()));
 }
 
 #[test]
 fn test_rawreservex_with_parsing() {
-    let reserved_grams = 123456789u128;
+    let reserved_coins = 123456789u128;
     let mut other = HashmapE::with_bit_len(32);
     let key = BuilderData::new().append_u32(1).unwrap().clone();
     let value = BuilderData::new().append_u128(0).unwrap().append_u128(100).unwrap().clone();
@@ -689,7 +689,7 @@ fn test_rawreservex_with_parsing() {
     let key = BuilderData::new().append_u32(2).unwrap().clone();
     let value = BuilderData::new().append_u128(0).unwrap().append_u128(200).unwrap().clone();
     other.set_builder(SliceData::load_builder(key).unwrap(), &value).unwrap();
-    let currency = &serialize_currency_collection(reserved_grams, other.data().cloned()).unwrap();
+    let currency = &serialize_currency_collection(reserved_coins, other.data().cloned()).unwrap();
     let flags = 3u8;
     let mut out_actions = BuilderData::new();
     out_actions.checked_append_reference(Cell::default()).unwrap();
@@ -708,7 +708,7 @@ fn test_rawreservex_with_parsing() {
         RAWRESERVEX
         PUSHCTR c5
         ",
-            reserved_grams, flags
+            reserved_coins, flags
         ),
         currency.references()[0].clone(),
     )

@@ -23,7 +23,7 @@ fn test_case_with_c7(code: &str) -> TestCaseInputs {
         PUSHINT 4
         PUSHINT 5
         PUSHINT 6
-        ; balance 1000 grams and no others
+        ; balance 1000 coins and no others
         PUSHINT 1000
         NULL
         PAIR
@@ -1034,7 +1034,7 @@ mod calc_fees {
     fn test_get_accont_and_messag_params() {
         let src = MsgAddressInt::standard(-1, [0x00; 32]);
         let addr = MsgAddressInt::standard(0, [0x55; 32]);
-        let value = CurrencyCollection::with_grams(5618);
+        let value = CurrencyCollection::with_coins(5618);
         let h = InternalMessageHeader::with_addresses_and_bounce(src, addr, value, true);
         let msg = Message::with_int_header(h);
         let message_root = msg.serialize().unwrap();

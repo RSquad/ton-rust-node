@@ -26,7 +26,7 @@ use ton_api::ton::{lite_server::BlockLink, tvm::StackEntry, Bool};
 use ton_block::{
     address_crc, base64_decode, base64_decode_url_safe, base64_encode, error, fail,
     read_single_root_boc, ton_method_id, write_boc, Account, AccountIdPrefixFull, AccountStatus,
-    Block, BlockIdExt, Cell, Deserializable, ExtBlkRef, ExternalInboundMessageHeader, Grams,
+    Block, BlockIdExt, Cell, Deserializable, ExtBlkRef, ExternalInboundMessageHeader, Coins,
     HashmapAugType, HashmapType, KeyExtBlkRef, Message, MsgAddressInt, Result, Serializable,
     ShardAccount, ShardIdent, SliceData, StateInit, StorageUsageCalc, Transaction,
     TransactionDescr, UInt256, UnixTime, ADDR_FORMAT_BOUNCE, ADDR_FORMAT_TESTNET,
@@ -321,7 +321,7 @@ async fn get_extended_address_information(p: GetAddressInformationParams, ctx: C
             "@type": "accountAddress",
             "account_address": p.address,
           },
-          "balance": balance.grams.to_string(),
+          "balance": balance.coins.to_string(),
           "extra_currencies": [],
           "last_transaction_id": serialize_shard_account(&acc_ctx.shard_account),
           "block_id": serialize_block_id(&acc_ctx.mc_block_id),
@@ -355,7 +355,7 @@ async fn get_wallet_information(p: GetAddressInformationParams, ctx: Ctx) -> Jso
 
     let mut result = serde_json::Map::new();
     result.insert("wallet".into(), serde_json::Value::Bool(false));
-    result.insert("balance".into(), serde_json::Value::String(balance.grams.to_string()));
+    result.insert("balance".into(), serde_json::Value::String(balance.coins.to_string()));
     result.insert("extra_currencies".into(), serde_json::Value::Array(Vec::new()));
     result.insert("account_state".into(), serde_json::Value::String(state.into()));
     result.insert("last_transaction_id".into(), serialize_shard_account(&acc_ctx.shard_account));
@@ -412,7 +412,7 @@ async fn get_address_information(p: GetAddressInformationParams, ctx: Ctx) -> Js
     let state = account_status(&account.status());
     let result = serde_json::json!({
         "@type": "raw.fullAccountState",
-        "balance": balance.grams.to_string(),
+        "balance": balance.coins.to_string(),
         "extra_currencies": [], // TODO: fill extra currencies
         "code": serialize_cell_opt(account.code()),
         "data": serialize_cell_opt(account.data()),
@@ -429,7 +429,7 @@ async fn get_address_information(p: GetAddressInformationParams, ctx: Ctx) -> Js
 async fn get_address_balance(p: GetAddressInformationParams, ctx: Ctx) -> JsonResult {
     let acc_ctx = AccountContext::with_address(&ctx, &p.address, p.seqno).await?;
     let account = acc_ctx.read_account()?;
-    Ok(serde_json::json!(account.balance().cloned().unwrap_or_default().grams.to_string()))
+    Ok(serde_json::json!(account.balance().cloned().unwrap_or_default().coins.to_string()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -794,10 +794,10 @@ async fn estimate_fee(p: EstimateFeeParams, ctx: Ctx) -> JsonResult {
     let storage_fee = if let Some(storage) = descr.storage_ph {
         storage.storage_fees_collected
     } else {
-        Grams::zero()
+        Coins::zero()
     };
     let gas_fee = descr.compute_ph.gas_fees();
-    let mut fwd_fee = Grams::zero();
+    let mut fwd_fee = Coins::zero();
     if let Some(action) = descr.action {
         if let Some(fee) = action.total_fwd_fees {
             fwd_fee += fee;

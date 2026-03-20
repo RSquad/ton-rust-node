@@ -10,7 +10,7 @@
  */
 use super::*;
 use crate::{
-    generate_test_stateinit, types::Grams, write_read_and_assert, AccountId, AccountStatus,
+    generate_test_stateinit, types::Coins, write_read_and_assert, AccountId, AccountStatus,
     HashUpdate, InMsgExternal, InternalMessageHeader, MsgAddressInt, StateInitTestOptions,
     TransactionDescr,
 };
@@ -46,7 +46,7 @@ fn transaction() -> Transaction {
 
     tr.set_logical_time(123423);
     tr.set_end_status(AccountStatus::AccStateFrozen);
-    tr.set_total_fees(CurrencyCollection::with_grams(653));
+    tr.set_total_fees(CurrencyCollection::with_coins(653));
     tr.write_in_msg(Some(&s_in_msg)).unwrap();
     tr.add_out_message(&s_out_msg1).unwrap();
     tr.add_out_message(&s_out_msg2).unwrap();
@@ -134,7 +134,7 @@ fn test_serialization_out_msg_queue() {
     let mut queue = OutMsgQueue::default();
     for n in 0..100 {
         let msg = get_message();
-        let out_msg_env = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+        let out_msg_env = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
         queue.insert(0, n, &out_msg_env, 11).unwrap();
     }
     println!("{:?}", queue);
@@ -174,7 +174,7 @@ fn test_work_with_out_msg_desc() {
     let msg = get_message_with_addrs(create_account_id(3), create_account_id(4));
     let msg_in = InMsg::external(ChildCell::with_struct(&msg).unwrap(), tr_cell.clone());
 
-    let env = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let env = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
     let out_msg = OutMsgImmediate::with_cells(
         ChildCell::with_struct(&env).unwrap(),
         tr_cell.clone(),
@@ -187,7 +187,7 @@ fn test_work_with_out_msg_desc() {
 
     // test OutMsg::OutMsgNew
     let msg = get_message_with_addrs(create_account_id(4), create_account_id(5));
-    let env = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let env = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
 
     let out_msg_new = OutMsg::new(ChildCell::with_struct(&env).unwrap(), tr_cell.clone());
 
@@ -199,7 +199,7 @@ fn test_work_with_out_msg_desc() {
     let msg_in = InMsg::external(ChildCell::with_struct(&msg).unwrap(), tr_cell.clone());
 
     let out_msg_transit = OutMsg::Transit(OutMsgTransit::with_cells(
-        ChildCell::with_struct(&MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap())
+        ChildCell::with_struct(&MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap())
             .unwrap(),
         ChildCell::with_struct(&msg_in).unwrap(),
     ));
@@ -209,7 +209,7 @@ fn test_work_with_out_msg_desc() {
 
     // test OutMsg::OutMsgDequeue
     let msg = get_message_with_addrs(create_account_id(6), create_account_id(7));
-    let env = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let env = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
     let out_msg = OutMsgDequeue::with_cells(ChildCell::with_struct(&env).unwrap(), 32523);
     let out_msg_dequeue = OutMsg::Dequeue(out_msg);
 
@@ -236,7 +236,7 @@ fn test_work_with_out_msg_desc() {
     let msg = get_message_with_addrs(create_account_id(8), create_account_id(9));
     let msg_in = InMsg::external(ChildCell::with_cell(msg.serialize().unwrap()), tr_cell.clone());
     let out_msg_transit = OutMsg::TransitRequeued(OutMsgTransitRequeued::with_cells(
-        ChildCell::with_struct(&MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap())
+        ChildCell::with_struct(&MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap())
             .unwrap(),
         ChildCell::with_struct(&msg_in).unwrap(),
     ));
@@ -245,7 +245,7 @@ fn test_work_with_out_msg_desc() {
     assert_eq!(msg_desc.len().unwrap(), 8);
     // test OutMsg::NewDefer
     let msg = get_message_with_addrs(create_account_id(10), create_account_id(11));
-    let env = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let env = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
 
     let out_msg_new = OutMsg::new_defer(ChildCell::with_struct(&env).unwrap(), tr_cell.clone());
 
@@ -256,7 +256,7 @@ fn test_work_with_out_msg_desc() {
     let msg = get_message_with_addrs(create_account_id(12), create_account_id(13));
     let msg_in = InMsg::external(ChildCell::with_struct(&msg).unwrap(), tr_cell.clone());
 
-    let env = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let env = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
     let out_msg_transit = OutMsg::DeferredTransit(OutMsgDefferedTransit::with_cells(
         ChildCell::with_struct(&env).unwrap(),
         ChildCell::with_struct(&msg_in).unwrap(),
@@ -272,7 +272,7 @@ fn test_out_msg_queue_and_info() {
 
     // test OutMsg::External
     let msg = get_message_with_addrs(create_account_id(1), create_account_id(2));
-    let out_msg_env = MsgEnvelope::with_message_and_fee(&msg, Grams::one()).unwrap();
+    let out_msg_env = MsgEnvelope::with_message_and_fee(&msg, Coins::one()).unwrap();
 
     queue.insert(0, 1, &out_msg_env, 11).unwrap();
     assert_eq!(queue.len().unwrap(), 1);

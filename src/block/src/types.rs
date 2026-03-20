@@ -373,12 +373,12 @@ pub fn bits_to_bytes(bits: usize) -> usize {
 /// var_uint$_ {n:#} len:(#< n) value:(uint (len * 8)) = VarUInteger n;
 ///
 /// var_int$_ {n:#} len:(#< n) value:(int (len * 8)) = VarInteger n;
-/// nanograms$_ amount:(VarUInteger 16) = Grams;
+/// nanocoins$_ amount:(VarUInteger 16) = Coins;
 ///
-/// If one wants to represent x nanograms, one selects an integer l < 16 such
+/// If one wants to represent x nanocoins, one selects an integer l < 16 such
 /// that x < 2^8*l, and serializes first l as an unsigned 4-bit integer, then x itself
 /// as an unsigned 8`-bit integer. Notice that four zero bits represent a zero
-/// amount of Grams.
+/// amount of Coins.
 macro_rules! define_VarIntegerN {
     ( $varname:ident, $N:expr, BigInt ) => {
         #[derive(Eq, Clone, Debug)]
@@ -852,36 +852,36 @@ macro_rules! define_VarIntegerN {
     };
 }
 
-// Grams is `VarUInteger 16`, but macro is defined in the way,
+// Coins is `VarUInteger 16`, but macro is defined in the way,
 // that it uses `$N.leading_zeros` to define type length, so length 15 is used here
-define_VarIntegerN!(Grams, 15, u128);
+define_VarIntegerN!(Coins, 15, u128);
 // Macro which defines the type using BigInt as underlying type,
 // calculates length with `($N - 1).log2 + 1`, so proper length is used here
 define_VarIntegerN!(VarUInteger32, 32, BigInt);
 define_VarIntegerN!(VarUInteger3, 3, u32);
 define_VarIntegerN!(VarUInteger7, 7, u64);
 
-pub type VarUInteger16 = Grams;
+pub type VarUInteger16 = Coins;
 
-impl Augmentable for Grams {
+impl Augmentable for Coins {
     fn calc(&mut self, other: &Self) -> Result<bool> {
         self.add(other)
     }
 }
 
 // it cannot produce problem
-impl From<u64> for Grams {
+impl From<u64> for Coins {
     fn from(value: u64) -> Self {
         Self(value as u128)
     }
 }
 
-impl PartialEq<u64> for Grams {
+impl PartialEq<u64> for Coins {
     fn eq(&self, other: &u64) -> bool {
         self.0 == (*other as u128)
     }
 }
-impl PartialOrd<u64> for Grams {
+impl PartialOrd<u64> for Coins {
     fn partial_cmp(&self, other: &u64) -> Option<std::cmp::Ordering> {
         Some(self.0.cmp(&(*other as u128)))
     }
@@ -922,7 +922,7 @@ impl VarUInteger3 {
     }
 }
 
-impl Grams {
+impl Coins {
     pub const fn new(value: u64) -> Self {
         Self(value as u128)
     }
@@ -938,7 +938,7 @@ impl Grams {
     }
 }
 
-impl FromStr for Grams {
+impl FromStr for Coins {
     type Err = crate::Error;
 
     fn from_str(string: &str) -> Result<Self> {
@@ -1142,13 +1142,13 @@ extra_currencies$_
 = ExtraCurrencyCollection;
 
 currencies$_
-    grams: Grams
+    coins: Coins
     other:ExtraCurrencyCollection
 = CurrencyCollection;
 */
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CurrencyCollection {
-    pub grams: Grams,
+    pub coins: Coins,
     pub other: ExtraCurrencyCollection,
 }
 
@@ -1174,19 +1174,19 @@ impl CurrencyCollection {
     }
 
     pub const fn new() -> Self {
-        CurrencyCollection { grams: Grams::zero(), other: ExtraCurrencyCollection::new() }
+        CurrencyCollection { coins: Coins::zero(), other: ExtraCurrencyCollection::new() }
     }
 
-    pub const fn with_grams(grams: u64) -> Self {
-        Self::from_grams(Grams::new(grams))
+    pub const fn with_coins(coins: u64) -> Self {
+        Self::from_coins(Coins::new(coins))
     }
 
-    pub const fn from_grams(grams: Grams) -> Self {
-        CurrencyCollection { grams, other: ExtraCurrencyCollection::new() }
+    pub const fn from_coins(coins: Coins) -> Self {
+        CurrencyCollection { coins, other: ExtraCurrencyCollection::new() }
     }
 
     pub fn is_zero(&self) -> Result<bool> {
-        if !self.grams.is_zero() {
+        if !self.coins.is_zero() {
             return Ok(false);
         }
         self.other.iterate(|value| Ok(value.is_zero()))
@@ -1199,7 +1199,7 @@ impl CurrencyCollection {
 
 impl Serializable for CurrencyCollection {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.grams.write_to(cell)?;
+        self.coins.write_to(cell)?;
         self.other.write_to(cell)?;
         Ok(())
     }
@@ -1207,12 +1207,12 @@ impl Serializable for CurrencyCollection {
 
 impl Deserializable for CurrencyCollection {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        self.grams.read_from(cell)?;
+        self.coins.read_from(cell)?;
         self.other.read_from(cell)?;
         Ok(())
     }
     fn skip(slice: &mut SliceData) -> Result<()> {
-        Grams::skip(slice)?;
+        Coins::skip(slice)?;
         ExtraCurrencyCollection::skip(slice)?;
         Ok(())
     }
@@ -1225,7 +1225,7 @@ pub trait AddSub {
 
 impl AddSub for CurrencyCollection {
     fn sub(&mut self, other: &Self) -> Result<bool> {
-        if !self.grams.sub(&other.grams)? {
+        if !self.coins.sub(&other.coins)? {
             return Ok(false);
         }
         other.other.iterate_with_keys(|key: u32, b| -> Result<bool> {
@@ -1240,7 +1240,7 @@ impl AddSub for CurrencyCollection {
         })
     }
     fn add(&mut self, other: &Self) -> Result<bool> {
-        self.grams.add(&other.grams)?;
+        self.coins.add(&other.coins)?;
         let mut result = self.other.clone();
         other.other.iterate_with_keys(|key: u32, b| -> Result<bool> {
             match self.other.get(&key)? {
@@ -1261,7 +1261,7 @@ impl AddSub for CurrencyCollection {
 
 impl fmt::Display for CurrencyCollection {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.grams)?;
+        write!(f, "{}", self.coins)?;
         if !self.other.is_empty() {
             let mut len = 0;
             write!(f, ", other: {{")?;
@@ -1280,7 +1280,7 @@ impl fmt::Display for CurrencyCollection {
 
 impl From<u64> for CurrencyCollection {
     fn from(value: u64) -> Self {
-        Self::with_grams(value)
+        Self::with_coins(value)
     }
 }
 
