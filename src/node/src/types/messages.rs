@@ -10,9 +10,9 @@
  */
 use std::fmt::{self, Display, Formatter};
 use ton_block::{
-    error, fail, AccountId, AccountIdPrefixFull, AddSub, Cell, ChildCell, Deserializable,
-    EnqueuedMsg, Coins, IntermediateAddress, Message, MsgEnvelope, MsgMetadata, OutMsgQueueKey,
-    Result, ShardIdent, SliceData, UInt256,
+    error, fail, AccountId, AccountIdPrefixFull, AddSub, Cell, ChildCell, Coins, Deserializable,
+    EnqueuedMsg, IntermediateAddress, Message, MsgEnvelope, MsgMetadata, OutMsgQueueKey, Result,
+    ShardIdent, SliceData, UInt256,
 };
 use ton_executor::BlockchainConfig;
 

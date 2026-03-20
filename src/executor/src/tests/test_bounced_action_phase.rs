@@ -15,7 +15,7 @@ mod common;
 use common::*;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    AccStatusChange, AccountStatus, AnycastInfo, CurrencyCollection, Coins, InternalMessageHeader,
+    AccStatusChange, AccountStatus, AnycastInfo, Coins, CurrencyCollection, InternalMessageHeader,
     Message, MsgAddressInt, MsgAddressIntOrNone, Serializable, SliceData, StorageUsed,
     TrBouncePhase, TrBouncePhase::Nofunds, TrBouncePhaseNofunds, TrBouncePhaseOk,
     SENDMSG_BOUNCE_IF_FAIL, SENDMSG_ORDINARY,

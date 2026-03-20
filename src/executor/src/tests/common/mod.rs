@@ -23,15 +23,15 @@ use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
     base64_decode, read_single_root_boc, AccStatusChange, Account, AccountId, AccountStatus,
-    AccountStorage, AddSub, BuilderData, Cell, ComputeSkipReason, ConfigParam8, ConfigParamEnum,
-    ConfigParams, CurrencyCollection, Deserializable, ExternalInboundMessageHeader,
-    GetRepresentationHash, Coins, HashmapAugType, HashmapType, InRefValue, InternalMessageHeader,
-    KeyExtBlkRef, McStateExtra, MerkleProof, Message, MsgAddressInt, OutAction, OutActions, Result,
-    Serializable, ShardAccount, ShardIdent, ShardStateUnsplit, SimpleLib, SliceData, StateInit,
-    StorageInfo, StorageUsageCalc, StorageUsed, TickTock, TrActionPhase, TrBouncePhase,
-    TrComputePhase, TrComputePhaseSkipped, TrComputePhaseVm, TrCreditPhase, TrStoragePhase,
-    Transaction, TransactionDescr, TransactionDescrOrdinary, TransactionTickTock, UInt15, UInt256,
-    VarUInteger32, VarUInteger7, DICT_HASH_MIN_CELLS,
+    AccountStorage, AddSub, BuilderData, Cell, Coins, ComputeSkipReason, ConfigParam8,
+    ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable,
+    ExternalInboundMessageHeader, GetRepresentationHash, HashmapAugType, HashmapType, InRefValue,
+    InternalMessageHeader, KeyExtBlkRef, McStateExtra, MerkleProof, Message, MsgAddressInt,
+    OutAction, OutActions, Result, Serializable, ShardAccount, ShardIdent, ShardStateUnsplit,
+    SimpleLib, SliceData, StateInit, StorageInfo, StorageUsageCalc, StorageUsed, TickTock,
+    TrActionPhase, TrBouncePhase, TrComputePhase, TrComputePhaseSkipped, TrComputePhaseVm,
+    TrCreditPhase, TrStoragePhase, Transaction, TransactionDescr, TransactionDescrOrdinary,
+    TransactionTickTock, UInt15, UInt256, VarUInteger32, VarUInteger7, DICT_HASH_MIN_CELLS,
 };
 use ton_vm::{smart_contract_info::PrevBlocksInfo, stack::read_stack_item};
 

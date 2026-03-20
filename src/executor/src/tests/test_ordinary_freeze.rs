@@ -17,9 +17,9 @@ use common::*;
 use pretty_assertions::assert_eq;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    AccStatusChange, Account, AccountStatus, ComputeSkipReason, CurrencyCollection,
-    GetRepresentationHash, Coins, InternalMessageHeader, MsgAddressInt, MsgAddressIntOrNone,
-    OutAction, OutActions, Serializable, SliceData, StateInit, StorageUsed, TrActionPhase,
+    AccStatusChange, Account, AccountStatus, Coins, ComputeSkipReason, CurrencyCollection,
+    GetRepresentationHash, InternalMessageHeader, MsgAddressInt, MsgAddressIntOrNone, OutAction,
+    OutActions, Serializable, SliceData, StateInit, StorageUsed, TrActionPhase,
     TrBouncePhaseNofunds, TrBouncePhaseOk, TrComputePhase, TrComputePhaseVm, TrCreditPhase,
     TrStoragePhase, Transaction, TransactionDescr, UInt256, DICT_HASH_MIN_CELLS, SENDMSG_ORDINARY,
 };

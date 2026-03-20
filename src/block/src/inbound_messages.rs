@@ -22,7 +22,7 @@ use crate::{
     fail,
     messages::Message,
     transactions::Transaction,
-    types::{AddSub, ChildCell, CurrencyCollection, Coins},
+    types::{AddSub, ChildCell, Coins, CurrencyCollection},
     BuilderData, Cell, Deserializable, IBitstring, Result, Serializable, SliceData, UInt256,
 };
 use std::fmt;

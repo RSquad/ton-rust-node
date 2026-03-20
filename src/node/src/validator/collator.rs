@@ -50,9 +50,9 @@ use std::{
 use ton_block::{
     error, fail, Account, AccountDispatchQueue, AccountId, AccountStorageDictProof, AddSub,
     BlkPrevInfo, Block, BlockCreateStats, BlockExtra, BlockIdExt, BlockInfo, BocFlags, BocWriter,
-    Cell, ChildCell, CommonMsgInfo, ConfigParamEnum, ConfigParams, CreatorStats,
+    Cell, ChildCell, Coins, CommonMsgInfo, ConfigParamEnum, ConfigParams, CreatorStats,
     CurrencyCollection, Deserializable, Error, ExtBlkRef, FutureSplitMerge, GlobalCapabilities,
-    GlobalVersion, Coins, HashmapAugType, HashmapRemover, HashmapType, InMsg, InMsgDescr,
+    GlobalVersion, HashmapAugType, HashmapRemover, HashmapType, InMsg, InMsgDescr,
     InternalMessageHeader, KeyExtBlkRef, KeyMaxLt, Libraries, McBlockExtra, McShardRecord,
     McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgMetadata, OutMsg,
     OutMsgDescr, OutMsgQueueKey, ParamLimitIndex, ProcessedInfoKey, ProcessedUpto, Result,

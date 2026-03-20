@@ -17,7 +17,7 @@ use crate::{
     messages::{Message, MsgAddressInt, StateInit, StateInitLib, TickTock},
     shard::{ShardIdent, ShardStateUnsplit},
     shard_accounts::DepthBalanceInfo,
-    types::{AddSub, ChildCell, CurrencyCollection, Coins, Number5, VarUInteger7},
+    types::{AddSub, ChildCell, Coins, CurrencyCollection, Number5, VarUInteger7},
     AccountId, AccountStorageStat, BuilderData, Cell, ConfigParams, Deserializable, GasConsumer,
     GetRepresentationHash, HashmapType, IBitstring, Serializable, SliceData, UInt256, UsageTree,
     DICT_HASH_MIN_CELLS,

@@ -16,7 +16,7 @@ use crate::{
     shard_accounts::ShardAccounts,
     signature::{CryptoSignature, SigPubKey},
     types::{
-        ChildCell, ExtraCurrencyCollection, Coins, Number12, Number13, Number16, Number32, Number8,
+        ChildCell, Coins, ExtraCurrencyCollection, Number12, Number13, Number16, Number32, Number8,
     },
     validators::{ValidatorDescr, ValidatorSet},
     AccountId, BlockError, BuilderData, Cell, Deserializable, HashmapE, HashmapIterator,

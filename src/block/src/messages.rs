@@ -17,7 +17,7 @@ use crate::{
     merkle_proof::MerkleProof,
     read_boc_root,
     shard::MASTERCHAIN_ID,
-    types::{CurrencyCollection, Coins, Number5, Number9},
+    types::{Coins, CurrencyCollection, Number5, Number9},
     AccountId, BlockError, BuilderData, Cell, ChildCell, Deserializable, GasConsumer,
     GetRepresentationHash, IBitstring, Mask, Result, Serializable, SliceData, UInt256, UsageTree,
     VarUInteger16, MAX_DATA_BITS, MAX_REFERENCES_COUNT,

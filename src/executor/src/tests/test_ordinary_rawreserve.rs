@@ -23,7 +23,7 @@ use ton_block::{
         AccStatusChange, TrActionPhase, TrComputePhase, TrComputePhaseVm, TrCreditPhase,
         TrStoragePhase, Transaction, TransactionDescr,
     },
-    CurrencyCollection, GetRepresentationHash, Coins, DICT_HASH_MIN_CELLS,
+    Coins, CurrencyCollection, GetRepresentationHash, DICT_HASH_MIN_CELLS,
 };
 
 #[test]

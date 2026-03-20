@@ -18,9 +18,9 @@ use rand::prelude::{Rng, StdRng};
 use std::panic;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    accounts::Account, AccountId, BuilderData, CurrencyCollection, ExternalInboundMessageHeader,
-    Coins, InternalMessageHeader, MsgAddressInt, Serializable, SliceData, StateInit, UInt256,
-    VarUInteger16,
+    accounts::Account, AccountId, BuilderData, Coins, CurrencyCollection,
+    ExternalInboundMessageHeader, InternalMessageHeader, MsgAddressInt, Serializable, SliceData,
+    StateInit, UInt256, VarUInteger16,
 };
 
 fn gen_bool(rng: &mut StdRng) -> bool {

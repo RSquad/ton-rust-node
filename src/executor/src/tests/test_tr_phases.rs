@@ -19,10 +19,10 @@ mod common;
 use common::*;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    AccStatusChange, Account, AccountId, AccountStatus, BuilderData, ComputeSkipReason,
+    AccStatusChange, Account, AccountId, AccountStatus, BuilderData, Coins, ComputeSkipReason,
     ConfigParamEnum, CurrencyCollection, ExtOutMessageHeader, ExternalInboundMessageHeader,
-    GetRepresentationHash, Coins, InternalMessageHeader, Message, MsgAddressExt, MsgAddressInt,
-    OutAction, OutActions, Serializable, SliceData, StateInit, StorageUsed, SuspendedAddressList,
+    GetRepresentationHash, InternalMessageHeader, Message, MsgAddressExt, MsgAddressInt, OutAction,
+    OutActions, Serializable, SliceData, StateInit, StorageUsed, SuspendedAddressList,
     TrActionPhase, TrComputePhase, TrComputePhaseVm, Transaction, VarUInteger32,
     DICT_HASH_MIN_CELLS, RESERVE_ALL_BUT, RESERVE_EXACTLY, RESERVE_IGNORE_ERROR,
     SENDMSG_ALL_BALANCE, SENDMSG_IGNORE_ERROR, SENDMSG_ORDINARY, SENDMSG_PAY_FEE_SEPARATELY,

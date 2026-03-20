@@ -75,8 +75,8 @@
 //! - `vm::CellBuilder::finalize(is_special)` → `set_special_cell_type_from_data()` + `into_cell()`
 
 use crate::{
-    error, fail, BocFlags, BocReader, BocWriter, BuilderData, Cell, CellType, CurrencyCollection,
-    Deserializable, Coins, IBitstring, Result, Serializable, SliceData, UInt256,
+    error, fail, BocFlags, BocReader, BocWriter, BuilderData, Cell, CellType, Coins,
+    CurrencyCollection, Deserializable, IBitstring, Result, Serializable, SliceData, UInt256,
 };
 use std::{collections::HashMap, io::Cursor, vec::Vec};
 

@@ -13,7 +13,7 @@ use crate::{
     TransactionExecutor,
 };
 use ton_block::{
-    error, fail, Account, Cell, CurrencyCollection, Coins, Message, Result, Serializable,
+    error, fail, Account, Cell, Coins, CurrencyCollection, Message, Result, Serializable,
     SliceData, TrComputePhase, Transaction, TransactionDescr, TransactionDescrTickTock,
     TransactionTickTock,
 };

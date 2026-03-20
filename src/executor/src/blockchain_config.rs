@@ -10,8 +10,8 @@
  */
 use num::BigInt;
 use ton_block::{
-    fail, AccountId, ConfigParam18, ConfigParams, FundamentalSmcAddresses, GasLimitsPrices,
-    GlobalCapabilities, Coins, Mask, MsgAddressInt, MsgForwardPrices, Result, SizeLimitsConfig,
+    fail, AccountId, Coins, ConfigParam18, ConfigParams, FundamentalSmcAddresses, GasLimitsPrices,
+    GlobalCapabilities, Mask, MsgAddressInt, MsgForwardPrices, Result, SizeLimitsConfig,
     StorageInfo, StoragePrices, UInt256, SUPPORTED_VERSION,
 };
 

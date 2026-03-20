@@ -15,7 +15,7 @@ use pretty_assertions::assert_eq;
 use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    AccountId, AccountStatus, BuilderData, Cell, CurrencyCollection, GetRepresentationHash, Coins,
+    AccountId, AccountStatus, BuilderData, Cell, Coins, CurrencyCollection, GetRepresentationHash,
     HashmapE, MsgAddressInt, Serializable, SliceData, StateInit, Status, TrComputePhase,
     Transaction, DICT_HASH_MIN_CELLS, SENDMSG_ORDINARY, SET_LIB_CODE_ADD_PRIVATE,
 };

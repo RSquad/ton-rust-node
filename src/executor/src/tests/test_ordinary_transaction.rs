@@ -27,12 +27,12 @@ use ton_block::{
         AccStatusChange, TrActionPhase, TrComputePhase, TrComputePhaseVm, TrCreditPhase,
         TrStoragePhase, Transaction, TransactionDescr,
     },
-    AccountId, AccountStatus, AnycastInfo, BouncedByPhase, BuilderData, Cell, ComputeSkipReason,
-    ConfigParam8, ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable, ExceptionCode,
-    GetRepresentationHash, GlobalVersion, Coins, IBitstring, InternalMessageHeader, MerkleProof,
-    NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, Serializable, SliceData,
-    StateInit, StorageUsed, TrBouncePhaseNofunds, UInt256, DICT_HASH_MIN_CELLS,
-    SENDMSG_PAY_FEE_SEPARATELY,
+    AccountId, AccountStatus, AnycastInfo, BouncedByPhase, BuilderData, Cell, Coins,
+    ComputeSkipReason, ConfigParam8, ConfigParamEnum, ConfigParams, CurrencyCollection,
+    Deserializable, ExceptionCode, GetRepresentationHash, GlobalVersion, IBitstring,
+    InternalMessageHeader, MerkleProof, NewBounceBody, NewBounceComputePhaseInfo,
+    NewBounceOriginalInfo, Serializable, SliceData, StateInit, StorageUsed, TrBouncePhaseNofunds,
+    UInt256, DICT_HASH_MIN_CELLS, SENDMSG_PAY_FEE_SEPARATELY,
 };
 use ton_vm::{
     int,

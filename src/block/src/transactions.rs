@@ -19,7 +19,7 @@ use crate::{
     merkle_proof::MerkleProof,
     messages::Message,
     shard::ShardStateUnsplit,
-    types::{ChildCell, CurrencyCollection, Coins, InRefValue, VarUInteger3, VarUInteger7},
+    types::{ChildCell, Coins, CurrencyCollection, InRefValue, VarUInteger3, VarUInteger7},
     AccountId, BuilderData, Cell, Deserializable, HashmapType, IBitstring, Result, Serializable,
     SliceData, UInt256, UsageTree,
 };
