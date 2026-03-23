@@ -79,7 +79,8 @@ jobs:
         run: make fmt check=--check
 
   check:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: large
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
@@ -103,7 +104,8 @@ jobs:
         run: cargo check --all --tests --release
 
   tests:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: large
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
@@ -124,7 +126,8 @@ jobs:
         run: NODE_SKIP_TEST_LOGS=yes make test
 
   tests-net:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: large
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
