@@ -21,8 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -89,10 +87,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -118,8 +112,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -141,8 +133,6 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
     steps:
       - uses: actions/checkout@v5
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Install system dependencies
         run: |
