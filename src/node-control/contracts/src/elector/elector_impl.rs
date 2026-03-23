@@ -12,7 +12,7 @@ use anyhow::Context;
 use common::tvm_stack_parser::TvmStackParser;
 use std::{collections::HashMap, sync::Arc};
 use ton_api::ton::tvm::StackEntry;
-use ton_block::{Coins, Deserializable, HashmapE, HashmapType, MsgAddressInt};
+use ton_block::{Deserializable, Coins, HashmapE, HashmapType, MsgAddressInt};
 
 pub struct ElectorWrapperImpl {
     provider: Arc<dyn ContractProvider>,

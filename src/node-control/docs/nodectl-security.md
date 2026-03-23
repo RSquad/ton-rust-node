@@ -1,10 +1,12 @@
 # Nodectl Security Guide (for operators)
 
 This document explains how `nodectl` REST API security works in day-to-day operations.
-It is written for trained system operators, not software developers.
 
 ## 1) Quick overview
 
+- **Authentication is disabled by default.** All endpoints are accessible without a token until at least one user is created via `nodectl auth add`.
+- On first start the service creates a JWT signing key in the vault (secret `auth.jwt-signing-key`) even when authentication is disabled.
+- **No service restart is required** to enable authentication — the service hot-reloads the configuration, so adding a user activates auth immediately.
 - A user logs in to the REST API with `username/password`.
 - The API returns a JWT token with a limited lifetime.
 - The token is sent in `Authorization: Bearer <token>`.

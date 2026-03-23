@@ -9,17 +9,18 @@ This guide provides step-by-step instructions for deploying and configuring **no
 - [Step 2: Configure SecretsVault](#step-2-configure-secretsvault)
 - [Step 3: Create nodectl Configuration](#step-3-create-nodectl-configuration)
 - [Step 4: Configure TON HTTP API](#step-4-configure-ton-http-api)
-- [Step 5: Master Wallet](#step-5-master-wallet)
-- [Step 6: Add Nodes](#step-6-add-nodes)
-- [Step 7: Add Wallets](#step-7-add-wallets)
-- [Step 8: Add Pools](#step-8-add-pools)
-- [Step 9: Create Secrets in Vault](#step-9-create-secrets-in-vault)
+- [Step 5: Create Secrets in Vault](#step-5-create-secrets-in-vault)
+- [Step 6: Master Wallet](#step-6-master-wallet)
+- [Step 7: Add Nodes](#step-7-add-nodes)
+- [Step 8: Add Wallets](#step-8-add-wallets)
+- [Step 9: Add Pools](#step-9-add-pools)
 - [Step 10: Configure Control Server Client Keys](#step-10-configure-control-server-client-keys)
 - [Step 11: Create Bindings](#step-11-create-bindings)
 - [Step 12: Configure Logging](#step-12-configure-logging)
 - [Step 13: Increase non-swap memory limits](#step-13-increase-non-swap-memory-limits)
 - [Step 14: Run the Service](#step-14-run-the-service)
 - [Step 15: Enable Elections](#step-15-enable-elections)
+- [Step 16: Configure REST API Authentication](#step-16-configure-rest-api-authentication)
 - [Security Recommendations](#security-recommendations)
 - [Troubleshooting](#troubleshooting)
 
@@ -190,14 +191,60 @@ Make sure the TON node's `config.json` has the RPC server enabled:
 
 ---
 
-## Step 5: Master Wallet
+## Step 5: Create Secrets in Vault
+
+Before configuring the master wallet, nodes, wallets, and pools, create all required cryptographic keys in the vault. These keys will be referenced by name in subsequent configuration steps.
+
+Make sure the `VAULT_URL` environment variable is set (see [Step 2](#step-2-configure-secretsvault)).
+
+```bash
+# Create the master wallet key (the default config references "master-wallet-secret")
+nodectl key add -n "master-wallet-secret"
+
+# Create wallet keys (one per validator node you plan to add)
+nodectl key add -n "wallet1-secret"
+nodectl key add -n "wallet2-secret"
+nodectl key add -n "wallet3-secret"
+
+# Create the control client key (shared by all nodes)
+# Must be --extractable because nodectl reads the private key for ADNL connections
+nodectl key add -n "control-client-secret" -e
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-n, --name` | Secret name (will be referenced in config steps below) |
+| `-a, --algorithm` | Key algorithm (default: `ed25519`) |
+| `-e, --extractable` | Allow private key extraction (required for ADNL client keys) |
+
+> **Note:** Wallet and master wallet keys should **not** be extractable. Only control client keys need the `-e` flag.
+
+Import an existing private key instead of generating a new one:
+
+```bash
+nodectl key import -n "my-key" -k "<base64-encoded-private-key>" -e
+```
+
+List all secrets in the vault:
+
+```bash
+nodectl key ls
+```
+
+The output shows the name, algorithm, extractable flag, creation date, and **public key** for each secret.
+
+---
+
+## Step 6: Master Wallet
 
 The **master wallet** is a central funding source that the service uses to:
 
 - Automatically deploy validator wallets and nominator pools
 - Periodically top up validator wallets when their balance drops below the threshold (5 TON)
 
-When you created the configuration file in [Step 3](#step-3-create-nodectl-configuration), a `master_wallet` section was included automatically. The `key.name` field contains the vault secret name. If the secret does not exist in the vault yet, the service will **automatically generate** it on first startup.
+When you created the configuration file in [Step 3](#step-3-create-nodectl-configuration), a `master_wallet` section was included automatically. The `key.name` field contains the vault secret name — this key was created in [Step 5](#step-5-create-secrets-in-vault).
 
 View master wallet information:
 
@@ -213,13 +260,13 @@ This shows the wallet address, balance, state, and public key.
 
 ---
 
-## Step 6: Add Nodes
+## Step 7: Add Nodes
 
 Add each TON validator node to the configuration. For each node you need three things:
 
 - **Control Server endpoint** — the IP address and port where the node's Control Server is listening (e.g. `192.168.1.10:3031`). You can find this in the node's `config.json` under `control_server.address`.
 - **Control Server public key** — the server's public key in Base64 format. You can find it in the node's `config.json` under `control_server.server_key` (derive the public key from the private key, or use the key provided during node setup).
-- **Client secret name** — the name of the vault secret for the ADNL client private key. This key will be created later in [Step 9](#step-9-create-secrets-in-vault). For now, just choose a name (e.g. `control-client-secret`).
+- **Client secret name** — the name of the vault secret for the ADNL client private key. This key was created in [Step 5](#step-5-create-secrets-in-vault). Use the same name you chose there (e.g. `control-client-secret`).
 
 ```bash
 nodectl config node add \
@@ -255,9 +302,9 @@ nodectl config node ls
 
 ---
 
-## Step 7: Add Wallets
+## Step 8: Add Wallets
 
-Add a validator wallet for each node. Each wallet needs a unique name and a vault secret name for its private key. The key will be created in [Step 9](#step-9-create-secrets-in-vault).
+Add a validator wallet for each node. Each wallet needs a unique name and a vault secret name for its private key. The key was created in [Step 5](#step-5-create-secrets-in-vault).
 
 ```bash
 nodectl config wallet add -n wallet1 -s "wallet1-secret"
@@ -289,7 +336,7 @@ nodectl config wallet ls
 
 ---
 
-## Step 8: Add Pools
+## Step 9: Add Pools
 
 Add a Single Nominator Pool for each validator:
 
@@ -318,49 +365,6 @@ List configured pools:
 ```bash
 nodectl config pool ls
 ```
-
----
-
-## Step 9: Create Secrets in Vault
-
-Now create the cryptographic keys that you referenced in the previous steps. These keys are stored in the vault and used by nodectl for signing transactions and authenticating with nodes.
-
-Make sure the `VAULT_URL` environment variable is set (see [Step 2](#step-2-configure-secretsvault)).
-
-```bash
-# Create the control client key (shared by all nodes)
-# Must be --extractable because nodectl reads the private key for ADNL connections
-nodectl key add -n "control-client-secret" -e
-
-# Create wallet keys (one per wallet)
-nodectl key add -n "wallet1-secret"
-nodectl key add -n "wallet2-secret"
-nodectl key add -n "wallet3-secret"
-```
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `-n, --name` | Secret name (must match what you used in config) |
-| `-a, --algorithm` | Key algorithm (default: `ed25519`) |
-| `-e, --extractable` | Allow private key extraction (required for ADNL client keys) |
-
-> **Note:** Wallet keys should **not** be extractable. Only control client keys need the `-e` flag.
-
-Import an existing private key instead of generating a new one:
-
-```bash
-nodectl key import -n "my-key" -k "<base64-encoded-private-key>" -e
-```
-
-List all secrets in the vault:
-
-```bash
-nodectl key ls
-```
-
-The output shows the name, algorithm, extractable flag, creation date, and **public key** for each secret.
 
 ---
 
@@ -641,6 +645,82 @@ nodectl config elections stake-policy --reset -n node1
 
 ---
 
+## Step 16: Configure REST API Authentication
+
+**Authentication is disabled by default** — all REST API endpoints are accessible without a token until at least one user is created.
+
+On first start the service automatically creates a JWT signing key in the vault (secret `auth.jwt-signing-key`), even when no users exist yet. This ensures the key is ready when you enable auth later.
+
+**No service restart is required** to enable authentication. The service hot-reloads the configuration, so creating the first user with `nodectl auth add` activates auth immediately.
+
+> For a detailed description of roles, token lifecycle, revocation, rate limiting, and monitoring, see the **[Security Guide](./nodectl-security.md)**.
+
+### 16.1 Create Users
+
+Use `nodectl auth add` to create users. The password is entered interactively.
+
+```bash
+# Create an operator user (full operational access)
+nodectl auth add --username operator --role operator
+
+# Create a nominator user (read-only access)
+nodectl auth add --username viewer --role nominator
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--username` | Username (alphanumeric, `_`, `-`, max 64 chars) |
+| `--role` | User role: `operator` or `nominator` |
+
+Password hashes are stored in the vault (secret name: `auth.users.<username>`).
+
+### 16.2 List Users
+
+```bash
+nodectl auth ls
+```
+
+### 16.3 Configure Token TTL
+
+```bash
+nodectl auth set ttl --operator 720h --nominator 24h
+```
+
+Values accept seconds (`3600`), or duration suffixes (`30s`, `60m`, `8h`).
+
+### 16.4 Log In to the REST API
+
+Use `nodectl api login` to obtain a JWT token:
+
+```bash
+# Interactive password prompt
+nodectl api login operator
+```
+
+The command prints the JWT token, its expiration, and the user role. Store the token for subsequent API calls:
+
+```bash
+export NODECTL_API_TOKEN="<token from login>"
+```
+
+By default `nodectl api login` connects to `http://127.0.0.1:8080`. Override with `-u`:
+
+```bash
+nodectl api login operator -u http://192.168.1.10:8080
+```
+
+Once the token is exported, all `nodectl api` commands use it automatically:
+
+```bash
+nodectl api elections
+nodectl api validators
+nodectl api task elections restart
+```
+
+---
+
 ## Security Recommendations
 
 ### Network Security
@@ -655,7 +735,17 @@ nodectl config elections stake-policy --reset -n node1
 
 2. **Use SSH tunneling for remote access**
 
-3. **Never expose the REST API to the public internet** — all endpoints are unauthenticated
+3. **Never expose the REST API to the public internet without TLS**
+
+### Authentication Security
+
+1. **Create strong passwords** — minimum 8 characters; use a password manager
+
+2. **Use short token TTLs in production** — reduce the blast radius of a leaked token
+
+3. **Revoke tokens immediately** when a user leaves or credentials are compromised (`nodectl auth revoke <username>`)
+
+4. **See [Security Guide](./nodectl-security.md)** for full details on roles, rate limiting, and monitoring
 
 ### Key Security
 

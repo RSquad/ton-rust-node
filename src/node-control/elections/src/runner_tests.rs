@@ -11,6 +11,7 @@ use common::{
     app_config::{ElectionsConfig, NodeBinding, StakePolicy},
     snapshot::SnapshotStore,
     task_cancellation::{CancellationCtx, CancellationReason},
+    time_format,
 };
 use contracts::{
     ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
@@ -20,7 +21,7 @@ use contracts::{
 use mockall::mock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use ton_block::{
-    BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, SliceData,
+    BuilderData, Cell, ConfigParam15, Deserializable, Coins, MsgAddressInt, SliceData,
     ValidatorSet, read_single_root_boc,
 };
 
@@ -89,6 +90,7 @@ mock! {
         async fn account(&mut self, address: &str) -> anyhow::Result<crate::providers::Account>;
         async fn export_public_key(&mut self, key_id: &[u8]) -> anyhow::Result<Vec<u8>>;
         async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet>;
+        async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>>;
     }
 }
 
@@ -389,6 +391,7 @@ fn setup_default_provider(
 
     // get_current_vset: not crucial, return error to skip
     provider.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    provider.expect_get_next_vset().returning(|| Ok(None));
 
     // new_validator_key
     provider
@@ -748,6 +751,44 @@ async fn test_no_active_elections() {
     assert!(result.is_ok());
 
     assert_eq!(runner.snapshot_cache.last_elections_status, ElectionsStatus::Closed);
+}
+
+#[tokio::test]
+async fn test_closed_elections_without_submission_stays_not_submitted() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+
+    setup_elector_no_elections(&mut harness.elector_mock);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let provider = &mut harness.provider_mock;
+    provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    provider.expect_shutdown().returning(|| Ok(()));
+
+    let mut runner = harness.build(node_id);
+    let result = runner.run().await;
+    assert!(result.is_ok());
+    assert_eq!(runner.snapshot_cache.last_elections_status, ElectionsStatus::Closed);
+
+    // Simulate stale previous elections snapshot still present in cache.
+    runner.snapshot_cache.last_elections = Some(ElectionsSnapshot {
+        election_id: ELECTION_ID,
+        elections_range: TimeRange {
+            start: ELECTION_ID.saturating_sub(1800),
+            start_utc: time_format::format_ts(ELECTION_ID.saturating_sub(1800)),
+            end: ELECTION_ID.saturating_sub(600),
+            end_utc: time_format::format_ts(ELECTION_ID.saturating_sub(600)),
+        },
+        ..Default::default()
+    });
+
+    let store = Arc::new(SnapshotStore::new());
+    runner.publish_snapshot(&store).await;
+    let snapshot = store.get();
+    let node_snapshot = &snapshot.validators.controlled_nodes[0];
+
+    assert!(!node_snapshot.is_validator);
+    assert!(node_snapshot.validator_index.is_none());
 }
 
 // =====================================================
@@ -1151,6 +1192,7 @@ async fn test_multiple_nodes_one_excluded() {
     provider2.expect_election_parameters().returning(|| Ok(default_cfg15()));
     provider2.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
     provider2.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    provider2.expect_get_next_vset().returning(|| Ok(None));
     provider2.expect_export_public_key().returning(|_| Ok(PUB_KEY.to_vec()));
     provider2.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
     provider2.expect_shutdown().returning(|| Ok(()));
@@ -1479,6 +1521,8 @@ async fn test_build_elections_snapshot() {
     assert!(!snapshot.failed);
     assert_eq!(snapshot.participants_count, 2);
     assert_eq!(snapshot.min_stake, nanotons_to_dec_string(MIN_STAKE));
+    assert_eq!(snapshot.participant_min_stake, Some(nanotons_to_dec_string(MIN_STAKE)));
+    assert_eq!(snapshot.participant_max_stake, Some(nanotons_to_dec_string(MIN_STAKE * 2)));
     assert_eq!(snapshot.total_stake, nanotons_to_dec_string(MIN_STAKE * 3));
 
     // Validation range
@@ -1505,7 +1549,10 @@ async fn test_build_elections_snapshot() {
         .iter()
         .find(|p| p.is_controlled)
         .expect("should have controlled participant");
-    assert_eq!(our_participant.pubkey, hex::encode(&PUB_KEY));
+    assert_eq!(
+        our_participant.pubkey,
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &PUB_KEY)
+    );
     assert_eq!(our_participant.stake, nanotons_to_dec_string(MIN_STAKE));
 
     let other_participant = snapshot
@@ -1513,7 +1560,10 @@ async fn test_build_elections_snapshot() {
         .iter()
         .find(|p| !p.is_controlled)
         .expect("should have non-controlled participant");
-    assert_eq!(other_participant.pubkey, hex::encode([0xDD; 32]));
+    assert_eq!(
+        other_participant.pubkey,
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xDD; 32])
+    );
 }
 
 // =====================================================
@@ -1690,6 +1740,7 @@ async fn test_publish_snapshot_validators() {
     assert!(node_snapshot.wallet_addr.is_some());
     assert!(node_snapshot.pubkey.is_some());
     assert!(node_snapshot.adnl.is_some());
+    assert!(node_snapshot.key_id.is_some());
     assert!(node_snapshot.stake.is_some());
     assert!(!node_snapshot.is_validator, "not in vset");
 }
@@ -1828,4 +1879,119 @@ fn test_compute_status_idle_when_enabled_no_recover_no_participant() {
     use common::app_config::BindingStatus;
     let status = ElectionRunner::compute_node_status(false, false, false, false);
     assert_eq!(status, BindingStatus::Idle);
+}
+
+// Participation status transitions across election lifecycle
+// Simulates: Idle → Participating → Submitted → Accepted → Elected → Validating
+// Also verifies that stale election flags don't leak after elections close.
+#[tokio::test]
+async fn test_participation_status_lifecycle() {
+    use common::snapshot::ParticipationStatus;
+
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+
+    setup_elector_no_elections(&mut harness.elector_mock);
+    setup_wallet(&mut harness.wallet_mock);
+    let provider = &mut harness.provider_mock;
+    provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    provider.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    provider.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    provider.expect_get_next_vset().returning(|| Ok(None));
+    provider.expect_export_public_key().returning(|_| Ok(PUB_KEY.to_vec()));
+    provider.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
+    provider.expect_shutdown().returning(|| Ok(()));
+
+    let mut runner = harness.build(node_id);
+
+    // Helper to get the status of our node
+    let get_status = |r: &ElectionRunner| -> ParticipationStatus {
+        let participants = r.build_our_participants_snapshot();
+        participants.into_iter().find(|p| p.node_id == node_id).unwrap().status
+    };
+
+    // --- Phase 1: Idle (no elections, not validating) ---
+    runner.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
+    assert_eq!(get_status(&runner), ParticipationStatus::Idle);
+
+    // --- Phase 2: Participating (elections active, participant set, no submissions) ---
+    runner.snapshot_cache.last_elections_status = ElectionsStatus::Active;
+    let node = runner.nodes.get_mut(node_id).unwrap();
+    node.participant = Some(Participant {
+        pub_key: PUB_KEY.to_vec(),
+        adnl_addr: ADNL_ADDR.to_vec(),
+        election_id: ELECTION_ID,
+        wallet_addr: addr_bytes(&wallet_address()),
+        stake: 0,
+        max_factor: 0,
+        stake_message_boc: None,
+    });
+    assert_eq!(get_status(&runner), ParticipationStatus::Participating);
+
+    // --- Phase 3: Submitted (stake sent) ---
+    let node = runner.nodes.get_mut(node_id).unwrap();
+    node.stake_submissions.push(StakeSubmissionRecord {
+        stake: 10_000_000_000_000,
+        max_factor: 3 * 65536,
+        submission_time: time_format::now(),
+    });
+    assert_eq!(get_status(&runner), ParticipationStatus::Submitted);
+
+    // --- Phase 4: Accepted (elector accepted the stake) ---
+    let node = runner.nodes.get_mut(node_id).unwrap();
+    node.stake_accepted = true;
+    node.accepted_stake_amount = Some(10_000_000_000_000);
+    assert_eq!(get_status(&runner), ParticipationStatus::Accepted);
+
+    // --- Phase 5: Elected (node appears in p36 / next validator set) ---
+    let node = runner.nodes.get_mut(node_id).unwrap();
+    node.is_next_validator = true;
+    assert_eq!(get_status(&runner), ParticipationStatus::Elected);
+
+    // --- Phase 6: Validating (p36 → p34, elections closed) ---
+    // Node moves from next vset to current vset, elections are done.
+    let node = runner.nodes.get_mut(node_id).unwrap();
+    node.is_next_validator = false;
+    node.is_validator = true;
+    runner.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
+    assert_eq!(get_status(&runner), ParticipationStatus::Validating);
+
+    // --- Phase 7: Verify stale flags don't leak ---
+    // stake_accepted is still true from phase 4, but elections are closed.
+    // Must show Validating, NOT Accepted.
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.stake_accepted, "stake_accepted should still be true (stale)");
+    assert_eq!(get_status(&runner), ParticipationStatus::Validating);
+
+    // --- Phase 8: New elections start while validating ---
+    // Node is still in p34, but new election cycle begins and node submits again.
+    runner.snapshot_cache.last_elections_status = ElectionsStatus::Active;
+    let node = runner.nodes.get_mut(node_id).unwrap();
+    node.stake_accepted = false;
+    node.accepted_stake_amount = None;
+    node.stake_submissions.clear();
+    node.participant = Some(Participant {
+        pub_key: PUB_KEY.to_vec(),
+        adnl_addr: ADNL_ADDR.to_vec(),
+        election_id: ELECTION_ID + 3600,
+        wallet_addr: addr_bytes(&wallet_address()),
+        stake: 0,
+        max_factor: 0,
+        stake_message_boc: None,
+    });
+    node.stake_submissions.push(StakeSubmissionRecord {
+        stake: 15_000_000_000_000,
+        max_factor: 3 * 65536,
+        submission_time: time_format::now(),
+    });
+    // Should show Submitted (election activity), NOT Validating
+    assert_eq!(get_status(&runner), ParticipationStatus::Submitted);
+
+    // --- Phase 9: Back to idle (not validating, no elections) ---
+    let node = runner.nodes.get_mut(node_id).unwrap();
+    node.is_validator = false;
+    node.participant = None;
+    node.stake_submissions.clear();
+    runner.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
+    assert_eq!(get_status(&runner), ParticipationStatus::Idle);
 }

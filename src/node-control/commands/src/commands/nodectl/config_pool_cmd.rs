@@ -6,13 +6,16 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::utils::{
-    calculate_wallet_address, save_config, try_create_rpc_client,
+use crate::commands::nodectl::{
+    output_format::OutputFormat,
+    utils::{
+        calculate_wallet_address, save_config, try_create_rpc_client, warn_ton_api_unavailable,
+    },
 };
 use colored::Colorize;
 use common::{
     app_config::{AppConfig, PoolConfig},
-    ton_utils::nanotons_to_tons_f64,
+    ton_utils::display_tons,
 };
 use contracts::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl};
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
@@ -58,7 +61,10 @@ pub struct PoolAddCmd {
 
 #[derive(clap::Args, Clone)]
 #[command(about = "List all configured pools")]
-pub struct PoolLsCmd {}
+pub struct PoolLsCmd {
+    #[arg(long = "format", default_value = "table", help = "Output format: table or json")]
+    format: OutputFormat,
+}
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Remove a pool from the configuration")]
@@ -118,106 +124,167 @@ impl PoolAddCmd {
     }
 }
 
+#[derive(serde::Serialize)]
+struct PoolView {
+    name: String,
+    kind: String,
+    balance: Option<String>,
+    address: Option<String>,
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addresses: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validator_share: Option<u64>,
+}
+
 impl PoolLsCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
         let config = AppConfig::load(path)?;
 
         if config.pools.is_empty() {
-            println!("\n{}\n", "No pools configured".yellow());
+            match self.format {
+                OutputFormat::Json => println!("[]"),
+                OutputFormat::Table => println!("\n{}\n", "No pools configured".yellow()),
+            }
             return Ok(());
         }
 
         let rpc_client = match try_create_rpc_client(&config).await {
             Ok(c) => Some(c),
             Err(e) => {
-                println!(
-                    "{}: {}",
-                    "Warning: failed to connect to ton api".yellow(),
-                    e.to_string().yellow()
-                );
+                if matches!(self.format, OutputFormat::Table) {
+                    warn_ton_api_unavailable(&e, "Balances will not be available");
+                }
                 None
             }
         };
 
-        // The vault is needed for the address calculation, but it will be loaded lazily.
-        // The vault is not necessary so it is wrapped in an inner Option.
-        let mut vault: Option<Option<Arc<SecretVault>>> = None;
+        let views =
+            collect_pool_views(&config, &rpc_client, self.format == OutputFormat::Table).await;
 
-        println!("\n{} {} ({})\n", "OK".green().bold(), "Pools:".green(), config.pools.len());
-        println!(
-            "  {:<15} {:<6} {:<14} {:<50} {}",
-            "Name".cyan().bold(),
-            "Kind".cyan().bold(),
-            "Balance".cyan().bold(),
-            "Address".cyan().bold(),
-            "Owner".cyan().bold(),
-        );
-        println!("  {}", "─".repeat(137).dimmed());
+        match self.format {
+            OutputFormat::Json => print_pools_json(&views)?,
+            OutputFormat::Table => print_pools_table(&views),
+        }
+        Ok(())
+    }
+}
 
-        for (name, pool) in &config.pools {
-            match pool {
-                PoolConfig::SNP { address, owner } => {
-                    let needs_vault = address.is_none() && owner.is_some();
-                    if needs_vault && vault.is_none() {
-                        vault = Some(match SecretVaultBuilder::from_env().await {
-                            Ok(v) => Some(v),
-                            Err(e) => {
+async fn collect_pool_views(
+    config: &AppConfig,
+    rpc_client: &Option<Arc<ClientJsonRpc>>,
+    warn_on_error: bool,
+) -> Vec<PoolView> {
+    let mut vault: Option<Option<Arc<SecretVault>>> = None;
+    let mut views = Vec::new();
+
+    for (name, pool) in &config.pools {
+        match pool {
+            PoolConfig::SNP { address, owner } => {
+                let needs_vault = address.is_none() && owner.is_some();
+                if needs_vault && vault.is_none() {
+                    vault = Some(match SecretVaultBuilder::from_env().await {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            if warn_on_error {
                                 println!(
                                     "{}: {}",
                                     "Warning: failed to initialize secret vault".yellow(),
                                     e.to_string().yellow()
                                 );
-                                None
                             }
-                        });
-                    }
-                    let vault_ref = vault.as_ref().and_then(|v| v.clone());
-
-                    let addr_result = get_pool_display_result(
-                        name,
-                        address.as_ref(),
-                        owner.as_ref(),
-                        &config,
-                        vault_ref,
-                    )
-                    .await;
-
-                    let balance_result = resolve_pool_balance(&addr_result, &rpc_client).await;
-
-                    let display_addr = match addr_result {
-                        Ok(addr) => addr.white(),
-                        Err(msg) => msg.red(),
-                    };
-
-                    let display_balance = match balance_result {
-                        Ok(balance) => balance.white(),
-                        Err(msg) => msg.red(),
-                    };
-
-                    println!(
-                        "  {:<15} {:<6} {:<14} {:<50} {}",
-                        name,
-                        "SNP",
-                        display_balance,
-                        display_addr,
-                        owner.as_deref().unwrap_or("-")
-                    );
+                            None
+                        }
+                    });
                 }
-                PoolConfig::TONCore { addresses, validator_share } => {
-                    println!(
-                        "  {:<15} {:<6} {:<14} {:<50} share={}",
-                        name,
-                        "Core",
-                        "-",
-                        addresses.join(", "),
-                        validator_share
-                    );
-                }
+                let vault_ref = vault.as_ref().and_then(|v| v.clone());
+
+                let addr_result = get_pool_display_result(
+                    name,
+                    address.as_ref(),
+                    owner.as_ref(),
+                    config,
+                    vault_ref,
+                )
+                .await;
+
+                let balance_result = resolve_pool_balance(&addr_result, rpc_client).await;
+
+                let display_owner =
+                    owner.as_ref().and_then(|o| MsgAddressInt::from_str(o).ok()).and_then(|o| {
+                        o.to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE).ok()
+                    });
+
+                views.push(PoolView {
+                    name: name.clone(),
+                    kind: "SNP".to_string(),
+                    balance: balance_result.ok(),
+                    address: addr_result.ok(),
+                    owner: display_owner,
+                    addresses: None,
+                    validator_share: None,
+                });
+            }
+            PoolConfig::TONCore { addresses, validator_share } => {
+                views.push(PoolView {
+                    name: name.clone(),
+                    kind: "Core".to_string(),
+                    balance: None,
+                    address: None,
+                    owner: None,
+                    addresses: Some(addresses.to_vec()),
+                    validator_share: Some(*validator_share),
+                });
             }
         }
-        println!();
-        Ok(())
     }
+    views
+}
+
+fn print_pools_json(views: &[PoolView]) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(views)?);
+    Ok(())
+}
+
+fn print_pools_table(views: &[PoolView]) {
+    println!("\n{} {} ({})\n", "OK".green().bold(), "Pools:".green(), views.len());
+    println!(
+        "  {:<15} {:<6} {:<14} {:<50} {}",
+        "Name".cyan().bold(),
+        "Kind".cyan().bold(),
+        "Balance".cyan().bold(),
+        "Address".cyan().bold(),
+        "Owner".cyan().bold(),
+    );
+    println!("  {}", "─".repeat(137).dimmed());
+
+    for v in views {
+        match v.kind.as_str() {
+            "SNP" => {
+                let display_addr =
+                    v.address.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
+                let display_owner =
+                    v.owner.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
+                let display_balance =
+                    v.balance.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
+
+                println!(
+                    "  {:<15} {:<6} {:<14} {:<50} {}",
+                    v.name, "SNP", display_balance, display_addr, display_owner,
+                );
+            }
+            "Core" => {
+                let addrs = v.addresses.as_deref().map(|a| a.join(", ")).unwrap_or_default();
+                let share = v.validator_share.map(|s| s.to_string()).unwrap_or_default();
+                println!(
+                    "  {:<15} {:<6} {:<14} {:<50} share={}",
+                    v.name, "Core", "-", addrs, share,
+                );
+            }
+            _ => {}
+        }
+    }
+    println!();
 }
 
 async fn get_pool_display_result(
@@ -245,7 +312,7 @@ async fn resolve_pool_balance(
         (Ok(addr_str), Some(client)) => {
             let addr = MsgAddressInt::from_str(addr_str).map_err(|_| "invalid address")?;
             match client.get_address_information(&addr).await {
-                Ok(info) => Ok(format!("{:.4}", nanotons_to_tons_f64(info.balance))),
+                Ok(info) => Ok(display_tons(info.balance)),
                 Err(e) => Err(format!("ton api failed: {e}")),
             }
         }

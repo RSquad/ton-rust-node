@@ -19,7 +19,7 @@ use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
 
 /// Minimal required balance for the master wallet before it can be deployed.
-const DEPLOY_AMOUNT: u64 = 1_000_000_000; // 1 TON
+const DEPLOY_AMOUNT: u64 = 1_100_000_000; // 1 TON
 /// Minimal required balance for a wallet before it will be topped up.
 const MIN_WALLET_BALANCE: u64 = 5_000_000_000; // 5 TON
 /// Gas cost for sending message from a wallet.
