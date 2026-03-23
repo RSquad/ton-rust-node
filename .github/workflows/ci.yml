@@ -79,8 +79,7 @@ jobs:
         run: make fmt check=--check
 
   check:
-    runs-on:
-      group: large
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
@@ -105,7 +104,7 @@ jobs:
 
   tests:
     runs-on:
-      group: large
+      group: ton-large
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
@@ -127,7 +126,7 @@ jobs:
 
   tests-net:
     runs-on:
-      group: large
+      group: ton-large
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
