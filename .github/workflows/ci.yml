@@ -34,7 +34,7 @@ jobs:
           set -euo pipefail
 
           set +e
-          cargo audit --config audit.toml --json > cargo-audit.json
+          cargo audit --json > cargo-audit.json
           AUDIT_EXIT=$?
           set -e
 
