@@ -12,6 +12,7 @@ Step-by-step guide for deploying nodectl and configuring it to manage TON valida
 - [Step 3: Set up keys](#step-3-set-up-keys)
 - [Step 4: Restart the service](#step-4-restart-the-service)
 - [Step 5: Fund and verify](#step-5-fund-and-verify)
+- [Expose the REST API externally](#expose-the-rest-api-externally)
 - [Migrating an existing deployment](#migrating-an-existing-deployment)
 - [Troubleshooting](#troubleshooting)
 
@@ -368,6 +369,36 @@ See [elections.md](elections.md) for binding statuses, stake policies, and elect
 
 ---
 
+## Expose the REST API externally
+
+> **Important:** The nodectl REST API has **no authentication by default** — all endpoints are open until at least one user is created. Do not expose the API externally before completing the steps below. See [nodectl-security.md](../../../src/node-control/docs/nodectl-security.md) for the full security model.
+
+### 1. Create a user inside the pod
+
+```bash
+kubectl exec -it deploy/my-nodectl -- nodectl auth add <username> --role operator
+```
+
+Authentication activates within 10 seconds — no restart required.
+
+### 2. Verify auth is working
+
+```bash
+kubectl exec deploy/my-nodectl -- nodectl api elections
+```
+
+If authentication is active, the command returns an error (401 Unauthorized). This confirms the API is protected and safe to expose externally.
+
+### 3. Expose the Service
+
+The chart creates a Kubernetes Service with configurable `service.type`. Set it to `NodePort` or `LoadBalancer` in your values, or keep the default `ClusterIP` and attach your own Ingress or reverse proxy to the Service by name. See `values.yaml` for all available `service.*` parameters.
+
+The chart does not terminate TLS — the pod serves plain HTTP on port 8080. TLS should be handled by your load balancer, Ingress controller, or reverse proxy.
+
+> **Rate limiter:** Make sure your reverse proxy forwards the real client IP (e.g. `X-Forwarded-For`). Without it, the login rate limiter keys all requests to the proxy IP instead of the real client.
+
+---
+
 ## Migrating an existing deployment
 
 nodectl configuration should only be managed through the CLI — do not edit `config.json` by hand. However, if you need to migrate nodectl to a different cluster or namespace, you can transfer the config and vault files from the existing PVC.
@@ -436,9 +467,7 @@ All nodes share the same wallet. The SNP address depends on the validator wallet
 
 ### Probes failing
 
-The default generated config uses `http.bind: "127.0.0.1:8080"`. Kubernetes probes need to reach the pod from outside localhost. Edit the config inside the pod:
-
-Change `"bind": "127.0.0.1:8080"` to `"bind": "0.0.0.0:8080"`.
+The default `http.bind` is `0.0.0.0:8080`, so probes should work out of the box. If you have overridden it to `127.0.0.1:8080`, change it back to `0.0.0.0:8080` — Kubernetes probes need to reach the pod from outside localhost.
 
 ### Debug mode
 
