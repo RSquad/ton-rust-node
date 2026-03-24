@@ -33,7 +33,7 @@ Nodectl will automatically withdraw the unfrozen stake previously submitted by t
 
 ### Critical — read before the first Rust election
 
-[!CAUTION]
+> [!CAUTION]
 > If the node's staking policy in `nodectl` is set to `split50` (the default), nodectl first calculates the total available funds for staking = frozen stake + pool's free balance + already submitted stake, then splits them in half and submits that amount to the current elections. However, since the Rust node does not have the validator key that the C++ node is currently using to validate in this round, nodectl cannot determine the frozen stake and will treat it as 0. **As a result, the stake amount will be half of what it should be.**
 
 For example:

@@ -953,7 +953,7 @@ nodectl config-param -c config.json 34
 
 ## REST API Endpoints
 
-When running in service mode, nodectl exposes a REST API for monitoring and management. Protected endpoints require a JWT token in the `Authorization: Bearer <token>` header. See the **[Security Guide](./docs/nodectl-security.md)** for full details on roles, rate limiting, and token revocation.
+When running in service mode, nodectl exposes a REST API for monitoring and management. By default, the HTTP server listens on all interfaces (`0.0.0.0:8080`), all endpoints are open, and authentication is disabled. Authentication activates automatically once the first user is created via `nodectl auth add`. Protected endpoints require a JWT token in the `Authorization: Bearer <token>` header. See the **[Security Guide](./docs/nodectl-security.md)** for full details on roles, rate limiting, and token revocation.
 
 ### Configuration
 
