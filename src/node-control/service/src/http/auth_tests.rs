@@ -68,7 +68,7 @@ fn app_cfg_no_auth() -> Arc<common::app_config::AppConfig> {
         pools: HashMap::new(),
         bindings: HashMap::new(),
         ton_http_api: Default::default(),
-        http: Default::default(),
+        http: common::app_config::HttpConfig { auth: None, ..Default::default() },
         elections: Some(Default::default()),
         voting: None,
         master_wallet: None,
