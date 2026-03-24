@@ -809,7 +809,7 @@ RUST_LOG=debug nodectl service -c config.json
 
 ### Service API Commands
 
-Commands for interacting with the nodectl service REST API. The service URL is resolved in this order: explicit `--url`, then `http.bind` from `--config`, then default `http://127.0.0.1:8080`.
+Commands for interacting with the nodectl service REST API. The service URL is resolved in this order: explicit `--url`, then `http.bind` from `--config`. If neither is available, the command fails. When connecting from a remote machine, pass `--url` explicitly.
 
 #### `api`
 
@@ -953,7 +953,9 @@ nodectl config-param -c config.json 34
 
 ## REST API Endpoints
 
-When running in service mode, nodectl exposes a REST API for monitoring and management. By default, the HTTP server listens on all interfaces (`0.0.0.0:8080`), all endpoints are open, and authentication is disabled. Authentication activates automatically once the first user is created via `nodectl auth add`. Protected endpoints require a JWT token in the `Authorization: Bearer <token>` header. See the **[Security Guide](./docs/nodectl-security.md)** for full details on roles, rate limiting, and token revocation.
+When running in service mode, nodectl exposes a REST API for monitoring and management. By default, the HTTP server listens on all interfaces (`0.0.0.0:8080`) with authentication enabled and no users — all protected endpoints return `401` until at least one user is created via `nodectl auth add`. Protected endpoints require a JWT token in the `Authorization: Bearer <token>` header. See the **[Security Guide](./docs/nodectl-security.md)** for full details on roles, rate limiting, and token revocation.
+
+> **Warning:** nodectl serves plain HTTP. If the API is reachable outside your trusted network, terminate TLS at a reverse proxy or load balancer — otherwise passwords (`/auth/login`) and JWT tokens (`Authorization` header) travel in plain text.
 
 ### Configuration
 
@@ -1374,13 +1376,13 @@ HTTP REST API server configuration:
 - `enable_swagger` — enable Swagger UI at `/swagger` (default: `true`)
 - `auth` — JWT authentication configuration (see below)
 
-#### `http.auth` (optional)
+#### `http.auth`
 
-REST API authentication settings. **Authentication is disabled by default** — all endpoints are accessible without a token until at least one user is created via `nodectl auth add`.
+REST API authentication settings. **Authentication is enabled by default** — a freshly generated config includes the `http.auth` section with an empty user list, so all protected endpoints return `401` until at least one user is created via `nodectl auth add`. To disable authentication and open all endpoints, remove the `http.auth` section from the config (or set it to `null`).
 
-> **Note:** On first start the service creates a JWT signing key in the vault (secret `auth.jwt-signing-key`) even when authentication is disabled. This ensures the key is ready when you enable auth later.
+> **Note:** On first start the service creates a JWT signing key in the vault (secret `auth.jwt-signing-key`).
 >
-> **No restart required:** Authentication can be enabled at runtime — the service hot-reloads the configuration, so adding a user with `nodectl auth add` activates auth immediately.
+> **No restart required:** The service hot-reloads the configuration, so changes to users or auth settings take effect immediately.
 
 - `operator_token_ttl` — operator token TTL in seconds (default: `2592000` — 30 days)
 - `nominator_token_ttl` — nominator token TTL in seconds (default: `86400` — 1 day)

@@ -12,7 +12,7 @@ Step-by-step guide for deploying nodectl and configuring it to manage TON valida
 - [Step 3: Set up keys](#step-3-set-up-keys)
 - [Step 4: Restart the service](#step-4-restart-the-service)
 - [Step 5: Fund and verify](#step-5-fund-and-verify)
-- [Expose the REST API externally](#expose-the-rest-api-externally)
+- [Setup REST API authentication](#setup-rest-api-authentication)
 - [Migrating an existing deployment](#migrating-an-existing-deployment)
 - [Troubleshooting](#troubleshooting)
 
@@ -369,17 +369,17 @@ See [elections.md](elections.md) for binding statuses, stake policies, and elect
 
 ---
 
-## Expose the REST API externally
+## Setup REST API authentication
 
-> **Important:** The nodectl REST API has **no authentication by default** — all endpoints are open until at least one user is created. Do not expose the API externally before completing the steps below. See [nodectl-security.md](../../../src/node-control/docs/nodectl-security.md) for the full security model.
+> **Authentication is enabled by default.** A freshly deployed nodectl has the `http.auth` section in its config with an empty user list — all protected endpoints return `401` until at least one user is created. The API is safe to expose only after you create a user and verify authentication works. See [nodectl-security.md](../../../src/node-control/docs/nodectl-security.md) for the full security model.
 
 ### 1. Create a user inside the pod
 
 ```bash
-kubectl exec -it deploy/my-nodectl -- nodectl auth add <username> --role operator
+kubectl exec -it deploy/my-nodectl -- nodectl auth add -u <username> -r operator
 ```
 
-Authentication activates within 10 seconds — no restart required.
+The service picks up the new user automatically — no restart required.
 
 ### 2. Verify auth is working
 
@@ -387,13 +387,45 @@ Authentication activates within 10 seconds — no restart required.
 kubectl exec deploy/my-nodectl -- nodectl api elections
 ```
 
-If authentication is active, the command returns an error (401 Unauthorized). This confirms the API is protected and safe to expose externally.
+Without a token, the command returns `401 Unauthorized`. This confirms the API is protected and safe to expose externally.
 
-### 3. Expose the Service
+### 3. Log in and use the API
+
+All `nodectl api` commands resolve the service URL in this order:
+
+1. Explicit `--url` flag (e.g. `--url http://10.0.0.5:8080`)
+2. `http.bind` value from `--config` (or `CONFIG_PATH`)
+
+When running **inside the pod**, the config file is available and the URL is resolved automatically. When running **outside the pod** (e.g. from your workstation), pass `--url` explicitly — otherwise the command tries to read the local config and fails:
+
+```bash
+# Inside the pod — URL from config
+kubectl exec -it deploy/my-nodectl -- nodectl api login <username>
+
+# Outside the pod — explicit URL required
+nodectl api login <username> --url http://<SERVICE_IP>:8080
+```
+
+```bash
+# Get a token (inside the pod)
+kubectl exec -it deploy/my-nodectl -- nodectl api login <username>
+export NODECTL_API_TOKEN="<jwt>"
+
+# Use the API (from outside, with --url)
+nodectl api elections --url http://<SERVICE_IP>:8080
+
+# Or set both token and URL, then run commands without flags
+export NODECTL_API_TOKEN="<jwt>"
+nodectl api elections --url http://<SERVICE_IP>:8080
+```
+
+### 4. Expose the Service REST API externally (Optional)
 
 The chart creates a Kubernetes Service with configurable `service.type`. Set it to `NodePort` or `LoadBalancer` in your values, or keep the default `ClusterIP` and attach your own Ingress or reverse proxy to the Service by name. See `values.yaml` for all available `service.*` parameters.
 
 The chart does not terminate TLS — the pod serves plain HTTP on port 8080. TLS should be handled by your load balancer, Ingress controller, or reverse proxy.
+
+> **Warning:** Without TLS, passwords sent to `/auth/login` and JWT tokens in `Authorization` headers are transmitted in plain text. Always terminate TLS before the traffic leaves your trusted network — at the Ingress controller, load balancer, or reverse proxy.
 
 > **Rate limiter:** Make sure your reverse proxy forwards the real client IP (e.g. `X-Forwarded-For`). Without it, the login rate limiter keys all requests to the proxy IP instead of the real client.
 
