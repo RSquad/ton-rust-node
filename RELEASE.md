@@ -55,7 +55,7 @@ Merge feature branches and fixes into the release branch. This is where all chan
 
 ### 3. Test with RC tags (optional)
 
-Tag release candidates from the branch to trigger CI:
+Tag release candidates **only from the release branch** to trigger CI:
 
 ```bash
 git tag <artifact>/v<version>-rc.1
@@ -63,6 +63,8 @@ git push origin <artifact>/v<version>-rc.1
 ```
 
 CI builds and publishes the RC automatically. RC releases are marked as **Pre-release** on GitHub.
+
+> **Internal/test builds:** If you need to build an image for testing outside of a release branch, use the `alpha` or `beta` pre-release suffix: `<artifact>/v<version>-alpha.1`. These builds are strictly internal — never distribute or deploy them to production.
 
 ### 4. Open PR into master
 
