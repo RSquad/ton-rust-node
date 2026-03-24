@@ -189,8 +189,7 @@ impl ApiCmd {
             normalize_base_url(Cow::Borrowed(url))
         } else {
             let app_cfg = AppConfig::load(Path::new(&self.config))?;
-            let bind = app_cfg.http.bind.replace("0.0.0.0", "127.0.0.1");
-            normalize_base_url(Cow::Owned(bind))
+            normalize_base_url(Cow::Owned(app_cfg.http.bind.clone()))
         };
         let client = reqwest::Client::new();
         let token = self.token.as_deref();

@@ -27,7 +27,7 @@ port: 8080
 
 ## @section Service parameters
 
-## @param service.type Service type (`ClusterIP`, `NodePort`, `LoadBalancer`, `ExternalName`)
+## @param service.type Service type (`ClusterIP`, `NodePort`, `LoadBalancer`)
 ## @param service.annotations [object] Annotations for the Service (e.g. cloud LB TLS settings)
 ## @param service.nodePort [nullable] Node port number. Only used when `service.type` is `NodePort`.
 ## @param service.clusterIP [nullable] Explicit ClusterIP. Set to `None` for a headless service.
