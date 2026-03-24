@@ -1706,6 +1706,28 @@ nodectl config wallet send \
   --amount 10.0
 ```
 
+### Manual staking
+
+`nodectl config wallet stake` sends an election stake through a nominator pool. Use it to participate in elections manually.
+
+```bash
+nodectl config wallet stake -b <BINDING> -a <AMOUNT> [-m <MAX_FACTOR>]
+```
+
+| Flag | Long | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `-b` | `--binding` | Yes | — | Binding name (node-wallet-pool triple) |
+| `-a` | `--amount` | Yes | — | Stake amount in TON |
+| `-m` | `--max-factor` | No | `3.0` | Max factor (`1.0`–`3.0`) |
+
+Example:
+
+```bash
+nodectl config wallet stake -b node0 -a 50000 -m 2.5
+```
+
+The command validates that elections are active, manages validator keys and ADNL addresses automatically, builds and sends the stake transaction, and polls the Elector until the stake is confirmed.
+
 ### Starting the Service Daemon
 
 ```bash
