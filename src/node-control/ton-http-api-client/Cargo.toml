@@ -1,6 +1,6 @@
 [package]
 name = "ton-http-api-client"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = 'GPL-3.0'
 
@@ -9,7 +9,6 @@ serde = { version = "1.0" }
 serde_json = "1.0.145"
 base64 = "0.22"
 anyhow = "1.0"
-async-trait = "0.1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 ton_block = { path = "../../block" }

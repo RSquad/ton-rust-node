@@ -18,6 +18,7 @@ Image: `ghcr.io/rsquad/ton-rust-node/nodectl:v0.2.1`
 Image: `ghcr.io/rsquad/ton-rust-node/nodectl:v0.2.0`
 
 ### Added
+
 - `config log` CLI commands (`ls`, `set`) for viewing and updating log settings
 - Log file rotation and automatic cleanup configuration
 - Support for multiple ton-http-api endpoints with failover and per-endpoint API keys

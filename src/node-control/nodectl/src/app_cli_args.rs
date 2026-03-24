@@ -11,8 +11,24 @@ use std::sync::OnceLock;
 
 static CLI_ARGS: OnceLock<AppCliArgs> = OnceLock::new();
 
+fn long_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nCOMMIT_ID: ",
+        env!("BUILD_GIT_COMMIT"),
+        "\nBUILD_DATE: ",
+        env!("BUILD_TIME"),
+        "\nCOMMIT_DATE: ",
+        env!("BUILD_GIT_DATE"),
+        "\nGIT_BRANCH: ",
+        env!("BUILD_GIT_BRANCH"),
+        "\nRUST_VERSION: ",
+        env!("BUILD_RUST_VERSION"),
+    )
+}
+
 #[derive(clap::Parser, Clone)]
-#[command(author, version, about, long_about)]
+#[command(author, version, about, long_about, long_version = long_version())]
 pub struct AppCliArgs {
     #[command(subcommand)]
     pub command: Option<CliCommands>,

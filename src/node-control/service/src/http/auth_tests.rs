@@ -107,6 +107,12 @@ fn elections_task(rt: Arc<RuntimeConfigStore>) -> Arc<TaskController> {
     Arc::new(TaskController::new("elections", Noop, rt))
 }
 
+const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
+
+async fn test_jwt_auth() -> Arc<JwtAuth> {
+    Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap())
+}
+
 async fn state_with_auth() -> AppState {
     let cfg = auth_config();
     let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(cfg.clone())));
@@ -114,19 +120,19 @@ async fn state_with_auth() -> AppState {
         store: Arc::new(SnapshotStore::new()),
         runtime_cfg: rt.clone(),
         elections_task: elections_task(rt.clone()),
-        jwt_auth: Some(Arc::new(JwtAuth::new(None, &cfg).await.unwrap())),
+        jwt_auth: test_jwt_auth().await,
         user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
     }
 }
 
-fn state_no_auth() -> AppState {
+async fn state_no_auth() -> AppState {
     let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_no_auth()));
     AppState {
         store: Arc::new(SnapshotStore::new()),
         runtime_cfg: rt.clone(),
         elections_task: elections_task(rt.clone()),
-        jwt_auth: None,
+        jwt_auth: test_jwt_auth().await,
         user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
     }
@@ -314,7 +320,7 @@ async fn protected_route_invalid_token_401() {
 #[tokio::test]
 async fn protected_route_valid_operator_token_200() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
     let resp = app(st).oneshot(get_bearer("/v1/elections", &tok)).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
@@ -322,7 +328,7 @@ async fn protected_route_valid_operator_token_200() {
 #[tokio::test]
 async fn protected_route_valid_nominator_token_200() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("nom", Role::Nominator).unwrap().0;
+    let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
     let resp = app(st).oneshot(get_bearer("/v1/elections", &tok)).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
@@ -332,7 +338,7 @@ async fn protected_route_valid_nominator_token_200() {
 #[tokio::test]
 async fn nominator_forbidden_on_operator_route() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("nom", Role::Nominator).unwrap().0;
+    let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
     let body = StakePolicyRequest { policy: StakePolicy::Minimum, node: None };
     let resp = app(st).oneshot(post_bearer("/v1/stake_strategy", &body, &tok)).await.unwrap();
     assert_eq!(resp.status(), 403);
@@ -341,7 +347,7 @@ async fn nominator_forbidden_on_operator_route() {
 #[tokio::test]
 async fn operator_allowed_on_operator_route() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
     let body = StakePolicyRequest { policy: StakePolicy::Fixed(100), node: None };
     let resp = app(st).oneshot(post_bearer("/v1/stake_strategy", &body, &tok)).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -350,7 +356,7 @@ async fn operator_allowed_on_operator_route() {
 #[tokio::test]
 async fn operator_can_access_nominator_routes() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
     let resp = app(st).oneshot(get_bearer("/v1/validators", &tok)).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
@@ -381,14 +387,14 @@ async fn login_endpoint_always_public() {
 
 #[tokio::test]
 async fn auth_disabled_all_routes_open() {
-    let st = state_no_auth();
+    let st = state_no_auth().await;
     let resp = app(st).oneshot(get("/v1/elections")).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
 async fn auth_disabled_operator_routes_open() {
-    let st = state_no_auth();
+    let st = state_no_auth().await;
     let body = StakePolicyRequest { policy: StakePolicy::Fixed(100), node: None };
     let resp = app(st).oneshot(post_json("/v1/stake_strategy", &body)).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -399,7 +405,7 @@ async fn auth_disabled_operator_routes_open() {
 #[tokio::test]
 async fn me_returns_operator_claims() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
     let resp = app(st).oneshot(get_bearer("/auth/me", &tok)).await.unwrap();
     assert_eq!(resp.status(), 200);
     let v = json(resp).await;
@@ -410,7 +416,7 @@ async fn me_returns_operator_claims() {
 #[tokio::test]
 async fn me_returns_nominator_claims() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("nom", Role::Nominator).unwrap().0;
+    let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
     let resp = app(st).oneshot(get_bearer("/auth/me", &tok)).await.unwrap();
     assert_eq!(resp.status(), 200);
     let v = json(resp).await;
@@ -421,7 +427,7 @@ async fn me_returns_nominator_claims() {
 #[tokio::test]
 async fn protected_route_token_revoked_by_cutoff_401() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
 
     st.runtime_cfg
         .update_with(|cfg| {
@@ -442,8 +448,8 @@ async fn protected_route_token_revoked_by_cutoff_401() {
 #[tokio::test]
 async fn protected_route_token_revoked_on_equal_cutoff_401() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
-    let claims = st.jwt_auth.as_ref().unwrap().verify(&tok).unwrap();
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
+    let claims = st.jwt_auth.verify(&tok).unwrap();
 
     st.runtime_cfg
         .update_with(|cfg| {
@@ -464,7 +470,7 @@ async fn protected_route_token_revoked_on_equal_cutoff_401() {
 #[tokio::test]
 async fn protected_route_token_rejected_after_role_change_401() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
 
     st.runtime_cfg
         .update_with(|cfg| {
@@ -485,7 +491,7 @@ async fn protected_route_token_rejected_after_role_change_401() {
 #[tokio::test]
 async fn create_user_via_rest_is_not_allowed() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
 
     let resp = app(st)
         .oneshot(post_bearer(
@@ -505,7 +511,7 @@ async fn create_user_via_rest_is_not_allowed() {
 #[tokio::test]
 async fn delete_user_via_rest_returns_404() {
     let st = state_with_auth().await;
-    let tok = st.jwt_auth.as_ref().unwrap().generate("op", Role::Operator).unwrap().0;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
 
     let req = axum::http::Request::builder()
         .method("DELETE")

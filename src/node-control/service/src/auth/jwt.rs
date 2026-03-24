@@ -7,7 +7,6 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::{Claims, Role};
-use common::app_config::AuthConfig;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use secrets_vault::{
     types::{algorithm::Algorithm, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec},
@@ -26,19 +25,21 @@ const JWT_KEY_SECRET_ID: &str = "auth.jwt-signing-key";
 pub struct JwtAuth {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
-    auth_config: AuthConfig,
 }
 
 impl JwtAuth {
     /// Creates a new instance, resolving the HMAC-SHA256 signing key
-    /// from vault (preferred) or config fallback.
+    /// from vault (preferred) or `jwt_secret` fallback.
+    ///
+    /// `jwt_secret` is a base64-encoded key used **only for testing** when
+    /// vault is not available. In production the vault is always present.
     pub async fn new(
         vault: Option<Arc<SecretVault>>,
-        auth_config: &AuthConfig,
+        jwt_secret: Option<&str>,
     ) -> anyhow::Result<Self> {
         let secret_bytes = if let Some(vault) = vault {
             Self::load_or_create_key(&vault).await?
-        } else if let Some(jwt_secret) = &auth_config.jwt_secret {
+        } else if let Some(jwt_secret) = jwt_secret {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
                 .decode(jwt_secret)
@@ -54,20 +55,16 @@ impl JwtAuth {
         Ok(Self {
             encoding_key: EncodingKey::from_secret(&secret_bytes),
             decoding_key: DecodingKey::from_secret(&secret_bytes),
-            auth_config: auth_config.clone(),
         })
     }
 
-    /// generates a new JWT for the given user. Returns `(token, ttl_seconds)`.
-    /// TTL depends on the role (configured in [`AuthConfig`]).
-    pub fn generate(&self, username: &str, role: Role) -> anyhow::Result<(String, u64)> {
+    /// Generates a new JWT for the given user. Returns `(token, ttl_seconds)`.
+    ///
+    /// The caller provides the `ttl` (seconds) from the current live config,
+    /// so that TTL changes applied via config reload take effect immediately.
+    pub fn generate(&self, username: &str, role: Role, ttl: u64) -> anyhow::Result<(String, u64)> {
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-
-        let ttl = match role {
-            Role::Operator => self.auth_config.operator_token_ttl,
-            Role::Nominator => self.auth_config.nominator_token_ttl,
-        };
 
         let claims = Claims { sub: username.to_owned(), role, iat: now, exp: now + ttl };
 
@@ -121,19 +118,14 @@ mod tests {
     use super::*;
     use base64::Engine;
 
-    fn test_config() -> AuthConfig {
-        AuthConfig {
-            operator_token_ttl: 3600,
-            nominator_token_ttl: 7200,
-            jwt_secret: Some(base64::engine::general_purpose::STANDARD.encode([42u8; 32])),
-            ..Default::default()
-        }
+    fn test_secret() -> String {
+        base64::engine::general_purpose::STANDARD.encode([42u8; 32])
     }
 
     #[tokio::test]
     async fn sign_and_verify_roundtrip() {
-        let mgr = JwtAuth::new(None, &test_config()).await.unwrap();
-        let (token, ttl) = mgr.generate("admin", Role::Operator).unwrap();
+        let mgr = JwtAuth::new(None, Some(&test_secret())).await.unwrap();
+        let (token, ttl) = mgr.generate("admin", Role::Operator, 3600).unwrap();
         assert_eq!(ttl, 3600);
 
         let claims = mgr.verify(&token).unwrap();
@@ -143,27 +135,24 @@ mod tests {
 
     #[tokio::test]
     async fn verify_rejects_invalid_token() {
-        let mgr = JwtAuth::new(None, &test_config()).await.unwrap();
+        let mgr = JwtAuth::new(None, Some(&test_secret())).await.unwrap();
         assert!(mgr.verify("not-a-valid-token").is_err());
     }
 
     #[tokio::test]
     async fn verify_rejects_wrong_secret() {
-        let cfg1 = test_config();
-        let mgr1 = JwtAuth::new(None, &cfg1).await.unwrap();
-        let (token, _) = mgr1.generate("admin", Role::Operator).unwrap();
+        let secret1 = test_secret();
+        let mgr1 = JwtAuth::new(None, Some(&secret1)).await.unwrap();
+        let (token, _) = mgr1.generate("admin", Role::Operator, 3600).unwrap();
 
-        let cfg2 = AuthConfig {
-            jwt_secret: Some(base64::engine::general_purpose::STANDARD.encode([99u8; 32])),
-            ..cfg1
-        };
-        let mgr2 = JwtAuth::new(None, &cfg2).await.unwrap();
+        let secret2 = base64::engine::general_purpose::STANDARD.encode([99u8; 32]);
+        let mgr2 = JwtAuth::new(None, Some(&secret2)).await.unwrap();
         assert!(mgr2.verify(&token).is_err());
     }
 
     #[tokio::test]
     async fn verify_rejects_expired_token() {
-        let mgr = JwtAuth::new(None, &test_config()).await.unwrap();
+        let mgr = JwtAuth::new(None, Some(&test_secret())).await.unwrap();
         let claims = Claims {
             sub: "admin".to_owned(),
             role: Role::Operator,
@@ -176,16 +165,12 @@ mod tests {
 
     #[tokio::test]
     async fn no_vault_no_secret_fails() {
-        let cfg = AuthConfig { jwt_secret: None, ..test_config() };
-        assert!(JwtAuth::new(None, &cfg).await.is_err());
+        assert!(JwtAuth::new(None, None).await.is_err());
     }
 
     #[tokio::test]
     async fn short_secret_fails() {
-        let cfg = AuthConfig {
-            jwt_secret: Some(base64::engine::general_purpose::STANDARD.encode([1u8; 16])),
-            ..test_config()
-        };
-        assert!(JwtAuth::new(None, &cfg).await.is_err());
+        let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        assert!(JwtAuth::new(None, Some(&short)).await.is_err());
     }
 }
