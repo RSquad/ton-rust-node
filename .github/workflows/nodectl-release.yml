@@ -1,0 +1,72 @@
+name: Publish nodectl Container
+
+on:
+  push:
+    tags:
+      - "nodectl/v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/rsquad/ton-rust-node/nodectl
+          tags: |
+            type=match,pattern=nodectl/(v.*),group=1
+            type=raw,value=latest
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src
+          file: ./src/Dockerfile.nodectl
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#nodectl/}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          if echo "$VERSION" | grep -qE '(rc|alpha|beta)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "nodectl/${{ steps.version.outputs.version }}"
+          body: |
+            nodectl ${{ steps.version.outputs.version }}
+
+            Image: `ghcr.io/rsquad/ton-rust-node/nodectl:${{ steps.version.outputs.version }}`
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          make_latest: false
