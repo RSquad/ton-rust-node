@@ -1,7 +1,9 @@
 name: nodectl release (dry run)
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - feat/nodectl-v0-3-0-migration
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -52,20 +54,6 @@ jobs:
             cargo build --release --package nodectl --target ${{ matrix.target }}
           fi
         shell: bash
-
-      - name: Rename binary
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp src/target/${{ matrix.target }}/release/nodectl.exe ${{ matrix.name }}
-          else
-            cp src/target/${{ matrix.target }}/release/nodectl ${{ matrix.name }}
-          fi
-        shell: bash
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
 
   container:
     runs-on: ubuntu-latest
