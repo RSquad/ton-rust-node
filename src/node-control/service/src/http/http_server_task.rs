@@ -82,6 +82,8 @@ pub async fn run(
     let bind_addr: SocketAddr = match bind.parse() {
         Ok(a) => a,
         Err(e) => {
+            // Intentionally fall back to localhost (not 0.0.0.0) to avoid
+            // accidentally exposing the API when the configured address is invalid.
             tracing::error!("invalid http.bind '{}': {} (fallback to 127.0.0.1:8080)", &bind, e);
             "127.0.0.1:8080".parse().expect("static bind must parse")
         }
