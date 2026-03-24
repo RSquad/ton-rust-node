@@ -907,7 +907,8 @@ mod tests {
     use base64::Engine;
     use common::{
         app_config::{
-            AppConfig, ElectionsConfig, LogConfig, NodeBinding, StakePolicy, TonHttpApiConfig,
+            AppConfig, ElectionsConfig, HttpConfig, LogConfig, NodeBinding, StakePolicy,
+            TonHttpApiConfig,
         },
         snapshot::{
             ElectionsParticipantSnapshot, ElectionsSnapshot, ElectionsStatus,
@@ -975,7 +976,7 @@ mod tests {
             pools: HashMap::new(),
             bindings,
             ton_http_api: TonHttpApiConfig::default(),
-            http: Default::default(),
+            http: HttpConfig { auth: None, ..Default::default() },
             elections: Some(ElectionsConfig { policy, ..Default::default() }),
             voting: None,
             master_wallet: None,
@@ -991,7 +992,7 @@ mod tests {
             pools: HashMap::new(),
             bindings: HashMap::new(),
             ton_http_api: TonHttpApiConfig::default(),
-            http: Default::default(),
+            http: HttpConfig { auth: None, ..Default::default() },
             elections: None,
             voting: None,
             master_wallet: None,
