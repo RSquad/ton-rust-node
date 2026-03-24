@@ -138,3 +138,10 @@ jobs:
           files: artifacts/*
           prerelease: ${{ steps.version.outputs.prerelease }}
           make_latest: false
+          draft: ${{ steps.version.outputs.prerelease }}
+
+      - name: Publish pre-release
+        if: steps.version.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
