@@ -138,7 +138,7 @@ impl AddUserCmd {
 
         if config.http.auth.is_none() {
             println!(
-                "{}: auth is not configured yet, default config is being created",
+                "{}: auth is not configured yet; enabling with default settings",
                 "Warning".yellow().bold()
             );
         }
@@ -316,7 +316,7 @@ fn list_users(config_path: &Path) -> anyhow::Result<()> {
     let config = AppConfig::load(config_path)?;
 
     if config.http.auth.is_none() {
-        anyhow::bail!("{}", "auth is not configured yet; add users with 'nodectl auth add' to enable authentication".red());
+        anyhow::bail!("{}", "auth is disabled (http.auth section removed from config). Use 'nodectl auth add' to enable.".red());
     }
 
     let users = config.http.auth.as_ref().map(|a| a.users.as_slice()).unwrap_or_default();

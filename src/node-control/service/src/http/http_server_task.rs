@@ -82,6 +82,8 @@ pub async fn run(
     let bind_addr: SocketAddr = match bind.parse() {
         Ok(a) => a,
         Err(e) => {
+            // Intentionally fall back to localhost (not 0.0.0.0) to avoid
+            // accidentally exposing the API when the configured address is invalid.
             tracing::error!("invalid http.bind '{}': {} (fallback to 127.0.0.1:8080)", &bind, e);
             "127.0.0.1:8080".parse().expect("static bind must parse")
         }
@@ -905,7 +907,8 @@ mod tests {
     use base64::Engine;
     use common::{
         app_config::{
-            AppConfig, ElectionsConfig, LogConfig, NodeBinding, StakePolicy, TonHttpApiConfig,
+            AppConfig, ElectionsConfig, HttpConfig, LogConfig, NodeBinding, StakePolicy,
+            TonHttpApiConfig,
         },
         snapshot::{
             ElectionsParticipantSnapshot, ElectionsSnapshot, ElectionsStatus,
@@ -973,7 +976,7 @@ mod tests {
             pools: HashMap::new(),
             bindings,
             ton_http_api: TonHttpApiConfig::default(),
-            http: Default::default(),
+            http: HttpConfig { auth: None, ..Default::default() },
             elections: Some(ElectionsConfig { policy, ..Default::default() }),
             voting: None,
             master_wallet: None,
@@ -989,7 +992,7 @@ mod tests {
             pools: HashMap::new(),
             bindings: HashMap::new(),
             ton_http_api: TonHttpApiConfig::default(),
-            http: Default::default(),
+            http: HttpConfig { auth: None, ..Default::default() },
             elections: None,
             voting: None,
             master_wallet: None,

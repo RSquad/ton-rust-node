@@ -647,11 +647,11 @@ nodectl config elections stake-policy --reset -n node1
 
 ## Step 16: Configure REST API Authentication
 
-**Authentication is disabled by default** — all REST API endpoints are accessible without a token until at least one user is created.
+**Authentication is enabled by default.** A freshly generated config includes the `http.auth` section with an empty user list — all protected endpoints return `401` until at least one user is created. The `/health` endpoint remains accessible.
 
-On first start the service automatically creates a JWT signing key in the vault (secret `auth.jwt-signing-key`), even when no users exist yet. This ensures the key is ready when you enable auth later.
+On first start the service automatically creates a JWT signing key in the vault (secret `auth.jwt-signing-key`).
 
-**No service restart is required** to enable authentication. The service hot-reloads the configuration, so creating the first user with `nodectl auth add` activates auth immediately.
+**No service restart is required** to change authentication settings. The service hot-reloads the configuration, so creating the first user with `nodectl auth add` makes the API accessible immediately.
 
 > For a detailed description of roles, token lifecycle, revocation, rate limiting, and monitoring, see the **[Security Guide](./nodectl-security.md)**.
 
@@ -692,23 +692,27 @@ Values accept seconds (`3600`), or duration suffixes (`30s`, `60m`, `8h`).
 
 ### 16.4 Log In to the REST API
 
-Use `nodectl api login` to obtain a JWT token:
+All `nodectl api` commands resolve the service URL in this order:
+
+1. Explicit `--url` (`-u`) flag
+2. `http.bind` value from `--config` (or `CONFIG_PATH`)
+
+If neither is available, the command fails. When running on the same host as the service, the config file is usually present and the URL is resolved automatically. When connecting from a remote machine, pass `--url` explicitly:
 
 ```bash
-# Interactive password prompt
+# Local — URL from config
 nodectl api login operator
+
+# Remote — explicit URL
+nodectl api login operator -u http://192.168.1.10:8080
 ```
+
+> **Warning:** nodectl serves plain HTTP. If you connect from outside the host, terminate TLS at a reverse proxy or SSH tunnel — otherwise the password and JWT token travel in plain text.
 
 The command prints the JWT token, its expiration, and the user role. Store the token for subsequent API calls:
 
 ```bash
 export NODECTL_API_TOKEN="<token from login>"
-```
-
-By default `nodectl api login` connects to `http://127.0.0.1:8080`. Override with `-u`:
-
-```bash
-nodectl api login operator -u http://192.168.1.10:8080
 ```
 
 Once the token is exported, all `nodectl api` commands use it automatically:
@@ -725,7 +729,9 @@ nodectl api task elections restart
 
 ### Network Security
 
-1. **Run Nodectl HTTP server on localhost only**
+1. **Always use TLS for external access** — nodectl serves plain HTTP. Passwords sent to `/auth/login` and JWT tokens in `Authorization` headers travel in plain text without TLS. Terminate TLS at a reverse proxy, load balancer, or use an SSH tunnel.
+
+2. **Bind to localhost when external access is not needed**
 
    ```json
    "http": {
@@ -733,9 +739,7 @@ nodectl api task elections restart
    }
    ```
 
-2. **Use SSH tunneling for remote access**
-
-3. **Never expose the REST API to the public internet without TLS**
+3. **Use SSH tunneling for remote access** when TLS termination is not available
 
 ### Authentication Security
 

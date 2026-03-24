@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-03-20
+## [0.3.0] - 2026-03-24
 
 ### Added
 
@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful RPC error handling in `wallet ls`** — wallet listing no longer fails when TON API is unreachable; addresses are still displayed with `-` for unavailable state/balance fields; unified warning format
 - **Hot reload for auth state** — JWT TTL changes, newly added users, and token revocations take effect on config reload without service restart; JWT signing key is generated on first start even if auth is disabled
 - **Extended version command** — `nodectl --version` now prints build artifacts (git hash, build date, features)
-- Updated nodectl documentation with auth commands
+- **Updated documentation** — added descriptions for new commands and flags, fixed documentation errors, added document on `nodectl` security model, added documentation for first elections with Rust node, added documentation for REST API authentication
 
 ### Fixed
 
