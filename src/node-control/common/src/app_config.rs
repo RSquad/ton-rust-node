@@ -188,7 +188,7 @@ impl KeyConfig {
 }
 
 fn default_http_bind() -> String {
-    "127.0.0.1:8080".to_owned()
+    "0.0.0.0:8080".to_owned()
 }
 
 fn default_http_enable_swagger() -> bool {

@@ -962,7 +962,7 @@ The HTTP server is configured in the `http` section of the config:
 ```json
 {
   "http": {
-    "bind": "127.0.0.1:8080",
+    "bind": "0.0.0.0:8080",
     "enable_swagger": true
   }
 }
@@ -1278,7 +1278,7 @@ Configuration is specified in JSON format.
     "api_key": "<OPTIONAL_API_KEY>" | null
   },
   "http": {
-    "bind": "127.0.0.1:8080",
+    "bind": "0.0.0.0:8080",
     "enable_swagger": true,
     "api_key": null
   },
@@ -1370,7 +1370,7 @@ TON HTTP API configuration:
 
 HTTP REST API server configuration:
 
-- `bind` — address and port to bind (default: `127.0.0.1:8080`)
+- `bind` — address and port to bind (default: `0.0.0.0:8080`)
 - `enable_swagger` — enable Swagger UI at `/swagger` (default: `true`)
 - `auth` — JWT authentication configuration (see below)
 
@@ -1443,7 +1443,7 @@ Logging configuration:
     "tick_interval": 40
   },
   "http": {
-    "bind": "127.0.0.1:8080",
+    "bind": "0.0.0.0:8080",
     "enable_swagger": true
   },
   "master_wallet": {
