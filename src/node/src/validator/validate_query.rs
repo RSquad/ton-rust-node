@@ -5544,10 +5544,11 @@ impl ValidateQuery {
         tasks: &mut TasksVec,
     ) -> Result<()> {
         // log::debug!(target: "validate_query", "({}): checking all transactions", base.next_block_descr);
-        let block_version = base.config_params.global_version();
-        let capabilities = base.config_params.capabilities();
-        let config =
-            BlockchainConfig::with_params(capabilities, block_version, base.config_params.clone())?;
+        let config = BlockchainConfig::with_params(
+            base.config_params.capabilities(),
+            base.info.gen_software().map_or(0, |v| v.version),
+            base.config_params.clone()
+        )?;
         base.account_blocks.iterate_with_keys_and_aug(|account_addr, acc_block, _fee| {
             let base = base.clone();
             let libraries = libraries.clone();
