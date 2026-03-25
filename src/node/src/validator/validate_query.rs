@@ -764,7 +764,8 @@ impl ValidateQuery {
         let mc_state_extra = mc_state.shard_state_extra()?.clone();
         let config_params = mc_state_extra.config();
         CHECK!(config_params, inited);
-        let block_version = base.info.gen_software().map_or(0, |v| v.version);
+        let (capabilities, block_version) =
+            base.info.gen_software().map_or((0, 0), |v| (v.capabilities, v.version));
         if block_version < config_params.global_version() {
             reject_query!(
                 "This block version {} is too old, node_version: {} net version: {}",
@@ -5547,7 +5548,7 @@ impl ValidateQuery {
         let config = BlockchainConfig::with_params(
             base.config_params.capabilities(),
             base.info.gen_software().map_or(0, |v| v.version),
-            base.config_params.clone()
+            base.config_params.clone(),
         )?;
         base.account_blocks.iterate_with_keys_and_aug(|account_addr, acc_block, _fee| {
             let base = base.clone();
