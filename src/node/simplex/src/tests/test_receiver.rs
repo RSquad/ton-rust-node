@@ -53,7 +53,7 @@ use ton_api::{
     },
     IntoBoxed,
 };
-use ton_block::{sha256_digest, BlockIdExt, Ed25519KeyOption, Error, ShardIdent, UInt256};
+use ton_block::{error, sha256_digest, BlockIdExt, Ed25519KeyOption, Error, ShardIdent, UInt256};
 
 include!("../../../../common/src/info.rs");
 
@@ -193,6 +193,20 @@ impl ReceiverListener for TestReceiverListener {
             certificate
         );
     }
+
+    fn on_candidate_query_fallback(
+        &self,
+        _slot: crate::block::SlotIndex,
+        _block_hash: UInt256,
+        _want_notar: bool,
+        response_callback: consensus_common::QueryResponseCallback,
+    ) {
+        log::trace!(
+            "Receiver {} candidate_query_fallback: no-op (test mock)",
+            self.stats.receiver_idx
+        );
+        response_callback(Err(error!("Not implemented in test mock")));
+    }
 }
 
 impl Drop for TestReceiverListener {
@@ -237,12 +251,14 @@ impl ReceiverInstance {
             session_id.clone(),
             &shard,
             max_candidate_size,
+            0,
             nodes,
             &private_key,
             overlay_manager,
             listener_weak,
             Duration::from_secs(10), // standstill_timeout
             panicked_flag,
+            false,
             health_counters,
         )?;
 
@@ -667,12 +683,14 @@ fn test_receiver_candidate_resolver() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_secs(10),
         panicked_flag0,
+        false,
         health_counters0,
     )
     .expect("Failed to create receiver 0");
@@ -727,6 +745,9 @@ fn test_receiver_candidate_resolver() {
 
     // Send the broadcast (will be cached in receiver 0's resolver cache)
     receiver0.send_block_broadcast(slot, candidate_hash.clone(), broadcast);
+    // requestCandidate currently asks for both candidate+notar. Seed notar in
+    // resolver cache so late joiners can complete merged CandidateAndCert.
+    receiver0.cache_notarization_cert(slot, candidate_hash.clone(), vec![0xAA, 0xBB, 0xCC]);
     log::info!(
         "Receiver 0 broadcast candidate for slot {} with hash {}",
         slot,
@@ -751,12 +772,14 @@ fn test_receiver_candidate_resolver() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_secs(10),
         panicked_flag1,
+        false,
         health_counters1,
     )
     .expect("Failed to create receiver 1");
@@ -769,12 +792,14 @@ fn test_receiver_candidate_resolver() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[2],
         overlay_manager.clone(),
         Arc::downgrade(&listener2_arc),
         Duration::from_secs(10),
         panicked_flag2,
+        false,
         health_counters2,
     )
     .expect("Failed to create receiver 2");
@@ -910,12 +935,14 @@ fn test_receiver_send_certificate_and_standstill_rebroadcasts_cached_certificate
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_millis(200),
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
     )
     .expect("Failed to create receiver 0");
@@ -926,12 +953,14 @@ fn test_receiver_send_certificate_and_standstill_rebroadcasts_cached_certificate
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_millis(200),
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
     )
     .expect("Failed to create receiver 1");
@@ -1010,12 +1039,14 @@ fn test_receiver_standstill_rebroadcasts_cached_local_votes() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_millis(200),
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
     )
     .expect("Failed to create receiver 0");
@@ -1026,12 +1057,14 @@ fn test_receiver_standstill_rebroadcasts_cached_local_votes() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_millis(200),
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
     )
     .expect("Failed to create receiver 1");
@@ -1087,12 +1120,14 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_millis(200),
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
     )
     .expect("Failed to create receiver 0");
@@ -1103,12 +1138,14 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_millis(200),
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
     )
     .expect("Failed to create receiver 1");

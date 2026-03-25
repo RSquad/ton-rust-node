@@ -9,6 +9,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    error::tvm_exception_code,
     executor::{
         engine::Engine,
         math::DivMode,
@@ -24,7 +25,10 @@ use crate::{
     },
 };
 use std::collections::HashSet;
-use ton_block::{BuilderData, Cell, IBitstring, SliceData, Status};
+use ton_block::{
+    BuilderData, Cell, CurrencyCollection, Deserializable, ExceptionCode, IBitstring, SliceData,
+    Status,
+};
 
 #[test]
 fn test_assert_stack() {
@@ -256,4 +260,20 @@ fn test_currency_collection_ser() {
     let b1 = serialize_currency_collection(12345678u128, None).unwrap();
     let b2 = BuilderData::with_raw(vec![0x3b, 0xc6, 0x14, 0xe0], 29).unwrap();
     assert_eq!(b1, b2);
+}
+
+#[test]
+fn test_tvm_serialize_currency_collection() {
+    let coins = 1u64 << 63;
+    let coins1 = int!(coins).as_coins().unwrap();
+    let builder = serialize_currency_collection(coins1, None).unwrap();
+    let mut slice = SliceData::load_builder(builder).unwrap();
+    let coins1 = CurrencyCollection::construct_from(&mut slice).unwrap();
+    let coins2 = CurrencyCollection::with_coins(coins);
+    assert_eq!(coins1, coins2);
+
+    assert_eq!(
+        tvm_exception_code(&int!(1u128 << 120).as_coins().expect_err("Expect range check error")),
+        Some(ExceptionCode::RangeCheckError)
+    );
 }

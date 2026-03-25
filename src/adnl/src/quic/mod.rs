@@ -27,7 +27,7 @@ use ton_api::{
         request::{Message as QuicMessage, Query as QuicQuery},
         Request, Response as QuicResponse,
     },
-    IntoBoxed, TLObject,
+    IntoBoxed,
 };
 use ton_block::{
     ed25519_encode_private_key_to_pkcs8, error, fail, Ed25519KeyOption, KeyId, Result,
@@ -340,6 +340,9 @@ impl QuicNode {
 
     const DEFAULT_MAX_STREAMS_PER_CONNECTION: usize = 256;
 
+    /// Maximum number of messages buffered per outbound peer
+    const SEND_QUEUE_CAPACITY: usize = 1024;
+
     /// Register a local identity on a specific bind address.
     /// Creates a new endpoint if one doesn't exist for this port yet.
     pub fn add_key(
@@ -445,7 +448,10 @@ impl QuicNode {
         match self.get_outbound_connection(src, dst, true).await? {
             QuicOutboundConnection { conn: Some(ref conn), ref send_queue } => {
                 if send_queue.check(true) {
-                    send_queue.push(data);
+                    if !send_queue.try_push(data) {
+                        send_queue.check(false);
+                        fail!("QUIC send queue full for peer {dst}");
+                    }
                     while !send_queue.check(false) {
                         tokio::task::yield_now().await;
                     }
@@ -464,7 +470,11 @@ impl QuicNode {
                     return Ok(Some(len));
                 }
             }
-            QuicOutboundConnection { conn: None, ref send_queue } => send_queue.push(data),
+            QuicOutboundConnection { conn: None, ref send_queue } => {
+                if !send_queue.try_push(data) {
+                    fail!("QUIC send queue full for peer {dst} (connecting)");
+                }
+            }
         }
         Ok(None)
     }
@@ -489,7 +499,7 @@ impl QuicNode {
         src: &Arc<KeyId>,
         dst: &Arc<KeyId>,
         timeout_ms: Option<u64>,
-    ) -> Result<Option<TLObject>> {
+    ) -> Result<Option<Vec<u8>>> {
         self.ensure_peer_registered(adnl, src, dst)?;
         let timeout_ms = timeout_ms.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT_MS);
         let wire = serialize_boxed(&QuicQuery { data: data.into() }.into_boxed())?;
@@ -500,16 +510,27 @@ impl QuicNode {
         let obj = deserialize_boxed(&response)
             .map_err(|e| error!("Cannot deserialise QUIC answer: {e}"))?;
         match obj.downcast::<QuicResponse>() {
-            Ok(QuicResponse::Quic_Answer(answer)) => Ok(Some(
-                deserialize_boxed(&answer.data)
-                    .map_err(|e| error!("Cannot deserialise QUIC answer payload: {e}"))?,
-            )),
+            Ok(QuicResponse::Quic_Answer(answer)) => Ok(Some(answer.data.to_vec())),
             Err(x) => fail!("Unexpected QUIC response type {x:?}"),
         }
     }
 
-    /// Shut down all QUIC endpoints.
+    /// Shut down all QUIC endpoints, cancel background tasks, and release resources.
     pub fn shutdown(&self) {
+        // Cancel all background tasks (accept loops, connection checkers, drain tasks)
+        self.cancellation_token.cancel();
+
+        // Close all outbound connections in every local key state
+        for entry in self.local_keys.iter() {
+            let outbound = &entry.val().outbound;
+            for conn_entry in outbound.map().iter() {
+                if let Some(ref conn) = conn_entry.val().conn {
+                    conn.close(0u32.into(), b"shutdown");
+                }
+            }
+        }
+
+        // Close all endpoints
         if let Ok(endpoints) = self.endpoints.lock() {
             for (port, state) in endpoints.iter() {
                 log::info!(target: TARGET, "Shutting down QUIC endpoint on port {port}");
@@ -698,6 +719,7 @@ impl QuicNode {
             self.subscribers.clone(),
             bind_addr,
             self.max_streams_per_connection,
+            self.cancellation_token.clone(),
         );
 
         let state = Arc::new(EndpointState {
@@ -741,7 +763,7 @@ impl QuicNode {
                     });
                 }
                 None => {
-                    let queue = QuicSendQueue::new();
+                    let queue = QuicSendQueue::with_capacity(Self::SEND_QUEUE_CAPACITY);
                     add_unbound_object_to_map(outbound.map(), addr, || {
                         Ok(QuicOutboundConnection { conn: None, send_queue: queue.clone() })
                     })?;
@@ -1209,27 +1231,43 @@ impl QuicNode {
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         bind_addr: SocketAddr,
         max_streams_per_connection: usize,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) {
         tokio::spawn(async move {
             let inbound: Arc<Connections<quinn::Connection>> = Connections::new();
             loop {
                 log::trace!(target: TARGET, "Loop QUIC server on {bind_addr}");
-                let Some(incoming) = endpoint.accept().await else {
-                    log::info!(target: TARGET, "QUIC endpoint on {bind_addr} closed");
-                    break;
-                };
-                let addr = incoming.remote_address();
-                log::debug!(target: TARGET, "Accept in QUIC server on {bind_addr} from {addr}");
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        log::info!(target: TARGET, "QUIC accept loop on {bind_addr} cancelled");
+                        break;
+                    }
+                    incoming = endpoint.accept() => {
+                        let Some(incoming) = incoming else {
+                            log::info!(target: TARGET, "QUIC endpoint on {bind_addr} closed");
+                            break;
+                        };
+                        let addr = incoming.remote_address();
+                        log::debug!(target: TARGET, "Accept in QUIC server on {bind_addr} from {addr}");
 
-                tokio::spawn(Self::handle_connection(
-                    incoming,
-                    local_key_names.clone(),
-                    server_cert_resolver.clone(),
-                    inbound.clone(),
-                    subscribers.clone(),
-                    bind_addr,
-                    max_streams_per_connection,
-                ));
+                        let token = cancellation_token.clone();
+                        let lkn = local_key_names.clone();
+                        let scr = server_cert_resolver.clone();
+                        let ib = inbound.clone();
+                        let subs = subscribers.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = token.cancelled() => {
+                                    log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
+                                }
+                                _ = Self::handle_connection(
+                                    incoming, lkn, scr, ib, subs, bind_addr,
+                                    max_streams_per_connection,
+                                ) => {}
+                            }
+                        });
+                    }
+                }
             }
         });
     }
@@ -1266,6 +1304,13 @@ impl QuicNode {
                                     conn.close_reason()
                                 );
                                 Self::remove_dead_connection(outbound, addr, conn);
+                                // Fully remove entry if queue is drained
+                                if let Some(entry) = outbound.map().get(&addr) {
+                                    let s = entry.val();
+                                    if s.conn.is_none() && s.send_queue.is_inactive() {
+                                        outbound.map().remove(&addr);
+                                    }
+                                }
                                 removed += 1;
                             }
                         }

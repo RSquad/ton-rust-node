@@ -937,10 +937,26 @@ fn test_simplex_config() {
         slots_per_leader_window: 4,
         first_block_timeout_ms: 1000,
         max_leader_window_desync: 100,
+        ..Default::default()
     };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
     let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
     assert_eq!(config, config2);
+}
+
+#[test]
+fn test_simplex_config_with_quic() {
+    let config = SimplexConfig {
+        use_quic: true,
+        target_rate_ms: 300,
+        slots_per_leader_window: 4,
+        first_block_timeout_ms: 1000,
+        max_leader_window_desync: 100,
+    };
+    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config, config2);
+    assert!(config2.use_quic);
 }
 
 #[test]
@@ -950,12 +966,14 @@ fn test_new_consensus_config_all_both() {
         slots_per_leader_window: 4,
         first_block_timeout_ms: 1000,
         max_leader_window_desync: 100,
+        ..Default::default()
     };
     let shard_config = SimplexConfig {
         target_rate_ms: 200,
         slots_per_leader_window: 8,
         first_block_timeout_ms: 500,
         max_leader_window_desync: 50,
+        ..Default::default()
     };
     let config = NewConsensusConfigAll { mc: Some(mc_config), shard: Some(shard_config) };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
@@ -970,6 +988,7 @@ fn test_new_consensus_config_all_shard_only() {
         slots_per_leader_window: 8,
         first_block_timeout_ms: 500,
         max_leader_window_desync: 50,
+        ..Default::default()
     };
     let config = NewConsensusConfigAll { mc: None, shard: Some(shard_config) };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
@@ -984,6 +1003,7 @@ fn test_new_consensus_config_all_mc_only() {
         slots_per_leader_window: 4,
         first_block_timeout_ms: 1000,
         max_leader_window_desync: 100,
+        ..Default::default()
     };
     let config = NewConsensusConfigAll { mc: Some(mc_config), shard: None };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();

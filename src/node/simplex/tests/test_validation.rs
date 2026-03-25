@@ -26,7 +26,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256,
+    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
+    Ed25519KeyOption, ShardIdent, UInt256,
 };
 
 include!("../../../common/src/info.rs");
@@ -129,7 +130,15 @@ impl SessionListener for ValidationTestListener {
         // Generate dummy candidate with proper hashes
         // The collator must provide file_hash = sha256(data) and collated_file_hash = sha256(collated_data)
         // to match what the receiver will compute from the data
-        let block_data = vec![1u8, 2, 3, 4];
+        // Block data must be valid BOC (compress_candidate_data deserializes it)
+        let block_data = {
+            let mut b = BuilderData::new();
+            b.append_raw(&[1u8, 2, 3, 4], 32).unwrap();
+            let cell = b.into_cell().unwrap();
+            let mut buf = Vec::new();
+            BocWriter::with_flags([cell], BocFlags::all()).unwrap().write(&mut buf).unwrap();
+            buf
+        };
         let collated_data_bytes: Vec<u8> = vec![];
 
         // Compute hashes that match what receiver will compute

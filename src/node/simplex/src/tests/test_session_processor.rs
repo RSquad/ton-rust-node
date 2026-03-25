@@ -15,8 +15,9 @@ use super::*;
 use crate::{
     block::ValidatorIndex,
     receiver::Receiver,
+    simplex_state::SimplexStateOptions,
     task_queue::{CallbackTaskQueuePtr, TaskQueuePtr},
-    SessionId, SessionNode, SessionOptions,
+    SessionId, SessionNode, SessionOptions, SIMPLEX_ROUNDLESS,
 };
 use consensus_common::{
     AsyncRequestPtr, BlockPayloadPtr, BlockSourceInfo, CollationParentHint, PublicKey,
@@ -28,28 +29,48 @@ use std::{
     env, fs, mem,
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::channel,
         Arc, Mutex,
     },
     time::{Duration, SystemTime},
 };
 use ton_api::{
-    ton::consensus::{
-        simplex::{
-            certificate::Certificate, unsignedvote::SkipVote, vote::Vote as TlVote,
-            votesignature::VoteSignature, votesignatureset::VoteSignatureSet,
-            Certificate as CertificateBoxed, VoteSignature as VoteSignatureBoxed,
+    deserialize_boxed,
+    ton::{
+        consensus::{
+            candidatedata::Block as CandidateDataBlock,
+            simplex::{
+                certificate::Certificate, unsignedvote::SkipVote, vote::Vote as TlVote,
+                votesignature::VoteSignature, votesignatureset::VoteSignatureSet, CandidateAndCert,
+                Certificate as CertificateBoxed, VoteSignature as VoteSignatureBoxed,
+            },
+            CandidateData, CandidateParent,
         },
-        CandidateData,
+        validator_session::candidate::Candidate as TlCandidate,
     },
     IntoBoxed,
 };
 use ton_block::{
-    error, signature::BlockSignaturesVariant, BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256,
+    error, sha256_digest, signature::BlockSignaturesVariant, BlockIdExt, BocFlags, BocWriter,
+    BuilderData, Ed25519KeyOption, ShardIdent, UInt256,
 };
 
 // ============================================================================
 // Test Helpers
 // ============================================================================
+
+/// Create valid BOC bytes from raw data (for tests that need valid BOC input).
+///
+/// The compress/decompress pipeline requires valid BOC, so mock data must be
+/// wrapped in a cell + serialized as BOC with appropriate flags.
+fn make_test_boc(data: &[u8], flags: BocFlags) -> Vec<u8> {
+    let mut b = BuilderData::new();
+    b.append_raw(data, data.len() * 8).unwrap();
+    let cell = b.into_cell().unwrap();
+    let mut buf = Vec::new();
+    BocWriter::with_flags([cell], flags).unwrap().write(&mut buf).unwrap();
+    buf
+}
 
 /// Create test validators with equal weights
 fn create_test_validators(count: u32) -> Vec<SessionNode> {
@@ -113,6 +134,8 @@ enum ReceiverAction {
     CacheLastFinalCertificate { slot: u32, bytes_len: usize },
     /// cleanup() was called
     Cleanup { up_to_slot: u32 },
+    /// request_candidate() was called
+    RequestCandidate { slot: u32, block_hash: UInt256 },
 }
 
 /// Mock receiver that records all outbound calls
@@ -169,8 +192,11 @@ impl Receiver for MockReceiver {
         self.actions.lock().unwrap().push_back(ReceiverAction::Cleanup { up_to_slot });
     }
 
-    fn request_candidate(&self, _slot: u32, _block_hash: UInt256) {
-        // No-op for tests
+    fn request_candidate(&self, slot: u32, block_hash: UInt256) {
+        self.actions
+            .lock()
+            .unwrap()
+            .push_back(ReceiverAction::RequestCandidate { slot, block_hash });
     }
 
     fn reschedule_standstill(&self) {
@@ -635,14 +661,15 @@ fn test_genesis_collation_expected_seqno_uses_initial_block_seqno() {
     let genesis_block_id =
         BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
 
+    // Use valid BOC bytes — compress_candidate_data requires valid BOC input
+    let block_boc = make_test_boc(&[0xAA], BocFlags::all());
+    let collated_boc = make_test_boc(&[0xBB], BocFlags::Crc32);
     let candidate = crate::ValidatorBlockCandidate {
         public_key: fixture.nodes[0].public_key.clone(),
         id: genesis_block_id,
-        collated_file_hash: UInt256::rand(),
-        data: consensus_common::ConsensusCommonFactory::create_block_payload(vec![0xAA].into()),
-        collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
-            vec![0xBB].into(),
-        ),
+        collated_file_hash: UInt256::from_slice(&sha256_digest(&collated_boc)),
+        data: consensus_common::ConsensusCommonFactory::create_block_payload(block_boc),
+        collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(collated_boc),
     };
 
     fixture
@@ -706,9 +733,9 @@ fn test_should_generate_empty_block_uses_committed_head_at_session_start() {
     assert_eq!(processor.last_committed_seqno, Some(46));
 
     // Slot 0 is the initial `first_non_progressed_slot` in fresh state.
-    // MC: new_seqno=48, committed=46 → 46+1=47 < 48 → empty
+    // MC: new_seqno=48, committed=46 -> 46+1=47 < 48 -> empty
     assert!(processor.should_generate_empty_block(SlotIndex::new(0), 48));
-    // MC: new_seqno=47, committed=46 → 46+1=47 == 47 → NOT empty
+    // MC: new_seqno=47, committed=46 -> 46+1=47 == 47 -> NOT empty
     assert!(!processor.should_generate_empty_block(SlotIndex::new(0), 47));
 }
 
@@ -1029,12 +1056,9 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
         })
         .count();
 
-    // External skip certificates are stored for state consistency + standstill caching,
-    // but are NOT re-broadcast when ingested externally (should_broadcast=false).
-    assert_eq!(
-        send_cert_count, 0,
-        "expected no send_certificate for externally provided skip cert"
-    );
+    // C++ parity (pool.cpp handle_saved_certificate): every newly accepted
+    // certificate is relayed once, regardless of origin.
+    assert_eq!(send_cert_count, 1, "C++ parity: foreign skip cert must be relayed once");
     assert_eq!(
         cache_standstill_count, 1,
         "expected exactly one cache_standstill_certificate on first apply"
@@ -1073,7 +1097,6 @@ fn test_handle_finalization_reached_caches_final_certificate_for_standstill() {
         slot,
         block_hash: block_hash.clone(),
         certificate: cert,
-        should_broadcast: true,
     };
 
     fixture.processor.handle_finalization_reached(event);
@@ -1130,8 +1153,6 @@ fn test_handle_notarization_reached_requests_missing_candidate_body() {
         slot,
         block_hash: block_hash.clone(),
         certificate: cert,
-        // Foreign cert ingestion path: do not re-broadcast.
-        should_broadcast: false,
     };
 
     // Act: should schedule requestCandidate for missing body.
@@ -1246,8 +1267,6 @@ fn test_batch_finalization_notarized_parents_finalized_descendant() {
 /// Test that SIMPLEX_ROUNDLESS constant is u32::MAX
 #[test]
 fn test_simplex_roundless_constant_value() {
-    use crate::SIMPLEX_ROUNDLESS;
-
     assert_eq!(SIMPLEX_ROUNDLESS, u32::MAX, "SIMPLEX_ROUNDLESS should be u32::MAX");
     assert_eq!(SIMPLEX_ROUNDLESS, 0xFFFFFFFF, "SIMPLEX_ROUNDLESS should be 0xFFFFFFFF");
 }
@@ -1259,8 +1278,6 @@ fn test_simplex_roundless_constant_value() {
 /// by forcing EMPTY collation on non-committed parents.
 #[test]
 fn test_simplex_state_options_require_finalized_parent() {
-    use crate::simplex_state::SimplexStateOptions;
-
     // Default (cpp_compatible) should have require_finalized_parent=false
     let cpp_compat = SimplexStateOptions::cpp_compatible();
     assert!(
@@ -1268,7 +1285,7 @@ fn test_simplex_state_options_require_finalized_parent() {
         "cpp_compatible() should have require_finalized_parent=false"
     );
 
-    // With optimistic validation (TN-822), the collation gate is disabled:
+    // With optimistic validation, the collation gate is disabled:
     // ValidatorGroup now uses candidate-native validation, so non-finalized parents are allowed.
     assert!(
         !DISABLE_NON_FINALIZED_PARENTS_FOR_COLLATION,
@@ -1410,7 +1427,7 @@ fn test_candidate_decision_fail_drops_late_failure_for_committed_block() {
 }
 
 // ============================================================================
-// Optimistic Validation Tests (TN-822 / OPTIMISTIC-VALID-1)
+// Optimistic Validation Tests
 // ============================================================================
 
 /// Helper: create a non-empty RawCandidate for check_validation tests.
@@ -1712,7 +1729,7 @@ fn test_check_validation_chains_notarized_parent_to_descendant() {
 }
 
 // ============================================================================
-// Health check anomaly tests (NODE-19)
+// Health check anomaly tests
 // ============================================================================
 
 /// Reset health alert timestamps to a deterministic base time so that
@@ -1967,4 +1984,437 @@ fn test_check_collation_pacing_gate_is_idempotent() {
     fixture.processor.reset_next_awake_time();
     fixture.processor.check_collation();
     assert_eq!(fixture.processor.get_next_awake_time(), gate_time);
+}
+
+// ============================================================================
+// Candidate Query Fallback Tests (C++ parity: CandidateResolver DB fallback)
+// ============================================================================
+
+#[test]
+fn test_candidate_query_fallback_cache_hit() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(5);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    let fake_candidate_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE];
+    fixture.processor.candidate_data_cache.insert(candidate_id, fake_candidate_bytes.clone());
+
+    let (tx, rx) = channel();
+    let callback: crate::QueryResponseCallback = Box::new(move |result| {
+        tx.send(result).unwrap();
+    });
+
+    fixture.processor.handle_candidate_query_fallback(slot, block_hash, false, callback);
+
+    let result = rx.recv_timeout(Duration::from_secs(2)).expect("callback not called");
+    let payload = result.expect("response should be Ok");
+    let response_bytes = payload.data();
+
+    assert!(!response_bytes.is_empty(), "response should contain serialized CandidateAndCert");
+
+    let deserialized = deserialize_boxed(response_bytes)
+        .expect("should deserialize response")
+        .downcast::<CandidateAndCert>()
+        .expect("should be CandidateAndCert");
+
+    let inner = match deserialized {
+        CandidateAndCert::Consensus_Simplex_CandidateAndCert(inner) => inner,
+    };
+
+    assert_eq!(
+        &inner.candidate[..],
+        &fake_candidate_bytes[..],
+        "candidate bytes should match the cached data"
+    );
+}
+
+#[test]
+fn test_candidate_query_fallback_miss_returns_empty() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(99);
+    let block_hash = UInt256::rand();
+
+    let (tx, rx) = channel();
+    let callback: crate::QueryResponseCallback = Box::new(move |result| {
+        tx.send(result).unwrap();
+    });
+
+    fixture.processor.handle_candidate_query_fallback(slot, block_hash, false, callback);
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).expect("callback not called");
+    let payload = result.expect("response should be Ok even for empty");
+    let response_bytes = payload.data();
+
+    let deserialized = deserialize_boxed(response_bytes)
+        .expect("should deserialize response")
+        .downcast::<CandidateAndCert>()
+        .expect("should be CandidateAndCert");
+
+    let inner = match deserialized {
+        CandidateAndCert::Consensus_Simplex_CandidateAndCert(inner) => inner,
+    };
+
+    assert!(inner.candidate.is_empty(), "candidate bytes should be empty when not found");
+}
+
+#[test]
+fn test_candidate_data_cache_populated_on_candidate_received() {
+    let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Debug).try_init();
+    let mut fixture = TestFixture::new(4);
+
+    // Use slot 0 so that validator 0 (local) is the slot leader
+    let slot = 0u32;
+    let block_data = vec![1u8, 2, 3, 4, 5];
+    let collated_data: Vec<u8> = vec![];
+    let root_hash = UInt256::from_slice(&sha256_digest(&block_data));
+    let shard = ShardIdent::masterchain();
+
+    // Build uncompressed TL candidate (same approach as test_receiver_candidate_resolver)
+    let tl_inner = TlCandidate {
+        src: UInt256::default(),
+        round: slot as i32,
+        root_hash: root_hash.clone(),
+        data: block_data.clone().into(),
+        collated_data: collated_data.clone().into(),
+    };
+    let candidate_bytes = consensus_common::serialize_tl_boxed_object!(&tl_inner.into_boxed());
+
+    let block_id = BlockIdExt {
+        shard_id: shard,
+        seq_no: slot,
+        root_hash: root_hash.clone(),
+        file_hash: root_hash.clone(),
+    };
+    let collated_file_hash = UInt256::from_slice(&sha256_digest(&collated_data));
+
+    let candidate_hash = crate::utils::compute_candidate_id_hash_u32(
+        slot,
+        Some(&block_id),
+        Some(&collated_file_hash),
+        None,
+    );
+
+    let session_id = fixture.processor.session_id().clone();
+    let leader_key = fixture.processor.description.get_source_public_key(ValidatorIndex::new(0));
+    let signature =
+        crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, leader_key)
+            .expect("signing failed");
+
+    let broadcast = CandidateData::Consensus_Block(CandidateDataBlock {
+        slot: slot as i32,
+        candidate: candidate_bytes.into(),
+        parent: CandidateParent::Consensus_CandidateWithoutParents,
+        signature: signature.into(),
+    });
+
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(slot), hash: candidate_hash.clone() };
+
+    assert!(
+        !fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        "cache should be empty before on_candidate_received"
+    );
+
+    fixture.processor.on_candidate_received(0, broadcast, None);
+
+    assert!(
+        fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        "cache should be populated after on_candidate_received"
+    );
+
+    assert!(
+        fixture.processor.received_candidates.contains_key(&candidate_id),
+        "received_candidates should also have the candidate"
+    );
+}
+
+// ============================================================================
+// Protocol Parity Tests (stub body, partial merge, finalized seqno)
+// ============================================================================
+
+#[test]
+fn test_has_real_candidate_body_returns_false_for_stub() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(10);
+    let hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: hash.clone() };
+
+    // No entry => false
+    assert!(!fixture.processor.has_real_candidate_body(&candidate_id));
+
+    // Insert a finalized-boundary stub (empty candidate_hash_data_bytes)
+    fixture.processor.received_candidates.insert(
+        candidate_id.clone(),
+        ReceivedCandidate {
+            slot,
+            source_idx: ValidatorIndex::new(0),
+            candidate_id_hash: hash.clone(),
+            candidate_hash_data_bytes: Vec::new(), // stub marker
+            block_id: BlockIdExt::default(),
+            root_hash: UInt256::default(),
+            file_hash: UInt256::default(),
+            data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+            collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                Vec::new(),
+            ),
+            receive_time: fixture.processor.now(),
+            is_empty: false,
+            parent_id: None,
+            is_fully_resolved: true,
+        },
+    );
+
+    // Stub => false
+    assert!(
+        !fixture.processor.has_real_candidate_body(&candidate_id),
+        "finalized-boundary stub must NOT count as real body"
+    );
+
+    // Overwrite with real data
+    fixture
+        .processor
+        .received_candidates
+        .get_mut(&candidate_id)
+        .unwrap()
+        .candidate_hash_data_bytes = vec![1, 2, 3];
+
+    // Now should be true
+    assert!(
+        fixture.processor.has_real_candidate_body(&candidate_id),
+        "entry with non-empty candidate_hash_data_bytes must count as real body"
+    );
+}
+
+#[test]
+fn test_handle_block_finalized_requests_triggered_stub_body_when_committed_head_exists() {
+    let mut fixture = TestFixture::new(4);
+
+    // Simulate an already-committed head, so triggered finalized block enters
+    // collect_gapless_commit_chain() as a non-genesis continuation.
+    fixture.processor.last_committed_seqno = Some(100);
+    fixture.processor.last_committed_block_id = Some(BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        100,
+        UInt256::rand(),
+        UInt256::rand(),
+    ));
+
+    let slot = SlotIndex::new(555);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+    let finalized_block_id =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 101, UInt256::rand(), UInt256::rand());
+
+    let final_cert = Arc::new(crate::certificate::Certificate {
+        vote: crate::simplex_state::FinalizeVote { slot, block_hash: block_hash.clone() },
+        signatures: vec![
+            crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![0u8; 64]),
+            crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![1u8; 64]),
+            crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![2u8; 64]),
+        ],
+    });
+
+    fixture.processor.handle_block_finalized(BlockFinalizedEvent {
+        slot,
+        block_hash: block_hash.clone(),
+        block_id: Some(finalized_block_id),
+        certificate: final_cert,
+    });
+
+    assert!(
+        fixture.processor.requested_candidates.contains_key(&candidate_id),
+        "triggered finalized-boundary stub must be treated as missing body and requested"
+    );
+
+    // The core regression guard is scheduling requestCandidate at processor level.
+    // (Receiver send timing is exercised by dedicated delayed-action tests.)
+}
+
+#[test]
+fn test_candidate_query_fallback_returns_notar_only_when_body_missing() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(99);
+    let block_hash = UInt256::rand();
+
+    let (tx, rx) = channel();
+    let callback: crate::QueryResponseCallback = Box::new(move |result| {
+        tx.send(result).unwrap();
+    });
+
+    // No candidate in cache or DB => should return empty/empty
+    fixture.processor.handle_candidate_query_fallback(slot, block_hash, false, callback);
+
+    let result = rx.recv().unwrap();
+    assert!(result.is_ok(), "should return Ok even when nothing found");
+}
+
+#[test]
+fn test_set_mc_finalized_seqno_couples_consensus_finalized_seqno() {
+    let mut fixture = TestFixture::new(4);
+
+    // Initially 0
+    assert_eq!(fixture.processor.last_consensus_finalized_seqno, Some(0));
+
+    // Set MC finalized to 42
+    fixture.processor.set_mc_finalized_seqno(42);
+
+    // C++ parity: consensus finalized should advance to max(mc, consensus)
+    assert_eq!(
+        fixture.processor.last_consensus_finalized_seqno,
+        Some(42),
+        "set_mc_finalized_seqno should couple to last_consensus_finalized_seqno via max()"
+    );
+
+    // Set consensus finalized higher via direct field (simulating a final commit)
+    fixture.processor.last_consensus_finalized_seqno = Some(100);
+
+    // Set MC finalized lower => should NOT decrease consensus
+    fixture.processor.set_mc_finalized_seqno(50);
+    assert_eq!(
+        fixture.processor.last_consensus_finalized_seqno,
+        Some(100),
+        "set_mc_finalized_seqno must not decrease last_consensus_finalized_seqno"
+    );
+
+    // Monotonic MC seqno: out-of-order MC event with lower seqno must not regress
+    fixture.processor.last_mc_finalized_seqno = Some(200);
+    fixture.processor.set_mc_finalized_seqno(150);
+    assert_eq!(
+        fixture.processor.last_mc_finalized_seqno,
+        Some(200),
+        "set_mc_finalized_seqno must keep last_mc_finalized_seqno monotonic"
+    );
+}
+
+// ============================================================================
+// Foreign Certificate Relay Regression Tests (C++ parity)
+// ============================================================================
+
+/// Verify that a notarization certificate ingested via set_notarize_certificate
+/// (foreign path) triggers relay to peers.
+#[test]
+fn test_foreign_notarization_cert_is_relayed() {
+    let mut fixture = TestFixture::new(4);
+
+    let slot = crate::block::SlotIndex::new(3);
+    let block_hash = UInt256::rand();
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![10]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![11]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![12]),
+    ];
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+
+    let event = crate::simplex_state::NotarizationReachedEvent {
+        slot,
+        block_hash: block_hash.clone(),
+        certificate: cert,
+    };
+
+    fixture.processor.handle_notarization_reached(event);
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "foreign notarization cert must be relayed (C++ parity: handle_saved_certificate)"
+    );
+}
+
+/// Verify that a finalization certificate ingested via set_finalize_certificate
+/// (foreign path) triggers relay to peers.
+#[test]
+fn test_foreign_finalization_cert_is_relayed() {
+    let mut fixture = TestFixture::new(4);
+
+    let slot = crate::block::SlotIndex::new(5);
+    let block_hash = UInt256::rand();
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![20]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![21]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![22]),
+    ];
+    let vote = crate::simplex_state::FinalizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+
+    let event = crate::simplex_state::FinalizationReachedEvent {
+        slot,
+        block_hash: block_hash.clone(),
+        certificate: cert,
+    };
+
+    fixture.processor.handle_finalization_reached(event);
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "foreign finalization cert must be relayed (C++ parity: handle_saved_certificate)"
+    );
+}
+
+#[test]
+fn test_foreign_vote_is_not_rebroadcast() {
+    let mut fixture = TestFixture::new(4);
+
+    let slot = crate::block::SlotIndex::new(2);
+    let block_hash = UInt256::from([0xAB; 32]);
+    let vote = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
+        slot,
+        block_hash,
+    });
+    let tl_vote = crate::utils::sign_vote(
+        &vote,
+        fixture.description.get_session_id(),
+        &fixture.nodes[1].public_key,
+    )
+    .expect("failed to sign foreign vote");
+    let raw_vote: crate::RawVoteData =
+        consensus_common::serialize_tl_boxed_object!(&tl_vote).into();
+
+    fixture.processor.on_vote(1, tl_vote, raw_vote);
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "foreign votes must not be re-broadcast"
+    );
+}
+
+#[test]
+fn test_recovery_drain_startup_events_drops_certificate_relay_events() {
+    let mut fixture = TestFixture::new(4);
+
+    let slot = crate::block::SlotIndex::new(3);
+    let block_hash = UInt256::from([0xCD; 32]);
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![1]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![2]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![3]),
+    ];
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let stored = fixture
+        .processor
+        .simplex_state
+        .set_notarize_certificate(&fixture.description, slot, &block_hash, cert)
+        .expect("set_notarize_certificate should succeed");
+    assert!(stored, "notar cert should be stored before startup drain");
+
+    let kept_votes =
+        crate::startup_recovery::SessionStartupRecoveryListener::recovery_drain_startup_events(
+            &mut fixture.processor,
+        );
+    assert!(
+        kept_votes.is_empty(),
+        "this setup should produce only certificate events, no startup votes"
+    );
+
+    fixture.processor.check_all();
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "drained startup certificate events must not be re-broadcast on first normal tick"
+    );
 }
