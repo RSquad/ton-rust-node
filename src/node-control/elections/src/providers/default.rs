@@ -16,7 +16,7 @@ use control_client::{
         AddAdnlAddressRq, AddValidatorAdnlAddrRq, AddValidatorPermKeyRq, AddValidatorTempKeyRq,
         ClientAPI, SignRq,
     },
-    config_params::{parse_config_param_15, parse_config_param_34},
+    config_params::{parse_config_param_15, parse_config_param_34, parse_config_param_36},
 };
 use std::collections::HashMap;
 use ton_block::{ConfigParam15, ValidatorSet};
@@ -128,5 +128,14 @@ impl ElectionsProvider for DefaultElectionsProvider {
     async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet> {
         let bytes = self.client.get_config_param(34).await?;
         parse_config_param_34(&bytes)
+    }
+    async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>> {
+        match self.client.get_config_param(36).await {
+            Ok(bytes) => Ok(Some(parse_config_param_36(&bytes)?)),
+            Err(e) => {
+                tracing::trace!("get_next_vset: config param 36 not available: {e:?}");
+                Ok(None)
+            }
+        }
     }
 }

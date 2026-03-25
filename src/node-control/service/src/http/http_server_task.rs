@@ -19,7 +19,10 @@ use crate::{
 };
 use common::{
     app_config::StakePolicy,
-    snapshot::{ElectionsSnapshot, ElectionsStatus, SnapshotStore, TimeRange, ValidatorsSnapshot},
+    snapshot::{
+        ElectionsSnapshot, ElectionsStatus, OurElectionParticipant, SnapshotStore, TimeRange,
+        ValidatorsSnapshot,
+    },
     task_cancellation::CancellationCtx,
     time_format,
 };
@@ -30,7 +33,7 @@ pub struct AppState {
     pub store: Arc<SnapshotStore>,
     pub runtime_cfg: Arc<RuntimeConfigStore>,
     pub elections_task: Arc<TaskController>,
-    pub jwt_auth: Option<Arc<JwtAuth>>,
+    pub jwt_auth: Arc<JwtAuth>,
     pub user_store: Arc<UserStore>,
     pub(crate) login_rate_limiter: Arc<tokio::sync::Mutex<LoginRateLimiter>>,
 }
@@ -48,37 +51,39 @@ pub async fn run(
     let enable_swagger = cfg.http.enable_swagger;
     let user_store = Arc::new(UserStore::new(runtime_cfg.clone() as Arc<dyn RuntimeConfig>));
 
-    let jwt_auth = if let Some(auth_config) = &cfg.http.auth {
-        let vault = runtime_cfg.vault();
-        let mgr = match JwtAuth::new(vault.clone(), auth_config).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(
-                    target: "auth",
-                    event = "auth_setup_failed",
-                    error = ?e,
-                    "authentication setup failed"
-                );
-                return;
-            }
-        };
-
-        tracing::info!(target: "auth", event = "auth_enabled", "authentication enabled");
-        Some(Arc::new(mgr))
-    } else {
-        tracing::warn!(
-            target: "auth",
-            event = "auth_disabled",
-            reason = "no_auth_config",
-            "authentication disabled"
-        );
-        None
+    // Always create JwtAuth so that auth can be enabled at runtime via config
+    // reload.
+    // The middleware decides at request time whether to enforce authentication
+    // by checking the live config.
+    let vault = runtime_cfg.vault();
+    let jwt_secret = cfg.http.auth.as_ref().and_then(|a| a.jwt_secret.clone());
+    let jwt_auth = match JwtAuth::new(vault, jwt_secret.as_deref()).await {
+        Ok(m) => {
+            tracing::info!(
+                target: "auth",
+                event = "auth_jwt_key_ready",
+                auth_configured = cfg.http.auth.is_some(),
+                "JWT signing key loaded",
+            );
+            Arc::new(m)
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "auth",
+                event = "auth_setup_failed",
+                error = ?e,
+                "authentication setup failed",
+            );
+            return;
+        }
     };
     drop(cfg);
 
     let bind_addr: SocketAddr = match bind.parse() {
         Ok(a) => a,
         Err(e) => {
+            // Intentionally fall back to localhost (not 0.0.0.0) to avoid
+            // accidentally exposing the API when the configured address is invalid.
             tracing::error!("invalid http.bind '{}': {} (fallback to 127.0.0.1:8080)", &bind, e);
             "127.0.0.1:8080".parse().expect("static bind must parse")
         }
@@ -115,8 +120,6 @@ pub async fn run(
 }
 
 pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
-    let auth_enabled = state.jwt_auth.is_some();
-
     let mut public = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
         .route("/openapi.json", axum::routing::get(openapi_handler))
@@ -128,27 +131,27 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
             .route("/swagger-ui", axum::routing::get(swagger_ui_handler));
     }
 
-    let mut authenticated = axum::Router::new()
+    // Auth middleware is always applied; it checks the live config on every
+    // request and passes through when `http.auth` is not configured.
+    let authenticated = axum::Router::new()
         .route("/v1/elections", axum::routing::get(v1_elections_handler))
-        .route("/v1/validators", axum::routing::get(v1_validators_handler));
+        .route("/v1/validators", axum::routing::get(v1_validators_handler))
+        .route("/auth/me", axum::routing::get(me_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::require_nominator,
+        ));
 
-    let mut operator_only = axum::Router::new()
+    let operator_only = axum::Router::new()
         .route("/v1/elections/exclude", axum::routing::post(v1_elections_exclude_handler))
         .route("/v1/elections/include", axum::routing::post(v1_elections_include_handler))
         .route("/v1/stake_strategy", axum::routing::post(v1_stake_strategy_handler))
-        .route("/v1/task/elections", axum::routing::post(v1_task_elections_handler));
-
-    if auth_enabled {
-        authenticated =
-            authenticated.route("/auth/me", axum::routing::get(me_handler)).route_layer(
-                axum::middleware::from_fn_with_state(state.clone(), middleware::require_nominator),
-            );
-
-        operator_only =
-            operator_only.route("/auth/users", axum::routing::get(list_users_handler)).route_layer(
-                axum::middleware::from_fn_with_state(state.clone(), middleware::require_operator),
-            );
-    }
+        .route("/v1/task/elections", axum::routing::post(v1_task_elections_handler))
+        .route("/auth/users", axum::routing::get(list_users_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::require_operator,
+        ));
 
     axum::Router::new()
         .merge(public)
@@ -237,6 +240,13 @@ pub struct ElectionsResponse {
     pub status: ElectionsStatus,
     pub result: Option<ElectionsSnapshot>,
     pub next_elections: Option<TimeRange>,
+    pub our_participants: Vec<OurElectionParticipant>,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+pub struct ElectionsQuery {
+    /// Include full elections participants list in response.
+    pub include_participants: Option<bool>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -371,7 +381,8 @@ pub struct UserInfoDto {
     responses(
         (status = 200, description = "Service is healthy", body = HealthResponse, example = json!({"ok": true, "result": "OK"})),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(())
 )]
 pub async fn health_handler() -> axum::Json<HealthResponse> {
     axum::Json(HealthResponse { ok: true, result: "OK".to_owned() })
@@ -380,20 +391,28 @@ pub async fn health_handler() -> axum::Json<HealthResponse> {
 #[utoipa::path(
     get,
     path = "/v1/elections",
+    params(
+        ("include_participants" = Option<bool>, Query, description = "Include full elections participants list")
+    ),
     responses(
         (status = 200, description = "Current elections snapshot (may be null if not available yet)", body = ElectionsResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn v1_elections_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ElectionsQuery>,
 ) -> axum::Json<ElectionsResponse> {
-    let snapshot = state.store.get();
+    let include_participants = query.include_participants.unwrap_or(false);
+    let view = state.store.get_elections_view(include_participants);
     axum::Json(ElectionsResponse {
         ok: true,
-        result: snapshot.elections,
-        status: snapshot.elections_status,
-        next_elections: snapshot.next_elections_range,
+        result: view.elections,
+        status: view.status,
+        next_elections: view.next_elections,
+        our_participants: view.our_participants,
     })
 }
 
@@ -404,8 +423,10 @@ pub async fn v1_elections_handler(
     responses(
         (status = 200, description = "List of nodes excluded from elections", body = ElectionsExcludeResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn v1_elections_exclude_handler(
     state: axum::extract::State<AppState>,
@@ -453,8 +474,10 @@ pub async fn v1_elections_exclude_handler(
     responses(
         (status = 200, description = "List of nodes excluded from elections", body = ElectionsExcludeResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn v1_elections_include_handler(
     state: axum::extract::State<AppState>,
@@ -500,8 +523,10 @@ pub async fn v1_elections_include_handler(
     path = "/v1/validators",
     responses(
         (status = 200, description = "Current validators snapshot", body = ValidatorsResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn v1_validators_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -517,8 +542,10 @@ pub async fn v1_validators_handler(
     responses(
         (status = 200, description = "Applied stake policy", body = StakePolicyResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn v1_stake_strategy_handler(
     state: axum::extract::State<AppState>,
@@ -566,8 +593,10 @@ pub async fn v1_stake_strategy_handler(
     responses(
         (status = 200, description = "Updated elections task state", body = ElectionsTaskControlResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn v1_task_elections_handler(
     state: axum::extract::State<AppState>,
@@ -635,19 +664,27 @@ async fn swagger_ui_handler() -> axum::response::Html<String> {
         (status = 401, description = "Invalid credentials", body = ApiErrorResponse),
         (status = 429, description = "Too many login attempts", body = ApiErrorResponse),
         (status = 500, description = "Internal error", body = ApiErrorResponse)
-    )
+    ),
+    security(())
 )]
 pub async fn login_handler(
     state: axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
     req: axum::Json<LoginRequest>,
 ) -> Result<axum::Json<LoginResponse>, AppError> {
+    let (operator_ttl, nominator_ttl) = {
+        let cfg_snapshot = state.runtime_cfg.get();
+        let auth_cfg = cfg_snapshot
+            .http
+            .auth
+            .as_ref()
+            .ok_or_else(|| AppError::bad_request("authentication is not configured"))?;
+        (auth_cfg.operator_token_ttl, auth_cfg.nominator_token_ttl)
+    };
+
     validate_username(&req.username).map_err(|e| AppError::bad_request(&e.to_string()))?;
 
-    let jwt_auth = state
-        .jwt_auth
-        .as_ref()
-        .ok_or_else(|| AppError::bad_request("authentication is not configured"))?;
+    let jwt_auth = &state.jwt_auth;
     let user_store = state.user_store.as_ref();
     let now = time_format::now();
     let limiter_key = login_limiter_key(&headers, &req.username);
@@ -718,7 +755,12 @@ pub async fn login_handler(
         }
     };
 
-    let (token, expires_in) = jwt_auth.generate(&req.username, role).map_err(|e| {
+    let ttl = match role {
+        crate::auth::Role::Operator => operator_ttl,
+        crate::auth::Role::Nominator => nominator_ttl,
+    };
+
+    let (token, expires_in) = jwt_auth.generate(&req.username, role, ttl).map_err(|e| {
         tracing::error!(
             target: "auth",
             event = "auth_token_generation_error",
@@ -739,7 +781,8 @@ pub async fn login_handler(
     responses(
         (status = 200, description = "Current user identity", body = MeResponse),
         (status = 401, description = "Not authenticated", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn me_handler(
     req: axum::http::Request<axum::body::Body>,
@@ -763,7 +806,8 @@ pub async fn me_handler(
         (status = 200, description = "List of registered users", body = UserListResponse),
         (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 403, description = "Insufficient permissions", body = ApiErrorResponse)
-    )
+    ),
+    security(("bearerAuth" = []))
 )]
 pub async fn list_users_handler(
     state: axum::extract::State<AppState>,
@@ -779,8 +823,27 @@ pub async fn list_users_handler(
     }))
 }
 
+struct BearerAuthAddon;
+
+impl utoipa::Modify for BearerAuthAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "bearerAuth",
+            utoipa::openapi::security::SecurityScheme::Http(
+                utoipa::openapi::security::HttpBuilder::new()
+                    .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .description(Some("Paste a JWT token obtained from POST /auth/login"))
+                    .build(),
+            ),
+        );
+    }
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
+    modifiers(&BearerAuthAddon),
     paths(
         health_handler,
         v1_elections_handler,
@@ -798,6 +861,7 @@ pub async fn list_users_handler(
         ApiErrorResponse,
         HealthResponse,
         ElectionsResponse,
+        NodeListRequest,
         ValidatorsResponse,
         common::app_config::StakePolicy,
         common::app_config::BindingStatus,
@@ -817,8 +881,12 @@ pub async fn list_users_handler(
         UserListResponse,
         UserInfoDto,
         common::snapshot::Snapshot,
+        common::snapshot::ElectionsStatus,
         common::snapshot::ElectionsSnapshot,
         common::snapshot::ElectionsParticipantSnapshot,
+        common::snapshot::OurElectionParticipant,
+        common::snapshot::ParticipationStatus,
+        common::snapshot::StakeSubmission,
         common::snapshot::ValidatorsSnapshot,
         common::snapshot::ValidatorNodeSnapshot,
         common::snapshot::TimeRange
@@ -836,11 +904,16 @@ mod tests {
     use super::*;
     use crate::{runtime_config::RuntimeConfigStore, task::task_manager::ServiceTask};
     use axum::body::Body;
+    use base64::Engine;
     use common::{
         app_config::{
-            AppConfig, ElectionsConfig, LogConfig, NodeBinding, StakePolicy, TonHttpApiConfig,
+            AppConfig, ElectionsConfig, HttpConfig, LogConfig, NodeBinding, StakePolicy,
+            TonHttpApiConfig,
         },
-        snapshot::{ElectionsSnapshot, ElectionsStatus, TimeRange, ValidatorNodeSnapshot},
+        snapshot::{
+            ElectionsParticipantSnapshot, ElectionsSnapshot, ElectionsStatus,
+            OurElectionParticipant, StakeSubmission, TimeRange, ValidatorNodeSnapshot,
+        },
         task_cancellation::CancellationCtx,
     };
     use http_body_util::BodyExt;
@@ -868,7 +941,12 @@ mod tests {
         Arc::new(TaskController::new("elections", NoopTask, runtime_cfg))
     }
 
-    fn test_state(
+    async fn test_jwt_auth() -> Arc<JwtAuth> {
+        let secret = base64::engine::general_purpose::STANDARD.encode([42u8; 32]);
+        Arc::new(JwtAuth::new(None, Some(&secret)).await.unwrap())
+    }
+
+    async fn test_state(
         store: Arc<SnapshotStore>,
         runtime_cfg: Arc<RuntimeConfigStore>,
         elections_task: Arc<TaskController>,
@@ -878,7 +956,7 @@ mod tests {
             store,
             runtime_cfg,
             elections_task,
-            jwt_auth: None,
+            jwt_auth: test_jwt_auth().await,
             user_store,
             login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
         }
@@ -898,7 +976,7 @@ mod tests {
             pools: HashMap::new(),
             bindings,
             ton_http_api: TonHttpApiConfig::default(),
-            http: Default::default(),
+            http: HttpConfig { auth: None, ..Default::default() },
             elections: Some(ElectionsConfig { policy, ..Default::default() }),
             voting: None,
             master_wallet: None,
@@ -914,7 +992,7 @@ mod tests {
             pools: HashMap::new(),
             bindings: HashMap::new(),
             ton_http_api: TonHttpApiConfig::default(),
-            http: Default::default(),
+            http: HttpConfig { auth: None, ..Default::default() },
             elections: None,
             voting: None,
             master_wallet: None,
@@ -941,6 +1019,27 @@ mod tests {
             .unwrap()
     }
 
+    fn collect_component_schema_refs(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(serde_json::Value::as_str) {
+                    if let Some(name) = reference.strip_prefix("#/components/schemas/") {
+                        out.push(name.to_string());
+                    }
+                }
+                for child in map.values() {
+                    collect_component_schema_refs(child, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    collect_component_schema_refs(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[tokio::test]
     async fn stake_policy_invalid_fixed_zero_returns_400() {
         let store = Arc::new(SnapshotStore::new());
@@ -948,7 +1047,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app
             .oneshot(post_json(
@@ -971,7 +1070,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app
             .oneshot(post_json(
@@ -995,7 +1094,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let state = test_state(store, runtime_cfg.clone(), elections_task);
+        let state = test_state(store, runtime_cfg.clone(), elections_task).await;
         let app = routes(false, state);
 
         let resp = app
@@ -1028,7 +1127,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let state = test_state(store, runtime_cfg, elections_task);
+        let state = test_state(store, runtime_cfg, elections_task).await;
 
         // Disable
         let app = routes(false, state.clone());
@@ -1081,7 +1180,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app.oneshot(get_request("/health")).await.unwrap();
 
@@ -1098,7 +1197,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app.oneshot(get_request("/v1/elections")).await.unwrap();
 
@@ -1107,6 +1206,7 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["status"], "closed");
         assert!(v["result"].is_null());
+        assert!(v["our_participants"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1117,6 +1217,18 @@ mod tests {
             s.elections = Some(ElectionsSnapshot {
                 election_id: 100,
                 participants_count: 5,
+                min_stake: "100".to_string(),
+                participant_min_stake: Some("200".to_string()),
+                participant_max_stake: Some("900".to_string()),
+                participants: vec![ElectionsParticipantSnapshot {
+                    pubkey: "aa".to_string(),
+                    adnl: "bb".to_string(),
+                    sender_addr: "cc".to_string(),
+                    is_controlled: false,
+                    stake: "300".to_string(),
+                    max_factor: 3.0,
+                    election_id: 100,
+                }],
                 ..Default::default()
             });
             s.next_elections_range =
@@ -1127,7 +1239,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app.oneshot(get_request("/v1/elections")).await.unwrap();
 
@@ -1137,8 +1249,103 @@ mod tests {
         assert_eq!(v["status"], "active");
         assert_eq!(v["result"]["election_id"], 100);
         assert_eq!(v["result"]["participants_count"], 5);
+        assert_eq!(v["result"]["min_stake"], "100");
+        assert_eq!(v["result"]["participant_min_stake"], "200");
+        assert_eq!(v["result"]["participant_max_stake"], "900");
+        assert!(v["result"]["participants"].as_array().unwrap().is_empty());
         assert_eq!(v["next_elections"]["start"], 1000);
         assert_eq!(v["next_elections"]["end"], 2000);
+        assert!(v["our_participants"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn elections_include_participants_query_returns_full_list() {
+        let store = Arc::new(SnapshotStore::new());
+        store.update_with(|s| {
+            s.elections_status = ElectionsStatus::Active;
+            s.elections = Some(ElectionsSnapshot {
+                election_id: 100,
+                participants_count: 1,
+                participants: vec![ElectionsParticipantSnapshot {
+                    pubkey: "aa".to_string(),
+                    adnl: "bb".to_string(),
+                    sender_addr: "cc".to_string(),
+                    is_controlled: true,
+                    stake: "300".to_string(),
+                    max_factor: 3.0,
+                    election_id: 100,
+                }],
+                ..Default::default()
+            });
+        });
+
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp =
+            app.oneshot(get_request("/v1/elections?include_participants=true")).await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["participants_count"], 1);
+        assert_eq!(v["result"]["participants"].as_array().unwrap().len(), 1);
+        assert_eq!(v["result"]["participants"][0]["pubkey"], "aa");
+    }
+
+    #[tokio::test]
+    async fn elections_returns_our_participants() {
+        let store = Arc::new(SnapshotStore::new());
+        store.update_with(|s| {
+            s.our_participants.push(OurElectionParticipant {
+                node_id: "node-1".to_string(),
+                stake_accepted: true,
+                stake_submissions: vec![
+                    StakeSubmission {
+                        stake: "100".to_string(),
+                        max_factor: 3.0,
+                        submission_time: 12345,
+                        submission_time_utc: "2024-01-01T00:00:00Z".to_string(),
+                    },
+                    StakeSubmission {
+                        stake: "50".to_string(),
+                        max_factor: 3.0,
+                        submission_time: 12400,
+                        submission_time_utc: "2024-01-01T00:01:00Z".to_string(),
+                    },
+                ],
+                accepted_stake: Some("150".to_string()),
+                elected: true,
+                position: Some(5),
+                ..Default::default()
+            });
+        });
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app.oneshot(get_request("/v1/elections")).await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        let participants = v["our_participants"].as_array().unwrap();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0]["node_id"], "node-1");
+        assert_eq!(participants[0]["stake_accepted"], true);
+        let submissions = participants[0]["stake_submissions"].as_array().unwrap();
+        assert_eq!(submissions.len(), 2);
+        assert_eq!(submissions[0]["stake"], "100");
+        assert_eq!(submissions[0]["max_factor"], 3.0);
+        assert_eq!(submissions[1]["stake"], "50");
+        assert_eq!(participants[0]["accepted_stake"], "150");
+        assert_eq!(participants[0]["elected"], true);
+        assert_eq!(participants[0]["position"], 5);
     }
 
     #[tokio::test]
@@ -1148,7 +1355,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app.oneshot(get_request("/v1/validators")).await.unwrap();
 
@@ -1166,6 +1373,8 @@ mod tests {
                 node_id: "node-1".to_string(),
                 is_validator: true,
                 validator_index: Some(42),
+                key_id: Some("a2V5X2lk".to_string()),
+                adnl: Some("YWRubA==".to_string()),
                 ..Default::default()
             });
             s.validators.default_stake_policy = StakePolicy::Minimum;
@@ -1175,7 +1384,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app.oneshot(get_request("/v1/validators")).await.unwrap();
 
@@ -1187,6 +1396,8 @@ mod tests {
         assert_eq!(nodes[0]["node_id"], "node-1");
         assert_eq!(nodes[0]["is_validator"], true);
         assert_eq!(nodes[0]["validator_index"], 42);
+        assert_eq!(nodes[0]["key_id"], "a2V5X2lk");
+        assert_eq!(nodes[0]["adnl"], "YWRubA==");
     }
 
     #[tokio::test]
@@ -1196,7 +1407,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app.oneshot(get_request("/openapi.json")).await.unwrap();
 
@@ -1206,6 +1417,21 @@ mod tests {
         assert!(v["paths"].as_object().unwrap().contains_key("/health"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/elections"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/validators"));
+        let schemas = v["components"]["schemas"].as_object().unwrap();
+        assert!(schemas.contains_key("ElectionsStatus"));
+        assert!(schemas.contains_key("NodeListRequest"));
+
+        let mut refs = Vec::new();
+        collect_component_schema_refs(&v, &mut refs);
+        refs.sort();
+        refs.dedup();
+        let missing_refs: Vec<String> =
+            refs.into_iter().filter(|name| !schemas.contains_key(name)).collect();
+        assert!(
+            missing_refs.is_empty(),
+            "openapi has unresolved component schema refs: {:?}",
+            missing_refs
+        );
     }
 
     #[tokio::test]
@@ -1236,7 +1462,7 @@ mod tests {
         ));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task));
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
 
         let resp = app
             .oneshot(post_json(
@@ -1266,7 +1492,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config_no_elections()));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app
             .oneshot(post_json(
@@ -1309,7 +1535,7 @@ mod tests {
         ));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task));
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
 
         let resp = app
             .oneshot(post_json(
@@ -1340,7 +1566,7 @@ mod tests {
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config_no_elections()));
         let elections_task = test_elections_task();
 
-        let app = routes(false, test_state(store, runtime_cfg, elections_task));
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app
             .oneshot(post_json(
@@ -1353,5 +1579,34 @@ mod tests {
         assert_eq!(resp.status(), 400);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn openapi_spec_contains_bearer_auth_scheme() {
+        let spec = <ApiDoc as utoipa::OpenApi>::openapi();
+        let json = serde_json::to_value(&spec).unwrap();
+
+        // Security scheme is defined in components
+        let scheme = &json["components"]["securitySchemes"]["bearerAuth"];
+        assert_eq!(scheme["type"], "http");
+        assert_eq!(scheme["scheme"], "bearer");
+        assert_eq!(scheme["bearerFormat"], "JWT");
+
+        // Protected endpoint references the scheme
+        let elections_security = &json["paths"]["/v1/elections"]["get"]["security"];
+        assert!(elections_security.is_array(), "elections endpoint should have security");
+        assert_eq!(elections_security[0]["bearerAuth"], serde_json::json!([]));
+
+        // Public endpoints opt out of security
+        let health_security = &json["paths"]["/health"]["get"]["security"];
+        let login_security = &json["paths"]["/auth/login"]["post"]["security"];
+        for (name, sec) in [("health", health_security), ("login", login_security)] {
+            assert!(sec.is_array(), "{name} endpoint should have a security array");
+            let arr = sec.as_array().unwrap();
+            assert!(
+                !arr.iter().any(|v| v.get("bearerAuth").is_some()),
+                "{name} endpoint should not require bearerAuth"
+            );
+        }
     }
 }

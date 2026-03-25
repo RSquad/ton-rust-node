@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::Role;
-use crate::http::http_server_task::AppState;
+use crate::{http::http_server_task::AppState, runtime_config::RuntimeConfig};
 use axum::{
     body::Body,
     extract::State,
@@ -49,10 +49,16 @@ async fn require_role_impl(
     next: Next,
     min_role: Role,
 ) -> Response {
-    let jwt_auth = match &state.jwt_auth {
-        Some(mgr) => mgr,
-        None => return next.run(req).await,
-    };
+    // Check live config: when auth is not configured, pass through.
+    // This allows auth to be enabled/disabled at runtime via config reload.
+    {
+        let cfg = state.runtime_cfg.get();
+        if cfg.http.auth.is_none() {
+            return next.run(req).await;
+        }
+    }
+
+    let jwt_auth = &state.jwt_auth;
 
     let auth_header =
         req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());

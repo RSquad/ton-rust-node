@@ -18,6 +18,7 @@ pub(crate) mod config_wallet_cmd;
 pub(crate) mod deploy_cmd;
 pub(crate) mod key_cmd;
 pub(crate) mod master_wallet_cmd;
+pub(crate) mod output_format;
 pub(crate) mod service_api_cmd;
 pub(crate) mod service_cmd;
 mod utils;

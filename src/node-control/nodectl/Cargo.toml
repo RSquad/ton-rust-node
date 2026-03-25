@@ -1,22 +1,15 @@
 [package]
+build = '../../common/build/build.rs'
 name = "nodectl"
-version = "0.2.0"
+description = "Tool for managing Rust TON node"
+version = "0.3.0"
 edition = "2024"
 license = 'GPL-3.0'
 
 [dependencies]
-scopeguard = "1"
-strum = "0.27"
-strum_macros = "0.27"
-serde = { features = ["derive", "rc"], version = "1.0" }
 tokio = { version = "1.40", features = ["full"] }
-tokio-util = "0.7"
-async-trait = "0.1.89"
 clap = { version = "4.4", features = ["derive"] }
-toml = "0.8"
 tracing = "0.1"
-thiserror = "1.0"
 anyhow = "1.0"
-control-client = { path = "../control-client" }
 common = { path = "../common" }
 commands = { path = "../commands" }
