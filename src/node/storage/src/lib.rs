@@ -71,8 +71,10 @@ pub struct StorageTelemetry {
     pub shardstates_queue: Arc<Metric>,
     pub cached_cells_counters: Arc<Metric>,
 
-    pub loaded_cells: Arc<MetricBuilder>,
-    pub load_cell_time_nanos: Arc<Metric>,
+    pub loaded_cells_from_db: Arc<MetricBuilder>,
+    pub load_cell_from_db_time_nanos: Arc<Metric>,
+    pub load_cell_from_cache_time_nanos: Arc<Metric>,
+    pub store_cell_to_cache_time_nanos: Arc<Metric>,
     pub stored_new_cells: Arc<MetricBuilder>,
     pub deleted_cells: Arc<MetricBuilder>,
 
@@ -92,6 +94,10 @@ pub struct StorageTelemetry {
     pub delete_boc_traverse_micros: Arc<Metric>,
     pub delete_boc_tr_build_micros: Arc<Metric>,
     pub delete_boc_commit_micros: Arc<Metric>,
+
+    pub cell_cache_hits: Arc<MetricBuilder>,
+    pub cell_cache_misses: Arc<MetricBuilder>,
+    pub cell_cache_len: Arc<Metric>,
 }
 #[cfg(feature = "telemetry")]
 impl Default for StorageTelemetry {
@@ -104,11 +110,13 @@ impl Default for StorageTelemetry {
             storing_cells: Metric::without_totals("", 1),
             shardstates_queue: Metric::without_totals("", 1),
             cached_cells_counters: Metric::without_totals("", 1),
-            loaded_cells: MetricBuilder::with_metric_and_period(
+            loaded_cells_from_db: MetricBuilder::with_metric_and_period(
                 Metric::with_total_amount("", 1),
                 1000000000,
             ),
-            load_cell_time_nanos: Metric::with_total_average("", 1),
+            load_cell_from_db_time_nanos: Metric::with_total_average("", 1),
+            load_cell_from_cache_time_nanos: Metric::with_total_average("", 1),
+            store_cell_to_cache_time_nanos: Metric::with_total_average("", 1),
             stored_new_cells: MetricBuilder::with_metric_and_period(
                 Metric::with_total_amount("", 1),
                 1000000000,
@@ -136,6 +144,15 @@ impl Default for StorageTelemetry {
             delete_boc_traverse_micros: Metric::with_total_average("", 1),
             delete_boc_tr_build_micros: Metric::with_total_average("", 1),
             delete_boc_commit_micros: Metric::with_total_average("", 1),
+            cell_cache_hits: MetricBuilder::with_metric_and_period(
+                Metric::with_total_amount("", 1),
+                1000000000,
+            ),
+            cell_cache_misses: MetricBuilder::with_metric_and_period(
+                Metric::with_total_amount("", 1),
+                1000000000,
+            ),
+            cell_cache_len: Metric::without_totals("", 1),
         }
     }
 }
