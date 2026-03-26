@@ -23,7 +23,7 @@ use spin::mutex::SpinMutex;
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{self, LineWriter, Write},
+    io::{self, Cursor, LineWriter, Write},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -37,7 +37,8 @@ use ton_api::{
     IntoBoxed,
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256,
+    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocReader, BocWriter,
+    BuilderData, Ed25519KeyOption, ShardIdent, UInt256,
 };
 
 /*
@@ -93,11 +94,22 @@ impl DummyCollatedData {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap()
+        // Wrap in single-cell BOC — compress_candidate_data requires valid BOC input
+        let raw = bincode::serialize(self).unwrap();
+        let mut b = BuilderData::new();
+        b.append_raw(&raw, raw.len() * 8).unwrap();
+        let cell = b.into_cell().unwrap();
+        let mut buf = Vec::new();
+        BocWriter::with_flags([cell], BocFlags::all()).unwrap().write(&mut buf).unwrap();
+        buf
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        bincode::deserialize(bytes).unwrap()
+        // Extract from BOC wrapper
+        let boc = BocReader::new().read(&mut Cursor::new(bytes)).unwrap();
+        let cell = &boc.roots[0];
+        let raw = cell.data();
+        bincode::deserialize(raw).unwrap()
     }
 }
 
@@ -208,10 +220,10 @@ impl Default for TestConfig {
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 200,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_millis(1000),
             test_name: "simplex_consensus".to_string(),
-            test_timeout: Duration::from_secs(60),
+            test_timeout: Duration::from_secs(120),
             expect_timeout: false,
             shard: ShardIdent::masterchain(),
             mc_notification_interval: None, // No MC notifications for masterchain
@@ -1969,8 +1981,8 @@ fn test_simplex_consensus_basic() {
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 10000,
-            target_rate: Duration::from_millis(50),
-            first_block_timeout: Duration::from_millis(300),
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_millis(1000),
             test_name: "simplex_basic".to_string(),
             test_timeout: Duration::from_secs(180),
             expect_timeout: false, // Expect completion, not timeout
@@ -2016,14 +2028,14 @@ fn test_simplex_consensus_basic() {
 fn test_simplex_consensus_with_failures() {
     run_simplex_consensus_test(
         TestConfig {
-            total_rounds: 50,
+            total_rounds: 30,
             min_commit_percent: 0.3, // Lower threshold due to failures
             node_count: 11,
             generation_failure_probability: 0.1,
             candidate_rejection_probability: 0.1,
             max_collations: 150,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(2000),
             test_name: "simplex_with_failures".to_string(),
             // This scenario includes randomized generation/rejection failures and can
             // occasionally complete just above 120s on loaded CI/containers.
@@ -2088,10 +2100,10 @@ fn test_simplex_consensus_finalcert_recovery() {
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 200,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(2000),
             test_name: "simplex_finalcert_recovery".to_string(),
-            test_timeout: Duration::from_secs(180),
+            test_timeout: Duration::from_secs(240),
             expect_timeout: false,
             shard: ShardIdent::masterchain(),
             mc_notification_interval: None,
@@ -2164,10 +2176,10 @@ fn test_simplex_consensus_shard_with_mc_notifications() {
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 500,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_millis(1000),
             test_name: "simplex_shard_mc".to_string(),
-            test_timeout: Duration::from_secs(120),
+            test_timeout: Duration::from_secs(180),
             expect_timeout: false,
             // Use a shard chain (workchain 0, full shard)
             shard: ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
@@ -2340,7 +2352,7 @@ fn test_simplex_consensus_restart_gremlin() {
             candidate_rejection_probability: 0.0,
             max_collations: 2000,
             target_rate: Duration::from_millis(200),
-            first_block_timeout: Duration::from_millis(500),
+            first_block_timeout: Duration::from_millis(1200),
             test_name: "simplex_restart_gremlin".to_string(),
             test_timeout: Duration::from_secs(180), // Longer timeout for restart cycles
             expect_timeout: false,

@@ -69,7 +69,10 @@ use crate::{
 };
 use consensus_common::{
     check_execution_time,
-    utils::{get_elapsed_time, MetricsDumper},
+    utils::{
+        add_compute_percentage_metric, add_compute_relative_metric, add_compute_result_metric,
+        get_elapsed_time, MetricsDumper,
+    },
 };
 use crossbeam::channel::{bounded, Sender};
 use std::{
@@ -89,7 +92,7 @@ use ton_api::ton::consensus::{
     simplex::{Certificate, Vote},
     CandidateData,
 };
-use ton_block::{error, Error, Result, ShardIdent};
+use ton_block::{error, Error, Result, ShardIdent, UInt256};
 
 /*
     Constants
@@ -147,6 +150,24 @@ impl ReceiverListener for ReceiverListenerImpl {
     fn on_certificate(&self, source_idx: u32, certificate: Certificate) {
         self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
             processor.on_certificate(source_idx, certificate);
+        }));
+    }
+
+    /// Handle RequestCandidate cache miss by delegating to SessionProcessor
+    fn on_candidate_query_fallback(
+        &self,
+        slot: crate::block::SlotIndex,
+        block_hash: UInt256,
+        want_notar: bool,
+        response_callback: consensus_common::QueryResponseCallback,
+    ) {
+        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
+            processor.handle_candidate_query_fallback(
+                slot,
+                block_hash,
+                want_notar,
+                response_callback,
+            );
         }));
     }
 }
@@ -538,12 +559,14 @@ impl SessionImpl {
             session_id.clone(),
             &shard,
             max_candidate_size,
+            options.proto_version,
             &ids,
             &local_key,
             overlay_manager.clone(),
             receiver_listener,
             options.standstill_timeout,
             panicked_flag.clone(),
+            options.use_quic,
             health_counters.clone(),
         ) {
             Ok(r) => r,
@@ -860,10 +883,6 @@ impl SessionImpl {
     /// Configures derivative metrics (rate of change), percentage metrics,
     /// and result status metrics similar to validator-session.
     fn create_metrics_dumper() -> MetricsDumper {
-        use consensus_common::utils::{
-            add_compute_percentage_metric, add_compute_relative_metric, add_compute_result_metric,
-        };
-
         let mut metrics_dumper = MetricsDumper::new();
 
         // Derivative metrics for loop counters (rate per second)

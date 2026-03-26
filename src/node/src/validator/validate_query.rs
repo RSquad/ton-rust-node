@@ -53,15 +53,15 @@ use ton_block::{
     read_boc, Account, AccountBlock, AccountDispatchQueue, AccountId, AccountIdPrefixFull,
     AccountStatus, AccountStorageDictProof, AddSub, Block, BlockCreateStats, BlockError,
     BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, Coins, ConfigParamEnum,
-    ConfigParams, Counters, CreatorStats, CurrencyCollection, DepthBalanceInfo, Deserializable,
-    EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities, HashmapAugType, HashmapType, InMsg,
-    InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries, McBlockExtra, McShardRecord,
-    McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope, MsgMetadata,
-    OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable, ShardAccount, ShardAccountBlocks,
-    ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent, ShardStateUnsplit, SizeLimitsConfig,
-    SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase, Transaction, TransactionDescr,
-    UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID,
-    MAX_SPLIT_DEPTH,
+    ConfigParams, ConsensusExtraData, Counters, CreatorStats, CurrencyCollection, DepthBalanceInfo,
+    Deserializable, EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities, HashmapAugType,
+    HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries, McBlockExtra,
+    McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope,
+    MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable, ShardAccount,
+    ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent, ShardStateUnsplit,
+    SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase, Transaction,
+    TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr,
+    INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 use ton_executor::{
     BlockchainConfig, ExecuteParams, OrdinaryTransactionExecutor, TickTockTransactionExecutor,
@@ -142,6 +142,7 @@ impl Default for ValidateResult {
 struct ValidateBase {
     global_id: i32,
     is_fake: bool,
+    is_simplex: bool,
     created_by: UInt256,
     after_merge: bool,
     after_split: bool,
@@ -167,6 +168,7 @@ struct ValidateBase {
     virt_states: HashMap<UInt256, ShardStateUnsplit>, // prev state and neighbour out msg queues proofs by block root hash
     storage_dict_proofs: HashMap<UInt256, Cell>,
     full_collated_data: bool,
+    now_ms: Option<u64>, // gen_utime_ms from ConsensusExtraData (simplex consensus)
 
     gas_used: Arc<AtomicU64>,
     transactions_executed: Arc<AtomicU32>,
@@ -257,6 +259,7 @@ pub struct ValidateQuery {
     validator_set: ValidatorSet,
     is_fake: bool,
     multithread: bool,
+    is_simplex: bool,
     // previous state can be as two states for merge
     prev_blocks_ids: Vec<BlockIdExt>,
     old_mc_shards: ShardHashes, // old_shard_conf_
@@ -295,6 +298,7 @@ impl ValidateQuery {
         engine: Arc<dyn EngineOperations>,
         is_fake: bool,
         multithread: bool,
+        is_simplex: bool,
     ) -> Self {
         let next_block_descr = Arc::new(fmt_next_block_descr(&block_candidate.block_id));
         Self {
@@ -305,6 +309,7 @@ impl ValidateQuery {
             validator_set,
             is_fake,
             multithread,
+            is_simplex,
             prev_blocks_ids,
             old_mc_shards: Default::default(),
             // new state after applying block_candidate
@@ -327,6 +332,7 @@ impl ValidateQuery {
         let mut base = ValidateBase {
             next_block_descr: self.next_block_descr.clone(),
             is_fake: self.is_fake,
+            is_simplex: self.is_simplex,
             created_by: self.block_candidate.created_by.clone(),
             prev_blocks_ids: mem::take(&mut self.prev_blocks_ids),
             ..Default::default()
@@ -626,17 +632,55 @@ impl ValidateQuery {
                         if let Some(BlockError::InvalidConstructorTag { t: _, s: _ }) =
                             err.downcast_ref()
                         {
-                            let dict_proof =
-                                AccountStorageDictProof::construct_from_cell(croot.clone())?;
-                            log::debug!(
-                                target: "validate_query",
-                                "({}): collated datum # {idx} is an AccountStorageDictProof",
-                                base.next_block_descr
-                            );
-                            let dict_proof = MerkleProof::construct_from_cell(dict_proof.proof)?;
-                            base.storage_dict_proofs
-                                .insert(dict_proof.hash, dict_proof.proof.virtualize(1));
-                            base.full_collated_data = true;
+                            // Try AccountStorageDictProof first
+                            match AccountStorageDictProof::construct_from_cell(croot.clone()) {
+                                Ok(dict_proof) => {
+                                    log::debug!(
+                                        target: "validate_query",
+                                        "({}): collated datum # {idx} is an AccountStorageDictProof",
+                                        base.next_block_descr
+                                    );
+                                    let dict_proof =
+                                        MerkleProof::construct_from_cell(dict_proof.proof)?;
+                                    base.storage_dict_proofs
+                                        .insert(dict_proof.hash, dict_proof.proof.virtualize(1));
+                                    base.full_collated_data = true;
+                                }
+                                Err(_) => {
+                                    // Try ConsensusExtraData
+                                    match ConsensusExtraData::construct_from_cell(croot.clone()) {
+                                        Ok(extra) => {
+                                            log::debug!(
+                                                target: "validate_query",
+                                                "({}): collated datum # {idx} is a ConsensusExtraData, gen_utime_ms={}",
+                                                base.next_block_descr,
+                                                extra.gen_utime_ms
+                                            );
+                                            if base.now_ms.is_some() {
+                                                reject_query!(
+                                                    "duplicate ConsensusExtraData in collated data"
+                                                )
+                                            }
+                                            // Check: ConsensusExtraData is only valid when simplex is enabled
+                                            if !base.is_simplex {
+                                                reject_query!("unexpected ConsensusExtraData")
+                                            }
+                                            base.now_ms = Some(extra.gen_utime_ms);
+                                        }
+                                        Err(_) => {
+                                            let tag = SliceData::load_cell_ref(croot)?
+                                                .get_next_u32()
+                                                .unwrap_or(0);
+                                            log::warn!(
+                                                target: "validate_query",
+                                                "({}): collated datum # {idx} has unknown type (tag {:#010x}), ignoring",
+                                                base.next_block_descr,
+                                                tag
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             return Err(err);
                         }
@@ -764,8 +808,7 @@ impl ValidateQuery {
         let mc_state_extra = mc_state.shard_state_extra()?.clone();
         let config_params = mc_state_extra.config();
         CHECK!(config_params, inited);
-        let (capabilities, block_version) =
-            base.info.gen_software().map_or((0, 0), |v| (v.capabilities, v.version));
+        let block_version = base.info.gen_software().map_or(0, |v| v.version);
         if block_version < config_params.global_version() {
             reject_query!(
                 "This block version {} is too old, node_version: {} net version: {}",
@@ -2023,30 +2066,19 @@ impl ValidateQuery {
 
     fn check_utime_lt(&self, base: &ValidateBase, mc_data: &McData) -> Result<()> {
         CHECK!(&base.config_params, inited);
+        // C++ parity: allow_same_timestamp_ = global_version_ >= 13.
+        // Depends only on the global protocol version, not on consensus type.
+        // When true, also skips the future-time check (base.now > engine.now + 15)
+        // which C++ simplex testnet does not have.
         let allow_same_timestamp = {
-            #[cfg(feature = "simplex")]
+            #[cfg(feature = "xp25")]
             {
-                let simplex_enabled_for_shard = if base.shard().is_masterchain() {
-                    base.config_params.get_mc_simplex_config().ok().flatten().is_some()
-                } else {
-                    base.config_params.get_shard_simplex_config().ok().flatten().is_some()
-                };
-
-                simplex_enabled_for_shard
-                //TODO: LK: enable after change block version to 13
-                //&& base.config_params.global_version()
-                //        >= super::SIMPLEX_ALLOW_SAME_TIMESTAMP_FROM_GLOBAL_VERSION
+                true
             }
-            #[cfg(not(feature = "simplex"))]
+            #[cfg(not(feature = "xp25"))]
             {
-                #[cfg(feature = "xp25")]
-                {
-                    true
-                }
-                #[cfg(not(feature = "xp25"))]
-                {
-                    false
-                }
+                base.config_params.global_version()
+                    >= super::SIMPLEX_ALLOW_SAME_TIMESTAMP_FROM_GLOBAL_VERSION
             }
         };
         let mut gen_lt = u64::MIN;
@@ -2090,14 +2122,19 @@ impl ValidateQuery {
             )
         }
 
-        let now = self.engine.now();
-        if base.now() > now + 15 {
-            reject_query!(
-                "block has creation time {} too much in the future (it is only {} now)",
-                base.now(),
-                now
-            )
+        // C++ parity: C++ variants (mainnet, simplex-testnet, alpenglow-work) do not
+        // reject blocks for being too far in the future. To stay compatible with blocks
+        // produced by C++ collators, we only emit a warning instead of rejecting.
+        if !allow_same_timestamp {
+            let now = self.engine.now();
+            if base.now() > now + 15 {
+                log::warn!(
+                    "block has creation time {} too much in the future (local time is {now})",
+                    base.now(),
+                );
+            }
         }
+
         if base.info.start_lt() <= mc_data.state.state()?.gen_lt() {
             reject_query!(
                 "block has start_lt {} less than or equal to lt {} \
@@ -2134,6 +2171,19 @@ impl ValidateQuery {
                 base.info.end_lt() - base.info.start_lt(),
                 delta_hard
             )
+        }
+        if base.is_simplex {
+            match base.now_ms {
+                None => reject_query!("now_ms is not set"),
+                Some(now_ms) if now_ms / 1000 != base.info.gen_utime() as u64 => {
+                    reject_query!(
+                        "gen_utime is {}, but gen_utime_ms in ConsensusExtraData is {}",
+                        base.info.gen_utime(),
+                        now_ms
+                    )
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -5545,11 +5595,10 @@ impl ValidateQuery {
         tasks: &mut TasksVec,
     ) -> Result<()> {
         // log::debug!(target: "validate_query", "({}): checking all transactions", base.next_block_descr);
-        let config = BlockchainConfig::with_params(
-            base.config_params.capabilities(),
-            base.info.gen_software().map_or(0, |v| v.version),
-            base.config_params.clone(),
-        )?;
+        let (capabilities, block_version) =
+            base.info.gen_software().map_or((0, 0), |v| (v.capabilities, v.version));
+        let config =
+            BlockchainConfig::with_params(capabilities, block_version, base.config_params.clone())?;
         base.account_blocks.iterate_with_keys_and_aug(|account_addr, acc_block, _fee| {
             let base = base.clone();
             let libraries = libraries.clone();

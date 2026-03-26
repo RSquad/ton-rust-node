@@ -319,8 +319,7 @@ impl ValidatorGroupImpl {
     }
 
     /// Get simplex session pointer for simplex-specific operations (e.g., MC finalization)
-    /// Returns None if this is not a simplex session or simplex feature is not enabled
-    #[cfg(feature = "simplex")]
+    /// Returns None if this is not a simplex session
     #[allow(dead_code)]
     pub fn get_simplex_session(&self) -> Option<super::consensus::SimplexSessionPtr> {
         self.session.as_ref().and_then(|s| s.get_simplex_session())
@@ -420,7 +419,7 @@ impl ValidatorGroupImpl {
         is_accelerated_consensus_enabled: bool,
         consensus_type: ConsensusType,
     ) -> ValidatorGroupImpl {
-        log::info!(target: "validator", "Initializing session {:x}, shard {}, consensus_type {}", 
+        log::info!(target: "validator", "Initializing session {:x}, shard {}, consensus_type {}",
             session_id, shard, consensus_type);
 
         let prev_block_ids = PrevBlockHistory::with_shard(&shard);
@@ -973,6 +972,7 @@ impl ValidatorGroup {
         let request_clone = request.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
+        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
 
         let collation_task = tokio::spawn(async move {
             log::info!(
@@ -1007,6 +1007,7 @@ impl ValidatorGroup {
                             local_key,
                             validator_set.clone(),
                             engine.clone(),
+                            is_simplex,
                         )
                         .await
                         {
@@ -1173,6 +1174,7 @@ impl ValidatorGroup {
         let last_validation_time = self.last_validation_time.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
+        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
         let (
             expected_current_round,
             prev_block_ids,
@@ -1273,8 +1275,12 @@ impl ValidatorGroup {
                         candidate_block_id
                     );
 
-                    let validation_completion_time =
-                        run_validate_query_any_candidate(candidate.clone(), engine.clone()).await?;
+                    let validation_completion_time = run_validate_query_any_candidate(
+                        candidate.clone(),
+                        engine.clone(),
+                        is_simplex,
+                    )
+                    .await?;
 
                     // Post-validation: broadcast + save (shared with legacy path)
                     Self::post_validation_actions(
@@ -1353,6 +1359,7 @@ impl ValidatorGroup {
                         candidate.clone(),
                         validator_set.clone(),
                         engine.clone(),
+                        is_simplex,
                     )
                     .await?;
 

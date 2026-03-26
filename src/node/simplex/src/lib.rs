@@ -471,6 +471,11 @@ pub struct SessionOptions {
     /// Default: `FullReplay`
     pub restart_recommit_strategy: RestartRecommitStrategy,
 
+    /// Use QUIC overlay transport instead of ADNL UDP for this session.
+    /// When true, overlay messages/queries are sent via QUIC streams.
+    /// Default: false
+    pub use_quic: bool,
+
     /// Cooldown between repeated health alerts of the same anomaly type.
     /// Default: 30 seconds
     pub health_alert_cooldown: Duration,
@@ -507,6 +512,7 @@ impl Default for SessionOptions {
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
             restart_recommit_strategy: RestartRecommitStrategy::default(),
+            use_quic: false,
             health_alert_cooldown: Duration::from_secs(30),
             health_stall_warning_secs: 15,
             health_stall_error_secs: 60,

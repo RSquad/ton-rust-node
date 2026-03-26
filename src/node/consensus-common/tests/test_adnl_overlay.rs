@@ -473,6 +473,8 @@ fn test_adnl_overlay_quic_delivery() -> Result<()> {
         true, // is_tcp_enabled
         true, // is_quic_enabled
     );
+    // Quinn QUIC requires a Tokio runtime context on the calling thread
+    let _runtime_guard = test_network.get_runtime().enter();
     let result = run_overlay_test(test_network.get_nodes().clone(), TRANSPORT_TYPE);
 
     test_network.shutdown();

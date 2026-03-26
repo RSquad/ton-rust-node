@@ -180,13 +180,60 @@ impl EngineOperations for TestPipelineCollatorEngine {
 #[test]
 fn test_calc_utime_allow_same_timestamp_does_not_drift_when_prev_ahead() {
     // Simplex / allow_same_timestamp=true: monotonic, but no forced +1 drift.
-    assert_eq!(Collator::calc_utime(1015, 1000, true), 1015);
+    // prev=1015s, now_ms=1000_000ms (1000s) → gen_utime=1015, gen_utime_ms=1015_000
+    let (gen_utime, gen_utime_ms) = Collator::calc_utime(1015, 1_000_000, true);
+    assert_eq!(gen_utime, 1015);
+    assert_eq!(gen_utime_ms, 1_015_000);
+    assert_eq!(gen_utime_ms / 1000, gen_utime as u64);
 }
 
 #[test]
 fn test_calc_utime_strict_timestamp_forces_increment_when_prev_ahead() {
     // Catchain / allow_same_timestamp=false: C++-compatible strict +1.
-    assert_eq!(Collator::calc_utime(1015, 1000, false), 1016);
+    // prev=1015s, now_ms=1000_000ms (1000s) → gen_utime=1016, gen_utime_ms=1016_000
+    let (gen_utime, gen_utime_ms) = Collator::calc_utime(1015, 1_000_000, false);
+    assert_eq!(gen_utime, 1016);
+    assert_eq!(gen_utime_ms, 1_016_000);
+    assert_eq!(gen_utime_ms / 1000, gen_utime as u64);
+}
+
+#[test]
+fn test_calc_utime_ms_preserves_milliseconds_when_now_dominates() {
+    // now_ms=2000_500ms (2000.5s), prev=1000s → gen_utime=2000, gen_utime_ms=2000_500
+    let (gen_utime, gen_utime_ms) = Collator::calc_utime(1000, 2_000_500, true);
+    assert_eq!(gen_utime, 2000);
+    assert_eq!(gen_utime_ms, 2_000_500);
+    assert_eq!(gen_utime_ms / 1000, gen_utime as u64);
+}
+
+#[test]
+fn test_calc_utime_invariant_ms_div_1000_equals_seconds() {
+    // Verify the core invariant across various inputs
+    for &(prev, now_ms, allow_same) in &[
+        (100u32, 100_500u64, true),
+        (100, 100_500, false),
+        (100, 99_999, true),
+        (100, 99_999, false),
+        (100, 101_000, true),
+        (0, 1_000, true),
+        (0, 1_000, false),
+    ] {
+        let (gen_utime, gen_utime_ms) = Collator::calc_utime(prev, now_ms, allow_same);
+        assert_eq!(
+            gen_utime_ms / 1000,
+            gen_utime as u64,
+            "invariant violated: prev={prev}, now_ms={now_ms}, allow_same={allow_same}"
+        );
+    }
+}
+
+#[test]
+fn test_calc_utime_strict_mode_saturates_at_u32_max() {
+    // Strict mode would normally add +1 second, but must not wrap at u32::MAX.
+    let (gen_utime, gen_utime_ms) = Collator::calc_utime(u32::MAX, 0, false);
+    assert_eq!(gen_utime, u32::MAX);
+    assert_eq!(gen_utime_ms, u32::MAX as u64 * 1000);
+    assert_eq!(gen_utime_ms / 1000, gen_utime as u64);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -35,8 +35,8 @@ use std::{
     time::{Duration, Instant},
 };
 use ton_api::{
-    deserialize_boxed_bundle_with_suffix, deserialize_boxed_with_suffix, serialize_boxed,
-    serialize_boxed_append,
+    deserialize_boxed, deserialize_boxed_bundle_with_suffix, deserialize_boxed_with_suffix,
+    serialize_boxed, serialize_boxed_append,
     ton::{
         adnl::id::short::Short as AdnlShortId,
         catchain::{
@@ -1849,7 +1849,10 @@ impl OverlayNode {
             .await?;
         let mut data = overlay.query_prefix.clone();
         serialize_boxed_append(&mut data, &query.object)?;
-        quic.query(data, Some(&self.adnl), peers.local(), peers.other(), timeout_ms).await
+        match quic.query(data, Some(&self.adnl), peers.local(), peers.other(), timeout_ms).await? {
+            Some(raw) => Ok(Some(deserialize_boxed(&raw)?)),
+            None => Ok(None),
+        }
     }
 
     /// Send query via RLDP
