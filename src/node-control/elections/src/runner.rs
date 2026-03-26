@@ -6,7 +6,10 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry};
+use crate::{
+    election_emulator::{self, ElectionContext},
+    providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry},
+};
 use anyhow::Context as _;
 use common::{
     app_config::{BindingStatus, ElectionsConfig, NodeBinding, StakePolicy},
@@ -17,7 +20,7 @@ use common::{
     },
     task_cancellation::CancellationCtx,
     time_format,
-    ton_utils::nanotons_to_dec_string,
+    ton_utils::{nanotons_to_dec_string, nanotons_to_tons_f64},
 };
 use contracts::{
     ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
@@ -29,7 +32,9 @@ use std::{
     time::Duration,
 };
 use ton_block::{
-    Cell, ConfigParam15, MsgAddressInt, UnixTime, ValidatorDescr, ValidatorSet, write_boc,
+    Cell, ConfigParam15, MsgAddressInt, UnixTime, ValidatorDescr, ValidatorSet,
+    config_params::{ConfigParam16, ConfigParam17},
+    write_boc,
 };
 
 #[cfg(test)]
@@ -159,8 +164,17 @@ pub(crate) struct ElectionRunner {
     default_max_factor: f32,
     default_stake_policy: StakePolicy,
     past_elections: Vec<PastElections>,
+    /// Election ID for which `past_elections` and `cached_prev_min_eff` were fetched.
+    /// Used to avoid redundant RPC calls within the same election round.
+    past_elections_cache_id: u64,
+    /// Cached prev_min_eff_stake computed from past_elections.
+    cached_prev_min_eff: Option<u64>,
     // Snapshot cache updated during tick execution and published to SnapshotStore in run_loop().
     snapshot_cache: SnapshotCache,
+    /// AdaptiveSplit50: minimum wait fraction of election duration.
+    adaptive_sleep_pct: f64,
+    /// AdaptiveSplit50: maximum wait fraction of election duration.
+    adaptive_waiting_pct: f64,
 }
 
 #[derive(Default)]
@@ -221,7 +235,7 @@ impl ElectionRunner {
                             return None;
                         }
                     };
-                    let pool = pools.get(&node_id).map(|p| p.clone());
+                    let pool = pools.get(&node_id).cloned();
                     let binding = bindings.get(&node_id);
                     let excluded = !binding.map(|b| b.enable).unwrap_or(false);
                     let binding_status = binding.map(|b| b.status).unwrap_or(BindingStatus::Idle);
@@ -257,6 +271,10 @@ impl ElectionRunner {
             elector,
             snapshot_cache: SnapshotCache::default(),
             past_elections: vec![],
+            past_elections_cache_id: 0,
+            cached_prev_min_eff: None,
+            adaptive_sleep_pct: elections_config.adaptive_sleep_period_pct,
+            adaptive_waiting_pct: elections_config.adaptive_waiting_period_pct,
         }
     }
 
@@ -379,7 +397,29 @@ impl ElectionRunner {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Postponed;
         }
 
-        self.past_elections = self.elector.past_elections().await.context("past_elections")?;
+        // Fetch past_elections only when election_id changes (cache across ticks).
+        if self.past_elections_cache_id != election_id {
+            self.past_elections = self.elector.past_elections().await.context("past_elections")?;
+            self.cached_prev_min_eff = self
+                .past_elections
+                .first()
+                .and_then(|pe| pe.frozen_map.values().min_by_key(|f| f.stake).map(|f| f.stake));
+            self.past_elections_cache_id = election_id;
+            if let Some(prev) = self.cached_prev_min_eff {
+                tracing::info!(
+                    "prev_min_eff_stake from past elections: {} TON",
+                    nanotons_to_tons_f64(prev)
+                );
+            }
+        }
+        // Fetch config params 16/17 - used for AdaptiveSplit50 strategy
+        let cfg16 = self.fetch_config_param_16().await?;
+        let cfg17 = self.fetch_config_param_17().await?;
+
+        // Cap prev_min_eff to cfg17.max_stake as a sanity bound against outliers.
+        let prev_min_eff_stake =
+            self.cached_prev_min_eff.map(|v| v.min(cfg17.max_stake.as_u64().unwrap_or(u64::MAX)));
+
         // walk through the nodes and try to participate in the elections
         let mut nodes = self.nodes.keys().cloned().collect::<Vec<String>>();
         nodes.sort();
@@ -389,7 +429,9 @@ impl ElectionRunner {
             let recover_amount = match self.recover_stake(&node_id).await {
                 Ok(amount) => amount,
                 Err(e) => {
-                    self.nodes.get_mut(&node_id).map(|node| node.last_error = Some(e.to_string()));
+                    if let Some(node) = self.nodes.get_mut(&node_id) {
+                        node.last_error = Some(e.to_string());
+                    }
                     tracing::error!("node [{}] recover stake error: {}", node_id, e);
                     continue;
                 }
@@ -408,8 +450,21 @@ impl ElectionRunner {
             }
 
             tracing::info!("node [{}] participate in elections: id={}", node_id, election_id);
-            if let Err(e) = self.participate(&node_id, election_id, &elections_info, &cfg15).await {
-                self.nodes.get_mut(&node_id).map(|node| node.last_error = Some(format!("{:#}", e)));
+            if let Err(e) = self
+                .participate(
+                    &node_id,
+                    election_id,
+                    &elections_info,
+                    &cfg15,
+                    &cfg16,
+                    &cfg17,
+                    prev_min_eff_stake,
+                )
+                .await
+            {
+                if let Some(node) = self.nodes.get_mut(&node_id) {
+                    node.last_error = Some(format!("{:#}", e));
+                }
                 tracing::error!("node [{}] participate error: {:#}", node_id, e);
             }
         }
@@ -479,28 +534,44 @@ impl ElectionRunner {
         election_id: u64,
         elections_info: &ElectionsInfo,
         cfg15: &ConfigParam15,
+        cfg16: &ConfigParam16,
+        cfg17: &ConfigParam17,
+        prev_min_eff_stake: Option<u64>,
     ) -> anyhow::Result<()> {
         let max_factor = (self.calc_max_factor() * 65536.0) as u32;
-        let mut node = self.nodes.get_mut(node_id).expect("node not found");
+        let node = self.nodes.get_mut(node_id).expect("node not found");
         // Find validator key for current elections in the validator config
         let validator_key = node.find_election_key(election_id).await;
         // Find participant in the elections info by validator public key
         let participant = validator_key.as_ref().and_then(|entry| {
-            elections_info
-                .participants
-                .iter()
-                .find(|p| p.pub_key == entry.public_key)
-                .map(|p| p.clone())
+            elections_info.participants.iter().find(|p| p.pub_key == entry.public_key).cloned()
         });
+        // If the elector already has our stake, mark it accepted early
+        // so that calc_stake uses the correct current_stake (not 0).
+        if participant.is_some() {
+            node.stake_accepted = true;
+        }
         let stake = Self::calc_stake(
-            &mut node,
-            &node_id,
+            node,
+            node_id,
             &self.past_elections,
             participant.as_ref().map(|p| p.stake).unwrap_or(0),
-            elections_info.min_stake,
+            elections_info,
+            cfg15,
+            cfg16,
+            cfg17,
+            max_factor,
+            self.adaptive_sleep_pct,
+            self.adaptive_waiting_pct,
+            prev_min_eff_stake,
         )
         .await
         .context("stake calculation error")?;
+
+        if stake == 0 {
+            tracing::info!("node [{}] skipping elections this tick (stake=0)", node_id);
+            return Ok(());
+        }
 
         tracing::info!(
             "node [{}] max_factor={}, stake={} TON, strategy={}",
@@ -586,9 +657,21 @@ impl ElectionRunner {
                             ),
                             participant.election_id
                         );
+                        node.accepted_stake_amount = Some(participant.stake);
                         node.participant = Some(participant.clone());
                         node.stake_accepted = true;
-                        node.accepted_stake_amount = Some(participant.stake);
+                        if matches!(node.stake_policy, StakePolicy::AdaptiveSplit50) && stake > 0 {
+                            let old_stake = node.participant.as_ref().map(|p| p.stake).unwrap_or(0);
+                            tracing::info!(
+                                "node [{}] adaptive top-up: {} TON → {} TON (delta={} TON)",
+                                node_id,
+                                nanotons_to_tons_f64(old_stake),
+                                nanotons_to_tons_f64(old_stake + stake),
+                                nanotons_to_tons_f64(stake),
+                            );
+                            Self::send_stake(node_id, node, stake).await?;
+                            node.participant.as_mut().map(|p| p.stake += stake);
+                        }
                     }
                     None => {
                         tracing::warn!("node [{}] stake not found in elector", node_id);
@@ -629,7 +712,7 @@ impl ElectionRunner {
 
     async fn send_stake(node_id: &str, node: &mut Node, stake: u64) -> anyhow::Result<()> {
         tracing::info!("node [{}] build stake message", node_id);
-        let payload = Self::build_new_stake_payload(node_id, node).await?;
+        let payload = Self::build_new_stake_payload(node_id, node, stake).await?;
         // For simplicity we always assume that the node has nominator pool.
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
         let stake_balance = node.stake_balance(fee).await?;
@@ -671,7 +754,11 @@ impl ElectionRunner {
         Ok(())
     }
 
-    async fn build_new_stake_payload(node_id: &str, node: &mut Node) -> anyhow::Result<Cell> {
+    async fn build_new_stake_payload(
+        node_id: &str,
+        node: &mut Node,
+        stake: u64,
+    ) -> anyhow::Result<Cell> {
         let Some(participant) = &mut node.participant else {
             anyhow::bail!("node [{}] no participant info", node_id);
         };
@@ -680,7 +767,7 @@ impl ElectionRunner {
             node_id,
             participant.election_id,
             participant.max_factor,
-            participant.stake as f64 / 1_000_000_000.0,
+            stake as f64 / 1_000_000_000.0,
             hex::encode(participant.pub_key.as_slice()),
             base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
@@ -701,7 +788,7 @@ impl ElectionRunner {
         let signature = node.api.sign(node.key_id.clone(), data).await?;
         let body = nominator::new_stake(&nominator::NewStakeParams {
             query_id: UnixTime::now(),
-            stake_amount: participant.stake,
+            stake_amount: stake,
             validator_pubkey: participant.pub_key.as_slice(),
             stake_at: participant.election_id as u32,
             max_factor: participant.max_factor,
@@ -777,6 +864,30 @@ impl ElectionRunner {
         anyhow::bail!("get election parameters: all nodes failed");
     }
 
+    async fn fetch_config_param_16(&mut self) -> anyhow::Result<ConfigParam16> {
+        for (node_id, node) in self.nodes.iter_mut() {
+            match node.api.config_param_16().await {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => {
+                    tracing::warn!("node [{}] get config param 16 error: {:#}", node_id, e)
+                }
+            }
+        }
+        anyhow::bail!("get config param 16: all nodes failed");
+    }
+
+    async fn fetch_config_param_17(&mut self) -> anyhow::Result<ConfigParam17> {
+        for (node_id, node) in self.nodes.iter_mut() {
+            match node.api.config_param_17().await {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => {
+                    tracing::warn!("node [{}] get config param 17 error: {:#}", node_id, e)
+                }
+            }
+        }
+        anyhow::bail!("get config param 17: all nodes failed");
+    }
+
     fn print_election_cycle(cfg15: &ConfigParam15, election_id: u64) {
         let validation_start =
             time_format::format_ts(election_id - cfg15.validators_elected_for as u64);
@@ -797,9 +908,17 @@ impl ElectionRunner {
         node: &mut Node,
         node_id: &str,
         past_elections: &[PastElections],
-        elections_stake: u64, // stake sent to the elections but not yet accepted by the elector
-        min_stake: u64,
+        elections_stake: u64, // stake sent to the elections but not yet frozen by the elector
+        elections_info: &ElectionsInfo,
+        cfg15: &ConfigParam15,
+        cfg16: &ConfigParam16,
+        cfg17: &ConfigParam17,
+        our_max_factor: u32,
+        adaptive_sleep_pct: f64,
+        adaptive_waiting_pct: f64,
+        prev_min_eff_stake: Option<u64>,
     ) -> anyhow::Result<u64> {
+        let min_stake = elections_info.min_stake;
         tracing::info!("node [{}] calc stake", node_id);
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
         let mut frozen_stake = 0;
@@ -818,7 +937,8 @@ impl ElectionRunner {
 
         // Get pool free balance
         let pool_free_balance = node.stake_balance(fee).await?;
-        let total_balance = frozen_stake + pool_free_balance + elections_stake;
+        let total_balance =
+            frozen_stake.saturating_add(pool_free_balance).saturating_add(elections_stake);
         tracing::info!(
             "node [{}] frozen_stake={} TON, pool_balance={} TON, elections_stake={} TON, total_balance={} TON",
             node_id,
@@ -834,7 +954,237 @@ impl ElectionRunner {
                 min_stake as f64 / 1_000_000_000.0
             );
         }
-        node.stake_policy.calculate_stake(min_stake, total_balance)
+
+        match &node.stake_policy {
+            StakePolicy::AdaptiveSplit50 => {
+                // AdaptiveSplit50 wait logic: defer staking until enough participants
+                // AND minimum sleep period has passed.
+                if !node.stake_accepted {
+                    let min_validators = cfg16.min_validators.as_u16() as usize;
+                    let participants_count = elections_info.participants.len();
+                    let election_duration =
+                        cfg15.elections_start_before.saturating_sub(cfg15.elections_end_before)
+                            as u64;
+
+                    // Skip wait/sleep logic if election_duration is 0 (misconfigured).
+                    if election_duration == 0 {
+                        tracing::warn!(
+                            "node [{}] adaptive_split50: election_duration=0, skipping wait logic",
+                            node_id
+                        );
+                    } else {
+                        let election_start =
+                            elections_info.elect_close.saturating_sub(election_duration);
+                        let sleep_deadline =
+                            election_start + (election_duration as f64 * adaptive_sleep_pct) as u64;
+                        let wait_deadline = election_start
+                            + (election_duration as f64 * adaptive_waiting_pct) as u64;
+                        let now = time_format::now();
+
+                        // Wait if sleep period hasn't passed yet
+                        if now < sleep_deadline {
+                            tracing::info!(
+                                "node [{}] adaptive_split50 - sleep period: now < sleep_deadline={}",
+                                node_id,
+                                time_format::format_ts(sleep_deadline)
+                            );
+                            return Ok(0); // defer staking
+                        }
+
+                        // Wait if not enough participants and waiting period hasn't expired
+                        if participants_count < min_validators && now < wait_deadline {
+                            tracing::info!(
+                                "node [{}] adaptive_split50 - waiting for participants: ({}/{}), deadline={}",
+                                node_id,
+                                participants_count,
+                                min_validators,
+                                time_format::format_ts(wait_deadline)
+                            );
+                            return Ok(0); // defer staking
+                        }
+                    } // else election_duration > 0
+                }
+                let current_stake = if node.stake_accepted { elections_stake } else { 0 };
+                Self::calc_adaptive_stake(
+                    node_id,
+                    total_balance,
+                    pool_free_balance,
+                    current_stake,
+                    our_max_factor,
+                    elections_info,
+                    cfg16,
+                    cfg17,
+                    prev_min_eff_stake,
+                )
+            }
+            other => other.calculate_stake(min_stake, total_balance),
+        }
+    }
+
+    /// Calculate stake for AdaptiveSplit50 policy.
+    ///
+    /// Determines min_eff_stake from current emulation and/or past elections,
+    /// then decides whether to split funds (stake half) or stake min_eff_stake.
+    ///
+    /// Note: On subsequent ticks, tops up if min_eff_stake grew above current_stake.
+    /// If the remainder for the next round would be below min_eff_stake, stakes everything.
+    fn calc_adaptive_stake(
+        node_id: &str,
+        total_balance: u64,
+        free_balance: u64,
+        current_stake: u64,
+        our_max_factor: u32,
+        elections_info: &ElectionsInfo,
+        cfg16: &ConfigParam16,
+        cfg17: &ConfigParam17,
+        prev_min_eff_stake: Option<u64>,
+    ) -> anyhow::Result<u64> {
+        let min_validators = cfg16.min_validators.as_u16();
+        let max_validators = cfg16.max_validators.as_u16();
+        let max_stake_factor = cfg17.max_stake_factor;
+        let cfg17_min_stake = cfg17.min_stake.as_u64().unwrap_or(0);
+        let cfg17_max_stake = cfg17.max_stake.as_u64().unwrap_or(u64::MAX);
+        let half = total_balance / 2;
+
+        // Compute curr_min_eff_stake from current participants (if enough).
+        tracing::info!(
+            "node [{}] adaptive_split50: emulate elections on {} participants",
+            node_id,
+            elections_info.participants.len()
+        );
+        let participants = elections_info
+            .participants
+            .iter()
+            .map(|p| election_emulator::ParticipantStake {
+                stake: p.stake,
+                max_factor: p.max_factor,
+            })
+            .collect();
+
+        let ctx = ElectionContext {
+            participants,
+            max_validators,
+            min_validators,
+            global_max_factor: max_stake_factor,
+            min_stake: cfg17_min_stake,
+            max_stake: cfg17_max_stake,
+        };
+
+        // If we already have elections stake, don't add our stake to the emulation,
+        // because it's already in the participants list.
+        let emulated_stake = if current_stake > 0 { 0 } else { half };
+        // Only trust emulation if there are real participants (not just our own stake).
+        let has_real_participants = !elections_info.participants.is_empty();
+        let curr_min_eff = if has_real_participants || current_stake > 0 {
+            election_emulator::emulate_election(&ctx, emulated_stake, our_max_factor)
+                .map(|r| r.effective_min_stake)
+        } else {
+            None
+        };
+
+        // Step 3.1: Choose the smallest min_eff_stake from curr and prev.
+        let min_eff_stake = match (curr_min_eff, prev_min_eff_stake) {
+            (Some(curr), Some(prev)) => {
+                tracing::info!(
+                    "node [{}] adaptive_split50: curr_min_eff={} TON, prev_min_eff={} TON, using min={} TON",
+                    node_id,
+                    nanotons_to_tons_f64(curr),
+                    nanotons_to_tons_f64(prev),
+                    nanotons_to_tons_f64(curr.min(prev))
+                );
+                curr.min(prev)
+            }
+            (Some(curr), None) => {
+                tracing::info!(
+                    "node [{}] adaptive_split50: curr_min_eff={} TON (no past elections data)",
+                    node_id,
+                    nanotons_to_tons_f64(curr)
+                );
+                curr
+            }
+            (None, Some(prev)) => {
+                tracing::info!(
+                    "node [{}] adaptive_split50: prev_min_eff={} TON (not enough current participants < {})",
+                    node_id,
+                    nanotons_to_tons_f64(prev),
+                    min_validators
+                );
+                prev
+            }
+            (None, None) => {
+                anyhow::bail!(
+                    "node [{}] adaptive_split50: cannot determine min effective stake \
+                     (not enough participants and no past elections)",
+                    node_id
+                );
+            }
+        };
+
+        // If we already have enough stake, no need to top-up.
+        if current_stake >= min_eff_stake {
+            tracing::debug!(
+                "node [{}] adaptive_split50: stake={} TON >= min_eff={} TON, no top-up needed",
+                node_id,
+                nanotons_to_tons_f64(current_stake),
+                nanotons_to_tons_f64(min_eff_stake)
+            );
+            return Ok(0);
+        }
+
+        // Insufficient funds guard — if the pool doesn't have enough free
+        // funds to cover min_eff_stake, skip the election entirely.
+        // On the initial submission (current_stake == 0) we need at least min_eff_stake
+        // free; on top-ups we need at least the delta.
+        let required = min_eff_stake.saturating_sub(current_stake);
+        if free_balance < required {
+            tracing::error!(
+                "node [{}] adaptive_split50: insufficient funds free_balance={} TON < required={} TON (min_eff={} TON), skipping election",
+                node_id,
+                nanotons_to_tons_f64(free_balance),
+                nanotons_to_tons_f64(required),
+                nanotons_to_tons_f64(min_eff_stake),
+            );
+            return Ok(0);
+        }
+
+        // Decide between staking half or min_eff_stake.
+        if half >= min_eff_stake {
+            // Step 3.4: half is enough — stake half.
+            let stake = half.saturating_sub(current_stake);
+            tracing::info!(
+                "node [{}] adaptive_split50 - stake half: current_stake={} TON, left_to_stake={} TON, half={} TON >= min_eff={} TON",
+                node_id,
+                nanotons_to_tons_f64(current_stake),
+                nanotons_to_tons_f64(stake),
+                nanotons_to_tons_f64(half),
+                nanotons_to_tons_f64(min_eff_stake),
+            );
+            if stake > free_balance {
+                // Not enough free funds to stake half. Skip and let the operator top up.
+                tracing::error!(
+                    "node [{}] adaptive_split50 - insufficient free balance: need {} TON to stake half, \
+                     but only {} TON available. Consider topping up the pool.",
+                    node_id,
+                    nanotons_to_tons_f64(stake),
+                    nanotons_to_tons_f64(free_balance),
+                );
+                return Ok(0);
+            }
+            Ok(stake)
+        } else {
+            // half < min_eff — splitting is not viable.
+            // Since half < min_eff, it follows that total < 2 * min_eff,
+            // so the remainder after staking min_eff would also be < min_eff.
+            // The next round won't have enough funds anyway — stake everything.
+            tracing::info!(
+                "node [{}] adaptive_split50 - stake all: half={} TON < min_eff={} TON, staking all free_balance={} TON",
+                node_id,
+                nanotons_to_tons_f64(half),
+                nanotons_to_tons_f64(min_eff_stake),
+                nanotons_to_tons_f64(free_balance),
+            );
+            Ok(free_balance)
+        }
     }
 
     fn build_participants_snapshot(
@@ -924,7 +1274,7 @@ impl ElectionRunner {
             self.snapshot_cache.last_elections.as_ref().map(|snapshot| snapshot.election_id);
 
         let mut node_ids = self.nodes.keys().cloned().collect::<Vec<String>>();
-        node_ids.sort_by(|a, b| a.cmp(b));
+        node_ids.sort();
 
         let mut controlled_nodes = Vec::new();
         for node_id in node_ids {
@@ -1227,10 +1577,10 @@ impl ElectionRunner {
         let last_binding_statuses = &mut self.snapshot_cache.last_binding_statuses;
         for (node_id, node) in self.nodes.iter() {
             let last_status = last_binding_statuses
-                .insert(node_id.clone(), node.binding_status.clone())
+                .insert(node_id.clone(), node.binding_status)
                 .unwrap_or(BindingStatus::Idle);
             if node.binding_status != last_status {
-                changes.insert(node_id.clone(), node.binding_status.clone());
+                changes.insert(node_id.clone(), node.binding_status);
             }
         }
         changes
@@ -1260,22 +1610,19 @@ async fn find_validator_entries(
         let mut key = [0u8; 32];
         key.copy_from_slice(&public_key);
 
-        if current_entry.is_none() {
-            if let Some(vset) = current_vset {
-                if let Some(idx) =
-                    vset.list().iter().position(|item| item.public_key.as_slice() == &key)
-                {
-                    current_entry = Some((u16::try_from(idx)?, vset.list()[idx].clone()));
-                }
-            }
+        if current_entry.is_none()
+            && let Some(vset) = current_vset
+            && let Some(idx) =
+                vset.list().iter().position(|item| item.public_key.as_slice() == &key)
+        {
+            current_entry = Some((u16::try_from(idx)?, vset.list()[idx].clone()));
         }
 
-        if !is_in_next {
-            if let Some(vset) = next_vset {
-                if vset.list().iter().any(|item| item.public_key.as_slice() == &key) {
-                    is_in_next = true;
-                }
-            }
+        if !is_in_next
+            && let Some(vset) = next_vset
+            && vset.list().iter().any(|item| item.public_key.as_slice() == &key)
+        {
+            is_in_next = true;
         }
 
         if current_entry.is_some() && is_in_next {
