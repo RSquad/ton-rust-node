@@ -491,6 +491,9 @@ impl FullNodeOverlaysRouter {
                     shard_prefix,
                 )?;
                 if create {
+                    if let Some(old) = self.fast_sync_overlays.remove(&shard) {
+                        old.val().stop();
+                    }
                     let overlay = create_overlay(&shard).await?;
                     self.fast_sync_overlays.insert(shard, overlay)
                 } else {
@@ -501,24 +504,36 @@ impl FullNodeOverlaysRouter {
             Ok(())
         };
 
+        // Delete old overlays if monitor min split changed or we are not a validator anymore
         if (old_monitor_min_split != new_monitor_min_split) || key.is_none() {
+            if key.is_none() {
+                if let Some(old) = self.fast_sync_overlays.remove(&ShardIdent::MASTERCHAIN) {
+                    old.val().stop();
+                }
+            }
             update_monitor_min_split(old_monitor_min_split, false).await?;
         }
 
         if key.is_none() {
             self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
             log::info!("We are not a validator");
+            *cur_validators = new_validators.clone();
             return Ok(());
         }
 
+        // Update masterchain overlay
         if validators_changed {
             let shard = ShardIdent::MASTERCHAIN;
-            let overlay = create_overlay(&shard).await?;
-            if let Some(removed) = self.fast_sync_overlays.insert(shard, overlay) {
-                removed.val().stop();
+            if let Some(old) = self.fast_sync_overlays.remove(&shard) {
+                old.val().stop();
             }
+            let overlay = create_overlay(&shard).await?;
+            self.fast_sync_overlays.insert(shard, overlay);
         }
+
+        // Create new shard overlays
         update_monitor_min_split(new_monitor_min_split, true).await?;
+
         self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
         *cur_validators = new_validators.clone();
 
