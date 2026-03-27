@@ -1268,8 +1268,8 @@ fn outmsg_action_handler(
     let (force_body_to_ref, body) = match msg.body() {
         None => (false, None),
         Some(body) => {
-            let b = body.clone().into_builder().unwrap_or_default();
-            (b.references_used() >= 2, Some(b))
+            let b = body.clone().into_cell().unwrap_or_default();
+            (b.references_count() >= 2, Some(b))
         }
     };
     let (force_init_to_ref, init) = match msg.state_init() {
@@ -1305,7 +1305,7 @@ fn outmsg_action_handler(
         };
         let mut sstat = StorageUsageCalc::with_limits(max_cells, limits.max_msg_bits as u64);
         if let Some(body) = &body {
-            sstat.append_builder(body, body_to_ref, &mut 0).map_err(|err| {
+            sstat.append_cell(body, body_to_ref, &mut 0).map_err(|err| {
                 log::error!(target: "executor", "cannot calc msg storage used for body: {err}");
                 RESULT_CODE_UNKNOWN_OR_INVALID_ACTION
             })?;

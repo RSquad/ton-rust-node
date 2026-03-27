@@ -57,7 +57,6 @@ impl ConfigParams {
         let ConfigParamEnum::ConfigParam0(ConfigParam0 { config_addr }) = result else {
             fail!("config param 0 has invalid format");
         };
-        assert_eq!(config_addr.remaining_bits(), 256);
         Ok(Self { config_addr, config_params })
     }
 

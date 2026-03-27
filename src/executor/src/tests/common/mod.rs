@@ -137,13 +137,13 @@ pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
 
 #[cfg(feature = "cross_check")]
 pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
+    // let _ = cross_check::DisableCrossCheck::new();
     enum DebugType {
         None,
         Simple,
         Emulator,
     }
-    let debug = DebugType::Emulator;
-    let _ = cross_check::DisableCrossCheck::new();
+    let debug = DebugType::None;
     let (verbosity, pattern, trace_callback) = match debug {
         DebugType::None => (4, None, None),
         DebugType::Simple => (2048 + 4, Some("{m}"), None),
