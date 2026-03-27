@@ -86,13 +86,13 @@ impl PfxHashmapE {
         self.hashmap_set_with_mode(key, value, gas_consumer, REPLACE)
     }
     /// sets value as reference in empty SliceData
-    pub fn setref(&mut self, key: SliceData, value: &Cell) -> Leaf {
+    pub fn setref(&mut self, key: SliceData, value: Cell) -> Leaf {
         self.hashmap_setref_with_mode(key, value, &mut 0, ADD | REPLACE)
     }
     pub fn setref_with_gas(
         &mut self,
         key: SliceData,
-        value: &Cell,
+        value: Cell,
         gas_consumer: &mut dyn GasConsumer,
     ) -> Leaf {
         self.hashmap_setref_with_mode(key, value, gas_consumer, ADD | REPLACE)
@@ -100,7 +100,7 @@ impl PfxHashmapE {
     pub fn replaceref_with_gas(
         &mut self,
         key: SliceData,
-        value: &Cell,
+        value: Cell,
         gas_consumer: &mut dyn GasConsumer,
     ) -> Leaf {
         self.hashmap_setref_with_mode(key, value, gas_consumer, REPLACE)

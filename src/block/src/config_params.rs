@@ -60,10 +60,6 @@ impl ConfigParams {
         Ok(Self { config_addr, config_params })
     }
 
-    pub const fn with_address_and_root(config_addr: AccountId, data: Cell) -> Self {
-        Self { config_addr, config_params: HashmapE::with_hashmap(32, Some(data)) }
-    }
-
     pub const fn with_address_and_params(config_addr: AccountId, data: Option<Cell>) -> Self {
         Self { config_addr, config_params: HashmapE::with_hashmap(32, data) }
     }
@@ -571,10 +567,11 @@ impl ConfigParams {
 }
 
 impl Deserializable for ConfigParams {
-    fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        self.config_addr.read_from(cell)?;
-        *self.config_params.data_mut() = Some(cell.checked_drain_reference()?);
-        Ok(())
+    fn construct_from(slice: &mut SliceData) -> Result<Self> {
+        let config_addr = slice.get_next_slice(256)?;
+        let data = slice.checked_drain_reference()?;
+        let config_params = HashmapE::with_hashmap(32, Some(data));
+        Ok(Self { config_addr, config_params })
     }
 }
 

@@ -35,7 +35,7 @@ fn setref_and_get() {
     assert_eq!(
         tree.setref(
             SliceData::from_raw(vec![0b11111111], 8),
-            &BuilderData::with_raw(vec![0b11111111], 8).unwrap().into_cell().unwrap()
+            BuilderData::with_raw(vec![0b11111111], 8).unwrap().into_cell().unwrap()
         )
         .unwrap(),
         None
@@ -464,14 +464,14 @@ fn test_dictionary_of_dictionaries() {
 
     let mut root = HashmapE::with_bit_len(3);
     let key1 = SliceData::from_raw(vec![0xFF], 3);
-    assert_eq!(root.setref(key1.clone(), tree1.data().unwrap()).unwrap(), None);
+    assert_eq!(root.setref(key1.clone(), tree1.data().unwrap().clone()).unwrap(), None);
     assert_eq!(
         root.get(key1.clone()).unwrap().unwrap().reference(0).as_ref().unwrap(),
         tree1.data().unwrap()
     );
 
     let key2 = SliceData::from_raw(vec![0xC0], 3);
-    assert_eq!(root.setref(key2.clone(), tree2.data().unwrap()).unwrap(), None);
+    assert_eq!(root.setref(key2.clone(), tree2.data().unwrap().clone()).unwrap(), None);
     assert_eq!(
         root.get(key2.clone()).unwrap().unwrap().reference(0).as_ref().unwrap(),
         tree2.data().unwrap()

@@ -218,7 +218,7 @@ mod getparam {
         let library_cell_code = code.as_library_cell();
         let mut library = ton_block::HashmapE::with_bit_len(256);
         let key = code.repr_hash().write_to_bitstring().unwrap();
-        library.setref(key, &code).unwrap();
+        library.setref(key, code.clone()).unwrap();
         // simple case
         test_case_with_bytecode(code)
             .with_account(SHARD_ACCOUNT.clone())
@@ -246,13 +246,13 @@ mod root {
         params
             .setref(
                 SliceData::from_raw(2000i32.to_be_bytes().to_vec(), 32),
-                &SliceData::new(vec![0x67, 0x89, 0x08]).into_cell().unwrap(),
+                SliceData::new(vec![0x67, 0x89, 0x08]).into_cell().unwrap(),
             )
             .unwrap();
         params
             .setref(
                 SliceData::from_raw((-1i32).to_be_bytes().to_vec(), 32),
-                &SliceData::new(vec![0x12, 0x34, 0x58]).into_cell().unwrap(),
+                SliceData::new(vec![0x12, 0x34, 0x58]).into_cell().unwrap(),
             )
             .unwrap();
         test_case_with_c7("CONFIGROOT").expect_item(StackItem::dict(params.data()));
@@ -300,13 +300,13 @@ mod dict {
         params
             .setref(
                 SliceData::from_raw(2000i32.to_be_bytes().to_vec(), 32),
-                &SliceData::new(vec![0x67, 0x89, 0x08]).into_cell().unwrap(),
+                SliceData::new(vec![0x67, 0x89, 0x08]).into_cell().unwrap(),
             )
             .unwrap();
         params
             .setref(
                 SliceData::from_raw((-1i32).to_be_bytes().to_vec(), 32),
-                &SliceData::new(vec![0x12, 0x34, 0x58]).into_cell().unwrap(),
+                SliceData::new(vec![0x12, 0x34, 0x58]).into_cell().unwrap(),
             )
             .unwrap();
         test_case_with_c7("CONFIGDICT").expect_stack(
