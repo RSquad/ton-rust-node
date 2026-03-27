@@ -1414,7 +1414,7 @@ impl Transaction {
 
     /// add output message to Hashmap
     pub fn add_out_message(&mut self, msg: &Message) -> Result<()> {
-        self.out_msgs.setref(&UInt15(self.outmsg_cnt), &msg.serialize()?)?;
+        self.out_msgs.setref(&UInt15(self.outmsg_cnt), msg.serialize()?)?;
         self.outmsg_cnt += 1;
         Ok(())
     }

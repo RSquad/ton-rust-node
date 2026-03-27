@@ -19,6 +19,8 @@ use crate::{
     BlockchainConfig, ExecuteParams, ExecutorError, OrdinaryTransactionExecutor,
     TickTockTransactionExecutor, TransactionExecutor,
 };
+#[cfg(feature = "cross_check")]
+use std::sync::Arc;
 use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
@@ -123,16 +125,42 @@ pub fn default_config() -> BlockchainConfig {
     BlockchainConfig::with_config(create_config("real_boc/default_config.boc").unwrap()).unwrap()
 }
 
+#[cfg(not(feature = "cross_check"))]
 pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
-    let debug = false;
-    // let _ = cross_check::DisableCrossCheck::new();
-    // init_log_without_config(None, log::LevelFilter::Debug, None);
-    // cross_check::set_cross_check_verbosity(if debug { 2048 + 4 } else { 4 });
     ExecuteParams {
         block_unixtime: BLOCK_UT,
         block_lt: last_tr_lt - last_tr_lt % 1_000_000,
         last_tr_lt,
-        debug,
+        ..ExecuteParams::default()
+    }
+}
+
+#[cfg(feature = "cross_check")]
+pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
+    enum DebugType {
+        None,
+        Simple,
+        Emulator,
+    }
+    let debug = DebugType::Emulator;
+    let _ = cross_check::DisableCrossCheck::new();
+    let (verbosity, pattern, trace_callback) = match debug {
+        DebugType::None => (4, None, None),
+        DebugType::Simple => (2048 + 4, Some("{m}"), None),
+        DebugType::Emulator => {
+            let emulator_trace_callback: Option<Arc<ton_vm::executor::TraceCallback>> =
+                Some(Arc::new(ton_vm::executor::Engine::emulator_trace_callback));
+            (2048 + 4, Some("{m}"), emulator_trace_callback)
+        }
+    };
+    init_log_without_config(pattern, log::LevelFilter::Debug, None);
+    cross_check::set_cross_check_verbosity(verbosity);
+    ExecuteParams {
+        block_unixtime: BLOCK_UT,
+        block_lt: last_tr_lt - last_tr_lt % 1_000_000,
+        last_tr_lt,
+        trace_callback,
+        debug: !matches!(debug, DebugType::None),
         ..ExecuteParams::default()
     }
 }
@@ -928,26 +956,27 @@ pub fn replay_transaction(
 fn read_config(cfg: &str) -> Result<ConfigParams> {
     println!("prepare to read config");
     let config = if let Ok(data) = base64_decode(cfg) {
-        println!("config read as base64");
         let data = read_single_root_boc(data).unwrap();
         if let Ok(config) = ConfigParams::construct_from_cell(data.clone()) {
+            println!("config params read as base64");
             config
         } else {
-            ConfigParams::with_root(data)
+            println!("config hashmap read as base64");
+            ConfigParams::with_root(data)?
         }
     } else if let Ok(config) = create_config(cfg) {
-        println!("config read from file {cfg}");
+        println!("config read from file boc {cfg}");
         config
         // let config = ton_block_json::debug_possible_config_params(&config).unwrap();
         // std::fs::write("d:\\config.json", config).unwrap();
     } else if let Ok(data) = read_single_root_boc(std::fs::read(cfg).unwrap()) {
-        println!("config read from file as hashmap");
-        ConfigParams::with_root(data)
+        println!("config hashmap read from boc");
+        ConfigParams::with_root(data)?
     } else {
         println!("config read from file as json");
         let json: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&std::fs::read_to_string(cfg).unwrap()).unwrap();
-        ton_block_json::parse_config(json.get("config").unwrap().as_object().unwrap()).unwrap()
+        ton_block_json::parse_config(json.get("config").unwrap().as_object().unwrap())?
         // let cfg = cfg.replace("json", "boc");
         // config.write_to_file(&cfg).unwrap();
     };

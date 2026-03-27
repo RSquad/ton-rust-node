@@ -764,7 +764,7 @@ impl ValidateQuery {
         let mc_state_extra = mc_state.shard_state_extra()?.clone();
         let config_params = mc_state_extra.config();
         CHECK!(config_params, inited);
-        let (capabilities, block_version) =
+        let (_capabilities, block_version) =
             base.info.gen_software().map_or((0, 0), |v| (v.capabilities, v.version));
         if block_version < config_params.global_version() {
             reject_query!(

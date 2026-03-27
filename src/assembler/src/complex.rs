@@ -265,7 +265,7 @@ fn build_code_dict(
         } else {
             let value_cell = value_slice.clone().into_cell()?;
             info.append(&mut value_dbg);
-            dict.setref(key_slice.clone(), &value_cell)
+            dict.setref(key_slice.clone(), value_cell)
                 .map_err(|e| OperationError::CodeDictConstruction(e.to_string()))?;
         }
     }

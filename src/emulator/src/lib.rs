@@ -63,17 +63,18 @@ pub extern "C" fn transaction_emulator_create(
     vm_log_verbosity: u32,
 ) -> *mut c_void {
     init_log_without_config(None, log_level_from_verbosity(vm_log_verbosity), None);
-    match deserialize_boc(config_params_boc) {
-        Ok(config_params_root) => {
-            let config_params = ConfigParams::with_root(config_params_root);
-            let emulator = Box::new(Emulator::new(config_params));
-            Box::into_raw(emulator) as *mut c_void
-        }
-        Err(err) => {
-            log::error!("Failed to deserialize config params: {err}");
-            std::ptr::null_mut()
-        }
-    }
+    let err = match deserialize_boc(config_params_boc) {
+        Ok(config_params_root) => match ConfigParams::with_root(config_params_root) {
+            Ok(config_params) => {
+                let emulator = Box::new(Emulator::new(config_params));
+                return Box::into_raw(emulator) as *mut c_void;
+            }
+            Err(err) => err,
+        },
+        Err(err) => err,
+    };
+    log::error!("Failed to deserialize config params: {err}");
+    std::ptr::null_mut()
 }
 
 /**
@@ -176,16 +177,18 @@ pub extern "C" fn transaction_emulator_set_config(
         log::error!("Received null pointer for transaction_emulator");
         return;
     }
-    match deserialize_boc(config_params_boc) {
-        Ok(config_params_root) => {
-            let config_params = ConfigParams::with_root(config_params_root);
-            let transaction_emulator = unsafe { &mut *(transaction_emulator as *mut Emulator) };
-            transaction_emulator.config_params = config_params;
-        }
-        Err(err) => {
-            log::error!("Failed to parse config_params: {err}");
-        }
-    }
+    let err = match deserialize_boc(config_params_boc) {
+        Ok(config_params_root) => match ConfigParams::with_root(config_params_root) {
+            Ok(config_params) => {
+                let transaction_emulator = unsafe { &mut *(transaction_emulator as *mut Emulator) };
+                transaction_emulator.config_params = config_params;
+                return;
+            }
+            Err(err) => err,
+        },
+        Err(err) => err,
+    };
+    log::error!("Failed to parse config_params: {err}");
 }
 
 /**
