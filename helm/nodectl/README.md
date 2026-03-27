@@ -299,6 +299,7 @@ On first deploy, the init container prepares the PVC:
 | Step-by-step validator setup | [docs/setup.md](docs/setup.md) |
 | Elections and stake policies | [docs/elections.md](docs/elections.md) |
 | Chart maintainer guide | [docs/maintaining.md](docs/maintaining.md) |
+| First elections with Rust node | [docs/first-elections.md](docs/first-elections.md) |
 
 ## Useful commands
 

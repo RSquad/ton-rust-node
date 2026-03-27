@@ -37,13 +37,21 @@ pub fn parse_config_param_15(bytes: &[u8]) -> anyhow::Result<ConfigParam15> {
 }
 
 pub fn parse_config_param_34(bytes: &[u8]) -> anyhow::Result<ValidatorSet> {
+    parse_validator_set(bytes, "p34")
+}
+
+pub fn parse_config_param_36(bytes: &[u8]) -> anyhow::Result<ValidatorSet> {
+    parse_validator_set(bytes, "p36")
+}
+
+fn parse_validator_set(bytes: &[u8], key: &str) -> anyhow::Result<ValidatorSet> {
     let param: serde_json::Value = serde_json::from_slice(bytes)?;
     let map = param
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid config param"))?
-        .get("p34")
+        .get(key)
         .and_then(|v| v.as_object())
-        .ok_or_else(|| anyhow::anyhow!("p34 entry not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("{} entry not found", key))?;
     let utime_since = map
         .get("utime_since")
         .and_then(|value| value.as_u64())
