@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::*;
+use crate::adaptive_strategy::calc_adaptive_stake;
 use common::{
     app_config::{ElectionsConfig, NodeBinding, StakePolicy},
     snapshot::SnapshotStore,
@@ -1980,7 +1981,7 @@ fn test_adaptive_stake_half_when_above_min_eff() {
 
     let elections_info = elections_info_with_participants(50, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2034,7 +2035,7 @@ fn test_adaptive_stake_all_when_half_below_min_eff() {
         participants: stakes,
     };
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2063,7 +2064,7 @@ fn test_adaptive_no_topup_when_stake_sufficient() {
 
     let elections_info = elections_info_with_participants(50, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2093,7 +2094,7 @@ fn test_adaptive_skip_when_insufficient_funds() {
 
     let elections_info = elections_info_with_participants(50, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2126,7 +2127,7 @@ fn test_adaptive_skip_when_half_exceeds_free_balance() {
 
     let elections_info = elections_info_with_participants(5, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2156,7 +2157,7 @@ fn test_adaptive_uses_min_of_curr_and_prev() {
 
     let elections_info = elections_info_with_participants(50, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2187,7 +2188,7 @@ fn test_adaptive_fallback_to_prev_when_not_enough_participants() {
 
     let elections_info = elections_info_with_participants(5, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2215,7 +2216,7 @@ fn test_adaptive_error_when_no_min_eff_available() {
 
     let elections_info = elections_info_with_participants(5, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
@@ -2247,7 +2248,7 @@ fn test_adaptive_topup_to_half() {
     // With < min_validators participants, emulation returns None → uses prev_min_eff.
     let elections_info = elections_info_with_participants(5, 300_000 * NANO);
 
-    let result = ElectionRunner::calc_adaptive_stake(
+    let result = calc_adaptive_stake(
         "node-1",
         total_balance,
         free_balance,
