@@ -262,6 +262,7 @@ struct CollatorData {
 
     // determined fields
     gen_utime: u32,
+    gen_utime_ms: u64,
     config: BlockchainConfig,
     collated_block_descr: Arc<String>,
     block_limit_class: ParamLimitIndex,
@@ -312,6 +313,7 @@ struct CollatorData {
 impl CollatorData {
     pub fn new(
         gen_utime: u32,
+        gen_utime_ms: u64,
         config: BlockchainConfig,
         usage_tree: UsageTree,
         prev_data: &PrevData,
@@ -338,6 +340,7 @@ impl CollatorData {
             dispatch_queue_total_limit_reached: false,
             have_unprocessed_account_dispatch_queue: false,
             gen_utime,
+            gen_utime_ms,
             config,
             collated_block_descr,
             block_limit_class: ParamLimitIndex::Underload,
@@ -381,6 +384,10 @@ impl CollatorData {
 
     fn gen_utime(&self) -> u32 {
         self.gen_utime
+    }
+
+    fn gen_utime_ms(&self) -> u64 {
+        self.gen_utime_ms
     }
 
     //
@@ -1592,7 +1599,7 @@ impl Collator {
         let is_masterchain = self.shard.is_masterchain();
         self.check_stop_flag()?;
 
-        let now = self.init_utime(&mc_data, &prev_data)?;
+        let (now, now_ms) = self.init_utime(&mc_data, &prev_data)?;
         let config = BlockchainConfig::with_params(
             mc_data.config().capabilities(),
             supported_version(),
@@ -1600,6 +1607,7 @@ impl Collator {
         )?;
         let mut collator_data = CollatorData::new(
             now,
+            now_ms,
             config,
             usage_tree,
             &prev_data,
@@ -2176,60 +2184,65 @@ impl Collator {
         Ok(usage_tree)
     }
 
-    fn init_utime(&self, mc_data: &McData, prev_data: &PrevData) -> Result<u32> {
+    fn init_utime(&self, mc_data: &McData, prev_data: &PrevData) -> Result<(u32, u64)> {
         // consider unixtime and lt from previous block(s) of the same shardchain
         let prev_now = prev_data.prev_state_utime();
         let prev = max(mc_data.state().state()?.gen_time(), prev_now);
         log::trace!("{}: init_utime prev_time: {}", self.collated_block_descr, prev);
         let allow_same_timestamp = self.allow_same_timestamp(mc_data);
-        Ok(Self::calc_utime(prev, self.engine.now(), allow_same_timestamp))
+        // Compute gen_utime_ms first, then derive gen_utime from it (like C++).
+        // This guarantees gen_utime_ms / 1000 == gen_utime, avoiding second-boundary
+        // mismatches in ConsensusExtraData validation.
+        let (gen_utime, gen_utime_ms) =
+            Self::calc_utime(prev, self.engine.now_ms(), allow_same_timestamp);
+        Ok((gen_utime, gen_utime_ms))
     }
 
     /// Whether this shard is allowed to have `gen_utime` equal to the previous one.
     ///
-    /// C++ compatibility:
-    /// - non-simplex (catchain): always strict (`prev + 1`)
-    /// - simplex: allow equal timestamps starting from `global_version >= 13`
+    /// C++ parity: `allow_same_timestamp_ = global_version_ >= 13`.
+    /// Depends only on the global protocol version, not on consensus type.
+    /// When false (global_version < 13), gen_utime must strictly increase (prev + 1).
+    /// When true, gen_utime may equal the previous block's (non-decreasing).
     fn allow_same_timestamp(&self, mc_data: &McData) -> bool {
-        #[cfg(feature = "simplex")]
-        {
-            let simplex_enabled_for_shard = if self.shard.is_masterchain() {
-                mc_data.config().get_mc_simplex_config().ok().flatten().is_some()
-            } else {
-                mc_data.config().get_shard_simplex_config().ok().flatten().is_some()
-            };
-
-            // C++-compatible gating: allow equal timestamps only starting from global_version >= 13.
-            // This must match validator-side checks (`validate_query.rs`).
-            simplex_enabled_for_shard
-            //TODO: LK: enable after change block version to 13
-            //&& mc_data.config().global_version()
-            //        >= super::SIMPLEX_ALLOW_SAME_TIMESTAMP_FROM_GLOBAL_VERSION
-        }
-        #[cfg(not(feature = "simplex"))]
+        #[cfg(feature = "xp25")]
         {
             let _ = mc_data;
-            #[cfg(feature = "xp25")]
-            {
-                true
-            }
-            #[cfg(not(feature = "xp25"))]
-            {
-                false
-            }
+            true
+        }
+        #[cfg(not(feature = "xp25"))]
+        {
+            mc_data.config().global_version()
+                >= super::SIMPLEX_ALLOW_SAME_TIMESTAMP_FROM_GLOBAL_VERSION
         }
     }
 
+    /// Compute gen_utime_ms and gen_utime from previous block time and current wall clock.
+    ///
+    /// Mirrors C++ collator.cpp:
+    /// ```cpp
+    /// now_ms_ = std::max((td::uint64)(prev + (allow_same ? 0 : 1)) * 1000,
+    ///                    (td::uint64)(td::Clocks::system() * 1000));
+    /// now_ = (UnixTime)(now_ms_ / 1000);
+    /// ```
+    ///
+    /// By computing milliseconds first and deriving seconds, we guarantee
+    /// `gen_utime_ms / 1000 == gen_utime` always holds.
     #[inline]
-    fn calc_utime(prev: u32, now: u32, allow_same_timestamp: bool) -> u32 {
-        if allow_same_timestamp {
-            // NOTE: keep gen_utime monotonic (non-decreasing), but do NOT force +1 when blocks
-            // are produced faster than 1/sec (otherwise chain time drifts into the future).
-            max(prev, now)
+    fn calc_utime(prev: u32, now_ms: u64, allow_same_timestamp: bool) -> (u32, u64) {
+        let prev_sec = if allow_same_timestamp {
+            // Non-decreasing: do NOT force +1 when blocks are produced faster than 1/sec.
+            prev
         } else {
-            // C++ non-simplex behavior: strictly increasing gen_utime
-            max(prev.saturating_add(1), now)
-        }
+            // Strictly increasing gen_utime (legacy behavior), saturating at u32::MAX.
+            prev.saturating_add(1)
+        };
+        let prev_ms = prev_sec as u64 * 1000;
+        // Clamp to u32::MAX seconds range to prevent wraparound on cast.
+        let max_ms = u32::MAX as u64 * 1000;
+        let gen_utime_ms = max(prev_ms, now_ms).min(max_ms);
+        let gen_utime = (gen_utime_ms / 1000) as u32;
+        (gen_utime, gen_utime_ms)
     }
 
     fn check_utime(
@@ -4863,7 +4876,15 @@ impl Collator {
             roots.push(tbds.serialize()?);
         }
 
-        // match collator's BoC flags to consensus version config
+        // 1.2 store info for simplex consensus (C++ parity)
+        if self.collator_settings.is_simplex {
+            let extra = ton_block::ConsensusExtraData {
+                flags: 0,
+                gen_utime_ms: collator_data.gen_utime_ms(),
+            };
+            roots.push(extra.serialize()?);
+        }
+
         let collated_data_flags = if collator_data
             .config
             .raw_config()

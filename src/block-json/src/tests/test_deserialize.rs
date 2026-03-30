@@ -297,12 +297,14 @@ fn get_config_param30() -> NewConsensusConfigAll {
             slots_per_leader_window: 4,
             first_block_timeout_ms: 1000,
             max_leader_window_desync: 100,
+            ..Default::default()
         }),
         shard: Some(SimplexConfig {
             target_rate_ms: 200,
             slots_per_leader_window: 8,
             first_block_timeout_ms: 500,
             max_leader_window_desync: 50,
+            ..Default::default()
         }),
     }
 }

@@ -1130,6 +1130,10 @@ consensus.simplex.db.candidateResolver.candidateInfo leader_id:int candidate_has
 consensus.simplex.db.key.candidateResolver.notarCert candidateId:consensus.candidateId = consensus.simplex.db.key.candidateResolver.NotarCert;
 consensus.simplex.db.candidateResolver.notarCert notar:consensus.simplex.voteSignatureSet = consensus.simplex.db.candidateResolver.NotarCert;
 
+// Candidate resolver: full candidate payload (serialized CandidateData bytes)
+// Reference: C++ candidate-resolver.cpp store_candidate() / try_load_candidate_data_from_db()
+consensus.simplex.db.key.candidate candidateId:consensus.candidateId = consensus.simplex.db.key.Candidate;
+
 ---functions---
 consensus.simplex.requestCandidate id:consensus.CandidateId want_candidate:Bool want_notar:Bool = consensus.simplex.CandidateAndCert;
 consensus.simplex.vote unsignedVote:consensus.simplex.UnsignedVote signature:bytes = consensus.simplex.Vote;

@@ -97,7 +97,7 @@ impl FastSyncOverlayClient {
     }
 
     pub fn stop(&self) {
-        log::debug!("Stopping fast sync overlay {} {}", self.shard, self.id);
+        log::info!("Stopping fast sync overlay {} {}", self.shard, self.id);
         self.client.delete().ok();
     }
 

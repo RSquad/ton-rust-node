@@ -118,6 +118,7 @@ pub struct DynamicBocDb {
     storing_cells: Arc<lockfree::map::Map<UInt256, Cell>>,
     storing_cells_count: AtomicU64,
     cells_counters: Option<Arc<parking_lot::Mutex<CellsCounters>>>,
+    cell_cache: quick_cache::sync::Cache<UInt256, Cell>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
     allocated: Arc<StorageAlloc>,
@@ -153,6 +154,7 @@ impl DynamicBocDb {
             storing_cells: Arc::new(lockfree::map::Map::new()),
             storing_cells_count: AtomicU64::new(0),
             cells_counters,
+            cell_cache: quick_cache::sync::Cache::new(config.cells_lru_cache_capacity),
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
@@ -251,8 +253,8 @@ impl DynamicBocDb {
                 self.telemetry
                     .stored_cells
                     .update(self.allocated.storage_cells.load(Ordering::Relaxed));
-                self.telemetry.loaded_cells.update(1);
-                self.telemetry.load_cell_time_nanos.update(now.elapsed().as_nanos() as u64);
+                self.telemetry.loaded_cells_from_db.update(1);
+                self.telemetry.load_cell_from_db_time_nanos.update(now.elapsed().as_nanos() as u64);
             }
             return Ok(Cell::with_cell_impl(cell));
         }
@@ -489,6 +491,39 @@ impl DynamicBocDb {
     pub(crate) fn load_cell(self: &Arc<Self>, cell_id: &UInt256, panic: bool) -> Result<Cell> {
         #[cfg(feature = "telemetry")]
         let now = Instant::now();
+        if let Some(cell) = self.cell_cache.get(cell_id) {
+            #[cfg(feature = "telemetry")]
+            {
+                self.telemetry.cell_cache_hits.update(1);
+                self.telemetry
+                    .load_cell_from_cache_time_nanos
+                    .update(now.elapsed().as_nanos() as u64);
+            }
+            return Ok(cell);
+        }
+        #[cfg(feature = "telemetry")]
+        self.telemetry.cell_cache_misses.update(1);
+        let cell = self.load_cell_uncached(cell_id, panic)?;
+        #[cfg(feature = "telemetry")]
+        let now_insert = Instant::now();
+        self.cell_cache.insert(cell_id.clone(), cell.clone());
+        #[cfg(feature = "telemetry")]
+        {
+            self.telemetry
+                .store_cell_to_cache_time_nanos
+                .update(now_insert.elapsed().as_nanos() as u64);
+            self.telemetry.cell_cache_len.update(self.cell_cache.len() as u64);
+        }
+        Ok(cell)
+    }
+
+    pub(crate) fn load_cell_uncached(
+        self: &Arc<Self>,
+        cell_id: &UInt256,
+        panic: bool,
+    ) -> Result<Cell> {
+        #[cfg(feature = "telemetry")]
+        let now = Instant::now();
         let storage_cell_data = match self.db.get_pinned_cf(&self.cells_cf()?, cell_id.as_slice()) {
             Ok(Some(data)) => data,
             _ => {
@@ -517,7 +552,7 @@ impl DynamicBocDb {
         };
 
         #[cfg(feature = "telemetry")]
-        let load_cell_time_nanos = now.elapsed().as_nanos() as u64;
+        let load_cell_from_db_time_nanos = now.elapsed().as_nanos() as u64;
 
         let storage_cell = match StoredCell::deserialize(self, cell_id, &storage_cell_data) {
             Ok(cell) => Arc::new(cell),
@@ -548,8 +583,8 @@ impl DynamicBocDb {
             self.telemetry
                 .stored_cells
                 .update(self.allocated.storage_cells.load(Ordering::Relaxed));
-            self.telemetry.load_cell_time_nanos.update(load_cell_time_nanos);
-            self.telemetry.loaded_cells.update(1);
+            self.telemetry.load_cell_from_db_time_nanos.update(load_cell_from_db_time_nanos);
+            self.telemetry.loaded_cells_from_db.update(1);
         }
 
         log::trace!(
@@ -980,7 +1015,7 @@ impl CellByHashStorageAdapter {
 
 impl CellsStorage for CellByHashStorageAdapter {
     fn load_cell(&self, hash: &UInt256) -> Result<Cell> {
-        if let Ok(c) = self.db.clone().load_cell(hash, false) {
+        if let Ok(c) = self.db.clone().load_cell_uncached(hash, false) {
             Ok(c)
         } else if let Some(data) = self.root_cells_data.get(hash) {
             StoredCell::deserialize(&self.db, hash, data).map(Cell::with_cell_impl)
@@ -1000,8 +1035,11 @@ impl CellsStorage for CellByHashStorageAdapter {
         if let Ok(Some(data)) = self.db.db.get_pinned_cf(&self.db.cells_cf()?, hash.as_slice()) {
             #[cfg(feature = "telemetry")]
             {
-                self.db.telemetry.load_cell_time_nanos.update(now.elapsed().as_nanos() as u64);
-                self.db.telemetry.loaded_cells.update(1);
+                self.db
+                    .telemetry
+                    .load_cell_from_db_time_nanos
+                    .update(now.elapsed().as_nanos() as u64);
+                self.db.telemetry.loaded_cells_from_db.update(1);
             }
 
             StoredCell::write_cell_data(&data, hash, write_hashes, dest)

@@ -34,10 +34,12 @@ use ton_block::{
     Libraries, McStateExtra, Result, UInt256,
 };
 
-/// C++ simplex collator/validator allows equal `gen_utime` starting from this global version.
+/// Minimum global version that allows equal `gen_utime` between consecutive blocks.
 ///
-/// Reference (C++): `allow_same_timestamp_ = global_version_ >= 13`.
-#[allow(dead_code)]
+/// C++ parity: `allow_same_timestamp_ = global_version_ >= 13`.
+/// Applies to all consensus types (not simplex-specific despite the name).
+/// Under `xp25` feature this constant is unused — `allow_same_timestamp` is always true.
+#[cfg(not(feature = "xp25"))]
 pub(super) const SIMPLEX_ALLOW_SAME_TIMESTAMP_FROM_GLOBAL_VERSION: u32 = 13;
 
 #[derive(Clone, Default, Debug)]
@@ -58,6 +60,8 @@ pub struct CollatorSettings {
     pub is_bundle: bool,
     // produce blocks identical to cpp-node - mostly for tests
     pub lt_compatible: bool,
+    // true when running under simplex consensus (passed from ValidatorGroup)
+    pub is_simplex: bool,
 }
 
 impl CollatorSettings {

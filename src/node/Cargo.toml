@@ -3,7 +3,7 @@ build = '../common/build/build.rs'
 edition = '2021'
 license = 'GPL-3.0'
 name = 'node'
-version = '0.3.0'
+version = '0.4.0'
 
 [[bin]]
 name = 'adnl_resolve'
@@ -122,10 +122,9 @@ default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key']
 cell_counter = ['ton_block/cell_counter']
 ci_run = []
 export_key = ['catchain/export_key', 'ton_block/export_key']
+mirrornet = ['ton_block/mirrornet']
 only_sorted_clean = []
-simplex = []
 telemetry = ['adnl/telemetry', 'storage/telemetry']
 trace_alloc = []
 trace_alloc_detail = ['trace_alloc']
 xp25 = ['ton_block/xp25', 'adnl/xp25']
-mirrornet = ['ton_block/mirrornet']

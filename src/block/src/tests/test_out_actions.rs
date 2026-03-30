@@ -129,39 +129,24 @@ fn test_unpack_out_action_slices_rejects_non_empty_tail() {
 #[test]
 fn test_deserialize_out_action_slices_valid_list() {
     let actions = get_out_actions();
-    let slices =
-        unpack_out_action_slices(SliceData::load_cell(actions.serialize().unwrap()).unwrap())
-            .unwrap();
-    let parsed = deserialize_out_action_slices(slices).unwrap();
-    assert_eq!(parsed.len(), actions.len());
-    for (expected, actual) in actions.into_iter().zip(parsed.into_iter()) {
+    let slice = SliceData::load_cell(actions.serialize().unwrap()).unwrap();
+    let slices = unpack_out_action_slices(slice).unwrap();
+    assert_eq!(slices.len(), actions.len());
+    for (expected, mut slice) in actions.into_iter().zip(slices.into_iter()) {
+        let actual = OutAction::construct_from(&mut slice).unwrap();
         assert_eq!(expected, actual);
     }
 }
 
 #[test]
-fn test_deserialize_out_action_slices_returns_indexed_error() {
+fn test_deserialize_bad_out_action() {
     let valid_cell = OutAction::new_set(Cell::default()).serialize().unwrap();
-    let valid_slice = SliceData::load_cell(valid_cell).unwrap();
+    let mut valid_slice = SliceData::load_cell(valid_cell).unwrap();
+    OutAction::construct_from(&mut valid_slice).unwrap(); // sanity check that the valid slice is indeed valid
 
     let mut invalid_builder = BuilderData::new();
     0xffff_ffffu32.write_to(&mut invalid_builder).unwrap();
-    let invalid_slice = SliceData::load_cell(invalid_builder.into_cell().unwrap()).unwrap();
+    let mut invalid_slice = SliceData::load_cell(invalid_builder.into_cell().unwrap()).unwrap();
 
-    let err = deserialize_out_action_slices(vec![valid_slice, invalid_slice]).unwrap_err();
-    assert_eq!(err.0, 1);
+    OutAction::construct_from(&mut invalid_slice).unwrap_err(); // sanity check that the invalid slice is indeed invalid
 }
-
-// TODO: move to anythere
-// #[test]
-// fn test_tvm_serialize_currency_collection() {
-//     let coins = 1u64<<63;
-//     let coins1 = int!(coins).as_coins().unwrap();
-//     let coins1 = serialize_currency_collection(coins1, None).unwrap();
-//     let coins1: CurrencyCollection = CurrencyCollection::construct_from(&mut coins1.into()).unwrap();
-//     let coins2 = CurrencyCollection::with_coins(coins);
-//     assert_eq!(coins1, coins2);
-
-//     assert_eq!(int!(1u128<<120).as_coins().expect_err("Expect range check error").code,
-//         ExceptionCode::RangeCheckError);
-// }
