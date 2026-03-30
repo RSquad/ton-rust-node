@@ -3897,7 +3897,7 @@ impl Collator {
                 let account = shard_acc.account();
                 if let Some(storage_dict) = shard_acc.storage_dict() {
                     if account.dict_hash().is_some() {
-                        let size = account.storage_info().map(|info| info.used().cells()).unwrap_or(0);
+                        let size = account.storage_info().map_or(0, |info| info.used().cells());
                         log::trace!(
                             "{}: updated storage dict with hash {:x} for account {:x} of size {}",
                             self.collated_block_descr,
