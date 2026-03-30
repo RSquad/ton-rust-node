@@ -13,13 +13,12 @@ use adnl::{
         AdnlPeers, Answer, QueryAnswer, QueryResult, Subscriber, TaggedByteSlice, TaggedByteVec,
     },
     node::AdnlNode,
-    rldp::RldpNode,
+    RldpNode,
 };
 use rand::Rng;
-use std::sync::{
-    atomic::{AtomicU32, AtomicU8, Ordering},
-    Arc,
-};
+#[cfg(feature = "debug")]
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
 #[cfg(not(feature = "debug"))]
 use std::time::Instant;
 use ton_api::{
@@ -98,12 +97,7 @@ async fn bench_scenario(
             #[cfg(feature = "telemetry")]
             tag: 0,
         };
-        let res = if v2 {
-            rldp1.query_v2(&data, Some(size as u64 + 1024), &peers, None).await
-        } else {
-            rldp1.query(&data, Some(size as u64 + 1024), &peers, None).await
-        }
-        .unwrap();
+        let res = rldp1.query(&data, Some(size as u64 + 1024), &peers, v2, None).await.unwrap();
         let (Some(reply), _) = res else {
             println!(" failed: empty response");
             break;

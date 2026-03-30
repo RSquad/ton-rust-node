@@ -32,7 +32,7 @@ fn replay_transaction_by_files(
 ) {
     let config = read_config(config).unwrap();
     let mc_state_proof = mc_state_proof_cell_with_config(config);
-    replay_transaction(c, acc, acc_after, tr, mc_state_proof);
+    replay_transaction(c, acc, acc_after, tr, "", mc_state_proof);
 }
 
 fn bench_simple_transaction(c: &mut Criterion) {
@@ -326,7 +326,7 @@ fn load_blockchain_config(config_account: &Account) -> Result<BlockchainConfig> 
         .ok_or_else(|| error!("config account data loading error"))?
         .reference(0)
         .unwrap();
-    let config_params = ConfigParams::with_root(config_cell);
+    let config_params = ConfigParams::with_root(config_cell)?;
     BlockchainConfig::with_config(config_params)
 }
 
@@ -351,7 +351,7 @@ fn load_block(block_filename: &str) -> Result<BlockData> {
 
 fn replay_block(data: BlockData) -> Status {
     for acc in data.accounts {
-        let mut account = acc.account_cell;
+        let mut account = Account::construct_from_cell(acc.account_cell.clone())?;
         for tr in acc.transactions {
             let executor: Box<dyn TransactionExecutor> = match tr.read_description()? {
                 TransactionDescr::TickTock(desc) => {
@@ -372,7 +372,7 @@ fn replay_block(data: BlockData) -> Status {
                     ..Default::default()
                 },
             )?;
-            if account.repr_hash() != tr.read_state_update()?.new_hash {
+            if account.serialize()?.repr_hash() != tr.read_state_update()?.new_hash {
                 fail!("new hash mismatch");
             }
         }
@@ -414,7 +414,6 @@ criterion_group!(
     bench_tick_tock_message,
     bench_count_steps_vm,
     bench_not_aborted_accepted_transaction,
-    bench_ihr_fee_output_msg,
     bench_block_0,
 );
 criterion_main!(benches);

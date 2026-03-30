@@ -8,7 +8,6 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#![cfg(test)]
 #![allow(dead_code)]
 #![allow(clippy::duplicate_mod)]
 #![allow(clippy::field_reassign_with_default)]
@@ -915,6 +914,7 @@ pub fn replay_transaction(
     //         transaction.write_to_file(tr).unwrap();
     //     }
     // }
+    // pretty_assertions::assert_eq!(our_transaction, transaction);
     pretty_assertions::assert_eq!(
         our_transaction.read_description().unwrap(),
         transaction.read_description().unwrap()
@@ -953,7 +953,7 @@ pub fn replay_transaction(
     pretty_assertions::assert_eq!(account, account_after);
 }
 
-fn read_config(cfg: &str) -> Result<ConfigParams> {
+pub fn read_config(cfg: &str) -> Result<ConfigParams> {
     println!("prepare to read config");
     let config = if let Ok(data) = base64_decode(cfg) {
         let data = read_single_root_boc(data).unwrap();
