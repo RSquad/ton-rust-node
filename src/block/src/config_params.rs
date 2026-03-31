@@ -3790,7 +3790,7 @@ pub struct SimplexConfig {
     pub max_leader_window_desync: u32,
 }
 
-/// Byte layout: flags:(## 7) use_quic:Bool — 7 flag bits (reserved) + 1 use_quic bit = 1 byte.
+/// Byte layout: flags:(## 7) use_quic:Bool - 7 flag bits (reserved) + 1 use_quic bit = 1 byte.
 /// TLB writes MSB-first, so use_quic occupies the LSB: byte = (flags << 1) | use_quic.
 impl Serializable for SimplexConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
