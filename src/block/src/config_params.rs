@@ -47,11 +47,17 @@ impl Default for ConfigParams {
 }
 
 impl ConfigParams {
-    pub const fn with_root(data: Cell) -> Self {
-        Self {
-            config_addr: AccountId::ZERO_ID,
-            config_params: HashmapE::with_hashmap(32, Some(data)),
-        }
+    pub fn with_root(data: Cell) -> Result<Self> {
+        let config_params = HashmapE::with_hashmap(32, Some(data));
+        let cell = config_params
+            .get(0u32.write_to_bitstring()?)?
+            .ok_or_else(|| error!("config param 0 is missing"))?
+            .reference(0)?;
+        let result = ConfigParamEnum::construct_from_cell_and_number(cell, 0)?;
+        let ConfigParamEnum::ConfigParam0(ConfigParam0 { config_addr }) = result else {
+            fail!("config param 0 has invalid format");
+        };
+        Ok(Self { config_addr, config_params })
     }
 
     pub const fn with_address_and_root(config_addr: AccountId, data: Cell) -> Self {
@@ -3784,7 +3790,7 @@ pub struct SimplexConfig {
     pub max_leader_window_desync: u32,
 }
 
-/// Byte layout: flags:(## 7) use_quic:Bool â€” 7 flag bits (reserved) + 1 use_quic bit = 1 byte.
+/// Byte layout: flags:(## 7) use_quic:Bool — 7 flag bits (reserved) + 1 use_quic bit = 1 byte.
 /// TLB writes MSB-first, so use_quic occupies the LSB: byte = (flags << 1) | use_quic.
 impl Serializable for SimplexConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {

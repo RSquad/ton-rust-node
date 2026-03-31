@@ -8,7 +8,6 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#![cfg(test)]
 #![allow(dead_code)]
 #![allow(clippy::duplicate_mod)]
 #![allow(clippy::field_reassign_with_default)]
@@ -123,6 +122,7 @@ pub fn default_config() -> BlockchainConfig {
     BlockchainConfig::with_config(create_config("real_boc/default_config.boc").unwrap()).unwrap()
 }
 
+#[cfg(feature = "cross_check")]
 pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
     let debug = false;
     // let _ = cross_check::DisableCrossCheck::new();
@@ -133,6 +133,36 @@ pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
         block_lt: last_tr_lt - last_tr_lt % 1_000_000,
         last_tr_lt,
         debug,
+        ..ExecuteParams::default()
+    }
+}
+
+#[cfg(not(feature = "cross_check"))]
+pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
+    // let _ = cross_check::DisableCrossCheck::new();
+    enum DebugType {
+        None,
+        Simple,
+        Emulator,
+    }
+    let debug = DebugType::None;
+    let (verbosity, pattern, trace_callback) = match debug {
+        DebugType::None => (4, None, None),
+        DebugType::Simple => (2048 + 4, Some("{m}"), None),
+        DebugType::Emulator => {
+            let emulator_trace_callback: Option<Arc<ton_vm::executor::TraceCallback>> =
+                Some(Arc::new(ton_vm::executor::Engine::emulator_trace_callback));
+            (2048 + 4, Some("{m}"), emulator_trace_callback)
+        }
+    };
+    init_log_without_config(pattern, log::LevelFilter::Debug, None);
+    cross_check::set_cross_check_verbosity(verbosity);
+    ExecuteParams {
+        block_unixtime: BLOCK_UT,
+        block_lt: last_tr_lt - last_tr_lt % 1_000_000,
+        last_tr_lt,
+        trace_callback,
+        debug: !matches!(debug, DebugType::None),
         ..ExecuteParams::default()
     }
 }
@@ -887,6 +917,7 @@ pub fn replay_transaction(
     //         transaction.write_to_file(tr).unwrap();
     //     }
     // }
+    // pretty_assertions::assert_eq!(our_transaction, transaction);
     pretty_assertions::assert_eq!(
         our_transaction.read_description().unwrap(),
         transaction.read_description().unwrap()
@@ -925,7 +956,7 @@ pub fn replay_transaction(
     pretty_assertions::assert_eq!(account, account_after);
 }
 
-fn read_config(cfg: &str) -> Result<ConfigParams> {
+pub fn read_config(cfg: &str) -> Result<ConfigParams> {
     println!("prepare to read config");
     let config = if let Ok(data) = base64_decode(cfg) {
         println!("config read as base64");

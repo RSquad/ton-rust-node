@@ -447,6 +447,24 @@ impl Engine {
         }
     }
 
+    pub fn emulator_trace_callback(&self, info: &EngineTraceInfo) {
+        if info.has_cmd() {
+            if self.trace_bit(Engine::TRACE_CODE) {
+                if let Ok(code_cell) = info.cmd_code.cell().as_ref() {
+                    log::info!(target: "executor", "code cell hash: {:X} offset: {}\n",
+                        code_cell.repr_hash(), info.cmd_code.pos());
+                }
+                log::info!(target: "executor", "{}\n", info.cmd_str);
+            }
+            if self.trace_bit(Engine::TRACE_STACK) {
+                log::info!(target: "executor", " [ {} ] \n", self.get_stack_result_fift());
+            }
+            if self.trace_bit(Engine::TRACE_GAS) {
+                log::info!(target: "executor", "gas - {}\n", info.gas_used);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn dump_stack_result(stack: &Stack) -> String {
         static PREV_STACK: LazyLock<Mutex<Stack>> = LazyLock::new(|| Mutex::new(Stack::new()));
