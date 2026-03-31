@@ -78,9 +78,7 @@ pub fn emergency_withdraw(query_id: u64, request_address: &[u8; 32]) -> anyhow::
 /// Can be sent by anyone; the pool checks config param 34 on-chain.
 pub fn update_validator_set(query_id: u64) -> anyhow::Result<Cell> {
     let mut builder = BuilderData::new();
-    builder
-        .append_u32(opcodes::UPDATE_VALIDATOR_SET)?
-        .append_u64(query_id)?;
+    builder.append_u32(opcodes::UPDATE_VALIDATOR_SET)?.append_u64(query_id)?;
     builder.into_cell()
 }
 
@@ -89,9 +87,7 @@ pub fn update_validator_set(query_id: u64) -> anyhow::Result<Cell> {
 /// Removes config proposal votings older than 30 days.
 pub fn cleanup_votings(query_id: u64) -> anyhow::Result<Cell> {
     let mut builder = BuilderData::new();
-    builder
-        .append_u32(opcodes::CLEANUP_VOTINGS)?
-        .append_u64(query_id)?;
+    builder.append_u32(opcodes::CLEANUP_VOTINGS)?.append_u64(query_id)?;
     builder.into_cell()
 }
 
@@ -101,9 +97,7 @@ pub fn cleanup_votings(query_id: u64) -> anyhow::Result<Cell> {
 /// Attach the desired amount of TON to the message; 1 TON is deducted as a processing fee.
 pub fn deposit_validator(query_id: u64) -> anyhow::Result<Cell> {
     let mut builder = BuilderData::new();
-    builder
-        .append_u32(opcodes::DEPOSIT_VALIDATOR)?
-        .append_u64(query_id)?;
+    builder.append_u32(opcodes::DEPOSIT_VALIDATOR)?.append_u64(query_id)?;
     builder.into_cell()
 }
 
@@ -113,9 +107,7 @@ pub fn deposit_validator(query_id: u64) -> anyhow::Result<Cell> {
 /// Can only be called when pool state == 0 (not participating in validation).
 pub fn withdraw_validator(query_id: u64, amount: u64) -> anyhow::Result<Cell> {
     let mut builder = BuilderData::new();
-    builder
-        .append_u32(opcodes::WITHDRAW_VALIDATOR)?
-        .append_u64(query_id)?;
+    builder.append_u32(opcodes::WITHDRAW_VALIDATOR)?.append_u64(query_id)?;
     Coins::new(amount).write_to(&mut builder)?;
     builder.into_cell()
 }

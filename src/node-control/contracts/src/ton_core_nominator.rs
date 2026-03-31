@@ -11,6 +11,4 @@ pub mod messages;
 /// Nominator pool contract implementation (wrapper, deploy state init, RPC).
 mod ton_core_nominator;
 
-pub use ton_core_nominator::{
-    NominatorPoolWrapperImpl, resolve_deploy_pool_params,
-};
+pub use ton_core_nominator::{NominatorPoolWrapperImpl, resolve_deploy_pool_params};

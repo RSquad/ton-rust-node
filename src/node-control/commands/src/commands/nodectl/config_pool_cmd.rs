@@ -72,7 +72,10 @@ pub struct PoolAddCmd {
     addr1: Option<String>,
     #[arg(long = "addr2", help = "Core: addresses[1] (with --kind core)")]
     addr2: Option<String>,
-    #[arg(long = "validator-share", help = "Core: validator_share, basis points (with --kind core)")]
+    #[arg(
+        long = "validator-share",
+        help = "Core: validator_share, basis points (with --kind core)"
+    )]
     validator_share: Option<u64>,
     #[arg(long = "max-nominators", help = "Core: max nominators (default: 40)")]
     max_nominators: Option<u16>,
@@ -126,7 +129,9 @@ impl PoolAddCmd {
         let (pool_config, info) = match self.kind {
             PoolAddKind::Snp => {
                 if self.address.is_none() && self.owner.is_none() {
-                    anyhow::bail!("For SNP: at least one of --address or --owner must be specified");
+                    anyhow::bail!(
+                        "For SNP: at least one of --address or --owner must be specified"
+                    );
                 }
 
                 let normalized_address = self
@@ -134,13 +139,18 @@ impl PoolAddCmd {
                     .as_deref()
                     .map(|addr| normalize_ton_address(addr, "address"))
                     .transpose()?;
-                let normalized_owner =
-                    self.owner.as_deref().map(|owner| normalize_ton_address(owner, "owner")).transpose()?;
+                let normalized_owner = self
+                    .owner
+                    .as_deref()
+                    .map(|owner| normalize_ton_address(owner, "owner"))
+                    .transpose()?;
 
                 let info = match (&normalized_address, &normalized_owner) {
                     (Some(a), Some(o)) => format!("kind=snp address='{}', owner='{}'", a, o),
                     (Some(a), None) => format!("kind=snp address='{}'", a),
-                    (None, Some(o)) => format!("kind=snp owner='{}' (address will be calculated on bind)", o),
+                    (None, Some(o)) => {
+                        format!("kind=snp owner='{}' (address will be calculated on bind)", o)
+                    }
                     _ => unreachable!(),
                 };
 

@@ -712,9 +712,8 @@ fn resolve_pool_address(
             min_validator_stake,
             min_nominator_stake,
         } => {
-            let configured_validator = addresses[0]
-                .parse::<MsgAddressInt>()
-                .context("invalid TONCore addresses[0]")?;
+            let configured_validator =
+                addresses[0].parse::<MsgAddressInt>().context("invalid TONCore addresses[0]")?;
             if configured_validator != *validator_addr {
                 anyhow::bail!(
                     "TONCore addresses[0] must match validator wallet for manual stake (expected {}, got {})",
