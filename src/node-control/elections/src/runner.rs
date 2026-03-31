@@ -8,6 +8,7 @@
  */
 use crate::{
     adaptive_strategy,
+    election_emulator::ParticipantStake,
     providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry},
 };
 use anyhow::Context as _;
@@ -51,7 +52,7 @@ const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 /// Gas fee consumed by validator wallet
 const WALLET_COMPUTE_FEE: u64 = 200_000_000;
 /// Reserved minimum balance on the wallet (or pool) balance for stake calculations
-const MIN_NANOTON_FOR_STORAGE: u64 = 1_100_000_000;
+const MIN_NANOTON_FOR_STORAGE: u64 = 1_050_000_000;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 
@@ -172,9 +173,9 @@ pub(crate) struct ElectionRunner {
     // Snapshot cache updated during tick execution and published to SnapshotStore in run_loop().
     snapshot_cache: SnapshotCache,
     /// AdaptiveSplit50: minimum wait fraction of election duration.
-    adaptive_sleep_pct: f64,
+    sleep_pct: f64,
     /// AdaptiveSplit50: maximum wait fraction of election duration.
-    adaptive_waiting_pct: f64,
+    waiting_pct: f64,
 }
 
 #[derive(Default)]
@@ -225,8 +226,8 @@ struct ConfigParams<'a> {
 struct StakeContext<'a> {
     past_elections: &'a [PastElections],
     our_max_factor: u32,
-    adaptive_sleep_pct: f64,
-    adaptive_waiting_pct: f64,
+    sleep_pct: f64,
+    waiting_pct: f64,
     prev_min_eff_stake: Option<u64>,
 }
 
@@ -290,8 +291,8 @@ impl ElectionRunner {
             past_elections: vec![],
             past_elections_cache_id: 0,
             cached_prev_min_eff: None,
-            adaptive_sleep_pct: elections_config.adaptive_sleep_period_pct,
-            adaptive_waiting_pct: elections_config.adaptive_waiting_period_pct,
+            sleep_pct: elections_config.sleep_period_pct,
+            waiting_pct: elections_config.waiting_period_pct,
         }
     }
 
@@ -546,8 +547,8 @@ impl ElectionRunner {
         let stake_ctx = StakeContext {
             past_elections: &self.past_elections,
             our_max_factor: max_factor,
-            adaptive_sleep_pct: self.adaptive_sleep_pct,
-            adaptive_waiting_pct: self.adaptive_waiting_pct,
+            sleep_pct: self.sleep_pct,
+            waiting_pct: self.waiting_pct,
             prev_min_eff_stake: self.cached_prev_min_eff,
         };
         let node = self.nodes.get_mut(node_id).expect("node not found");
@@ -947,19 +948,33 @@ impl ElectionRunner {
                     configs.cfg15.elections_start_before,
                     configs.cfg15.elections_end_before,
                     configs.cfg16,
-                    ctx.adaptive_sleep_pct,
-                    ctx.adaptive_waiting_pct,
+                    ctx.sleep_pct,
+                    ctx.waiting_pct,
                 ) {
                     return Ok(0);
                 }
                 let current_stake = if node.stake_accepted { elections_stake } else { 0 };
+                let stakes: Vec<_> = configs
+                    .elections_info
+                    .participants
+                    .iter()
+                    .filter(|p| {
+                        p.pub_key.as_slice()
+                            != node
+                                .participant
+                                .as_ref()
+                                .map(|p| p.pub_key.as_slice())
+                                .unwrap_or_default()
+                    })
+                    .map(|p| ParticipantStake { stake: p.stake, max_factor: p.max_factor })
+                    .collect();
                 adaptive_strategy::calc_adaptive_stake(
                     node_id,
                     total_balance,
                     pool_free_balance,
                     current_stake,
                     ctx.our_max_factor,
-                    configs.elections_info,
+                    stakes,
                     configs.cfg16,
                     configs.cfg17,
                     ctx.prev_min_eff_stake,

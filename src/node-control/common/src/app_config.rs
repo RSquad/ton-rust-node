@@ -467,8 +467,12 @@ fn default_tick_interval() -> u64 {
     40
 }
 
-fn default_adaptive_waiting_pct() -> f64 {
-    0.3
+fn default_waiting_pct() -> f64 {
+    0.4
+}
+
+fn default_sleep_pct() -> f64 {
+    0.2
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -485,14 +489,14 @@ pub struct ElectionsConfig {
     /// Interval for elections runner in seconds
     #[serde(default = "default_tick_interval")]
     pub tick_interval: u64,
-    /// AdaptiveSplit50: minimum wait time as fraction of election duration (0.0 - 1.0).
+    /// Minimum wait time as fraction of election duration (0.0 - 1.0).
     /// Algorithm waits at least this long from election start, even if min_validators is reached.
-    #[serde(default)]
-    pub adaptive_sleep_period_pct: f64,
-    /// AdaptiveSplit50: maximum wait time as fraction of election duration (0.0 - 1.0).
+    #[serde(default = "default_sleep_pct")]
+    pub sleep_period_pct: f64,
+    /// Maximum wait time as fraction of election duration (0.0 - 1.0).
     /// If min_validators is not reached within this period, proceed without waiting.
-    #[serde(default = "default_adaptive_waiting_pct")]
-    pub adaptive_waiting_period_pct: f64,
+    #[serde(default = "default_waiting_pct")]
+    pub waiting_period_pct: f64,
 }
 
 impl ElectionsConfig {
@@ -506,14 +510,14 @@ impl ElectionsConfig {
         if !(1.0..=3.0).contains(&self.max_factor) {
             anyhow::bail!("max_factor must be in range [1.0..3.0]");
         }
-        if !(0.0..=1.0).contains(&self.adaptive_sleep_period_pct) {
-            anyhow::bail!("adaptive_sleep_period_pct must be in range [0.0..1.0]");
+        if !(0.0..=1.0).contains(&self.sleep_period_pct) {
+            anyhow::bail!("sleep_period_pct must be in range [0.0..1.0]");
         }
-        if !(0.0..=1.0).contains(&self.adaptive_waiting_period_pct) {
-            anyhow::bail!("adaptive_waiting_period_pct must be in range [0.0..1.0]");
+        if !(0.0..=1.0).contains(&self.waiting_period_pct) {
+            anyhow::bail!("waiting_period_pct must be in range [0.0..1.0]");
         }
-        if self.adaptive_sleep_period_pct > self.adaptive_waiting_period_pct {
-            anyhow::bail!("adaptive_sleep_period_pct must be <= adaptive_waiting_period_pct");
+        if self.sleep_period_pct > self.waiting_period_pct {
+            anyhow::bail!("sleep_period_pct must be <= waiting_period_pct");
         }
         Ok(())
     }
@@ -526,8 +530,8 @@ impl Default for ElectionsConfig {
             policy_overrides: HashMap::new(),
             max_factor: default_max_factor(),
             tick_interval: default_tick_interval(),
-            adaptive_sleep_period_pct: 0.0,
-            adaptive_waiting_period_pct: default_adaptive_waiting_pct(),
+            sleep_period_pct: default_sleep_pct(),
+            waiting_period_pct: default_waiting_pct(),
         }
     }
 }

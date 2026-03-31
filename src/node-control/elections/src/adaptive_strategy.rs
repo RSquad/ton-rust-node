@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 
-use crate::election_emulator::{self, ElectionContext};
+use crate::election_emulator::{self, ElectionContext, ParticipantStake};
 use common::ton_utils::nanotons_to_tons_f64;
 use contracts::ElectionsInfo;
 use ton_block::config_params::{ConfigParam16, ConfigParam17};
@@ -22,8 +22,8 @@ pub(crate) fn is_adaptive_split50_ready(
     cfg15_start_before: u32,
     cfg15_end_before: u32,
     cfg16: &ConfigParam16,
-    adaptive_sleep_pct: f64,
-    adaptive_waiting_pct: f64,
+    sleep_pct: f64,
+    waiting_pct: f64,
 ) -> bool {
     let min_validators = cfg16.min_validators.as_u16() as usize;
     let participants_count = elections_info.participants.len();
@@ -38,8 +38,8 @@ pub(crate) fn is_adaptive_split50_ready(
     }
 
     let election_start = elections_info.elect_close.saturating_sub(election_duration);
-    let sleep_deadline = election_start + (election_duration as f64 * adaptive_sleep_pct) as u64;
-    let wait_deadline = election_start + (election_duration as f64 * adaptive_waiting_pct) as u64;
+    let sleep_deadline = election_start + (election_duration as f64 * sleep_pct) as u64;
+    let wait_deadline = election_start + (election_duration as f64 * waiting_pct) as u64;
     let now = common::time_format::now();
 
     // Wait if sleep period hasn't passed yet
@@ -80,7 +80,7 @@ pub(crate) fn calc_adaptive_stake(
     free_balance: u64,
     current_stake: u64,
     our_max_factor: u32,
-    elections_info: &ElectionsInfo,
+    stakes: Vec<ParticipantStake>,
     cfg16: &ConfigParam16,
     cfg17: &ConfigParam17,
     prev_min_stake: Option<u64>,
@@ -96,16 +96,11 @@ pub(crate) fn calc_adaptive_stake(
     tracing::info!(
         "node [{}] adaptive_split50: emulate elections on {} participants",
         node_id,
-        elections_info.participants.len()
+        stakes.len()
     );
-    let participants = elections_info
-        .participants
-        .iter()
-        .map(|p| election_emulator::ParticipantStake { stake: p.stake, max_factor: p.max_factor })
-        .collect();
 
     let ctx = ElectionContext {
-        participants,
+        participants: stakes,
         max_validators,
         min_validators,
         global_max_factor: max_stake_factor,
@@ -136,10 +131,10 @@ pub(crate) fn calc_adaptive_stake(
         }
         (None, Some(prev)) => {
             tracing::info!(
-                "node [{}] adaptive_split50: prev_min={} TON (not enough current participants < {})",
+                "node [{}] adaptive_split50: not enough current participants < {}, use prev_min={} TON",
                 node_id,
+                min_validators,
                 nanotons_to_tons_f64(prev),
-                min_validators
             );
             prev
         }
@@ -222,7 +217,6 @@ pub(crate) fn calc_adaptive_stake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use contracts::{ElectionsInfo, Participant};
     use ton_block::{
         Coins, Number16,
         config_params::{ConfigParam16, ConfigParam17},
@@ -230,8 +224,6 @@ mod tests {
 
     const NANO: u64 = 1_000_000_000;
     const FACTOR_3X: u32 = 3 * 65536;
-    const ELECTION_ID: u64 = 1_700_000_000;
-    const MIN_STAKE: u64 = 10_000_000_000_000; // 10_000 TON
 
     fn default_cfg16() -> ConfigParam16 {
         ConfigParam16 {
@@ -250,33 +242,9 @@ mod tests {
         }
     }
 
-    /// Build an ElectionsInfo with `n` participants each staking `stake_per` nanotons.
-    fn elections_info_with_participants(n: usize, stake_per: u64) -> ElectionsInfo {
-        let participants = (0..n)
-            .map(|i| {
-                let mut pubkey = [0u8; 32];
-                pubkey[0] = i as u8;
-                pubkey[1] = (i >> 8) as u8;
-                Participant {
-                    pub_key: pubkey.to_vec(),
-                    adnl_addr: [0xEE; 32].to_vec(),
-                    wallet_addr: pubkey.to_vec(),
-                    stake: stake_per,
-                    max_factor: FACTOR_3X,
-                    election_id: ELECTION_ID,
-                    stake_message_boc: None,
-                }
-            })
-            .collect();
-        ElectionsInfo {
-            election_id: ELECTION_ID,
-            elect_close: ELECTION_ID + 600,
-            min_stake: MIN_STAKE,
-            total_stake: n as u64 * stake_per,
-            failed: false,
-            finished: false,
-            participants,
-        }
+    /// Build `n` participant stakes each with `stake_per` nanotons.
+    fn participant_stakes(n: usize, stake_per: u64) -> Vec<ParticipantStake> {
+        vec![ParticipantStake { stake: stake_per, max_factor: FACTOR_3X }; n]
     }
 
     // ---- half >= min_eff → stake half ----
@@ -291,7 +259,7 @@ mod tests {
         let free_balance = total_balance; // no frozen, no current
         let current_stake = 0;
 
-        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+        let stakes = participant_stakes(50, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -299,7 +267,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             None,
@@ -321,31 +289,12 @@ mod tests {
         let free_balance = total_balance;
         let current_stake = 0;
 
-        let stakes: Vec<Participant> = (0..400)
-            .map(|i| {
-                let mut pubkey = [0u8; 32];
-                pubkey[0] = i as u8;
-                pubkey[1] = (i >> 8) as u8;
-                Participant {
-                    pub_key: pubkey.to_vec(),
-                    adnl_addr: [0xEE; 32].to_vec(),
-                    wallet_addr: pubkey.to_vec(),
-                    stake: (700_000 + i as u64 * 100) * NANO,
-                    max_factor: FACTOR_3X,
-                    election_id: ELECTION_ID,
-                    stake_message_boc: None,
-                }
+        let stakes: Vec<ParticipantStake> = (0..400)
+            .map(|i| ParticipantStake {
+                stake: (700_000 + i as u64 * 100) * NANO,
+                max_factor: FACTOR_3X,
             })
             .collect();
-        let elections_info = ElectionsInfo {
-            election_id: ELECTION_ID,
-            elect_close: ELECTION_ID + 600,
-            min_stake: MIN_STAKE,
-            total_stake: stakes.iter().map(|p| p.stake).sum(),
-            failed: false,
-            finished: false,
-            participants: stakes,
-        };
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -353,7 +302,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes,
             &default_cfg16(),
             &default_cfg17(),
             None,
@@ -374,7 +323,7 @@ mod tests {
         let free_balance = 0; // all staked or frozen
         let current_stake = 650_000 * NANO;
 
-        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+        let stakes = participant_stakes(50, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -382,7 +331,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             None,
@@ -404,7 +353,7 @@ mod tests {
         let current_stake = 0;
         let total_balance = frozen + free_balance + current_stake;
 
-        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+        let stakes = participant_stakes(50, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -412,7 +361,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             None,
@@ -437,7 +386,7 @@ mod tests {
         let total_balance = frozen + free_balance + current_stake;
         let prev_min_eff = Some(50_000 * NANO);
 
-        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+        let stakes = participant_stakes(5, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -445,7 +394,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             prev_min_eff,
@@ -467,7 +416,7 @@ mod tests {
         let current_stake = 0;
         let prev_min_eff = Some(80_000 * NANO);
 
-        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+        let stakes = participant_stakes(50, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -475,7 +424,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             prev_min_eff,
@@ -498,7 +447,7 @@ mod tests {
         let current_stake = 0;
         let prev_min_eff = Some(80_000 * NANO);
 
-        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+        let stakes = participant_stakes(50, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -506,7 +455,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             prev_min_eff,
@@ -531,7 +480,7 @@ mod tests {
         let current_stake = 0;
         let prev_min_eff = Some(50_000 * NANO);
 
-        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+        let stakes = participant_stakes(5, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -539,7 +488,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             prev_min_eff,
@@ -559,7 +508,7 @@ mod tests {
         let free_balance = total_balance;
         let current_stake = 0;
 
-        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+        let stakes = participant_stakes(5, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -567,7 +516,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             None,
@@ -591,7 +540,7 @@ mod tests {
 
         // current_stake > 0 → emulation uses our_stake = 0 (already in list).
         // With < min_validators participants, emulation returns None → uses prev_min_eff.
-        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+        let stakes = participant_stakes(5, 300_000 * NANO);
 
         let result = calc_adaptive_stake(
             "node-1",
@@ -599,7 +548,7 @@ mod tests {
             free_balance,
             current_stake,
             FACTOR_3X,
-            &elections_info,
+            stakes.clone(),
             &default_cfg16(),
             &default_cfg17(),
             prev_min_eff,

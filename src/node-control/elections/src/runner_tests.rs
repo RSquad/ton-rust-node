@@ -358,8 +358,8 @@ impl TestHarness {
                 policy_overrides: HashMap::new(),
                 max_factor: 3.0,
                 tick_interval: 10,
-                adaptive_sleep_period_pct: 0.0,
-                adaptive_waiting_period_pct: 0.3,
+                sleep_period_pct: 0.0,
+                waiting_period_pct: 0.3,
             },
             bindings: HashMap::new(),
         }
@@ -1190,8 +1190,8 @@ async fn test_multiple_nodes_one_excluded() {
         policy_overrides: HashMap::new(),
         max_factor: 3.0,
         tick_interval: 10,
-        adaptive_sleep_period_pct: 0.0,
-        adaptive_waiting_period_pct: 0.3,
+        sleep_period_pct: 0.0,
+        waiting_period_pct: 0.3,
     };
 
     let mut bindings = HashMap::new();
@@ -1628,8 +1628,8 @@ async fn test_node_without_wallet_skipped() {
         policy_overrides: HashMap::new(),
         max_factor: 3.0,
         tick_interval: 10,
-        adaptive_sleep_period_pct: 0.0,
-        adaptive_waiting_period_pct: 0.3,
+        sleep_period_pct: 0.0,
+        waiting_period_pct: 0.3,
     };
 
     let mut bindings = HashMap::new();
@@ -1974,8 +1974,8 @@ async fn test_adaptive_wait_for_participants() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
     harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
-    harness.elections_config.adaptive_sleep_period_pct = 0.0;
-    harness.elections_config.adaptive_waiting_period_pct = 0.3;
+    harness.elections_config.sleep_period_pct = 0.0;
+    harness.elections_config.waiting_period_pct = 0.3;
 
     // elect_close far in the future (now + 10_000s) so we're early in the election.
     let now = common::time_format::now();
@@ -2020,8 +2020,8 @@ async fn test_adaptive_proceed_after_wait_timeout() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
     harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
-    harness.elections_config.adaptive_sleep_period_pct = 0.0;
-    harness.elections_config.adaptive_waiting_period_pct = 0.3;
+    harness.elections_config.sleep_period_pct = 0.0;
+    harness.elections_config.waiting_period_pct = 0.3;
 
     let now = common::time_format::now();
     let elect_close = now + 10; // almost closed
@@ -2087,8 +2087,8 @@ async fn test_adaptive_sleep_period_delays_even_with_enough_participants() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
     harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
-    harness.elections_config.adaptive_sleep_period_pct = 0.99;
-    harness.elections_config.adaptive_waiting_period_pct = 0.99;
+    harness.elections_config.sleep_period_pct = 0.99;
+    harness.elections_config.waiting_period_pct = 0.99;
 
     let now = common::time_format::now();
     let elect_close = now + 10_000; // election just started
@@ -2136,85 +2136,137 @@ async fn test_adaptive_sleep_period_delays_even_with_enough_participants() {
 
 #[tokio::test]
 async fn test_adaptive_topup_three_ticks() {
-    // Tick 1: No participants, prev_min_eff=20k → stakes half (~25k).
-    // Tick 2: Our stake in elector → stake_accepted=true, re-stakes (current_stake=0
-    //         because stake_accepted was false at calc_stake time).
-    // Tick 3: stake_accepted=true from tick 2. prev_min_eff rises to 40k
-    //         which is > our current_stake. Triggers actual top-up with current_stake > 0.
+    // Full adaptive cycle with election emulation and top-up.
+    // Uses 13 other participants (= min_validators, boundary value) so emulation works.
+    //
+    // Tick 1: 13 participants at 100k TON → emulate → curr_min_eff ≈ 32.5k.
+    //         wallet = 100k, half ≈ 50k >= min_eff → stake half.
+    //
+    // Tick 2: Elector sees our stake (~50k) → stake_accepted=true.
+    //         current_stake (~50k) >= min_eff (~32.5k) → no top-up.
+    //
+    // Tick 3: One participant raises stake to 240k → curr_min_eff jumps to ≈ 60k.
+    //         Our entry in elector is filtered out before emulation.
+    //         current_stake (~50k) < min_eff (~60k) → sends additional stake to elector.
+    //         remaining ≈ 50k, total ≈ 100k, half ≈ 50k < min_eff → stake all remaining.
 
     let node_id = "node-1";
+    let wallet_balance = 100_000 * NANO;
     let mut harness = TestHarness::new();
     harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
     let wallet_addr = addr_bytes(&wallet_address());
 
     let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
-    let pool_free_balance = WALLET_BALANCE - fee - MIN_NANOTON_FOR_STORAGE;
-    // Tick 1: prev_min_eff = 30k. half = pool_free/2 ≈ 25k < 30k → stake all.
-    let initial_stake = pool_free_balance; // stake all free_balance
+    let pool_free_balance = wallet_balance - fee - MIN_NANOTON_FOR_STORAGE;
+    let initial_stake = pool_free_balance / 2; // stake half on tick 1
 
-    // Tick 2: stake_accepted set early, current_stake = initial_stake.
-    // total = pool_free + initial, half = total / 2.
-    // prev_min_eff = 30k (cached from tick 1).
-    // current_stake (≈50k) >= min_eff (30k) → no top-up. stake unchanged.
-    let stake_after_tick2 = initial_stake;
+    // --- Helper: build participants with given stakes ---
+    fn make_participants(stakes: &[(u64, u8)]) -> Vec<Participant> {
+        stakes
+            .iter()
+            .map(|(stake, id)| {
+                let mut pubkey = [0u8; 32];
+                pubkey[0] = 0x10 + id; // distinct from PUB_KEY
+                Participant {
+                    pub_key: pubkey.to_vec(),
+                    adnl_addr: vec![0xEE; 32],
+                    wallet_addr: pubkey.to_vec(),
+                    stake: *stake,
+                    max_factor: FACTOR_3X,
+                    election_id: ELECTION_ID,
+                    stake_message_boc: None,
+                }
+            })
+            .collect()
+    }
+
+    // 13 participants at 100k each
+    let base_stakes: Vec<(u64, u8)> = (0..13u8).map(|i| (100_000 * NANO, i)).collect();
+    // Participant #0 raises to 240k on tick 3
+    let raised_stakes: Vec<(u64, u8)> =
+        (0..13u8).map(|i| (if i == 0 { 240_000 * NANO } else { 100_000 * NANO }, i)).collect();
 
     // --- Elector: elections_info varies per tick ---
     let ei_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let ei_cc = ei_count.clone();
     let wallet_addr_clone = wallet_addr.clone();
+    let base_stakes_clone = base_stakes.clone();
     harness.elector_mock.expect_elections_info().times(3).returning(move || {
         let n = ei_cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if n == 0 {
-            // Tick 1: no participants
-            Ok(ElectionsInfo {
-                election_id: ELECTION_ID,
-                elect_close: ELECTION_ID - 300,
-                min_stake: MIN_STAKE,
-                total_stake: 0,
-                failed: false,
-                finished: false,
-                participants: vec![],
-            })
-        } else {
-            // Tick 2 & 3: our stake in elector. On tick 3 the elector
-            // reports the updated stake (after tick-2 re-stake).
-            let stake = if n == 1 { initial_stake } else { stake_after_tick2 };
-            Ok(ElectionsInfo {
-                election_id: ELECTION_ID,
-                elect_close: ELECTION_ID - 300,
-                min_stake: MIN_STAKE,
-                total_stake: stake,
-                failed: false,
-                finished: false,
-                participants: vec![Participant {
+        match n {
+            0 => {
+                // Tick 1: 13 participants at 100k, our node not yet in elector
+                let participants = make_participants(&base_stakes_clone);
+                let total: u64 = participants.iter().map(|p| p.stake).sum();
+                Ok(ElectionsInfo {
+                    election_id: ELECTION_ID,
+                    elect_close: ELECTION_ID - 300,
+                    min_stake: MIN_STAKE,
+                    total_stake: total,
+                    failed: false,
+                    finished: false,
+                    participants,
+                })
+            }
+            1 => {
+                // Tick 2: same 13 at 100k + our node in elector
+                let mut participants = make_participants(&base_stakes_clone);
+                participants.push(Participant {
                     pub_key: PUB_KEY.to_vec(),
                     adnl_addr: ADNL_ADDR.to_vec(),
                     wallet_addr: wallet_addr_clone.clone(),
-                    stake,
+                    stake: initial_stake,
                     max_factor: FACTOR_3X,
                     election_id: ELECTION_ID,
                     stake_message_boc: None,
-                }],
-            })
+                });
+                let total: u64 = participants.iter().map(|p| p.stake).sum();
+                Ok(ElectionsInfo {
+                    election_id: ELECTION_ID,
+                    elect_close: ELECTION_ID - 300,
+                    min_stake: MIN_STAKE,
+                    total_stake: total,
+                    failed: false,
+                    finished: false,
+                    participants,
+                })
+            }
+            _ => {
+                // Tick 3: participant #0 doubled to 200k, rest at 100k + our node
+                let mut participants = make_participants(&raised_stakes);
+                participants.push(Participant {
+                    pub_key: PUB_KEY.to_vec(),
+                    adnl_addr: ADNL_ADDR.to_vec(),
+                    wallet_addr: wallet_addr_clone.clone(),
+                    stake: initial_stake,
+                    max_factor: FACTOR_3X,
+                    election_id: ELECTION_ID,
+                    stake_message_boc: None,
+                });
+                let total: u64 = participants.iter().map(|p| p.stake).sum();
+                Ok(ElectionsInfo {
+                    election_id: ELECTION_ID,
+                    elect_close: ELECTION_ID - 300,
+                    min_stake: MIN_STAKE,
+                    total_stake: total,
+                    failed: false,
+                    finished: false,
+                    participants,
+                })
+            }
         }
     });
 
-    // --- Elector: past_elections fetched twice (tick 1, tick 3; tick 2 uses cache) ---
-    // prev_min_eff on tick 1 must be > initial_stake so tick 2 triggers top-up.
-    // initial_stake ≈ 25k, so we use 30k.
-    let pe_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let pe_cc = pe_count.clone();
-    harness.elector_mock.expect_past_elections().times(2).returning(move || {
-        let n = pe_cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Call 0 (tick 1): 30k (> initial_stake ~25k). Call 1 (tick 3): raised above stake_after_tick2.
-        let prev_min = if n == 0 { 30_000 * NANO } else { stake_after_tick2 + 5_000 * NANO };
+    // --- Elector: past_elections (fetched once, cached for same election_id) ---
+    // prev_min = 30k — only used as fallback if emulation fails.
+    harness.elector_mock.expect_past_elections().times(1).returning(|| {
         let mut frozen_map = HashMap::new();
         frozen_map.insert(
             [0xAA; 32],
             FrozenParticipant {
                 wallet_addr: [0xBB; 32],
                 weight: 1,
-                stake: prev_min,
+                stake: 30_000 * NANO,
                 banned: false,
             },
         );
@@ -2224,7 +2276,7 @@ async fn test_adaptive_topup_three_ticks() {
             stake_held: 7200,
             vset_hash: vec![],
             frozen_map,
-            total_stake: prev_min,
+            total_stake: 30_000 * NANO,
             bonuses: 0,
         }])
     });
@@ -2235,14 +2287,16 @@ async fn test_adaptive_topup_three_ticks() {
     harness.provider_mock.expect_validator_config().times(3).returning(move || {
         let n = vcc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
+            // Tick 1: no existing key → runner generates new key
             Ok(ValidatorConfig::new())
         } else {
+            // Tick 2-3: key available
             let mut keys = HashMap::new();
             keys.insert(
                 ELECTION_ID,
                 ValidatorEntry {
                     key_id: KEY_ID.to_vec(),
-                    public_key: vec![],
+                    public_key: PUB_KEY.to_vec(),
                     adnl_addrs: vec![(ADNL_ADDR.to_vec(), ELECTION_ID + 7200)],
                     expired_at: ELECTION_ID + 7200,
                 },
@@ -2251,14 +2305,22 @@ async fn test_adaptive_topup_three_ticks() {
         }
     });
 
+    // --- Provider: dynamic account balance (decreases after staking) ---
+    let account_bal = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(wallet_balance));
+    let ab = account_bal.clone();
+    harness
+        .provider_mock
+        .expect_account()
+        .returning(move |_| Ok(fake_account(ab.load(std::sync::atomic::Ordering::SeqCst))));
+
     // --- Rest of elector/provider/wallet setup ---
     setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
-    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_default_provider(&mut harness.provider_mock, wallet_balance, None);
     setup_wallet(&mut harness.wallet_mock);
 
     let mut runner = harness.build(node_id);
 
-    // === Tick 1: initial stake (half) ===
+    // === Tick 1: emulate election → stake half ===
     runner.refresh_validator_configs().await;
     runner.refresh_validator_set().await;
     let r1 = runner.run().await;
@@ -2266,10 +2328,15 @@ async fn test_adaptive_topup_three_ticks() {
     let node = runner.nodes.get(node_id).unwrap();
     assert!(node.participant.is_some(), "should participate after tick 1");
     assert!(!node.stake_accepted, "stake not yet accepted after tick 1");
-    assert_eq!(node.participant.as_ref().unwrap().stake, initial_stake);
+    assert_eq!(
+        node.participant.as_ref().unwrap().stake,
+        initial_stake,
+        "tick 1: should stake half of pool_free"
+    );
+    // Simulate wallet balance decrease after staking
+    account_bal.store(wallet_balance - initial_stake - fee, std::sync::atomic::Ordering::SeqCst);
 
-    // === Tick 2: elector recognizes our stake, stake_accepted → true ===
-    // current_stake = initial_stake (~50k) >= prev_min_eff (30k) → no top-up.
+    // === Tick 2: elector accepted, no top-up (current_stake >= min_eff) ===
     runner.refresh_validator_configs().await;
     runner.refresh_validator_set().await;
     let r2 = runner.run().await;
@@ -2277,12 +2344,12 @@ async fn test_adaptive_topup_three_ticks() {
     let node = runner.nodes.get(node_id).unwrap();
     assert!(node.stake_accepted, "stake should be accepted on tick 2");
     let tick2_stake = node.participant.as_ref().unwrap().stake;
-    assert_eq!(tick2_stake, initial_stake, "tick 2: no top-up needed (current_stake >= min_eff)");
+    assert_eq!(
+        tick2_stake, initial_stake,
+        "tick 2: no top-up needed (current_stake >= curr_min_eff)"
+    );
 
-    // === Tick 3: actual top-up with current_stake > 0 ===
-    // Invalidate past_elections cache so tick 3 re-fetches with raised prev_min_eff.
-    // prev_min_eff now = stake_after_tick2 + 5k > current_stake → triggers top-up.
-    runner.past_elections_cache_id = 0;
+    // === Tick 3: one participant raised stake → top-up ===
     runner.refresh_validator_configs().await;
     runner.refresh_validator_set().await;
     let r3 = runner.run().await;
@@ -2291,34 +2358,28 @@ async fn test_adaptive_topup_three_ticks() {
     assert!(node.stake_accepted, "stake should still be accepted on tick 3");
     let tick3_stake = node.participant.as_ref().unwrap().stake;
 
-    // On tick 3: stake_accepted=true → current_stake = stake_after_tick2.
-    // prev_min_eff = stake_after_tick2 + 5k → current_stake < min_eff → top-up.
-    // total = pool_free + stake_after_tick2, half = total/2.
-    let min_eff_tick3 = stake_after_tick2 + 5_000 * NANO;
-    let total_tick3 = pool_free_balance + stake_after_tick2;
-    let half_tick3 = total_tick3 / 2;
+    // Remaining wallet ≈ 50k, current_stake ≈ 50k in elector.
+    // total ≈ 100k, half ≈ 50k < min_eff (~60k) → stake all remaining.
+    let remaining_balance = wallet_balance - initial_stake - fee;
+    let pool_free_tick3 = remaining_balance - fee - MIN_NANOTON_FOR_STORAGE;
     assert!(
         tick3_stake > tick2_stake,
         "tick 3: stake should increase via top-up: tick2={}, tick3={}",
         tick2_stake,
         tick3_stake
     );
-    if half_tick3 >= min_eff_tick3 {
-        // half branch: topup = half - current_stake
-        let topup = half_tick3 - stake_after_tick2;
-        assert_eq!(
-            tick3_stake,
-            tick2_stake + topup,
-            "tick 3: participant.stake = old + (half - current_stake)"
-        );
-    }
+    assert_eq!(
+        tick3_stake,
+        tick2_stake + pool_free_tick3,
+        "tick 3: should stake all remaining (half < min_eff)"
+    );
 }
 
 #[test]
 fn test_elections_config_validate_sleep_gt_waiting() {
     let config = ElectionsConfig {
-        adaptive_sleep_period_pct: 0.5,
-        adaptive_waiting_period_pct: 0.3, // sleep > waiting → invalid
+        sleep_period_pct: 0.5,
+        waiting_period_pct: 0.3, // sleep > waiting → invalid
         ..ElectionsConfig::default()
     };
     assert!(config.validate().is_err());
@@ -2327,7 +2388,7 @@ fn test_elections_config_validate_sleep_gt_waiting() {
 #[test]
 fn test_elections_config_validate_sleep_out_of_range() {
     let config = ElectionsConfig {
-        adaptive_sleep_period_pct: 1.5, // > 1.0 → invalid
+        sleep_period_pct: 1.5, // > 1.0 → invalid
         ..ElectionsConfig::default()
     };
     assert!(config.validate().is_err());
@@ -2336,8 +2397,8 @@ fn test_elections_config_validate_sleep_out_of_range() {
 #[test]
 fn test_elections_config_validate_valid() {
     let config = ElectionsConfig {
-        adaptive_sleep_period_pct: 0.1,
-        adaptive_waiting_period_pct: 0.5,
+        sleep_period_pct: 0.1,
+        waiting_period_pct: 0.5,
         ..ElectionsConfig::default()
     };
     assert!(config.validate().is_ok());
@@ -2346,8 +2407,8 @@ fn test_elections_config_validate_valid() {
 #[test]
 fn test_elections_config_defaults() {
     let config = ElectionsConfig::default();
-    assert_eq!(config.adaptive_sleep_period_pct, 0.0);
-    assert_eq!(config.adaptive_waiting_period_pct, 0.3);
+    assert_eq!(config.sleep_period_pct, 0.0);
+    assert_eq!(config.waiting_period_pct, 0.3);
 }
 // Participation status transitions across election lifecycle
 // Simulates: Idle → Participating → Submitted → Accepted → Elected → Validating
