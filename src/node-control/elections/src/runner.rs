@@ -20,7 +20,7 @@ use common::{
     },
     task_cancellation::CancellationCtx,
     time_format,
-    ton_utils::{nanotons_to_dec_string, nanotons_to_tons_f64},
+    ton_utils::{display_tons, nanotons_to_dec_string, nanotons_to_tons_f64},
 };
 use contracts::{
     ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
@@ -51,7 +51,7 @@ const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 /// Gas fee consumed by validator wallet
 const WALLET_COMPUTE_FEE: u64 = 200_000_000;
 /// Reserved minimum balance on the wallet (or pool) balance for stake calculations
-const MIN_NANOTON_FOR_STORAGE: u64 = 1_000_000_000;
+const MIN_NANOTON_FOR_STORAGE: u64 = 1_100_000_000;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 
@@ -562,10 +562,38 @@ impl ElectionRunner {
                 .find(|p| p.pub_key == entry.public_key)
                 .cloned()
         });
+
+        // Refresh participant if missing or stale (different election cycle)
+        let needs_refresh = match node.participant.as_ref() {
+            Some(existing) => existing.election_id != election_id,
+            None => true,
+        };
+        if needs_refresh {
+            // Reset participation-related state for the new election cycle
+            node.stake_accepted = false;
+            node.accepted_stake_amount = None;
+            node.submission_time = None;
+            node.stake_submissions.clear();
+            node.participant = participant.clone();
+            node.key_id = validator_key.as_ref().map(|entry| entry.key_id.clone()).unwrap_or_default();
+        }
         // If the elector already has our stake, mark it accepted early
-        // so that calc_stake uses the correct current_stake (not 0).
-        if participant.is_some() {
+        // so that `calc_stake` uses the correct current_stake (not 0).
+        if let Some(participant) = participant.as_ref() {
+            tracing::info!(
+                "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
+                node_id,
+                display_tons(participant.stake),
+                hex::encode(&participant.wallet_addr),
+                hex::encode(participant.pub_key.as_slice()),
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    participant.adnl_addr.as_slice(),
+                ),
+                participant.election_id
+            );
             node.stake_accepted = true;
+            node.accepted_stake_amount = Some(participant.stake);
         }
         let elections_stake = participant.as_ref().map(|p| p.stake).unwrap_or(0);
         let stake = Self::calc_stake(node, node_id, elections_stake, params, &stake_ctx)
@@ -587,7 +615,6 @@ impl ElectionRunner {
 
         match validator_key {
             None => {
-                node.reset_participation();
                 tracing::warn!(
                     "node [{}] validator key not found: election_id={}",
                     node_id,
@@ -648,22 +675,7 @@ impl ElectionRunner {
                     hex::encode(entry.public_key.as_slice())
                 );
                 match participant {
-                    Some(participant) => {
-                        tracing::info!(
-                            "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
-                            node_id,
-                            participant.stake as f64 / 1_000_000_000.0,
-                            hex::encode(&participant.wallet_addr),
-                            hex::encode(participant.pub_key.as_slice()),
-                            base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                participant.adnl_addr.as_slice(),
-                            ),
-                            participant.election_id
-                        );
-                        node.accepted_stake_amount = Some(participant.stake);
-                        node.participant = Some(participant.clone());
-                        node.stake_accepted = true;
+                    Some(_) => {
                         if matches!(node.stake_policy, StakePolicy::AdaptiveSplit50) && stake > 0 {
                             let old_stake = node.participant.as_ref().map(|p| p.stake).unwrap_or(0);
                             tracing::info!(
@@ -679,30 +691,6 @@ impl ElectionRunner {
                     }
                     None => {
                         tracing::warn!("node [{}] stake not found in elector", node_id);
-                        // Refresh participant if missing or stale (different election cycle)
-                        let needs_refresh = match node.participant.as_ref() {
-                            Some(existing) => existing.election_id != election_id,
-                            None => true,
-                        };
-                        if needs_refresh {
-                            // Reset participation-related state for the new election cycle
-                            node.stake_accepted = false;
-                            node.accepted_stake_amount = None;
-                            node.submission_time = None;
-                            node.stake_submissions.clear();
-                            node.participant = Some(Participant {
-                                stake_message_boc: None,
-                                adnl_addr: entry
-                                    .adnl_addr()
-                                    .ok_or_else(|| anyhow::anyhow!("no adnl address"))?,
-                                pub_key: entry.public_key,
-                                election_id,
-                                wallet_addr: node.wallet_addr(),
-                                stake,
-                                max_factor,
-                            });
-                            node.key_id = entry.key_id;
-                        }
                         if let Some(p) = node.participant.as_mut() {
                             p.stake = stake;
                         }
@@ -954,7 +942,6 @@ impl ElectionRunner {
             StakePolicy::AdaptiveSplit50 => {
                 if !adaptive_strategy::is_adaptive_split50_ready(
                     node_id,
-                    node.stake_accepted,
                     configs.elections_info,
                     configs.cfg15.elections_start_before,
                     configs.cfg15.elections_end_before,
