@@ -18,7 +18,6 @@ use ton_block::config_params::{ConfigParam16, ConfigParam17};
 /// Returns `true` if staking should proceed, `false` if we should defer (return 0).
 pub(crate) fn is_adaptive_split50_ready(
     node_id: &str,
-    stake_accepted: bool,
     elections_info: &ElectionsInfo,
     cfg15_start_before: u32,
     cfg15_end_before: u32,
@@ -26,9 +25,6 @@ pub(crate) fn is_adaptive_split50_ready(
     adaptive_sleep_pct: f64,
     adaptive_waiting_pct: f64,
 ) -> bool {
-    if stake_accepted {
-        return true;
-    }
 
     let min_validators = cfg16.min_validators.as_u16() as usize;
     let participants_count = elections_info.participants.len();
@@ -88,7 +84,7 @@ pub(crate) fn calc_adaptive_stake(
     elections_info: &ElectionsInfo,
     cfg16: &ConfigParam16,
     cfg17: &ConfigParam17,
-    prev_min_eff_stake: Option<u64>,
+    prev_min_stake: Option<u64>,
 ) -> anyhow::Result<u64> {
     let min_validators = cfg16.min_validators.as_u16();
     let max_validators = cfg16.max_validators.as_u16();
@@ -120,17 +116,16 @@ pub(crate) fn calc_adaptive_stake(
 
     let curr_min_eff = election_emulator::compute_min_effective_stake(&ctx, our_max_factor);
 
-    // Choose the smallest min_eff_stake from curr and prev.
-    let min_eff_stake = match (curr_min_eff, prev_min_eff_stake) {
+    // Calculate estimated curr effective stake. If failed to calculate, use previous elections min_stake.
+    let min_eff_stake = match (curr_min_eff, prev_min_stake) {
         (Some(curr), Some(prev)) => {
             tracing::info!(
-                "node [{}] adaptive_split50: curr_min_eff={} TON, prev_min_eff={} TON, using min={} TON",
+                "node [{}] adaptive_split50: curr_min_eff={} TON, prev_min={} TON",
                 node_id,
                 nanotons_to_tons_f64(curr),
                 nanotons_to_tons_f64(prev),
-                nanotons_to_tons_f64(curr.min(prev))
             );
-            curr.min(prev)
+            curr
         }
         (Some(curr), None) => {
             tracing::info!(
@@ -142,7 +137,7 @@ pub(crate) fn calc_adaptive_stake(
         }
         (None, Some(prev)) => {
             tracing::info!(
-                "node [{}] adaptive_split50: prev_min_eff={} TON (not enough current participants < {})",
+                "node [{}] adaptive_split50: prev_min={} TON (not enough current participants < {})",
                 node_id,
                 nanotons_to_tons_f64(prev),
                 min_validators
@@ -222,5 +217,394 @@ pub(crate) fn calc_adaptive_stake(
             nanotons_to_tons_f64(free_balance),
         );
         Ok(free_balance)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contracts::{ElectionsInfo, Participant};
+    use ton_block::{
+        Coins, Number16,
+        config_params::{ConfigParam16, ConfigParam17},
+    };
+
+    const NANO: u64 = 1_000_000_000;
+    const FACTOR_3X: u32 = 3 * 65536;
+    const ELECTION_ID: u64 = 1_700_000_000;
+    const MIN_STAKE: u64 = 10_000_000_000_000; // 10_000 TON
+
+    fn default_cfg16() -> ConfigParam16 {
+        ConfigParam16 {
+            max_validators: Number16::from(400u16),
+            max_main_validators: Number16::from(100u16),
+            min_validators: Number16::from(13u16),
+        }
+    }
+
+    fn default_cfg17() -> ConfigParam17 {
+        ConfigParam17 {
+            min_stake: Coins::from(10_000_000_000_000u64), // 10,000 TON
+            max_stake: Coins::from(10_000_000_000_000_000u64), // 10,000,000 TON
+            min_total_stake: Coins::from(100_000_000_000_000u64), // 100,000 TON
+            max_stake_factor: 3 * 65536,                   // 3x
+        }
+    }
+
+    /// Build an ElectionsInfo with `n` participants each staking `stake_per` nanotons.
+    fn elections_info_with_participants(n: usize, stake_per: u64) -> ElectionsInfo {
+        let participants = (0..n)
+            .map(|i| {
+                let mut pubkey = [0u8; 32];
+                pubkey[0] = i as u8;
+                pubkey[1] = (i >> 8) as u8;
+                Participant {
+                    pub_key: pubkey.to_vec(),
+                    adnl_addr: [0xEE; 32].to_vec(),
+                    wallet_addr: pubkey.to_vec(),
+                    stake: stake_per,
+                    max_factor: FACTOR_3X,
+                    election_id: ELECTION_ID,
+                    stake_message_boc: None,
+                }
+            })
+            .collect();
+        ElectionsInfo {
+            election_id: ELECTION_ID,
+            elect_close: ELECTION_ID + 600,
+            min_stake: MIN_STAKE,
+            total_stake: n as u64 * stake_per,
+            failed: false,
+            finished: false,
+            participants,
+        }
+    }
+
+    // ---- half >= min_eff → stake half ----
+
+    #[test]
+    fn test_adaptive_stake_half_when_above_min_eff() {
+        // 50 participants with 300k TON each, max_validators=400 (set NOT full).
+        // effective_min is ~100k TON (300k / factor 3).
+        // total_balance = 1_300_000 TON, half = 650_000 TON >> effective_min.
+        // Expected: stake half = 650_000 TON.
+        let total_balance = 1_300_000 * NANO;
+        let free_balance = total_balance; // no frozen, no current
+        let current_stake = 0;
+
+        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            None,
+        )
+        .unwrap();
+
+        let half = total_balance / 2;
+        assert_eq!(result, half, "should stake half");
+    }
+
+    // ---- half < min_eff → stake all ----
+
+    #[test]
+    fn test_adaptive_stake_all_when_half_below_min_eff() {
+        // 400 participants with ~700k TON each (set FULL, max_validators=400).
+        // effective_min ~700k TON. Our total = 1_300_000 TON, half = 650_000 < 700_000.
+        // Expected: stake all free_balance.
+        let total_balance = 1_300_000 * NANO;
+        let free_balance = total_balance;
+        let current_stake = 0;
+
+        let stakes: Vec<Participant> = (0..400)
+            .map(|i| {
+                let mut pubkey = [0u8; 32];
+                pubkey[0] = i as u8;
+                pubkey[1] = (i >> 8) as u8;
+                Participant {
+                    pub_key: pubkey.to_vec(),
+                    adnl_addr: [0xEE; 32].to_vec(),
+                    wallet_addr: pubkey.to_vec(),
+                    stake: (700_000 + i as u64 * 100) * NANO,
+                    max_factor: FACTOR_3X,
+                    election_id: ELECTION_ID,
+                    stake_message_boc: None,
+                }
+            })
+            .collect();
+        let elections_info = ElectionsInfo {
+            election_id: ELECTION_ID,
+            elect_close: ELECTION_ID + 600,
+            min_stake: MIN_STAKE,
+            total_stake: stakes.iter().map(|p| p.stake).sum(),
+            failed: false,
+            finished: false,
+            participants: stakes,
+        };
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result, free_balance, "should stake all free_balance when half < min_eff");
+    }
+
+    // ---- current_stake >= min_eff → no top-up ----
+
+    #[test]
+    fn test_adaptive_no_topup_when_stake_sufficient() {
+        // 50 participants with 300k TON. effective_min ~100k.
+        // current_stake = 650_000 TON >> effective_min.
+        // Expected: return 0 (no top-up).
+        let total_balance = 1_300_000 * NANO;
+        let free_balance = 0; // all staked or frozen
+        let current_stake = 650_000 * NANO;
+
+        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result, 0, "should return 0 when current_stake >= min_eff");
+    }
+
+    // ---- insufficient funds guard ----
+
+    #[test]
+    fn test_adaptive_skip_when_insufficient_funds() {
+        // 50 participants with 300k TON. effective_min ~100k.
+        // total_balance is high (due to frozen), but free_balance < required.
+        // Expected: return 0 (skip).
+        let frozen = 900_000 * NANO;
+        let free_balance = 50_000 * NANO; // less than effective_min (~100k)
+        let current_stake = 0;
+        let total_balance = frozen + free_balance + current_stake;
+
+        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result, 0, "should skip when free_balance < min_eff_stake");
+    }
+
+    // ---- cap to free_balance when half > free_balance ----
+
+    #[test]
+    fn test_adaptive_skip_when_half_exceeds_free_balance() {
+        // Use few participants (< min_validators) so emulation returns None.
+        // prev_min_eff = 50k controls the effective_min.
+        // total = 1_300_000, half = 650_000 > 50k → half branch.
+        // free_balance = 200_000 < half(650k) → skip (not enough to stake half).
+        // free_balance (200k) > prev_min_eff (50k) → passes insufficient funds guard.
+        let frozen = 1_100_000 * NANO;
+        let free_balance = 200_000 * NANO;
+        let current_stake = 0;
+        let total_balance = frozen + free_balance + current_stake;
+        let prev_min_eff = Some(50_000 * NANO);
+
+        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            prev_min_eff,
+        )
+        .unwrap();
+
+        assert_eq!(result, 0, "should skip when free_balance < half (operator should top up pool)");
+    }
+
+    // ---- curr vs prev selection ----
+
+    #[test]
+    fn test_adaptive_uses_curr_when_both_available() {
+        // 50 participants with 300k TON. curr_min_eff ~99.4k TON (≈ 300k / factor 3).
+        // prev_min_eff = 80k < curr → should use curr (~99.4k), not prev.
+        // total = 200k, half = 100k >= curr (~99.4k) → stake half = 100k.
+        let total_balance = 200_000 * NANO;
+        let free_balance = total_balance;
+        let current_stake = 0;
+        let prev_min_eff = Some(80_000 * NANO);
+
+        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            prev_min_eff,
+        )
+        .unwrap();
+
+        let half = total_balance / 2;
+        assert_eq!(result, half, "should use curr_min_eff and stake half");
+    }
+
+    #[test]
+    fn test_adaptive_ignores_prev_when_curr_available() {
+        // 50 participants with 300k TON. curr_min_eff ~99.4k TON.
+        // prev_min_eff = 80k < curr. total = 190k, half = 95k.
+        // half (95k) is between prev (80k) and curr (~99.4k):
+        //   - old behavior (min of curr and prev): min_eff = 80k → half ≥ 80k → stake half (95k)
+        //   - new behavior (use curr): min_eff = curr (~99.4k) → half < curr → stake all (190k)
+        let total_balance = 190_000 * NANO;
+        let free_balance = total_balance;
+        let current_stake = 0;
+        let prev_min_eff = Some(80_000 * NANO);
+
+        let elections_info = elections_info_with_participants(50, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            prev_min_eff,
+        )
+        .unwrap();
+
+        assert_eq!(result, free_balance, "should use curr_min_eff (not prev) and stake all when half < curr");
+    }
+
+    // ---- prev only (curr = None, fewer than min_validators) ----
+
+    #[test]
+    fn test_adaptive_fallback_to_prev_when_not_enough_participants() {
+        // Only 5 participants (< min_validators=13) → emulation returns None.
+        // prev_min_eff = 50k.
+        // total = 200k, half = 100k >= 50k → stake half.
+        let total_balance = 200_000 * NANO;
+        let free_balance = total_balance;
+        let current_stake = 0;
+        let prev_min_eff = Some(50_000 * NANO);
+
+        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            prev_min_eff,
+        )
+        .unwrap();
+
+        let half = total_balance / 2;
+        assert_eq!(result, half, "should fallback to prev_min_eff when not enough participants");
+    }
+
+    // ---- both None → error ----
+
+    #[test]
+    fn test_adaptive_error_when_no_min_eff_available() {
+        // Fewer than min_validators (5 < 13) AND no prev_min_eff → error.
+        let total_balance = 200_000 * NANO;
+        let free_balance = total_balance;
+        let current_stake = 0;
+
+        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            None,
+        );
+
+        assert!(result.is_err(), "should fail when both curr and prev min_eff are unavailable");
+    }
+
+    // ---- top-up: half branch, partial top-up ----
+
+    #[test]
+    fn test_adaptive_topup_to_half() {
+        // Use few participants so emulation returns None; prev_min_eff controls effective.
+        // prev_min_eff = 600k. current_stake = 500k < 600k → need top-up.
+        // total = 1_300_000, half = 650_000 > 600k → half branch.
+        // stake = half - current = 650k - 500k = 150k.
+        let total_balance = 1_300_000 * NANO;
+        let free_balance = 200_000 * NANO;
+        let current_stake = 500_000 * NANO;
+        let prev_min_eff = Some(600_000 * NANO);
+
+        // current_stake > 0 → emulation uses our_stake = 0 (already in list).
+        // With < min_validators participants, emulation returns None → uses prev_min_eff.
+        let elections_info = elections_info_with_participants(5, 300_000 * NANO);
+
+        let result = calc_adaptive_stake(
+            "node-1",
+            total_balance,
+            free_balance,
+            current_stake,
+            FACTOR_3X,
+            &elections_info,
+            &default_cfg16(),
+            &default_cfg17(),
+            prev_min_eff,
+        )
+        .unwrap();
+
+        let expected = total_balance / 2 - current_stake;
+        assert_eq!(result, expected, "should top up to half");
     }
 }
