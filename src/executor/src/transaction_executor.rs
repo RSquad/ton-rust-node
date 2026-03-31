@@ -17,8 +17,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use ton_block::{
-    deserialize_out_action_slices, error, fail, unpack_out_action_slices, AccStatusChange, Account,
-    AccountId, AccountStatus, AddSub, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
+    error, fail, unpack_out_action_slices, AccStatusChange, Account, AccountId, AccountStatus,
+    AddSub, BlockError, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
     CurrencyCollection, Deserializable, ExceptionCode, GasLimitsPrices, GetRepresentationHash,
     GlobalCapabilities, HashmapE, HashmapFilterResult, IBitstring, Mask, Message, MsgAddressInt,
     NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, OutAction, Result,
@@ -565,30 +565,43 @@ pub trait TransactionExecutor {
         }
         let limits = self.config().size_limits_config();
 
-        let parsed_actions = match deserialize_out_action_slices(action_slices) {
-            Ok(actions) => actions,
-            Err((i, err)) => {
-                log::debug!(
-                    target: "executor",
-                    "invalid action {} found while preprocessing action list: {}",
-                    i,
-                    err
-                );
-                phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
-                if i != 0 {
-                    phase.result_arg = Some(i as i32);
+        let mut parsed_actions = Vec::with_capacity(action_slices.len());
+        for (i, mut slice) in action_slices.into_iter().enumerate() {
+            match OutAction::construct_from(&mut slice) {
+                Ok(action) => parsed_actions.push(Some(action)),
+                Err(err) => {
+                    if let Some(BlockError::OutActionError(_, mode)) = err.downcast_ref() {
+                        if mode.bit(SENDMSG_IGNORE_ERROR) {
+                            phase.skipped_actions += 1;
+                            parsed_actions.push(None);
+                            continue;
+                        } else if mode.bit(SENDMSG_BOUNCE_IF_FAIL) {
+                            bounce = true;
+                        }
+                    };
+                    log::debug!(
+                        target: "executor",
+                        "invalid action {i} found while preprocessing action list: {err}"
+                    );
+                    phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
+                    if i != 0 {
+                        phase.result_arg = Some(i as i32);
+                    }
+                    return finish_action_phase_with_fine(
+                        tr,
+                        phase,
+                        Some(msg_remaining_balance),
+                        acc_balance,
+                        bounce,
+                    );
                 }
-                return finish_action_phase_with_fine(
-                    tr,
-                    phase,
-                    Some(msg_remaining_balance),
-                    acc_balance,
-                    bounce,
-                );
             }
-        };
+        }
 
         for (i, action) in parsed_actions.into_iter().enumerate() {
+            let Some(action) = action else {
+                continue;
+            };
             log::debug!(target: "executor", "\nAction #{}\nType: {}\nInitial balance: {}",
                 i,
                 action_type(&action),

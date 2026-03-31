@@ -88,8 +88,8 @@ fn make_ping_wire(value: i64) -> Vec<u8> {
     serialize_boxed(&QuicQuery { data: make_ping_data(value).into() }.into_boxed()).unwrap()
 }
 
-fn parse_pong(obj: TLObject) -> i64 {
-    obj.downcast::<AdnlPongBoxed>().unwrap().only().value
+fn parse_pong(data: Vec<u8>) -> i64 {
+    deserialize_boxed(&data).unwrap().downcast::<AdnlPongBoxed>().unwrap().only().value
 }
 
 /// Parse pong from raw wire bytes (for low-level stream tests)

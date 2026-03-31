@@ -666,6 +666,7 @@ impl StateParser {
 
     fn parse_simplex_config(p: &PathMap) -> Result<SimplexConfig> {
         Ok(SimplexConfig {
+            use_quic: p.get_num32("use_quic").unwrap_or(0) != 0,
             target_rate_ms: p.get_num32("target_rate_ms")?,
             slots_per_leader_window: p.get_num32("slots_per_leader_window")?,
             first_block_timeout_ms: p.get_num32("first_block_timeout_ms")?,

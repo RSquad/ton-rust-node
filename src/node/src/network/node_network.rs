@@ -252,6 +252,10 @@ impl NodeNetwork {
     pub async fn stop_adnl(&self) {
         log::info!("Stopping node network loops...");
         self.cancellation_token.cancel();
+        if let Some(quic) = &self.network_context.stack.quic {
+            log::info!("Stopping QUIC...");
+            quic.shutdown();
+        }
         log::info!("Node network loops stopped. Stopping adnl...");
         self.network_context.stack.adnl.stop().await;
         log::info!("Stopped adnl");

@@ -1071,6 +1071,9 @@ fn serialize_accelerator(acc: &AcceleratedConsensusConfig) -> Result<Value> {
 
 fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
     let mut map = Map::new();
+    if cfg.use_quic {
+        serialize_field(&mut map, "use_quic", 1u32);
+    }
     serialize_field(&mut map, "target_rate_ms", cfg.target_rate_ms);
     serialize_field(&mut map, "slots_per_leader_window", cfg.slots_per_leader_window);
     serialize_field(&mut map, "first_block_timeout_ms", cfg.first_block_timeout_ms);

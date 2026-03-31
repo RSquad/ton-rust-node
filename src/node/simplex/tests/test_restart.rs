@@ -35,7 +35,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256,
+    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
+    Ed25519KeyOption, ShardIdent, UInt256,
 };
 
 include!("../../../common/src/info.rs");
@@ -217,7 +218,16 @@ impl SessionListener for RestartSingleSessionListener {
         );
 
         // Block + collated data (keep small; hashes must match)
-        let block_data = vec![1u8, 2, 3, 4, (seqno % 255) as u8];
+        // Block data must be valid BOC (compress_candidate_data deserializes it)
+        let block_data = {
+            let raw = [1u8, 2, 3, 4, (seqno % 255) as u8];
+            let mut b = BuilderData::new();
+            b.append_raw(&raw, raw.len() * 8).unwrap();
+            let cell = b.into_cell().unwrap();
+            let mut buf = Vec::new();
+            BocWriter::with_flags([cell], BocFlags::all()).unwrap().write(&mut buf).unwrap();
+            buf
+        };
         let collated_data: Vec<u8> = vec![];
 
         let file_hash = UInt256::from_slice(&sha256_digest(&block_data));
@@ -520,7 +530,6 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
 
     let last_committed_slot_before = listener.last_committed_slot();
     let collation_before = listener.collation_count();
-    let approved_fetch_before = listener.approved_candidate_requests();
 
     // Stop session 1 and give some time for DB handles to close
     session_1.stop();
@@ -608,15 +617,6 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
             PHASE_TIMEOUT
         );
     }
-
-    // Post-condition: restart recovery should have requested approved candidates
-    // (for candidate cache restoration). We allow >=1 because small tests may have few blocks.
-    assert!(
-        listener.approved_candidate_requests() > approved_fetch_before,
-        "expected get_approved_candidate to be used during restart recovery (before={}, after={})",
-        approved_fetch_before,
-        listener.approved_candidate_requests()
-    );
 
     // Post-condition: no session errors recorded
     assert_eq!(

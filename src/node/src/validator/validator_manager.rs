@@ -29,25 +29,24 @@ use crate::{
         },
     },
 };
-#[cfg(feature = "simplex")]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     cmp::{max, min},
     collections::{HashMap, HashSet},
     convert::TryFrom,
     fs,
     ops::RangeInclusive,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 use tokio::time::timeout;
 use ton_api::IntoBoxed;
-#[cfg(feature = "simplex")]
-use ton_block::SimplexConfig;
 use ton_block::{
     error, fail, AcceleratedConsensusConfig, BlockIdExt, CatchainConfig, ConfigParamEnum,
-    ConsensusConfig, FutureSplitMerge, McStateExtra, Result, ShardDescr, ShardIdent, UInt256,
-    UnixTime, ValidatorDescr, ValidatorSet,
+    ConsensusConfig, FutureSplitMerge, McStateExtra, Result, ShardDescr, ShardIdent, SimplexConfig,
+    UInt256, UnixTime, ValidatorDescr, ValidatorSet,
 };
 
 #[cfg(feature = "xp25")]
@@ -56,9 +55,8 @@ const MC_ACCELERATED_CONSENSUS_ENABLED: bool = true;
 const MC_ACCELERATED_CONSENSUS_ENABLED: bool = false;
 
 // When true, use hardcoded testing constants for simplex instead of ConfigParam 30.
-// Set to true during testing period for consistent behavior across all nodes.
-#[cfg(feature = "simplex")]
-const SIMPLEX_USE_TESTING_CONSTANTS: bool = true;
+// Set to false for production: reads ConfigParam 30 from masterchain state.
+const SIMPLEX_USE_TESTING_CONSTANTS: bool = false;
 
 // Magic tag for accelerated consensus session ID differentiation
 const ACCELERATED_CONSENSUS_MAGIC_TAG: u32 = 0xACCE1E8A;
@@ -783,7 +781,6 @@ impl ValidatorManagerImpl {
     /// - Get `new_consensus_config` from masterchain state
     /// - If present, create bridge (simplex/null consensus)
     /// - If absent, create catchain
-    #[cfg(feature = "simplex")]
     fn select_consensus_options(
         &self,
         shard: &ShardIdent,
@@ -794,10 +791,12 @@ impl ValidatorManagerImpl {
 
         // During testing period, use hardcoded constants instead of ConfigParam 30
         if SIMPLEX_USE_TESTING_CONSTANTS {
-            let options = ConsensusFactory::create_simplex_options(
+            let mut options = ConsensusFactory::create_simplex_options(
                 catchain_options.max_block_size as usize,
                 catchain_options.max_collated_data_size as usize,
+                catchain_options.proto_version as u32,
             );
+            options.proto_version = catchain_options.proto_version;
             static LAST_WARN: AtomicU64 = AtomicU64::new(0);
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -834,7 +833,18 @@ impl ValidatorManagerImpl {
             }
         };
 
-        // Get simplex config for mc or shard based on workchain
+        // C++ compatibility: simplex requires global_version >= 13
+        let global_ver = config_params.global_version();
+        if global_ver < 13 {
+            log::trace!(
+                target: "validator_manager",
+                "global_version={global_ver} < 13 for {shard}, using catchain"
+            );
+            return ConsensusOptions::Catchain(catchain_options.clone());
+        }
+
+        // Get simplex config for mc or shard based on workchain.
+        // Consensus type is selected by global_version >= 13 AND ConfigParam 30 presence.
         let simplex_cfg: Option<SimplexConfig> = if shard.is_masterchain() {
             config_params.get_mc_simplex_config().ok().flatten()
         } else {
@@ -851,12 +861,14 @@ impl ValidatorManagerImpl {
                 cfg.first_block_timeout_ms
             );
             return ConsensusOptions::Simplex(SimplexSessionOptions {
+                proto_version: catchain_options.proto_version as u32,
                 slots_per_leader_window: cfg.slots_per_leader_window,
                 first_block_timeout: Duration::from_millis(cfg.first_block_timeout_ms as u64),
                 target_rate: Duration::from_millis(cfg.target_rate_ms as u64),
                 // max_block_size and max_collated_data_size come from ConfigParam 29 (via catchain_options)
                 max_block_size: catchain_options.max_block_size as usize,
                 max_collated_data_size: catchain_options.max_collated_data_size as usize,
+                use_quic: cfg.use_quic,
                 ..Default::default()
             });
         }
@@ -866,16 +878,6 @@ impl ValidatorManagerImpl {
             "No simplex config for {}, using catchain",
             shard
         );
-        ConsensusOptions::Catchain(catchain_options.clone())
-    }
-
-    #[cfg(not(feature = "simplex"))]
-    fn select_consensus_options(
-        &self,
-        _shard: &ShardIdent,
-        _mc_state: &ShardStateStuff,
-        catchain_options: &CatchainSessionOptions,
-    ) -> ConsensusOptions {
         ConsensusOptions::Catchain(catchain_options.clone())
     }
 

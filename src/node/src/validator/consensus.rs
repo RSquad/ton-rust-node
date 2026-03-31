@@ -89,9 +89,9 @@ pub use consensus_common::{
     ConsensusOverlayListener, ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListener,
     ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
     ConsensusOverlayPtr, ConsensusReplayListener, ConsensusReplayListenerPtr, LogPlayer,
-    LogPlayerPtr, LogReplayOptions, PrivateKey, PublicKey, PublicKeyHash, RawBuffer, Result,
-    Session, SessionId, SessionListener, SessionListenerPtr, SessionNode, SessionPtr, SessionStats,
-    ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
+    LogPlayerPtr, LogReplayOptions, OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash,
+    RawBuffer, Result, Session, SessionId, SessionListener, SessionListenerPtr, SessionNode,
+    SessionPtr, SessionStats, ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback, ValidatorBlockCandidatePtr, ValidatorWeight,
 };
 
@@ -473,10 +473,13 @@ impl ConsensusFactory {
     pub fn create_simplex_options(
         max_block_size: usize,
         max_collated_data_size: usize,
+        proto_version: u32,
     ) -> SimplexSessionOptions {
         use super::consensus::*;
 
         SimplexSessionOptions {
+            proto_version,
+
             // Core timing from testing constants (p30 reference)
             target_rate: Duration::from_millis(SIMPLEX_TARGET_RATE_MS),
             slots_per_leader_window: SIMPLEX_SLOTS_PER_LEADER_WINDOW,

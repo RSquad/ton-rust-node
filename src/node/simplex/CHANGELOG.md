@@ -2,20 +2,20 @@
 
 All notable changes to the Simplex Consensus Protocol implementation will be documented in this file.
 
-## [Unreleased]
+## [0.5.0] - 2026-03-20
 
 ### Added
-- **GET-COMMITTED-1**: Download committed block via full-node proof for MC gap recovery.
+- Download committed block via full-node proof for MC gap recovery.
   Replaces Rust-only `requestCandidate2` with C++-compatible mechanism.
   `SessionListener::get_committed_candidate` trait method, `CommittedBlockProof` type,
   `ValidatorGroup::on_get_committed_candidate` implementation using `download_block_proof()`.
 - `test_simplex_consensus_finalcert_recovery`: FinalCert-recovery gremlin test with per-node
   lossy overlay targeting (7 MC nodes, node 0 gets 40% broadcast + 30% message/query loss).
 - `lossy_overlay_node_indices` field in `LossyOverlayOpts` for per-node loss targeting.
-- **NODE-20 (OBS-1)**: C++-parity standstill slot-grid dump (`standstill_slot_grid_dump()`
+- C++-parity standstill slot-grid dump (`standstill_slot_grid_dump()`
   on `SimplexState`). Mirrors C++ `pool.cpp::alarm()` per-validator markers (F/I/N/S/.)
   and cert flags (notar/skip/final). Wired into `debug_dump()` on stall detection.
-- **NODE-19 (HEALTH-1)**: Receiver-side anomaly checks with configurable thresholds.
+- Receiver-side anomaly checks with configurable thresholds.
   Shared `ReceiverHealthCounters` (`Arc<AtomicU64>`) for cross-thread standstill trigger
   and candidate giveup counting. Delta-based anomaly detection in `run_health_checks()`
   for cert verify failures, standstill triggers, and candidate giveups with cooldown.
@@ -44,7 +44,7 @@ All notable changes to the Simplex Consensus Protocol implementation will be doc
 - Max-base merge for `available_base`: align ordering/merge semantics with
   C++ `pool.cpp::add_available_base()` while preventing forward-progress
   regression from out-of-order notarizations and skip propagation.
-- **TN-754**: Diagnostic dump no longer lists self (local validator) in the inactive nodes summary. `get_last_activity()` in receiver now reports self as always-active (consistent with `calculate_active_weight()`), and `debug_dump()` skips self index in the compact inactive list.
+- Diagnostic dump no longer lists self (local validator) in the inactive nodes summary. `get_last_activity()` in receiver now reports self as always-active (consistent with `calculate_active_weight()`), and `debug_dump()` skips self index in the compact inactive list.
 - **Restart gremlin test enabled**: `test_simplex_consensus_restart_gremlin` now passes — `first_non_finalized_slot` correctly advances on skip in all modes.
 - DB is now preserved on session stop (previously destroyed prematurely).
 - Overlay is registered before bootstrap load completes (prevents missed messages during startup).
@@ -52,7 +52,7 @@ All notable changes to the Simplex Consensus Protocol implementation will be doc
 ### Removed
 - `requestCandidate2` / `candidateAndCert2` TL types and all v2 request paths.
   `ENABLE_REQUEST_CANDIDATE_V2` constant removed. `want_final` param removed from
-  `request_candidate()`. All FinalCert recovery now uses GET-COMMITTED-1.
+  `request_candidate()`. All FinalCert recovery now uses committed-block proof download.
 
 ### Planned
 - FinalCert proactive rebroadcast (C++ `cfd8850c` parity)
@@ -61,12 +61,6 @@ All notable changes to the Simplex Consensus Protocol implementation will be doc
 - Precollation parent tracking (lock parent at start of collation)
 - Twostep broadcast via RLDP2
 - C++ interoperability testing with testnet
-
----
-
-## [0.5.0] - 2026-02-01
-
-**Baseline**: 0.4.0 release.
 
 ---
 
@@ -433,7 +427,7 @@ Major release focusing on candidate resolution, certificate system, and operatio
 
 | Version | Date | Tag | Description |
 |---------|------|-----|-------------|
-| 0.5.0 | 2026-02-28 | `simplex-0.5.0` | GET-COMMITTED-1, restart gremlin fix, requestCandidate2 removal |
+| 0.5.0 | 2026-03-20 | `simplex-0.5.0` | Committed-block proof recovery, restart gremlin fix, requestCandidate2 removal, parity docs update |
 | 0.4.0 | 2026-02-01 | `simplex-0.4.0` | Block signature types, C++ compatibility, restart resilience |
 | 0.3.0 | 2026-01-14 | `simplex-0.3.0` | Candidate resolver, certificates, operational stability |
 | 0.2.0 | 2026-01-07 | `simplex-0.2.0` | consensus-common integration, dependency restructuring |
@@ -441,10 +435,5 @@ Major release focusing on candidate resolution, certificate system, and operatio
 
 ---
 
-[Unreleased]: https://github.com/RSquad/ton-node/compare/simplex-0.5.0...HEAD
-[0.5.0]: https://github.com/RSquad/ton-node/compare/simplex-0.4.0...simplex-0.5.0
-[0.4.0]: https://github.com/RSquad/ton-node/compare/simplex-0.3.0...simplex-0.4.0
-[0.3.0]: https://github.com/RSquad/ton-node/compare/simplex-0.2.0...simplex-0.3.0
-[0.2.0]: https://github.com/RSquad/ton-node/compare/simplex-0.1.0...simplex-0.2.0
-[0.1.0]: https://github.com/RSquad/ton-node/releases/tag/simplex-0.1.0
+
 

@@ -431,8 +431,7 @@ pub enum GlobalCapabilities {
     CapResolveMerkleCell      = 0x0000_0200_0000,
 }
 
-//TODO: LK: enable after change block version to 13
-pub const SUPPORTED_VERSION: u32 = 12;
+pub const SUPPORTED_VERSION: u32 = 13;
 pub const LT_ALIGN: u64 = 1_000_000;
 
 impl ConfigParams {
@@ -3781,16 +3780,20 @@ const SIMPLEX_CONFIG_TAG: u8 = 0x21;
 ///       max_leader_window_desync:uint32 = NewConsensusConfig;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SimplexConfig {
+    pub use_quic: bool,
     pub target_rate_ms: u32,
     pub slots_per_leader_window: u32,
     pub first_block_timeout_ms: u32,
     pub max_leader_window_desync: u32,
 }
 
+/// Byte layout: flags:(## 7) use_quic:Bool — 7 flag bits (reserved) + 1 use_quic bit = 1 byte.
+/// TLB writes MSB-first, so use_quic occupies the LSB: byte = (flags << 1) | use_quic.
 impl Serializable for SimplexConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
         cell.append_u8(SIMPLEX_CONFIG_TAG)?;
-        cell.append_u8(0)?; // flags - reserved for future use
+        let flags_byte = if self.use_quic { 1u8 } else { 0u8 };
+        cell.append_u8(flags_byte)?;
         self.target_rate_ms.write_to(cell)?;
         self.slots_per_leader_window.write_to(cell)?;
         self.first_block_timeout_ms.write_to(cell)?;
@@ -3805,12 +3808,14 @@ impl Deserializable for SimplexConfig {
         if tag != SIMPLEX_CONFIG_TAG {
             fail!(Self::invalid_tag(tag as u32));
         }
-        let _flags = slice.get_next_byte()?; // Reserved, ignore
+        let flags_byte = slice.get_next_byte()?;
+        let use_quic = (flags_byte & 1) != 0;
         let target_rate_ms = u32::construct_from(slice)?;
         let slots_per_leader_window = u32::construct_from(slice)?;
         let first_block_timeout_ms = u32::construct_from(slice)?;
         let max_leader_window_desync = u32::construct_from(slice)?;
         Ok(Self {
+            use_quic,
             target_rate_ms,
             slots_per_leader_window,
             first_block_timeout_ms,

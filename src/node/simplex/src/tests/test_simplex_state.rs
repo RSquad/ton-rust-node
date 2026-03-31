@@ -261,11 +261,12 @@ fn test_on_candidate_stores_pending_when_no_parent() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
 
-    // Create candidate for slot 0 but window doesn't have this parent available
+    // Candidate for slot 1 with parent at slot 0, but parent isn't notarized yet
+    // so it can't be resolved → candidate stored as pending
     let parent_hash = UInt256::from_slice(&[1u8; 32]);
 
     let candidate = create_test_candidate(
-        0,
+        1,
         UInt256::default(),
         BlockIdExt::default(),
         Some((0, parent_hash)),
@@ -274,7 +275,7 @@ fn test_on_candidate_stores_pending_when_no_parent() {
 
     state.on_candidate(&desc, candidate).expect("on_candidate should succeed");
 
-    // Should NOT broadcast (parent not available)
+    // Should NOT broadcast (parent not available in window state)
     let events: Vec<_> = from_fn(|| state.pull_event()).collect();
     assert!(
         !events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(_)))),
@@ -282,8 +283,8 @@ fn test_on_candidate_stores_pending_when_no_parent() {
         events
     );
 
-    // Should have pending block
-    assert!(state.get_window(WindowIndex::new(0)).unwrap().slots[0].pending_block.is_some());
+    // Should have pending block (slot 1 = offset 1 in window 0)
+    assert!(state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some());
 }
 
 #[test]
@@ -972,8 +973,10 @@ fn test_genesis_propagates_to_next_window_on_full_skip() {
     // Clear events
     while state.pull_event().is_some() {}
 
-    // Slot 0 should be skipped, first_non_finalized_slot = 1
-    assert_eq!(state.first_non_finalized_slot, SlotIndex::new(1));
+    // Slot 0 should be skipped; C++ parity: first_non_finalized_slot stays at 0
+    assert_eq!(state.first_non_finalized_slot, SlotIndex::new(0));
+    // But first_non_progressed_slot advances
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(1));
 
     // Window 1 should NOT have genesis yet (slot 0 was not the last slot in window 0)
     // Note: window 1 may or may not exist at this point
@@ -995,8 +998,9 @@ fn test_genesis_propagates_to_next_window_on_full_skip() {
     // Clear events
     while state.pull_event().is_some() {}
 
-    // Now entire window 0 is skipped, first_non_finalized_slot = 2
-    assert_eq!(state.first_non_finalized_slot, SlotIndex::new(2));
+    // C++ parity: first_non_finalized_slot still at 0, progress cursor at 2
+    assert_eq!(state.first_non_finalized_slot, SlotIndex::new(0));
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(2));
 
     // Window 1 should now have genesis (None) as available base
     // This was propagated from window 0 since no finalization occurred
@@ -1142,11 +1146,12 @@ fn test_skip_certificate_threshold_66_triggers_slot_skipped() {
         "Expected SlotSkipped event at skip certificate threshold"
     );
 
-    // Skip advances first_non_finalized_slot (a skipped slot will never be finalized).
+    // C++ parity: skip does NOT advance first_non_finalized_slot (only finalization does).
+    // But first_non_progressed_slot (C++ `now_`) does advance on skip.
     assert_eq!(
         state.first_non_finalized_slot,
-        SlotIndex::new(1),
-        "first_non_finalized_slot should advance past skipped slot"
+        SlotIndex::new(0),
+        "first_non_finalized_slot should NOT advance on skip (C++ parity)"
     );
     assert_eq!(
         state.first_non_progressed_slot,
@@ -1195,10 +1200,6 @@ fn test_skip_certificate_reached_event_emitted_in_cpp_mode() {
     let ev = skip_cert_events[0];
     assert_eq!(ev.slot, slot, "event slot must match");
     assert_eq!(ev.certificate.vote.slot, slot, "certificate vote slot must match");
-    assert!(
-        ev.should_broadcast,
-        "SkipCertificateReached should_broadcast must be true for vote-based emission"
-    );
     assert_eq!(
         ev.certificate.signatures.len(),
         3,
@@ -1319,12 +1320,13 @@ fn test_slot_skipped_not_emitted_twice() {
     let skip_count = events.iter().filter(|e| matches!(e, SimplexEvent::SlotSkipped(_))).count();
     assert_eq!(skip_count, 1, "Should emit exactly one SlotSkipped at skip certificate");
 
-    // 5th vote: slot is now past first_non_finalized_slot, so it's rejected
-    // as SlotAlreadyFinalized (the slot was settled by the skip certificate).
+    // 5th vote: C++ parity -- first_non_finalized_slot does NOT advance on skip,
+    // so the slot is still "open" for vote reception (additional votes are accepted
+    // but won't re-trigger SlotSkipped since the cert is already formed).
     let result = state.on_vote_test(&desc, ValidatorIndex::new(4), vote, Vec::new());
     assert!(
-        matches!(result, VoteResult::SlotAlreadyFinalized),
-        "Vote for settled (skipped) slot should be rejected, got: {:?}",
+        matches!(result, VoteResult::Applied),
+        "Vote for skipped slot should still be accepted (first_non_finalized_slot unchanged), got: {:?}",
         result
     );
 
@@ -1407,28 +1409,78 @@ fn test_ignore_finalized_slot_vote() {
 }
 
 #[test]
-fn test_reject_non_first_slot_without_parent() {
+fn test_candidate_without_parent_accepted() {
+    // C++ consensus.cpp:173 — C++ never rejects a candidate for missing parent.
+    // It only validates parent_slot < candidate_slot when parent exists.
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
 
-    // Try to send candidate for slot 1 (non-first in window) without parent
-    // Note: We construct directly here because create_test_candidate enforces parent for block.id
-    // but we want to test the FSM's validation
     let candidate = Candidate::new(
         crate::block::CandidateId {
-            slot: SlotIndex::new(1), // Second slot in window
+            slot: SlotIndex::new(1), // Non-first slot
             hash: UInt256::default(),
             block: BlockIdExt::default(),
         },
-        None, // No parent!
+        None, // No parent — valid per C++
         ValidatorIndex::new(0),
         Some(create_stub_block(BlockIdExt::default())),
         vec![],
     );
 
-    // Should return error
     let result = state.on_candidate(&desc, candidate);
-    assert!(result.is_err(), "Non-first slot without parent should be rejected");
+    assert!(result.is_ok(), "Candidate without parent must be accepted (C++ parity)");
+}
+
+#[test]
+fn test_candidate_with_parent_slot_ge_rejected() {
+    // C++ consensus.cpp:173: parent_slot >= candidate_slot → misbehavior
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
+
+    let candidate = Candidate::new(
+        crate::block::CandidateId {
+            slot: SlotIndex::new(1),
+            hash: UInt256::from([0xAA; 32]),
+            block: BlockIdExt::default(),
+        },
+        Some(crate::block::CandidateId {
+            slot: SlotIndex::new(1), // parent_slot == candidate_slot
+            hash: UInt256::from([0xBB; 32]),
+            block: BlockIdExt::default(),
+        }),
+        ValidatorIndex::new(0),
+        Some(create_stub_block(BlockIdExt::default())),
+        vec![],
+    );
+
+    let result = state.on_candidate(&desc, candidate);
+    assert!(result.is_err(), "Candidate with parent_slot >= candidate_slot must be rejected");
+}
+
+#[test]
+fn test_candidate_with_valid_parent_accepted() {
+    // C++ consensus.cpp:173: parent_slot < candidate_slot → accepted
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
+
+    let candidate = Candidate::new(
+        crate::block::CandidateId {
+            slot: SlotIndex::new(1),
+            hash: UInt256::from([0xAA; 32]),
+            block: BlockIdExt::default(),
+        },
+        Some(crate::block::CandidateId {
+            slot: SlotIndex::new(0), // parent_slot < candidate_slot
+            hash: UInt256::from([0xBB; 32]),
+            block: BlockIdExt::default(),
+        }),
+        ValidatorIndex::new(0),
+        Some(create_stub_block(BlockIdExt::default())),
+        vec![],
+    );
+
+    let result = state.on_candidate(&desc, candidate);
+    assert!(result.is_ok(), "Candidate with parent_slot < candidate_slot must be accepted");
 }
 
 #[test]
@@ -2124,10 +2176,6 @@ fn test_notarization_reached_event_emitted() {
     let event = notar_reached.unwrap();
     assert_eq!(event.slot, SlotIndex::new(0));
     assert_eq!(event.block_hash, block_hash);
-    assert!(
-        event.should_broadcast,
-        "NotarizationReached should_broadcast must be true for vote-based emission"
-    );
     assert_eq!(event.certificate.signatures.len(), 3, "Certificate should have 3 signatures");
 }
 
@@ -2215,10 +2263,6 @@ fn test_finalization_reached_event_emitted() {
     let event = final_reached.unwrap();
     assert_eq!(event.slot, SlotIndex::new(0));
     assert_eq!(event.block_hash, block_hash);
-    assert!(
-        event.should_broadcast,
-        "FinalizationReached should_broadcast must be true for vote-based emission"
-    );
     assert_eq!(event.certificate.signatures.len(), 3, "Certificate should have 3 signatures");
 
     // Should also have BlockFinalized event (emitted after FinalizationReached)
@@ -2584,11 +2628,12 @@ fn test_skip_certificate_created_at_threshold() {
         "SlotSkipped event should be emitted when skip threshold reached"
     );
 
-    // Skip advances first_non_finalized_slot (a skipped slot will never be finalized).
+    // C++ parity: skip does NOT advance first_non_finalized_slot (only finalization does).
+    // But first_non_progressed_slot (C++ `now_`) does advance on skip.
     assert_eq!(
         state.first_non_finalized_slot,
-        SlotIndex::new(1),
-        "first_non_finalized_slot should advance past skipped slot"
+        SlotIndex::new(0),
+        "first_non_finalized_slot should NOT advance on skip (C++ parity)"
     );
     assert_eq!(
         state.first_non_progressed_slot,
@@ -2662,6 +2707,8 @@ fn test_set_notarize_certificate_idempotent() {
         .set_notarize_certificate(&desc, slot, &block_hash, cert.clone())
         .expect("should not conflict");
     let weight_after_first = state.get_notarize_weight(slot, &block_hash);
+    // Drain first-store events so we can assert duplicate store emits none.
+    while state.pull_event().is_some() {}
 
     let stored2 = state
         .set_notarize_certificate(&desc, slot, &block_hash, cert.clone())
@@ -2677,6 +2724,10 @@ fn test_set_notarize_certificate_idempotent() {
         "Weight should not change on second call (idempotent)"
     );
     assert_eq!(weight_after_first, 3, "Weight should be 3");
+    assert!(
+        !state.has_pending_events(),
+        "duplicate notar cert must not emit relay-triggering events"
+    );
 }
 
 #[test]
@@ -2799,10 +2850,6 @@ fn test_set_notarize_certificate_emits_notarization_reached_for_tracked_slot() {
     let ev = notar_reached.unwrap();
     assert_eq!(ev.slot, slot);
     assert_eq!(ev.block_hash, block_hash);
-    assert!(
-        !ev.should_broadcast,
-        "External set_notarize_certificate must set should_broadcast=false"
-    );
     assert!(Arc::ptr_eq(&ev.certificate, &cert), "Event should carry the stored cert");
 }
 
@@ -3117,11 +3164,12 @@ fn test_skip_events_emitted_when_threshold_reached() {
         "SlotSkipped(1) should be emitted immediately when threshold reached"
     );
 
-    // first_non_finalized_slot should have advanced past slot 1
+    // C++ parity: first_non_finalized_slot does NOT advance on skip.
+    // It stays at 0 since nothing was finalized.
     assert_eq!(
         state.first_non_finalized_slot,
-        SlotIndex::new(2),
-        "first_non_finalized_slot should advance to 2"
+        SlotIndex::new(0),
+        "first_non_finalized_slot should NOT advance on skip (C++ parity)"
     );
 }
 
@@ -4451,6 +4499,8 @@ fn test_set_finalize_certificate_deduplicates() {
         .set_finalize_certificate(&desc, slot, &block_hash, final_cert.clone())
         .expect("should not conflict");
     assert!(stored1, "first application should store");
+    // Drain first-store events so we can assert duplicate store emits none.
+    while state.pull_event().is_some() {}
 
     // Apply second time
     let stored2 = state
@@ -4460,6 +4510,35 @@ fn test_set_finalize_certificate_deduplicates() {
 
     // Weight should still be 3
     assert_eq!(state.get_finalize_weight(slot, &block_hash), 3);
+    assert!(
+        !state.has_pending_events(),
+        "duplicate finalize cert must not emit relay-triggering events"
+    );
+}
+
+#[test]
+fn test_set_skip_certificate_deduplicates_without_events() {
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
+
+    let slot = SlotIndex::new(2);
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+    let skip_cert = create_test_skip_cert(&desc, slot, &signers);
+
+    let stored1 = state
+        .set_skip_certificate(&desc, slot, skip_cert.clone())
+        .expect("first set_skip_certificate should succeed");
+    assert!(stored1, "first skip certificate application should store");
+    while state.pull_event().is_some() {}
+
+    let stored2 = state
+        .set_skip_certificate(&desc, slot, skip_cert)
+        .expect("second set_skip_certificate should succeed");
+    assert!(!stored2, "second skip certificate application should be deduplicated");
+    assert!(
+        !state.has_pending_events(),
+        "duplicate skip cert must not emit relay-triggering events"
+    );
 }
 
 #[test]
@@ -4570,6 +4649,33 @@ fn test_set_skip_certificate_emits_slot_skipped_event_for_tracked_slot() {
     );
 }
 
+/// C++ parity (pool.cpp handle_saved_certificate): set_skip_certificate must emit
+/// SkipCertificateReached so SessionProcessor relays foreign skip certificates.
+#[test]
+fn test_set_skip_certificate_emits_skip_cert_reached() {
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
+
+    while state.pull_event().is_some() {}
+
+    let slot = SlotIndex::new(1);
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+    let skip_cert = create_test_skip_cert(&desc, slot, &signers);
+
+    let stored = state.set_skip_certificate(&desc, slot, skip_cert).expect("should not error");
+    assert!(stored, "skip certificate should be stored");
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    let skip_reached = events
+        .iter()
+        .find_map(|e| match e {
+            SimplexEvent::SkipCertificateReached(ev) if ev.slot == slot => Some(ev),
+            _ => None,
+        })
+        .expect("Expected SkipCertificateReached event for foreign skip cert");
+    assert_eq!(skip_reached.slot, slot);
+}
+
 #[test]
 fn test_set_skip_certificate_does_not_emit_slot_skipped_event_for_old_slot() {
     let desc = create_test_desc(4, 2);
@@ -4593,6 +4699,11 @@ fn test_set_skip_certificate_does_not_emit_slot_skipped_event_for_old_slot() {
     assert!(
         !events.iter().any(|e| matches!(e, SimplexEvent::SlotSkipped(_))),
         "SlotSkipped must not be emitted for old slots, got {:?}",
+        events
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SimplexEvent::SkipCertificateReached(_))),
+        "SkipCertificateReached must not be emitted for old slots, got {:?}",
         events
     );
 }
@@ -4685,11 +4796,6 @@ fn test_set_finalize_certificate_emits_block_finalized_and_finalization_reached_
     assert_eq!(final_reached.slot, slot);
     assert_eq!(final_reached.block_hash, block_hash);
     assert!(Arc::ptr_eq(&final_reached.certificate, &cert));
-    assert!(
-        !final_reached.should_broadcast,
-        "External set_finalize_certificate must set should_broadcast=false \
-        (only local creation broadcasts)"
-    );
 }
 
 /*
