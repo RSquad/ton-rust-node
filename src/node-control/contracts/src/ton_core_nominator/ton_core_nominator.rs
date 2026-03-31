@@ -6,8 +6,10 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::nominator::{NominatorRoles, NominatorWrapper, PoolConfig, PoolData};
-use crate::{ContractProvider, SmartContract};
+use crate::{
+    ContractProvider, SmartContract,
+    nominator::{NominatorRoles, NominatorWrapper, PoolConfig, PoolData},
+};
 use anyhow::Context;
 use std::sync::Arc;
 use ton_block::{
