@@ -1351,9 +1351,9 @@ Nominator pool configurations. Two pool types are supported:
 - `kind` — `"core"`
 - `addresses` — two addresses: validator wallet (`[0]`) and pool contract (`[1]`, must match the address derived from the parameters below)
 - `validator_share` — validator reward share (basis points; stored as `u16` on-chain)
-- `max_nominators` — optional; if omitted, `contracts` `resolve_deploy_pool_params` uses the default next to the pool contract
-- `min_validator_stake` — optional (nanotons); same
-- `min_nominator_stake` — optional (nanotons); same
+- `max_nominators` — optional; if omitted, defaults from the contracts module are used (40 nominators)
+- `min_validator_stake` — optional (nanotons); if omitted, defaults from the contracts module are used (100 TON)
+- `min_nominator_stake` — optional (nanotons); if omitted, defaults from the contracts module are used (10 TON)
 
 #### `bindings`
 
