@@ -25,7 +25,6 @@ pub(crate) fn is_adaptive_split50_ready(
     adaptive_sleep_pct: f64,
     adaptive_waiting_pct: f64,
 ) -> bool {
-
     let min_validators = cfg16.min_validators.as_u16() as usize;
     let participants_count = elections_info.participants.len();
     let election_duration = cfg15_start_before.saturating_sub(cfg15_end_before) as u64;
@@ -514,7 +513,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, free_balance, "should use curr_min_eff (not prev) and stake all when half < curr");
+        assert_eq!(
+            result, free_balance,
+            "should use curr_min_eff (not prev) and stake all when half < curr"
+        );
     }
 
     // ---- prev only (curr = None, fewer than min_validators) ----

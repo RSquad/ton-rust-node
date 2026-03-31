@@ -575,7 +575,8 @@ impl ElectionRunner {
             node.submission_time = None;
             node.stake_submissions.clear();
             node.participant = participant.clone();
-            node.key_id = validator_key.as_ref().map(|entry| entry.key_id.clone()).unwrap_or_default();
+            node.key_id =
+                validator_key.as_ref().map(|entry| entry.key_id.clone()).unwrap_or_default();
         }
         // If the elector already has our stake, mark it accepted early
         // so that `calc_stake` uses the correct current_stake (not 0).
