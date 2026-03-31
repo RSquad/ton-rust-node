@@ -3891,25 +3891,25 @@ impl Collator {
                     new_config_opt = Some(Self::extract_new_config(shard_acc.account(), addr)?);
                 }
             }
-            let acc_block = shard_acc.update_shard_state(&mut new_accounts)?;
-            if !acc_block.transactions().is_empty() {
+            if shard_acc.is_touched() {
+                let acc_block = shard_acc.update_shard_state(&mut new_accounts)?;
                 accounts.insert(&acc_block)?;
-            }
-            let account = shard_acc.account();
-            if let Some(storage_dict) = shard_acc.storage_dict() {
-                if account.dict_hash().is_some() {
-                    let size = account.storage_info().map(|info| info.used().cells()).unwrap_or(0);
-                    log::trace!(
-                        "{}: updated storage dict with hash {:x} for account {:x} of size {}",
-                        self.collated_block_descr,
-                        storage_dict.repr_hash(),
-                        account_id,
-                        size
-                    );
-                    self.engine.add_account_storage_dict(storage_dict, size)
+                let account = shard_acc.account();
+                if let Some(storage_dict) = shard_acc.storage_dict() {
+                    if account.dict_hash().is_some() {
+                        let size = account.storage_info().map_or(0, |info| info.used().cells());
+                        log::trace!(
+                            "{}: updated storage dict with hash {:x} for account {:x} of size {}",
+                            self.collated_block_descr,
+                            storage_dict.repr_hash(),
+                            account_id,
+                            size
+                        );
+                        self.engine.add_account_storage_dict(storage_dict, size)
+                    }
                 }
+                changed_accounts.insert(account_id, shard_acc);
             }
-            changed_accounts.insert(account_id, shard_acc);
         }
 
         if let Some(hardfork_config) = self.engine.get_config_for_hardfork() {
