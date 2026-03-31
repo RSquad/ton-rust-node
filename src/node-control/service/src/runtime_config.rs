@@ -13,7 +13,8 @@ use common::{
     vault_signer::VaultSigner,
 };
 use contracts::{
-    NominatorWrapper, NominatorWrapperImpl, TonWallet, WalletContract, contract_provider,
+    NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl, TonWallet, WalletContract,
+    contract_provider, resolve_deploy_pool_params,
 };
 use secrets_vault::{
     types::{algorithm::Algorithm, secret_id::SecretId, secret_spec::SecretSpec},
@@ -514,6 +515,54 @@ fn open_nominator_pool(
             };
             Ok(Arc::new(pool))
         }
-        _ => anyhow::bail!("unsupported pool kind"),
+        PoolConfig::TONCore {
+            addresses,
+            validator_share,
+            max_nominators,
+            min_validator_stake,
+            min_nominator_stake,
+        } => {
+            let configured_validator = MsgAddressInt::from_str(addresses[0].as_str())
+                .context(format!("invalid TONCore addresses[0]: {}", addresses[0]))?;
+            if configured_validator != *validator_addr {
+                anyhow::bail!(
+                    "TONCore addresses[0] must match validator wallet (expected {}, got {})",
+                    validator_addr,
+                    addresses[0]
+                );
+            }
+            let reward_share = u16::try_from(*validator_share)
+                .map_err(|_| anyhow::anyhow!("validator_share must fit in u16 (0..=65535)"))?;
+            let (max_n, min_v, min_n) = resolve_deploy_pool_params(
+                max_nominators.as_ref().copied(),
+                min_validator_stake.as_ref().copied(),
+                min_nominator_stake.as_ref().copied(),
+            );
+            let calculated = NominatorPoolWrapperImpl::calculate_address(
+                &configured_validator,
+                reward_share,
+                max_n,
+                min_v,
+                min_n,
+            )?;
+            let explicit = MsgAddressInt::from_str(addresses[1].as_str())
+                .context(format!("invalid TONCore addresses[1]: {}", addresses[1]))?;
+            if explicit != calculated {
+                anyhow::bail!(
+                    "TONCore addresses[1] ({}) does not match pool address derived from addresses[0] and validator_share ({})",
+                    explicit,
+                    calculated
+                );
+            }
+            let pool = NominatorPoolWrapperImpl::from_init_data(
+                contract_provider!(rpc_client.clone()),
+                &configured_validator,
+                reward_share,
+                max_n,
+                min_v,
+                min_n,
+            )?;
+            Ok(Arc::new(pool))
+        }
     }
 }

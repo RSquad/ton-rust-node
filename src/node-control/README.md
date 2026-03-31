@@ -1349,8 +1349,11 @@ Nominator pool configurations. Two pool types are supported:
 **TONCore Pool:**
 
 - `kind` — `"core"`
-- `addresses` — array of exactly 2 pool addresses
-- `validator_share` — validator share percentage
+- `addresses` — two addresses: validator wallet (`[0]`) and pool contract (`[1]`, must match the address derived from the parameters below)
+- `validator_share` — validator reward share (basis points; stored as `u16` on-chain)
+- `max_nominators` — optional; if omitted, `contracts` `resolve_deploy_pool_params` uses the default next to the pool contract
+- `min_validator_stake` — optional (nanotons); same
+- `min_nominator_stake` — optional (nanotons); same
 
 #### `bindings`
 

@@ -17,11 +17,20 @@ use common::{
     app_config::{AppConfig, PoolConfig},
     ton_utils::display_tons,
 };
-use contracts::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl};
+use contracts::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, resolve_deploy_pool_params};
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
 use std::{path::Path, str::FromStr, sync::Arc};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt};
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum PoolAddKind {
+    /// Single Nominator Pool (`kind: "snp"` in config)
+    #[default]
+    Snp,
+    /// Nominator Pool (`kind: "core"` / `PoolConfig::TONCore`)
+    Core,
+}
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage pools in the configuration")]
@@ -45,18 +54,38 @@ pub enum PoolAction {
 pub struct PoolAddCmd {
     #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
     name: String,
+    #[arg(long = "kind", value_enum, default_value_t = PoolAddKind::Snp, help = "snp or core")]
+    kind: PoolAddKind,
     #[arg(
         short = 'a',
         long = "address",
-        help = "Pool contract address, raw or base64url (if already deployed)"
+        help = "SNP: pool contract address, raw or base64url (if already deployed)"
     )]
     address: Option<String>,
     #[arg(
         short = 'o',
         long = "owner",
-        help = "Owner address, raw or base64url (for deployment/verification)"
+        help = "SNP: owner address, raw or base64url (for deployment/verification)"
     )]
     owner: Option<String>,
+    #[arg(long = "addr1", help = "Core: addresses[0] (with --kind core)")]
+    addr1: Option<String>,
+    #[arg(long = "addr2", help = "Core: addresses[1] (with --kind core)")]
+    addr2: Option<String>,
+    #[arg(long = "validator-share", help = "Core: validator_share, basis points (with --kind core)")]
+    validator_share: Option<u64>,
+    #[arg(long = "max-nominators", help = "Core: max nominators (default: 40)")]
+    max_nominators: Option<u16>,
+    #[arg(
+        long = "min-validator-stake-nano",
+        help = "Core: min validator stake in nanotons (embedded at deploy)"
+    )]
+    min_validator_stake_nano: Option<u64>,
+    #[arg(
+        long = "min-nominator-stake-nano",
+        help = "Core: min nominator stake in nanotons (embedded at deploy)"
+    )]
+    min_nominator_stake_nano: Option<u64>,
 }
 
 #[derive(clap::Args, Clone)]
@@ -85,18 +114,6 @@ impl PoolCmd {
 
 impl PoolAddCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if self.address.is_none() && self.owner.is_none() {
-            anyhow::bail!("At least one of --address or --owner must be specified");
-        }
-
-        let normalized_address = self
-            .address
-            .as_deref()
-            .map(|addr| normalize_ton_address(addr, "address"))
-            .transpose()?;
-        let normalized_owner =
-            self.owner.as_deref().map(|owner| normalize_ton_address(owner, "owner")).transpose()?;
-
         let mut config = AppConfig::load(path)?;
 
         if config.pools.contains_key(&self.name) {
@@ -106,19 +123,76 @@ impl PoolAddCmd {
             );
         }
 
-        let pool_config = PoolConfig::SNP {
-            address: normalized_address.clone(),
-            owner: normalized_owner.clone(),
+        let (pool_config, info) = match self.kind {
+            PoolAddKind::Snp => {
+                if self.address.is_none() && self.owner.is_none() {
+                    anyhow::bail!("For SNP: at least one of --address or --owner must be specified");
+                }
+
+                let normalized_address = self
+                    .address
+                    .as_deref()
+                    .map(|addr| normalize_ton_address(addr, "address"))
+                    .transpose()?;
+                let normalized_owner =
+                    self.owner.as_deref().map(|owner| normalize_ton_address(owner, "owner")).transpose()?;
+
+                let info = match (&normalized_address, &normalized_owner) {
+                    (Some(a), Some(o)) => format!("kind=snp address='{}', owner='{}'", a, o),
+                    (Some(a), None) => format!("kind=snp address='{}'", a),
+                    (None, Some(o)) => format!("kind=snp owner='{}' (address will be calculated on bind)", o),
+                    _ => unreachable!(),
+                };
+
+                (
+                    PoolConfig::SNP {
+                        address: normalized_address.clone(),
+                        owner: normalized_owner.clone(),
+                    },
+                    info,
+                )
+            }
+            PoolAddKind::Core => {
+                let addr1 = self
+                    .addr1
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("For core: --addr1 is required"))?;
+                let addr2 = self
+                    .addr2
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("For core: --addr2 is required"))?;
+                let share = self
+                    .validator_share
+                    .ok_or_else(|| anyhow::anyhow!("For core: --validator-share is required"))?;
+
+                let a1 = normalize_ton_address(addr1, "addr1")?;
+                let a2 = normalize_ton_address(addr2, "addr2")?;
+
+                let (mx, mv, mn) = resolve_deploy_pool_params(
+                    self.max_nominators,
+                    self.min_validator_stake_nano,
+                    self.min_nominator_stake_nano,
+                );
+                let info = format!(
+                    "kind=core addresses=['{}', '{}'], validator_share={} (basis points), deploy_params_resolved: max_nominators={}, min_validator_stake_nano={}, min_nominator_stake_nano={} (omitted fields use contract defaults)",
+                    a1, a2, share, mx, mv, mn
+                );
+
+                (
+                    PoolConfig::TONCore {
+                        addresses: [a1, a2],
+                        validator_share: share,
+                        max_nominators: self.max_nominators,
+                        min_validator_stake: self.min_validator_stake_nano,
+                        min_nominator_stake: self.min_nominator_stake_nano,
+                    },
+                    info,
+                )
+            }
         };
+
         config.pools.insert(self.name.clone(), pool_config);
         save_config(&config, path)?;
-
-        let info = match (&normalized_address, &normalized_owner) {
-            (Some(a), Some(o)) => format!("address='{}', owner='{}'", a, o),
-            (Some(a), None) => format!("address='{}'", a),
-            (None, Some(o)) => format!("owner='{}' (address will be calculated on bind)", o),
-            _ => unreachable!(),
-        };
         println!("\n{} Pool '{}' added ({})\n", "OK".green().bold(), self.name, info);
         Ok(())
     }
@@ -225,7 +299,7 @@ async fn collect_pool_views(
                     validator_share: None,
                 });
             }
-            PoolConfig::TONCore { addresses, validator_share } => {
+            PoolConfig::TONCore { addresses, validator_share, .. } => {
                 views.push(PoolView {
                     name: name.clone(),
                     kind: "Core".to_string(),

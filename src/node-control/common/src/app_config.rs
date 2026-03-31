@@ -338,7 +338,20 @@ pub enum PoolConfig {
         owner: Option<String>,
     },
     #[serde(rename = "core")]
-    TONCore { addresses: [String; 2], validator_share: u64 },
+    TONCore {
+        addresses: [String; 2],
+        validator_share: u64,
+        /// Deploy-time pool parameters; if omitted, defaults are applied in `contracts` (`resolve_deploy_pool_params`).
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_nominators: Option<u16>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_validator_stake: Option<u64>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_nominator_stake: Option<u64>,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -826,12 +839,40 @@ mod tests {
             PoolConfig::TONCore {
                 addresses: [addr1.to_string(), addr2.to_string()],
                 validator_share: 50,
+                max_nominators: None,
+                min_validator_stake: None,
+                min_nominator_stake: None,
             }
         );
 
         let json = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["kind"], "core");
         assert_eq!(json["validator_share"], 50);
+    }
+
+    #[test]
+    fn test_pool_config_serde_core_explicit_deploy_params() {
+        let addr1 = ADDR;
+        let addr2 = OWNER;
+        let value = serde_json::json!({
+            "kind": "core",
+            "addresses": [addr1.to_string(), addr2.to_string()],
+            "validator_share": 100,
+            "max_nominators": 10,
+            "min_validator_stake": 5_000_000_000_000u64,
+            "min_nominator_stake": 1_000_000_000_000u64,
+        });
+        let cfg: PoolConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg,
+            PoolConfig::TONCore {
+                addresses: [addr1.to_string(), addr2.to_string()],
+                validator_share: 100,
+                max_nominators: Some(10),
+                min_validator_stake: Some(5_000_000_000_000),
+                min_nominator_stake: Some(1_000_000_000_000),
+            }
+        );
     }
 
     #[test]

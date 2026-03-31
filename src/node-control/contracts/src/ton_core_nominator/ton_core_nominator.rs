@@ -26,6 +26,25 @@ const CODE: &str = "b5ee9c7201023a010009c2000114ff00f4a413f4bcf2c80b010201620203
 /// Pool is always deployed in the masterchain.
 pub const POOL_WORKCHAIN: i32 = -1;
 
+/// Deploy-time parameters for `build_state_init` when the app config omits them.
+pub const DEFAULT_DEPLOY_MAX_NOMINATORS: u16 = 40;
+pub const DEFAULT_DEPLOY_MIN_VALIDATOR_STAKE_NANOTONS: u64 = 100_000_000_000_000;
+pub const DEFAULT_DEPLOY_MIN_NOMINATOR_STAKE_NANOTONS: u64 = 10_000_000_000_000;
+
+/// Resolve deploy parameters for address derivation and `StateInit` (defaults from this module).
+#[must_use]
+pub fn resolve_deploy_pool_params(
+    max_nominators: Option<u16>,
+    min_validator_stake: Option<u64>,
+    min_nominator_stake: Option<u64>,
+) -> (u16, u64, u64) {
+    (
+        max_nominators.unwrap_or(DEFAULT_DEPLOY_MAX_NOMINATORS),
+        min_validator_stake.unwrap_or(DEFAULT_DEPLOY_MIN_VALIDATOR_STAKE_NANOTONS),
+        min_nominator_stake.unwrap_or(DEFAULT_DEPLOY_MIN_NOMINATOR_STAKE_NANOTONS),
+    )
+}
+
 /// Wrapper for the TON Nominator Pool contract.
 ///
 /// See: <https://github.com/ton-blockchain/nominator-pool>

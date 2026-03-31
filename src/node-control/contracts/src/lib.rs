@@ -20,7 +20,7 @@ pub use config_contract::{
 };
 pub use elector::{ElectionsInfo, ElectorWrapper, ElectorWrapperImpl, Participant};
 pub use nominator::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, NominatorWrapperImpl};
-pub use ton_core_nominator::NominatorPoolWrapperImpl;
+pub use ton_core_nominator::{NominatorPoolWrapperImpl, resolve_deploy_pool_params};
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;
 pub use wallet::{TonWallet, WalletContract};
