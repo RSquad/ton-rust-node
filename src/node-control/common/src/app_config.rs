@@ -848,6 +848,9 @@ mod tests {
         let json = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["kind"], "core");
         assert_eq!(json["validator_share"], 50);
+        assert!(json.get("max_nominators").is_none());
+        assert!(json.get("min_validator_stake").is_none());
+        assert!(json.get("min_nominator_stake").is_none());
     }
 
     #[test]
