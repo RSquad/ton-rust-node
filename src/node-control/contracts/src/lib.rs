@@ -9,6 +9,7 @@
 pub mod config_contract;
 pub mod elector;
 pub mod nominator;
+pub mod ton_core_nominator;
 pub mod provider;
 pub mod smart_contract;
 mod stack_utils;
@@ -19,6 +20,7 @@ pub use config_contract::{
 };
 pub use elector::{ElectionsInfo, ElectorWrapper, ElectorWrapperImpl, Participant};
 pub use nominator::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, NominatorWrapperImpl};
+pub use ton_core_nominator::NominatorPoolWrapperImpl;
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;
 pub use wallet::{TonWallet, WalletContract};
