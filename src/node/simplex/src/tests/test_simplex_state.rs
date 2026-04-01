@@ -5702,3 +5702,125 @@ fn test_try_notar_not_blocked_by_its_over_after_finalize_restart_cpp_mode() {
         events
     );
 }
+
+#[test]
+fn test_notarized_parent_chain_genesis_base_propagates_across_skipped_windows() {
+    // Regression test for bootstrap deadlock: when use_notarized_parent_chain=true (default
+    // C++ compat mode), skipping an entire window must propagate the available base to the
+    // next window via advance_leader_window_on_progress_cursor().
+    //
+    // Without the fix, advance_leader_window_on_progress_cursor() only advanced the window
+    // index and set timeouts but never populated the new window's available_bases, causing
+    // has_available_parent() to return false and blocking all collation permanently.
+    //
+    // Reference: C++ pool.cpp advance_present() reads slot_at(now_)->state->available_base
+    // and publishes it via LeaderWindowObserved(now_, base).
+    let desc = create_test_desc(4, 2); // 2 slots per window
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    // Window 0 starts with genesis base
+    assert!(state.has_available_parent(&desc, SlotIndex::new(0)));
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
+
+    // Skip slot 0 (need 3 out of 4 for threshold_66)
+    let skip_vote_0 = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip_vote_0.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip_vote_0.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip_vote_0, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(1));
+
+    // Skip slot 1 (last slot in window 0) -> should trigger window advancement
+    let skip_vote_1 = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip_vote_1.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip_vote_1.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip_vote_1, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    // Progress cursor should be at slot 2 (start of window 1)
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(2));
+
+    // Window must have advanced to window 1
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "leader window must advance to window 1 after all window 0 slots skipped"
+    );
+
+    // Window 1's available_bases must contain the genesis base (None)
+    let w1 = state.get_window(WindowIndex::new(1));
+    assert!(w1.is_some(), "window 1 must exist");
+    assert!(
+        w1.unwrap().available_bases.contains(&None),
+        "window 1 must have genesis (None) base propagated from window 0 via \
+        advance_leader_window_on_progress_cursor(). Got: {:?}",
+        w1.unwrap().available_bases
+    );
+
+    // Slot 2 (first slot of window 1) must have available_base set
+    let slot2_base = state.get_slot_available_base(&desc, SlotIndex::new(2));
+    assert_eq!(slot2_base, Some(None), "slot 2 available_base must be genesis (Some(None))");
+
+    // has_available_parent must return true for collation to proceed
+    assert!(
+        state.has_available_parent(&desc, SlotIndex::new(2)),
+        "has_available_parent must be true for slot 2 after genesis base propagated"
+    );
+
+    // get_available_parent must return None (genesis = no parent info)
+    let parent = state.get_available_parent(&desc, SlotIndex::new(2));
+    assert_eq!(parent, None, "genesis parent should return None (no parent id)");
+}
+
+#[test]
+fn test_notarized_parent_chain_base_propagates_across_multiple_skipped_windows() {
+    // Verify that base propagation works across multiple consecutive skipped windows.
+    // This is the sustained stall scenario: window 0 -> 1 -> 2 all skip without finalization.
+    let desc = create_test_desc(4, 1); // 1 slot per window for simplicity
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    assert!(state.has_available_parent(&desc, SlotIndex::new(0)));
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
+
+    // Skip window 0 (slot 0)
+    let skip = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(1));
+    assert!(
+        state.has_available_parent(&desc, SlotIndex::new(1)),
+        "window 1 must have available parent after window 0 skipped"
+    );
+
+    // Skip window 1 (slot 1)
+    let skip = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(2));
+    assert!(
+        state.has_available_parent(&desc, SlotIndex::new(2)),
+        "window 2 must have available parent after windows 0+1 skipped"
+    );
+
+    // Skip window 2 (slot 2)
+    let skip = Vote::Skip(SkipVote { slot: SlotIndex::new(2) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(3));
+    assert!(
+        state.has_available_parent(&desc, SlotIndex::new(3)),
+        "window 3 must have available parent after windows 0+1+2 all skipped"
+    );
+}
