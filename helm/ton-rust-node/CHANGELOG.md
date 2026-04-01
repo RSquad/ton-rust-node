@@ -5,6 +5,14 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.4.3] - 2026-04-01
+
+appVersion: `v0.3.0`
+
+### Added
+
+- `terminationGracePeriodSeconds` — configurable grace period before SIGKILL on pod termination. Defaults to 300s (5 minutes). The Kubernetes default of 30s is too short for a TON node — an unclean kill may corrupt the database and forces a cold boot
+
 ## [0.4.2] - 2026-03-18
 
 appVersion: `v0.3.0`

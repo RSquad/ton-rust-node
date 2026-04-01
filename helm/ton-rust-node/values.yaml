@@ -407,6 +407,10 @@ serviceAccount:
   name: ""
   annotations: {}
 
+## @param terminationGracePeriodSeconds Time (in seconds) given to the node process to shut down gracefully before SIGKILL. The default Kubernetes value (30s) is too short for a TON node — an unclean kill may corrupt the database and forces a cold boot. Set this to at least 300s.
+##
+terminationGracePeriodSeconds: 300
+
 ## @section Scheduling parameters
 
 ## @param nodeSelector [object] Node selector for pod scheduling
