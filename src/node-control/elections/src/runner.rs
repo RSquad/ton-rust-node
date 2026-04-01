@@ -51,8 +51,14 @@ const RECOVER_FEE: u64 = 200_000_000;
 const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 /// Gas fee consumed by validator wallet
 const WALLET_COMPUTE_FEE: u64 = 200_000_000;
-/// Reserved minimum balance on the wallet (or pool) balance for stake calculations
-const MIN_NANOTON_FOR_STORAGE: u64 = 1_050_000_000;
+/// Reserved minimum balance on the pool (or wallet) to correctly calculate free
+/// funds for staking. Includes:
+/// 1) 1 TON required by SNP (MIN_TON_FOR_STORAGE);
+/// 2) 0.05 TON to cover storage fees accumulated after last pool transaction.
+/// It's an approximation to avoid error when staking all available funds:
+/// throw_unless(ERROR::INSUFFICIENT_BALANCE, stake_amount <= my_balance - msg_value - MIN_TON_FOR_STORAGE);
+/// where `my_balance` is already decreased by storage fees which we want to cover.
+const MIN_NANOTON_FOR_STORAGE: u64 = 1_005_000_000;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 

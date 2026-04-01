@@ -2407,8 +2407,8 @@ fn test_elections_config_validate_valid() {
 #[test]
 fn test_elections_config_defaults() {
     let config = ElectionsConfig::default();
-    assert_eq!(config.sleep_period_pct, 0.0);
-    assert_eq!(config.waiting_period_pct, 0.3);
+    assert_eq!(config.sleep_period_pct, 0.2);
+    assert_eq!(config.waiting_period_pct, 0.4);
 }
 // Participation status transitions across election lifecycle
 // Simulates: Idle → Participating → Submitted → Accepted → Elected → Validating
