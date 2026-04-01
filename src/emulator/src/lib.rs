@@ -63,9 +63,8 @@ pub extern "C" fn transaction_emulator_create(
     vm_log_verbosity: u32,
 ) -> *mut c_void {
     init_log_without_config(None, log_level_from_verbosity(vm_log_verbosity), None);
-    match deserialize_boc(config_params_boc) {
-        Ok(config_params_root) => {
-            let config_params = ConfigParams::with_root(config_params_root);
+    match deserialize_boc(config_params_boc).and_then(ConfigParams::with_root) {
+        Ok(config_params) => {
             let emulator = Box::new(Emulator::new(config_params));
             Box::into_raw(emulator) as *mut c_void
         }
@@ -176,9 +175,8 @@ pub extern "C" fn transaction_emulator_set_config(
         log::error!("Received null pointer for transaction_emulator");
         return;
     }
-    match deserialize_boc(config_params_boc) {
-        Ok(config_params_root) => {
-            let config_params = ConfigParams::with_root(config_params_root);
+    match deserialize_boc(config_params_boc).and_then(ConfigParams::with_root) {
+        Ok(config_params) => {
             let transaction_emulator = unsafe { &mut *(transaction_emulator as *mut Emulator) };
             transaction_emulator.config_params = config_params;
         }

@@ -48,15 +48,17 @@ impl Default for ConfigParams {
 }
 
 impl ConfigParams {
-    pub const fn with_root(data: Cell) -> Self {
-        Self {
-            config_addr: AccountId::ZERO_ID,
-            config_params: HashmapE::with_hashmap(32, Some(data)),
-        }
-    }
-
-    pub const fn with_address_and_root(config_addr: AccountId, data: Cell) -> Self {
-        Self { config_addr, config_params: HashmapE::with_hashmap(32, Some(data)) }
+    pub fn with_root(data: Cell) -> Result<Self> {
+        let config_params = HashmapE::with_hashmap(32, Some(data));
+        let cell = config_params
+            .get(0u32.write_to_bitstring()?)?
+            .ok_or_else(|| error!("config param 0 is missing"))?
+            .reference(0)?;
+        let result = ConfigParamEnum::construct_from_cell_and_number(cell, 0)?;
+        let ConfigParamEnum::ConfigParam0(ConfigParam0 { config_addr }) = result else {
+            fail!("config param 0 has invalid format");
+        };
+        Ok(Self { config_addr, config_params })
     }
 
     pub const fn with_address_and_params(config_addr: AccountId, data: Option<Cell>) -> Self {
@@ -566,10 +568,11 @@ impl ConfigParams {
 }
 
 impl Deserializable for ConfigParams {
-    fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        self.config_addr.read_from(cell)?;
-        *self.config_params.data_mut() = Some(cell.checked_drain_reference()?);
-        Ok(())
+    fn construct_from(slice: &mut SliceData) -> Result<Self> {
+        let config_addr = slice.get_next_slice(256)?;
+        let data = slice.checked_drain_reference()?;
+        let config_params = HashmapE::with_hashmap(32, Some(data));
+        Ok(Self { config_addr, config_params })
     }
 }
 
