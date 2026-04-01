@@ -635,6 +635,10 @@ impl BlockHandleStorage {
         self.load_state(key, &self.validator_state_db)
     }
 
+    pub fn load_validator_state_raw(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.validator_state_db.try_get_raw(key.as_bytes())?.map(|value| value.to_vec()))
+    }
+
     pub fn save_handle(
         &self,
         handle: &Arc<BlockHandle>,
@@ -657,6 +661,16 @@ impl BlockHandleStorage {
         self.storer
             .send((StoreJob::SaveValidatorState((key, refid)), None))
             .map_err(|_| error!("Cannot store validator state {}: storer thread dropped", id))
+    }
+
+    pub fn save_validator_state_raw(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.delete_state(key)?;
+        self.validator_state_db.put_raw(key.as_bytes(), data)
+    }
+
+    pub fn drop_validator_state_raw(&self, key: &str) -> Result<()> {
+        self.delete_state(key)?;
+        self.validator_state_db.delete_raw(key.as_bytes())
     }
 
     pub fn drop_handle(&self, id: BlockIdExt, callback: Option<Arc<dyn Callback>>) -> Result<()> {

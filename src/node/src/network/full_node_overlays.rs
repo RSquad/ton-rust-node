@@ -540,6 +540,11 @@ impl FullNodeOverlaysRouter {
         Ok(())
     }
 
+    /// Look up the local ADNL key for the given validator set.
+    ///
+    /// Returns `None` both when the node is not a validator and when it is a validator
+    /// but the ADNL/overlay context is not yet ready (the `network_ready == false` case
+    /// in [`ValidatorListOutcome`]). Callers must tolerate `None` gracefully.
     fn try_get_our_key(
         self: &Arc<Self>,
         validators: &ValidatorSet,
@@ -549,7 +554,11 @@ impl FullNodeOverlaysRouter {
 
         match self.network.try_get_validator_adnl_key(&val_list_id) {
             None => {
-                log::info!("We are not a validator");
+                log::info!(
+                    "No local validator ADNL key for list {:x} (node is either not a validator \
+                     for this list yet, or validator network context is still not ready)",
+                    val_list_id
+                );
                 return Ok(None);
             }
             Some(k) => Ok(Some(k)),

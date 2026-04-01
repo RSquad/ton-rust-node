@@ -72,6 +72,7 @@ const CELLSCOUNTERS_CF_NAME: &str = "cells_db_v6_counters";
 
 /// Validator state keys
 pub(crate) const LAST_ROTATION_MC_BLOCK: &str = "LastRotationBlockId";
+pub(crate) const DESTROYED_VALIDATOR_SESSIONS: &str = "DestroyedValidatorSessions";
 
 #[derive(Clone, Debug)]
 pub enum DataStatus {
@@ -1225,6 +1226,21 @@ impl InternalDb {
     pub fn save_validator_state(&self, key: &'static str, block_id: &BlockIdExt) -> Result<()> {
         let _tc = TimeChecker::new(format!("save_validator_state {}", key), 30);
         self.block_handle_storage.save_validator_state(key.to_string(), block_id)
+    }
+
+    pub fn drop_validator_state_raw(&self, key: &'static str) -> Result<()> {
+        let _tc = TimeChecker::new(format!("drop_validator_state_raw {}", key), 30);
+        self.block_handle_storage.drop_validator_state_raw(key)
+    }
+
+    pub fn load_validator_state_raw(&self, key: &'static str) -> Result<Option<Vec<u8>>> {
+        let _tc = TimeChecker::new(format!("load_validator_state_raw {}", key), 30);
+        self.block_handle_storage.load_validator_state_raw(key)
+    }
+
+    pub fn save_validator_state_raw(&self, key: &'static str, data: &[u8]) -> Result<()> {
+        let _tc = TimeChecker::new(format!("save_validator_state_raw {}", key), 30);
+        self.block_handle_storage.save_validator_state_raw(key, data)
     }
 
     pub async fn get_archive_id(&self, mc_seq_no: u32, shard: &ShardIdent) -> Option<u64> {

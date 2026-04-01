@@ -1594,12 +1594,13 @@ impl OverlayNode {
     }
 
     /// Two-step message broadcast
-    pub async fn broadcast_two_step(
+    pub async fn broadcast_twostep(
         &self,
         overlay_id: &Arc<OverlayShortId>,
         data: &TaggedByteSlice<'_>,
         src_key: Option<&Arc<dyn KeyOption>>,
         flags: u32,
+        extra: Vec<u8>,
     ) -> Result<BroadcastSendInfo> {
         log::trace!(target: TARGET, "Two-step broadcast {} bytes", data.object.len());
         let overlay =
@@ -1614,9 +1615,9 @@ impl OverlayNode {
         let neighbours = overlay.calc_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
         if big_data && (neighbours >= Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST) {
-            BroadcastTwostepFecProtocol::for_send(data.object, neighbours)?.send(ctx).await
+            BroadcastTwostepFecProtocol::for_send(data.object, neighbours, extra)?.send(ctx).await
         } else {
-            BroadcastTwostepSimpleProtocol::new(big_data).send(ctx).await
+            BroadcastTwostepSimpleProtocol::for_send(big_data, extra).send(ctx).await
         }
     }
 
@@ -2386,7 +2387,7 @@ impl Subscriber for OverlayNode {
                 }
                 Ok(Broadcast::Overlay_BroadcastTwostepSimple(bcast)) => {
                     let big_data = bcast.data.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
-                    BroadcastTwostepSimpleProtocol::new(big_data).recv(bcast, ctx).await?;
+                    BroadcastTwostepSimpleProtocol::for_recv(big_data).recv(bcast, ctx).await?;
                     return Ok(true);
                 }
                 Ok(bcast) => fail!("Unsupported overlay broadcast message {:?}", bcast),

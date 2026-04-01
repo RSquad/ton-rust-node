@@ -321,7 +321,7 @@ fn test_twostep_rust_sender_cpp_leaf() {
 
     // Send TwostepFec from Rust sender
     if let Node::Rust(ref sender) = topo.sender {
-        sender.send_broadcast_two_step(&topo.overlay_short_id, &test_data);
+        sender.send_broadcast_twostep(&topo.overlay_short_id, &test_data);
     }
 
     // Wait for redistribution and delivery
@@ -379,7 +379,7 @@ fn test_twostep_mixed_bridges_rust_leaf() {
 
     // Send TwostepFec from Rust sender
     if let Node::Rust(ref sender) = topo.sender {
-        sender.send_broadcast_two_step(&topo.overlay_short_id, &test_data);
+        sender.send_broadcast_twostep(&topo.overlay_short_id, &test_data);
     }
 
     // Check Rust leaf

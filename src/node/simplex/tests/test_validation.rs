@@ -402,7 +402,6 @@ fn run_validation_test() {
         &session_opts,
         &session_id,
         &shard,
-        initial_block_seqno,
         nodes.clone(),
         &private_key_0,
         db_path_0,
@@ -410,13 +409,12 @@ fn run_validation_test() {
         Arc::downgrade(&session_listener_0),
     )
     .expect("Failed to create session 0");
+    session_0.start(initial_block_seqno);
 
-    // Create session for node 1
     let session_1 = SessionFactory::create_session(
         &session_opts,
         &session_id,
         &shard,
-        initial_block_seqno,
         nodes.clone(),
         &private_key_1,
         db_path_1,
@@ -424,6 +422,7 @@ fn run_validation_test() {
         Arc::downgrade(&session_listener_1),
     )
     .expect("Failed to create session 1");
+    session_1.start(initial_block_seqno);
 
     log::info!("Sessions created, waiting for validation callback on node 1...");
 

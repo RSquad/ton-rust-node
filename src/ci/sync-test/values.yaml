@@ -1,0 +1,56 @@
+image:
+  repository: ghcr.io/rsquad/ton-node
+  tag: ""  # set by CI: --set image.tag=sha-xxx
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: ghcr
+
+ports:
+  metrics: 9100
+  control: null
+
+services:
+  adnl:
+    perReplica: []  # set by CI: --set services.adnl.perReplica[0].annotations.metallb\.universe\.tf/loadBalancerIPs=<ip>
+
+storage:
+  main:
+    resourcePolicy: ""
+  db:
+    resourcePolicy: ""
+  keys:
+    resourcePolicy: ""
+
+# Watcher sidecar — polls /healthz, sets GitHub commit status
+extraVolumes:
+  - name: watcher-script
+    configMap:
+      name: synctest-watcher
+      defaultMode: 0755
+
+extraContainers:
+  - name: watcher
+    image: alpine:3.21
+    command: ["/bin/sh", "/scripts/watcher.sh"]
+    env:
+      - name: GITHUB_SHA
+        value: "{{ .Values.synctest.sha }}"
+      - name: GITHUB_REPO
+        value: "{{ .Values.synctest.repo }}"
+      - name: NETWORK
+        value: mainnet
+      - name: SYNC_TIMEOUT
+        value: "86400"
+      - name: METRICS_PORT
+        value: "9100"
+    envFrom:
+      - secretRef:
+          name: credentials
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 200m, memory: 128Mi }
+    volumeMounts:
+      - name: watcher-script
+        mountPath: /scripts
+        readOnly: true

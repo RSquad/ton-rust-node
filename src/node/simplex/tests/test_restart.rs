@@ -490,7 +490,6 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
         &session_opts,
         &session_id,
         &shard,
-        initial_block_seqno,
         nodes.clone(),
         &private_key,
         db_path.clone(),
@@ -498,6 +497,7 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
         Arc::downgrade(&session_listener),
     )
     .expect("Failed to create session (phase 1)");
+    session_1.start(initial_block_seqno);
 
     let rounds_before_restart: u32 = 5;
     let start = Instant::now();
@@ -550,7 +550,6 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
         &session_opts,
         &session_id,
         &shard,
-        restart_initial_seqno,
         nodes,
         &private_key,
         db_path,
@@ -558,6 +557,7 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
         Arc::downgrade(&session_listener),
     )
     .expect("Failed to create session (phase 2)");
+    session_2.start(restart_initial_seqno);
 
     // Wait for first post-restart slot generation (proof that current slot was seeded)
     let start = Instant::now();
