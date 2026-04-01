@@ -1074,10 +1074,37 @@ fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
     if cfg.use_quic {
         serialize_field(&mut map, "use_quic", 1u32);
     }
-    serialize_field(&mut map, "target_rate_ms", cfg.target_rate_ms);
     serialize_field(&mut map, "slots_per_leader_window", cfg.slots_per_leader_window);
-    serialize_field(&mut map, "first_block_timeout_ms", cfg.first_block_timeout_ms);
-    serialize_field(&mut map, "max_leader_window_desync", cfg.max_leader_window_desync);
+    let np = &cfg.noncritical_params;
+    serialize_field(&mut map, "target_rate_ms", np.target_rate_ms);
+    serialize_field(&mut map, "first_block_timeout_ms", np.first_block_timeout_ms);
+    serialize_field(
+        &mut map,
+        "first_block_timeout_multiplier_bits",
+        np.first_block_timeout_multiplier_bits,
+    );
+    serialize_field(&mut map, "first_block_timeout_cap_ms", np.first_block_timeout_cap_ms);
+    serialize_field(&mut map, "candidate_resolve_timeout_ms", np.candidate_resolve_timeout_ms);
+    serialize_field(
+        &mut map,
+        "candidate_resolve_timeout_multiplier_bits",
+        np.candidate_resolve_timeout_multiplier_bits,
+    );
+    serialize_field(
+        &mut map,
+        "candidate_resolve_timeout_cap_ms",
+        np.candidate_resolve_timeout_cap_ms,
+    );
+    serialize_field(&mut map, "candidate_resolve_cooldown_ms", np.candidate_resolve_cooldown_ms);
+    serialize_field(&mut map, "standstill_timeout_ms", np.standstill_timeout_ms);
+    serialize_field(
+        &mut map,
+        "standstill_max_egress_bytes_per_s",
+        np.standstill_max_egress_bytes_per_s,
+    );
+    serialize_field(&mut map, "max_leader_window_desync", np.max_leader_window_desync);
+    serialize_field(&mut map, "bad_signature_ban_duration_ms", np.bad_signature_ban_duration_ms);
+    serialize_field(&mut map, "candidate_resolve_rate_limit", np.candidate_resolve_rate_limit);
     Ok(map.into())
 }
 

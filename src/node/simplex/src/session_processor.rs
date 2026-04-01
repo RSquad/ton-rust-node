@@ -749,6 +749,8 @@ pub(crate) struct SessionProcessor {
     batch_commit_counter: metrics::Counter,
     /// Histogram for batch commit sizes (number of blocks committed at once)
     batch_commit_size_histogram: metrics::Histogram,
+    /// Gauge for finalized-but-uncommitted journal size (commit lag indicator)
+    finalized_uncommitted_gauge: metrics::Gauge,
 
     /*
         Error tracking for SessionStats
@@ -1284,6 +1286,9 @@ impl SessionProcessor {
             health_warnings_counter,
         ) = Self::init_metrics(&metrics_receiver, &description);
 
+        let finalized_uncommitted_gauge =
+            metrics_receiver.sink().register_gauge(&"simplex_finalized_uncommitted_count".into());
+
         let now = description.get_time();
         let num_validators = description.get_total_nodes() as usize;
 
@@ -1345,6 +1350,7 @@ impl SessionProcessor {
             errors_counter,
             batch_commit_counter,
             batch_commit_size_histogram,
+            finalized_uncommitted_gauge,
             // Error tracking (includes startup errors from before processor was created)
             session_errors_count: AtomicU32::new(initial_errors),
             // Slot stage tracking
@@ -2689,14 +2695,17 @@ impl SessionProcessor {
             self.round_debug_at = now + ROUND_DEBUG_PERIOD;
         }
 
-        // Call SimplexState FSM check_all (processes timeouts, pending blocks)
-        self.simplex_state.check_all(&self.description);
-
         // Check validation (process pending validations)
         self.check_validation();
 
-        // Process validated candidates and feed to FSM
+        // Feed validated candidates to FSM BEFORE timeout processing so that
+        // the FSM has all available candidates before it evaluates timeouts
+        // (mirrors C++ where process_blocks() feeds candidates before the
+        // round timer is checked).
         self.process_validated_candidates();
+
+        // Call SimplexState FSM check_all (processes timeouts, pending blocks)
+        self.simplex_state.check_all(&self.description);
 
         // Process all events produced by FSM
         self.process_simplex_events();
@@ -2821,6 +2830,22 @@ impl SessionProcessor {
         // Collation follows notarized/skipped progress, not finalization.
         // Reference: C++ block-producer.cpp collates on notarized chain.
         let current_slot = self.simplex_state.get_first_non_progressed_slot();
+
+        // Stale window guard (C++ parity: consensus.cpp LeaderWindowObserved handler sets
+        // current_window_ BEFORE the leader check). Skip collation when the progress
+        // cursor still points at a slot in a window that has already been superseded.
+        let slot_window = self.description.get_window_idx(current_slot);
+        let current_window = self.simplex_state.get_current_leader_window_idx();
+        if slot_window < current_window {
+            log::trace!(
+                "Session {} check_collation: skipping stale slot {} (window {} < current {})",
+                &self.session_id().to_hex_string()[..8],
+                current_slot,
+                slot_window,
+                current_window
+            );
+            return;
+        }
 
         // Don't generate if already generated or pending for this slot
         if self.slot_is_generated(current_slot) || self.slot_is_pending_generate(current_slot) {
@@ -3628,6 +3653,23 @@ impl SessionProcessor {
 
         // Remove from precollated blocks
         self.remove_precollated_block(slot);
+
+        // Stale window guard (C++ parity: block-producer.cpp generation loop,
+        // consensus.cpp start_generation). Discard candidates whose leader window
+        // has already been superseded — the collation callback arrived too late.
+        let slot_window = self.description.get_window_idx(slot);
+        let current_window = self.simplex_state.get_current_leader_window_idx();
+        if slot_window != current_window {
+            log::warn!(
+                "Session {} generated_block: discarding stale candidate for slot {} \
+                (window {} != current {})",
+                &self.session_id().to_hex_string()[..8],
+                slot,
+                slot_window,
+                current_window
+            );
+            return;
+        }
 
         // Use FSM's progress cursor to validate this is for the current slot.
         // Collation follows notarized/skipped progress, not finalization.
@@ -6183,14 +6225,14 @@ impl SessionProcessor {
                 .get(&candidate_id)
                 .and_then(|p| p.raw_candidate.block.as_block().map(|b| b.id.seq_no)),
         ) {
-            log::warn!(
-                "Session {} candidate_decision_ok: slot={slot}, hash={:?}, \
-                committed_seqno={committed_seqno}, cand_seqno={cand_seqno} (drop because new \
-                block is already committed)",
-                self.session_id().to_hex_string(),
-                candidate_id,
-            );
             if cand_seqno <= committed_seqno {
+                log::warn!(
+                    "Session {} candidate_decision_ok: slot={slot}, hash={:?}, \
+                    committed_seqno={committed_seqno}, cand_seqno={cand_seqno} (drop because \
+                    new block is already committed)",
+                    self.session_id().to_hex_string(),
+                    candidate_id,
+                );
                 self.pending_approve.remove(&candidate_id);
                 self.pending_validations.remove(&candidate_id);
                 self.validation_attempt_map.remove(&candidate_id);
@@ -6200,7 +6242,8 @@ impl SessionProcessor {
 
         self.candidate_decision_ok_internal(candidate_id, slot, receive_time);
 
-        self.set_next_awake_time(validity_start_time);
+        // Wake immediately so check_all() runs in the very next main-loop iteration
+        self.set_next_awake_time(self.now());
     }
 
     /// Internal helper for successful validation (used by both normal and empty block paths)
@@ -7806,13 +7849,20 @@ impl SessionProcessor {
     ///
     /// This function is idempotent and safe to call multiple times.
     fn try_commit_finalized_chains(&mut self) {
-        // Collect keys to process (avoid borrow conflicts)
-        let finalized_keys: Vec<RawCandidateId> =
+        // Collect keys to process, sorted by (seqno, slot) for deterministic
+        // oldest-first commit ordering (avoid arbitrary HashMap iteration order).
+        let mut finalized_keys: Vec<RawCandidateId> =
             self.finalized_journal_pending_commit.keys().cloned().collect();
 
         if finalized_keys.is_empty() {
             return;
         }
+
+        finalized_keys.sort_unstable_by_key(|id| {
+            let seqno =
+                self.received_candidates.get(id).map(|r| r.block_id.seq_no).unwrap_or(u32::MAX);
+            (seqno, id.slot.0)
+        });
 
         log::trace!(
             "Session {} try_commit_finalized_chains: checking {} finalized blocks",
@@ -7999,10 +8049,6 @@ impl SessionProcessor {
                                             finalized_id: inner_finalized_id,
                                             finalized_seqno: inner_finalized_seqno,
                                         } => {
-                                            // Invariant: commit_target was selected as the *next committable* non-empty
-                                            // masterchain block (seqno == expected_seqno) and we have its FinalCert.
-                                            // Therefore, collect_gapless_commit_chain(commit_target) must NOT return
-                                            // WaitingForFinalCert again.
                                             log::error!(
                                                 "Session {} try_commit_finalized_chains: MC gap \
                                                 recovery invariant violated - \
@@ -8076,9 +8122,18 @@ impl SessionProcessor {
         }
 
         // Remove committed entries from journal
+        let did_commit = !committed_keys.is_empty();
         for key in committed_keys {
             self.finalized_journal_pending_commit.remove(&key);
         }
+
+        // If something was committed, newly-unblocked chains may now be ready.
+        // Reschedule check_all so the session loop re-enters this function.
+        if did_commit {
+            self.set_next_awake_time(self.now());
+        }
+
+        self.finalized_uncommitted_gauge.set(self.finalized_journal_pending_commit.len() as f64);
     }
 
     /// Commit a finalized chain that has been verified as commit-ready
@@ -8372,6 +8427,39 @@ impl SessionProcessor {
 
         // Clean up candidate_data_cache in sync with received_candidates
         self.candidate_data_cache.retain(|id, _| id.slot >= up_to_slot);
+
+        // Remove stale finalized-journal entries for old slots.
+        {
+            let now = self.now();
+            let session_id_hex = self.session_id().to_hex_string();
+            let mut stale_count = 0u32;
+            self.finalized_journal_pending_commit.retain(|id, entry| {
+                if id.slot < up_to_slot {
+                    let age_secs = now
+                        .duration_since(entry.finalized_at)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    log::warn!(
+                        "Session {} cleanup: removing stale finalized-journal entry slot={} \
+                        (finalized {:.1}s ago, never committed)",
+                        &session_id_hex[..8],
+                        id.slot,
+                        age_secs,
+                    );
+                    stale_count += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            if stale_count > 0 {
+                self.session_errors_count
+                    .fetch_add(stale_count, std::sync::atomic::Ordering::Relaxed);
+                self.errors_counter.increment(stale_count as u64);
+                self.finalized_uncommitted_gauge
+                    .set(self.finalized_journal_pending_commit.len() as f64);
+            }
+        }
 
         // Prune log-throttle set to prevent unbounded growth over long sessions
         self.missing_body_logged.retain(|&slot| slot >= up_to_slot.value());

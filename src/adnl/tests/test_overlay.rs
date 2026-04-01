@@ -667,7 +667,9 @@ fn run_propagation(
                             .await
                     }
                     Protocol::TwostepSimple | Protocol::TwostepFec => {
-                        node_send.broadcast_two_step(&overlay_id_send, &data, None, 0).await
+                        node_send
+                            .broadcast_twostep(&overlay_id_send, &data, None, 0, Vec::new())
+                            .await
                     }
                 }
                 .unwrap();

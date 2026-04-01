@@ -430,14 +430,15 @@ impl Engine {
     pub const MASK_SERVICE_ARCHIVES_GC: u32 = 0x0800;
     pub const MASK_SERVICE_SS_CACHE_KEEPER: u32 = 0x1000;
 
-    // Sync status
-    pub const SYNC_STATUS_START_BOOT: u32 = 0x0001;
-    pub const SYNC_STATUS_LOAD_STATES: u32 = 0x0003;
-    pub const SYNC_STATUS_FINISH_BOOT: u32 = 0x0004;
-    pub const SYNC_STATUS_SYNC_BLOCKS: u32 = 0x0005;
-    pub const SYNC_STATUS_FINISH_SYNC: u32 = 0x0006;
-    pub const SYNC_STATUS_CHECKING_DB: u32 = 0x0007;
-    pub const SYNC_STATUS_DB_BROKEN: u32 = 0x0008;
+    // Sync status (ordered by normal flow: boot → states → finish boot → archives → blocks → synced)
+    pub const SYNC_STATUS_START_BOOT: u32 = 1;
+    pub const SYNC_STATUS_LOAD_STATES: u32 = 2;
+    pub const SYNC_STATUS_FINISH_BOOT: u32 = 3;
+    pub const SYNC_STATUS_SYNC_ARCHIVES: u32 = 4;
+    pub const SYNC_STATUS_SYNC_BLOCKS: u32 = 5;
+    pub const SYNC_STATUS_FINISH_SYNC: u32 = 6;
+    pub const SYNC_STATUS_CHECKING_DB: u32 = 7;
+    pub const SYNC_STATUS_DB_BROKEN: u32 = 8;
 
     const MASK_STOP: u32 = 0x80000000;
     const TIMEOUT_STOP_MS: u64 = 1000;
@@ -2293,6 +2294,7 @@ pub async fn run(
 
         // Sync by archives
         if sync_by_archives && !engine.check_sync().await? {
+            engine.set_sync_status(Engine::SYNC_STATUS_SYNC_ARCHIVES);
             struct Checker;
             #[async_trait::async_trait]
             impl crate::sync::StopSyncChecker for Checker {
@@ -2531,8 +2533,8 @@ pub fn init_prometheus_recorder(
     // -- engine
     metrics::describe_gauge!(
         "ton_node_engine_sync_status",
-        "Sync state (0=not_set, 1=boot, 3=load_states, 4=finish_boot, \
-        5=syncing, 6=synced, 7=checking_db, 8=db_broken)"
+        "Sync state (0=not_set, 1=boot, 2=load_states, 3=finish_boot, \
+        4=sync_archives, 5=sync_blocks, 6=synced, 7=checking_db, 8=db_broken)"
     );
     metrics::describe_gauge!(
         "ton_node_engine_timediff_seconds",

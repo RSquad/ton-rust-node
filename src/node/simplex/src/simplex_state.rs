@@ -2534,26 +2534,46 @@ impl SimplexState {
 
             self.ensure_window_exists(window_idx);
 
-            let is_voted = if let Some(window) = self.get_window(window_idx) {
-                window.slots[offset].is_voted
+            // C++ consensus.cpp CandidateReceived only gates on voted_notar (line 170),
+            // NOT voted_skip. A local skip vote must NOT prevent storing a candidate as
+            // pending — the pending retry (`check_pending_blocks`) will notarize it once
+            // the parent base propagates through skip certs.
+            //
+            // Alpenglow uses the stricter `is_voted` (any local vote blocks storage).
+            let dominated = if let Some(window) = self.get_window(window_idx) {
+                if self.opts.enable_fallback_protocol {
+                    window.slots[offset].is_voted
+                } else {
+                    window.slots[offset].voted_notar.is_some()
+                }
             } else {
                 false
             };
 
-            if !is_voted {
+            if !dominated {
                 log::trace!(
                     "SimplexState::on_candidate: ({}/{}) try_notar=false, storing as pending block",
                     window_idx,
                     slot
                 );
-                // Alpenglow: pendingBlocks[s] ← Block(s, hash, hashparent)
+                // C++ parity: first pending candidate wins. If a pending block already
+                // exists for this slot, reject any different candidate (equivocation).
                 if let Some(window) = self.get_window_mut(window_idx) {
+                    if let Some(ref existing) = window.slots[offset].pending_block {
+                        if existing.id.hash != candidate.id.hash {
+                            log::warn!(
+                                "SimplexState::on_candidate: ({window_idx}/{slot}) \
+                                pending_block already set with different hash, ignoring"
+                            );
+                        }
+                        return Ok(());
+                    }
                     window.slots[offset].pending_block = Some(candidate);
                     self.pending_slots.push(PendingSlot(slot));
                 }
             } else {
                 log::trace!(
-                    "SimplexState::on_candidate: ({}/{}) already voted, ignoring candidate",
+                    "SimplexState::on_candidate: ({}/{}) already notarized, ignoring candidate",
                     window_idx,
                     slot
                 );
@@ -4361,8 +4381,11 @@ impl SimplexState {
 
                 slot_state.is_voted
             } else {
-                // C++: only notarize/final blocks further notarize (skip is allowed)
-                slot_state.voted_notar.is_some() || slot_state.its_over
+                // C++ parity: only voted_notar gates notarization. C++ try_notarize()
+                // does NOT check voted_final/its_over — a slot that was finalized on a
+                // previous run can still be re-notarized after restart (the later
+                // auto-finalize simply skips re-broadcasting).
+                slot_state.voted_notar.is_some()
             };
 
             if already_voted {
@@ -5817,6 +5840,14 @@ impl SimplexState {
     ///   `if (auto base = slot.state->available_base) next_slot.state->add_available_base(*base);`
     /// Note: C++ uses `add_available_base` (max-merge), not a conditional assignment.
     ///
+    /// C++ also calls `maybe_resolve_requests()` (pool.cpp) after every certificate,
+    /// which does a backward walk to resolve pending parent-wait requests even if
+    /// `available_base` was not set on intermediate slots. Rust has no backward walk,
+    /// so instead we chain the base forward through all consecutive already-skipped
+    /// slots, ensuring every intermediate slot gets its `available_base` set. This
+    /// allows `check_pending_blocks` / `try_notar` to find the base for any pending
+    /// block regardless of skip-cert arrival order.
+    ///
     /// This is always called when a slot is skipped, regardless of mode.
     /// The tracked state is used for progress when `use_notarized_parent_chain` is enabled.
     fn propagate_base_after_skip_cert(&mut self, desc: &SessionDescription, slot: SlotIndex) {
@@ -5830,19 +5861,36 @@ impl SimplexState {
             );
         }
 
-        // Propagate base forward using max-merge: if slot has a base, merge it into
-        // the next non-skipped slot (C++ pool.cpp on_skip: add_available_base).
-        let next_slot = self.find_next_nonskipped_slot(desc, slot);
-        let current_base = self.get_slot_available_base(desc, slot);
-
-        if let Some(base) = current_base {
-            if let Some(next_state) = self.get_slot_mut(desc, next_slot) {
+        // Chain base forward: propagate slot-by-slot through consecutive already-skipped
+        // slots. Unlike the previous `find_next_nonskipped_slot` approach which jumped
+        // directly to the first non-skipped slot (potentially hundreds of slots away),
+        // this ensures every intermediate skipped slot gets its `available_base` set.
+        //
+        // Without this chaining, skip certs arriving out-of-order leave gaps:
+        //   cert(5) arrives first → slot 5 has no base → nothing propagates
+        //   cert(0) arrives → base jumps from 0 to 388 (next non-skipped) → slots 1-387 have no base
+        // With chaining:
+        //   cert(0) → base set on slot 1 → slot 1 already skipped → chain to slot 2 → ... → slot 388
+        let mut current = slot;
+        loop {
+            let current_base = self.get_slot_available_base(desc, current);
+            let Some(base) = current_base else {
+                break;
+            };
+            let next = current + 1;
+            self.ensure_window_exists(desc.get_window_idx(next));
+            if let Some(next_state) = self.get_slot_mut(desc, next) {
                 log::trace!(
                     "SimplexState: propagating base from skipped slot {} -> slot {} (max-merge)",
-                    slot,
-                    next_slot
+                    current,
+                    next
                 );
                 next_state.add_available_base_max(base);
+            }
+            if self.is_slot_skipped_cert(desc, next) {
+                current = next;
+            } else {
+                break;
             }
         }
 
@@ -5953,12 +6001,21 @@ impl SimplexState {
         panic!("SimplexState::find_next_nonskipped_slot: exceeded scan limit from slot {}", slot);
     }
 
-    /// Advance leader window when progress cursor crosses window boundary
+    /// Advance leader window when progress cursor crosses window boundary.
     ///
     /// Reference: C++ pool.cpp maybe_publish_new_leader_windows()
     ///
     /// This triggers timeout scheduling for the new window and applies adaptive backoff.
     /// Only called when `SimplexStateOptions::use_notarized_parent_chain` is enabled.
+    ///
+    /// # Ordering guarantee (C++ parity: PR #2195)
+    ///
+    /// `current_leader_window_idx` is updated here, inside `check_all()` ->
+    /// notarization/skip handlers -> `advance_progress_cursor()` -> this method.
+    /// `SessionProcessor::check_collation()` runs strictly after `check_all()`
+    /// returns, so the leader-status check always sees the up-to-date window.
+    /// This mirrors C++ consensus.cpp where `current_window_` is set BEFORE
+    /// the leader check in the `LeaderWindowObserved` handler.
     fn advance_leader_window_on_progress_cursor(&mut self, desc: &SessionDescription) {
         let now_window = desc.get_window_idx(self.first_non_progressed_slot);
         if now_window <= self.current_leader_window_idx {

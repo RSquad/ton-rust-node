@@ -793,6 +793,7 @@ impl TonNodeConfig {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn get_validator_key_info(&self, validator_key_id: &str) -> Result<Option<ValidatorKeysJson>> {
         if let Some(validator_keys) = &self.validator_keys {
             for key_json in validator_keys {
@@ -1021,10 +1022,11 @@ impl TonNodeConfig {
         election_id: i32,
         expire_at: i32,
     ) -> Result<ValidatorKeysJson> {
+        let new_key_id_b64 = base64_encode(key_id);
         let key_info = ValidatorKeysJson {
             expire_at,
             election_id,
-            validator_key_id: base64_encode(key_id),
+            validator_key_id: new_key_id_b64.clone(),
             validator_adnl_key_id: None,
         };
 
@@ -1034,7 +1036,16 @@ impl TonNodeConfig {
         let added_key_info = self.get_validator_key_info_by_election_id(&election_id)?;
         match &mut self.validator_keys {
             Some(validator_keys) => match added_key_info {
-                Some(_) => {
+                Some(existing) => {
+                    if existing.validator_key_id != new_key_id_b64 {
+                        log::warn!(
+                            "add_validator_key: OVERWRITING validator key for election_id={}: \
+                             old_key={} -> new_key={} (adnl_key will be cleared)",
+                            election_id,
+                            existing.validator_key_id,
+                            new_key_id_b64,
+                        );
+                    }
                     self.update_validator_key_info(key_info.clone())?;
                 }
                 None => {
@@ -1054,12 +1065,46 @@ impl TonNodeConfig {
         validator_key_id: &[u8; 32],
         adnl_key_id: &[u8; 32],
     ) -> Result<ValidatorKeysJson> {
-        if let Some(mut key_info) = self.get_validator_key_info(&base64_encode(validator_key_id))? {
-            key_info.validator_adnl_key_id = Some(base64_encode(adnl_key_id));
-            self.update_validator_key_info(key_info)
-        } else {
+        let key_id_b64 = base64_encode(validator_key_id);
+        let new_adnl_b64 = base64_encode(adnl_key_id);
+
+        let matching: Vec<ValidatorKeysJson> = self
+            .validator_keys
+            .as_ref()
+            .map(|keys| keys.iter().filter(|k| k.validator_key_id == key_id_b64).cloned().collect())
+            .unwrap_or_default();
+
+        if matching.is_empty() {
             fail!("Validator key have not been added!")
         }
+
+        let mut last_updated = None;
+        for entry in &matching {
+            if let Some(existing_adnl) = &entry.validator_adnl_key_id {
+                if *existing_adnl != new_adnl_b64 {
+                    log::warn!(
+                        "add_validator_adnl_key: OVERWRITING adnl key for election_id={}: \
+                         old_adnl={} -> new_adnl={} (validator_key={})",
+                        entry.election_id,
+                        existing_adnl,
+                        new_adnl_b64,
+                        key_id_b64,
+                    );
+                }
+            }
+            let mut updated = entry.clone();
+            updated.validator_adnl_key_id = Some(new_adnl_b64.clone());
+            last_updated = Some(self.update_validator_key_info(updated)?);
+        }
+        if matching.len() > 1 {
+            log::info!(
+                "add_validator_adnl_key: updated adnl binding for {} elections sharing \
+                 validator_key={}",
+                matching.len(),
+                key_id_b64,
+            );
+        }
+        Ok(last_updated.unwrap())
     }
 
     async fn remove_validator_key(
@@ -2154,7 +2199,27 @@ impl ValidatorKeys {
         // inserted in sorted order
         let mut first = false;
 
-        add_unbound_object_to_map_with_update(&self.values, key.election_id, |_| {
+        add_unbound_object_to_map_with_update(&self.values, key.election_id, |old| {
+            if let Some(existing) = old {
+                if existing.validator_key_id != key.validator_key_id {
+                    log::warn!(
+                        "ValidatorKeys: replacing validator key for election_id={}: \
+                         old_key={} -> new_key={}",
+                        key.election_id,
+                        existing.validator_key_id,
+                        key.validator_key_id,
+                    );
+                }
+                if existing.validator_adnl_key_id != key.validator_adnl_key_id {
+                    log::warn!(
+                        "ValidatorKeys: adnl key changed for election_id={}: \
+                         old_adnl={:?} -> new_adnl={:?}",
+                        key.election_id,
+                        existing.validator_adnl_key_id,
+                        key.validator_adnl_key_id,
+                    );
+                }
+            }
             if self
                 .first
                 .compare_exchange(

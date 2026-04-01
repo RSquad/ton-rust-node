@@ -177,8 +177,8 @@ impl<Q> SendQueue<Q> {
         true
     }
 
-    pub(crate) fn is_inactive(&self) -> bool {
-        self.sync.load(Ordering::Relaxed) == Self::SYNC_INACTIVE
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len.load(Ordering::Relaxed) == 0
     }
 
     fn switch(&self, from: u8, to: u8) -> bool {

@@ -13,6 +13,7 @@ use adnl::{
     QuicNode,
 };
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -129,7 +130,7 @@ fn test_quic_concurrent_accept() {
 
         let server_bind: SocketAddr =
             format!("127.0.0.1:{}", SERVER_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
-        let server = QuicNode::new(vec![server_sub], server_token.clone());
+        let server = QuicNode::new(vec![server_sub], server_token.clone(), None);
         server.add_key(&server_key, &server_key_id, server_bind).unwrap();
 
         // --- clients ---
@@ -157,7 +158,7 @@ fn test_quic_concurrent_accept() {
             let bind: SocketAddr =
                 format!("127.0.0.1:{}", port + QuicNode::OFFSET_PORT).parse().unwrap();
             let token = CancellationToken::new();
-            let quic = QuicNode::new(vec![sub], token.clone());
+            let quic = QuicNode::new(vec![sub], token.clone(), None);
             quic.add_key(&key, &key_id, bind).unwrap();
             quic.add_peer_key(server_key_id.clone(), server_bind).unwrap();
             server.add_peer_key(key_id.clone(), bind).unwrap();
@@ -253,10 +254,10 @@ fn test_quic_session() {
         let bind_a: SocketAddr = "127.0.0.1:5600".parse().unwrap();
         let bind_b: SocketAddr = "127.0.0.1:5601".parse().unwrap();
 
-        let quic_a = QuicNode::new(vec![sub_a], token_a.clone());
+        let quic_a = QuicNode::new(vec![sub_a], token_a.clone(), None);
         quic_a.add_key(&key_bytes_a, &key_id_a, bind_a).unwrap();
 
-        let quic_b = QuicNode::new(vec![sub_b], token_b.clone());
+        let quic_b = QuicNode::new(vec![sub_b], token_b.clone(), None);
         quic_b.add_key(&key_bytes_b, &key_id_b, bind_b).unwrap();
 
         // Register peer addresses
@@ -334,7 +335,7 @@ fn test_quic_reconnect_after_server_restart() {
         let client_sub = Arc::new(TestSubscriber { key_id: client_key_id.clone(), msg_tx: cli_tx })
             as Arc<dyn Subscriber>;
 
-        let client = QuicNode::new(vec![client_sub], client_token.clone());
+        let client = QuicNode::new(vec![client_sub], client_token.clone(), None);
         client.add_key(&client_key, &client_key_id, client_bind).unwrap();
 
         // --- server B1 (will be shut down) ---
@@ -353,7 +354,7 @@ fn test_quic_reconnect_after_server_restart() {
             Arc::new(TestSubscriber { key_id: server_key_id.clone(), msg_tx: srv_tx1 })
                 as Arc<dyn Subscriber>;
 
-        let server1 = QuicNode::new(vec![server_sub1], server_token1.clone());
+        let server1 = QuicNode::new(vec![server_sub1], server_token1.clone(), None);
         server1.add_key(&server_key, &server_key_id, server_bind).unwrap();
 
         // Register peer keys
@@ -387,7 +388,7 @@ fn test_quic_reconnect_after_server_restart() {
             Arc::new(TestSubscriber { key_id: server_key_id.clone(), msg_tx: srv_tx2 })
                 as Arc<dyn Subscriber>;
 
-        let server2 = QuicNode::new(vec![server_sub2], server_token2.clone());
+        let server2 = QuicNode::new(vec![server_sub2], server_token2.clone(), None);
         server2.add_key(&server_key, &server_key_id, server_bind).unwrap();
         server2.add_peer_key(client_key_id.clone(), client_bind).unwrap();
         println!("Step 3: server B2 started on same port with same key");
@@ -490,7 +491,7 @@ fn test_quic_stream_limit() {
         let server_bind: SocketAddr =
             format!("127.0.0.1:{}", SERVER_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
         let server =
-            QuicNode::with_stream_limit(vec![server_sub], server_token.clone(), STREAM_LIMIT);
+            QuicNode::new(vec![server_sub], server_token.clone(), Some(STREAM_LIMIT));
         server.add_key(&server_key, &server_key_id, server_bind).unwrap();
 
         // --- client (normal limits) ---
@@ -509,7 +510,7 @@ fn test_quic_stream_limit() {
 
         let client_bind: SocketAddr =
             format!("127.0.0.1:{}", CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
-        let client = QuicNode::new(vec![client_sub], client_token.clone());
+        let client = QuicNode::new(vec![client_sub], client_token.clone(), None);
         client.add_key(&client_key, &client_key_id, client_bind).unwrap();
 
         // Register peers
@@ -593,7 +594,7 @@ fn make_endpoint(
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let sub =
         Arc::new(TestSubscriber { key_id: key_id.clone(), msg_tx: tx }) as Arc<dyn Subscriber>;
-    let quic = QuicNode::new(vec![sub], token.clone());
+    let quic = QuicNode::new(vec![sub], token.clone(), None);
     quic.add_key(&key, &key_id, bind).unwrap();
     (quic, key, key_id, bind, token)
 }
@@ -1263,7 +1264,7 @@ fn test_quic_connection_pool_exhaustion() {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let sub = Arc::new(TestSubscriber { key_id: key_id.clone(), msg_tx: tx })
                 as Arc<dyn Subscriber>;
-            let quic = QuicNode::new(vec![sub], token.clone());
+            let quic = QuicNode::new(vec![sub], token.clone(), None);
             quic.add_key(&key, &key_id, bind).unwrap();
             quic.add_peer_key(server_key_id.clone(), server_bind).unwrap();
             server.add_peer_key(key_id.clone(), bind).unwrap();
@@ -1333,5 +1334,243 @@ fn test_quic_connection_pool_exhaustion() {
         fk_token.cancel();
         server.shutdown();
         server_token.cancel();
+    });
+}
+
+/// Fire messages through a server restart cycle. Verifies the sender task
+/// drains the queue after reconnection without hanging or losing messages.
+/// In the old hot-loop design, the yield_now() spins would starve the runtime.
+#[test]
+fn test_quic_message_burst_reconnect() {
+    init_test_log();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        const CLIENT_PORT: u16 = 8100;
+        const SERVER_PORT: u16 = 8101;
+        const BURST_SIZE: usize = 50;
+
+        let client_bind: SocketAddr = format!("127.0.0.1:{CLIENT_PORT}").parse().unwrap();
+        let server_bind: SocketAddr = format!("127.0.0.1:{SERVER_PORT}").parse().unwrap();
+
+        let client_token = CancellationToken::new();
+        let client_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, client_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{CLIENT_PORT}"),
+            vec![(client_key, KEY_TAG)],
+        )
+        .unwrap();
+        let client_key_id = client_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        let (cli_tx, _cli_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client_sub = Arc::new(TestSubscriber { key_id: client_key_id.clone(), msg_tx: cli_tx })
+            as Arc<dyn Subscriber>;
+        let client = QuicNode::new(vec![client_sub], client_token.clone(), None);
+        client.add_key(&client_key, &client_key_id, client_bind).unwrap();
+
+        let server_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, server_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{SERVER_PORT}"),
+            vec![(server_key, KEY_TAG)],
+        )
+        .unwrap();
+        let server_key_id = server_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        // --- Phase 1: first server instance ---
+        let srv_token1 = CancellationToken::new();
+        let (srv_tx1, mut srv_rx1) = tokio::sync::mpsc::unbounded_channel();
+        let srv_sub1 = Arc::new(TestSubscriber { key_id: server_key_id.clone(), msg_tx: srv_tx1 })
+            as Arc<dyn Subscriber>;
+        let server1 = QuicNode::new(vec![srv_sub1], srv_token1.clone(), None);
+        server1.add_key(&server_key, &server_key_id, server_bind).unwrap();
+
+        client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
+        server1.add_peer_key(client_key_id.clone(), client_bind).unwrap();
+
+        for i in 0..BURST_SIZE {
+            let payload = format!("msg-phase1-{i}").into_bytes();
+            client.message(payload, None, &client_key_id, &server_key_id).await.unwrap();
+        }
+
+        let expected_p1: HashSet<Vec<u8>> =
+            (0..BURST_SIZE).map(|i| format!("msg-phase1-{i}").into_bytes()).collect();
+        let mut got_p1 = HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while got_p1.len() < BURST_SIZE {
+            match tokio::time::timeout_at(deadline, srv_rx1.recv()).await {
+                Ok(Some(data)) => {
+                    got_p1.insert(data);
+                }
+                _ => break,
+            }
+        }
+        println!("Phase 1: received {}/{BURST_SIZE} unique messages", got_p1.len());
+        assert_eq!(
+            got_p1, expected_p1,
+            "Phase 1 must deliver every distinct message (at-least-once guarantee)"
+        );
+
+        // --- Phase 2: restart server, send another burst ---
+        server1.shutdown();
+        srv_token1.cancel();
+        drop(server1);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        let srv_token2 = CancellationToken::new();
+        let (srv_tx2, mut srv_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let srv_sub2 = Arc::new(TestSubscriber { key_id: server_key_id.clone(), msg_tx: srv_tx2 })
+            as Arc<dyn Subscriber>;
+        let server2 = QuicNode::new(vec![srv_sub2], srv_token2.clone(), None);
+        server2.add_key(&server_key, &server_key_id, server_bind).unwrap();
+        server2.add_peer_key(client_key_id.clone(), client_bind).unwrap();
+
+        for i in 0..BURST_SIZE {
+            let payload = format!("msg-phase2-{i}").into_bytes();
+            client.message(payload, None, &client_key_id, &server_key_id).await.unwrap();
+        }
+
+        let expected_p2: HashSet<Vec<u8>> =
+            (0..BURST_SIZE).map(|i| format!("msg-phase2-{i}").into_bytes()).collect();
+        let mut got_p2 = HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while got_p2.len() < BURST_SIZE {
+            match tokio::time::timeout_at(deadline, srv_rx2.recv()).await {
+                Ok(Some(data)) => {
+                    got_p2.insert(data);
+                }
+                _ => break,
+            }
+        }
+        println!(
+            "Phase 2: received {}/{BURST_SIZE} unique messages after server restart",
+            got_p2.len()
+        );
+        assert_eq!(
+            got_p2, expected_p2,
+            "Phase 2 must deliver every distinct message after restart (at-least-once guarantee)"
+        );
+
+        client.shutdown();
+        server2.shutdown();
+        client_token.cancel();
+        srv_token2.cancel();
+    });
+}
+
+/// Concurrent message senders to the same peer must not deadlock or starve
+/// the Tokio runtime. Uses only 2 worker threads to make thread starvation
+/// from the old yield_now() hot loops detectable.
+#[test]
+fn test_quic_single_sender_invariant() {
+    init_test_log();
+    let rt =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        const CLIENT_PORT: u16 = 8200;
+        const SERVER_PORT: u16 = 8201;
+        const NUM_SENDERS: usize = 20;
+        const MSGS_PER_SENDER: usize = 5;
+        const TOTAL_MSGS: usize = NUM_SENDERS * MSGS_PER_SENDER;
+        const TIMEOUT: Duration = Duration::from_secs(20);
+
+        let client_bind: SocketAddr = format!("127.0.0.1:{CLIENT_PORT}").parse().unwrap();
+        let server_bind: SocketAddr = format!("127.0.0.1:{SERVER_PORT}").parse().unwrap();
+
+        let client_token = CancellationToken::new();
+        let client_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, client_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{CLIENT_PORT}"),
+            vec![(client_key, KEY_TAG)],
+        )
+        .unwrap();
+        let client_key_id = client_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        let (cli_tx, _cli_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client_sub = Arc::new(TestSubscriber { key_id: client_key_id.clone(), msg_tx: cli_tx })
+            as Arc<dyn Subscriber>;
+        let client = QuicNode::new(vec![client_sub], client_token.clone(), None);
+        client.add_key(&client_key, &client_key_id, client_bind).unwrap();
+
+        let srv_token = CancellationToken::new();
+        let server_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, server_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{SERVER_PORT}"),
+            vec![(server_key, KEY_TAG)],
+        )
+        .unwrap();
+        let server_key_id = server_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        let (srv_tx, mut srv_rx) = tokio::sync::mpsc::unbounded_channel();
+        let srv_sub = Arc::new(TestSubscriber { key_id: server_key_id.clone(), msg_tx: srv_tx })
+            as Arc<dyn Subscriber>;
+        let server = QuicNode::new(vec![srv_sub], srv_token.clone(), None);
+        server.add_key(&server_key, &server_key_id, server_bind).unwrap();
+
+        client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
+        server.add_peer_key(client_key_id.clone(), client_bind).unwrap();
+
+        let expected: HashSet<Vec<u8>> = (0..NUM_SENDERS)
+            .flat_map(|s| {
+                (0..MSGS_PER_SENDER).map(move |m| format!("sender-{s}-msg-{m}").into_bytes())
+            })
+            .collect();
+        let got = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let got_clone = got.clone();
+        let drain_handle = tokio::spawn(async move {
+            while let Some(data) = srv_rx.recv().await {
+                got_clone.lock().await.insert(data);
+            }
+        });
+
+        let mut handles = Vec::with_capacity(NUM_SENDERS);
+        for sender_id in 0..NUM_SENDERS {
+            let quic = client.clone();
+            let src = client_key_id.clone();
+            let dst = server_key_id.clone();
+            handles.push(tokio::spawn(async move {
+                for msg_id in 0..MSGS_PER_SENDER {
+                    let payload = format!("sender-{sender_id}-msg-{msg_id}").into_bytes();
+                    if let Err(e) = quic.message(payload, None, &src, &dst).await {
+                        eprintln!("sender {sender_id} msg {msg_id} failed: {e}");
+                    }
+                }
+            }));
+        }
+
+        let send_result = tokio::time::timeout(TIMEOUT, async {
+            for h in handles {
+                h.await.expect("sender task panicked");
+            }
+        })
+        .await;
+        assert!(send_result.is_ok(), "Concurrent senders timed out — possible hot-loop regression");
+
+        let recv_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let unique_count = got.lock().await.len();
+            if unique_count >= TOTAL_MSGS {
+                break;
+            }
+            if tokio::time::Instant::now() >= recv_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let received = got.lock().await;
+        println!(
+            "Single-sender invariant: {}/{TOTAL_MSGS} unique messages delivered \
+             by {NUM_SENDERS} concurrent senders on 2 Tokio threads",
+            received.len()
+        );
+        assert_eq!(
+            *received, expected,
+            "All {TOTAL_MSGS} distinct messages must be delivered (at-least-once guarantee)"
+        );
+
+        client.shutdown();
+        server.shutdown();
+        client_token.cancel();
+        srv_token.cancel();
+        drain_handle.abort();
     });
 }

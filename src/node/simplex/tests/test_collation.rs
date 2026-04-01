@@ -350,7 +350,6 @@ fn run_collation_test() {
         &session_opts,
         &session_id,
         &shard,
-        initial_block_seqno,
         nodes,
         &private_key,
         db_path,
@@ -358,6 +357,7 @@ fn run_collation_test() {
         Arc::downgrade(&session_listener),
     )
     .expect("Failed to create session");
+    session.start(initial_block_seqno);
 
     log::info!("Session created, waiting for collation callback...");
 

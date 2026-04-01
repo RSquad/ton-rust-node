@@ -11,8 +11,8 @@
 use crate::{
     block::{BlockIdExtExtention, BlockStuff},
     internal_db::{
-        BlockHandle, InternalDb, ARCHIVES_GC_BLOCK, LAST_APPLIED_MC_BLOCK, LAST_ROTATION_MC_BLOCK,
-        PSS_KEEPER_MC_BLOCK, SHARD_CLIENT_MC_BLOCK,
+        BlockHandle, InternalDb, ARCHIVES_GC_BLOCK, DESTROYED_VALIDATOR_SESSIONS,
+        LAST_APPLIED_MC_BLOCK, LAST_ROTATION_MC_BLOCK, PSS_KEEPER_MC_BLOCK, SHARD_CLIENT_MC_BLOCK,
     },
     shard_state::ShardStateStuff,
 };
@@ -673,6 +673,7 @@ async fn calc_min_mc_state_id(
                 min_id = id;
             } else {
                 db.drop_validator_state(LAST_ROTATION_MC_BLOCK)?;
+                db.drop_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)?;
             }
         }
     }

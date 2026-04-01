@@ -624,7 +624,7 @@ pub(crate) struct SendPartContextV2 {
     pub(crate) tag: u32,
     #[cfg(feature = "debug")]
     pub(crate) timestamp: Arc<AtomicPtr<Instant>>,
-    #[cfg(feature = "debug")]
+    #[cfg(any(feature = "debug", feature = "telemetry"))]
     pub(crate) total_packets: Arc<AtomicU32>,
     pub(crate) transfer_str: String,
 }

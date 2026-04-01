@@ -370,6 +370,7 @@ fn run_overlay_test(
                 &node1.adnl_id,
                 &node1.public_key.id(),
                 broadcast_payload.clone(),
+                None,
             );
         }
     }
@@ -778,6 +779,7 @@ fn run_adnl_overlay_performance_test(
                     &node1.adnl_id,
                     &node1.public_key.id(),
                     make_broadcast_payload(),
+                    None,
                 );
                 broadcasts_sent += 1;
                 thread::sleep(SLEEP_TIME);
