@@ -5996,7 +5996,9 @@ impl SessionProcessor {
                 }
             }
 
-            // Empty blocks don't need validation (C++ skips validation for empty blocks)
+            // Empty blocks skip ValidatorGroup validation but still need FSM-tip reference
+            // check (performed in try_approve_block). C++ block-validator.cpp rejects unless
+            // block == event->state->as_normal().
             if pending.raw_candidate.block.is_empty() {
                 to_validate.push((
                     candidate_id.clone(),
@@ -6035,6 +6037,36 @@ impl SessionProcessor {
         }
     }
 
+    /// Resolve the expected referenced BlockIdExt for an empty candidate.
+    ///
+    /// Walks the parent chain through `received_candidates` until a non-empty
+    /// ancestor is found. Returns its `block_id`, which is the C++ equivalent
+    /// of `event->state->as_normal()` in `block-validator.cpp`.
+    ///
+    /// Returns `None` if the parent chain is broken, missing, or contains
+    /// only empty ancestors (no normal tip exists).
+    fn resolve_expected_empty_block(&self, raw_candidate: &RawCandidate) -> Option<BlockIdExt> {
+        let parent_id = raw_candidate.parent_id.as_ref()?;
+        let parent = self.received_candidates.get(parent_id)?;
+        if !parent.is_empty {
+            return Some(parent.block_id.clone());
+        }
+        let mut current_parent = parent.parent_id.clone();
+        let mut depth = 0u32;
+        while let Some(pid) = current_parent {
+            depth += 1;
+            if depth > MAX_CHAIN_DEPTH {
+                return None;
+            }
+            let ancestor = self.received_candidates.get(&pid)?;
+            if !ancestor.is_empty {
+                return Some(ancestor.block_id.clone());
+            }
+            current_parent = ancestor.parent_id.clone();
+        }
+        None
+    }
+
     /// Try to approve a block candidate by sending to higher layer
     ///
     /// Reference: validator-session/src/session_processor.rs try_approve_block()
@@ -6070,15 +6102,53 @@ impl SessionProcessor {
             return;
         };
 
-        // Handle empty blocks (no validation needed)
+        // Handle empty blocks: C++ block-validator.cpp rejects unless the referenced
+        // block equals event->state->as_normal(). We resolve the expected block from
+        // the parent chain and compare before approving.
         if pending.raw_candidate.block.is_empty() {
-            log::trace!(
-                "Session {} try_approve_block: empty block, auto-approving {:?}",
-                self.session_id().to_hex_string(),
-                candidate_id,
-            );
-            // Empty blocks are auto-approved - directly push to validated_candidates
-            self.candidate_decision_ok_internal(candidate_id.clone(), slot, receive_time);
+            let referenced_block = pending.raw_candidate.block.block_id().clone();
+            let expected = self.resolve_expected_empty_block(&pending.raw_candidate);
+            let cid = candidate_id.clone();
+
+            match expected {
+                Some(expected_block) if referenced_block == expected_block => {
+                    log::trace!(
+                        "Session {} try_approve_block: empty block matches parent normal tip, \
+                        approving {:?}",
+                        self.session_id().to_hex_string(),
+                        cid,
+                    );
+                    self.candidate_decision_ok_internal(cid, slot, receive_time);
+                }
+                Some(expected_block) => {
+                    log::warn!(
+                        "Session {} try_approve_block: empty block REJECTED — wrong referenced \
+                        block (got seqno={}, expected seqno={}) for {:?}",
+                        self.session_id().to_hex_string(),
+                        referenced_block.seq_no,
+                        expected_block.seq_no,
+                        cid,
+                    );
+                    self.candidate_decision_fail(
+                        slot,
+                        cid,
+                        error!("Wrong referenced block in empty candidate"),
+                    );
+                }
+                None => {
+                    log::warn!(
+                        "Session {} try_approve_block: empty block REJECTED — cannot resolve \
+                        parent normal tip for {:?}",
+                        self.session_id().to_hex_string(),
+                        cid,
+                    );
+                    self.candidate_decision_fail(
+                        slot,
+                        cid,
+                        error!("Cannot resolve parent normal tip for empty candidate"),
+                    );
+                }
+            }
             return;
         }
 
