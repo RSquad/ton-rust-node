@@ -12,7 +12,7 @@ use crate::{
     block::{construct_and_check_prev_stuff, BlockStuff},
     block_proof::BlockProofStuff,
     engine_traits::EngineOperations,
-    full_node::apply_block::calc_shard_state,
+    full_node::apply_block::store_state_update,
     shard_state::ShardStateStuff,
     types::top_block_descr::TopBlockDescrStuff,
     validating_utils::{fmt_block_id_short, simplex_to_sign_checked, UNREGISTERED_CHAIN_MAX_LEN},
@@ -295,8 +295,7 @@ pub async fn accept_block_routine(
     }
 
     log::debug!(target: "validator", "({}): accept_block: calculating shard state", block_descr);
-    let _ss =
-        calc_shard_state(&handle, &block, &(prev[0].clone(), prev.get(1).cloned()), engine).await?;
+    store_state_update(&handle, &block, &(prev[0].clone(), prev.get(1).cloned()), engine).await?;
 
     // Create proof using variant-aware function if Simplex variant provided
     let (proof, signatures_out) = match signatures_variant {

@@ -23,7 +23,7 @@ use crate::{
     StorageAlloc,
 };
 use std::{future::Future, path::Path, pin::Pin, sync::Arc};
-use ton_block::{error, BlockIdExt, Result, ShardIdent, UInt256};
+use ton_block::{error, AccountIdPrefixFull, BlockIdExt, Result, ShardIdent, UInt256};
 
 const DB_PATH: &str = "../../target/test";
 
@@ -41,6 +41,7 @@ async fn prepare_test(
     name: &str,
     package_type: PackageType,
     shard_split_depth: u8,
+    archive_id: u32,
 ) -> Result<(Arc<RocksDb>, TestContext)> {
     let db_root = Path::new(DB_PATH).join(name);
     let _ = std::fs::remove_dir_all(&db_root);
@@ -48,7 +49,7 @@ async fn prepare_test(
     let archive_slice = ArchiveSlice::new_empty(
         db.clone(),
         Arc::new(db_root),
-        0,
+        archive_id,
         package_type,
         shard_split_depth,
         #[cfg(feature = "telemetry")]
@@ -72,9 +73,11 @@ async fn run_test(
     name: &str,
     package_type: PackageType,
     shard_split_depth: u8,
+    archive_id: u32,
     scenario: impl Fn(TestContext) -> Pinned,
 ) -> Result<()> {
-    let (db, test_context) = prepare_test(name, package_type, shard_split_depth).await?;
+    let (db, test_context) =
+        prepare_test(name, package_type, shard_split_depth, archive_id).await?;
     scenario(test_context).await?;
     destroy_db(db, name).await;
     Ok(())
@@ -147,7 +150,7 @@ async fn test_scenario_gold() -> Result<()> {
         Ok(())
     }
 
-    run_test("test_archive_slice_scenario_gold", PackageType::Blocks, 0, |ctx| {
+    run_test("test_archive_slice_scenario_gold", PackageType::Blocks, 0, 0, |ctx| {
         Box::pin(scenario(ctx))
     })
     .await
@@ -184,6 +187,53 @@ async fn test_key_blocks_slice() -> Result<()> {
         Ok(())
     }
 
-    run_test("test_key_blocks_slice", PackageType::KeyBlocks, 0, |ctx| Box::pin(scenario(ctx)))
+    run_test("test_key_blocks_slice", PackageType::KeyBlocks, 0, 0, |ctx| Box::pin(scenario(ctx)))
         .await
+}
+
+#[tokio::test]
+async fn test_lookup_proof_by_seqno() -> Result<()> {
+    async fn scenario(test_context: TestContext) -> Result<()> {
+        let proof_data = vec![7u8, 8, 9];
+        let mc_seqno = 55u32;
+
+        let block_id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            mc_seqno,
+            UInt256::with_array([mc_seqno as u8; 32]),
+            UInt256::default(),
+        );
+        let meta = BlockMeta::with_data(0, 1000, 100_000, mc_seqno, 0);
+        let handle = test_context
+            .block_handle_storage
+            .create_handle(block_id.clone(), meta, None)?
+            .ok_or_else(|| error!("Cannot create handle"))?;
+
+        test_context
+            .archive_slice
+            .add_file(&handle, &PackageEntryId::Block(&block_id), vec![1, 2, 3])
+            .await?;
+        test_context
+            .archive_slice
+            .add_file(&handle, &PackageEntryId::Proof(&block_id), proof_data.clone())
+            .await?;
+
+        let prefix = AccountIdPrefixFull { workchain_id: -1, prefix: 0 };
+
+        let result = test_context.archive_slice.lookup_proof_by_seqno(&prefix, mc_seqno).await?;
+        let (found_id, found_data) = result.expect("proof should be found");
+        assert_eq!(found_id, block_id);
+        assert_eq!(found_data, proof_data);
+
+        let result = test_context.archive_slice.lookup_proof_by_seqno(&prefix, 999).await?;
+        assert!(result.is_none(), "lookup of non-existent seqno should return None");
+
+        drop(test_context);
+        Ok(())
+    }
+
+    run_test("test_lookup_proof_by_seqno", PackageType::Blocks, 0, 50, |ctx| {
+        Box::pin(scenario(ctx))
+    })
+    .await
 }

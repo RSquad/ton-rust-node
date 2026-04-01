@@ -109,4 +109,11 @@ impl PackageEntry {
     pub fn take_data(self) -> Vec<u8> {
         self.data
     }
+
+    /// Returns the serialized size of this entry (header + filename + data).
+    pub fn serialized_size(&self) -> u64 {
+        PKG_ENTRY_HEADER_SIZE as u64
+            + self.filename.as_bytes().len() as u64
+            + self.data.len() as u64
+    }
 }

@@ -747,6 +747,16 @@ impl EngineOperations for Engine {
         Ok(state)
     }
 
+    async fn store_state_update(
+        &self,
+        handle: &Arc<BlockHandle>,
+        state_update: Cell,
+    ) -> Result<()> {
+        self.db().store_state_update(handle, state_update).await?;
+        self.shard_states_awaiters().shunt_async(handle.id(), self.load_state(handle.id())).await?;
+        Ok(())
+    }
+
     async fn store_zerostate(
         &self,
         state: Arc<ShardStateStuff>,
@@ -1247,6 +1257,10 @@ impl EngineOperations for Engine {
         config: &ConfigParams,
     ) -> Result<()> {
         self.update_public_overlays(keyblock_id, config).await
+    }
+
+    fn is_archival_mode(&self) -> bool {
+        self.db().is_archival_mode()
     }
 }
 

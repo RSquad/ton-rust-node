@@ -8,11 +8,14 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+pub mod archive_shardstate_db;
 pub mod archives;
 pub mod block_handle_db;
 pub mod block_info_db;
 pub mod catchain_persistent_db;
+pub mod cell_db;
 pub mod db;
+pub mod dynamic_boc_archive_db;
 pub mod dynamic_boc_rc_db;
 pub mod error;
 mod macros;

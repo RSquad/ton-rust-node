@@ -44,7 +44,7 @@ use std::{
     },
     time::Duration,
 };
-use storage::shardstate_db_async::CellsDbConfig;
+use storage::{archives::epoch::ArchivalModeConfig, shardstate_db_async::CellsDbConfig};
 use ton_api::{
     ton::{
         self,
@@ -408,6 +408,8 @@ pub struct TonNodeConfig {
     sync_by_archives: bool,
     #[serde(default)]
     accelerated_consensus_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archival_mode: Option<ArchivalModeConfig>,
     #[serde(skip)]
     custom_overlays: CustomOverlaysConfigBoxed,
     #[serde(default)]
@@ -619,12 +621,20 @@ impl TonNodeConfig {
     }
 
     pub fn gc_archives_life_time_hours(&self) -> Option<u32> {
+        // GC disabled in archival mode
+        if self.archival_mode.is_some() {
+            return None;
+        }
         if let Some(gc) = &self.gc {
             if gc.enable_for_archives {
                 return gc.archives_life_time_hours.or(Some(0));
             }
         }
         None
+    }
+
+    pub fn archival_mode(&self) -> Option<&ArchivalModeConfig> {
+        self.archival_mode.as_ref()
     }
 
     pub fn internal_db_path(&self) -> &str {
