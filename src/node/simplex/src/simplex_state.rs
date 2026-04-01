@@ -6034,25 +6034,29 @@ impl SimplexState {
             self.first_non_progressed_slot,
         );
 
-        // C++ CHECK(base.has_value()) before publishing LeaderWindowObserved(now_, base)
-        // Enforce the same invariant for window-start slots
-        if desc.is_first_in_window(self.first_non_progressed_slot) {
-            let base_known =
-                self.get_slot_available_base(desc, self.first_non_progressed_slot).is_some();
-            if !base_known {
-                log::error!(
-                    "SimplexState: notarized-parent chain invariant violated - \
-                     base unknown for window start slot {} (now_window={})",
-                    self.first_non_progressed_slot,
-                    now_window
-                );
-            }
-            debug_assert!(
-                base_known,
-                "notarized-parent chain: base must be known for window start slot {}",
-                self.first_non_progressed_slot
+        // C++ parity: read available_base from the progress cursor slot.
+        // Reference: pool.cpp advance_present():
+        //   ParentId base = {};
+        //   if (now_ != 0) { base = slot_at(now_)->state->available_base.value(); }
+        //   publish<LeaderWindowObserved>(now_, base);
+        //
+        // For genesis (slot 0), base is None (matches C++ ParentId{} = std::nullopt).
+        // For later slots, base comes from the per-slot available_base propagated
+        // by notarization/skip handlers.
+        let base: CandidateParent = if self.first_non_progressed_slot.value() == 0 {
+            None
+        } else {
+            let slot_base = self.get_slot_available_base(desc, self.first_non_progressed_slot);
+            assert!(
+                slot_base.is_some(),
+                "SimplexState: notarized-parent chain invariant violated — \
+                 base unknown for progress cursor slot {} (now_window={}). \
+                 C++ CHECK(maybe_base.has_value()) in pool.cpp advance_present()",
+                self.first_non_progressed_slot,
+                now_window
             );
-        }
+            slot_base.unwrap()
+        };
 
         // Apply adaptive timeout backoff (reuse existing logic)
         self.apply_adaptive_timeout_backoff(
@@ -6065,9 +6069,26 @@ impl SimplexState {
         self.current_leader_window_idx = now_window;
         self.set_timeouts(desc);
 
+        // C++ parity: populate new window's available_bases and first slot base.
+        // In C++ this happens via LeaderWindowObserved -> consensus.cpp handler which
+        // calls start_generation(event->base, ...). In Rust the FSM handles this
+        // directly: the base is inserted into the window's available_bases set so
+        // that check_collation() -> has_available_parent() sees it.
+        self.ensure_window_exists(now_window);
+        if let Some(window) = self.get_window_mut(now_window) {
+            window.available_bases.insert(base.clone());
+        }
+        let first_slot = now_window.window_start(self.slots_per_leader_window);
+        if let Some(slot) = self.get_slot_mut(desc, first_slot) {
+            if slot.available_base.is_none() {
+                slot.available_base = Some(base.clone());
+            }
+        }
+
         log::trace!(
-            "SimplexState: advanced to window {}, scheduling timeouts from slot {}",
+            "SimplexState: advanced to window {}, base={}, scheduling timeouts from slot {}",
             now_window,
+            Self::format_parent(base.as_ref()),
             self.skip_slot
         );
     }

@@ -1455,24 +1455,49 @@ fn make_test_non_empty_candidate(
     crate::block::RawCandidate::new(candidate_id, parent_id, ValidatorIndex::new(0), block, vec![])
 }
 
-/// Helper: create an empty RawCandidate for check_validation tests.
-fn make_test_empty_candidate(
+/// Helper: create an empty RawCandidate with a specific referenced BlockIdExt.
+fn make_test_empty_candidate_with_block(
     candidate_id: RawCandidateId,
     parent_id: RawCandidateId,
+    referenced_block: BlockIdExt,
 ) -> crate::block::RawCandidate {
-    let block_id = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        parent_id.slot.value() + 1,
-        UInt256::rand(),
-        UInt256::rand(),
-    );
     crate::block::RawCandidate::new_empty(
         candidate_id,
         parent_id,
         ValidatorIndex::new(0),
-        block_id,
+        referenced_block,
         vec![],
     )
+}
+
+/// Helper: insert a minimal ReceivedCandidate into the processor's received_candidates map.
+fn insert_received_candidate(
+    processor: &mut SessionProcessor,
+    candidate_id: &RawCandidateId,
+    block_id: BlockIdExt,
+    is_empty: bool,
+    parent_id: Option<RawCandidateId>,
+) {
+    processor.received_candidates.insert(
+        candidate_id.clone(),
+        ReceivedCandidate {
+            slot: candidate_id.slot,
+            source_idx: ValidatorIndex::new(0),
+            candidate_id_hash: candidate_id.hash.clone(),
+            candidate_hash_data_bytes: Vec::new(),
+            block_id: block_id.clone(),
+            root_hash: block_id.root_hash.clone(),
+            file_hash: block_id.file_hash.clone(),
+            data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+            collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                Vec::new(),
+            ),
+            receive_time: SystemTime::now(),
+            is_empty,
+            parent_id,
+            is_fully_resolved: true,
+        },
+    );
 }
 
 /// Helper: insert a PendingValidation into the processor.
@@ -1601,20 +1626,134 @@ fn test_check_validation_auto_approves_empty_blocks() {
     let parent_slot = SlotIndex::new(0);
     let parent_id = RawCandidateId { slot: parent_slot, hash: UInt256::rand() };
 
+    let parent_block_id =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
+
+    insert_received_candidate(
+        &mut fixture.processor,
+        &parent_id,
+        parent_block_id.clone(),
+        false,
+        None,
+    );
+
     let child_slot = SlotIndex::new(1);
     let child_id = RawCandidateId { slot: child_slot, hash: UInt256::rand() };
 
-    let raw_candidate = make_test_empty_candidate(child_id.clone(), parent_id.clone());
+    let raw_candidate = make_test_empty_candidate_with_block(
+        child_id.clone(),
+        parent_id.clone(),
+        parent_block_id.clone(),
+    );
+    insert_received_candidate(
+        &mut fixture.processor,
+        &child_id,
+        parent_block_id,
+        true,
+        Some(parent_id),
+    );
     let time = fixture.description.get_time();
     insert_pending_validation(&mut fixture.processor, &child_id, raw_candidate, time);
 
-    // Empty blocks should be auto-approved even without parent notarization.
-    // candidate_decision_ok_internal removes from both pending_validations and pending_approve,
-    // so we verify the candidate was processed by checking it left pending_validations.
+    // Empty blocks with a matching referenced block should be auto-approved.
+    // C++ block-validator.cpp accepts when block == event->state->as_normal().
     fixture.processor.check_validation();
     assert!(
         !fixture.processor.pending_validations.contains_key(&child_id),
-        "empty block must be processed (removed from pending_validations) regardless of parent notarization"
+        "empty block must be approved when referenced block matches parent normal tip"
+    );
+}
+
+#[test]
+fn test_empty_block_accepted_when_referenced_block_matches_parent() {
+    let mut fixture = TestFixture::new(4);
+
+    let parent_slot = SlotIndex::new(0);
+    let parent_id = RawCandidateId { slot: parent_slot, hash: UInt256::rand() };
+
+    let parent_block_id =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
+
+    insert_received_candidate(
+        &mut fixture.processor,
+        &parent_id,
+        parent_block_id.clone(),
+        false,
+        None,
+    );
+
+    let child_slot = SlotIndex::new(1);
+    let child_id = RawCandidateId { slot: child_slot, hash: UInt256::rand() };
+
+    let raw_candidate = make_test_empty_candidate_with_block(
+        child_id.clone(),
+        parent_id.clone(),
+        parent_block_id.clone(),
+    );
+    insert_received_candidate(
+        &mut fixture.processor,
+        &child_id,
+        parent_block_id,
+        true,
+        Some(parent_id),
+    );
+    let time = fixture.description.get_time();
+    insert_pending_validation(&mut fixture.processor, &child_id, raw_candidate, time);
+
+    fixture.processor.check_validation();
+    assert!(
+        !fixture.processor.pending_validations.contains_key(&child_id),
+        "empty block must be approved when referenced block matches parent normal tip"
+    );
+    assert!(
+        fixture.processor.approved.contains_key(&child_id),
+        "empty block must appear in approved set after matching reference check"
+    );
+}
+
+#[test]
+fn test_empty_block_rejected_when_referenced_block_differs() {
+    let mut fixture = TestFixture::new(4);
+
+    let parent_slot = SlotIndex::new(0);
+    let parent_id = RawCandidateId { slot: parent_slot, hash: UInt256::rand() };
+
+    let parent_block_id =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::rand(), UInt256::rand());
+
+    insert_received_candidate(&mut fixture.processor, &parent_id, parent_block_id, false, None);
+
+    let child_slot = SlotIndex::new(1);
+    let child_id = RawCandidateId { slot: child_slot, hash: UInt256::rand() };
+
+    let wrong_block_id =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 99, UInt256::rand(), UInt256::rand());
+
+    let raw_candidate = make_test_empty_candidate_with_block(
+        child_id.clone(),
+        parent_id.clone(),
+        wrong_block_id.clone(),
+    );
+    insert_received_candidate(
+        &mut fixture.processor,
+        &child_id,
+        wrong_block_id,
+        true,
+        Some(parent_id),
+    );
+    let time = fixture.description.get_time();
+    insert_pending_validation(&mut fixture.processor, &child_id, raw_candidate, time);
+
+    // C++ block-validator.cpp rejects empty candidates whose referenced block
+    // does not match event->state->as_normal(). Rust must do the same.
+    fixture.processor.check_validation();
+    assert!(
+        fixture.processor.rejected.contains(&child_id),
+        "empty block must be rejected when referenced block differs from parent normal tip"
+    );
+    assert!(
+        !fixture.processor.approved.contains_key(&child_id),
+        "rejected empty block must not appear in approved set"
     );
 }
 
