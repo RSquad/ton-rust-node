@@ -45,7 +45,7 @@ pub(crate) fn is_adaptive_split50_ready(
     // Wait if sleep period hasn't passed yet
     if now < sleep_deadline {
         tracing::info!(
-            "node [{}] adaptive_split50 - sleep period: now < sleep_deadline={}",
+            "node [{}] adaptive_split50: sleep period, now < sleep_deadline={}",
             node_id,
             common::time_format::format_ts(sleep_deadline)
         );
@@ -55,7 +55,7 @@ pub(crate) fn is_adaptive_split50_ready(
     // Wait if not enough participants and waiting period hasn't expired
     if participants_count < min_validators && now < wait_deadline {
         tracing::info!(
-            "node [{}] adaptive_split50 - waiting for participants: ({}/{}), deadline={}",
+            "node [{}] adaptive_split50: waiting for participants ({}/{}), deadline={}",
             node_id,
             participants_count,
             min_validators,
@@ -179,7 +179,7 @@ pub(crate) fn calc_adaptive_stake(
         // half is enough — stake half.
         let stake = half.saturating_sub(current_stake);
         tracing::info!(
-            "node [{}] adaptive_split50 - stake half: current_stake={} TON, left_to_stake={} TON, half={} TON >= min_eff={} TON",
+            "node [{}] adaptive_split50: stake half, current_stake={} TON, left_to_stake={} TON, half={} TON >= min_eff={} TON",
             node_id,
             nanotons_to_tons_f64(current_stake),
             nanotons_to_tons_f64(stake),
@@ -189,7 +189,7 @@ pub(crate) fn calc_adaptive_stake(
         if stake > free_balance {
             // Not enough free funds to stake half. Skip and let the operator top up.
             tracing::error!(
-                "node [{}] adaptive_split50 - insufficient free balance: need {} TON to stake half, \
+                "node [{}] adaptive_split50: insufficient free balance, need {} TON to stake half, \
                  but only {} TON available. Consider topping up the pool.",
                 node_id,
                 nanotons_to_tons_f64(stake),
@@ -204,7 +204,7 @@ pub(crate) fn calc_adaptive_stake(
         // so the remainder after staking min_eff would also be < min_eff.
         // The next round won't have enough funds anyway — stake everything.
         tracing::info!(
-            "node [{}] adaptive_split50 - stake all: half={} TON < min_eff={} TON, staking all free_balance={} TON",
+            "node [{}] adaptive_split50: stake all, half={} TON < min_eff={} TON, staking all free_balance={} TON",
             node_id,
             nanotons_to_tons_f64(half),
             nanotons_to_tons_f64(min_eff_stake),

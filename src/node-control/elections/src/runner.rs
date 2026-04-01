@@ -687,7 +687,7 @@ impl ElectionRunner {
                         if matches!(node.stake_policy, StakePolicy::AdaptiveSplit50) && stake > 0 {
                             let old_stake = node.participant.as_ref().map(|p| p.stake).unwrap_or(0);
                             tracing::info!(
-                                "node [{}] adaptive top-up: {} TON → {} TON (delta={} TON)",
+                                "node [{}] adaptive_split50: top-up {} TON → {} TON (delta={} TON)",
                                 node_id,
                                 nanotons_to_tons_f64(old_stake),
                                 nanotons_to_tons_f64(old_stake + stake),
