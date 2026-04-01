@@ -467,6 +467,7 @@ impl CatchainOverlay for CatchainClient {
         _sender_id: &PublicKeyHash,
         _send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
+        _extra: Option<Vec<u8>>,
     ) {
         let msg = payload.clone();
         let overlay_id = self.overlay_id.clone();

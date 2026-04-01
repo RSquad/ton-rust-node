@@ -24,6 +24,7 @@ use crate::{
     BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 use num::BigInt;
+use std::collections::BTreeMap;
 
 #[cfg(test)]
 #[path = "tests/test_config_params.rs"]
@@ -3771,56 +3772,198 @@ const NEW_CONSENSUS_CONFIG_ALL_TAG: u8 = 0x10;
 #[allow(dead_code)] // Used in deserialization logic - null consensus means fallback to catchain
 const NULL_CONSENSUS_CONFIG_TAG: u8 = 0x20;
 const SIMPLEX_CONFIG_TAG: u8 = 0x21;
+const SIMPLEX_CONFIG_V2_TAG: u8 = 0x22;
 
-/// SimplexConfig - simplex_config#21 from ConfigParam 30
-/// Enables Simplex (Alpenglow) consensus for the specified workchain.
+/// Named noncritical consensus parameters, mirroring the C++ `NoncriticalParams` struct
+/// defined via `ENUMERATE_NONCRITICAL_PARAMS` in `ton-types.h`.
 ///
-/// TL-B: simplex_config#21 flags:(## 8) target_rate_ms:uint32
-///       slots_per_leader_window:uint32 first_block_timeout_ms:uint32
-///       max_leader_window_desync:uint32 = NewConsensusConfig;
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SimplexConfig {
-    pub use_quic: bool,
-    pub target_rate_ms: u32,
-    pub slots_per_leader_window: u32,
-    pub first_block_timeout_ms: u32,
-    pub max_leader_window_desync: u32,
+/// All fields have concrete default values matching C++. For v1 configs the three
+/// on-chain fields (`target_rate_ms`, `first_block_timeout_ms`, `max_leader_window_desync`)
+/// are populated from the TL-B, the rest keep their defaults. For v2, the on-chain hashmap
+/// overrides any subset of the 13 parameters.
+///
+/// "double" parameters (multipliers) are stored as raw `f32` bit patterns in a `u32`,
+/// matching the C++ `store_double` / `read_double` convention.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoncriticalParams {
+    pub target_rate_ms: u32,                            // idx 0, duration
+    pub first_block_timeout_ms: u32,                    // idx 1, duration
+    pub first_block_timeout_multiplier_bits: u32,       // idx 2, double (f32 bits)
+    pub first_block_timeout_cap_ms: u32,                // idx 3, duration
+    pub candidate_resolve_timeout_ms: u32,              // idx 4, duration
+    pub candidate_resolve_timeout_multiplier_bits: u32, // idx 5, double (f32 bits)
+    pub candidate_resolve_timeout_cap_ms: u32,          // idx 6, duration
+    pub candidate_resolve_cooldown_ms: u32,             // idx 7, duration
+    pub standstill_timeout_ms: u32,                     // idx 8, duration
+    pub standstill_max_egress_bytes_per_s: u32,         // idx 9, uint32
+    pub max_leader_window_desync: u32,                  // idx 10, uint32
+    pub bad_signature_ban_duration_ms: u32,             // idx 11, duration
+    pub candidate_resolve_rate_limit: u32,              // idx 12, uint32
 }
 
-/// Byte layout: flags:(## 7) use_quic:Bool - 7 flag bits (reserved) + 1 use_quic bit = 1 byte.
-/// TLB writes MSB-first, so use_quic occupies the LSB: byte = (flags << 1) | use_quic.
+impl Default for NoncriticalParams {
+    fn default() -> Self {
+        Self {
+            target_rate_ms: 2400,
+            first_block_timeout_ms: 1000,
+            first_block_timeout_multiplier_bits: (1.2f32).to_bits(),
+            first_block_timeout_cap_ms: 100_000,
+            candidate_resolve_timeout_ms: 1000,
+            candidate_resolve_timeout_multiplier_bits: (1.2f32).to_bits(),
+            candidate_resolve_timeout_cap_ms: 10_000,
+            candidate_resolve_cooldown_ms: 10,
+            standstill_timeout_ms: 10_000,
+            standstill_max_egress_bytes_per_s: 50 << 17,
+            max_leader_window_desync: 250,
+            bad_signature_ban_duration_ms: 5_000,
+            candidate_resolve_rate_limit: 10,
+        }
+    }
+}
+
+impl NoncriticalParams {
+    /// Set a parameter by its on-chain hashmap index.
+    pub fn set(&mut self, idx: u8, value: u32) {
+        match idx {
+            0 => self.target_rate_ms = value,
+            1 => self.first_block_timeout_ms = value,
+            2 => self.first_block_timeout_multiplier_bits = value,
+            3 => self.first_block_timeout_cap_ms = value,
+            4 => self.candidate_resolve_timeout_ms = value,
+            5 => self.candidate_resolve_timeout_multiplier_bits = value,
+            6 => self.candidate_resolve_timeout_cap_ms = value,
+            7 => self.candidate_resolve_cooldown_ms = value,
+            8 => self.standstill_timeout_ms = value,
+            9 => self.standstill_max_egress_bytes_per_s = value,
+            10 => self.max_leader_window_desync = value,
+            11 => self.bad_signature_ban_duration_ms = value,
+            12 => self.candidate_resolve_rate_limit = value,
+            _ => {}
+        }
+    }
+
+    /// Construct from a raw hashmap (as stored on-chain in simplex_config_v2).
+    pub fn from_raw_map(map: &BTreeMap<u8, u32>) -> Self {
+        let mut p = Self::default();
+        for (&k, &v) in map {
+            p.set(k, v);
+        }
+        p
+    }
+
+    /// Convert all fields to a raw hashmap for on-chain v2 serialization.
+    pub fn to_raw_map(&self) -> BTreeMap<u8, u32> {
+        BTreeMap::from([
+            (0, self.target_rate_ms),
+            (1, self.first_block_timeout_ms),
+            (2, self.first_block_timeout_multiplier_bits),
+            (3, self.first_block_timeout_cap_ms),
+            (4, self.candidate_resolve_timeout_ms),
+            (5, self.candidate_resolve_timeout_multiplier_bits),
+            (6, self.candidate_resolve_timeout_cap_ms),
+            (7, self.candidate_resolve_cooldown_ms),
+            (8, self.standstill_timeout_ms),
+            (9, self.standstill_max_egress_bytes_per_s),
+            (10, self.max_leader_window_desync),
+            (11, self.bad_signature_ban_duration_ms),
+            (12, self.candidate_resolve_rate_limit),
+        ])
+    }
+}
+
+/// Unified Simplex consensus config — the single output type
+/// produced by deserializing either `simplex_config#21` (v1) or
+/// `simplex_config_v2#22` (v2) from ConfigParam 30.
+///
+/// Mirrors C++ `NewConsensusConfig` in `ton-types.h`: critical fields
+/// (`use_quic`, `slots_per_leader_window`) live at top level; all tunable
+/// timing/rate parameters live inside `noncritical_params`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimplexConfig {
+    pub use_quic: bool,
+    pub slots_per_leader_window: u32,
+    pub noncritical_params: NoncriticalParams,
+}
+
+impl Default for SimplexConfig {
+    fn default() -> Self {
+        Self {
+            use_quic: false,
+            slots_per_leader_window: 4,
+            noncritical_params: NoncriticalParams::default(),
+        }
+    }
+}
+
+/// Maximum noncritical param key defined in the C++ reference (candidate_resolve_rate_limit).
+const NONCRITICAL_PARAMS_MAX_KEY: u8 = 12;
+
+/// Always serializes as simplex_config_v2#22 (the current on-chain format).
 impl Serializable for SimplexConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        cell.append_u8(SIMPLEX_CONFIG_TAG)?;
+        cell.append_u8(SIMPLEX_CONFIG_V2_TAG)?;
         let flags_byte = if self.use_quic { 1u8 } else { 0u8 };
         cell.append_u8(flags_byte)?;
-        self.target_rate_ms.write_to(cell)?;
         self.slots_per_leader_window.write_to(cell)?;
-        self.first_block_timeout_ms.write_to(cell)?;
-        self.max_leader_window_desync.write_to(cell)?;
+        let raw_map = self.noncritical_params.to_raw_map();
+        let mut params_hashmap = HashmapE::with_bit_len(8);
+        for (&key, &value) in &raw_map {
+            let key_slice = SliceData::from_raw(vec![key], 8);
+            let mut vb = BuilderData::new();
+            value.write_to(&mut vb)?;
+            params_hashmap.set(key_slice, &SliceData::load_builder(vb)?)?;
+        }
+        params_hashmap.write_hashmap_data(cell)?;
         Ok(())
     }
 }
 
+/// Deserializes both simplex_config#21 (v1) and simplex_config_v2#22 (v2).
 impl Deserializable for SimplexConfig {
     fn construct_from(slice: &mut SliceData) -> Result<Self> {
         let tag = slice.get_next_byte()?;
-        if tag != SIMPLEX_CONFIG_TAG {
-            fail!(Self::invalid_tag(tag as u32));
+        match tag {
+            SIMPLEX_CONFIG_TAG => {
+                let flags_byte = slice.get_next_byte()?;
+                let use_quic = (flags_byte & 1) != 0;
+                let target_rate_ms = u32::construct_from(slice)?;
+                let slots_per_leader_window = u32::construct_from(slice)?;
+                let first_block_timeout_ms = u32::construct_from(slice)?;
+                let max_leader_window_desync = u32::construct_from(slice)?;
+                Ok(Self {
+                    use_quic,
+                    slots_per_leader_window,
+                    noncritical_params: NoncriticalParams {
+                        target_rate_ms,
+                        first_block_timeout_ms,
+                        max_leader_window_desync,
+                        ..Default::default()
+                    },
+                })
+            }
+            SIMPLEX_CONFIG_V2_TAG => {
+                let flags_byte = slice.get_next_byte()?;
+                let use_quic = (flags_byte & 1) != 0;
+                let slots_per_leader_window = u32::construct_from(slice)?;
+                let has_params = slice.get_next_bit()?;
+                let params_cell =
+                    if has_params { Some(slice.checked_drain_reference()?) } else { None };
+                let params_map = HashmapE::with_hashmap(8, params_cell);
+                let mut raw = BTreeMap::new();
+                for key_idx in 0..=NONCRITICAL_PARAMS_MAX_KEY {
+                    let key = SliceData::from_raw(vec![key_idx], 8);
+                    if let Some(mut vs) = params_map.get(key)? {
+                        raw.insert(key_idx, u32::construct_from(&mut vs)?);
+                    }
+                }
+                Ok(Self {
+                    use_quic,
+                    slots_per_leader_window,
+                    noncritical_params: NoncriticalParams::from_raw_map(&raw),
+                })
+            }
+            _ => fail!(Self::invalid_tag(tag as u32)),
         }
-        let flags_byte = slice.get_next_byte()?;
-        let use_quic = (flags_byte & 1) != 0;
-        let target_rate_ms = u32::construct_from(slice)?;
-        let slots_per_leader_window = u32::construct_from(slice)?;
-        let first_block_timeout_ms = u32::construct_from(slice)?;
-        let max_leader_window_desync = u32::construct_from(slice)?;
-        Ok(Self {
-            use_quic,
-            target_rate_ms,
-            slots_per_leader_window,
-            first_block_timeout_ms,
-            max_leader_window_desync,
-        })
     }
 }
 
@@ -3872,17 +4015,17 @@ impl Deserializable for NewConsensusConfigAll {
             let cell = slice.checked_drain_reference()?;
             let mut inner = SliceData::load_cell(cell)?;
             let inner_tag = inner.clone().get_next_byte()?;
-            if inner_tag == SIMPLEX_CONFIG_TAG {
+            if inner_tag == SIMPLEX_CONFIG_TAG || inner_tag == SIMPLEX_CONFIG_V2_TAG {
                 result.mc = Some(SimplexConfig::construct_from(&mut inner)?);
             }
-            // else null_consensus_config#20 - leave as None (catchain fallback)
+            // else null_consensus_config#20 or unknown → None (catchain fallback)
         }
         // shard:(Maybe ^NewConsensusConfig)
         if slice.get_next_bit()? {
             let cell = slice.checked_drain_reference()?;
             let mut inner = SliceData::load_cell(cell)?;
             let inner_tag = inner.clone().get_next_byte()?;
-            if inner_tag == SIMPLEX_CONFIG_TAG {
+            if inner_tag == SIMPLEX_CONFIG_TAG || inner_tag == SIMPLEX_CONFIG_V2_TAG {
                 result.shard = Some(SimplexConfig::construct_from(&mut inner)?);
             }
         }

@@ -5168,3 +5168,537 @@ fn test_available_base_skip_propagates_max_merge() {
         "skip-propagation max-merge must upgrade to the higher-slot parent"
     );
 }
+
+// ==========================================================================
+// Stale window guard tests
+// ==========================================================================
+
+#[test]
+fn test_stale_window_guard_current_leader_window_idx_updated_before_collation_check() {
+    // Verifies the ordering guarantee for leader window state:
+    // `current_leader_window_idx` must be up-to-date after notarization advances
+    // the progress cursor across a window boundary, BEFORE any code can check
+    // leader status (the stale-window guard in SessionProcessor::check_collation
+    // compares slot_window vs current_leader_window_idx).
+    //
+    // Setup: 4 validators, 2 slots per window.
+    // Progress both slots in window 0 via notarization -> cursor crosses to window 1.
+    let desc = create_test_desc(4, 2);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(0));
+
+    // Notarize slot 0 (3 out of 4 validators -> quorum)
+    let h0 = UInt256::from([0xD0u8; 32]);
+    let vote0 = Vote::Notarize(NotarizeVote { slot: SlotIndex::new(0), block_hash: h0.clone() });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), vote0.clone(), vec![1]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), vote0.clone(), vec![2]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), vote0, vec![3]).unwrap();
+
+    // Slot 0 notarized -> cursor at slot 1, still in window 0
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(1));
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(0),
+        "window must not advance until full window is progressed"
+    );
+
+    // Notarize slot 1 (3 out of 4)
+    let h1 = UInt256::from([0xD1u8; 32]);
+    let vote1 = Vote::Notarize(NotarizeVote { slot: SlotIndex::new(1), block_hash: h1.clone() });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), vote1.clone(), vec![4]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), vote1.clone(), vec![5]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), vote1, vec![6]).unwrap();
+
+    // Both slots in window 0 are notarized -> cursor crosses to slot 2 (window 1)
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(2));
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "current_leader_window_idx must advance when progress cursor crosses window boundary"
+    );
+
+    // The stale-window guard: slot 0 is in window 0, but current window is 1.
+    // SessionProcessor::check_collation would see slot_window(0) < current_window(1) -> skip.
+    let slot0_window = desc.get_window_idx(SlotIndex::new(0));
+    assert!(
+        slot0_window < state.current_leader_window_idx,
+        "slot 0 (window {slot0_window}) must be stale relative to current window {}",
+        state.current_leader_window_idx
+    );
+
+    // Slot 2 is in the current window -> not stale
+    let slot2_window = desc.get_window_idx(SlotIndex::new(2));
+    assert_eq!(
+        slot2_window, state.current_leader_window_idx,
+        "slot 2 must be in the current window"
+    );
+}
+
+#[test]
+fn test_stale_window_guard_skip_also_advances_window() {
+    // Same as above but using skip votes instead of notarization.
+    // Window advancement via skips must also update current_leader_window_idx.
+    let desc = create_test_desc(4, 2);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    // Skip slot 0 (3 out of 4 validators)
+    let skip0 = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip0.clone(), vec![1]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip0.clone(), vec![2]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip0, vec![3]).unwrap();
+
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(1));
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
+
+    // Skip slot 1 (3 out of 4)
+    let skip1 = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip1.clone(), vec![4]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip1.clone(), vec![5]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip1, vec![6]).unwrap();
+
+    // Both slots in window 0 skipped -> cursor at slot 2, window must advance
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(2));
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "current_leader_window_idx must advance after full-window skip"
+    );
+}
+
+/*
+    ========================================================================
+    C++ parity: candidate pending storage despite local skip vote
+
+    Regression tests for the fix to on_candidate() where candidates were
+    permanently dropped after a local skip vote. C++ consensus.cpp only
+    gates on voted_notar — a skip vote must NOT prevent storing a candidate
+    as pending_block for later retry via check_pending_blocks.
+    ========================================================================
+*/
+
+#[test]
+fn test_candidate_stored_as_pending_despite_skip_vote_cpp_mode() {
+    // A local skip vote must NOT prevent storing a candidate as pending_block
+    // when try_notar fails (base not propagated yet).
+    // Reference: C++ consensus.cpp CandidateReceived only checks voted_notar.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    // Cast local skip for all of window 1 (slots 4-7).
+    state.try_skip_window(WindowIndex::new(1));
+    drain_events(&mut state);
+
+    let w1 = state.get_window(WindowIndex::new(1)).unwrap();
+    assert!(w1.slots[0].voted_skip, "voted_skip must be set for slot 4");
+    assert!(w1.slots[0].voted_notar.is_none(), "voted_notar must NOT be set");
+    assert!(
+        w1.slots[0].available_base.is_none(),
+        "available_base for slot 4 must be None (not propagated)"
+    );
+
+    // Submit candidate for slot 4 with genesis parent
+    let hash4 = UInt256::from([0xAA; 32]);
+    let candidate = create_test_candidate(4, hash4, BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).unwrap();
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        !events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(_)))),
+        "must NOT broadcast NotarVote — base not propagated yet, got: {:?}",
+        events
+    );
+
+    let w1 = state.get_window(WindowIndex::new(1)).unwrap();
+    assert!(
+        w1.slots[0].pending_block.is_some(),
+        "candidate must be stored as pending_block despite local skip vote (C++ parity)"
+    );
+}
+
+#[test]
+fn test_pending_block_notarized_after_base_propagates_via_skip_certs() {
+    // Full lifecycle: candidate stored as pending after skip vote, then notarized
+    // when skip certs propagate the genesis base through to the candidate's slot.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    // Cast local skip for window 1 (slots 4-7)
+    state.try_skip_window(WindowIndex::new(1));
+    drain_events(&mut state);
+
+    // Store candidate at slot 4 (pending — base not propagated)
+    let hash4 = UInt256::from([0xBB; 32]);
+    let candidate = create_test_candidate(4, hash4, BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).unwrap();
+    drain_events(&mut state);
+
+    assert!(
+        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_some(),
+        "precondition: candidate stored as pending"
+    );
+
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Issue skip certs for s0, s1, s2, s3 — each propagates genesis base one hop forward
+    for s in 0..4u32 {
+        let skip_cert = create_test_skip_cert(&desc, SlotIndex::new(s), &signers);
+        state.set_skip_certificate(&desc, SlotIndex::new(s), skip_cert).unwrap();
+    }
+
+    // After all 4 skip certs, genesis base should have reached slot 4.
+    // check_pending_blocks (called by propagate_base_after_skip_cert) must
+    // retry the pending candidate → try_notar succeeds → NotarVote emitted.
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if *slot == SlotIndex::new(4))
+        ),
+        "must emit NotarVote for pending candidate at slot 4 after base propagates, got: {:?}",
+        events
+    );
+
+    // Pending block should be cleared after successful notarization
+    assert!(
+        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_none(),
+        "pending_block must be cleared after notarization"
+    );
+}
+
+#[test]
+fn test_candidate_dropped_when_voted_notar_cpp_mode() {
+    // When voted_notar is already set for a slot, a second candidate with a different
+    // hash must be correctly dropped (not stored as pending).
+    let desc = create_test_desc(4, 1);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
+
+    // Slot 0 has genesis base → first candidate succeeds immediately
+    let h1 = UInt256::from([0x11; 32]);
+    let candidate1 = create_test_candidate(0, h1.clone(), BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate1).unwrap();
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { block_hash, .. })) if *block_hash == h1)
+        ),
+        "first candidate must trigger NotarVote"
+    );
+
+    // Now send a second candidate with a different hash for the same slot
+    let h2 = UInt256::from([0x22; 32]);
+    let candidate2 = create_test_candidate(0, h2, BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate2).unwrap();
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        !events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(_)))),
+        "second candidate must NOT trigger NotarVote (voted_notar already set)"
+    );
+
+    // Candidate must NOT be stored as pending — voted_notar gates it
+    let w0 = state.get_window(WindowIndex::new(0)).unwrap();
+    assert!(
+        w0.slots[0].pending_block.is_none(),
+        "candidate must NOT be stored as pending when voted_notar is set"
+    );
+}
+
+#[test]
+fn test_out_of_order_skip_certs_still_propagate_base_to_pending() {
+    // Out-of-order skip cert arrival: s3 arrives first but has no base, so
+    // nothing propagates. Later s0, s1, s2 arrive in order — when s2 is
+    // processed, find_next_nonskipped_slot skips over s3 (already marked
+    // skipped) and propagates genesis base directly to s4.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    // Cast local skip for window 1 (slots 4-7)
+    state.try_skip_window(WindowIndex::new(1));
+    drain_events(&mut state);
+
+    // Store candidate at slot 4 (pending — no base)
+    let hash4 = UInt256::from([0xCC; 32]);
+    let candidate = create_test_candidate(4, hash4, BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).unwrap();
+    drain_events(&mut state);
+
+    assert!(
+        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_some(),
+        "precondition: candidate stored as pending"
+    );
+
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Issue skip cert for s3 FIRST (out of order)
+    let skip3 = create_test_skip_cert(&desc, SlotIndex::new(3), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(3), skip3).unwrap();
+
+    // s3 has no base → nothing propagates → no vote yet
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if *slot == SlotIndex::new(4))
+        ),
+        "no NotarVote yet — s3 had no base to propagate"
+    );
+
+    // Issue skip certs for s0, s1
+    for s in 0..2u32 {
+        let skip = create_test_skip_cert(&desc, SlotIndex::new(s), &signers);
+        state.set_skip_certificate(&desc, SlotIndex::new(s), skip).unwrap();
+        drain_events(&mut state);
+    }
+
+    // Verify slot 4 still has no base (propagated to s2 only so far)
+    assert!(
+        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_some(),
+        "candidate still pending after s0+s1 skip certs"
+    );
+
+    // Issue skip cert for s2 — propagation chain: s2 skipped, find_next_nonskipped(s2)
+    // skips over s3 (already skipped) → lands on s4 → base arrives → pending block retried
+    let skip2 = create_test_skip_cert(&desc, SlotIndex::new(2), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(2), skip2).unwrap();
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if *slot == SlotIndex::new(4))
+        ),
+        "must emit NotarVote for slot 4 after out-of-order skip certs propagate base, got: {:?}",
+        events
+    );
+
+    assert!(
+        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_none(),
+        "pending_block must be cleared after successful notarization"
+    );
+}
+
+/*
+    ========================================================================
+    Base propagation chaining through already-skipped slots
+
+    When skip certs arrive out of order, `propagate_base_after_skip_cert`
+    must chain the base forward through all consecutive already-skipped
+    intermediate slots. Without this, the base jumps from the cert's slot
+    to the first non-skipped slot, leaving intermediate slots baseless
+    and pending blocks stuck forever (no backward-walk like C++ has).
+    ========================================================================
+*/
+
+#[test]
+fn test_base_chains_through_already_skipped_slots() {
+    // Scenario: skip certs for slots 1-6 arrive BEFORE slot 0's cert.
+    // When slot 0's cert is finally processed, the chaining loop must
+    // propagate the genesis base through slots 1→2→3→4→5→6→7.
+    let desc = create_test_desc(4, 8); // 4 validators, 8 slots/window
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Issue skip certs for slots 1-6 first (out of order — slot 0 last)
+    for s in 1..=6u32 {
+        let cert = create_test_skip_cert(&desc, SlotIndex::new(s), &signers);
+        state.set_skip_certificate(&desc, SlotIndex::new(s), cert).unwrap();
+    }
+    drain_events(&mut state);
+
+    // Verify: slots 1-6 are skipped but have no available_base (no source yet)
+    for s in 1..=6u32 {
+        let base = state.get_slot_ref(&desc, SlotIndex::new(s)).unwrap().available_base.clone();
+        assert!(
+            base.is_none(),
+            "slot {} should have no base before slot 0's cert chains through",
+            s
+        );
+    }
+
+    // Now issue skip cert for slot 0 — triggers chaining through 1→2→3→4→5→6→7
+    let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(0), cert0).unwrap();
+    drain_events(&mut state);
+
+    // Every intermediate skipped slot must now have the genesis base
+    for s in 1..=6u32 {
+        let base = state.get_slot_ref(&desc, SlotIndex::new(s)).unwrap().available_base.clone();
+        assert_eq!(
+            base,
+            Some(None), // genesis
+            "slot {} must have genesis base after chaining from slot 0",
+            s
+        );
+    }
+
+    // Slot 7 (first non-skipped after the chain) must also have the base
+    let base7 = state.get_slot_ref(&desc, SlotIndex::new(7)).unwrap().available_base.clone();
+    assert_eq!(base7, Some(None), "slot 7 (first non-skipped) must have genesis base");
+}
+
+#[test]
+fn test_base_chaining_enables_pending_block_at_intermediate_skipped_slot() {
+    // Regression test for the real-network failure mode:
+    // A pending block sits at a slot whose skip cert arrived before the base
+    // propagated. The old code would never set `available_base` on that slot
+    // because `find_next_nonskipped_slot` jumped past it. The chaining fix
+    // ensures the base reaches it.
+    let desc = create_test_desc(4, 8);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Skip-vote slot 4 locally so candidate can be stored as pending
+    state.try_skip_window(WindowIndex::new(0));
+    drain_events(&mut state);
+
+    // Store a pending candidate at slot 4 (parent = genesis)
+    let hash4 = UInt256::from([0xDD; 32]);
+    let candidate = create_test_candidate(4, hash4, BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).unwrap();
+    drain_events(&mut state);
+
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[4].pending_block.is_some(),
+        "precondition: candidate stored as pending at slot 4"
+    );
+
+    // Skip certs for slots 1-3 arrive BEFORE slot 0.
+    // Slot 4 doesn't get a skip cert (it only has a local skip vote).
+    for s in 1..=3u32 {
+        let cert = create_test_skip_cert(&desc, SlotIndex::new(s), &signers);
+        state.set_skip_certificate(&desc, SlotIndex::new(s), cert).unwrap();
+    }
+    drain_events(&mut state);
+
+    // Verify no notarize vote yet — slot 4 still has no base
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[4].pending_block.is_some(),
+        "candidate still pending — base hasn't reached slot 4 yet"
+    );
+
+    // Now process slot 0's skip cert → chain: 0→1→2→3→4 (slot 4 not skipped-cert)
+    let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(0), cert0).unwrap();
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if *slot == SlotIndex::new(4))
+        ),
+        "must emit NotarVote for pending slot 4 after base chains through, got: {:?}",
+        events
+    );
+
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[4].pending_block.is_none(),
+        "pending_block must be cleared after notarization"
+    );
+}
+
+#[test]
+fn test_pending_block_not_overwritten_by_second_candidate_cpp_mode() {
+    // C++ parity: first pending candidate wins. A second candidate with a different
+    // hash for the same slot must be rejected (equivocation), keeping the original.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    // Cast local skip for window 1 (slots 4-7) so candidates go to pending
+    state.try_skip_window(WindowIndex::new(1));
+    drain_events(&mut state);
+
+    // Store candidate A at slot 4 as pending (no base → try_notar fails)
+    let hash_a = UInt256::from([0xAA; 32]);
+    let candidate_a = create_test_candidate(4, hash_a.clone(), BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate_a).unwrap();
+    drain_events(&mut state);
+
+    assert!(
+        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_some(),
+        "precondition: candidate A stored as pending"
+    );
+    assert_eq!(
+        state.get_window(WindowIndex::new(1)).unwrap().slots[0]
+            .pending_block
+            .as_ref()
+            .unwrap()
+            .id
+            .hash,
+        hash_a,
+        "precondition: pending_block is candidate A"
+    );
+
+    let pending_count_before = state.pending_slots.len();
+
+    // Submit candidate B with a different hash for the same slot 4
+    let hash_b = UInt256::from([0xBB; 32]);
+    let candidate_b = create_test_candidate(4, hash_b, BlockIdExt::default(), None, 1);
+    state.on_candidate(&desc, candidate_b).unwrap();
+    drain_events(&mut state);
+
+    // pending_block must still hold candidate A (not B)
+    let w1 = state.get_window(WindowIndex::new(1)).unwrap();
+    assert_eq!(
+        w1.slots[0].pending_block.as_ref().unwrap().id.hash,
+        hash_a,
+        "pending_block must still be candidate A — first candidate wins"
+    );
+
+    // No additional PendingSlot should have been pushed
+    assert_eq!(
+        state.pending_slots.len(),
+        pending_count_before,
+        "no additional PendingSlot should be pushed for duplicate/equivocating candidate"
+    );
+}
+
+#[test]
+fn test_try_notar_not_blocked_by_its_over_after_finalize_restart_cpp_mode() {
+    // C++ parity: after restart with a persisted Finalize vote, its_over=true and
+    // voted_final=true are set, but voted_notar remains None. C++ try_notarize()
+    // does NOT check voted_final, so notarization must still proceed.
+    let desc = create_test_desc(4, 1);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
+
+    // Simulate restart recovery: mark slot 0 as having a persisted Finalize vote
+    let finalize_vote = Vote::Finalize(FinalizeVote {
+        slot: SlotIndex::new(0),
+        block_hash: UInt256::from([0xFF; 32]),
+    });
+    state.mark_slot_voted_on_restart(&desc, &finalize_vote);
+
+    // Verify preconditions
+    let w0 = state.get_window(WindowIndex::new(0)).unwrap();
+    assert!(w0.slots[0].its_over, "precondition: its_over must be true after Finalize restart");
+    assert!(
+        w0.slots[0].voted_final,
+        "precondition: voted_final must be true after Finalize restart"
+    );
+    assert!(
+        w0.slots[0].voted_notar.is_none(),
+        "precondition: voted_notar must be None (Finalize does not set it)"
+    );
+
+    // Submit candidate for slot 0 (has genesis base → should succeed)
+    let hash = UInt256::from([0xCC; 32]);
+    let candidate = create_test_candidate(0, hash, BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).unwrap();
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if *slot == SlotIndex::new(0))
+        ),
+        "must emit NotarVote for slot 0 — its_over must NOT block try_notar in C++ mode, got: {:?}",
+        events
+    );
+}

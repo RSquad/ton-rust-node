@@ -27,15 +27,13 @@
 //! // 1. Create overlay manager (for production use ADNL, for tests use in-process)
 //! let overlay_manager = SessionFactory::create_in_process_overlay_manager(4);
 //!
-//! // 2. Create session with options
+//! // 2. Create session with options (overlay starts warming up immediately)
 //! let options = SessionOptions::default();
 //! let shard = ton_block::ShardIdent::masterchain();
-//! let initial_block_seqno = 1; // Expected seqno for first block
 //! let session = SessionFactory::create_session(
 //!     &options,
 //!     &session_id,
-//!     &shard,               // Shard identifier
-//!     initial_block_seqno,  // First block will have this seqno
+//!     &shard,
 //!     validator_nodes,
 //!     &local_private_key,
 //!     db_path,
@@ -44,8 +42,12 @@
 //!     session_listener,  // Weak<dyn SessionListener>
 //! )?;
 //!
-//! // 3. Session runs in background threads, callbacks via SessionListener
-//! // 4. Stop when done
+//! // 3. Start consensus processing with initial block seqno
+//! let initial_block_seqno = 1;
+//! session.start(initial_block_seqno);
+//!
+//! // 4. Session runs in background threads, callbacks via SessionListener
+//! // 5. Stop when done
 //! session.stop();
 //! ```
 //!
@@ -489,6 +491,40 @@ pub struct SessionOptions {
     /// Default: 30s (warn), 120s (error)
     pub health_parent_aging_warning_secs: u64,
     pub health_parent_aging_error_secs: u64,
+
+    // -- Noncritical params (from simplex_config_v2 HashmapE) --
+    //
+    // These fields are deserialized from on-chain config and passed through, but not yet
+    // consumed by the Rust session logic.
+
+    // TODO: replace `timeout_increase_factor` / `max_backoff_delay` with these two fields.
+    //   C++ consensus.cpp applies multiplier+cap on window skip (exponential backoff of
+    //   first_block_timeout_). Rust simplex_state.rs uses hardcoded values instead.
+    pub first_block_timeout_multiplier: f64,
+    pub first_block_timeout_cap: Duration,
+
+    // TODO: wire into candidate resolver. C++ candidate-resolver.cpp uses these four params
+    //   for exponential-backoff fetch retries with cooldown.
+    pub candidate_resolve_timeout: Duration,
+    pub candidate_resolve_timeout_multiplier: f64,
+    pub candidate_resolve_timeout_cap: Duration,
+    pub candidate_resolve_cooldown: Duration,
+
+    // TODO: wire into standstill recovery egress shaping. C++ pool.cpp uses this to
+    //   rate-limit bytes/s during standstill_resolution_task.
+    pub standstill_max_egress_bytes_per_s: u32,
+
+    // TODO: wire into slot/vote acceptance bounds. C++ consensus.cpp and pool.cpp use this
+    //   to reject candidates/votes from too-far-future windows.
+    pub max_leader_window_desync: u32,
+
+    // TODO: wire into peer ban logic. C++ pool.cpp bans peers with bad vote/cert signatures
+    //   for this duration.
+    pub bad_signature_ban_duration: Duration,
+
+    // TODO: wire into candidate resolver rate limiting. C++ candidate-resolver.cpp uses a
+    //   1-second sliding window with this limit per peer for requestCandidate.
+    pub candidate_resolve_rate_limit: u32,
 }
 
 impl Default for SessionOptions {
@@ -518,6 +554,16 @@ impl Default for SessionOptions {
             health_stall_error_secs: 60,
             health_parent_aging_warning_secs: 30,
             health_parent_aging_error_secs: 120,
+            first_block_timeout_multiplier: 1.2,
+            first_block_timeout_cap: Duration::from_secs(100),
+            candidate_resolve_timeout: Duration::from_secs(1),
+            candidate_resolve_timeout_multiplier: 1.2,
+            candidate_resolve_timeout_cap: Duration::from_secs(10),
+            candidate_resolve_cooldown: Duration::from_millis(10),
+            standstill_max_egress_bytes_per_s: 50 << 17,
+            max_leader_window_desync: 250,
+            bad_signature_ban_duration: Duration::from_secs(5),
+            candidate_resolve_rate_limit: 10,
         }
     }
 }
@@ -586,6 +632,39 @@ impl SessionOptions {
 
         if self.health_parent_aging_error_secs < self.health_parent_aging_warning_secs {
             fail!("health_parent_aging_error_secs must be >= health_parent_aging_warning_secs")
+        }
+
+        // Noncritical params from on-chain config
+        if !self.first_block_timeout_multiplier.is_finite()
+            || self.first_block_timeout_multiplier < 1.0
+        {
+            fail!("first_block_timeout_multiplier must be finite and >= 1.0")
+        }
+
+        if self.first_block_timeout_cap.is_zero() {
+            fail!("first_block_timeout_cap must be > 0")
+        }
+
+        if self.candidate_resolve_timeout.is_zero() {
+            fail!("candidate_resolve_timeout must be > 0")
+        }
+
+        if !self.candidate_resolve_timeout_multiplier.is_finite()
+            || self.candidate_resolve_timeout_multiplier < 1.0
+        {
+            fail!("candidate_resolve_timeout_multiplier must be finite and >= 1.0")
+        }
+
+        if self.candidate_resolve_timeout_cap.is_zero() {
+            fail!("candidate_resolve_timeout_cap must be > 0")
+        }
+
+        if self.candidate_resolve_cooldown.is_zero() {
+            fail!("candidate_resolve_cooldown must be > 0")
+        }
+
+        if self.bad_signature_ban_duration.is_zero() {
+            fail!("bad_signature_ban_duration must be > 0")
         }
 
         Ok(())
@@ -722,19 +801,19 @@ impl SessionFactory {
     /// * `options` - Session configuration options
     /// * `session_id` - Unique session identifier
     /// * `shard` - Shard identifier for this session
-    /// * `initial_block_seqno` - Expected seqno for the first block produced by this session.
-    ///   For merge scenarios, caller should pass max(prev1.seqno, prev2.seqno) + 1.
     /// * `ids` - List of validator nodes
     /// * `local_key` - Private key for signing
     /// * `db_path` - Full database path
     /// * `overlay_manager` - Network overlay manager
     /// * `listener` - Session event listener
+    ///
+    /// After creation, call `Session::start(initial_block_seqno)` to provide
+    /// the expected first block seqno and begin consensus processing.
     #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         options: &SessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
-        initial_block_seqno: u32,
         ids: Vec<SessionNode>,
         local_key: &PrivateKey,
         db_path: String,
@@ -745,7 +824,6 @@ impl SessionFactory {
             options,
             session_id,
             shard,
-            initial_block_seqno,
             ids,
             local_key,
             db_path,

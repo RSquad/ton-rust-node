@@ -83,6 +83,7 @@ use ton_api::{
     deserialize_boxed, serialize_boxed, tag_from_data,
     ton::{
         consensus::{
+            broadcastextra::BroadcastExtra,
             candidateid::CandidateId,
             overlayid::OverlayId,
             simplex::{
@@ -804,6 +805,9 @@ pub(crate) struct ReceiverImpl {
     shard: ShardIdent,
     /// Maximum block + collated data size for candidate verification
     max_candidate_size: usize,
+    /// Maximum answer size for candidate request queries (network budget).
+    /// Matches C++ PR #2195: max_block_size + max_collated_data_size + (1 << 20).
+    max_candidate_query_answer_size: u64,
     /// Protocol version from consensus config (determines BOC serialization flags)
     proto_version: u32,
     /// Metrics
@@ -1728,15 +1732,12 @@ impl ReceiverImpl {
         let session_id = self.session_id.clone();
         let task_queues = self.get_task_queues();
 
-        // Send query via overlay
-        self.overlay.send_query(
-            &peer_adnl_id,
-            &self.local_adnl_id,
-            query_name,
-            CANDIDATE_REQUEST_TIMEOUT,
-            &payload,
+        // Send query via RLDP overlay with explicit response size budget (C++ PR #2195 parity)
+        let timeout_deadline = SystemTime::now() + CANDIDATE_REQUEST_TIMEOUT;
+        self.overlay.send_query_via_rldp(
+            peer_adnl_id,
+            query_name.to_string(),
             Box::new(move |result: Result<consensus_common::BlockPayloadPtr>| {
-                // Post response handling to receiver thread
                 task_queues.post_closure(Box::new(move |receiver: &mut ReceiverImpl| {
                     receiver.handle_candidate_response(
                         slot_for_cb,
@@ -1746,6 +1747,10 @@ impl ReceiverImpl {
                     );
                 }));
             }),
+            timeout_deadline,
+            payload,
+            self.max_candidate_query_answer_size,
+            true, // RLDPv2
         );
     }
 
@@ -2275,8 +2280,17 @@ impl ReceiverImpl {
             stats.last_send_time = Some(SystemTime::now());
         }
 
+        // Build consensus.broadcastExtra with slot info (required for C++ interop)
+        let broadcast_extra = BroadcastExtra { slot: slot as i32 };
+        let extra = consensus_common::serialize_tl_boxed_object!(&broadcast_extra.into_boxed());
+
         // Send via overlay FEC broadcast
-        self.overlay.send_broadcast_fec_ex(&self.local_adnl_id, self.local_key.id(), payload);
+        self.overlay.send_broadcast_fec_ex(
+            &self.local_adnl_id,
+            self.local_key.id(),
+            payload,
+            Some(extra),
+        );
     }
 
     /// Shuffle send order for fairness
@@ -3132,6 +3146,7 @@ impl ReceiverWrapper {
         session_id: SessionId,
         shard: &ShardIdent,
         max_candidate_size: usize,
+        max_candidate_query_answer_size: u64,
         proto_version: u32,
         ids: &[SessionNode],
         local_key: &PrivateKey,
@@ -3315,6 +3330,7 @@ impl ReceiverWrapper {
                     dedup_votes: HashMap::new(),
                     shard: shard_clone,
                     max_candidate_size,
+                    max_candidate_query_answer_size,
                     proto_version,
                     in_messages_bytes: in_messages_bytes_clone,
                     out_messages_bytes: out_messages_bytes_clone,

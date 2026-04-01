@@ -358,6 +358,7 @@ impl CatchainOverlay for LoopbackOverlay {
         _sender_id: &PublicKeyHash,
         _send_as: &PublicKeyHash,
         _payload: BlockPayloadPtr,
+        _extra: Option<Vec<u8>>,
     ) {
         // no need to send broadcast to itself
         /*if let Some(listener) = self.listener.upgrade() {
@@ -439,6 +440,10 @@ pub(crate) struct SessionImpl {
 */
 
 impl consensus_common::Session for SessionImpl {
+    fn start(&self, _initial_block_seqno: u32) {
+        log::trace!("CatchainSession::start() called (no-op for catchain)");
+    }
+
     fn stop(&self) {
         self.stop_impl(false); // Stop without destroying DB (preserve for recovery)
     }

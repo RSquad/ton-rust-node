@@ -2418,3 +2418,499 @@ fn test_recovery_drain_startup_events_drops_certificate_relay_events() {
         "drained startup certificate events must not be re-broadcast on first normal tick"
     );
 }
+
+// ============================================================================
+// Gapless commit scheduler hardening tests
+// ============================================================================
+
+/// Verify that `cleanup_old_candidates` removes stale journal entries for old slots
+/// and increments the session error counter accordingly.
+#[test]
+fn test_journal_cleanup_removes_stale_entries() {
+    let mut fixture = TestFixture::new(4);
+
+    let old_slot = SlotIndex::new(5);
+    let current_slot = SlotIndex::new(20);
+    let old_hash = UInt256::rand();
+    let current_hash = UInt256::rand();
+
+    let old_id = RawCandidateId { slot: old_slot, hash: old_hash.clone() };
+    let current_id = RawCandidateId { slot: current_slot, hash: current_hash.clone() };
+
+    let dummy_cert: crate::certificate::FinalCertPtr = Arc::new(crate::certificate::Certificate {
+        vote: crate::simplex_state::FinalizeVote { slot: old_slot, block_hash: old_hash.clone() },
+        signatures: Vec::new(),
+    });
+
+    let dummy_cert2: crate::certificate::FinalCertPtr = Arc::new(crate::certificate::Certificate {
+        vote: crate::simplex_state::FinalizeVote {
+            slot: current_slot,
+            block_hash: current_hash.clone(),
+        },
+        signatures: Vec::new(),
+    });
+
+    let now = fixture.description.get_time();
+
+    fixture.processor.finalized_journal_pending_commit.insert(
+        old_id.clone(),
+        FinalizedEntry {
+            event: BlockFinalizedEvent {
+                slot: old_slot,
+                block_hash: old_hash,
+                block_id: None,
+                certificate: dummy_cert,
+            },
+            finalized_at: now - Duration::from_secs(60),
+        },
+    );
+
+    fixture.processor.finalized_journal_pending_commit.insert(
+        current_id.clone(),
+        FinalizedEntry {
+            event: BlockFinalizedEvent {
+                slot: current_slot,
+                block_hash: current_hash,
+                block_id: None,
+                certificate: dummy_cert2,
+            },
+            finalized_at: now,
+        },
+    );
+
+    assert_eq!(fixture.processor.finalized_journal_pending_commit.len(), 2);
+
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Cleanup slots < 10 — old_slot(5) should be removed, current_slot(20) kept.
+    fixture.processor.cleanup_old_candidates(SlotIndex::new(10));
+
+    assert_eq!(fixture.processor.finalized_journal_pending_commit.len(), 1);
+    assert!(!fixture.processor.finalized_journal_pending_commit.contains_key(&old_id));
+    assert!(fixture.processor.finalized_journal_pending_commit.contains_key(&current_id));
+
+    let errors_after =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(errors_after - errors_before, 1, "stale journal entry should increment error count");
+}
+
+/// Verify that the scheduler processes entries in seqno-ascending order,
+/// not arbitrary HashMap order.
+/// Both entries are WaitingForFinalCert on MC (seqno ahead of committed head)
+/// so neither can commit. Both stay pending in the journal.
+#[test]
+fn test_try_commit_processes_in_seqno_order() {
+    let mut fixture = TestFixture::new(4);
+
+    // TestFixture defaults to masterchain. Committed head seqno = 10.
+    let committed_block_id = ton_block::BlockIdExt::with_params(
+        ton_block::ShardIdent::masterchain(),
+        10,
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+    fixture.processor.last_committed_seqno = Some(10);
+    fixture.processor.last_committed_block_id = Some(committed_block_id);
+
+    // Both seqnos are ahead of expected (11), so MC fast-path returns
+    // WaitingForFinalCert and both entries remain in the journal.
+    let slot_a = SlotIndex::new(30);
+    let hash_a = UInt256::rand();
+    let id_a = RawCandidateId { slot: slot_a, hash: hash_a.clone() };
+    let block_id_a = ton_block::BlockIdExt::with_params(
+        ton_block::ShardIdent::masterchain(),
+        13, // ahead: expected=11
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+
+    let slot_b = SlotIndex::new(25);
+    let hash_b = UInt256::rand();
+    let id_b = RawCandidateId { slot: slot_b, hash: hash_b.clone() };
+    let block_id_b = ton_block::BlockIdExt::with_params(
+        ton_block::ShardIdent::masterchain(),
+        12, // ahead: expected=11
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+
+    for (id, slot, hash, block_id) in
+        [(&id_a, slot_a, &hash_a, &block_id_a), (&id_b, slot_b, &hash_b, &block_id_b)]
+    {
+        fixture.processor.received_candidates.insert(
+            id.clone(),
+            ReceivedCandidate {
+                slot,
+                source_idx: ValidatorIndex::new(0),
+                candidate_id_hash: hash.clone(),
+                candidate_hash_data_bytes: vec![1, 2, 3],
+                block_id: block_id.clone(),
+                root_hash: block_id.root_hash.clone(),
+                file_hash: block_id.file_hash.clone(),
+                data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                    vec![0xAA].into(),
+                ),
+                collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                    vec![0xBB].into(),
+                ),
+                receive_time: fixture.description.get_time(),
+                is_empty: false,
+                parent_id: None,
+                is_fully_resolved: true,
+            },
+        );
+
+        let cert: crate::certificate::FinalCertPtr = Arc::new(crate::certificate::Certificate {
+            vote: crate::simplex_state::FinalizeVote { slot, block_hash: hash.clone() },
+            signatures: vec![
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![0u8; 64]),
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![1u8; 64]),
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![2u8; 64]),
+            ],
+        });
+        fixture.processor.finalized_journal_pending_commit.insert(
+            id.clone(),
+            FinalizedEntry {
+                event: BlockFinalizedEvent {
+                    slot,
+                    block_hash: hash.clone(),
+                    block_id: Some(block_id.clone()),
+                    certificate: cert,
+                },
+                finalized_at: fixture.description.get_time(),
+            },
+        );
+    }
+
+    fixture.processor.try_commit_finalized_chains();
+
+    // Both entries remain pending — MC blocks ahead of committed head wait for FinalCert.
+    assert!(fixture.processor.finalized_journal_pending_commit.contains_key(&id_a));
+    assert!(fixture.processor.finalized_journal_pending_commit.contains_key(&id_b));
+    assert_eq!(fixture.processor.last_committed_seqno, Some(10));
+}
+
+/// Verify the finalized_uncommitted_gauge is updated correctly.
+#[test]
+fn test_finalized_uncommitted_gauge_tracks_journal_size() {
+    let mut fixture = TestFixture::new(4);
+
+    // Empty journal — gauge should be 0 (function runs without panic).
+    fixture.processor.try_commit_finalized_chains();
+
+    // Add a journal entry that will become AlreadyCommitted
+    let slot = SlotIndex::new(5);
+    let hash = UInt256::rand();
+    let id = RawCandidateId { slot, hash: hash.clone() };
+
+    fixture.processor.last_committed_seqno = Some(100);
+    let committed_block_id = ton_block::BlockIdExt::with_params(
+        ton_block::ShardIdent::masterchain(),
+        100,
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+    fixture.processor.last_committed_block_id = Some(committed_block_id.clone());
+
+    // Insert a received candidate with seqno < committed so collect_gapless returns AlreadyCommitted
+    fixture.processor.received_candidates.insert(
+        id.clone(),
+        ReceivedCandidate {
+            slot,
+            source_idx: ValidatorIndex::new(0),
+            candidate_id_hash: hash.clone(),
+            candidate_hash_data_bytes: vec![1, 2, 3],
+            block_id: committed_block_id.clone(),
+            root_hash: committed_block_id.root_hash.clone(),
+            file_hash: committed_block_id.file_hash.clone(),
+            data: consensus_common::ConsensusCommonFactory::create_block_payload(vec![0xAA].into()),
+            collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                vec![0xBB].into(),
+            ),
+            receive_time: fixture.description.get_time(),
+            is_empty: false,
+            parent_id: None,
+            is_fully_resolved: true,
+        },
+    );
+
+    let cert: crate::certificate::FinalCertPtr = Arc::new(crate::certificate::Certificate {
+        vote: crate::simplex_state::FinalizeVote { slot, block_hash: hash.clone() },
+        signatures: Vec::new(),
+    });
+    fixture.processor.finalized_journal_pending_commit.insert(
+        id.clone(),
+        FinalizedEntry {
+            event: BlockFinalizedEvent {
+                slot,
+                block_hash: hash,
+                block_id: Some(committed_block_id),
+                certificate: cert,
+            },
+            finalized_at: fixture.description.get_time(),
+        },
+    );
+
+    assert_eq!(fixture.processor.finalized_journal_pending_commit.len(), 1);
+
+    fixture.processor.try_commit_finalized_chains();
+
+    // The AlreadyCommitted entry should be removed
+    assert!(
+        fixture.processor.finalized_journal_pending_commit.is_empty(),
+        "AlreadyCommitted entry should be removed from journal"
+    );
+}
+
+/// Verify that seqno-sorted iteration commits sequential chains in a single pass
+/// and schedules an immediate re-check via set_next_awake_time(now).
+#[test]
+fn test_sorted_pass_commits_sequential_chains_and_reschedules() {
+    let mut fixture = TestFixture::new(4);
+
+    // Committed head at seqno 10
+    let committed_block_id = ton_block::BlockIdExt::with_params(
+        ton_block::ShardIdent::masterchain(),
+        10,
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+    fixture.processor.last_committed_seqno = Some(10);
+    fixture.processor.last_committed_block_id = Some(committed_block_id.clone());
+
+    // Build chain: slot_a (seqno 11, parent=boundary) → slot_b (seqno 12, parent=slot_a)
+    // On MC with matching expected_seqno, the MC fast-path commits the single block.
+    // After committing slot_a (seqno=11), re-loop should pick up slot_b (seqno=12).
+    let slot_a = SlotIndex::new(20);
+    let hash_a = UInt256::rand();
+    let id_a = RawCandidateId { slot: slot_a, hash: hash_a.clone() };
+    let block_id_a = ton_block::BlockIdExt::with_params(
+        ton_block::ShardIdent::masterchain(),
+        11,
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+
+    let slot_b = SlotIndex::new(25);
+    let hash_b = UInt256::rand();
+    let id_b = RawCandidateId { slot: slot_b, hash: hash_b.clone() };
+    let block_id_b = ton_block::BlockIdExt::with_params(
+        ton_block::ShardIdent::masterchain(),
+        12,
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+
+    // slot_a: parent = None (session boundary → MC fast-path single-commit if seqno matches)
+    fixture.processor.received_candidates.insert(
+        id_a.clone(),
+        ReceivedCandidate {
+            slot: slot_a,
+            source_idx: ValidatorIndex::new(0),
+            candidate_id_hash: hash_a.clone(),
+            candidate_hash_data_bytes: vec![1, 2, 3],
+            block_id: block_id_a.clone(),
+            root_hash: block_id_a.root_hash.clone(),
+            file_hash: block_id_a.file_hash.clone(),
+            data: consensus_common::ConsensusCommonFactory::create_block_payload(vec![0xAA].into()),
+            collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                vec![0xBB].into(),
+            ),
+            receive_time: fixture.description.get_time(),
+            is_empty: false,
+            parent_id: None,
+            is_fully_resolved: true,
+        },
+    );
+
+    // slot_b: parent = slot_a (will be WaitingForFinalCert initially since expected=11, seqno=12)
+    fixture.processor.received_candidates.insert(
+        id_b.clone(),
+        ReceivedCandidate {
+            slot: slot_b,
+            source_idx: ValidatorIndex::new(0),
+            candidate_id_hash: hash_b.clone(),
+            candidate_hash_data_bytes: vec![4, 5, 6],
+            block_id: block_id_b.clone(),
+            root_hash: block_id_b.root_hash.clone(),
+            file_hash: block_id_b.file_hash.clone(),
+            data: consensus_common::ConsensusCommonFactory::create_block_payload(vec![0xCC].into()),
+            collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                vec![0xDD].into(),
+            ),
+            receive_time: fixture.description.get_time(),
+            is_empty: false,
+            parent_id: Some(id_a.clone()),
+            is_fully_resolved: true,
+        },
+    );
+
+    // Provide FinalCert for both (MC requires FinalCert for non-empty blocks)
+    for (slot, hash) in [(&slot_a, &hash_a), (&slot_b, &hash_b)] {
+        let final_cert = Arc::new(crate::certificate::Certificate {
+            vote: crate::simplex_state::FinalizeVote { slot: *slot, block_hash: hash.clone() },
+            signatures: vec![
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![0u8; 64]),
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![1u8; 64]),
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![2u8; 64]),
+            ],
+        });
+        fixture
+            .processor
+            .simplex_state
+            .set_finalize_certificate(&fixture.description, *slot, hash, final_cert)
+            .expect("store final cert");
+    }
+
+    // Journal entries for both
+    for (id, slot, hash, block_id) in
+        [(&id_a, slot_a, &hash_a, &block_id_a), (&id_b, slot_b, &hash_b, &block_id_b)]
+    {
+        let cert: crate::certificate::FinalCertPtr = Arc::new(crate::certificate::Certificate {
+            vote: crate::simplex_state::FinalizeVote { slot, block_hash: hash.clone() },
+            signatures: vec![
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![0u8; 64]),
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![1u8; 64]),
+                crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![2u8; 64]),
+            ],
+        });
+        fixture.processor.finalized_journal_pending_commit.insert(
+            id.clone(),
+            FinalizedEntry {
+                event: BlockFinalizedEvent {
+                    slot,
+                    block_hash: hash.clone(),
+                    block_id: Some(block_id.clone()),
+                    certificate: cert,
+                },
+                finalized_at: fixture.description.get_time(),
+            },
+        );
+    }
+
+    // Push next_awake_time into the future so we can verify it gets pulled back after commit.
+    fixture.processor.reset_next_awake_time();
+    assert!(
+        fixture.processor.get_next_awake_time() > fixture.description.get_time(),
+        "next_awake_time should be in the future before commit"
+    );
+
+    // Because finalized_keys are sorted by seqno, slot_a (seqno=11) is processed
+    // first. After it commits, last_committed_seqno advances to 11, so when the
+    // iteration reaches slot_b (seqno=12), expected_seqno matches and it commits too.
+    fixture.processor.try_commit_finalized_chains();
+
+    assert_eq!(
+        fixture.processor.last_committed_seqno,
+        Some(12),
+        "sorted iteration should commit both seqno 11 and 12 in one pass"
+    );
+    assert!(
+        fixture.processor.finalized_journal_pending_commit.is_empty(),
+        "all journal entries should be committed and removed"
+    );
+    // Commits happened, so an immediate re-check should be scheduled.
+    assert!(
+        fixture.processor.get_next_awake_time() <= fixture.description.get_time(),
+        "next_awake_time should be <= now after a successful commit"
+    );
+}
+
+/// Verify that the correct processing order (validated candidates BEFORE
+/// FSM timeouts) allows a candidate to be notarized even when the clock
+/// has advanced past the skip timeout.
+///
+/// Without Fix A (processing-order), calling `simplex_state.check_all()`
+/// first would fire the `first_block_timeout` and skip-vote the slot
+/// before the already-validated candidate is fed to the FSM.
+#[test]
+fn test_process_validated_candidates_before_fsm_timeout() {
+    let mut fixture = TestFixture::new(4);
+
+    let slot = SlotIndex::new(0);
+    let candidate_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: candidate_hash.clone() };
+
+    // Create a non-empty candidate for slot 0 with no parent (genesis).
+    let raw_candidate = make_test_non_empty_candidate(candidate_id.clone(), None, &fixture.nodes);
+    let time = fixture.description.get_time();
+
+    // Insert pending validation so candidate_decision_ok_internal can find it.
+    insert_pending_validation(&mut fixture.processor, &candidate_id, raw_candidate, time);
+
+    // Simulate validation success: push the resolved candidate into the queue.
+    fixture.processor.candidate_decision_ok_internal(candidate_id.clone(), slot, time);
+    assert!(
+        !fixture.processor.validated_candidates.is_empty(),
+        "candidate must be in the validated_candidates queue"
+    );
+
+    // Advance time past first_block_timeout + target_rate (defaults: 3s + 1s = 4s).
+    fixture.advance_time(Duration::from_secs(5));
+
+    // --- Correct order (Fix A): feed candidates, THEN run FSM timeouts ---
+    fixture.processor.process_validated_candidates();
+    fixture.processor.simplex_state.check_all(&fixture.description);
+
+    // Collect FSM events produced by the two calls above.
+    let mut has_notarize = false;
+    while let Some(event) = fixture.processor.simplex_state.pull_event() {
+        if let crate::simplex_state::SimplexEvent::BroadcastVote(
+            crate::simplex_state::Vote::Notarize(ref v),
+        ) = event
+        {
+            if v.slot == slot {
+                has_notarize = true;
+            }
+        }
+    }
+
+    // The critical invariant: the candidate was notarized because
+    // process_validated_candidates() ran before simplex_state.check_all().
+    assert!(
+        has_notarize,
+        "slot 0 must be notarized (candidate was fed to FSM before timeout evaluation)"
+    );
+    // In C++ mode (allow_skip_after_notarize=true) a skip vote may follow
+    // the notarize vote after the timeout fires -- that is harmless and
+    // expected.  The key property is that the notarize vote was emitted.
+}
+
+/// Verify that the `log::warn!` for "drop because new block is already
+/// committed" only fires when `cand_seqno <= committed_seqno`, i.e. the
+/// candidate is actually dropped.  When `cand_seqno > committed_seqno`
+/// the candidate must proceed to `validated_candidates`.
+#[test]
+fn test_candidate_decision_ok_does_not_drop_when_cand_seqno_greater_than_committed() {
+    let mut fixture = TestFixture::new(4);
+
+    let slot = SlotIndex::new(0);
+    let candidate_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: candidate_hash.clone() };
+
+    let raw_candidate = make_test_non_empty_candidate(candidate_id.clone(), None, &fixture.nodes);
+    let time = fixture.description.get_time();
+    insert_pending_validation(&mut fixture.processor, &candidate_id, raw_candidate, time);
+
+    // Set last_committed_seqno to a value BELOW the candidate's seqno.
+    // make_test_non_empty_candidate uses slot.value()+1 as seq_no, so for
+    // slot 0 the candidate seqno = 1.  Setting committed to 0 means
+    // cand_seqno (1) > committed_seqno (0) → candidate must NOT be dropped.
+    fixture.processor.last_committed_seqno = Some(0);
+
+    // Call the public wrapper which contains the guard.
+    let validity_start = time;
+    fixture.processor.candidate_decision_ok(slot, candidate_id.clone(), validity_start, time);
+
+    // The candidate must have been pushed to validated_candidates (not dropped).
+    assert!(
+        !fixture.processor.validated_candidates.is_empty(),
+        "candidate with cand_seqno > committed_seqno must NOT be dropped"
+    );
+    // And it must have been removed from pending_validations (consumed, not leaked).
+    assert!(
+        !fixture.processor.pending_validations.contains_key(&candidate_id),
+        "pending_validations entry must be consumed"
+    );
+}

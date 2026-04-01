@@ -281,13 +281,13 @@ impl RustTestNode {
     }
 
     /// Send two-step FEC broadcast via overlay (requires RLDP)
-    pub fn send_broadcast_two_step(&self, overlay_id: &Arc<OverlayShortId>, data: &[u8]) {
+    pub fn send_broadcast_twostep(&self, overlay_id: &Arc<OverlayShortId>, data: &[u8]) {
         self.rt.block_on(async {
             let tagged = TaggedByteSlice::with_object(data);
             self.overlay
-                .broadcast_two_step(overlay_id, &tagged, None, 0)
+                .broadcast_twostep(overlay_id, &tagged, None, 0, Vec::new())
                 .await
-                .expect("broadcast_two_step failed");
+                .expect("broadcast_twostep failed");
         });
     }
 
@@ -517,7 +517,7 @@ impl RustQuicTestNode {
             let _guard = rt.enter();
             let quic_subscribers: Vec<Arc<dyn Subscriber>> =
                 vec![test_sub as Arc<dyn Subscriber>, overlay.clone()];
-            let quic = QuicNode::new(quic_subscribers, cancellation_token.clone());
+            let quic = QuicNode::new(quic_subscribers, cancellation_token.clone(), None);
             let bind_addr = SocketAddr::new(
                 Ipv4Addr::from(adnl.ip_address().ip()).into(),
                 adnl.ip_address().port() + QuicNode::OFFSET_PORT,

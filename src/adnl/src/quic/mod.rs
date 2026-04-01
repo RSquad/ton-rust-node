@@ -17,7 +17,10 @@ use crate::{
 use std::{
     fmt,
     net::SocketAddr,
-    sync::{Arc, Once},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Once,
+    },
     time::Duration,
 };
 use ton_api::{
@@ -56,6 +59,19 @@ fn key_id_from_spki(spki: &[u8]) -> Result<Arc<KeyId>> {
 struct QuicOutboundConnection {
     conn: Option<quinn::Connection>,
     send_queue: Arc<QuicSendQueue>,
+    sender_state: Arc<SenderState>,
+}
+
+/// Per-peer sender lifecycle guard. Uses an atomic flag to ensure exactly
+/// one sender task runs per outbound peer.
+struct SenderState {
+    active: AtomicBool,
+}
+
+impl SenderState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { active: AtomicBool::new(false) })
+    }
 }
 
 /// Presents a single fixed Ed25519 SPKI (RPK) as the client certificate.
@@ -333,15 +349,40 @@ pub struct QuicNode {
 
 impl QuicNode {
     pub const OFFSET_PORT: u16 = 1000;
-    const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5000;
 
     /// How often the background checker scans outbound connections for dead ones.
     const CONNECTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
     const DEFAULT_MAX_STREAMS_PER_CONNECTION: usize = 256;
-
+    const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5000;
     /// Maximum number of messages buffered per outbound peer
     const SEND_QUEUE_CAPACITY: usize = 1024;
+
+    /// Create a new QuicNode. No endpoints are bound — they are created lazily
+    /// by `add_key()` when the first identity for a given port is registered.
+    pub fn new(
+        subscribers: Vec<Arc<dyn Subscriber>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        max_streams_per_connection: Option<usize>,
+    ) -> Arc<Self> {
+        let max_streams_per_connection =
+            max_streams_per_connection.unwrap_or(Self::DEFAULT_MAX_STREAMS_PER_CONNECTION);
+        static CRYPTO_INIT: Once = Once::new();
+        CRYPTO_INIT.call_once(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("Failed to install default Rustls CryptoProvider");
+        });
+        let transport = Arc::new(Self {
+            cancellation_token: cancellation_token.clone(),
+            local_keys: lockfree::map::Map::new(),
+            endpoints: std::sync::Mutex::new(std::collections::HashMap::new()),
+            subscribers: Arc::new(subscribers),
+            peer_keys: lockfree::map::Map::new(),
+            max_streams_per_connection,
+        });
+        Self::spawn_connection_checker(Arc::downgrade(&transport), cancellation_token);
+        transport
+    }
 
     /// Register a local identity on a specific bind address.
     /// Creates a new endpoint if one doesn't exist for this port yet.
@@ -445,51 +486,62 @@ impl QuicNode {
     ) -> Result<Option<usize>> {
         self.ensure_peer_registered(adnl, src, dst)?;
         let data = serialize_boxed(&QuicMessage { data: data.into() }.into_boxed())?;
-        match self.get_outbound_connection(src, dst, true).await? {
-            QuicOutboundConnection { conn: Some(ref conn), ref send_queue } => {
-                if send_queue.check(true) {
-                    if !send_queue.try_push(data) {
-                        send_queue.check(false);
-                        fail!("QUIC send queue full for peer {dst}");
-                    }
-                    while !send_queue.check(false) {
-                        tokio::task::yield_now().await;
-                    }
-                } else {
-                    let len = data.len();
-                    if let Err(e) = Self::send_via_stream(conn, &data).await {
-                        log::warn!(
-                            target: TARGET,
-                            "QUIC send_message to {dst} failed: {e}, removing dead connection"
-                        );
-                        let addr = self.addr_by_key(dst)?;
-                        let state = self.local_key_state(src)?;
-                        Self::remove_dead_connection(&state.outbound, addr, conn);
-                        return Err(e);
-                    }
-                    return Ok(Some(len));
-                }
-            }
-            QuicOutboundConnection { conn: None, ref send_queue } => {
-                if !send_queue.try_push(data) {
-                    fail!("QUIC send queue full for peer {dst} (connecting)");
+        let addr = self.addr_by_key(dst)?;
+        let state = self.local_key_state(src)?;
+        let outbound = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
+
+        // Fast path: if connection is alive, send directly without queue overhead
+        if let Some(ref conn) = outbound.conn {
+            match Self::send_via_stream(conn, &data).await {
+                Ok(_) => return Ok(Some(data.len())),
+                Err(e) => {
+                    log::warn!(
+                        target: TARGET,
+                        "QUIC direct send to {dst} failed: {e}, removing dead connection, \
+                        falling back to queue"
+                    );
+                    Self::remove_dead_connection(&state.outbound, addr, conn);
                 }
             }
         }
-        Ok(None)
-    }
 
-    /// Create a new QuicNode. No endpoints are bound — they are created lazily
-    /// by `add_key()` when the first identity for a given port is registered.
-    pub fn new(
-        subscribers: Vec<Arc<dyn Subscriber>>,
-        cancellation_token: tokio_util::sync::CancellationToken,
-    ) -> Arc<Self> {
-        Self::with_stream_limit(
-            subscribers,
-            cancellation_token,
-            Self::DEFAULT_MAX_STREAMS_PER_CONNECTION,
-        )
+        // Slow path: no connection (or it just died) — enqueue for the sender task
+        // which will establish the connection and deliver
+        if !outbound.send_queue.try_push(data) {
+            fail!("QUIC send queue full for peer {dst}");
+        }
+
+        // Spawn sender task if not already running (CAS guarantees at most one per peer)
+        if outbound
+            .sender_state
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let quic = self.clone();
+            let src = src.clone();
+            let dst = dst.clone();
+            let send_queue = outbound.send_queue.clone();
+            let sender_state = outbound.sender_state.clone();
+            let outbound_conns = state.outbound.clone();
+            let server_name = Self::key_id_to_server_name(&dst);
+
+            spawn_cancelable(
+                self.cancellation_token.clone(),
+                Self::run_sender_task(
+                    quic,
+                    src,
+                    dst,
+                    addr,
+                    server_name,
+                    send_queue,
+                    sender_state,
+                    outbound_conns,
+                ),
+            );
+        }
+
+        Ok(None)
     }
 
     pub async fn query(
@@ -539,30 +591,6 @@ impl QuicNode {
         }
     }
 
-    /// Like `new`, but with a custom per-connection stream concurrency limit.
-    pub fn with_stream_limit(
-        subscribers: Vec<Arc<dyn Subscriber>>,
-        cancellation_token: tokio_util::sync::CancellationToken,
-        max_streams_per_connection: usize,
-    ) -> Arc<Self> {
-        static CRYPTO_INIT: Once = Once::new();
-        CRYPTO_INIT.call_once(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("Failed to install default Rustls CryptoProvider");
-        });
-        let transport = Arc::new(Self {
-            cancellation_token: cancellation_token.clone(),
-            local_keys: lockfree::map::Map::new(),
-            endpoints: std::sync::Mutex::new(std::collections::HashMap::new()),
-            subscribers: Arc::new(subscribers),
-            peer_keys: lockfree::map::Map::new(),
-            max_streams_per_connection,
-        });
-        Self::spawn_connection_checker(Arc::downgrade(&transport), cancellation_token);
-        transport
-    }
-
     fn addr_by_key(&self, key_id: &Arc<KeyId>) -> Result<SocketAddr> {
         match self.peer_keys.get(key_id) {
             Some(entry) => Ok(*entry.val()),
@@ -578,7 +606,13 @@ impl QuicNode {
         server_name: &str,
     ) -> Result<()> {
         let state = self.local_key_state(src)?;
-        let endpoint = self.endpoint_for_port(state.bound_port)?;
+        let endpoint = {
+            let endpoints = self.endpoints.lock().map_err(|e| error!("Endpoints lock: {e}"))?;
+            endpoints
+                .get(&state.bound_port)
+                .map(|s| s.endpoint.clone())
+                .ok_or_else(|| error!("No QUIC endpoint for port {}", state.bound_port))?
+        };
         let conn = endpoint
             .connect_with(state.client_config.clone(), addr, server_name)
             .map_err(|e| error!("QUIC connect to {addr} (SNI={server_name}): {e}"))?
@@ -599,6 +633,7 @@ impl QuicNode {
                 Ok(Some(QuicOutboundConnection {
                     conn: Some(conn.clone()),
                     send_queue: found.send_queue.clone(),
+                    sender_state: found.sender_state.clone(),
                 }))
             } else {
                 Ok(None)
@@ -609,13 +644,25 @@ impl QuicNode {
         Ok(())
     }
 
-    /// Get the endpoint for the given port.
-    fn endpoint_for_port(&self, port: u16) -> Result<quinn::Endpoint> {
-        let endpoints = self.endpoints.lock().map_err(|e| error!("Endpoints lock: {e}"))?;
-        endpoints
-            .get(&port)
-            .map(|s| s.endpoint.clone())
-            .ok_or_else(|| error!("No QUIC endpoint for port {port}"))
+    /// Obtain (or create) an outbound connection and connect in the foreground.
+    /// Used by the query path where a live connection is required synchronously.
+    async fn ensure_outbound_connection(
+        self: &Arc<Self>,
+        src: &Arc<KeyId>,
+        dst: &Arc<KeyId>,
+    ) -> Result<QuicOutboundConnection> {
+        let addr = self.addr_by_key(dst)?;
+        let server_name = Self::key_id_to_server_name(dst);
+        let state = self.local_key_state(src)?;
+        loop {
+            let conn = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
+            if conn.conn.is_some() {
+                break Ok(conn);
+            }
+            log::info!(target: TARGET, "Try new QUIC connection to {addr} in foreground");
+            self.connect(src, dst, addr, &server_name).await?;
+            log::info!(target: TARGET, "QUIC connected to {addr} in foreground");
+        }
     }
 
     fn ensure_peer_registered(
@@ -742,9 +789,6 @@ impl QuicNode {
             match outbound.map().get(&addr) {
                 Some(entry) => {
                     let found = entry.val();
-                    // Proactive liveness check: if the connection is dead, remove it
-                    // and loop again — the next iteration will see conn: None and
-                    // trigger a reconnect.
                     if let Some(ref c) = found.conn {
                         if c.close_reason().is_some() {
                             log::info!(
@@ -760,93 +804,20 @@ impl QuicNode {
                     break Ok(QuicOutboundConnection {
                         conn: found.conn.clone(),
                         send_queue: found.send_queue.clone(),
+                        sender_state: found.sender_state.clone(),
                     });
                 }
                 None => {
                     let queue = QuicSendQueue::with_capacity(Self::SEND_QUEUE_CAPACITY);
+                    let sender_state = SenderState::new();
                     add_unbound_object_to_map(outbound.map(), addr, || {
-                        Ok(QuicOutboundConnection { conn: None, send_queue: queue.clone() })
+                        Ok(QuicOutboundConnection {
+                            conn: None,
+                            send_queue: queue.clone(),
+                            sender_state: sender_state.clone(),
+                        })
                     })?;
                 }
-            }
-        }
-    }
-
-    async fn get_outbound_connection(
-        self: &Arc<Self>,
-        src: &Arc<KeyId>,
-        dst: &Arc<KeyId>,
-        create_async: bool,
-    ) -> Result<QuicOutboundConnection> {
-        let addr = self.addr_by_key(dst)?;
-        let server_name = Self::key_id_to_server_name(dst);
-        let state = self.local_key_state(src)?;
-        loop {
-            let conn = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
-            if let QuicOutboundConnection { conn: Some(_), .. } = &conn {
-                break Ok(conn);
-            }
-            if create_async {
-                let queue = conn.send_queue.clone();
-                let quic = self.clone();
-                let src = src.clone();
-                let dst = dst.clone();
-                let server_name = server_name.clone();
-                spawn_cancelable(self.cancellation_token.clone(), async move {
-                    while !queue.activate(true) {
-                        tokio::task::yield_now().await;
-                    }
-                    loop {
-                        let Some(data) = queue.pop() else {
-                            if queue.activate(false) {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                            continue;
-                        };
-                        loop {
-                            let result = quic.local_key_state(&src).and_then(|s| {
-                                Self::get_or_create_outbound_connection(&s.outbound, addr)
-                            });
-                            let result = match result {
-                                Ok(QuicOutboundConnection { conn: Some(ref conn), .. }) => {
-                                    Self::send_via_stream(conn, &data).await
-                                }
-                                Ok(_) => {
-                                    log::info!(
-                                        target: TARGET,
-                                        "Try new QUIC connection to {addr} in background"
-                                    );
-                                    let result = quic.connect(&src, &dst, addr, &server_name).await;
-                                    if let Err(e) = result {
-                                        Err(error!(
-                                            "QUIC background connection to {addr} error: {e}"
-                                        ))
-                                    } else {
-                                        log::info!(
-                                            target: TARGET,
-                                            "QUIC connected to {addr} in background"
-                                        );
-                                        continue;
-                                    }
-                                }
-                                Err(e) => Err(e),
-                            };
-                            if let Err(e) = result {
-                                log::warn!(
-                                    target: TARGET,
-                                    "QUIC send to {addr} in background error: {e}"
-                                );
-                            }
-                            break;
-                        }
-                    }
-                });
-                break Ok(conn);
-            } else {
-                log::info!(target: TARGET, "Try new QUIC connection to {addr} in foreground");
-                self.connect(&src, dst, addr, &server_name).await?;
-                log::info!(target: TARGET, "QUIC connected to {addr} in foreground");
             }
         }
     }
@@ -938,36 +909,76 @@ impl QuicNode {
         let peers = AdnlPeers::with_keys(local_key_id, peer_key_id);
         let conn_id = conn.stable_id();
         // Limit concurrent in-flight streams per connection to bound memory usage.
-        // When the semaphore is full, accept_bi() stalls, applying QUIC-level backpressure.
+        // When the semaphore is full, accept stalls, applying QUIC-level backpressure.
         let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(max_streams_per_connection));
-        loop {
-            let (send, recv) = match conn.accept_bi().await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    log::warn!(
-                        target: TARGET,
-                        "QUIC accept stream from {addr}: {e}"
-                    );
-                    break;
-                }
-            };
-            let permit = match stream_semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            let subscribers = subscribers.clone();
-            let peers = peers.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(e) =
-                    Self::process_incoming_stream(recv, send, &subscribers, &peers, addr).await
-                {
-                    log::warn!(
-                        target: TARGET,
-                        "QUIC process stream from {addr}: {e}"
-                    );
-                }
-            });
+
+        // Accept both bi-directional streams (queries + legacy messages) and
+        // uni-directional streams (fire-and-forget messages from the new sender).
+        let conn_bi = conn.clone();
+        let conn_uni = conn.clone();
+        let sem_bi = stream_semaphore.clone();
+        let sem_uni = stream_semaphore;
+        let subs_bi = subscribers.clone();
+        let subs_uni = subscribers;
+        let peers_bi = peers.clone();
+        let peers_uni = peers;
+
+        let bi_loop = async {
+            loop {
+                let (send, recv) = match conn_bi.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        log::warn!(target: TARGET, "QUIC accept bi-stream from {addr}: {e}");
+                        break;
+                    }
+                };
+                let permit = match sem_bi.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let subscribers = subs_bi.clone();
+                let peers = peers_bi.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) =
+                        Self::process_incoming_stream(recv, send, &subscribers, &peers, addr).await
+                    {
+                        log::warn!(target: TARGET, "QUIC process bi-stream from {addr}: {e}");
+                    }
+                });
+            }
+        };
+
+        let uni_loop = async {
+            loop {
+                let recv = match conn_uni.accept_uni().await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        log::warn!(target: TARGET, "QUIC accept uni-stream from {addr}: {e}");
+                        break;
+                    }
+                };
+                let permit = match sem_uni.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let subscribers = subs_uni.clone();
+                let peers = peers_uni.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) =
+                        Self::process_incoming_uni_stream(recv, &subscribers, &peers, addr).await
+                    {
+                        log::warn!(target: TARGET, "QUIC process uni-stream from {addr}: {e}");
+                    }
+                });
+            }
+        };
+
+        // Run both accept loops; when either exits (connection closed), both stop.
+        tokio::select! {
+            () = bi_loop => {}
+            () = uni_loop => {}
         }
         let is_current =
             inbound.map().get(&addr).map(|e| e.val().stable_id() == conn_id).unwrap_or(false);
@@ -1018,24 +1029,42 @@ impl QuicNode {
                 return Ok(());
             }
         };
-        log::debug!(target: TARGET, "process_incoming_stream from {addr}: read {} bytes", buf.len());
+        log::debug!(
+            target: TARGET,
+            "process_incoming_stream from {addr}: read {} bytes",
+            buf.len()
+        );
         if buf.is_empty() {
             return Ok(());
         }
         let obj = deserialize_boxed(&buf)
             .map_err(|e| error!("Cannot deserialize QUIC message from {addr}: {e}"))?;
-        log::debug!(target: TARGET, "process_incoming_stream from {addr}: deserialized TL, about to downcast");
+        log::debug!(
+            target: TARGET,
+            "process_incoming_stream from {addr}: deserialized TL, about to downcast"
+        );
         match obj.downcast::<Request>() {
             Ok(Request::Quic_Message(msg)) => {
-                log::debug!(target: TARGET, "process_incoming_stream from {addr}: QUIC MESSAGE, dispatching to {} subscribers", subscribers.len());
+                log::debug!(
+                    target: TARGET,
+                    "process_incoming_stream from {addr}: QUIC MESSAGE, \
+                    dispatching to {} subscribers",
+                    subscribers.len()
+                );
                 for subscriber in subscribers {
                     if subscriber.try_consume_custom(&msg.data, &peers).await? {
-                        log::debug!(target: TARGET, "process_incoming_stream from {addr}: consumed by subscriber");
+                        log::debug!(
+                            target: TARGET,
+                            "process_incoming_stream from {addr}: consumed by subscriber"
+                        );
                         break;
                     }
                 }
                 let _ = send.finish();
-                log::debug!(target: TARGET, "process_incoming_stream from {addr}: finished send side");
+                log::debug!(
+                    target: TARGET,
+                    "process_incoming_stream from {addr}: finished send side"
+                );
             }
             Ok(Request::Quic_Query(query)) => {
                 log::debug!(target: TARGET, "process_incoming_stream from {addr}: QUIC QUERY");
@@ -1059,7 +1088,63 @@ impl QuicNode {
                 let _ = send.finish();
             }
             Err(_obj) => {
-                log::warn!(target: TARGET, "Unknown QUIC TL message from {addr}: failed to downcast to Request");
+                log::warn!(
+                    target: TARGET,
+                    "Unknown QUIC TL message from {addr}: failed to downcast to Request"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Process a fire-and-forget message received on a uni-directional QUIC stream.
+    /// Only `QuicMessage` is expected; queries arriving on uni streams are rejected
+    /// because there is no send side to write a response to.
+    async fn process_incoming_uni_stream(
+        mut recv: quinn::RecvStream,
+        subscribers: &[Arc<dyn Subscriber>],
+        peers: &AdnlPeers,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        let buf = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recv.read_to_end(16 * 1024 * 1024),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| error!("QUIC uni read from {addr}: {e}"))?,
+            Err(_) => {
+                log::warn!(
+                    target: TARGET,
+                    "process_incoming_uni_stream from {addr}: read timed out after 5s"
+                );
+                return Ok(());
+            }
+        };
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let obj = deserialize_boxed(&buf)
+            .map_err(|e| error!("Cannot deserialize QUIC uni-stream from {addr}: {e}"))?;
+        match obj.downcast::<Request>() {
+            Ok(Request::Quic_Message(msg)) => {
+                for subscriber in subscribers {
+                    if subscriber.try_consume_custom(&msg.data, peers).await? {
+                        break;
+                    }
+                }
+            }
+            Ok(Request::Quic_Query(_)) => {
+                log::warn!(
+                    target: TARGET,
+                    "Received QUIC query on uni-directional stream from {addr} — no response possible"
+                );
+            }
+            Err(_) => {
+                log::warn!(
+                    target: TARGET,
+                    "Unknown QUIC TL message on uni-stream from {addr}"
+                );
             }
         }
         Ok(())
@@ -1075,6 +1160,13 @@ impl QuicNode {
         dead_conn: &quinn::Connection,
     ) -> bool {
         let dead_id = dead_conn.stable_id();
+        // Explicitly close the quinn connection so its internal ConnectionDriver
+        // task stops immediately. Without this, the driver continues processing
+        // keep-alive and retransmit timers until idle timeout (15s), causing the
+        // EndpointDriver to busy-loop on timer events and burn 100% CPU.
+        if dead_conn.close_reason().is_none() {
+            dead_conn.close(0u32.into(), b"dead connection cleanup");
+        }
         match outbound.set_connection_state(addr, |found| {
             if let Some(ref conn) = found.conn {
                 if conn.stable_id() == dead_id {
@@ -1085,6 +1177,7 @@ impl QuicNode {
                     return Ok(Some(QuicOutboundConnection {
                         conn: None,
                         send_queue: found.send_queue.clone(),
+                        sender_state: found.sender_state.clone(),
                     }));
                 }
             }
@@ -1144,6 +1237,85 @@ impl QuicNode {
         }
     }
 
+    /// Drain the send queue and exit. Spawned when `message()` has no live
+    /// connection and must enqueue data for later delivery. The task establishes
+    /// the connection, sends all queued messages, and terminates.
+    async fn run_sender_task(
+        quic: Arc<Self>,
+        src: Arc<KeyId>,
+        dst: Arc<KeyId>,
+        addr: SocketAddr,
+        server_name: String,
+        send_queue: Arc<QuicSendQueue>,
+        sender_state: Arc<SenderState>,
+        outbound: Arc<Connections<QuicOutboundConnection>>,
+    ) {
+        log::trace!(target: TARGET, "QUIC sender task started for {addr}");
+
+        loop {
+            // Drain the queue
+            while let Some(data) = send_queue.pop() {
+                if let Err(e) =
+                    quic.send_message(&src, &dst, addr, &server_name, &outbound, &data).await
+                {
+                    log::warn!(target: TARGET, "QUIC sender to {addr} error: {e}");
+                }
+            }
+
+            // Mark inactive, then re-check: a new message may have been enqueued
+            // between the last pop() returning None and the store below.
+            sender_state.active.store(false, Ordering::Release);
+            if send_queue.is_empty() {
+                break;
+            }
+            // Lost race — reactivate if no other task took over
+            if sender_state
+                .active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                break; // another task took over
+            }
+        }
+
+        log::trace!(target: TARGET, "QUIC sender task for {addr} exited");
+    }
+
+    /// Send a single message to the peer, establishing the connection first if needed.
+    async fn send_message(
+        &self,
+        src: &Arc<KeyId>,
+        dst: &Arc<KeyId>,
+        addr: SocketAddr,
+        server_name: &str,
+        outbound: &Connections<QuicOutboundConnection>,
+        data: &[u8],
+    ) -> Result<()> {
+        let entry = Self::get_or_create_outbound_connection(outbound, addr)?;
+        match entry.conn {
+            Some(ref conn) => {
+                if let Err(e) = Self::send_via_stream(conn, data).await {
+                    log::warn!(
+                        target: TARGET,
+                        "QUIC send to {addr} failed: {e}, removing dead connection"
+                    );
+                    Self::remove_dead_connection(outbound, addr, conn);
+                    return Err(e);
+                }
+            }
+            None => {
+                log::info!(target: TARGET, "QUIC sender: connecting to {addr}");
+                self.connect(src, dst, addr, server_name).await?;
+                log::info!(target: TARGET, "QUIC sender: connected to {addr}");
+                let entry = Self::get_or_create_outbound_connection(outbound, addr)?;
+                if let Some(ref conn) = entry.conn {
+                    Self::send_via_stream(conn, data).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn send_query_raw(
         self: &Arc<Self>,
         data: Vec<u8>,
@@ -1156,7 +1328,7 @@ impl QuicNode {
         let timeout = Duration::from_millis(timeout_ms);
 
         // First attempt
-        match self.get_outbound_connection(src, dst, false).await? {
+        match self.ensure_outbound_connection(src, dst).await? {
             QuicOutboundConnection { conn: Some(ref conn), .. } => {
                 let result =
                     tokio::time::timeout(timeout, Self::send_via_stream(conn, &data)).await;
@@ -1182,7 +1354,7 @@ impl QuicNode {
         }
 
         // Retry once with a fresh connection
-        match self.get_outbound_connection(src, dst, false).await? {
+        match self.ensure_outbound_connection(src, dst).await? {
             QuicOutboundConnection { conn: Some(ref conn), .. } => {
                 Self::send_via_stream(conn, &data).await
             }
@@ -1304,14 +1476,19 @@ impl QuicNode {
                                     conn.close_reason()
                                 );
                                 Self::remove_dead_connection(outbound, addr, conn);
-                                // Fully remove entry if queue is drained
-                                if let Some(entry) = outbound.map().get(&addr) {
-                                    let s = entry.val();
-                                    if s.conn.is_none() && s.send_queue.is_inactive() {
-                                        outbound.map().remove(&addr);
-                                    }
-                                }
                                 removed += 1;
+                            }
+                        }
+                        // Fully remove entry only when connection is cleared, no sender
+                        // task is running, and the queue is empty. Re-fetch from map
+                        // because remove_dead_connection may have updated the entry.
+                        if let Some(fresh) = outbound.map().get(&addr) {
+                            let s = fresh.val();
+                            if s.conn.is_none()
+                                && !s.sender_state.active.load(Ordering::Acquire)
+                                && s.send_queue.is_empty()
+                            {
+                                outbound.map().remove(&addr);
                             }
                         }
                     }
