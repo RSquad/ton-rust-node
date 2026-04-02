@@ -34,10 +34,11 @@ use ton_api::{
 };
 use ton_block::{
     fail, read_single_root_boc, write_boc, AccountDispatchQueue, BlkPrevInfo, Block, BlockExtra,
-    BlockIdExt, BlockInfo, ChildCell, CurrencyCollection, DispatchQueue, EnqueuedMsg, ExtBlkRef,
-    GetRepresentationHash, IntermediateAddress, InternalMessageHeader, KeyId, MerkleUpdate,
-    Message, MsgAddressInt, MsgEnvelope, OutMsgQueue, OutMsgQueueExtra, OutMsgQueueInfo,
-    OutMsgQueueKey, ShardIdent, UInt256, ValueFlow,
+    BlockIdExt, BlockInfo, ChildCell, ConfigParam0, ConfigParamEnum, ConfigParams,
+    CurrencyCollection, DispatchQueue, EnqueuedMsg, ExtBlkRef, GetRepresentationHash,
+    IntermediateAddress, InternalMessageHeader, KeyExtBlkRef, KeyId, McBlockExtra, MerkleUpdate,
+    Message, MsgAddressInt, MsgEnvelope, OldMcBlocksInfo, OutMsgQueue, OutMsgQueueExtra,
+    OutMsgQueueInfo, OutMsgQueueKey, ShardIdent, UInt256, ValueFlow,
 };
 
 //static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1785,19 +1786,22 @@ impl EngineOperations for ConfigParamsTestEngine {
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         Ok(Some(Arc::new(self.state_id.clone())))
     }
-}
 
-const CFG_FROM_PREV_KEY_BLOCK: i32 = 0x8000;
+    fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(Some(Arc::new(self.state_id.clone())))
+    }
+}
 
 /// Test that get_all_config_params returns empty state_proof for zerostate (seqno = 0)
 #[tokio::test]
 async fn test_get_all_config_params_zerostate() -> Result<()> {
     let engine = Arc::new(ConfigParamsTestEngine::new_zerostate());
 
-    let result = LiteServerQuerySubscriber::get_all_config_params(
+    let result = LiteServerQuerySubscriber::get_config_params(
         &(engine.clone() as Arc<dyn EngineOperations>),
-        0,
+        CFG_VISIT_ROOT,
         engine.state_id.clone(),
+        Vec::new(),
     )
     .await?;
 
@@ -1812,26 +1816,136 @@ async fn test_get_all_config_params_zerostate() -> Result<()> {
     Ok(())
 }
 
-/// Test CFG_FROM_PREV_KEY_BLOCK flag: for zerostate it should resolve to zerostate itself
-/// (since there are no previous key blocks)
-#[tokio::test]
-async fn test_get_config_params_from_prev_key_block_zerostate() -> Result<()> {
-    let engine = Arc::new(ConfigParamsTestEngine::new_zerostate());
+/// Build a masterchain key block at `seq_no` whose McBlockExtra carries `config`.
+fn create_key_block_with_config(
+    seq_no: u32,
+    config: ConfigParams,
+) -> Result<(Vec<u8>, BlockIdExt)> {
+    let mut info = BlockInfo::default();
+    info.set_shard(ShardIdent::masterchain());
+    info.set_seq_no(seq_no)?;
+    info.set_key_block(true);
+    info.set_prev_stuff(
+        false,
+        &BlkPrevInfo::Block {
+            prev: ExtBlkRef {
+                end_lt: 1,
+                seq_no: seq_no.saturating_sub(1),
+                root_hash: UInt256::from([0xAB; 32]),
+                file_hash: UInt256::from([0xCD; 32]),
+            },
+        },
+    )?;
 
-    // Request with CFG_FROM_PREV_KEY_BLOCK flag
-    let result = LiteServerQuerySubscriber::get_all_config_params(
-        &(engine.clone() as Arc<dyn EngineOperations>),
-        CFG_FROM_PREV_KEY_BLOCK,
-        engine.state_id.clone(),
+    let mut mc_extra = McBlockExtra::default();
+    mc_extra.set_config(config);
+
+    let mut extra = BlockExtra::default();
+    extra.write_custom(&mc_extra)?;
+
+    let block = Block::with_params(0, info, ValueFlow::default(), MerkleUpdate::default(), extra)?;
+    finalize_block_to_boc(
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq_no,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+        &block,
     )
-    .await?;
+}
 
-    // Should resolve to zerostate (no previous key blocks exist)
-    assert_eq!(result.id.seq_no(), 0, "should resolve to zerostate");
-    assert!(result.state_proof.is_empty(), "state_proof should be empty for zerostate");
+/// Test CFG_FROM_PREV_KEY_BLOCK flag with a real (non-zerostate) chain:
+/// state at seqno 20 has prev_blocks referencing key block at seqno 5.
+/// Blocks after key block resolve to it; blocks before it fail.
+#[tokio::test]
+async fn test_get_config_params_from_prev_key_block() -> Result<()> {
+    let mut cfg = ConfigParams::default();
+    cfg.set_config(ConfigParamEnum::ConfigParam0(ConfigParam0 {
+        config_addr: AccountId::from([0x55; 32]),
+    }))?;
+    let (key_block_data, key_block_id) = create_key_block_with_config(5, cfg)?;
+
+    // prev_blocks: zerostate(0), regular(2), key(5), regular(15)
+    let mut prev_blocks = OldMcBlocksInfo::default();
+    let mut add_block = |seq_no: u32, key: bool, rh: Option<UInt256>, fh: Option<UInt256>| {
+        let rh = rh.unwrap_or(UInt256::from([seq_no as u8; 32]));
+        let fh = fh.unwrap_or(UInt256::from([seq_no as u8 | 0x80; 32]));
+        prev_blocks.set_augmentable(
+            &seq_no,
+            &KeyExtBlkRef {
+                key,
+                blk_ref: ExtBlkRef {
+                    seq_no,
+                    end_lt: seq_no as u64 * 10000,
+                    root_hash: rh,
+                    file_hash: fh,
+                },
+            },
+        )
+    };
+    add_block(0, false, None, None)?;
+    add_block(2, false, None, None)?;
+    add_block(5, true, Some(key_block_id.root_hash.clone()), Some(key_block_id.file_hash.clone()))?;
+    add_block(15, false, None, None)?;
+
+    let state_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        20,
+        UInt256::from([0x11; 32]),
+        UInt256::from([0x22; 32]),
+    );
+    let state = gen_master_state(
+        GenMasterStateParams {
+            master_state_id: Some(state_id.clone()),
+            prev_blocks: Some(prev_blocks),
+            ..Default::default()
+        },
+        #[cfg(feature = "telemetry")]
+        None,
+        None,
+    );
+
+    let mut engine = LiteServerTestEngine::new().await;
+    engine.add_mock_block_with_handle(key_block_id.clone(), key_block_data).await?;
+    engine.add_ready_state(state_id.clone(), state);
+    engine.set_last_mc_block_id(state_id);
+    let engine = Arc::new(engine);
+
+    let mc_id = |seq_no: u32| {
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq_no,
+            UInt256::from([seq_no as u8; 32]),
+            UInt256::from([seq_no as u8 | 0x80; 32]),
+        )
+    };
+    let get_cfg = |engine: &Arc<LiteServerTestEngine>, id: BlockIdExt| {
+        let engine = engine.clone() as Arc<dyn EngineOperations>;
+        async move {
+            LiteServerQuerySubscriber::get_config_params(
+                &engine,
+                CFG_FROM_PREV_KEY_BLOCK | CFG_VISIT_ROOT,
+                id,
+                Vec::new(),
+            )
+            .await
+        }
+    };
+
+    // Block after key block → should resolve to key block at seqno 5
+    let result = get_cfg(&engine, mc_id(15)).await?;
+    assert_eq!(result.id.seq_no(), 5);
+    assert_eq!(result.id.root_hash, key_block_id.root_hash);
+    assert!(result.state_proof.is_empty());
     assert!(!result.config_proof.is_empty());
-    // Mode should preserve CFG_FROM_PREV_KEY_BLOCK flag
     assert_eq!(result.mode, CFG_FROM_PREV_KEY_BLOCK);
+
+    // Block before key block → no previous key block, must fail
+    assert!(dbg!(get_cfg(&engine, mc_id(2)).await).is_err(), "no key block before seqno 2");
+
+    // Zerostate → no previous key block, must fail
+    assert!(dbg!(get_cfg(&engine, mc_id(0)).await).is_err(), "no key block before zerostate");
 
     Ok(())
 }
