@@ -2568,7 +2568,7 @@ pub fn init_prometheus_recorder(
     // -- validator
     metrics::describe_gauge!(
         "ton_node_validator_status",
-        "Validation state (0=Disabled, 1=Waiting, 2=Countdown, 3=Active)"
+        "Validation state (0=Disabled, 1=Waiting, 2=Active)"
     );
     metrics::describe_gauge!(
         "ton_node_validator_in_current_set",

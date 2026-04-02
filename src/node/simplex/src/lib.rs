@@ -435,9 +435,6 @@ pub struct SessionOptions {
     /// Collation retry max attempts
     pub collation_retry_max_attempts: u32,
 
-    /// Maximum number of precollated blocks to keep in pipeline
-    pub max_precollated_blocks: u32,
-
     /// Standstill timeout - if no finalization occurs within this period,
     /// re-broadcast all our votes for tracked slots
     /// Default: 10 seconds (matches C++ standstill_timeout_s)
@@ -543,7 +540,6 @@ impl Default for SessionOptions {
             validation_retry_timeout: Duration::from_secs(1),
             collation_retry_timeout: Duration::from_millis(500),
             collation_retry_max_attempts: 3,
-            max_precollated_blocks: 0, // Precollation disabled until pipeline reset is implemented
             standstill_timeout: Duration::from_secs(10),
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
@@ -602,14 +598,6 @@ impl SessionOptions {
         // Collation flow parameters
         if self.collation_retry_timeout.is_zero() {
             fail!("collation_retry_timeout must be > 0")
-        }
-
-        // Precollation is temporarily disabled until pipeline reset triggering is implemented
-        // TODO: Remove this check when precollation pipeline reset is implemented
-        if self.max_precollated_blocks != 0 {
-            fail!(
-                "max_precollated_blocks must be 0 (precollation disabled until pipeline reset is implemented)"
-            )
         }
 
         // collation_retry_max_attempts = 0 is valid (no retries)

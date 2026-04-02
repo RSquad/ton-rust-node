@@ -315,6 +315,29 @@ struct PrecollatedBlock {
 /// Map of slot -> precollated block
 type PrecollatedBlockMap = HashMap<SlotIndex, PrecollatedBlock>;
 
+/// Window-local chain head for candidate chaining (C++ block-producer.cpp parity).
+///
+/// In C++, `generate_candidates()` carries mutable `parent` and `state` across slots
+/// within a single leader window, so slot N+1 chains off slot N's locally generated
+/// candidate without waiting for notarization. This struct tracks the same chain head
+/// on the Rust side: after `generated_block()` completes for a slot, we record the
+/// produced candidate's identity here so that `precollate_block()` for the next slot
+/// in the same window can use it immediately as an explicit parent.
+///
+/// Reset when the leader window changes or the progress cursor jumps.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct LocalChainHead {
+    /// Window this chain head belongs to
+    window: WindowIndex,
+    /// Slot of the last locally generated candidate
+    slot: SlotIndex,
+    /// Candidate parent info (slot + candidate-id hash) for the next slot
+    parent_info: crate::block::CandidateParentInfo,
+    /// Resolved BlockIdExt of the generated candidate (for seqno derivation and explicit parent hint)
+    block_id: BlockIdExt,
+}
+
 /*
     Collation result
 
@@ -674,6 +697,16 @@ pub(crate) struct SessionProcessor {
     /// precollated block is consumed). Checked at the top of `check_collation`.
     /// Reference: C++ block-producer.cpp coro_sleep(target_time)
     earliest_collation_time: Option<SystemTime>,
+    /// Window-local chain head for candidate chaining across slots in the same
+    /// leader window (C++ block-producer.cpp parity). Updated synchronously in
+    /// `generated_block()` so that `precollate_block()` can chain the next slot
+    /// without waiting for the async `on_candidate_received` self-loop.
+    local_chain_head: Option<LocalChainHead>,
+    /// Synchronous cache of locally generated parent metadata, keyed by
+    /// `RawCandidateId`. Populated in `generated_block()` *before* the async
+    /// `on_candidate_received` self-loop, so `resolve_parent_block_id()` can
+    /// find the parent immediately for chained precollation.
+    generated_parent_cache: HashMap<RawCandidateId, BlockIdExt>,
 
     /*
         Validation state
@@ -1321,6 +1354,8 @@ impl SessionProcessor {
             precollated_blocks_next_request_id: 0,
             precollated_blocks_max_slot: None,
             earliest_collation_time: None,
+            local_chain_head: None,
+            generated_parent_cache: HashMap::new(),
             // Validation state
             pending_validations: HashMap::new(),
             pending_approve: HashSet::new(),
@@ -2672,6 +2707,24 @@ impl SessionProcessor {
         Core consensus operations
     */
 
+    /// Arm FSM timeouts and prepare the processor for the main loop.
+    ///
+    /// Must be called exactly once, after overlay warmup and bootstrap
+    /// recovery, right before the main loop begins.  The FSM is created
+    /// with unarmed timeouts (`skip_timestamp = None`) so that no skip
+    /// cascade fires during the startup delay.
+    ///
+    /// Reference: C++ `Start` event -> `advance_present()` ->
+    /// `LeaderWindowObserved` -> `alarm_timestamp()`.
+    pub(crate) fn start(&mut self) {
+        self.simplex_state.set_timeouts(&self.description);
+
+        log::info!(
+            "Session {} started: skip timeouts armed",
+            &self.session_id().to_hex_string()[..8],
+        );
+    }
+
     /// Check all pending operations
     ///
     /// Called periodically from main loop when awake time is reached.
@@ -2794,7 +2847,13 @@ impl SessionProcessor {
         parent: &crate::block::CandidateParentInfo,
     ) -> Option<BlockIdExt> {
         let parent_id = RawCandidateId { slot: parent.slot, hash: parent.hash.clone() };
-        self.received_candidates.get(&parent_id).map(|c| c.block_id.clone())
+        // Check synchronous generated-parent cache first (populated in generated_block()
+        // before the async on_candidate_received self-loop), then fall back to the
+        // received_candidates map which is populated asynchronously.
+        self.generated_parent_cache
+            .get(&parent_id)
+            .cloned()
+            .or_else(|| self.received_candidates.get(&parent_id).map(|c| c.block_id.clone()))
     }
 
     /// Advance `earliest_collation_time` by `target_rate` from now.
@@ -2845,6 +2904,22 @@ impl SessionProcessor {
                 current_window
             );
             return;
+        }
+
+        // Invalidate the local chain head and cancel stale precollations when the
+        // leader window has changed since the last generation (C++ parity: the
+        // OurLeaderWindowStarted handler cancels the previous generation coroutine).
+        if let Some(ref head) = self.local_chain_head {
+            if head.window != current_window {
+                log::debug!(
+                    "Session {} check_collation: leader window changed ({} -> {}), \
+                    resetting precollation pipeline",
+                    &self.session_id().to_hex_string()[..8],
+                    head.window,
+                    current_window,
+                );
+                self.reset_precollations();
+            }
         }
 
         // Don't generate if already generated or pending for this slot
@@ -3226,6 +3301,10 @@ impl SessionProcessor {
             self.collates_expire_counter.failure();
 
             self.generated_block(slot, result);
+
+            // C++ parity: after generating a candidate, start precollation for the next
+            // slot in the same leader window (block-producer.cpp `++slot; parent = id;`).
+            self.precollate_block(slot + 1);
         } else if slot > fsm_first_non_progressed_slot {
             // Store as precollated for future slot
             // Note: Empty blocks are not precollated - they are generated on-demand
@@ -3668,6 +3747,7 @@ impl SessionProcessor {
                 slot_window,
                 current_window
             );
+            self.invalidate_local_chain_head();
             return;
         }
 
@@ -3731,6 +3811,31 @@ impl SessionProcessor {
         };
 
         self.persist_generated_candidate_info_to_db(slot, &prepared, &parent, is_empty);
+
+        // --- C++ candidate-chaining parity (block-producer.cpp `parent = id`) ---
+        // Synchronously seed the generated-parent cache and local chain head BEFORE
+        // the async on_candidate_received self-loop, so that precollate_block() for
+        // the next slot in the same window can resolve the parent immediately.
+        let candidate_parent_info =
+            crate::block::CandidateParentInfo { slot, hash: prepared.candidate_hash.clone() };
+        let raw_id = RawCandidateId { slot, hash: prepared.candidate_hash.clone() };
+        self.generated_parent_cache.insert(raw_id, prepared.block_id_ext.clone());
+
+        let slot_window = self.description.get_window_idx(slot);
+        self.local_chain_head = Some(LocalChainHead {
+            window: slot_window,
+            slot,
+            parent_info: candidate_parent_info,
+            block_id: prepared.block_id_ext.clone(),
+        });
+
+        log::trace!(
+            "Session {} generated_block: updated local_chain_head: window={}, slot={}, hash={}",
+            &self.session_id().to_hex_string()[..8],
+            slot_window,
+            slot,
+            &prepared.candidate_hash.to_hex_string()[..8],
+        );
 
         // Clone TL candidate data before broadcasting (needed for on_candidate_received)
         let tl_candidate_data_for_self = prepared.tl_candidate_data.clone();
@@ -4028,44 +4133,41 @@ impl SessionProcessor {
     }
 
     /*
-        Precollation Pipeline
-        Reference: validator-session/src/session_processor.rs precollation
+        Precollation Pipeline — C++ Candidate Chaining Parity
+        Reference: C++ block-producer.cpp generate_candidates() loop
 
-        NOTE: Precollation is currently DISABLED (max_precollated_blocks=0)
+        The precollation pipeline chains candidates across slots within a single leader
+        window. After `generated_block()` completes slot N, it updates `local_chain_head`
+        and calls `precollate_block(N+1)`, which uses the local chain head as the explicit
+        parent instead of waiting for FSM `available_base` propagation via notarization.
 
-        TODO(precollation): Before enabling precollation, fix these issues:
-        1. Implement precollation pipeline reset triggering.
-           See reset_precollations() for details on what needs to be implemented.
-        2. NOTE: Round mapping now uses slot directly (round = slot.value()).
-           - This eliminates the "precollation round mismatch" issue since round is derived
-             from the slot being collated, not from a separate counter.
-           - With optimistic validation on notarized parents, precollation slot
-             advancement is driven by the FSM progress cursor.
+        Pipeline reset (`reset_precollations()`) is triggered by:
+        - Session stop
+        - Leader window changes (via `invalidate_local_chain_head()`)
+        - Progress cursor jumping past queued slots
 
         ┌─────────────────────────────────────────────────────────────────────────────────┐
         │ Precollation Pipeline                                                           │
         │                                                                                 │
-        │  1. precollate_block(slot):                                                     │
-        │     ├── Check max_precollated_blocks limit                                      │
-        │     ├── If slot already in pipeline, advance to max_slot + 1                    │
-        │     └── Call invoke_collation(slot)                                             │
+        │  1. check_collation() — first slot in window:                                   │
+        │     ├── Use FSM available_base as parent                                        │
+        │     └── invoke_collation(slot, parent)                                          │
         │                                                                                 │
-        │  2. invoke_collation(slot):                                                     │
-        │     ├── Skip if already pending for slot                                        │
-        │     ├── Check priority (is leader for slot?)                                    │
-        │     ├── Update precollated_blocks_max_slot                                      │
-        │     ├── Create AsyncRequest and PrecollatedBlock entry                          │
-        │     └── notify_generate_slot(source_info, request, callback)                    │
+        │  2. generated_block() — after broadcast:                                        │
+        │     ├── Update local_chain_head + generated_parent_cache                        │
+        │     └── precollate_block(slot + 1) — chain next slot                            │
         │                                                                                 │
-        │  3. Collation callback (on_collation_complete):                                 │
-        │     ├── Store candidate in PrecollatedBlock                                     │
-        │     └── precollate_block(slot + 1) to keep pipeline full                        │
+        │  3. precollate_block(slot):                                                     │
+        │     ├── Prefer local_chain_head for parent (same window)                        │
+        │     ├── Fall back to FSM available_base                                         │
+        │     └── invoke_collation(slot, parent)                                          │
         │                                                                                 │
         │  4. check_collation() finds precollated block:                                  │
         │     ├── Use precollated candidate directly                                      │
         │     └── Remove from pipeline, start next precollation                           │
         │                                                                                 │
-        │  5. Slot skip: reset_precollations() cancels all pending                        │
+        │  5. Window change / progress jump:                                              │
+        │     └── invalidate_local_chain_head() + reset_precollations()                   │
         └─────────────────────────────────────────────────────────────────────────────────┘
     */
 
@@ -4075,7 +4177,8 @@ impl SessionProcessor {
     /// Reference: validator-session/src/session_processor.rs precollate_block
     fn precollate_block(&mut self, slot: SlotIndex) {
         // Check max precollated blocks limit
-        let max_precollated = self.description.opts().max_precollated_blocks as usize;
+        let max_precollated =
+            self.description.opts().slots_per_leader_window.saturating_sub(1) as usize;
         if self.precollated_blocks.len() >= max_precollated {
             log::trace!(
                 "Session {} precollate_block: max precollated blocks limit {} reached",
@@ -4097,19 +4200,69 @@ impl SessionProcessor {
             }
         }
 
-        // Precollation should only start when the parent is available (genesis or resolved).
-        // Note: `get_available_parent()` returns None for both genesis and "base unknown",
-        // so use `has_available_parent()` to disambiguate.
-        if !self.simplex_state.has_available_parent(&self.description, target_slot) {
+        // Must still be in the same leader window as the current window
+        let target_window = self.description.get_window_idx(target_slot);
+        let current_window = self.simplex_state.get_current_leader_window_idx();
+        if target_window != current_window {
             log::trace!(
-                "Session {} precollate_block: parent is not available for slot {}",
+                "Session {} precollate_block: slot {} is in window {} (current={}), skipping",
                 self.session_id().to_hex_string(),
-                target_slot
+                target_slot,
+                target_window,
+                current_window
             );
             return;
         }
 
-        let parent = self.simplex_state.get_available_parent(&self.description, target_slot);
+        // Must be leader for the target slot
+        let self_idx = self.description.get_self_idx();
+        let leader = self.description.get_leader(target_slot);
+        if leader != self_idx {
+            log::trace!(
+                "Session {} precollate_block: not leader for slot {} (leader={})",
+                self.session_id().to_hex_string(),
+                target_slot,
+                leader
+            );
+            return;
+        }
+
+        // C++ parity: prefer local chain head for parent when the previous slot in
+        // the same window was just generated locally (block-producer.cpp `parent = id`).
+        // Fall back to FSM available_base for the first slot in a window or if the
+        // local chain head is stale.
+        let parent = if let Some(ref head) = self.local_chain_head {
+            if head.window == target_window && head.slot + 1 == target_slot {
+                log::trace!(
+                    "Session {} precollate_block: using local_chain_head for slot {} \
+                    (parent=s{}:{})",
+                    &self.session_id().to_hex_string()[..8],
+                    target_slot,
+                    head.parent_info.slot,
+                    &head.parent_info.hash.to_hex_string()[..8],
+                );
+                Some(head.parent_info.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let parent = if parent.is_some() {
+            parent
+        } else {
+            // Fall back to FSM available_base
+            if !self.simplex_state.has_available_parent(&self.description, target_slot) {
+                log::trace!(
+                    "Session {} precollate_block: parent is not available for slot {}",
+                    self.session_id().to_hex_string(),
+                    target_slot
+                );
+                return;
+            }
+            self.simplex_state.get_available_parent(&self.description, target_slot)
+        };
 
         if let Some(ref parent_info) = parent {
             if self.resolve_parent_block_id(parent_info).is_none() {
@@ -4137,10 +4290,16 @@ impl SessionProcessor {
         }
     }
 
-    /// Reset all precollations (on slot skip or session stop)
+    /// Reset all precollations and invalidate the local chain head.
+    ///
+    /// Called when the precollation pipeline must be flushed:
+    /// - Session stop
+    /// - Leader window change (progress cursor moved to a new window)
+    /// - Progress cursor jumped past queued precollation slots
     fn reset_precollations(&mut self) {
         log::debug!(
-            "Session {} reset_precollations: cancelling {} pending precollations",
+            "Session {} reset_precollations: cancelling {} pending precollations, \
+            clearing local_chain_head",
             self.session_id().to_hex_string(),
             self.precollated_blocks.len()
         );
@@ -4152,6 +4311,26 @@ impl SessionProcessor {
 
         self.precollated_blocks.clear();
         self.precollated_blocks_max_slot = None;
+        self.invalidate_local_chain_head();
+    }
+
+    /// Invalidate the window-local chain head.
+    ///
+    /// Called when the leader window changes, the progress cursor jumps, or a
+    /// consensus event (skip/notarize) invalidates the locally generated parent
+    /// chain. After invalidation, the next collation will start fresh from the
+    /// FSM `available_base`.
+    fn invalidate_local_chain_head(&mut self) {
+        if let Some(ref head) = self.local_chain_head {
+            log::trace!(
+                "Session {} invalidate_local_chain_head: clearing (was window={}, slot={})",
+                &self.session_id().to_hex_string()[..8],
+                head.window,
+                head.slot,
+            );
+        }
+        self.local_chain_head = None;
+        self.generated_parent_cache.clear();
     }
 
     /*

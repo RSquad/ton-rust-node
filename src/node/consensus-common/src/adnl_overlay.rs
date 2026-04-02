@@ -934,8 +934,8 @@ impl AdnlOverlay {
             peers.len()
         );
 
-        // Register QUIC keys and create transport if QUIC is enabled
-        let transport = if use_quic {
+        // Register QUIC keys if QUIC is enabled
+        let quic_enabled = if use_quic {
             if let Some(quic) = &stack.quic {
                 // Register local validator's ADNL key as a TLS identity on a per-port endpoint
                 let key_bytes: [u8; 32] = *local_adnl_key.pvt_key()?;
@@ -1022,7 +1022,7 @@ impl AdnlOverlay {
             // Point-to-point multicast is used for broadcasts when TCP or QUIC
             // transport is available (FEC/UDP broadcast has no peers in private overlays).
             let is_tcp_available =
-                (stack.is_tcp_available() && allow_tcp_communication) || transport;
+                (stack.is_tcp_available() && allow_tcp_communication) || quic_enabled;
 
             if is_tcp_available {
                 log::debug!(
@@ -1069,7 +1069,7 @@ impl AdnlOverlay {
                 peers: peer_objects,
                 peers_storage: peer_storage.clone(),
                 is_tcp_available: is_tcp_available,
-                is_quic_available: transport,
+                is_quic_available: quic_enabled,
                 all_node_ids: all_node_ids,
                 task_processor_manager,
             }
@@ -1675,11 +1675,65 @@ impl ConsensusOverlay for AdnlOverlay {
         let stop_requested = self.stop_requested.clone();
 
         if stop_requested.load(Ordering::Relaxed) {
-            log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &overlay_id);
+            log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {overlay_id} was stopped!");
             return;
         }
 
-        if self.is_tcp_available {
+        if self.is_quic_available || !self.is_tcp_available {
+            // QUIC or UDP path
+            // If extra given, use two-step broadcast via QUIC/RLDP
+            // Otherwise use canonic broadcast via ADNL
+            let msg = payload.clone();
+            let overlay_node = self.stack.overlay.clone();
+            let local_validator_key = self.local_validator_key.clone();
+            let transport = if self.is_quic_available { "QUIC" } else { "UDP" };
+
+            self.runtime_handle.spawn(async move {
+                if stop_requested.load(Ordering::Relaxed) {
+                    log::warn!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay: Overlay {overlay_id} was stopped!"
+                    );
+                    return;
+                }
+
+                let msg_tagged = TaggedByteSlice {
+                    object: msg.data(),
+                    #[cfg(feature = "telemetry")]
+                    tag: 0x80000002, // Consensus broadcast
+                };
+
+                let result = if let Some(extra) = extra {
+                    // Twostep broadcast with extra
+                    overlay_node
+                        .broadcast_twostep(
+                            &overlay_id,
+                            &msg_tagged,
+                            Some(&local_validator_key),
+                            0,
+                            extra,
+                        )
+                        .await
+                } else {
+                    // Canonic broadcast
+                    overlay_node
+                        .broadcast(
+                            &overlay_id,
+                            &msg_tagged,
+                            Some(&local_validator_key),
+                            0,
+                            AdnlSendMethod::Fast,
+                        )
+                        .await
+                };
+
+                log::debug!(
+                    target: LOG_TARGET,
+                    "AdnlOverlay::send_broadcast_fec_ex ({transport}) status: {result:?}"
+                );
+            });
+        } else {
+            // TCP path: manually build BroadcastTwostepSimple and multicast
             const IS_RETRANSMISSION: bool = false;
 
             log::trace!(
@@ -1744,7 +1798,7 @@ impl ConsensusOverlay for AdnlOverlay {
                 log::trace!(
                     target: LOG_TARGET,
                     "AdnlOverlay::send_broadcast_fec_ex: sending BroadcastTwostepSimple \
-                     ({} bytes payload) via multicast to {} peers",
+                    ({} bytes payload) via TCP multicast to {} peers",
                     broadcast_payload.data().len(),
                     self.all_node_ids.len(),
                 );
@@ -1761,45 +1815,9 @@ impl ConsensusOverlay for AdnlOverlay {
             if let Err(err) = result {
                 log::error!(
                     target: LOG_TARGET,
-                    "AdnlOverlay::send_broadcast_fec_ex: failed to build/send two-step broadcast: {err}"
+                    "AdnlOverlay::send_broadcast_fec_ex: failed to build/send TCP broadcast: {err}"
                 );
             }
-        } else {
-            let msg = payload.clone();
-            let overlay_node = self.stack.overlay.clone();
-            let local_validator_key = self.local_validator_key.clone();
-            let runtime_handle = self.runtime_handle.clone();
-
-            runtime_handle.spawn(async move {
-                if stop_requested.load(Ordering::Relaxed) {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "AdnlOverlay: Overlay {overlay_id} was stopped!"
-                    );
-                    return;
-                }
-
-                let msg_tagged = TaggedByteSlice {
-                    object: msg.data(),
-                    #[cfg(feature = "telemetry")]
-                    tag: 0x80000002, // Catchain broadcast
-                };
-
-                let result = overlay_node
-                    .broadcast(
-                        &overlay_id,
-                        &msg_tagged,
-                        Some(&local_validator_key),
-                        0,
-                        AdnlSendMethod::Fast,
-                    )
-                    .await;
-
-                log::debug!(
-                    target: LOG_TARGET,
-                    "AdnlOverlay::send_broadcast_fec_ex status: {result:?}"
-                );
-            });
         }
     }
 }

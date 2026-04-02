@@ -466,6 +466,7 @@ declare_counted!(
 declare_counted!(
     struct Overlay {
         adnl: Arc<AdnlNode>,
+        quic: Option<Arc<QuicNode>>,
         rldp: Option<Arc<RldpNode>>,
         options: Arc<AtomicU32>,
         overlay_type: OverlayType,
@@ -697,11 +698,18 @@ impl Overlay {
                 BroadcastSendMethod::Fast => {
                     self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Fast).await.err()
                 }
-                BroadcastSendMethod::Rldp => {
-                    let Some(rldp) = self.rldp.as_ref() else {
-                        fail!("No RLDP sender is set in overlay {}", self.overlay_id);
-                    };
-                    rldp.message(data, peers, true, None).await.err()
+                BroadcastSendMethod::QuicOrRldp => {
+                    if let Some(quic) = self.quic.as_ref() {
+                        quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
+                    } else {
+                        let Some(rldp) = self.rldp.as_ref() else {
+                            fail!(
+                                "Neither QUIC nor RLDP sender is set in overlay {}",
+                                self.overlay_id
+                            );
+                        };
+                        rldp.message(data, peers, true, None).await.err()
+                    }
                 }
                 BroadcastSendMethod::Safe => {
                     self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Safe).await.err()
@@ -1769,7 +1777,7 @@ impl OverlayNode {
                 "Sending QUIC message to unknown overlay",
             )
             .await?;
-        quic.message(data, Some(&self.adnl), peers.local(), peers.other()).await?;
+        quic.message(data, Some(&self.adnl), &peers).await?;
         Ok(())
     }
 
@@ -1850,7 +1858,7 @@ impl OverlayNode {
             .await?;
         let mut data = overlay.query_prefix.clone();
         serialize_boxed_append(&mut data, &query.object)?;
-        match quic.query(data, Some(&self.adnl), peers.local(), peers.other(), timeout_ms).await? {
+        match quic.query(data, Some(&self.adnl), &peers, timeout_ms).await? {
             Some(raw) => Ok(Some(deserialize_boxed(&raw)?)),
             None => Ok(None),
         }
@@ -1966,6 +1974,7 @@ impl OverlayNode {
         let overlay = Overlay {
             adnl: self.adnl.clone(),
             rldp: self.rldp.get().cloned(),
+            quic: self.quic.get().cloned(),
             flags: params.flags,
             hops: params.hops,
             known_peers: AddressCacheWithBads::with_params(Self::MAX_PEERS, policy),
@@ -2140,7 +2149,7 @@ impl OverlayNode {
 
     fn delete_overlay(&self, overlay_id: &Arc<OverlayShortId>, is_private: bool) -> Result<bool> {
         let type_of = if is_private { "private" } else { "public" };
-        log::debug!(target: TARGET, "Delete {} overlay {}", type_of, overlay_id);
+        log::info!(target: TARGET, "Delete {} overlay {}", type_of, overlay_id);
         if let Some(overlay) = self.overlays.get(overlay_id) {
             let overlay = overlay.val();
             if is_private {

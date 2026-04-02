@@ -176,6 +176,10 @@ struct TestConfig {
     /// Restart tests benefit from a shorter interval so recovered nodes
     /// receive cached certificates faster than the skip timeout.
     standstill_timeout: Option<Duration>,
+    /// Override slots_per_leader_window (default: 1).
+    /// Set > 1 to test candidate chaining within a leader window.
+    /// Precollation depth is derived automatically as (window - 1).
+    slots_per_leader_window: Option<u32>,
 }
 
 /// Network gremlin configuration (net-gremlin).
@@ -233,6 +237,7 @@ impl Default for TestConfig {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         }
     }
 }
@@ -1232,11 +1237,12 @@ where
     let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
 
     // Session options
+    let slots_per_window = config.slots_per_leader_window.unwrap_or(1);
     let mut session_opts = SessionOptions {
         proto_version: 0,
         target_rate: config.target_rate,
         first_block_timeout: config.first_block_timeout,
-        slots_per_leader_window: 1,
+        slots_per_leader_window: slots_per_window,
         empty_block_mc_lag_threshold: if config.shard.is_masterchain() {
             None // MC uses internal finalization tracking
         } else {
@@ -1993,6 +1999,7 @@ fn test_simplex_consensus_basic() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -2048,6 +2055,7 @@ fn test_simplex_consensus_with_failures() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -2117,6 +2125,7 @@ fn test_simplex_consensus_finalcert_recovery() {
             }),
             lossy_overlay_node_indices: Some(vec![0]),
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
@@ -2190,6 +2199,7 @@ fn test_simplex_consensus_shard_with_mc_notifications() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -2246,6 +2256,7 @@ fn test_simplex_consensus_adnl_overlay() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
@@ -2306,6 +2317,7 @@ fn test_simplex_consensus_adnl_net_gremlin() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement (best-effort under partitions).
@@ -2370,6 +2382,7 @@ fn test_simplex_consensus_restart_gremlin() {
             // 1s rebroadcast cadence can flood restart-gremlin runs (large [begin,end) ranges),
             // causing receiver queues to explode and the test to stall intermittently.
             standstill_timeout: Some(Duration::from_secs(5)),
+            slots_per_leader_window: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
@@ -2550,6 +2563,7 @@ fn test_simplex_start_gate() {
         lossy_overlay: None,
         lossy_overlay_node_indices: None,
         standstill_timeout: None,
+        slots_per_leader_window: None,
     };
 
     for i in 0..node_count {
@@ -2659,6 +2673,69 @@ fn test_simplex_start_gate() {
     }
     drop(instances);
     log::info!("[start_gate] Test passed");
+}
+
+/// Test candidate chaining within a multi-slot leader window (C++ parity).
+///
+/// Configures `slots_per_leader_window = 4`. Precollation depth is derived
+/// automatically from `slots_per_leader_window`, so the leader can chain
+/// candidates across slots within a single window. With
+/// chaining, the leader generates slot N+1 with slot N's candidate as parent,
+/// which causes seqnos to increment (1, 2, 3, 4) instead of repeating seqno=1.
+///
+/// Acceptance: the test reaches the commit threshold (at least 30% of rounds
+/// committed), proving that chained candidates are notarized and finalized.
+#[test]
+fn test_simplex_consensus_candidate_chaining() {
+    run_simplex_consensus_test(
+        TestConfig {
+            total_rounds: 20,
+            min_commit_percent: 0.3,
+            node_count: 4,
+            generation_failure_probability: 0.0,
+            candidate_rejection_probability: 0.0,
+            max_collations: 2000,
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(3000),
+            test_name: "simplex_candidate_chaining".to_string(),
+            test_timeout: Duration::from_secs(120),
+            expect_timeout: false,
+            shard: ShardIdent::masterchain(),
+            mc_notification_interval: None,
+            overlay_type: OverlayType::InProcess,
+            net_gremlin: None,
+            restart_gremlin: None,
+            lossy_overlay: None,
+            lossy_overlay_node_indices: None,
+            standstill_timeout: None,
+            slots_per_leader_window: Some(4),
+        },
+        |instances| {
+            let config = &instances[0].lock().config.clone();
+            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+
+            for (idx, instance) in instances.iter().enumerate() {
+                let commits = instance.lock().on_block_committed_count();
+                log::info!(
+                    "[chaining] Instance {}: {} commits out of {} total_rounds (min required: {})",
+                    idx,
+                    commits,
+                    config.total_rounds,
+                    min_commits
+                );
+                assert!(
+                    commits >= min_commits,
+                    "Instance {} has {} commits but requires at least {} ({}% of {} rounds). \
+                    Candidate chaining may not be working correctly.",
+                    idx,
+                    commits,
+                    min_commits,
+                    config.min_commit_percent * 100.0,
+                    config.total_rounds
+                );
+            }
+        },
+    );
 }
 
 /// Test that empty collated_data produces a valid (non-default) hash
