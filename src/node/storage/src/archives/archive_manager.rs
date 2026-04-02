@@ -13,11 +13,13 @@ use crate::StorageTelemetry;
 use crate::{
     archives::{
         archive_slice::ArchiveSlice,
+        db_provider::ArchiveDbProvider,
         file_maps::{BlockRanges, FileDescription, FileMaps},
         get_mc_seq_no,
+        package::PKG_HEADER_SIZE,
         package_entry::PackageEntry,
         package_entry_id::{parse_short_filename, GetFileName, PackageEntryId},
-        package_id::PackageId,
+        package_id::{PackageId, PackageType},
         ARCHIVE_SLICE_SIZE, KEY_ARCHIVE_PACKAGE_SIZE,
     },
     block_handle_db::BlockHandle,
@@ -28,7 +30,7 @@ use std::{
     borrow::Borrow,
     hash::Hash,
     io::ErrorKind,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU8, Ordering},
         Arc,
@@ -38,12 +40,32 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use ton_block::{error, fail, AccountIdPrefixFull, BlockIdExt, Result, ShardIdent, MASTERCHAIN_ID};
 
+/// Metadata about a block being imported into the archive.
+pub struct ImportBlockMeta {
+    pub seq_no: u32,
+    pub shard: ShardIdent,
+    pub gen_utime: u32,
+    pub end_lt: u64,
+    pub mc_ref_seq_no: u32,
+}
+
+/// A single entry from a .pack file being imported.
+pub struct ImportEntry {
+    pub entry_id: PackageEntryId<BlockIdExt>,
+    pub offset: u64,
+    /// Metadata for Block entries. Must be Some for PackageEntryId::Block,
+    /// None for Proof/ProofLink.
+    pub block_meta: Option<ImportBlockMeta>,
+}
+
 pub struct ArchiveManager {
     db: Arc<RocksDb>,
     db_root_path: Arc<PathBuf>,
+    db_provider: Arc<dyn ArchiveDbProvider>,
     file_maps: FileMaps,
     shard_split_depth: Arc<AtomicU8>,
     unapplied_files_path: PathBuf,
+    create_slice_mutex: tokio::sync::Mutex<()>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
     allocated: Arc<StorageAlloc>,
@@ -55,6 +77,7 @@ impl ArchiveManager {
     pub async fn with_data(
         db: Arc<RocksDb>,
         db_root_path: Arc<PathBuf>,
+        db_provider: Arc<dyn ArchiveDbProvider>,
         last_unneeded_key_block: u32,
         shard_split_depth: Arc<AtomicU8>,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
@@ -63,6 +86,7 @@ impl ArchiveManager {
         let file_maps = FileMaps::new(
             db.clone(),
             &db_root_path,
+            &db_provider,
             last_unneeded_key_block,
             #[cfg(feature = "telemetry")]
             &telemetry,
@@ -76,9 +100,11 @@ impl ArchiveManager {
         let ret = Self {
             db,
             db_root_path,
+            db_provider,
             file_maps,
             shard_split_depth,
             unapplied_files_path,
+            create_slice_mutex: tokio::sync::Mutex::new(()),
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
@@ -373,14 +399,14 @@ impl ArchiveManager {
             }
             Ok(read) => read,
         };
-        let data = self.move_file_to_archive(data, handle, entry_id, false).await?;
+        let data = self.add_block_data_to_package(data, handle, entry_id, false).await?;
         if handle.is_key_block()? {
-            self.move_file_to_archive(data, handle, entry_id, true).await?;
+            self.add_block_data_to_package(data, handle, entry_id, true).await?;
         }
         Ok(Some(filename))
     }
 
-    async fn move_file_to_archive<B: Borrow<BlockIdExt> + Hash>(
+    pub async fn add_block_data_to_package<B: Borrow<BlockIdExt> + Hash>(
         &self,
         data: Vec<u8>,
         handle: &BlockHandle,
@@ -404,8 +430,10 @@ impl ArchiveManager {
             .get_file_desc(&package_id, true)
             .await?
             .ok_or_else(|| error!("Expected some value for {package_id:?}"))?;
-        if !key_archive && fd.update_block_ranges(handle) {
-            self.file_maps.files().update(fd.id().id(), &fd).await?;
+        if fd.update_block_ranges(handle) {
+            let file_map =
+                if key_archive { self.file_maps.key_files() } else { self.file_maps.files() };
+            file_map.update(fd.id().id(), &fd).await?;
         }
         fd.archive_slice().add_file(handle, entry_id, data).await
     }
@@ -436,7 +464,6 @@ impl ArchiveManager {
         id: &PackageId,
         force_create: bool,
     ) -> Result<Option<Arc<FileDescription>>> {
-        // TODO: Rewrite logics in order to handle multithreaded adding of packages
         if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
             if fd.deleted() {
                 return Ok(None);
@@ -444,6 +471,13 @@ impl ArchiveManager {
             return Ok(Some(fd));
         }
         if force_create {
+            let _guard = self.create_slice_mutex.lock().await;
+            if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
+                if fd.deleted() {
+                    return Ok(None);
+                }
+                return Ok(Some(fd));
+            }
             Ok(Some(self.add_file_desc(id).await?))
         } else {
             Ok(None)
@@ -451,14 +485,17 @@ impl ArchiveManager {
     }
 
     async fn add_file_desc(&self, id: &PackageId) -> Result<Arc<FileDescription>> {
-        // TODO: Rewrite logics in order to handle multithreaded adding of packages
         let file_map = self.file_maps.get(id.package_type());
         assert!(file_map.get(id.id()).await.is_none());
-        let dir = self.db_root_path.join(id.path());
+        let (slice_db, slice_root_path) = match id.package_type() {
+            PackageType::KeyBlocks => (self.db.clone(), Arc::clone(&self.db_root_path)),
+            PackageType::Blocks => self.db_provider.db_for_archive(id.id()).await?,
+        };
+        let dir = slice_root_path.join(id.path());
         tokio::fs::create_dir_all(&dir).await?;
         let archive_slice = ArchiveSlice::new_empty(
-            self.db.clone(),
-            Arc::clone(&self.db_root_path),
+            slice_db,
+            slice_root_path,
             id.id(),
             id.package_type(),
             self.shard_split_depth.load(Ordering::Relaxed),
@@ -522,6 +559,137 @@ impl ArchiveManager {
         }
     }
 
+    pub async fn import_package(
+        &self,
+        source_path: &Path,
+        archive_id: u32,
+        shard: &ShardIdent,
+        entries: &[ImportEntry],
+        move_file: bool,
+        contains_key_block: bool,
+    ) -> Result<()> {
+        let slice_id = self.get_package_id_force(archive_id, false, contains_key_block).await;
+        let fd = self.get_or_create_import_desc(&slice_id, shard.prefix_len()).await?;
+
+        let pkg_id = PackageId::for_block(archive_id);
+        let target_path = pkg_id.full_path(fd.archive_slice().db_root_path(), shard)?;
+
+        if target_path.exists() {
+            tokio::fs::remove_file(&target_path).await.map_err(|e| {
+                error!("Failed to remove existing file {}: {}", target_path.display(), e)
+            })?;
+        } else {
+            if let Some(parent) = target_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+
+        if move_file {
+            tokio::fs::rename(source_path, &target_path).await.map_err(|e| {
+                error!(
+                    "Failed to move {} to {}: {}",
+                    source_path.display(),
+                    target_path.display(),
+                    e
+                )
+            })?;
+        } else {
+            tokio::fs::copy(source_path, &target_path).await.map_err(|e| {
+                error!(
+                    "Failed to copy {} to {}: {}",
+                    source_path.display(),
+                    target_path.display(),
+                    e
+                )
+            })?;
+        }
+
+        let file_len = tokio::fs::metadata(&target_path).await?.len();
+        let file_size = file_len.checked_sub(PKG_HEADER_SIZE as u64).ok_or_else(|| {
+            error!("Package file {} is too short ({} bytes)", target_path.display(), file_len)
+        })?;
+
+        fd.archive_slice().import_package_entries(archive_id, &shard, file_size, entries).await?;
+
+        let file_map = self.file_maps.get(PackageType::Blocks);
+        let mut ranges_updated = false;
+        for entry in entries {
+            if let Some(meta) = &entry.block_meta {
+                ranges_updated |= fd.update_block_ranges_raw(
+                    &meta.shard,
+                    meta.seq_no,
+                    meta.gen_utime,
+                    meta.end_lt,
+                );
+            }
+        }
+        if ranges_updated {
+            file_map.update(fd.id().id(), &fd).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_or_create_import_desc(
+        &self,
+        id: &PackageId,
+        shard_split_depth: u8,
+    ) -> Result<Arc<FileDescription>> {
+        if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
+            if !fd.deleted() {
+                return Ok(fd);
+            }
+        }
+        let _guard = self.create_slice_mutex.lock().await;
+        if let Some(fd) = self.file_maps.get(id.package_type()).get(id.id()).await {
+            if !fd.deleted() {
+                return Ok(fd);
+            }
+        }
+        self.add_file_desc_for_import(id, shard_split_depth).await
+    }
+
+    async fn add_file_desc_for_import(
+        &self,
+        id: &PackageId,
+        shard_split_depth: u8,
+    ) -> Result<Arc<FileDescription>> {
+        let file_map = self.file_maps.get(id.package_type());
+        let (slice_db, slice_root_path) = match id.package_type() {
+            PackageType::KeyBlocks => (self.db.clone(), Arc::clone(&self.db_root_path)),
+            PackageType::Blocks => self.db_provider.db_for_archive(id.id()).await?,
+        };
+        let dir = slice_root_path.join(id.path());
+        tokio::fs::create_dir_all(&dir).await?;
+        let archive_slice = ArchiveSlice::new_for_import(
+            slice_db,
+            slice_root_path,
+            id.id(),
+            id.package_type(),
+            shard_split_depth,
+            #[cfg(feature = "telemetry")]
+            self.telemetry.clone(),
+            self.allocated.clone(),
+        )
+        .await?;
+        let fd = Arc::new(FileDescription::with_data(
+            id.clone(),
+            archive_slice,
+            false,
+            lockfree::map::Map::new(),
+        ));
+        file_map
+            .put(
+                id.id(),
+                Arc::clone(&fd),
+                #[cfg(feature = "telemetry")]
+                &self.telemetry,
+                &self.allocated,
+            )
+            .await?;
+        Ok(fd)
+    }
+
     pub async fn trunc<F: Fn(&BlockIdExt) -> bool>(
         &self,
         block_id: &BlockIdExt,
@@ -566,6 +734,31 @@ impl ArchiveManager {
             return fd.archive_slice().lookup_blocks_by_utime(prefix, utime, f).await;
         }
         Ok(())
+    }
+
+    pub async fn get_max_mc_seqno(&self) -> Option<u32> {
+        let fd = self.file_maps.files().get_closest(u32::MAX).await?;
+        let guard = fd.blocks_ranges().get(&ShardIdent::masterchain())?;
+        Some(guard.val().max_seqno.load(Ordering::Relaxed))
+    }
+
+    pub async fn get_max_key_block_seqno(&self) -> Option<u32> {
+        let fd = self.file_maps.key_files().get_closest(u32::MAX).await?;
+        let guard = fd.blocks_ranges().get(&ShardIdent::masterchain())?;
+        Some(guard.val().max_seqno.load(Ordering::Relaxed))
+    }
+
+    pub async fn lookup_proof_by_seqno(
+        &self,
+        prefix: &AccountIdPrefixFull,
+        seqno: u32,
+    ) -> Result<Option<(BlockIdExt, Vec<u8>)>> {
+        if let Some(fd) =
+            self.lookup_file_descr_by(prefix, &mut |br| br.compare_seqno(&seqno)).await
+        {
+            return fd.archive_slice().lookup_proof_by_seqno(prefix, seqno).await;
+        }
+        Ok(None)
     }
 
     async fn lookup_file_descr_by<F>(

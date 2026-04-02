@@ -38,6 +38,10 @@ name = 'zerostate'
 path = 'bin/zerostate.rs'
 
 [[bin]]
+name = 'archive_import'
+path = 'bin/archive_import.rs'
+
+[[bin]]
 name = 'hardfork'
 path = 'bin/hardfork.rs'
 
@@ -73,6 +77,7 @@ num_cpus = '1.13'
 openssl = '0.10'
 parking_lot = '0.12'
 rand = '0.8'
+rayon = '1'
 regex = '1.10'
 serde = '1.0'
 serde_derive = '1.0'
@@ -110,6 +115,7 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tempfile = '3'
 difference = '2.0'
 external-ip = '6.0'
 http-body-util = "0.1"

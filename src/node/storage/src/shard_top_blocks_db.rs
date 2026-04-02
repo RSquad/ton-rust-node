@@ -10,4 +10,6 @@
  */
 use crate::db_impl_base;
 
+pub const SHARD_TOP_BLOCKS_DB_NAME: &str = "shard_top_blocks_db";
+
 db_impl_base!(ShardTopBlocksDb, Vec<u8>);

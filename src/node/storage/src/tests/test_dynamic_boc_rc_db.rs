@@ -11,8 +11,9 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
+    cell_db::CellByHashStorageAdapter,
     db::rocksdb::{destroy_rocks_db, AccessType, RocksDb},
-    dynamic_boc_rc_db::{CellByHashStorageAdapter, DynamicBocDb},
+    dynamic_boc_rc_db::DynamicBocDb,
     shardstate_db_async::CellsDbConfig,
     tests::utils::{
         count_tree_unique_cells, get_another_test_tree_of_cells, get_test_tree_of_cells,
@@ -22,8 +23,8 @@ use crate::{
 };
 use std::sync::Arc;
 use ton_block::{
-    read_single_root_boc, BigBocWriter, BocFlags, BuilderData, Cell, CellsFactory, IBitstring,
-    Result, MAX_SAFE_DEPTH,
+    read_single_root_boc, BigBocWriter, BocFlags, BuilderData, Cell, IBitstring, Result,
+    MAX_SAFE_DEPTH,
 };
 
 const DB_PATH: &str = "../../target/test";
@@ -94,7 +95,7 @@ async fn test_dynamic_boc_rc_db_2() -> Result<()> {
         Arc::new(StorageAlloc::default()),
     )?);
 
-    let cells_factory = boc_db.clone() as Arc<dyn CellsFactory>;
+    let cells_factory = boc_db.cells_factory();
     let create_ss = |cells_chain: Vec<&str>| -> Cell {
         let mut child = None;
         let mut cell = Cell::default();
@@ -180,7 +181,7 @@ async fn test_cell_by_hash_storage() -> Result<()> {
         MAX_SAFE_DEPTH,
         BocFlags::all(),
         &|| false,
-        Arc::new(CellByHashStorageAdapter::new(boc_db.clone(), None, 0)?),
+        Arc::new(CellByHashStorageAdapter::new(boc_db.cell_db().clone(), None, 0)?),
     )?;
 
     let mut boc = Vec::new();

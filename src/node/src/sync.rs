@@ -760,7 +760,7 @@ async fn import_shard_blocks(
                         }
                     };
                     if let Some(block) = block {
-                        engine.apply_block(&handle, &block, mc_seq_no, false).await?;
+                        engine.apply_block(&handle, &block, mc_handle.id().seq_no(), false).await?;
                         return Ok(id);
                     }
                 }
@@ -770,7 +770,7 @@ async fn import_shard_blocks(
                     unapplied blocks. Will try to download it directly"
                 );
                 absent_blocks.fetch_add(1, Ordering::Relaxed);
-                engine.download_and_apply_block(&id, mc_seq_no, false).await?;
+                engine.download_and_apply_block(&id, mc_handle.id().seq_no(), false).await?;
                 Ok(id)
             });
             tasks.push(task)

@@ -29,7 +29,7 @@ use std::{
     time::Duration,
 };
 use storage::{
-    dynamic_boc_rc_db::BROKEN_CELL_BEACON_FILE, shardstate_db_async::SsNotificationCallback,
+    cell_db::BROKEN_CELL_BEACON_FILE, shardstate_db_async::SsNotificationCallback,
     traits::Serializable,
 };
 use ton_block::{
@@ -349,6 +349,9 @@ async fn restore(
     if !refill_cells_db {
         log::info!("Fast restore successfully finished");
         return Ok(db);
+    }
+    if db.config.archival_mode.is_some() {
+        fail!("Refilling cells db is not supported in archival mode");
     }
 
     // If there was broken cell or special flag set - check blocks and restore cells db
