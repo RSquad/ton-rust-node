@@ -569,8 +569,8 @@ impl QuicNode {
         let size = data.len();
         let timeout_ms = timeout_ms.unwrap_or(Self::DEFAULT_QUERY_TIMEOUT_MS);
         let wire = serialize_boxed(&QuicQuery { data: data.into() }.into_boxed())?;
-        self.msg_stats.record(tag, size, addr, true, true);
         let response = self.send_query_raw(wire, peers, timeout_ms).await?;
+        self.msg_stats.record(tag, size, addr, true, true);
         if response.is_empty() {
             return Ok(None);
         }

@@ -468,6 +468,24 @@ pub enum Answer {
     Raw(TaggedByteVec),
 }
 
+/// Cancellation-safety guard over AtomicU32 counter
+struct SyncGuard<'a> {
+    counter: &'a AtomicU32,
+}
+
+impl<'a> SyncGuard<'a> {
+    fn new(counter: &'a AtomicU32) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for SyncGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Asynchronous data receiver
 pub(crate) struct AsyncReceiver<T> {
     id: u64,
@@ -515,10 +533,10 @@ impl<T: Send + 'static> AsyncReceiver<T> {
 
     pub(crate) async fn pop(&self) -> Result<Option<T>> {
         self.started_receiving.store(true, Ordering::Relaxed);
-        self.sync.fetch_add(1, Ordering::Relaxed);
+        // Protect counter by guard
+        let _guard = SyncGuard::new(&self.sync);
         loop {
             if let Some(data) = self.data.pop() {
-                self.sync.fetch_sub(1, Ordering::Relaxed);
                 break Ok(data);
             }
             let subscriber = Arc::new(tokio::sync::Barrier::new(2));
