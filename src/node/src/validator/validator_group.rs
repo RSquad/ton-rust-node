@@ -134,7 +134,6 @@ fn should_reject_stale_mc_candidate(
 pub enum ValidatorGroupStatus {
     Created,
     EngineCreated,
-    Countdown { start_at: tokio::time::Instant },
     Sync,
     Active,
     Stopping,
@@ -146,10 +145,6 @@ impl Display for ValidatorGroupStatus {
         match self {
             ValidatorGroupStatus::Created => write!(f, "created"),
             ValidatorGroupStatus::EngineCreated => write!(f, "engine_created"),
-            ValidatorGroupStatus::Countdown { start_at: at } => {
-                let now = tokio::time::Instant::now();
-                write!(f, "cntdwn {}", at.saturating_duration_since(now).as_secs())
-            }
             ValidatorGroupStatus::Sync => write!(f, "sync"),
             ValidatorGroupStatus::Active => write!(f, "active"),
             ValidatorGroupStatus::Stopping => write!(f, "stopping"),
@@ -163,7 +158,6 @@ impl ValidatorGroupStatus {
         match self {
             Self::Created => "created",
             Self::EngineCreated => "engine_created",
-            Self::Countdown { .. } => "countdown",
             Self::Sync => "sync",
             Self::Active => "active",
             Self::Stopping => "stopping",
@@ -174,12 +168,7 @@ impl ValidatorGroupStatus {
 
 impl ValidatorGroupStatus {
     pub fn before(&self, of: &ValidatorGroupStatus) -> bool {
-        match (&self, of) {
-            (ValidatorGroupStatus::Countdown { .. }, ValidatorGroupStatus::Countdown { .. }) => {
-                false
-            }
-            _ => self <= of,
-        }
+        self <= of
     }
 }
 
@@ -388,16 +377,13 @@ impl ValidatorGroupImpl {
         Ok(())
     }
 
-    fn prepare_start(&mut self, validation_start_status: ValidatorGroupStatus) -> bool {
+    fn prepare_start(&mut self) -> bool {
         if self.start_pending {
             return false;
         }
         match self.status {
             ValidatorGroupStatus::Created | ValidatorGroupStatus::EngineCreated => {}
             _ => return false,
-        }
-        if let ValidatorGroupStatus::Countdown { .. } = validation_start_status {
-            self.status = validation_start_status;
         }
         self.start_pending = true;
         true
@@ -820,20 +806,14 @@ impl ValidatorGroup {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_with_status(
+    pub async fn start_session(
         self: Arc<ValidatorGroup>,
-        validation_start_status: ValidatorGroupStatus,
         prev: Vec<BlockIdExt>,
         min_masterchain_block_id: BlockIdExt,
         min_ts: SystemTime,
         rt: tokio::runtime::Handle,
     ) -> Result<()> {
         rt.clone().spawn(async move {
-            if let ValidatorGroupStatus::Countdown { start_at } = validation_start_status {
-                log::trace!(target: "validator", "Session delay started: {}", self.info().await);
-                tokio::time::sleep_until(start_at).await;
-            }
-
             let callback = self.make_validator_session_callback();
             self.group_impl
                 .execute_sync(|group_impl| {
@@ -857,7 +837,7 @@ impl ValidatorGroup {
                         }
                     } else {
                         group_impl.start_pending = false;
-                        log::trace!(target: "validator", "Session deleted before countdown: {}", group_impl.info());
+                        log::trace!(target: "validator", "Session deleted before start: {}", group_impl.info());
                     }
                 })
                 .await;
@@ -930,13 +910,8 @@ impl ValidatorGroup {
         self.group_impl.execute_sync(|group_impl| group_impl.start_pending).await
     }
 
-    pub async fn try_prepare_start(
-        &self,
-        validation_start_status: ValidatorGroupStatus,
-    ) -> Result<bool> {
-        self.group_impl
-            .execute_sync(|group_impl| Ok(group_impl.prepare_start(validation_start_status)))
-            .await
+    pub async fn try_prepare_start(&self) -> Result<bool> {
+        self.group_impl.execute_sync(|group_impl| Ok(group_impl.prepare_start())).await
     }
 
     pub async fn set_status(&self, status: ValidatorGroupStatus) -> Result<()> {
@@ -1147,7 +1122,9 @@ impl ValidatorGroup {
             ConsensusOptions::Catchain(opts) => {
                 opts.accelerated_consensus_max_precollated_blocks as usize
             }
-            ConsensusOptions::Simplex(opts) => opts.max_precollated_blocks as usize,
+            ConsensusOptions::Simplex(opts) => {
+                opts.slots_per_leader_window.saturating_sub(1) as usize
+            }
         };
         let request_clone = request.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
@@ -1959,18 +1936,17 @@ mod tests {
     fn test_prepare_start_immediate_keeps_created_and_marks_pending() {
         let mut group = make_group_impl_for_start_tests();
 
-        assert!(group.prepare_start(ValidatorGroupStatus::Sync));
+        assert!(group.prepare_start());
         assert!(group.status == ValidatorGroupStatus::Created);
         assert!(group.start_pending);
     }
 
     #[test]
-    fn test_prepare_start_countdown_marks_pending_and_countdown() {
+    fn test_prepare_start_keeps_created_status() {
         let mut group = make_group_impl_for_start_tests();
-        let countdown = ValidatorGroupStatus::Countdown { start_at: tokio::time::Instant::now() };
 
-        assert!(group.prepare_start(countdown));
-        assert!(matches!(group.status, ValidatorGroupStatus::Countdown { .. }));
+        assert!(group.prepare_start());
+        assert!(group.status == ValidatorGroupStatus::Created);
         assert!(group.start_pending);
     }
 
@@ -1978,8 +1954,8 @@ mod tests {
     fn test_prepare_start_rejects_duplicate_pending_start() {
         let mut group = make_group_impl_for_start_tests();
 
-        assert!(group.prepare_start(ValidatorGroupStatus::Sync));
-        assert!(!group.prepare_start(ValidatorGroupStatus::Sync));
+        assert!(group.prepare_start());
+        assert!(!group.prepare_start());
         assert!(group.status == ValidatorGroupStatus::Created);
         assert!(group.start_pending);
     }
@@ -1987,9 +1963,8 @@ mod tests {
     #[test]
     fn test_reset_after_start_failure_restores_retryable_state() {
         let mut group = make_group_impl_for_start_tests();
-        let countdown = ValidatorGroupStatus::Countdown { start_at: tokio::time::Instant::now() };
 
-        assert!(group.prepare_start(countdown));
+        assert!(group.prepare_start());
         group.reset_after_start_failure();
 
         assert!(group.status == ValidatorGroupStatus::Created);
@@ -2004,7 +1979,6 @@ mod tests {
         let states = [
             ValidatorGroupStatus::Created,
             ValidatorGroupStatus::EngineCreated,
-            ValidatorGroupStatus::Countdown { start_at: tokio::time::Instant::now() },
             ValidatorGroupStatus::Sync,
             ValidatorGroupStatus::Active,
             ValidatorGroupStatus::Stopping,
@@ -2042,25 +2016,15 @@ mod tests {
     }
 
     #[test]
-    fn test_before_rejects_countdown_to_countdown() {
-        let c1 = ValidatorGroupStatus::Countdown { start_at: tokio::time::Instant::now() };
-        let c2 = ValidatorGroupStatus::Countdown {
-            start_at: tokio::time::Instant::now() + Duration::from_secs(10),
-        };
-        assert!(!c1.before(&c2));
-        assert!(!c2.before(&c1));
-    }
-
-    #[test]
-    fn test_engine_created_state_between_created_and_countdown() {
+    fn test_engine_created_state_between_created_and_sync() {
         let created = ValidatorGroupStatus::Created;
         let engine_created = ValidatorGroupStatus::EngineCreated;
-        let countdown = ValidatorGroupStatus::Countdown { start_at: tokio::time::Instant::now() };
+        let sync = ValidatorGroupStatus::Sync;
 
         assert!(created < engine_created);
-        assert!(engine_created < countdown);
+        assert!(engine_created < sync);
         assert!(created.before(&engine_created));
-        assert!(engine_created.before(&countdown));
+        assert!(engine_created.before(&sync));
     }
 
     #[test]
@@ -2068,9 +2032,8 @@ mod tests {
         let mut group = make_group_impl_for_start_tests();
         group.status = ValidatorGroupStatus::EngineCreated;
 
-        let countdown = ValidatorGroupStatus::Countdown { start_at: tokio::time::Instant::now() };
-        assert!(group.prepare_start(countdown));
-        assert!(matches!(group.status, ValidatorGroupStatus::Countdown { .. }));
+        assert!(group.prepare_start());
+        assert!(group.status == ValidatorGroupStatus::EngineCreated);
         assert!(group.start_pending);
     }
 
@@ -2084,11 +2047,7 @@ mod tests {
         ] {
             let mut group = make_group_impl_for_start_tests();
             group.status = status;
-            assert!(
-                !group.prepare_start(ValidatorGroupStatus::Sync),
-                "prepare_start should reject status {}",
-                status
-            );
+            assert!(!group.prepare_start(), "prepare_start should reject status {}", status);
         }
     }
 
@@ -2172,10 +2131,6 @@ mod tests {
         let states = vec![
             (ValidatorGroupStatus::Created, "created"),
             (ValidatorGroupStatus::EngineCreated, "engine_created"),
-            (
-                ValidatorGroupStatus::Countdown { start_at: tokio::time::Instant::now() },
-                "countdown",
-            ),
             (ValidatorGroupStatus::Sync, "sync"),
             (ValidatorGroupStatus::Active, "active"),
             (ValidatorGroupStatus::Stopping, "stopping"),

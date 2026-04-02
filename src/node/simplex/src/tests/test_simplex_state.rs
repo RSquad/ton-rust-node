@@ -194,7 +194,8 @@ fn test_new_creates_initial_state() {
     assert_eq!(state.first_non_finalized_slot, SlotIndex::new(0));
     assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
     assert!(!state.has_pending_events());
-    assert!(state.get_next_timeout().is_some());
+    // Timeouts start unarmed; SessionProcessor::start() calls set_timeouts().
+    assert!(state.get_next_timeout().is_none());
 
     // Window 0 should have None (genesis) as available base
     assert!(state.get_window(WindowIndex::new(0)).unwrap().available_bases.contains(&None));
@@ -1639,9 +1640,131 @@ fn test_timeout_management() {
     let desc = create_test_desc(4, 2);
     let state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
 
-    // Should have initial timeout
-    assert!(state.get_next_timeout().is_some());
+    // FSM is created with unarmed timeouts (skip_timestamp = None).
+    // SessionProcessor::start() is responsible for calling set_timeouts().
+    assert!(state.get_next_timeout().is_none(), "FSM must start with unarmed timeouts");
     assert_eq!(state.skip_slot, SlotIndex::new(0));
+}
+
+#[test]
+fn test_unarmed_fsm_no_skip_cascade_after_delay() {
+    // Regression: the FSM must NOT fire skip votes when check_all() runs
+    // with unarmed timeouts, even after an arbitrary delay.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
+
+    // Simulate 60 s overlay warmup delay
+    let future = desc.get_time() + std::time::Duration::from_secs(60);
+    desc.set_time(future);
+
+    state.check_all(&desc);
+
+    let mut skip_count = 0;
+    while let Some(event) = state.pull_event() {
+        if matches!(event, SimplexEvent::BroadcastVote(Vote::Skip(_))) {
+            skip_count += 1;
+        }
+    }
+    assert_eq!(skip_count, 0, "unarmed FSM must produce NO skip votes regardless of clock delay");
+}
+
+#[test]
+fn test_set_timeouts_enables_skip_after_expiry() {
+    // After set_timeouts() the skip timer fires once the deadline elapses.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
+
+    let t0 = desc.get_time();
+
+    // Arm at t0
+    state.set_timeouts(&desc);
+    assert!(state.get_next_timeout().is_some(), "set_timeouts must set skip_timestamp");
+
+    // Immediately after arming, check_all should produce no skips
+    state.check_all(&desc);
+    let mut skip_count = 0;
+    while let Some(event) = state.pull_event() {
+        if matches!(event, SimplexEvent::BroadcastVote(Vote::Skip(_))) {
+            skip_count += 1;
+        }
+    }
+    assert_eq!(skip_count, 0, "no skip votes before timeout expires");
+
+    // Advance past first_block_timeout + target_rate (defaults: 3s + 1s = 4s)
+    desc.set_time(t0 + std::time::Duration::from_secs(5));
+    state.check_all(&desc);
+
+    let mut skip_count = 0;
+    while let Some(event) = state.pull_event() {
+        if matches!(event, SimplexEvent::BroadcastVote(Vote::Skip(_))) {
+            skip_count += 1;
+        }
+    }
+    assert!(skip_count > 0, "skip votes must fire after timeout expires");
+}
+
+#[test]
+fn test_try_skip_window_preserves_pending_block_cpp_mode() {
+    // In C++ mode, alarm() only sets voted_skip=true and does NOT clear
+    // pending_block.  The async try_notarize() coroutine can still complete
+    // after a skip vote, producing both Skip and Notar for the same slot.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
+
+    // Store a candidate as pending at slot 0
+    let hash = UInt256::from([1u8; 32]);
+    let block_id = BlockIdExt::default();
+    let candidate = create_test_candidate(0, hash.clone(), block_id, None, 0);
+    let _ = state.on_candidate(&desc, candidate);
+    // Drain events from on_candidate
+    while state.pull_event().is_some() {}
+
+    // Verify pending_block is set
+    let pending_before = state
+        .get_window(WindowIndex::new(0))
+        .and_then(|w| w.slots[0].pending_block.as_ref())
+        .is_some();
+
+    // Fire skip for the entire window (simulates timeout -> try_skip_window)
+    state.try_skip_window_for_test(WindowIndex::new(0));
+
+    // voted_skip must be set
+    let voted_skip =
+        state.get_window(WindowIndex::new(0)).map(|w| w.slots[0].voted_skip).unwrap_or(false);
+    assert!(voted_skip, "slot 0 must have voted_skip after try_skip_window");
+
+    // In C++ mode, pending_block must be PRESERVED (not cleared)
+    let pending_after = state
+        .get_window(WindowIndex::new(0))
+        .and_then(|w| w.slots[0].pending_block.as_ref())
+        .is_some();
+    assert_eq!(
+        pending_before, pending_after,
+        "C++ mode: pending_block must be preserved after skip (was={}, now={})",
+        pending_before, pending_after
+    );
+}
+
+#[test]
+fn test_try_skip_window_clears_pending_block_alpenglow_mode() {
+    // Alpenglow mode: pendingBlocks[k] <- bottom after skip
+    let desc = create_test_desc(4, 2);
+    let mut state =
+        SimplexState::new(&desc, opts_alpenglow()).expect("Failed to create SimplexState");
+
+    let hash = UInt256::from([1u8; 32]);
+    let block_id = BlockIdExt::default();
+    let candidate = create_test_candidate(0, hash.clone(), block_id, None, 0);
+    let _ = state.on_candidate(&desc, candidate);
+    while state.pull_event().is_some() {}
+
+    state.try_skip_window_for_test(WindowIndex::new(0));
+
+    let pending_after = state
+        .get_window(WindowIndex::new(0))
+        .and_then(|w| w.slots[0].pending_block.as_ref())
+        .is_some();
+    assert!(!pending_after, "Alpenglow mode: pending_block must be cleared after skip");
 }
 
 /*

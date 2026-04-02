@@ -84,26 +84,12 @@ fn create_test_validators(count: u32) -> Vec<SessionNode> {
 }
 
 /// Create test SessionDescription with default options
+#[allow(dead_code)]
 fn create_test_desc(
     nodes: &[SessionNode],
     local_idx: usize,
 ) -> Arc<crate::session_description::SessionDescription> {
-    let local_key = nodes[local_idx].public_key.clone();
-    let shard = ShardIdent::masterchain();
-    let opts = SessionOptions::default();
-    Arc::new(
-        crate::session_description::SessionDescription::new(
-            &opts,
-            SessionId::default(),
-            1, // initial_block_seqno
-            nodes,
-            local_key,
-            &shard,
-            SystemTime::now(),
-            None,
-        )
-        .unwrap(),
-    )
+    create_test_desc_with_opts(nodes, local_idx, &SessionOptions::default())
 }
 
 // ============================================================================
@@ -519,11 +505,39 @@ struct TestFixture {
     task_queue: Arc<TestTaskQueue>,
 }
 
+/// Create test SessionDescription with custom options
+fn create_test_desc_with_opts(
+    nodes: &[SessionNode],
+    local_idx: usize,
+    opts: &SessionOptions,
+) -> Arc<crate::session_description::SessionDescription> {
+    let local_key = nodes[local_idx].public_key.clone();
+    let shard = ShardIdent::masterchain();
+    Arc::new(
+        crate::session_description::SessionDescription::new(
+            opts,
+            SessionId::default(),
+            1, // initial_block_seqno
+            nodes,
+            local_key,
+            &shard,
+            SystemTime::now(),
+            None, // metrics
+        )
+        .unwrap(),
+    )
+}
+
 impl TestFixture {
     /// Create a test fixture with N validators (local is validator 0)
     fn new(validator_count: u32) -> Self {
+        Self::new_with_opts(validator_count, SessionOptions::default())
+    }
+
+    /// Create a test fixture with N validators and custom session options
+    fn new_with_opts(validator_count: u32, opts: SessionOptions) -> Self {
         let nodes = create_test_validators(validator_count);
-        let description = create_test_desc(&nodes, 0);
+        let description = create_test_desc_with_opts(&nodes, 0, &opts);
 
         let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> =
             Arc::new(MockListener);
@@ -3052,4 +3066,130 @@ fn test_candidate_decision_ok_does_not_drop_when_cand_seqno_greater_than_committ
         !fixture.processor.pending_validations.contains_key(&candidate_id),
         "pending_validations entry must be consumed"
     );
+}
+
+// ============================================================================
+// Candidate Chaining Tests (C++ parity)
+// ============================================================================
+
+/// Test that local_chain_head and generated_parent_cache start empty.
+#[test]
+fn test_local_chain_head_initial_state() {
+    let fixture = TestFixture::new(4);
+    assert!(fixture.processor.local_chain_head.is_none());
+    assert!(fixture.processor.generated_parent_cache.is_empty());
+}
+
+/// Test that invalidate_local_chain_head clears both the chain head and cache.
+#[test]
+fn test_invalidate_local_chain_head_clears_state() {
+    let mut fixture = TestFixture::new(4);
+
+    let hash = UInt256::from([0xAA; 32]);
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([0xBB; 32]),
+        UInt256::from([0xCC; 32]),
+    );
+    let parent_info =
+        crate::block::CandidateParentInfo { slot: SlotIndex::new(0), hash: hash.clone() };
+    let raw_id = RawCandidateId { slot: SlotIndex::new(0), hash: hash.clone() };
+
+    fixture.processor.local_chain_head = Some(LocalChainHead {
+        window: WindowIndex::new(0),
+        slot: SlotIndex::new(0),
+        parent_info,
+        block_id: block_id.clone(),
+    });
+    fixture.processor.generated_parent_cache.insert(raw_id.clone(), block_id);
+
+    assert!(fixture.processor.local_chain_head.is_some());
+    assert!(!fixture.processor.generated_parent_cache.is_empty());
+
+    fixture.processor.invalidate_local_chain_head();
+
+    assert!(fixture.processor.local_chain_head.is_none());
+    assert!(fixture.processor.generated_parent_cache.is_empty());
+}
+
+/// Test that resolve_parent_block_id finds parents in generated_parent_cache
+/// even before the async on_candidate_received self-loop populates received_candidates.
+#[test]
+fn test_resolve_parent_from_generated_cache() {
+    let mut fixture = TestFixture::new(4);
+
+    let hash = UInt256::from([0xDD; 32]);
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([0xEE; 32]),
+        UInt256::from([0xFF; 32]),
+    );
+    let parent_info =
+        crate::block::CandidateParentInfo { slot: SlotIndex::new(5), hash: hash.clone() };
+    let raw_id = RawCandidateId { slot: SlotIndex::new(5), hash: hash.clone() };
+
+    // Not in received_candidates yet
+    assert!(fixture.processor.resolve_parent_block_id(&parent_info).is_none());
+
+    // Seed the generated_parent_cache (as generated_block would)
+    fixture.processor.generated_parent_cache.insert(raw_id, block_id.clone());
+
+    // Now resolvable
+    let resolved = fixture.processor.resolve_parent_block_id(&parent_info);
+    assert_eq!(resolved, Some(block_id));
+}
+
+/// Test that reset_precollations clears the local chain head.
+#[test]
+fn test_reset_precollations_clears_chain_head() {
+    let mut fixture = TestFixture::new(4);
+
+    let hash = UInt256::from([0x11; 32]);
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([0x22; 32]),
+        UInt256::from([0x33; 32]),
+    );
+    let parent_info =
+        crate::block::CandidateParentInfo { slot: SlotIndex::new(0), hash: hash.clone() };
+
+    fixture.processor.local_chain_head = Some(LocalChainHead {
+        window: WindowIndex::new(0),
+        slot: SlotIndex::new(0),
+        parent_info,
+        block_id,
+    });
+
+    fixture.processor.reset_precollations();
+
+    assert!(fixture.processor.local_chain_head.is_none());
+    assert!(fixture.processor.generated_parent_cache.is_empty());
+}
+
+/// Test that multi-slot window options produce correct precollation depth.
+#[test]
+fn test_slots_per_leader_window_precollation_depth() {
+    // Single-slot window: no precollation
+    let opts1 = SessionOptions { slots_per_leader_window: 1, ..Default::default() };
+    assert_eq!(opts1.slots_per_leader_window.saturating_sub(1), 0);
+
+    // 4-slot window: up to 3 precollated
+    let opts4 = SessionOptions { slots_per_leader_window: 4, ..Default::default() };
+    assert_eq!(opts4.slots_per_leader_window.saturating_sub(1), 3);
+
+    // 8-slot window: up to 7 precollated
+    let opts8 = SessionOptions { slots_per_leader_window: 8, ..Default::default() };
+    assert_eq!(opts8.slots_per_leader_window.saturating_sub(1), 7);
+}
+
+/// Test that creating a SessionProcessor with multi-slot window succeeds.
+#[test]
+fn test_multi_slot_window_session_creation() {
+    let opts = SessionOptions { slots_per_leader_window: 4, ..Default::default() };
+    let fixture = TestFixture::new_with_opts(4, opts);
+    assert_eq!(fixture.description.opts().slots_per_leader_window, 4);
+    assert!(fixture.processor.local_chain_head.is_none());
 }

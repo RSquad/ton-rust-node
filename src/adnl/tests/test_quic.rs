@@ -171,12 +171,11 @@ fn test_quic_concurrent_accept() {
         let mut handles = Vec::with_capacity(NUM_CLIENTS);
         for (i, client) in clients.iter().enumerate() {
             let quic = client.quic.clone();
-            let local = client.key_id.clone();
-            let remote = server_key_id.clone();
+            let peers = AdnlPeers::with_keys(client.key_id.clone(), server_key_id.clone());
             let value = i as i64;
             handles.push(tokio::spawn(async move {
                 let resp = quic
-                    .query(make_ping_data(value), None, &local, &remote, None)
+                    .query(make_ping_data(value), None, &peers, None)
                     .await
                     .unwrap_or_else(|e| panic!("client {i} query failed: {e}"));
                 let pong = parse_pong(resp.unwrap());
@@ -264,27 +263,23 @@ fn test_quic_session() {
         quic_a.add_peer_key(key_id_b.clone(), "127.0.0.1:5601".parse().unwrap()).unwrap();
         quic_b.add_peer_key(key_id_a.clone(), "127.0.0.1:5600".parse().unwrap()).unwrap();
 
+        let peers_ab = AdnlPeers::with_keys(key_id_a.clone(), key_id_b.clone());
+        let peers_ba = AdnlPeers::with_keys(key_id_b.clone(), key_id_a.clone());
         for i in 0..ITERATIONS {
             let value = i as i64;
 
             // A → B: query
-            let resp = quic_a
-                .query(make_ping_data(value), None, &key_id_a, &key_id_b, None)
-                .await
-                .unwrap()
-                .unwrap();
+            let resp =
+                quic_a.query(make_ping_data(value), None, &peers_ab, None).await.unwrap().unwrap();
             assert_eq!(parse_pong(resp), value, "A→B query iter {i}: pong mismatch");
 
             // B → A: query
-            let resp = quic_b
-                .query(make_ping_data(value), None, &key_id_b, &key_id_a, None)
-                .await
-                .unwrap()
-                .unwrap();
+            let resp =
+                quic_b.query(make_ping_data(value), None, &peers_ba, None).await.unwrap().unwrap();
             assert_eq!(parse_pong(resp), value, "B→A query iter {i}: pong mismatch");
 
             // A → B: message
-            quic_a.message(MSG_PAYLOAD.to_vec(), None, &key_id_a, &key_id_b).await.unwrap();
+            quic_a.message(MSG_PAYLOAD.to_vec(), None, &peers_ab).await.unwrap();
             assert_eq!(
                 recv_with_timeout(&mut rx_b).await,
                 MSG_PAYLOAD,
@@ -292,7 +287,7 @@ fn test_quic_session() {
             );
 
             // B → A: message
-            quic_b.message(MSG_PAYLOAD.to_vec(), None, &key_id_b, &key_id_a).await.unwrap();
+            quic_b.message(MSG_PAYLOAD.to_vec(), None, &peers_ba).await.unwrap();
             assert_eq!(
                 recv_with_timeout(&mut rx_a).await,
                 MSG_PAYLOAD,
@@ -360,15 +355,14 @@ fn test_quic_reconnect_after_server_restart() {
         // Register peer keys
         client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
         server1.add_peer_key(client_key_id.clone(), client_bind).unwrap();
+        let peers = AdnlPeers::with_keys(client_key_id.clone(), server_key_id.clone());
 
         // Step 1: successful ping/pong through B1
-        let resp = tokio::time::timeout(
-            TIMEOUT,
-            client.query(make_ping_data(1), None, &client_key_id, &server_key_id, None),
-        )
-        .await
-        .expect("initial query timed out")
-        .expect("initial query failed");
+        let resp =
+            tokio::time::timeout(TIMEOUT, client.query(make_ping_data(1), None, &peers, None))
+                .await
+                .expect("initial query timed out")
+                .expect("initial query failed");
         assert_eq!(parse_pong(resp.unwrap()), 1, "initial pong mismatch");
         println!("Step 1: initial ping/pong succeeded");
 
@@ -394,13 +388,11 @@ fn test_quic_reconnect_after_server_restart() {
         println!("Step 3: server B2 started on same port with same key");
 
         // Step 4: client sends another query — should remove dead conn, reconnect, and succeed
-        let resp = tokio::time::timeout(
-            TIMEOUT,
-            client.query(make_ping_data(2), None, &client_key_id, &server_key_id, None),
-        )
-        .await
-        .expect("reconnect query timed out — dead connection removal may be broken")
-        .expect("reconnect query failed");
+        let resp =
+            tokio::time::timeout(TIMEOUT, client.query(make_ping_data(2), None, &peers, None))
+                .await
+                .expect("reconnect query timed out — dead connection removal may be broken")
+                .expect("reconnect query failed");
         assert_eq!(parse_pong(resp.unwrap()), 2, "reconnect pong mismatch");
         println!("Step 4: reconnect ping/pong succeeded");
 
@@ -516,11 +508,12 @@ fn test_quic_stream_limit() {
         // Register peers
         client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
         server.add_peer_key(client_key_id.clone(), client_bind).unwrap();
+        let peers = AdnlPeers::with_keys(client_key_id.clone(), server_key_id.clone());
 
         // Establish the connection with a ping/pong first
         let resp = tokio::time::timeout(
             Duration::from_secs(10),
-            client.query(make_ping_data(42), None, &client_key_id, &server_key_id, None),
+            client.query(make_ping_data(42), None, &peers, None),
         )
         .await
         .expect("initial query timed out")
@@ -531,11 +524,10 @@ fn test_quic_stream_limit() {
         let mut handles = Vec::with_capacity(NUM_MESSAGES);
         for i in 0..NUM_MESSAGES {
             let quic = client.clone();
-            let local = client_key_id.clone();
-            let remote = server_key_id.clone();
+            let peers = peers.clone();
             handles.push(tokio::spawn(async move {
                 let payload = format!("msg-{i}");
-                quic.message(payload.as_bytes().to_vec(), None, &local, &remote)
+                quic.message(payload.as_bytes().to_vec(), None, &peers)
                     .await
                     .unwrap_or_else(|e| panic!("message {i} failed: {e}"));
             }));
@@ -716,22 +708,19 @@ fn test_quic_duplicate_inbound_resolution() {
         server.add_peer_key(c1_key_id.clone(), c1_bind).unwrap();
         server.add_peer_key(c2_key_id.clone(), c2_bind).unwrap();
 
+        let peers1 = AdnlPeers::with_keys(c1_key_id.clone(), server_key_id.clone());
+        let peers2 = AdnlPeers::with_keys(c2_key_id.clone(), server_key_id.clone());
+
         // Step 1: both clients connect concurrently
         let h1 = {
             let q = client1.clone();
-            let local = c1_key_id.clone();
-            let remote = server_key_id.clone();
-            tokio::spawn(
-                async move { q.query(make_ping_data(1), None, &local, &remote, None).await },
-            )
+            let peers = peers1.clone();
+            tokio::spawn(async move { q.query(make_ping_data(1), None, &peers, None).await })
         };
         let h2 = {
             let q = client2.clone();
-            let local = c2_key_id.clone();
-            let remote = server_key_id.clone();
-            tokio::spawn(
-                async move { q.query(make_ping_data(2), None, &local, &remote, None).await },
-            )
+            let peers = peers2.clone();
+            tokio::spawn(async move { q.query(make_ping_data(2), None, &peers, None).await })
         };
 
         let (r1, r2) = tokio::time::timeout(TIMEOUT, async { tokio::join!(h1, h2) })
@@ -747,22 +736,18 @@ fn test_quic_duplicate_inbound_resolution() {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Step 3: both clients should still be able to query (through surviving connections)
-        let resp1 = tokio::time::timeout(
-            TIMEOUT,
-            client1.query(make_ping_data(10), None, &c1_key_id, &server_key_id, None),
-        )
-        .await
-        .expect("post-resolution query1 timed out")
-        .expect("post-resolution query1 failed");
+        let resp1 =
+            tokio::time::timeout(TIMEOUT, client1.query(make_ping_data(10), None, &peers1, None))
+                .await
+                .expect("post-resolution query1 timed out")
+                .expect("post-resolution query1 failed");
         assert_eq!(parse_pong(resp1.unwrap()), 10);
 
-        let resp2 = tokio::time::timeout(
-            TIMEOUT,
-            client2.query(make_ping_data(20), None, &c2_key_id, &server_key_id, None),
-        )
-        .await
-        .expect("post-resolution query2 timed out")
-        .expect("post-resolution query2 failed");
+        let resp2 =
+            tokio::time::timeout(TIMEOUT, client2.query(make_ping_data(20), None, &peers2, None))
+                .await
+                .expect("post-resolution query2 timed out")
+                .expect("post-resolution query2 failed");
         assert_eq!(parse_pong(resp2.unwrap()), 20);
         println!("Step 3: both clients still functional after duplicate resolution");
 
@@ -975,7 +960,12 @@ fn test_quic_stream_read_timeout() {
 
         let resp = tokio::time::timeout(
             Duration::from_secs(10),
-            normal_client.query(make_ping_data(777), None, &nc_key_id, &server_key_id, None),
+            normal_client.query(
+                make_ping_data(777),
+                None,
+                &AdnlPeers::with_keys(nc_key_id.clone(), server_key_id.clone()),
+                None,
+            ),
         )
         .await
         .expect("normal client query timed out")
@@ -1139,7 +1129,12 @@ fn test_quic_reject_non_rpk_client() {
 
         let resp = tokio::time::timeout(
             Duration::from_secs(10),
-            legit.query(make_ping_data(42), None, &lk_id, &server_key_id, None),
+            legit.query(
+                make_ping_data(42),
+                None,
+                &AdnlPeers::with_keys(lk_id.clone(), server_key_id.clone()),
+                None,
+            ),
         )
         .await
         .expect("legit query timed out after rogue attempt")
@@ -1191,7 +1186,12 @@ fn test_quic_rpk_identity_mismatch() {
         // peer_key_id == expected dst, and they won't match.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            client.query(make_ping_data(1), None, &client_key_id, &fake_key_id, None),
+            client.query(
+                make_ping_data(1),
+                None,
+                &AdnlPeers::with_keys(client_key_id.clone(), fake_key_id.clone()),
+                None,
+            ),
         )
         .await;
 
@@ -1276,12 +1276,11 @@ fn test_quic_connection_pool_exhaustion() {
         let mut handles = Vec::with_capacity(NUM_CLIENTS);
         for (i, client) in clients.iter().enumerate() {
             let quic = client.quic.clone();
-            let local = client.key_id.clone();
-            let remote = server_key_id.clone();
+            let peers = AdnlPeers::with_keys(client.key_id.clone(), server_key_id.clone());
             let value = i as i64;
             handles.push(tokio::spawn(async move {
                 let resp = quic
-                    .query(make_ping_data(value), None, &local, &remote, None)
+                    .query(make_ping_data(value), None, &peers, None)
                     .await
                     .unwrap_or_else(|e| panic!("client {i} query failed: {e}"));
                 assert_eq!(parse_pong(resp.unwrap()), value, "client {i}: pong mismatch");
@@ -1320,7 +1319,12 @@ fn test_quic_connection_pool_exhaustion() {
 
         let resp = tokio::time::timeout(
             Duration::from_secs(10),
-            fresh.query(make_ping_data(12345), None, &fk_id, &server_key_id, None),
+            fresh.query(
+                make_ping_data(12345),
+                None,
+                &AdnlPeers::with_keys(fk_id.clone(), server_key_id.clone()),
+                None,
+            ),
         )
         .await
         .expect("fresh client query timed out after pool exhaust")
@@ -1385,10 +1389,11 @@ fn test_quic_message_burst_reconnect() {
 
         client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
         server1.add_peer_key(client_key_id.clone(), client_bind).unwrap();
+        let peers = AdnlPeers::with_keys(client_key_id.clone(), server_key_id.clone());
 
         for i in 0..BURST_SIZE {
             let payload = format!("msg-phase1-{i}").into_bytes();
-            client.message(payload, None, &client_key_id, &server_key_id).await.unwrap();
+            client.message(payload, None, &peers).await.unwrap();
         }
 
         let expected_p1: HashSet<Vec<u8>> =
@@ -1425,7 +1430,7 @@ fn test_quic_message_burst_reconnect() {
 
         for i in 0..BURST_SIZE {
             let payload = format!("msg-phase2-{i}").into_bytes();
-            client.message(payload, None, &client_key_id, &server_key_id).await.unwrap();
+            client.message(payload, None, &peers).await.unwrap();
         }
 
         let expected_p2: HashSet<Vec<u8>> =
@@ -1529,7 +1534,8 @@ fn test_quic_single_sender_invariant() {
             handles.push(tokio::spawn(async move {
                 for msg_id in 0..MSGS_PER_SENDER {
                     let payload = format!("sender-{sender_id}-msg-{msg_id}").into_bytes();
-                    if let Err(e) = quic.message(payload, None, &src, &dst).await {
+                    let peers = AdnlPeers::with_keys(src.clone(), dst.clone());
+                    if let Err(e) = quic.message(payload, None, &peers).await {
                         eprintln!("sender {sender_id} msg {msg_id} failed: {e}");
                     }
                 }

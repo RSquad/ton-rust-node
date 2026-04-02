@@ -121,7 +121,7 @@ pub(crate) struct BroadcastSendContext<'a> {
 
 pub(crate) enum BroadcastSendMethod {
     Fast,
-    Rldp,
+    QuicOrRldp,
     Safe,
 }
 
@@ -129,7 +129,7 @@ impl Display for BroadcastSendMethod {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let msg = match self {
             Self::Fast => "datagram ADNL",
-            Self::Rldp => "RLDP",
+            Self::QuicOrRldp => "QUIC/RLDP",
             Self::Safe => "stream ADNL",
         };
         write!(f, "{msg}")
@@ -1722,7 +1722,7 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
     }
 
     fn send_method(&self) -> BroadcastSendMethod {
-        BroadcastSendMethod::Rldp
+        BroadcastSendMethod::QuicOrRldp
     }
 
     // Receive side
@@ -1994,7 +1994,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
 
     fn send_method(&self) -> BroadcastSendMethod {
         if self.big_data {
-            BroadcastSendMethod::Rldp
+            BroadcastSendMethod::QuicOrRldp
         } else {
             BroadcastSendMethod::Fast
         }

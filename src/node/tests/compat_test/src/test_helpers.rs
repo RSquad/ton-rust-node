@@ -636,7 +636,7 @@ impl RustQuicTestNode {
         let src = self.adnl_key_id();
         self.rt.block_on(async {
             self.quic
-                .message(data.to_vec(), Some(&*self.adnl), &src, dst)
+                .message(data.to_vec(), Some(&*self.adnl), &AdnlPeers::with_keys(src, dst.clone()))
                 .await
                 .expect("QUIC message failed");
         });
@@ -660,7 +660,7 @@ impl RustQuicTestNode {
 
         self.rt.block_on(async {
             self.quic
-                .message(overlay_data, Some(&*self.adnl), &src, dst)
+                .message(overlay_data, Some(&*self.adnl), &AdnlPeers::with_keys(src, dst.clone()))
                 .await
                 .expect("QUIC message failed");
         });
@@ -673,7 +673,12 @@ impl RustQuicTestNode {
         let src = self.adnl_key_id();
         self.rt.block_on(async {
             self.quic
-                .query(data.to_vec(), Some(&*self.adnl), &src, dst, None)
+                .query(
+                    data.to_vec(),
+                    Some(&*self.adnl),
+                    &AdnlPeers::with_keys(src, dst.clone()),
+                    None,
+                )
                 .await
                 .expect("QUIC query failed")
                 .expect("empty QUIC query answer")
@@ -699,7 +704,12 @@ impl RustQuicTestNode {
         self.rt.block_on(async {
             match tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
-                self.quic.query(overlay_data, Some(&*self.adnl), &src, dst, None),
+                self.quic.query(
+                    overlay_data,
+                    Some(&*self.adnl),
+                    &AdnlPeers::with_keys(src, dst.clone()),
+                    None,
+                ),
             )
             .await
             {
