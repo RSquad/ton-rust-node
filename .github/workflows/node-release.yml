@@ -21,6 +21,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Get commit timestamp
+        id: commit
+        run: echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -51,7 +55,7 @@ jobs:
           build-args: |
             GIT_BRANCH=${{ github.ref_name }}
             GIT_COMMIT=${{ github.sha }}
-            GIT_COMMIT_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_COMMIT_DATE=${{ steps.commit.outputs.date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
