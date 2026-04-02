@@ -45,6 +45,75 @@ pub fn resolve_deploy_pool_params(
     )
 }
 
+/// Resolved even/odd pool addresses (and optionally `StateInit`) for a TONCore config.
+pub struct ResolvedTonCorePools {
+    pub reward_share: u16,
+    pub max_nominators: u16,
+    pub min_validator_stake: u64,
+    pub min_nominator_stake: u64,
+    pub even_address: MsgAddressInt,
+    pub even_state_init: StateInit,
+    pub odd_address: MsgAddressInt,
+    pub odd_state_init: StateInit,
+}
+
+/// Validate and resolve both even/odd pool addresses from TONCore config fields.
+///
+/// Resolves deploy-time defaults, calculates deterministic addresses, and — if explicit
+/// addresses are provided — verifies they match the derived ones.
+pub fn resolve_toncore_pools(
+    validator_addr: &MsgAddressInt,
+    validator_share: u16,
+    even_pool_address: Option<&str>,
+    odd_pool_address: Option<&str>,
+    max_nominators: Option<u16>,
+    min_validator_stake: Option<u64>,
+    min_nominator_stake: Option<u64>,
+) -> anyhow::Result<ResolvedTonCorePools> {
+    let (max_n, min_v, min_n) =
+        resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
+
+    let (even_address, even_state_init) =
+        NominatorPoolWrapperImpl::calculate_address_with_state_init(
+            validator_addr, validator_share, max_n, min_v, min_n,
+        )?;
+    if let Some(addr) = even_pool_address {
+        let explicit = addr
+            .parse::<MsgAddressInt>()
+            .context(format!("invalid TONCore even_pool_address: {addr}"))?;
+        anyhow::ensure!(
+            explicit == even_address,
+            "TONCore even_pool_address ({explicit}) does not match derived address ({even_address})"
+        );
+    }
+
+    let min_v_odd = min_v.saturating_add(1);
+    let (odd_address, odd_state_init) =
+        NominatorPoolWrapperImpl::calculate_address_with_state_init(
+            validator_addr, validator_share, max_n, min_v_odd, min_n,
+        )?;
+    if let Some(addr) = odd_pool_address {
+        let explicit = addr
+            .parse::<MsgAddressInt>()
+            .context(format!("invalid TONCore odd_pool_address: {addr}"))?;
+        anyhow::ensure!(
+            explicit == odd_address,
+            "TONCore odd_pool_address ({explicit}) does not match derived address ({odd_address})"
+        );
+    }
+
+    Ok(ResolvedTonCorePools {
+        reward_share: validator_share,
+        max_nominators: max_n,
+        min_validator_stake: min_v,
+        min_nominator_stake: min_n,
+        even_address,
+        even_state_init,
+        odd_address,
+        odd_state_init,
+    })
+}
+
 /// Wrapper for the TON Nominator Pool contract.
 ///
 /// See: <https://github.com/ton-blockchain/nominator-pool>
@@ -79,14 +148,13 @@ impl NominatorPoolWrapperImpl {
         min_validator_stake: u64,
         min_nominator_stake: u64,
     ) -> anyhow::Result<Self> {
-        let state_init = Self::build_state_init(
+        let (pool_addr, state_init) = Self::calculate_address_with_state_init(
             validator_address,
             validator_reward_share,
             max_nominators_count,
             min_validator_stake,
             min_nominator_stake,
         )?;
-        let pool_addr = Self::address_from_state_init(&state_init)?;
         Ok(Self { provider, pool_addr, state_init: Some(state_init) })
     }
 
@@ -98,6 +166,20 @@ impl NominatorPoolWrapperImpl {
         min_validator_stake: u64,
         min_nominator_stake: u64,
     ) -> anyhow::Result<MsgAddressInt> {
+        Self::calculate_address_with_state_init(
+            validator_address, validator_reward_share,
+            max_nominators_count, min_validator_stake, min_nominator_stake,
+        ).map(|(addr, _)| addr)
+    }
+
+    /// Calculate both the pool address and `StateInit` in a single pass.
+    pub fn calculate_address_with_state_init(
+        validator_address: &MsgAddressInt,
+        validator_reward_share: u16,
+        max_nominators_count: u16,
+        min_validator_stake: u64,
+        min_nominator_stake: u64,
+    ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
         let state_init = Self::build_state_init(
             validator_address,
             validator_reward_share,
@@ -105,7 +187,8 @@ impl NominatorPoolWrapperImpl {
             min_validator_stake,
             min_nominator_stake,
         )?;
-        Self::address_from_state_init(&state_init)
+        let addr = Self::address_from_state_init(&state_init)?;
+        Ok((addr, state_init))
     }
 
     fn address_from_state_init(state_init: &StateInit) -> anyhow::Result<MsgAddressInt> {
@@ -222,8 +305,6 @@ impl NominatorWrapper for NominatorPoolWrapperImpl {
         let validator_reward_share = stack.i64(5).context("parse validator_reward_share")? as u16;
         let max_nominators_count = stack.i64(6).context("parse max_nominators_count")? as u16;
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
-        // In the shared PoolConfig struct this field is named `max_nominators_stake`
-        // for SNP compatibility; for the nominator pool it represents `min_nominator_stake`.
         let min_nominator_stake = stack.i64(8).context("parse min_nominator_stake")? as u64;
 
         // skip indices 9-10 (nominators, withdraw_requests)
@@ -253,7 +334,7 @@ impl NominatorWrapper for NominatorPoolWrapperImpl {
                 validator_reward_share,
                 max_nominators_count,
                 min_validator_stake,
-                max_nominators_stake: min_nominator_stake,
+                nominator_stake_threshold: min_nominator_stake,
             },
             stake_at,
             saved_validator_set_hash,

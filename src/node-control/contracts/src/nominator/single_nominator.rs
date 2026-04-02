@@ -38,9 +38,9 @@ impl NominatorWrapperImpl {
         validator_address: &MsgAddressInt,
         workchain: i32,
     ) -> anyhow::Result<Self> {
-        let state_init = Some(Self::build_state_init(owner_address, validator_address)?);
-        let nominator_addr = Self::calculate_address(workchain, owner_address, validator_address)?;
-        Ok(Self { provider, nominator_addr, state_init })
+        let (nominator_addr, state_init) =
+            Self::calculate_address_with_state_init(workchain, owner_address, validator_address)?;
+        Ok(Self { provider, nominator_addr, state_init: Some(state_init) })
     }
 
     pub fn calculate_address(
@@ -48,10 +48,20 @@ impl NominatorWrapperImpl {
         owner_address: &MsgAddressInt,
         validator_address: &MsgAddressInt,
     ) -> anyhow::Result<MsgAddressInt> {
-        let state_init = Self::build_state_init(owner_address, validator_address)?
-            .write_to_new_cell()?
-            .into_cell()?;
-        MsgAddressInt::with_params(wc, state_init.hash(0))
+        Self::calculate_address_with_state_init(wc, owner_address, validator_address)
+            .map(|(addr, _)| addr)
+    }
+
+    /// Calculate both the pool address and `StateInit` in a single pass.
+    pub fn calculate_address_with_state_init(
+        wc: i32,
+        owner_address: &MsgAddressInt,
+        validator_address: &MsgAddressInt,
+    ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
+        let state_init = Self::build_state_init(owner_address, validator_address)?;
+        let cell = state_init.write_to_new_cell()?.into_cell()?;
+        let addr = MsgAddressInt::with_params(wc, cell.hash(0))?;
+        Ok((addr, state_init))
     }
 
     pub fn build_state_init(
@@ -117,7 +127,7 @@ impl NominatorWrapper for NominatorWrapperImpl {
         let validator_reward_share = stack.i64(5).context("parse validator_reward_share")? as u16;
         let max_nominators_count = stack.i64(6).context("parse max_nominators_count")? as u16;
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
-        let max_nominators_stake = stack.i64(8).context("parse max_nominators_stake")? as u64;
+        let nominator_stake_threshold = stack.i64(8).context("parse nominator_stake_threshold")? as u64;
         // skip indices 9-10 (nominators, withdraw_requests)
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {
@@ -142,7 +152,7 @@ impl NominatorWrapper for NominatorWrapperImpl {
                 validator_reward_share,
                 max_nominators_count,
                 min_validator_stake,
-                max_nominators_stake,
+                nominator_stake_threshold,
             },
             stake_at,
             saved_validator_set_hash,

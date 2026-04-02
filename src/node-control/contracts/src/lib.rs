@@ -22,5 +22,8 @@ pub use elector::{ElectionsInfo, ElectorWrapper, ElectorWrapperImpl, Participant
 pub use nominator::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, NominatorWrapperImpl};
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;
-pub use ton_core_nominator::{NominatorPoolWrapperImpl, resolve_deploy_pool_params};
+pub use ton_core_nominator::{
+    NominatorPoolWrapperImpl, ResolvedTonCorePools, resolve_deploy_pool_params,
+    resolve_toncore_pools,
+};
 pub use wallet::{TonWallet, WalletContract};

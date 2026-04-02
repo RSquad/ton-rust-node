@@ -16,10 +16,8 @@ use common::{
     task_cancellation::CancellationCtx,
     ton_utils::{nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
-use contracts::{
-    NominatorPoolWrapperImpl, NominatorWrapperImpl, TonWallet, resolve_deploy_pool_params,
-};
-use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, str::FromStr, sync::Arc};
+use contracts::{NominatorWrapperImpl, TonWallet, resolve_toncore_pools};
+use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
 
@@ -325,46 +323,24 @@ impl DeployPoolCmd {
 
         let (pool_address, state_init) = match pool_cfg_opt {
             Some(PoolConfig::TONCore {
-                addresses,
                 validator_share,
+                even_pool_address,
+                odd_pool_address,
                 max_nominators,
                 min_validator_stake,
                 min_nominator_stake,
             }) => {
-                let validator_addr =
-                    MsgAddressInt::from_str(addresses[0].as_str()).map_err(set_err)?;
-                if validator_addr != wallet_address {
-                    return Err(set_err(anyhow::anyhow!(
-                        "TONCore addresses[0] must match this node's wallet (expected {}, config has {})",
-                        wallet_address,
-                        addresses[0]
-                    )));
-                }
-                let reward_share = u16::try_from(*validator_share).map_err(|e| {
-                    set_err(anyhow::anyhow!("validator_share must fit in u16: {}", e))
-                })?;
-                let (max_n, min_v, min_n) = resolve_deploy_pool_params(
+                let resolved = resolve_toncore_pools(
+                    &wallet_address,
+                    *validator_share,
+                    even_pool_address.as_deref(),
+                    odd_pool_address.as_deref(),
                     max_nominators.as_ref().copied(),
                     min_validator_stake.as_ref().copied(),
                     min_nominator_stake.as_ref().copied(),
-                );
-                let pool_address = NominatorPoolWrapperImpl::calculate_address(
-                    &validator_addr,
-                    reward_share,
-                    max_n,
-                    min_v,
-                    min_n,
                 )
                 .map_err(set_err)?;
-                let state_init = NominatorPoolWrapperImpl::build_state_init(
-                    &validator_addr,
-                    reward_share,
-                    max_n,
-                    min_v,
-                    min_n,
-                )
-                .map_err(set_err)?;
-                (pool_address, state_init)
+                (resolved.even_address, resolved.even_state_init)
             }
             Some(PoolConfig::SNP { .. }) | None => {
                 let owner = self.owner.as_ref().ok_or_else(|| {
@@ -372,11 +348,9 @@ impl DeployPoolCmd {
                         "SNP deploy requires --owner (set `pool` to a `kind: core` entry for TON Nominator Pool deploy)"
                     ))
                 })?;
-                let pool_address =
-                    NominatorWrapperImpl::calculate_address(-1, owner, &wallet_address)
+                let (pool_address, state_init) =
+                    NominatorWrapperImpl::calculate_address_with_state_init(-1, owner, &wallet_address)
                         .map_err(set_err)?;
-                let state_init = NominatorWrapperImpl::build_state_init(owner, &wallet_address)
-                    .map_err(set_err)?;
                 (pool_address, state_init)
             }
         };
@@ -406,9 +380,9 @@ impl DeployPoolCmd {
 
         if self.verbose {
             match pool_cfg_opt {
-                Some(PoolConfig::TONCore { addresses, validator_share, .. }) => println!(
-                    "Deploy TON Nominator Pool (core): validator={}, validator_share={} (addresses[1]={}) ...",
-                    addresses[0], validator_share, addresses[1]
+                Some(PoolConfig::TONCore { validator_share, .. }) => println!(
+                    "Deploy TON Nominator Pool (core): validator={}, validator_share={}, pool={} ...",
+                    wallet_address, validator_share, pool_address
                 ),
                 _ => {
                     if let Some(owner) = self.owner.as_ref() {

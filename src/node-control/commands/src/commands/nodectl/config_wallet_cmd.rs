@@ -24,8 +24,8 @@ use common::{
     ton_utils::{display_tons, tons_f64_to_nanotons},
 };
 use contracts::{
-    ElectorWrapper, ElectorWrapperImpl, NominatorPoolWrapperImpl, NominatorWrapperImpl, TonWallet,
-    contract_provider, nominator, resolve_deploy_pool_params,
+    ElectorWrapper, ElectorWrapperImpl, NominatorWrapperImpl, TonWallet, contract_provider,
+    nominator, resolve_toncore_pools,
 };
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use secrets_vault::{errors::error::VaultError, vault::SecretVault};
@@ -706,47 +706,23 @@ fn resolve_pool_address(
             (None, None) => anyhow::bail!("Pool has neither address nor owner configured"),
         },
         PoolConfig::TONCore {
-            addresses,
             validator_share,
+            even_pool_address,
+            odd_pool_address,
             max_nominators,
             min_validator_stake,
             min_nominator_stake,
         } => {
-            let configured_validator =
-                addresses[0].parse::<MsgAddressInt>().context("invalid TONCore addresses[0]")?;
-            if configured_validator != *validator_addr {
-                anyhow::bail!(
-                    "TONCore addresses[0] must match validator wallet for manual stake (expected {}, got {})",
-                    validator_addr,
-                    addresses[0]
-                );
-            }
-            let reward_share = u16::try_from(*validator_share)
-                .map_err(|_| anyhow::anyhow!("validator_share must fit in u16 (0..=65535)"))?;
-            let (max_n, min_v, min_n) = resolve_deploy_pool_params(
+            let resolved = resolve_toncore_pools(
+                validator_addr,
+                *validator_share,
+                even_pool_address.as_deref(),
+                odd_pool_address.as_deref(),
                 max_nominators.as_ref().copied(),
                 min_validator_stake.as_ref().copied(),
                 min_nominator_stake.as_ref().copied(),
-            );
-            let calculated = NominatorPoolWrapperImpl::calculate_address(
-                &configured_validator,
-                reward_share,
-                max_n,
-                min_v,
-                min_n,
             )?;
-            // addresses[1] must be the pool contract (same derivation as `nodectl deploy pool`).
-            let explicit = addresses[1]
-                .parse::<MsgAddressInt>()
-                .context("invalid TONCore pool contract address (addresses[1])")?;
-            if explicit != calculated {
-                anyhow::bail!(
-                    "TONCore addresses[1] ({}) does not match pool address derived from addresses[0] and validator_share ({})",
-                    explicit,
-                    calculated
-                );
-            }
-            Ok(explicit)
+            Ok(resolved.even_address)
         }
     }
 }

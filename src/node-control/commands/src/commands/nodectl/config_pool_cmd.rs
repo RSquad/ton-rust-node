@@ -9,18 +9,24 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        calculate_wallet_address, save_config, try_create_rpc_client, warn_ton_api_unavailable,
+        SEND_TIMEOUT, calculate_wallet_address, get_wallet_config, load_config_vault_rpc_client,
+        make_wallet, save_config, try_create_rpc_client, wait_for_seqno_change, wallet_info,
+        warn_ton_api_unavailable,
     },
 };
 use colored::Colorize;
 use common::{
     app_config::{AppConfig, PoolConfig},
-    ton_utils::display_tons,
+    task_cancellation::CancellationCtx,
+    ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
-use contracts::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, resolve_deploy_pool_params};
+use contracts::{
+    NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, TonWallet, resolve_deploy_pool_params,
+    resolve_toncore_pools, ton_core_nominator::messages as pool_messages,
+};
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
-use std::{path::Path, str::FromStr, sync::Arc};
-use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt};
+use std::{io::Write, path::Path, str::FromStr, sync::Arc};
+use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -47,6 +53,10 @@ pub enum PoolAction {
     Ls(PoolLsCmd),
     /// Remove a pool from the configuration
     Rm(PoolRmCmd),
+    /// Deposit validator funds into a TONCore nominator pool
+    DepositValidator(PoolDepositValidatorCmd),
+    /// Withdraw validator funds from a TONCore nominator pool
+    WithdrawValidator(PoolWithdrawValidatorCmd),
 }
 
 #[derive(clap::Args, Clone)]
@@ -68,15 +78,21 @@ pub struct PoolAddCmd {
         help = "SNP: owner address, raw or base64url (for deployment/verification)"
     )]
     owner: Option<String>,
-    #[arg(long = "addr1", help = "Core: addresses[0] (with --kind core)")]
-    addr1: Option<String>,
-    #[arg(long = "addr2", help = "Core: addresses[1] (with --kind core)")]
-    addr2: Option<String>,
+    #[arg(
+        long = "pool-addr-even",
+        help = "Core: even-round pool contract address (optional; derived from validator wallet if omitted)"
+    )]
+    pool_addr_even: Option<String>,
+    #[arg(
+        long = "pool-addr-odd",
+        help = "Core: odd-round pool contract address (derived with min_validator_stake+1; optional)"
+    )]
+    pool_addr_odd: Option<String>,
     #[arg(
         long = "validator-share",
-        help = "Core: validator_share, basis points (with --kind core)"
+        help = "Core: validator reward share encoded on-chain (basis points, 0–65535; e.g. 5000 ≈ 50%)"
     )]
-    validator_share: Option<u64>,
+    validator_share: Option<u16>,
     #[arg(long = "max-nominators", help = "Core: max nominators (default: 40)")]
     max_nominators: Option<u16>,
     #[arg(
@@ -105,12 +121,36 @@ pub struct PoolRmCmd {
     name: String,
 }
 
+#[derive(clap::Args, Clone)]
+#[command(about = "Deposit validator funds into a TONCore nominator pool")]
+pub struct PoolDepositValidatorCmd {
+    #[arg(short = 'b', long = "binding", help = "Binding name (resolves wallet and pool)")]
+    binding: String,
+    #[arg(short = 'a', long = "amount", help = "Amount in TON to deposit")]
+    amount: f64,
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Withdraw validator funds from a TONCore nominator pool")]
+pub struct PoolWithdrawValidatorCmd {
+    #[arg(short = 'b', long = "binding", help = "Binding name (resolves wallet and pool)")]
+    binding: String,
+    #[arg(short = 'a', long = "amount", help = "Amount in TON to withdraw")]
+    amount: f64,
+}
+
 impl PoolCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        path: &Path,
+        cancellation_ctx: CancellationCtx,
+    ) -> anyhow::Result<()> {
         match &self.action {
             PoolAction::Add(cmd) => cmd.run(path).await,
             PoolAction::Ls(cmd) => cmd.run(path).await,
             PoolAction::Rm(cmd) => cmd.run(path).await,
+            PoolAction::DepositValidator(cmd) => cmd.run(path, cancellation_ctx).await,
+            PoolAction::WithdrawValidator(cmd) => cmd.run(path, cancellation_ctx).await,
         }
     }
 }
@@ -163,20 +203,16 @@ impl PoolAddCmd {
                 )
             }
             PoolAddKind::Core => {
-                let addr1 = self
-                    .addr1
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("For core: --addr1 is required"))?;
-                let addr2 = self
-                    .addr2
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("For core: --addr2 is required"))?;
                 let share = self
                     .validator_share
                     .ok_or_else(|| anyhow::anyhow!("For core: --validator-share is required"))?;
 
-                let a1 = normalize_ton_address(addr1, "addr1")?;
-                let a2 = normalize_ton_address(addr2, "addr2")?;
+                let a1 = self.pool_addr_even.as_deref()
+                    .map(|a| normalize_ton_address(a, "pool-addr-even"))
+                    .transpose()?;
+                let a2 = self.pool_addr_odd.as_deref()
+                    .map(|a| normalize_ton_address(a, "pool-addr-odd"))
+                    .transpose()?;
 
                 let (mx, mv, mn) = resolve_deploy_pool_params(
                     self.max_nominators,
@@ -184,14 +220,18 @@ impl PoolAddCmd {
                     self.min_nominator_stake_nano,
                 );
                 let info = format!(
-                    "kind=core addresses=['{}', '{}'], validator_share={} (basis points), deploy_params_resolved: max_nominators={}, min_validator_stake_nano={}, min_nominator_stake_nano={} (omitted fields use contract defaults)",
-                    a1, a2, share, mx, mv, mn
+                    "kind=core validator_share={}, even={}, odd={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
+                    share,
+                    a1.as_deref().unwrap_or("<will be derived>"),
+                    a2.as_deref().unwrap_or("<will be derived>"),
+                    mx, mv, mn
                 );
 
                 (
                     PoolConfig::TONCore {
-                        addresses: [a1, a2],
                         validator_share: share,
+                        even_pool_address: a1,
+                        odd_pool_address: a2,
                         max_nominators: self.max_nominators,
                         min_validator_stake: self.min_validator_stake_nano,
                         min_nominator_stake: self.min_nominator_stake_nano,
@@ -218,7 +258,7 @@ struct PoolView {
     #[serde(skip_serializing_if = "Option::is_none")]
     addresses: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    validator_share: Option<u64>,
+    validator_share: Option<u16>,
 }
 
 impl PoolLsCmd {
@@ -309,14 +349,17 @@ async fn collect_pool_views(
                     validator_share: None,
                 });
             }
-            PoolConfig::TONCore { addresses, validator_share, .. } => {
+            PoolConfig::TONCore { validator_share, even_pool_address, odd_pool_address, .. } => {
+                let mut addrs = Vec::new();
+                addrs.push(even_pool_address.clone().unwrap_or_else(|| "<not deployed>".into()));
+                addrs.push(odd_pool_address.clone().unwrap_or_else(|| "<not deployed>".into()));
                 views.push(PoolView {
                     name: name.clone(),
                     kind: "Core".to_string(),
                     balance: None,
                     address: None,
                     owner: None,
-                    addresses: Some(addresses.to_vec()),
+                    addresses: Some(addrs),
                     validator_share: Some(*validator_share),
                 });
             }
@@ -493,6 +536,224 @@ impl PoolRmCmd {
         save_config(&config, path)?;
 
         println!("\n{} Pool '{}' removed\n", "OK".green().bold(), self.name);
+        Ok(())
+    }
+}
+
+fn resolve_toncore_pool_address(
+    pool_cfg: &PoolConfig,
+    wallet_address: &MsgAddressInt,
+) -> anyhow::Result<MsgAddressInt> {
+    match pool_cfg {
+        PoolConfig::TONCore {
+            validator_share,
+            even_pool_address,
+            odd_pool_address,
+            max_nominators,
+            min_validator_stake,
+            min_nominator_stake,
+        } => {
+            let resolved = resolve_toncore_pools(
+                wallet_address,
+                *validator_share,
+                even_pool_address.as_deref(),
+                odd_pool_address.as_deref(),
+                max_nominators.as_ref().copied(),
+                min_validator_stake.as_ref().copied(),
+                min_nominator_stake.as_ref().copied(),
+            )?;
+            Ok(resolved.even_address)
+        }
+        PoolConfig::SNP { .. } => {
+            anyhow::bail!("This command is only supported for TONCore pools, not SNP");
+        }
+    }
+}
+
+fn confirm_action(prompt: &str) -> anyhow::Result<bool> {
+    print!("{prompt} [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
+impl PoolDepositValidatorCmd {
+    pub async fn run(
+        &self,
+        path: &Path,
+        cancellation_ctx: CancellationCtx,
+    ) -> anyhow::Result<()> {
+        let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+
+        let binding = config
+            .bindings
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' not found", self.binding))?;
+
+        let wallet_cfg =
+            get_wallet_config(&binding.wallet, &config.wallets, config.master_wallet.as_ref())?;
+
+        let pool_name = binding
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' has no pool configured", self.binding))?;
+        let pool_cfg = config
+            .pools
+            .get(pool_name)
+            .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))?;
+
+        let (wallet_address, wallet_info_data, wallet_secret) =
+            wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
+
+        if wallet_info_data.account_state != ton_http_api_client::v2::data_models::AccountState::Active {
+            anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_data.account_state);
+        }
+
+        let pool_address = resolve_toncore_pool_address(pool_cfg, &wallet_address)?;
+
+        let deposit_nanotons = tons_f64_to_nanotons(self.amount);
+        if deposit_nanotons == 0 {
+            anyhow::bail!("Amount must be greater than 0");
+        }
+
+        let gas_reserve: u64 = 2_000_000_000;
+        if wallet_info_data.balance < deposit_nanotons.saturating_add(gas_reserve) {
+            anyhow::bail!(
+                "Insufficient wallet balance: {} TON (need {} TON + gas)",
+                nanotons_to_tons_f64(wallet_info_data.balance),
+                self.amount,
+            );
+        }
+
+        println!(
+            "\n{}\n  Binding: {}\n  Wallet:  {} ({})\n  Pool:    {}\n  Amount:  {:.9} TON\n",
+            "Deposit validator summary:".cyan().bold(),
+            self.binding,
+            binding.wallet,
+            wallet_address,
+            pool_address,
+            self.amount,
+        );
+
+        if !confirm_action("Confirm deposit?")? {
+            println!("{}", "Deposit cancelled".yellow());
+            return Ok(());
+        }
+
+        let wallet =
+            make_wallet(rpc_client.clone(), wallet_cfg, wallet_secret, &binding.wallet).await?;
+
+        let pool_addr_display = pool_address.to_string();
+        let body = pool_messages::deposit_validator(0)?;
+        let msg = wallet
+            .build_message(pool_address, deposit_nanotons, body, true, None, None, None)
+            .await?;
+
+        let msg_boc = write_boc(&msg)?;
+        rpc_client.send_boc(&msg_boc).await?;
+
+        wait_for_seqno_change(
+            rpc_client.clone(),
+            &wallet_address,
+            wallet_info_data.seqno,
+            &cancellation_ctx,
+            SEND_TIMEOUT,
+        )
+        .await?;
+
+        println!(
+            "{} Deposited {:.9} TON to pool {}",
+            "OK".green().bold(),
+            self.amount,
+            pool_addr_display
+        );
+        Ok(())
+    }
+}
+
+impl PoolWithdrawValidatorCmd {
+    pub async fn run(
+        &self,
+        path: &Path,
+        cancellation_ctx: CancellationCtx,
+    ) -> anyhow::Result<()> {
+        let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+
+        let binding = config
+            .bindings
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' not found", self.binding))?;
+
+        let wallet_cfg =
+            get_wallet_config(&binding.wallet, &config.wallets, config.master_wallet.as_ref())?;
+
+        let pool_name = binding
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' has no pool configured", self.binding))?;
+        let pool_cfg = config
+            .pools
+            .get(pool_name)
+            .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))?;
+
+        let (wallet_address, wallet_info_data, wallet_secret) =
+            wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
+
+        if wallet_info_data.account_state != ton_http_api_client::v2::data_models::AccountState::Active {
+            anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_data.account_state);
+        }
+
+        let pool_address = resolve_toncore_pool_address(pool_cfg, &wallet_address)?;
+
+        let withdraw_nanotons = tons_f64_to_nanotons(self.amount);
+        if withdraw_nanotons == 0 {
+            anyhow::bail!("Amount must be greater than 0");
+        }
+
+        println!(
+            "\n{}\n  Binding: {}\n  Wallet:  {} ({})\n  Pool:    {}\n  Amount:  {:.9} TON\n",
+            "Withdraw validator summary:".cyan().bold(),
+            self.binding,
+            binding.wallet,
+            wallet_address,
+            pool_address,
+            self.amount,
+        );
+
+        if !confirm_action("Confirm withdrawal?")? {
+            println!("{}", "Withdrawal cancelled".yellow());
+            return Ok(());
+        }
+
+        let wallet =
+            make_wallet(rpc_client.clone(), wallet_cfg, wallet_secret, &binding.wallet).await?;
+
+        let pool_addr_display = pool_address.to_string();
+        let gas_amount: u64 = 1_000_000_000;
+        let body = pool_messages::withdraw_validator(0, withdraw_nanotons)?;
+        let msg = wallet
+            .build_message(pool_address, gas_amount, body, true, None, None, None)
+            .await?;
+
+        let msg_boc = write_boc(&msg)?;
+        rpc_client.send_boc(&msg_boc).await?;
+
+        wait_for_seqno_change(
+            rpc_client.clone(),
+            &wallet_address,
+            wallet_info_data.seqno,
+            &cancellation_ctx,
+            SEND_TIMEOUT,
+        )
+        .await?;
+
+        println!(
+            "{} Withdrawal of {:.9} TON requested from pool {}",
+            "OK".green().bold(),
+            self.amount,
+            pool_addr_display
+        );
         Ok(())
     }
 }

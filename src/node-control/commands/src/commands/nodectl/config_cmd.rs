@@ -102,7 +102,7 @@ impl ConfigCmd {
             ConfigAction::Generate(cmd) => cmd.run().await,
             ConfigAction::Node(cmd) => cmd.run(path).await,
             ConfigAction::Wallet(cmd) => cmd.run(path, cancellation_ctx).await,
-            ConfigAction::Pool(cmd) => cmd.run(path).await,
+            ConfigAction::Pool(cmd) => cmd.run(path, cancellation_ctx).await,
             ConfigAction::Bind(cmd) => cmd.run(path).await,
             ConfigAction::TonHttpApi(cmd) => cmd.run(path).await,
             ConfigAction::MasterWallet(cmd) => cmd.run(path).await,

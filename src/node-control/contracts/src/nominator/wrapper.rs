@@ -42,7 +42,8 @@ pub struct PoolConfig {
     pub validator_reward_share: u16,
     pub max_nominators_count: u16,
     pub min_validator_stake: u64,
-    pub max_nominators_stake: u64,
+    /// SNP: max nominator stake; TONCore: min nominator stake.
+    pub nominator_stake_threshold: u64,
 }
 /// Pool data returned by get_pool_data()
 #[derive(Debug, Clone, Default, PartialEq)]
