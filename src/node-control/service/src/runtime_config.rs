@@ -13,8 +13,8 @@ use common::{
     vault_signer::VaultSigner,
 };
 use contracts::{
-    NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl, TonWallet, WalletContract,
-    contract_provider, resolve_toncore_pools,
+    NodePools, NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl, TonWallet,
+    WalletContract, contract_provider, resolve_toncore_pools,
 };
 use secrets_vault::{
     types::{algorithm::Algorithm, secret_id::SecretId, secret_spec::SecretSpec},
@@ -50,7 +50,7 @@ struct RuntimeState {
     /// Optional secrets vault for key management.
     vault: Option<Arc<SecretVault>>,
     /// Lazily-loaded nominator pools, rebuilt when config changes.
-    pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
+    pools: Arc<HashMap<String, NodePools>>,
     /// Lazily-loaded wallets, rebuilt when config changes.
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     /// Shared TON HTTP API JSON-RPC client.
@@ -76,7 +76,7 @@ impl std::error::Error for RuntimeConfigError {}
 pub trait RuntimeConfig: Send + Sync {
     fn get(&self) -> Arc<AppConfig>;
     fn master_wallet(&self) -> Arc<dyn TonWallet>;
-    fn pools(&self) -> Arc<HashMap<String, Arc<dyn NominatorWrapper>>>;
+    fn pools(&self) -> Arc<HashMap<String, NodePools>>;
     fn wallets(&self) -> Arc<HashMap<String, Arc<dyn TonWallet>>>;
     fn rpc_client(&self) -> Arc<ClientJsonRpc>;
     fn vault(&self) -> Option<Arc<SecretVault>>;
@@ -325,7 +325,7 @@ impl RuntimeConfigStore {
         app_config: &AppConfig,
         rpc_client: Arc<ClientJsonRpc>,
         wallets: &HashMap<String, Arc<dyn TonWallet>>,
-    ) -> anyhow::Result<Arc<HashMap<String, Arc<dyn NominatorWrapper>>>> {
+    ) -> anyhow::Result<Arc<HashMap<String, NodePools>>> {
         let mut map = HashMap::new();
         for (node_name, binding) in app_config.bindings.iter() {
             if let Some(pool_name) = &binding.pool {
@@ -337,16 +337,13 @@ impl RuntimeConfigStore {
                     .get(node_name)
                     .context(format!("validator wallet not found: {}", node_name))?
                     .address();
-                let pool = open_nominator_pool(cfg, rpc_client.clone(), &validator_address)
+                let pools = open_nominator_pool(cfg, rpc_client.clone(), &validator_address)
                     .map_err(|e| {
                         anyhow::anyhow!("node [{}] open nominator pool error: {:#}", node_name, e)
                     })?;
-                tracing::info!(
-                    "[{}] opened nominator pool: address={}",
-                    node_name,
-                    pool.address().to_string()
-                );
-                map.insert(node_name.to_owned(), pool);
+                let addrs: Vec<String> = pools.iter().map(|p| p.address().to_string()).collect();
+                tracing::info!("[{}] opened nominator pool(s): {}", node_name, addrs.join(", "));
+                map.insert(node_name.to_owned(), pools);
             }
         }
         Ok(Arc::new(map))
@@ -391,7 +388,7 @@ impl RuntimeConfig for RuntimeConfigStore {
         Arc::clone(&state.master_wallet)
     }
 
-    fn pools(&self) -> Arc<HashMap<String, Arc<dyn NominatorWrapper>>> {
+    fn pools(&self) -> Arc<HashMap<String, NodePools>> {
         let state = self.state.read().expect("Runtime state poisoned (read)");
         Arc::clone(&state.pools)
     }
@@ -468,7 +465,7 @@ fn open_nominator_pool(
     config: &PoolConfig,
     rpc_client: Arc<ClientJsonRpc>,
     validator_addr: &MsgAddressInt,
-) -> anyhow::Result<Arc<dyn NominatorWrapper>> {
+) -> anyhow::Result<NodePools> {
     match config {
         PoolConfig::SNP { address, owner } => {
             let pool = match (address, owner) {
@@ -513,7 +510,7 @@ fn open_nominator_pool(
                     anyhow::bail!("pool has neither address nor owner configured");
                 }
             };
-            Ok(Arc::new(pool))
+            Ok(NodePools { even: Arc::new(pool), odd: None })
         }
         PoolConfig::TONCore {
             validator_share,
@@ -532,12 +529,15 @@ fn open_nominator_pool(
                 min_validator_stake.as_ref().copied(),
                 min_nominator_stake.as_ref().copied(),
             )?;
-            // TODO: return both even/odd wrappers when elections runner supports round-based selection
-            let even = NominatorPoolWrapperImpl::new(
+            let even: Arc<dyn NominatorWrapper> = Arc::new(NominatorPoolWrapperImpl::new(
                 contract_provider!(rpc_client.clone()),
                 resolved.even_address,
-            );
-            Ok(Arc::new(even))
+            ));
+            let odd: Arc<dyn NominatorWrapper> = Arc::new(NominatorPoolWrapperImpl::new(
+                contract_provider!(rpc_client.clone()),
+                resolved.odd_address,
+            ));
+            Ok(NodePools { even, odd: Some(odd) })
         }
     }
 }

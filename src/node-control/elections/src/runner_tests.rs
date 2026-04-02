@@ -14,7 +14,7 @@ use common::{
     time_format,
 };
 use contracts::{
-    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
+    ElectionsInfo, ElectorWrapper, NodePools, NominatorWrapper, Participant, TonWallet,
     elector::{FrozenParticipant, PastElections},
     nominator::{NominatorRoles, PoolData, opcodes},
 };
@@ -357,9 +357,12 @@ impl TestHarness {
         let mut providers: HashMap<String, Box<dyn ElectionsProvider>> = HashMap::new();
         providers.insert(node_id.to_string(), Box::new(self.provider_mock));
 
-        let mut pools: HashMap<String, Arc<dyn NominatorWrapper>> = HashMap::new();
+        let mut pools: HashMap<String, NodePools> = HashMap::new();
         if let Some(pool) = self.pool_mock {
-            pools.insert(node_id.to_string(), Arc::new(pool));
+            pools.insert(
+                node_id.to_string(),
+                NodePools { even: Arc::new(pool), odd: None },
+            );
         }
 
         let elector: Arc<dyn ElectorWrapper> = Arc::new(self.elector_mock);
@@ -1594,7 +1597,7 @@ async fn test_node_without_wallet_skipped() {
     providers.insert("node-1".to_string(), Box::new(provider1));
 
     let wallets: HashMap<String, Arc<dyn TonWallet>> = HashMap::new(); // empty!
-    let pools: HashMap<String, Arc<dyn NominatorWrapper>> = HashMap::new();
+    let pools: HashMap<String, NodePools> = HashMap::new();
 
     let runner = ElectionRunner::new(
         &elections_config,
