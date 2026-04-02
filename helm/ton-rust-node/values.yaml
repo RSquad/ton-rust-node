@@ -319,6 +319,11 @@ vault:
 ##
 hostNetwork: false
 
+## @param dnsPolicy Pod DNS policy (only applies when hostNetwork is true). Defaults to ClusterFirstWithHostNet. Supported values: ClusterFirstWithHostNet, ClusterFirst, Default, None.
+## ref: https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-s-dns-policy
+##
+dnsPolicy: ""
+
 ## @param hostPort.adnl Expose the ADNL port on the host IP via hostPort
 ## @param hostPort.simplex Expose the simplex port on the host IP via hostPort
 ## @param hostPort.control Expose the control port on the host IP via hostPort

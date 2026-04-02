@@ -5,6 +5,18 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.4.4] - 2026-04-02
+
+appVersion: `v0.3.0`
+
+### Added
+
+- `dnsPolicy` — override pod DNS policy when `hostNetwork` is enabled (default: `ClusterFirstWithHostNet`)
+
+### Fixed
+
+- `hostNetwork: true` set invalid `dnsPolicy: ClusterFirstWithHostDNS` (typo — correct value is `ClusterFirstWithHostNet`), causing StatefulSet creation to fail
+
 ## [0.4.3] - 2026-04-01
 
 appVersion: `v0.3.0`

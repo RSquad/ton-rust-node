@@ -190,6 +190,13 @@ The pod uses the host's network stack directly. All container ports bind on the 
 hostNetwork: true
 ```
 
+The chart automatically sets `dnsPolicy: ClusterFirstWithHostNet` when `hostNetwork` is enabled. This ensures pods can still resolve cluster DNS names. Override with `dnsPolicy` if needed:
+
+```yaml
+hostNetwork: true
+dnsPolicy: Default
+```
+
 **When to use:** bare-metal deployments where you need zero NAT overhead and accept the security trade-off.
 
 **Trade-offs:**

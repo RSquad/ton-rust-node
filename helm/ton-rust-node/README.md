@@ -318,6 +318,7 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | Name                  | Description                                                                                                                                                                                            | Value   |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
 | `hostNetwork`         | Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md. | `false` |
+| `dnsPolicy`           | Pod DNS policy (only applies when hostNetwork is true). Defaults to ClusterFirstWithHostNet. Supported values: ClusterFirstWithHostNet, ClusterFirst, Default, None.                                   | `""`    |
 | `hostPort.adnl`       | Expose the ADNL port on the host IP via hostPort                                                                                                                                                       | `false` |
 | `hostPort.simplex`    | Expose the simplex port on the host IP via hostPort                                                                                                                                                    | `false` |
 | `hostPort.control`    | Expose the control port on the host IP via hostPort                                                                                                                                                    | `false` |
@@ -344,11 +345,12 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### ServiceAccount parameters
 
-| Name                         | Description                                                                   | Value   |
-| ---------------------------- | ----------------------------------------------------------------------------- | ------- |
-| `serviceAccount.enabled`     | Create a ServiceAccount for the pods                                          | `false` |
-| `serviceAccount.name`        | ServiceAccount name. Defaults to the release fullname if not set.             | `""`    |
-| `serviceAccount.annotations` | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding) | `{}`    |
+| Name                            | Description                                                                                                                                                                                                                                      | Value   |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| `serviceAccount.enabled`        | Create a ServiceAccount for the pods                                                                                                                                                                                                             | `false` |
+| `serviceAccount.name`           | ServiceAccount name. Defaults to the release fullname if not set.                                                                                                                                                                                | `""`    |
+| `serviceAccount.annotations`    | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding)                                                                                                                                                                    | `{}`    |
+| `terminationGracePeriodSeconds` | Time (in seconds) given to the node process to shut down gracefully before SIGKILL. The default Kubernetes value (30s) is too short for a TON node — an unclean kill may corrupt the database and forces a cold boot. Set this to at least 300s. | `300`   |
 
 ### Scheduling parameters
 
