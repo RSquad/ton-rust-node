@@ -2115,7 +2115,7 @@ async fn boot(
     let (last_applied_mc_block, cold) = match result {
         Ok(block_id) => (block_id.clone(), false),
         Err(err) => {
-            log::debug!("before cold boot: {}", err);
+            log::warn!("Before cold boot: {err}");
             engine.acquire_stop(Engine::MASK_SERVICE_BOOT);
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
