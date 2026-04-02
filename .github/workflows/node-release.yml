@@ -14,7 +14,8 @@ env:
 
 jobs:
   container:
-    runs-on: ton-large
+    runs-on:
+      group: ton-large
     permissions:
       contents: read
       packages: write
