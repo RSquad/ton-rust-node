@@ -133,7 +133,7 @@ storage:
 ## @section Port parameters
 
 ## @param ports.adnl ADNL port (UDP)
-## @param ports.simplex [nullable] Simplex consensus port (UDP). Only needed for validators after switching to simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port.
+## @param ports.simplex [nullable] Simplex consensus port (UDP). Required for validators — the network uses simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port.
 ## @param ports.control Control port (TCP). Set to null to disable.
 ## @param ports.liteserver [nullable] Liteserver port (TCP). Set to enable.
 ## @param ports.jsonRpc [nullable] JSON-RPC port (TCP). Set to enable.

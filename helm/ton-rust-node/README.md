@@ -21,6 +21,7 @@ A TON node can run in two roles — **validator** or **fullnode** — using the 
 
 **Validator** participates in network consensus: it validates blocks, votes in elections, and earns rewards. Validator is currently supported on **mainnet** only — testnet validator support is not yet available. A validator is a critical infrastructure component, so:
 
+- **Enable `ports.simplex: true`** — the network uses simplex consensus and validators will not work without it.
 - Never expose `liteserver` or `jsonRpc` ports on a validator. Every open port is an attack surface and adds unnecessary load to a machine that must stay performant and stable.
 - Allocate more resources (see [docs/resources.md](docs/resources.md) for recommended values).
 
@@ -53,6 +54,9 @@ Minimal deployment:
 ```yaml
 # values.yaml
 replicas: 2
+
+ports:
+  simplex: true
 
 services:
   perReplica:
@@ -240,14 +244,14 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Port parameters
 
-| Name               | Description                                                                                                                                                                 | Value   |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `ports.adnl`       | ADNL port (UDP)                                                                                                                                                             | `30303` |
-| `ports.simplex`    | Simplex consensus port (UDP). Only needed for validators after switching to simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port. | `false` |
-| `ports.control`    | Control port (TCP). Set to null to disable.                                                                                                                                 | `50000` |
-| `ports.liteserver` | Liteserver port (TCP). Set to enable.                                                                                                                                       | `nil`   |
-| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.                                                                                                                                         | `nil`   |
-| `ports.metrics`    | Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable.                                                                                          | `nil`   |
+| Name               | Description                                                                                                                                                              | Value   |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| `ports.adnl`       | ADNL port (UDP)                                                                                                                                                          | `30303` |
+| `ports.simplex`    | Simplex consensus port (UDP). Required for validators — the network uses simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port. | `false` |
+| `ports.control`    | Control port (TCP). Set to null to disable.                                                                                                                              | `50000` |
+| `ports.liteserver` | Liteserver port (TCP). Set to enable.                                                                                                                                    | `nil`   |
+| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.                                                                                                                                      | `nil`   |
+| `ports.metrics`    | Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable.                                                                                       | `nil`   |
 
 ### Service parameters
 
