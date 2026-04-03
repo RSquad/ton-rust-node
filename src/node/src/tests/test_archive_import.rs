@@ -48,7 +48,7 @@ fn prepare_archives(dest: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(ARCHIVES_PATH)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let restored_name = name.replacen("0_8000000000000000", "0:8000000000000000", 1);
+        let restored_name = name.replace("_", ":");
         std::fs::copy(entry.path(), dest.join(restored_name))?;
     }
     Ok(())
