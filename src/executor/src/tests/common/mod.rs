@@ -293,6 +293,7 @@ pub fn check_account_and_transaction_balances(
 
     let mut right = acc_after.balance().cloned().unwrap_or_default();
     right.add(trans.total_fees()).unwrap();
+    right.add(trans.blackhole_burned()).unwrap();
     trans
         .iterate_out_msgs(|out_msg| {
             if let Some(header) = out_msg.int_header() {
@@ -854,6 +855,7 @@ pub fn replay_transaction(
 
     let mut right = account.balance().cloned().unwrap_or_default().coins;
     right.add(&our_transaction.total_fees().coins).unwrap();
+    right.add(&our_transaction.blackhole_burned().coins).unwrap();
     our_transaction
         .iterate_out_msgs(|out_msg| {
             if let Some(header) = out_msg.int_header() {

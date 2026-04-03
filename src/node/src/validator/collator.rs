@@ -1135,6 +1135,7 @@ impl ExecutionManager {
             msg_metadata,
             is_special,
         )?;
+        collator_data.value_flow.burned.add(tr.blackhole_burned())?;
 
         collator_data.update_lt(self.max_lt.load(Ordering::Relaxed));
 
@@ -2704,9 +2705,27 @@ impl Collator {
         }
 
         let shard_fees = collator_data.shard_fees().root_extra().clone();
+        collator_data.value_flow.fees_imported = shard_fees.fees.clone();
 
-        collator_data.value_flow.fees_collected.add(&shard_fees.fees)?;
-        collator_data.value_flow.fees_imported = shard_fees.fees;
+        let mut burned_imported = CurrencyCollection::default();
+        if let Some(ConfigParamEnum::ConfigParam5(burning)) = mc_data.config().config(5)? {
+            if shard_fees.fees.coins.as_u128() < shard_fees.create.coins.as_u128() {
+                fail!(
+                    "fees_imported is smaller than imported created fees: {} < {}",
+                    shard_fees.fees.coins,
+                    shard_fees.create.coins
+                );
+            }
+            let imported_base = CurrencyCollection::from_coins(Coins::try_from(
+                shard_fees.fees.coins.as_u128() - shard_fees.create.coins.as_u128(),
+            )?);
+            burned_imported = burning.calculate_burned_fees(&imported_base)?;
+        }
+        collator_data.value_flow.burned.add(&burned_imported)?;
+
+        let mut net_imported = collator_data.value_flow.fees_imported.clone();
+        net_imported.sub(&burned_imported)?;
+        collator_data.value_flow.fees_collected.add(&net_imported)?;
 
         Ok(())
     }
@@ -3911,12 +3930,17 @@ impl Collator {
         let mut value_flow = collator_data.value_flow.clone();
         value_flow.imported = collator_data.in_msgs.root_extra().value_imported.clone();
         value_flow.exported = collator_data.out_msgs.root_extra().clone();
-        value_flow.fees_collected = accounts.root_extra().clone();
-        value_flow.fees_collected.coins.add(&collator_data.in_msgs.root_extra().fees_collected)?;
+        let mut total_fees = accounts.root_extra().clone();
+        total_fees.coins.add(&collator_data.in_msgs.root_extra().fees_collected)?;
 
-        // value_flow.fees_collected.coins.add(&out_msg_dscr.root_extra().coins)?; // TODO: Why only coins?
-
-        value_flow.fees_collected.add(&value_flow.fees_imported)?;
+        value_flow.fees_collected.add(&total_fees)?;
+        if self.shard.is_masterchain() {
+            if let Some(ConfigParamEnum::ConfigParam5(burning)) = mc_data.config().config(5)? {
+                let burned_master = burning.calculate_burned_fees(&total_fees)?;
+                value_flow.fees_collected.sub(&burned_master)?;
+                value_flow.burned.add(&burned_master)?;
+            }
+        }
         value_flow.fees_collected.add(&value_flow.created)?;
         value_flow.to_next_blk = new_accounts.full_balance().clone();
         //value_flow.to_next_blk.add(&value_flow.recovered)?;

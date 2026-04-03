@@ -19,9 +19,9 @@ use crate::{
         ChildCell, Coins, ExtraCurrencyCollection, Number12, Number13, Number16, Number32, Number8,
     },
     validators::{ValidatorDescr, ValidatorSet},
-    AccountId, BlockError, BuilderData, Cell, Deserializable, HashmapE, HashmapIterator,
-    HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData, UInt256,
-    BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
+    AccountId, BlockError, BuilderData, Cell, CurrencyCollection, Deserializable, HashmapE,
+    HashmapIterator, HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData,
+    UInt256, BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 use num::BigInt;
 
@@ -934,6 +934,15 @@ impl BurningConfig {
             fail!("fee_burn_num cannot be greater than fee_burn_denom");
         }
         Ok(())
+    }
+
+    pub fn calculate_burned_fees(&self, value: &CurrencyCollection) -> Result<CurrencyCollection> {
+        if self.fee_burn_num == 0 || value.coins.is_zero() {
+            return Ok(CurrencyCollection::default());
+        }
+        let burned =
+            value.coins.as_u128() * u128::from(self.fee_burn_num) / u128::from(self.fee_burn_denom);
+        Ok(CurrencyCollection::from_coins(Coins::try_from(burned)?))
     }
 }
 
