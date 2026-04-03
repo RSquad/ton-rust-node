@@ -419,7 +419,8 @@ impl ContractsMonitor {
     /// The TonCore pool contract tracks the on-chain validator set hash
     /// (config param 34) and increments an internal counter each time it changes.
     /// Recovery is only allowed once `validator_set_changes_count >= 2`.
-    /// Without this step, the counter stays at 0 and recovery is permanently blocked.
+    /// Unlike the SNP contract, the TonCore pool does not update this counter
+    /// automatically — opcode 6 must be sent explicitly (by anyone).
     async fn ensure_pool_validator_sets_updated(&self, seqno: &mut i64) -> anyhow::Result<bool> {
         let mut all_updated = true;
         tracing::info!(
