@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use ton_block::{
     error, fail, AccStatusChange, Account, AddSub, Cell, Coins, CommonMsgInfo, ComputeSkipReason,
-    Deserializable, Message, MsgAddressInt, Result, Serializable, StorageUsageCalc, TrBouncePhase,
-    TrComputePhase, Transaction, TransactionDescr, TransactionDescrOrdinary, MASTERCHAIN_ID,
-    MAX_MSG_MERKLE_DEPTH,
+    ConfigParamEnum, CurrencyCollection, Deserializable, Message, MsgAddressInt, Result,
+    Serializable, StorageUsageCalc, TrBouncePhase, TrComputePhase, Transaction, TransactionDescr,
+    TransactionDescrOrdinary, MASTERCHAIN_ID, MAX_MSG_MERKLE_DEPTH,
 };
 use ton_vm::{
     boolean, int,
@@ -176,6 +176,26 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 fail!(ExecutorError::NoFundsToImportMsg)
             }
             tr.add_fee_coins(&in_fwd_fee)?;
+        }
+
+        if is_masterchain {
+            if let Some(ConfigParamEnum::ConfigParam5(burning)) =
+                self.config.raw_config().config(5)?
+            {
+                if burning.blackhole_addr.as_ref() == Some(&account_id)
+                    && !msg_balance.coins.is_zero()
+                {
+                    let burned =
+                        CurrencyCollection::from_coins(std::mem::take(&mut msg_balance.coins));
+                    log::debug!(
+                        target: "executor",
+                        "Burning {} nanoton for blackhole account {:x}",
+                        burned.coins,
+                        account_id
+                    );
+                    tr.set_blackhole_burned(burned);
+                }
+            }
         }
 
         if description.credit_first && !is_ext_msg {
