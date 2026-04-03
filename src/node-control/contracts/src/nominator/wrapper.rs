@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::SmartContract;
+use std::sync::Arc;
 use ton_block::{MsgAddressInt, StateInit};
 
 /// Trait for interacting with single-nominator smart contract
@@ -68,4 +69,49 @@ pub struct PoolData {
     pub validator_set_change_time: u64,
     /// Stake held for duration
     pub stake_held_for: u64,
+}
+
+/// Pool binding for a single node: either one pool or two with routing.
+#[derive(Clone)]
+pub enum NodePools {
+    /// SNP or TONCore — a single nominator pool.
+    Single(Arc<dyn NominatorWrapper>),
+    /// TONCoreRouter — two pools; the runner picks the free one via `get_pool_data().state`.
+    Router([Arc<dyn NominatorWrapper>; 2]),
+}
+
+impl NodePools {
+    /// Primary pool (pool[0]). Used for address display and as the default staking address.
+    pub fn primary(&self) -> &Arc<dyn NominatorWrapper> {
+        match self {
+            NodePools::Single(p) => p,
+            NodePools::Router([p, _]) => p,
+        }
+    }
+
+    /// All pools (1 for Single, 2 for Router).
+    pub fn all(&self) -> Vec<&Arc<dyn NominatorWrapper>> {
+        match self {
+            NodePools::Single(p) => vec![p],
+            NodePools::Router([a, b]) => vec![a, b],
+        }
+    }
+
+    /// Select the pool that is ready for validation (`state == 0`).
+    /// For `Single` — always returns the only pool.
+    /// For `Router` — queries `get_pool_data()` on each pool, returns the first with `state == 0`.
+    pub async fn select_free(&self) -> anyhow::Result<&Arc<dyn NominatorWrapper>> {
+        match self {
+            NodePools::Single(p) => Ok(p),
+            NodePools::Router(pools) => {
+                for pool in pools {
+                    let data = pool.get_pool_data().await?;
+                    if data.state == 0 {
+                        return Ok(pool);
+                    }
+                }
+                anyhow::bail!("all router pools are busy (state != 0)")
+            }
+        }
+    }
 }

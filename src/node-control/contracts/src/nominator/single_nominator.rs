@@ -127,7 +127,8 @@ impl NominatorWrapper for NominatorWrapperImpl {
         let validator_reward_share = stack.i64(5).context("parse validator_reward_share")? as u16;
         let max_nominators_count = stack.i64(6).context("parse max_nominators_count")? as u16;
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
-        let nominator_stake_threshold = stack.i64(8).context("parse nominator_stake_threshold")? as u64;
+        let nominator_stake_threshold =
+            stack.i64(8).context("parse nominator_stake_threshold")? as u64;
         // skip indices 9-10 (nominators, withdraw_requests)
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {

@@ -16,7 +16,7 @@ use common::{
     task_cancellation::CancellationCtx,
     ton_utils::{nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
-use contracts::{NominatorWrapperImpl, TonWallet, resolve_toncore_pool};
+use contracts::{NominatorWrapperImpl, TonWallet, resolve_toncore_pool, resolve_toncore_router};
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
@@ -321,7 +321,7 @@ impl DeployPoolCmd {
             .or_else(|| config.bindings.get(&self.node).and_then(|b| b.pool.as_ref()))
             .and_then(|name| config.pools.get(name));
 
-        let (pool_address, state_init) = match pool_cfg_opt {
+        let deploy_targets: Vec<(MsgAddressInt, ton_block::StateInit)> = match pool_cfg_opt {
             Some(PoolConfig::TONCore {
                 validator_share,
                 address,
@@ -338,7 +338,25 @@ impl DeployPoolCmd {
                     min_nominator_stake.as_ref().copied(),
                 )
                 .map_err(set_err)?;
-                (resolved.address, resolved.state_init)
+                vec![(resolved.address, resolved.state_init)]
+            }
+            Some(PoolConfig::TONCoreRouter {
+                validator_share,
+                addresses,
+                max_nominators,
+                min_validator_stake,
+                min_nominator_stake,
+            }) => {
+                let resolved = resolve_toncore_router(
+                    &wallet_address,
+                    *validator_share,
+                    addresses.as_ref(),
+                    max_nominators.as_ref().copied(),
+                    min_validator_stake.as_ref().copied(),
+                    min_nominator_stake.as_ref().copied(),
+                )
+                .map_err(set_err)?;
+                resolved.into_iter().map(|r| (r.address, r.state_init)).collect()
             }
             Some(PoolConfig::SNP { .. }) | None => {
                 let owner = self.owner.as_ref().ok_or_else(|| {
@@ -347,51 +365,15 @@ impl DeployPoolCmd {
                     ))
                 })?;
                 let (pool_address, state_init) =
-                    NominatorWrapperImpl::calculate_address_with_state_init(-1, owner, &wallet_address)
-                        .map_err(set_err)?;
-                (pool_address, state_init)
+                    NominatorWrapperImpl::calculate_address_with_state_init(
+                        -1,
+                        owner,
+                        &wallet_address,
+                    )
+                    .map_err(set_err)?;
+                vec![(pool_address, state_init)]
             }
         };
-
-        res.borrow_mut().address = pool_address.to_string();
-
-        if self.verbose {
-            println!("Update pool info ...");
-        }
-
-        let pool_info = rpc_client.get_address_information(&pool_address).await.map_err(set_err)?;
-        res.borrow_mut().account_state = pool_info.state.clone();
-
-        if pool_info.state == AccountState::Active {
-            if self.verbose {
-                println!("The pool '{}' is already deployed", &pool_address);
-            }
-
-            return Ok(());
-        } else if pool_info.state == AccountState::Frozen {
-            return Err(set_err(anyhow::anyhow!("The pool '{}' is frozen", &pool_address)));
-        }
-
-        if cancellation_ctx.is_cancelled() {
-            return Err(set_err(anyhow::anyhow!("Task cancelled")));
-        }
-
-        if self.verbose {
-            match pool_cfg_opt {
-                Some(PoolConfig::TONCore { validator_share, .. }) => println!(
-                    "Deploy TON Nominator Pool (core): validator={}, validator_share={}, pool={} ...",
-                    wallet_address, validator_share, pool_address
-                ),
-                _ => {
-                    if let Some(owner) = self.owner.as_ref() {
-                        println!(
-                            "Deploy Single Nominator Pool: owner={}, wallet={} ...",
-                            owner, wallet_address
-                        );
-                    }
-                }
-            }
-        }
 
         if wallet_info.account_state != AccountState::Active {
             res.borrow_mut().error =
@@ -400,44 +382,84 @@ impl DeployPoolCmd {
         }
 
         let amount_to_send_nano = tons_f64_to_nanotons(self.amount);
-        if wallet_info.balance < amount_to_send_nano {
-            return Err(set_err(anyhow::anyhow!(
-                "Wallet '{}' balance {:.4}_TON is too low",
-                wallet_address,
-                nanotons_to_tons_f64(wallet_info.balance)
-            )));
-        }
 
-        // Deploy
         let wallet = make_wallet(rpc_client.clone(), wallet_cfg, secret, &self.node)
             .await
             .map_err(set_err)?;
-        let msg_boc = write_boc(
-            &wallet
-                .build_message(
-                    pool_address.clone(),
-                    amount_to_send_nano,
-                    Cell::default(),
-                    false,
-                    wallet_info.seqno,
-                    None,
-                    Some(state_init),
-                )
-                .await
-                .map_err(set_err)?,
-        )
-        .map_err(set_err)?;
+        let mut seqno = wallet_info.seqno;
 
-        rpc_client.send_boc(&msg_boc).await.map_err(set_err)?;
-        wait_for_deploy(
-            rpc_client.clone(),
-            &pool_address,
-            &cancellation_ctx,
-            self.verbose,
-            DEPLOY_TIMEOUT,
-        )
-        .await
-        .map_err(set_err)?;
+        for (i, (pool_address, state_init)) in deploy_targets.iter().enumerate() {
+            res.borrow_mut().address = pool_address.to_string();
+
+            if self.verbose {
+                println!("Update pool info [{}/{}] ...", i + 1, deploy_targets.len());
+            }
+
+            let pool_info =
+                rpc_client.get_address_information(pool_address).await.map_err(set_err)?;
+            res.borrow_mut().account_state = pool_info.state.clone();
+
+            if pool_info.state == AccountState::Active {
+                if self.verbose {
+                    println!("The pool '{}' is already deployed", pool_address);
+                }
+                continue;
+            } else if pool_info.state == AccountState::Frozen {
+                return Err(set_err(anyhow::anyhow!("The pool '{}' is frozen", pool_address)));
+            }
+
+            if cancellation_ctx.is_cancelled() {
+                return Err(set_err(anyhow::anyhow!("Task cancelled")));
+            }
+
+            let current_balance =
+                rpc_client.get_address_information(&wallet_address).await.map_err(set_err)?.balance;
+            if current_balance < amount_to_send_nano {
+                return Err(set_err(anyhow::anyhow!(
+                    "Wallet '{}' balance {:.4}_TON is too low",
+                    wallet_address,
+                    nanotons_to_tons_f64(current_balance)
+                )));
+            }
+
+            if self.verbose {
+                println!(
+                    "Deploy pool [{}/{}]: address={} ...",
+                    i + 1,
+                    deploy_targets.len(),
+                    pool_address
+                );
+            }
+
+            let msg_boc = write_boc(
+                &wallet
+                    .build_message(
+                        pool_address.clone(),
+                        amount_to_send_nano,
+                        Cell::default(),
+                        false,
+                        seqno,
+                        None,
+                        Some(state_init.clone()),
+                    )
+                    .await
+                    .map_err(set_err)?,
+            )
+            .map_err(set_err)?;
+
+            rpc_client.send_boc(&msg_boc).await.map_err(set_err)?;
+            wait_for_deploy(
+                rpc_client.clone(),
+                pool_address,
+                &cancellation_ctx,
+                self.verbose,
+                DEPLOY_TIMEOUT,
+            )
+            .await
+            .map_err(set_err)?;
+
+            seqno = seqno.map(|s| s + 1);
+        }
 
         res.borrow_mut().deployed = true;
         res.borrow_mut().account_state = AccountState::Active;

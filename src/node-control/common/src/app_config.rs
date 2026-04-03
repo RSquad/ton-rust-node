@@ -355,6 +355,27 @@ pub enum PoolConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
         min_nominator_stake: Option<u64>,
     },
+    /// Two TONCore pools with automatic routing: pool[0] uses `min_validator_stake`,
+    /// pool[1] uses `min_validator_stake + 1`. The runner picks the first pool with `state == 0`.
+    #[serde(rename = "core_router")]
+    TONCoreRouter {
+        validator_share: u16,
+        /// Two pool contract addresses `[pool_0, pool_1]`. Each element is optional —
+        /// `None` means "not deployed yet, derive deterministically".
+        /// The outer `Option` itself defaults to `None` (both derived).
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        addresses: Option<[Option<String>; 2]>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_nominators: Option<u16>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_validator_stake: Option<u64>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_nominator_stake: Option<u64>,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -871,6 +892,76 @@ mod tests {
                 max_nominators: Some(10),
                 min_validator_stake: Some(5_000_000_000_000),
                 min_nominator_stake: Some(1_000_000_000_000),
+            }
+        );
+    }
+
+    #[test]
+    fn test_pool_config_serde_core_router_no_addresses() {
+        let value = serde_json::json!({
+            "kind": "core_router",
+            "validator_share": 50,
+        });
+        let cfg: PoolConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg,
+            PoolConfig::TONCoreRouter {
+                validator_share: 50,
+                addresses: None,
+                max_nominators: None,
+                min_validator_stake: None,
+                min_nominator_stake: None,
+            }
+        );
+
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["kind"], "core_router");
+        assert_eq!(json["validator_share"], 50);
+        assert!(json.get("addresses").is_none());
+    }
+
+    #[test]
+    fn test_pool_config_serde_core_router_with_addresses() {
+        let addr0 = ADDR;
+        let addr1 = OWNER;
+        let value = serde_json::json!({
+            "kind": "core_router",
+            "validator_share": 100,
+            "addresses": [addr0.to_string(), addr1.to_string()],
+            "max_nominators": 10,
+            "min_validator_stake": 5_000_000_000_000u64,
+            "min_nominator_stake": 1_000_000_000_000u64,
+        });
+        let cfg: PoolConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg,
+            PoolConfig::TONCoreRouter {
+                validator_share: 100,
+                addresses: Some([Some(addr0.to_string()), Some(addr1.to_string())]),
+                max_nominators: Some(10),
+                min_validator_stake: Some(5_000_000_000_000),
+                min_nominator_stake: Some(1_000_000_000_000),
+            }
+        );
+    }
+
+    #[test]
+    fn test_pool_config_serde_core_router_partial_addresses() {
+        let addr0 = ADDR;
+        let value = serde_json::json!({
+            "kind": "core_router",
+            "validator_share": 50,
+            "addresses": [addr0.to_string(), null],
+        });
+        let cfg: PoolConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg,
+            PoolConfig::TONCoreRouter {
+                validator_share: 50,
+                addresses: Some([Some(addr0.to_string()), None]),
+                max_nominators: None,
+                min_validator_stake: None,
+                min_nominator_stake: None,
             }
         );
     }

@@ -70,10 +70,13 @@ pub fn resolve_toncore_pool(
     let (max_n, min_v, min_n) =
         resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
 
-    let (address, state_init) =
-        NominatorPoolWrapperImpl::calculate_address_with_state_init(
-            validator_addr, validator_share, max_n, min_v, min_n,
-        )?;
+    let (address, state_init) = NominatorPoolWrapperImpl::calculate_address_with_state_init(
+        validator_addr,
+        validator_share,
+        max_n,
+        min_v,
+        min_n,
+    )?;
     if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
@@ -92,6 +95,81 @@ pub fn resolve_toncore_pool(
         address,
         state_init,
     })
+}
+
+/// Resolve two TONCore pool addresses for the router configuration.
+///
+/// `pool[0]` uses `min_validator_stake`, `pool[1]` uses `min_validator_stake + 1`.
+/// If explicit addresses are provided, they are validated against the derived ones.
+pub fn resolve_toncore_router(
+    validator_addr: &MsgAddressInt,
+    validator_share: u16,
+    addresses: Option<&[Option<String>; 2]>,
+    max_nominators: Option<u16>,
+    min_validator_stake: Option<u64>,
+    min_nominator_stake: Option<u64>,
+) -> anyhow::Result<[ResolvedTonCorePool; 2]> {
+    let (max_n, min_v, min_n) =
+        resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
+
+    let explicit = |idx: usize| -> Option<&str> { addresses.and_then(|a| a[idx].as_deref()) };
+
+    let pool0 = {
+        let (address, state_init) = NominatorPoolWrapperImpl::calculate_address_with_state_init(
+            validator_addr,
+            validator_share,
+            max_n,
+            min_v,
+            min_n,
+        )?;
+        if let Some(addr) = explicit(0) {
+            let parsed = addr
+                .parse::<MsgAddressInt>()
+                .context(format!("invalid TONCoreRouter addresses[0]: {addr}"))?;
+            anyhow::ensure!(
+                parsed == address,
+                "TONCoreRouter addresses[0] ({parsed}) does not match derived address ({address})"
+            );
+        }
+        ResolvedTonCorePool {
+            reward_share: validator_share,
+            max_nominators: max_n,
+            min_validator_stake: min_v,
+            min_nominator_stake: min_n,
+            address,
+            state_init,
+        }
+    };
+
+    let min_v_1 = min_v.saturating_add(1);
+    let pool1 = {
+        let (address, state_init) = NominatorPoolWrapperImpl::calculate_address_with_state_init(
+            validator_addr,
+            validator_share,
+            max_n,
+            min_v_1,
+            min_n,
+        )?;
+        if let Some(addr) = explicit(1) {
+            let parsed = addr
+                .parse::<MsgAddressInt>()
+                .context(format!("invalid TONCoreRouter addresses[1]: {addr}"))?;
+            anyhow::ensure!(
+                parsed == address,
+                "TONCoreRouter addresses[1] ({parsed}) does not match derived address ({address})"
+            );
+        }
+        ResolvedTonCorePool {
+            reward_share: validator_share,
+            max_nominators: max_n,
+            min_validator_stake: min_v_1,
+            min_nominator_stake: min_n,
+            address,
+            state_init,
+        }
+    };
+
+    Ok([pool0, pool1])
 }
 
 /// Wrapper for the TON Nominator Pool contract.
@@ -156,9 +234,13 @@ impl NominatorPoolWrapperImpl {
         min_nominator_stake: u64,
     ) -> anyhow::Result<MsgAddressInt> {
         Self::calculate_address_with_state_init(
-            validator_address, validator_reward_share,
-            max_nominators_count, min_validator_stake, min_nominator_stake,
-        ).map(|(addr, _)| addr)
+            validator_address,
+            validator_reward_share,
+            max_nominators_count,
+            min_validator_stake,
+            min_nominator_stake,
+        )
+        .map(|(addr, _)| addr)
     }
 
     /// Calculate both the pool address and `StateInit` in a single pass.

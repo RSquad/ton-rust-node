@@ -25,7 +25,7 @@ use common::{
 };
 use contracts::{
     ElectorWrapper, ElectorWrapperImpl, NominatorWrapperImpl, TonWallet, contract_provider,
-    nominator, resolve_toncore_pool,
+    nominator, resolve_toncore_pool, resolve_toncore_router,
 };
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use secrets_vault::{errors::error::VaultError, vault::SecretVault};
@@ -122,6 +122,8 @@ pub struct WalletStakeCmd {
     amount: f64,
     #[arg(short = 'm', long = "max-factor", default_value = "3.0", help = "Max factor (1.0..3.0)")]
     max_factor: f32,
+    #[arg(long = "pool-index", default_value_t = 0, help = "Router: pool index (0 or 1)")]
+    pool_index: usize,
 }
 
 impl WalletCmd {
@@ -465,7 +467,7 @@ impl WalletStakeCmd {
         if wallet_info_res.account_state != AccountState::Active {
             anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_res.account_state);
         }
-        let pool_address = resolve_pool_address(pool_cfg, &wallet_address)?;
+        let pool_address = resolve_pool_address(pool_cfg, &wallet_address, self.pool_index)?;
         let pool_addr_bytes = pool_address.address().clone().storage().to_vec();
 
         // Connect to validator node via control protocol
@@ -694,8 +696,12 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 fn resolve_pool_address(
     pool_cfg: &PoolConfig,
     validator_addr: &MsgAddressInt,
+    pool_index: usize,
 ) -> anyhow::Result<MsgAddressInt> {
     match pool_cfg {
+        PoolConfig::SNP { .. } if pool_index != 0 => {
+            anyhow::bail!("--pool-index is not applicable for SNP pools");
+        }
         PoolConfig::SNP { address, owner } => match (address, owner) {
             (Some(addr), _) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
             (None, Some(owner)) => {
@@ -705,6 +711,11 @@ fn resolve_pool_address(
             }
             (None, None) => anyhow::bail!("Pool has neither address nor owner configured"),
         },
+        PoolConfig::TONCore { .. } if pool_index != 0 => {
+            anyhow::bail!(
+                "--pool-index is only valid for Router pools (TONCore has a single pool)"
+            );
+        }
         PoolConfig::TONCore {
             validator_share,
             address,
@@ -721,6 +732,26 @@ fn resolve_pool_address(
                 min_nominator_stake.as_ref().copied(),
             )?;
             Ok(resolved.address)
+        }
+        PoolConfig::TONCoreRouter { .. } if pool_index > 1 => {
+            anyhow::bail!("--pool-index must be 0 or 1 for Router pools");
+        }
+        PoolConfig::TONCoreRouter {
+            validator_share,
+            addresses,
+            max_nominators,
+            min_validator_stake,
+            min_nominator_stake,
+        } => {
+            let resolved = resolve_toncore_router(
+                validator_addr,
+                *validator_share,
+                addresses.as_ref(),
+                max_nominators.as_ref().copied(),
+                min_validator_stake.as_ref().copied(),
+                min_nominator_stake.as_ref().copied(),
+            )?;
+            Ok(resolved[pool_index].address.clone())
         }
     }
 }

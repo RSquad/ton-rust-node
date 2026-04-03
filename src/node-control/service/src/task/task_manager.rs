@@ -175,7 +175,7 @@ impl TaskController {
 mod tests {
     use super::*;
     use common::app_config::{HttpConfig, TonHttpApiConfig};
-    use contracts::{NominatorWrapper, TonWallet};
+    use contracts::{NodePools, TonWallet};
     use secrets_vault::vault::SecretVault;
     use std::{
         collections::HashMap,
@@ -194,11 +194,11 @@ mod tests {
         fn master_wallet(&self) -> Arc<dyn TonWallet> {
             unimplemented!()
         }
-        fn pools(&self) -> Arc<HashMap<String, Arc<dyn NominatorWrapper>>> {
-            unimplemented!()
+        fn pools(&self) -> Arc<HashMap<String, NodePools>> {
+            Arc::new(HashMap::new())
         }
         fn wallets(&self) -> Arc<HashMap<String, Arc<dyn TonWallet>>> {
-            unimplemented!()
+            Arc::new(HashMap::new())
         }
         fn rpc_client(&self) -> Arc<ClientJsonRpc> {
             unimplemented!()

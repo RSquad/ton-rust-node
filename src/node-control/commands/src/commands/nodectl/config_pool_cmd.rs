@@ -22,7 +22,7 @@ use common::{
 };
 use contracts::{
     NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, TonWallet, resolve_deploy_pool_params,
-    resolve_toncore_pool, ton_core_nominator::messages as pool_messages,
+    resolve_toncore_pool, resolve_toncore_router, ton_core_nominator::messages as pool_messages,
 };
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
 use std::{io::Write, path::Path, str::FromStr, sync::Arc};
@@ -36,6 +36,8 @@ enum PoolAddKind {
     Snp,
     /// Nominator Pool (`kind: "core"` / `PoolConfig::TONCore`)
     Core,
+    /// Two-pool router (`kind: "core_router"` / `PoolConfig::TONCoreRouter`)
+    Router,
 }
 
 #[derive(clap::Args, Clone)]
@@ -64,14 +66,18 @@ pub enum PoolAction {
 pub struct PoolAddCmd {
     #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
     name: String,
-    #[arg(long = "kind", value_enum, default_value_t = PoolAddKind::Snp, help = "snp or core")]
+    #[arg(long = "kind", value_enum, default_value_t = PoolAddKind::Snp, help = "snp, core, or router")]
     kind: PoolAddKind,
     #[arg(
         short = 'a',
         long = "address",
-        help = "Pool contract address, raw or base64url (optional; derived on deploy if omitted)"
+        help = "Pool contract address (SNP/Core; optional, derived on deploy if omitted)"
     )]
     address: Option<String>,
+    #[arg(long = "address-0", help = "Router: pool[0] address (optional; derived if omitted)")]
+    address_0: Option<String>,
+    #[arg(long = "address-1", help = "Router: pool[1] address (optional; derived if omitted)")]
+    address_1: Option<String>,
     #[arg(
         short = 'o',
         long = "owner",
@@ -80,19 +86,19 @@ pub struct PoolAddCmd {
     owner: Option<String>,
     #[arg(
         long = "validator-share",
-        help = "Core: validator reward share (basis points, 0–65535; e.g. 5000 ≈ 50%)"
+        help = "Core/Router: validator reward share (basis points, 0–65535; e.g. 5000 ≈ 50%)"
     )]
     validator_share: Option<u16>,
-    #[arg(long = "max-nominators", help = "Core: max nominators (default: 40)")]
+    #[arg(long = "max-nominators", help = "Core/Router: max nominators (default: 40)")]
     max_nominators: Option<u16>,
     #[arg(
         long = "min-validator-stake-nano",
-        help = "Core: min validator stake in nanotons (embedded at deploy)"
+        help = "Core/Router: min validator stake in nanotons (embedded at deploy)"
     )]
     min_validator_stake_nano: Option<u64>,
     #[arg(
         long = "min-nominator-stake-nano",
-        help = "Core: min nominator stake in nanotons (embedded at deploy)"
+        help = "Core/Router: min nominator stake in nanotons (embedded at deploy)"
     )]
     min_nominator_stake_nano: Option<u64>,
 }
@@ -118,6 +124,8 @@ pub struct PoolDepositValidatorCmd {
     binding: String,
     #[arg(short = 'a', long = "amount", help = "Amount in TON to deposit")]
     amount: f64,
+    #[arg(long = "pool-index", default_value_t = 0, help = "Router: pool index (0 or 1)")]
+    pool_index: usize,
 }
 
 #[derive(clap::Args, Clone)]
@@ -127,14 +135,12 @@ pub struct PoolWithdrawValidatorCmd {
     binding: String,
     #[arg(short = 'a', long = "amount", help = "Amount in TON to withdraw")]
     amount: f64,
+    #[arg(long = "pool-index", default_value_t = 0, help = "Router: pool index (0 or 1)")]
+    pool_index: usize,
 }
 
 impl PoolCmd {
-    pub async fn run(
-        &self,
-        path: &Path,
-        cancellation_ctx: CancellationCtx,
-    ) -> anyhow::Result<()> {
+    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         match &self.action {
             PoolAction::Add(cmd) => cmd.run(path).await,
             PoolAction::Ls(cmd) => cmd.run(path).await,
@@ -212,13 +218,66 @@ impl PoolAddCmd {
                     "kind=core validator_share={}, address={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
                     share,
                     normalized_address.as_deref().unwrap_or("<will be derived>"),
-                    mx, mv, mn
+                    mx,
+                    mv,
+                    mn
                 );
 
                 (
                     PoolConfig::TONCore {
                         validator_share: share,
                         address: normalized_address,
+                        max_nominators: self.max_nominators,
+                        min_validator_stake: self.min_validator_stake_nano,
+                        min_nominator_stake: self.min_nominator_stake_nano,
+                    },
+                    info,
+                )
+            }
+            PoolAddKind::Router => {
+                if self.address.is_some() {
+                    anyhow::bail!("For router: use --address-0 / --address-1 instead of --address");
+                }
+                let share = self
+                    .validator_share
+                    .ok_or_else(|| anyhow::anyhow!("For router: --validator-share is required"))?;
+
+                let a0 = self
+                    .address_0
+                    .as_deref()
+                    .map(|a| normalize_ton_address(a, "address-0"))
+                    .transpose()?;
+                let a1 = self
+                    .address_1
+                    .as_deref()
+                    .map(|a| normalize_ton_address(a, "address-1"))
+                    .transpose()?;
+
+                let addresses = if a0.is_some() || a1.is_some() {
+                    Some([a0.clone(), a1.clone()])
+                } else {
+                    None
+                };
+
+                let (mx, mv, mn) = resolve_deploy_pool_params(
+                    self.max_nominators,
+                    self.min_validator_stake_nano,
+                    self.min_nominator_stake_nano,
+                );
+                let info = format!(
+                    "kind=core_router validator_share={}, addr[0]={}, addr[1]={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
+                    share,
+                    a0.as_deref().unwrap_or("<will be derived>"),
+                    a1.as_deref().unwrap_or("<will be derived>"),
+                    mx,
+                    mv,
+                    mn
+                );
+
+                (
+                    PoolConfig::TONCoreRouter {
+                        validator_share: share,
+                        addresses,
                         max_nominators: self.max_nominators,
                         min_validator_stake: self.min_validator_stake_nano,
                         min_nominator_stake: self.min_nominator_stake_nano,
@@ -347,6 +406,20 @@ async fn collect_pool_views(
                     validator_share: Some(*validator_share),
                 });
             }
+            PoolConfig::TONCoreRouter { validator_share, addresses, .. } => {
+                let addrs = addresses.as_ref().map(|a| {
+                    a.iter().map(|o| o.clone().unwrap_or_else(|| "<not deployed>".into())).collect()
+                });
+                views.push(PoolView {
+                    name: name.clone(),
+                    kind: "Router".to_string(),
+                    balance: None,
+                    address: None,
+                    owner: None,
+                    addresses: addrs,
+                    validator_share: Some(*validator_share),
+                });
+            }
         }
     }
     views
@@ -385,11 +458,23 @@ fn print_pools_table(views: &[PoolView]) {
                 );
             }
             "Core" => {
-                let addrs = v.addresses.as_deref().map(|a| a.join(", ")).unwrap_or_default();
+                let display_addr = v.address.as_deref().unwrap_or("<not deployed>");
                 let share = v.validator_share.map(|s| s.to_string()).unwrap_or_default();
                 println!(
                     "  {:<15} {:<6} {:<14} {:<50} share={}",
-                    v.name, "Core", "-", addrs, share,
+                    v.name, "Core", "-", display_addr, share,
+                );
+            }
+            "Router" => {
+                let addrs = v
+                    .addresses
+                    .as_deref()
+                    .map(|a| a.join(", "))
+                    .unwrap_or_else(|| "<not deployed>".into());
+                let share = v.validator_share.map(|s| s.to_string()).unwrap_or_default();
+                println!(
+                    "  {:<15} {:<6} {:<14} {:<50} share={}",
+                    v.name, "Router", "-", addrs, share,
                 );
             }
             _ => {}
@@ -527,8 +612,14 @@ impl PoolRmCmd {
 fn resolve_toncore_pool_address(
     pool_cfg: &PoolConfig,
     wallet_address: &MsgAddressInt,
+    pool_index: usize,
 ) -> anyhow::Result<MsgAddressInt> {
     match pool_cfg {
+        PoolConfig::TONCore { .. } if pool_index != 0 => {
+            anyhow::bail!(
+                "--pool-index is only valid for Router pools (TONCore has a single pool)"
+            );
+        }
         PoolConfig::TONCore {
             validator_share,
             address,
@@ -546,6 +637,26 @@ fn resolve_toncore_pool_address(
             )?;
             Ok(resolved.address)
         }
+        PoolConfig::TONCoreRouter { .. } if pool_index > 1 => {
+            anyhow::bail!("--pool-index must be 0 or 1 for Router pools");
+        }
+        PoolConfig::TONCoreRouter {
+            validator_share,
+            addresses,
+            max_nominators,
+            min_validator_stake,
+            min_nominator_stake,
+        } => {
+            let resolved = resolve_toncore_router(
+                wallet_address,
+                *validator_share,
+                addresses.as_ref(),
+                max_nominators.as_ref().copied(),
+                min_validator_stake.as_ref().copied(),
+                min_nominator_stake.as_ref().copied(),
+            )?;
+            Ok(resolved[pool_index].address.clone())
+        }
         PoolConfig::SNP { .. } => {
             anyhow::bail!("This command is only supported for TONCore pools, not SNP");
         }
@@ -561,11 +672,7 @@ fn confirm_action(prompt: &str) -> anyhow::Result<bool> {
 }
 
 impl PoolDepositValidatorCmd {
-    pub async fn run(
-        &self,
-        path: &Path,
-        cancellation_ctx: CancellationCtx,
-    ) -> anyhow::Result<()> {
+    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
 
         let binding = config
@@ -588,11 +695,14 @@ impl PoolDepositValidatorCmd {
         let (wallet_address, wallet_info_data, wallet_secret) =
             wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
 
-        if wallet_info_data.account_state != ton_http_api_client::v2::data_models::AccountState::Active {
+        if wallet_info_data.account_state
+            != ton_http_api_client::v2::data_models::AccountState::Active
+        {
             anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_data.account_state);
         }
 
-        let pool_address = resolve_toncore_pool_address(pool_cfg, &wallet_address)?;
+        let pool_address =
+            resolve_toncore_pool_address(pool_cfg, &wallet_address, self.pool_index)?;
 
         let deposit_nanotons = tons_f64_to_nanotons(self.amount);
         if deposit_nanotons == 0 {
@@ -655,11 +765,7 @@ impl PoolDepositValidatorCmd {
 }
 
 impl PoolWithdrawValidatorCmd {
-    pub async fn run(
-        &self,
-        path: &Path,
-        cancellation_ctx: CancellationCtx,
-    ) -> anyhow::Result<()> {
+    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
 
         let binding = config
@@ -682,11 +788,14 @@ impl PoolWithdrawValidatorCmd {
         let (wallet_address, wallet_info_data, wallet_secret) =
             wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
 
-        if wallet_info_data.account_state != ton_http_api_client::v2::data_models::AccountState::Active {
+        if wallet_info_data.account_state
+            != ton_http_api_client::v2::data_models::AccountState::Active
+        {
             anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_data.account_state);
         }
 
-        let pool_address = resolve_toncore_pool_address(pool_cfg, &wallet_address)?;
+        let pool_address =
+            resolve_toncore_pool_address(pool_cfg, &wallet_address, self.pool_index)?;
 
         let withdraw_nanotons = tons_f64_to_nanotons(self.amount);
         if withdraw_nanotons == 0 {
@@ -714,9 +823,8 @@ impl PoolWithdrawValidatorCmd {
         let pool_addr_display = pool_address.to_string();
         let gas_amount: u64 = 1_000_000_000;
         let body = pool_messages::withdraw_validator(0, withdraw_nanotons)?;
-        let msg = wallet
-            .build_message(pool_address, gas_amount, body, true, None, None, None)
-            .await?;
+        let msg =
+            wallet.build_message(pool_address, gas_amount, body, true, None, None, None).await?;
 
         let msg_boc = write_boc(&msg)?;
         rpc_client.send_boc(&msg_boc).await?;

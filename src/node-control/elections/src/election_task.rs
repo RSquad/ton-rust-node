@@ -16,7 +16,7 @@ use common::{
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
-use contracts::{ElectorWrapperImpl, NominatorWrapper, TonWallet, contract_provider};
+use contracts::{ElectorWrapperImpl, NodePools, TonWallet, contract_provider};
 use secrets_vault::vault::SecretVault;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
@@ -29,7 +29,7 @@ pub async fn run(
     app_config: Arc<AppConfig>,
     rpc_client: Arc<ClientJsonRpc>,
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
-    pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
+    pools: Arc<HashMap<String, NodePools>>,
     store: Arc<SnapshotStore>,
     vault: Option<Arc<SecretVault>>,
     on_status_change: Option<BindingStatusCallback>,
