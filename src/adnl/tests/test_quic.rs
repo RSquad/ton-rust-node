@@ -872,6 +872,280 @@ fn test_quic_duplicate_inbound_same_address() {
 }
 
 // ===========================================================================
+// Test 1b: Multiple keys from same address must coexist
+// ===========================================================================
+
+/// A TON node may have multiple connections to each peer — one for the
+/// current validator key and one for the next key. Both connections originate
+/// from the same source address but use different client Ed25519 keys.
+/// They must coexist: the server must NOT close one when the other arrives.
+///
+/// This test opens two raw quinn connections from the same UDP endpoint with
+/// different Ed25519 RPK identities. After waiting past the duplicate-resolution
+/// window, BOTH connections must still be alive and answer queries.
+#[test]
+fn test_quic_multi_key_same_address() {
+    init_test_log();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        const SERVER_PORT: u16 = 5915;
+        const RAW_CLIENT_PORT: u16 = 5916;
+
+        // --- server ---
+        let (server, _server_key, server_key_id, server_bind, server_token) =
+            make_endpoint(SERVER_PORT);
+
+        // --- two different client keys (simulating current + next validator keys) ---
+        let key1 = ed25519_generate_private_key().unwrap().to_bytes();
+        let key2 = ed25519_generate_private_key().unwrap().to_bytes();
+
+        let (_, cfg1) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{RAW_CLIENT_PORT}"),
+            vec![(key1, KEY_TAG)],
+        )
+        .unwrap();
+        let key1_id = cfg1.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        let (_, cfg2) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{RAW_CLIENT_PORT}"),
+            vec![(key2, KEY_TAG)],
+        )
+        .unwrap();
+        let key2_id = cfg2.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        server
+            .add_peer_key(
+                key1_id.clone(),
+                format!("127.0.0.1:{}", RAW_CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap(),
+            )
+            .unwrap();
+        server
+            .add_peer_key(
+                key2_id.clone(),
+                format!("127.0.0.1:{}", RAW_CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap(),
+            )
+            .unwrap();
+
+        // Build two different quinn client configs (different RPK identities)
+        let client_config1 = build_raw_quinn_client(&key1);
+        let client_config2 = build_raw_quinn_client(&key2);
+
+        // Create a single raw quinn endpoint (both connections share the same source addr)
+        let raw_bind: SocketAddr =
+            format!("127.0.0.1:{}", RAW_CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        sock.set_reuse_address(true).unwrap();
+        sock.bind(&raw_bind.into()).unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let udp = std::net::UdpSocket::from(sock);
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp, runtime).unwrap();
+
+        // SNI name matching QuicNode's key_id_to_server_name
+        let hex = hex::encode(server_key_id.data());
+        let sni = format!("{}.{}", &hex[..32], &hex[32..]);
+
+        // Open connection 1 with key1
+        let conn1 = endpoint
+            .connect_with(client_config1, server_bind, &sni)
+            .unwrap()
+            .await
+            .expect("conn1 (key1) handshake failed");
+
+        // Open connection 2 with key2 (same source address, different identity)
+        let conn2 = endpoint
+            .connect_with(client_config2, server_bind, &sni)
+            .unwrap()
+            .await
+            .expect("conn2 (key2) handshake failed");
+
+        println!("Two connections established from same address with different keys");
+
+        // Verify both work immediately
+        let ping1 = make_ping_wire(101);
+        let (mut s1, mut r1) = conn1.open_bi().await.unwrap();
+        s1.write_all(&ping1).await.unwrap();
+        s1.finish().unwrap();
+        let resp1 = tokio::time::timeout(Duration::from_secs(10), r1.read_to_end(1 << 20))
+            .await
+            .expect("conn1 response timed out")
+            .expect("conn1 read failed");
+        assert_eq!(parse_pong_wire(&resp1), 101);
+        println!("conn1 (key1) ping/pong OK");
+
+        let ping2 = make_ping_wire(102);
+        let (mut s2, mut r2) = conn2.open_bi().await.unwrap();
+        s2.write_all(&ping2).await.unwrap();
+        s2.finish().unwrap();
+        let resp2 = tokio::time::timeout(Duration::from_secs(10), r2.read_to_end(1 << 20))
+            .await
+            .expect("conn2 response timed out")
+            .expect("conn2 read failed");
+        assert_eq!(parse_pong_wire(&resp2), 102);
+        println!("conn2 (key2) ping/pong OK");
+
+        // Wait past the maximum duplicate-resolution window (2500ms + margin)
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // BOTH connections must still be alive — this is the key assertion.
+        // With the old SocketAddr-based keying, one would have been killed.
+        assert!(
+            conn1.close_reason().is_none(),
+            "conn1 (key1) was closed — multi-key coexistence broken!"
+        );
+        assert!(
+            conn2.close_reason().is_none(),
+            "conn2 (key2) was closed — multi-key coexistence broken!"
+        );
+
+        // Both must still answer queries
+        let ping3 = make_ping_wire(201);
+        let (mut s3, mut r3) = conn1.open_bi().await.expect("conn1 should still accept streams");
+        s3.write_all(&ping3).await.unwrap();
+        s3.finish().unwrap();
+        let resp3 = tokio::time::timeout(Duration::from_secs(10), r3.read_to_end(1 << 20))
+            .await
+            .expect("conn1 post-wait response timed out")
+            .expect("conn1 post-wait read failed");
+        assert_eq!(parse_pong_wire(&resp3), 201);
+
+        let ping4 = make_ping_wire(202);
+        let (mut s4, mut r4) = conn2.open_bi().await.expect("conn2 should still accept streams");
+        s4.write_all(&ping4).await.unwrap();
+        s4.finish().unwrap();
+        let resp4 = tokio::time::timeout(Duration::from_secs(10), r4.read_to_end(1 << 20))
+            .await
+            .expect("conn2 post-wait response timed out")
+            .expect("conn2 post-wait read failed");
+        assert_eq!(parse_pong_wire(&resp4), 202);
+
+        println!("PASS: both connections survived duplicate-resolution window");
+
+        // --- cleanup ---
+        conn1.close(0u32.into(), b"done");
+        conn2.close(0u32.into(), b"done");
+        endpoint.close(0u32.into(), b"done");
+        server.shutdown();
+        server_token.cancel();
+    });
+}
+
+// ===========================================================================
+// Test 1c: Same-key duplicate connections must be deduplicated
+// ===========================================================================
+
+/// When two connections arrive from the same client key pair (genuine duplicate),
+/// the server must close the old one after the resolution window. This verifies
+/// that deduplication still works correctly with the AdnlPath-based keying.
+#[test]
+fn test_quic_same_key_deduplication() {
+    init_test_log();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        const SERVER_PORT: u16 = 5917;
+        const RAW_CLIENT_PORT: u16 = 5918;
+
+        // --- server ---
+        let (server, _server_key, server_key_id, server_bind, server_token) =
+            make_endpoint(SERVER_PORT);
+
+        // --- single client key (both connections use the same identity) ---
+        let key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{RAW_CLIENT_PORT}"),
+            vec![(key, KEY_TAG)],
+        )
+        .unwrap();
+        let key_id = cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+        let raw_bind: SocketAddr =
+            format!("127.0.0.1:{}", RAW_CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
+
+        server.add_peer_key(key_id.clone(), raw_bind).unwrap();
+
+        let client_config = build_raw_quinn_client(&key);
+
+        // Create raw quinn endpoint
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        sock.set_reuse_address(true).unwrap();
+        sock.bind(&raw_bind.into()).unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let udp = std::net::UdpSocket::from(sock);
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let mut endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp, runtime).unwrap();
+        endpoint.set_default_client_config(client_config);
+
+        let hex = hex::encode(server_key_id.data());
+        let sni = format!("{}.{}", &hex[..32], &hex[32..]);
+
+        // Open first connection, verify it works
+        let conn1 =
+            endpoint.connect(server_bind, &sni).unwrap().await.expect("conn1 handshake failed");
+
+        let ping1 = make_ping_wire(301);
+        let (mut s1, mut r1) = conn1.open_bi().await.unwrap();
+        s1.write_all(&ping1).await.unwrap();
+        s1.finish().unwrap();
+        let resp1 = tokio::time::timeout(Duration::from_secs(10), r1.read_to_end(1 << 20))
+            .await
+            .expect("conn1 response timed out")
+            .expect("conn1 read failed");
+        assert_eq!(parse_pong_wire(&resp1), 301);
+        println!("conn1 ping/pong OK");
+
+        // Open second connection with the SAME key (genuine duplicate)
+        let conn2 =
+            endpoint.connect(server_bind, &sni).unwrap().await.expect("conn2 handshake failed");
+
+        let ping2 = make_ping_wire(302);
+        let (mut s2, mut r2) = conn2.open_bi().await.unwrap();
+        s2.write_all(&ping2).await.unwrap();
+        s2.finish().unwrap();
+        let resp2 = tokio::time::timeout(Duration::from_secs(10), r2.read_to_end(1 << 20))
+            .await
+            .expect("conn2 response timed out")
+            .expect("conn2 read failed");
+        assert_eq!(parse_pong_wire(&resp2), 302);
+        println!("conn2 ping/pong OK");
+
+        // Wait past the duplicate-resolution window (max 2500ms + margin)
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // The old connection (conn1) should have been closed by duplicate resolution.
+        // Check by trying to open a stream — if the connection was closed, this fails.
+        let conn1_alive = conn1.close_reason().is_none() && conn1.open_bi().await.is_ok();
+        let conn2_alive = conn2.close_reason().is_none() && conn2.open_bi().await.is_ok();
+
+        println!("After dedup: conn1_alive={conn1_alive}, conn2_alive={conn2_alive}");
+
+        // Exactly one should have been closed (the old one).
+        // The new connection (conn2) must survive.
+        assert!(conn2_alive, "conn2 (newer) should survive deduplication");
+        assert!(!conn1_alive, "conn1 (older) should have been closed by deduplication");
+
+        println!("PASS: same-key duplicate was correctly deduplicated");
+
+        // --- cleanup ---
+        conn1.close(0u32.into(), b"done");
+        conn2.close(0u32.into(), b"done");
+        endpoint.close(0u32.into(), b"done");
+        server.shutdown();
+        server_token.cancel();
+    });
+}
+
+// ===========================================================================
 // Test 2: Stream timeout handling
 // ===========================================================================
 

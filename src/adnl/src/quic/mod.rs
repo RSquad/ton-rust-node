@@ -39,6 +39,14 @@ use ton_block::{
 
 const TARGET: &str = "quic";
 
+/// Key for the QUIC inbound connection map: (local_key_id, peer_key_id).
+/// Matches the C++ `AdnlPath{local_id, peer_id}` semantics so that two
+/// connections from the same peer address but different key pairs (e.g.
+/// current + next validator keys) coexist instead of evicting each other.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct QuicInboundKey(Arc<KeyId>, Arc<KeyId>);
+
+type QuicInboundMap = lockfree::map::Map<QuicInboundKey, quinn::Connection>;
 type QuicSendQueue = SendQueue<Vec<u8>>;
 
 /// Extract a `KeyId` from an Ed25519 SubjectPublicKeyInfo (SPKI) DER blob.
@@ -347,7 +355,7 @@ pub struct QuicNode {
     /// Max concurrent in-flight streams per inbound connection.
     max_streams_per_connection: usize,
     /// Inbound connection maps, one per endpoint/accept-loop. Used by the stats dumper.
-    inbound_pools: Mutex<Vec<Arc<Connections<quinn::Connection>>>>,
+    inbound_pools: Mutex<Vec<Arc<QuicInboundMap>>>,
     /// Per-TL-tag message counters for the stats dumper.
     msg_stats: Arc<MsgStats>,
 }
@@ -762,7 +770,7 @@ impl QuicNode {
         let local_key_names: Arc<lockfree::map::Map<String, Arc<KeyId>>> =
             Arc::new(lockfree::map::Map::new());
 
-        let inbound: Arc<Connections<quinn::Connection>> = Connections::new();
+        let inbound: Arc<QuicInboundMap> = Arc::new(lockfree::map::Map::new());
         match self.inbound_pools.lock() {
             Ok(mut pools) => pools.push(inbound.clone()),
             Err(e) => log::warn!(
@@ -840,7 +848,7 @@ impl QuicNode {
         incoming: quinn::Incoming,
         local_key_names: Arc<lockfree::map::Map<String, Arc<KeyId>>>,
         server_cert_resolver: Arc<QuicServerCertResolver>,
-        inbound: Arc<Connections<quinn::Connection>>,
+        inbound: Arc<QuicInboundMap>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         bind_addr: SocketAddr,
         max_streams_per_connection: usize,
@@ -900,17 +908,19 @@ impl QuicNode {
             }
         };
 
+        let inbound_key = QuicInboundKey(local_key_id.clone(), peer_key_id.clone());
         let had_existing = {
             let mut found_existing = false;
-            let result = add_unbound_object_to_map_with_update(inbound.map(), addr, |existing| {
-                if existing.is_some() {
-                    found_existing = true;
-                    // Keep existing entry; resolver task will handle replacement
-                    Ok(None)
-                } else {
-                    Ok(Some(conn.clone()))
-                }
-            });
+            let result =
+                add_unbound_object_to_map_with_update(&inbound, inbound_key.clone(), |existing| {
+                    if existing.is_some() {
+                        found_existing = true;
+                        // Keep existing entry; resolver task will handle replacement
+                        Ok(None)
+                    } else {
+                        Ok(Some(conn.clone()))
+                    }
+                });
             if let Err(e) = result {
                 log::warn!(target: TARGET, "Store QUIC inbound for {addr}: {e}");
                 return;
@@ -918,7 +928,12 @@ impl QuicNode {
             found_existing
         };
         if had_existing {
-            tokio::spawn(Self::resolve_duplicate_connection(inbound.clone(), conn.clone(), addr));
+            tokio::spawn(Self::resolve_duplicate_connection(
+                inbound.clone(),
+                conn.clone(),
+                inbound_key.clone(),
+                addr,
+            ));
         }
 
         let peers = AdnlPeers::with_keys(local_key_id, peer_key_id);
@@ -1008,9 +1023,9 @@ impl QuicNode {
             () = uni_loop => {}
         }
         let is_current =
-            inbound.map().get(&addr).map(|e| e.val().stable_id() == conn_id).unwrap_or(false);
+            inbound.get(&inbound_key).map(|e| e.val().stable_id() == conn_id).unwrap_or(false);
         if is_current {
-            inbound.map().remove(&addr);
+            inbound.remove(&inbound_key);
         }
         log::info!(
             target: TARGET,
@@ -1231,8 +1246,9 @@ impl QuicNode {
     }
 
     async fn resolve_duplicate_connection(
-        inbound: Arc<Connections<quinn::Connection>>,
+        inbound: Arc<QuicInboundMap>,
         new_conn: quinn::Connection,
+        key: QuicInboundKey,
         addr: SocketAddr,
     ) {
         use rand::Rng;
@@ -1240,11 +1256,11 @@ impl QuicNode {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
         let old_alive =
-            inbound.map().get(&addr).map(|e| e.val().close_reason().is_none()).unwrap_or(false);
+            inbound.get(&key).map(|e| e.val().close_reason().is_none()).unwrap_or(false);
         let new_alive = new_conn.close_reason().is_none();
 
         if old_alive && new_alive {
-            if let Some(old) = inbound.map().remove(&addr) {
+            if let Some(old) = inbound.remove(&key) {
                 log::info!(
                     target: TARGET,
                     "Closing old duplicate inbound from {addr} (both alive after {delay_ms}ms)"
@@ -1252,15 +1268,11 @@ impl QuicNode {
                 old.val().close(0u32.into(), b"Replaced by new inbound");
             }
             let nc = new_conn.clone();
-            let _ = add_unbound_object_to_map_with_update(inbound.map(), addr, |_| {
-                Ok(Some(nc.clone()))
-            });
+            let _ = add_unbound_object_to_map_with_update(&inbound, key, |_| Ok(Some(nc.clone())));
         } else if new_alive {
-            inbound.map().remove(&addr);
+            inbound.remove(&key);
             let nc = new_conn.clone();
-            let _ = add_unbound_object_to_map_with_update(inbound.map(), addr, |_| {
-                Ok(Some(nc.clone()))
-            });
+            let _ = add_unbound_object_to_map_with_update(&inbound, key, |_| Ok(Some(nc.clone())));
             log::debug!(
                 target: TARGET,
                 "Old inbound from {addr} already closed, keeping new"
@@ -1440,7 +1452,7 @@ impl QuicNode {
         bind_addr: SocketAddr,
         max_streams_per_connection: usize,
         cancellation_token: tokio_util::sync::CancellationToken,
-        inbound: Arc<Connections<quinn::Connection>>,
+        inbound: Arc<QuicInboundMap>,
         msg_stats: Arc<MsgStats>,
     ) {
         tokio::spawn(async move {
@@ -1613,8 +1625,9 @@ impl QuicNode {
                     }
                 };
                 for pool in &pools {
-                    for conn_entry in pool.map().iter() {
-                        let addr = *conn_entry.key();
+                    for conn_entry in pool.iter() {
+                        let QuicInboundKey(ref local_id, ref peer_id) = *conn_entry.key();
+                        let addr = conn_entry.val().remote_address();
                         let conn = conn_entry.val();
                         let s = conn.stats();
                         let id = (conn.stable_id(), false);
@@ -1626,9 +1639,9 @@ impl QuicNode {
                         fmt::Write::write_fmt(
                             &mut dump,
                             format_args!(
-                                "  inbound peer={addr} \
-                             dtx={} bytes/{} dgrams drx={} bytes/{} dgrams \
-                             dlost={} pkts rtt={:?} cwnd={} mtu={}\n",
+                                "  inbound peer={addr} local={local_id} remote={peer_id} \
+                                dtx={} bytes/{} dgrams drx={} bytes/{} dgrams \
+                                dlost={} pkts rtt={:?} cwnd={} mtu={}\n",
                                 delta.tx_bytes,
                                 delta.tx_dgrams,
                                 delta.rx_bytes,
