@@ -141,7 +141,7 @@ impl NominatorWrapper for NominatorWrapperImpl {
             stack.i64(13).context("parse validator_set_changes_count")? as i32;
         let validator_set_change_time =
             stack.i64(14).context("parse validator_set_change_time")? as u64;
-        let stake_held_for = stack.i64(11).context("parse stake_held_for")? as u64;
+        let stake_held_for = stack.i64(15).context("parse stake_held_for")? as u64;
 
         Ok(PoolData {
             state,

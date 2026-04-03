@@ -1338,7 +1338,7 @@ Validator wallets for election submissions and TON transfers:
 
 #### `pools`
 
-Nominator pool configurations. Two pool types are supported:
+Nominator pool configurations. Three pool types are supported:
 
 **Single Nominator Pool (SNP):**
 
@@ -1349,11 +1349,19 @@ Nominator pool configurations. Two pool types are supported:
 **TONCore Pool:**
 
 - `kind` — `"core"`
-- `addresses` — two addresses: validator wallet (`[0]`) and pool contract (`[1]`, must match the address derived from the parameters below)
+- `address` — optional deployed pool contract address. When omitted, the address is derived from the validator wallet and deploy parameters (see `resolve_deploy_pool_params` / `resolve_toncore_pool` in the contracts module). If set, it must match the derived address.
 - `validator_share` — validator reward share (basis points; stored as `u16` on-chain)
 - `max_nominators` — optional; if omitted, defaults from the contracts module are used (40 nominators)
 - `min_validator_stake` — optional (nanotons); if omitted, defaults from the contracts module are used (100,000 TON)
 - `min_nominator_stake` — optional (nanotons); if omitted, defaults from the contracts module are used (10,000 TON)
+
+**TONCore Router (two pools):**
+
+- `kind` — `"core_router"`
+- `addresses` — optional pair `[pool_0, pool_1]`, each entry an optional string (pool contract address). Serialized as `addresses: [ "<addr0>", "<addr1>" ]` when both are known, or with `null` entries for slots not yet deployed. When the whole field is omitted or entries are `null`, addresses are derived deterministically for each controller (see `resolve_toncore_router`). Each explicit address must match the corresponding derived address.
+- `validator_share` — validator reward share (basis points; same meaning as TONCore)
+- `max_nominators`, `min_validator_stake`, `min_nominator_stake` — same optional semantics as TONCore. Deploy resolution uses `min_validator_stake` for pool index `0` and `min_validator_stake + 1` (nanoton) for pool index `1` so the two contracts differ.
+- **Routing:** the election runner and pool helpers treat this as two separate TONCore controller contracts. When staking or recovering, the implementation selects a **free** pool: the first controller for which `get_pool_data()` reports `state == 0` (idle / ready). If both are busy (`state != 0`), operations fail until one round finishes and a controller returns to idle. This allows overlapping validation rounds using two pools under one binding.
 
 #### `bindings`
 
