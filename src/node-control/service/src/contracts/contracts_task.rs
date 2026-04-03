@@ -9,7 +9,7 @@
 use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
-use contracts::{NodePools, NominatorWrapper, TonWallet, contract_provider};
+use contracts::{NominatorWrapper, TonWallet, contract_provider};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -44,7 +44,7 @@ pub(crate) async fn run(
 
 struct ContractsMonitor {
     master_wallet: Arc<dyn TonWallet>,
-    pools: Arc<HashMap<String, NodePools>>,
+    pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     rpc_client: Arc<ClientJsonRpc>,
     _store: Arc<SnapshotStore>,
@@ -254,20 +254,18 @@ impl ContractsMonitor {
     /// Returns `false` if master balance is insufficient (caller should sleep).
     async fn ensure_pools_deployed(&self, seqno: &mut i64) -> anyhow::Result<bool> {
         let mut all_deployed = true;
-        for (node_id, node_pools) in self.pools.iter() {
-            for pool in node_pools.iter() {
-                match self.deploy_pool(node_id, pool.clone(), *seqno).await {
-                    Ok(true) => (),
-                    Ok(false) => {
-                        all_deployed = false;
-                        *seqno += 1;
-                    }
-                    Err(e) => {
-                        all_deployed = false;
-                        tracing::error!(target: "contracts", "[{}] deploy pool error: {:#}", node_id, e);
-                    }
-                };
-            }
+        for (node_id, pool) in self.pools.iter() {
+            match self.deploy_pool(node_id, pool.clone(), *seqno).await {
+                Ok(true) => (),
+                Ok(false) => {
+                    all_deployed = false;
+                    *seqno += 1;
+                }
+                Err(e) => {
+                    all_deployed = false;
+                    tracing::error!(target: "contracts", "[{}] deploy pool error: {:#}", node_id, e);
+                }
+            };
         }
         Ok(all_deployed)
     }
@@ -409,7 +407,7 @@ mod tests {
     use super::ContractsMonitor;
     use axum::{Json, Router, extract::State, routing::post};
     use common::snapshot::SnapshotStore;
-    use contracts::{NodePools, SmartContract, TonWallet};
+    use contracts::{NominatorWrapper, SmartContract, TonWallet};
     use std::{
         collections::HashMap,
         sync::{
@@ -584,7 +582,7 @@ mod tests {
         let rpc_client = Arc::new(ClientJsonRpc::connect(rpc_url, None).unwrap());
         ContractsMonitor {
             master_wallet,
-            pools: Arc::<HashMap<String, NodePools>>::default(),
+            pools: Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),
             wallets,
             rpc_client,
             _store: Arc::new(SnapshotStore::new()),

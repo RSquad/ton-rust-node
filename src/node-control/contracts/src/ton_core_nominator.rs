@@ -12,6 +12,6 @@ pub mod messages;
 mod ton_core_nominator;
 
 pub use ton_core_nominator::{
-    NominatorPoolWrapperImpl, ResolvedTonCorePools, resolve_deploy_pool_params,
-    resolve_toncore_pools,
+    NominatorPoolWrapperImpl, ResolvedTonCorePool, resolve_deploy_pool_params,
+    resolve_toncore_pool,
 };

@@ -22,7 +22,7 @@ use common::{
 };
 use contracts::{
     NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, TonWallet, resolve_deploy_pool_params,
-    resolve_toncore_pools, ton_core_nominator::messages as pool_messages,
+    resolve_toncore_pool, ton_core_nominator::messages as pool_messages,
 };
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
 use std::{io::Write, path::Path, str::FromStr, sync::Arc};
@@ -69,7 +69,7 @@ pub struct PoolAddCmd {
     #[arg(
         short = 'a',
         long = "address",
-        help = "SNP: pool contract address, raw or base64url (if already deployed)"
+        help = "Pool contract address, raw or base64url (optional; derived on deploy if omitted)"
     )]
     address: Option<String>,
     #[arg(
@@ -79,18 +79,8 @@ pub struct PoolAddCmd {
     )]
     owner: Option<String>,
     #[arg(
-        long = "pool-addr-even",
-        help = "Core: even-round pool contract address (optional; derived from validator wallet if omitted)"
-    )]
-    pool_addr_even: Option<String>,
-    #[arg(
-        long = "pool-addr-odd",
-        help = "Core: odd-round pool contract address (derived with min_validator_stake+1; optional)"
-    )]
-    pool_addr_odd: Option<String>,
-    #[arg(
         long = "validator-share",
-        help = "Core: validator reward share encoded on-chain (basis points, 0–65535; e.g. 5000 ≈ 50%)"
+        help = "Core: validator reward share (basis points, 0–65535; e.g. 5000 ≈ 50%)"
     )]
     validator_share: Option<u16>,
     #[arg(long = "max-nominators", help = "Core: max nominators (default: 40)")]
@@ -207,11 +197,10 @@ impl PoolAddCmd {
                     .validator_share
                     .ok_or_else(|| anyhow::anyhow!("For core: --validator-share is required"))?;
 
-                let a1 = self.pool_addr_even.as_deref()
-                    .map(|a| normalize_ton_address(a, "pool-addr-even"))
-                    .transpose()?;
-                let a2 = self.pool_addr_odd.as_deref()
-                    .map(|a| normalize_ton_address(a, "pool-addr-odd"))
+                let normalized_address = self
+                    .address
+                    .as_deref()
+                    .map(|a| normalize_ton_address(a, "address"))
                     .transpose()?;
 
                 let (mx, mv, mn) = resolve_deploy_pool_params(
@@ -220,18 +209,16 @@ impl PoolAddCmd {
                     self.min_nominator_stake_nano,
                 );
                 let info = format!(
-                    "kind=core validator_share={}, even={}, odd={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
+                    "kind=core validator_share={}, address={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
                     share,
-                    a1.as_deref().unwrap_or("<will be derived>"),
-                    a2.as_deref().unwrap_or("<will be derived>"),
+                    normalized_address.as_deref().unwrap_or("<will be derived>"),
                     mx, mv, mn
                 );
 
                 (
                     PoolConfig::TONCore {
                         validator_share: share,
-                        even_pool_address: a1,
-                        odd_pool_address: a2,
+                        address: normalized_address,
                         max_nominators: self.max_nominators,
                         min_validator_stake: self.min_validator_stake_nano,
                         min_nominator_stake: self.min_nominator_stake_nano,
@@ -349,17 +336,14 @@ async fn collect_pool_views(
                     validator_share: None,
                 });
             }
-            PoolConfig::TONCore { validator_share, even_pool_address, odd_pool_address, .. } => {
-                let mut addrs = Vec::new();
-                addrs.push(even_pool_address.clone().unwrap_or_else(|| "<not deployed>".into()));
-                addrs.push(odd_pool_address.clone().unwrap_or_else(|| "<not deployed>".into()));
+            PoolConfig::TONCore { validator_share, address, .. } => {
                 views.push(PoolView {
                     name: name.clone(),
                     kind: "Core".to_string(),
                     balance: None,
-                    address: None,
+                    address: address.clone(),
                     owner: None,
-                    addresses: Some(addrs),
+                    addresses: None,
                     validator_share: Some(*validator_share),
                 });
             }
@@ -547,22 +531,20 @@ fn resolve_toncore_pool_address(
     match pool_cfg {
         PoolConfig::TONCore {
             validator_share,
-            even_pool_address,
-            odd_pool_address,
+            address,
             max_nominators,
             min_validator_stake,
             min_nominator_stake,
         } => {
-            let resolved = resolve_toncore_pools(
+            let resolved = resolve_toncore_pool(
                 wallet_address,
                 *validator_share,
-                even_pool_address.as_deref(),
-                odd_pool_address.as_deref(),
+                address.as_deref(),
                 max_nominators.as_ref().copied(),
                 min_validator_stake.as_ref().copied(),
                 min_nominator_stake.as_ref().copied(),
             )?;
-            Ok(resolved.even_address)
+            Ok(resolved.address)
         }
         PoolConfig::SNP { .. } => {
             anyhow::bail!("This command is only supported for TONCore pools, not SNP");

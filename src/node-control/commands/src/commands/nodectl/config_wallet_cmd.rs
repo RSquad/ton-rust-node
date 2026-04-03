@@ -25,7 +25,7 @@ use common::{
 };
 use contracts::{
     ElectorWrapper, ElectorWrapperImpl, NominatorWrapperImpl, TonWallet, contract_provider,
-    nominator, resolve_toncore_pools,
+    nominator, resolve_toncore_pool,
 };
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use secrets_vault::{errors::error::VaultError, vault::SecretVault};
@@ -707,22 +707,20 @@ fn resolve_pool_address(
         },
         PoolConfig::TONCore {
             validator_share,
-            even_pool_address,
-            odd_pool_address,
+            address,
             max_nominators,
             min_validator_stake,
             min_nominator_stake,
         } => {
-            let resolved = resolve_toncore_pools(
+            let resolved = resolve_toncore_pool(
                 validator_addr,
                 *validator_share,
-                even_pool_address.as_deref(),
-                odd_pool_address.as_deref(),
+                address.as_deref(),
                 max_nominators.as_ref().copied(),
                 min_validator_stake.as_ref().copied(),
                 min_nominator_stake.as_ref().copied(),
             )?;
-            Ok(resolved.even_address)
+            Ok(resolved.address)
         }
     }
 }

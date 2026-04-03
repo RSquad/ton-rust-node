@@ -271,7 +271,7 @@ mod tests {
     use super::*;
     use crate::runtime_config::RuntimeConfig;
     use common::app_config::{AppConfig, AuthConfig, UserEntry};
-    use contracts::{NodePools, TonWallet};
+    use contracts::{NominatorWrapper, TonWallet};
     use secrets_vault::{
         crypto::{key_material::KeyMaterial, master_key::MasterKey},
         storage::file_json::FileJsonStorage,
@@ -370,7 +370,7 @@ mod tests {
             Arc::new(NoopWallet)
         }
 
-        fn pools(&self) -> Arc<HashMap<String, NodePools>> {
+        fn pools(&self) -> Arc<HashMap<String, Arc<dyn NominatorWrapper>>> {
             Arc::new(HashMap::new())
         }
 

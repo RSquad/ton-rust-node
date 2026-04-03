@@ -45,72 +45,52 @@ pub fn resolve_deploy_pool_params(
     )
 }
 
-/// Resolved even/odd pool addresses (and optionally `StateInit`) for a TONCore config.
-pub struct ResolvedTonCorePools {
+/// Resolved pool address and `StateInit` for a TONCore config.
+pub struct ResolvedTonCorePool {
     pub reward_share: u16,
     pub max_nominators: u16,
     pub min_validator_stake: u64,
     pub min_nominator_stake: u64,
-    pub even_address: MsgAddressInt,
-    pub even_state_init: StateInit,
-    pub odd_address: MsgAddressInt,
-    pub odd_state_init: StateInit,
+    pub address: MsgAddressInt,
+    pub state_init: StateInit,
 }
 
-/// Validate and resolve both even/odd pool addresses from TONCore config fields.
+/// Validate and resolve the pool address from TONCore config fields.
 ///
-/// Resolves deploy-time defaults, calculates deterministic addresses, and — if explicit
-/// addresses are provided — verifies they match the derived ones.
-pub fn resolve_toncore_pools(
+/// Resolves deploy-time defaults, calculates the deterministic address, and — if an explicit
+/// address is provided — verifies it matches the derived one.
+pub fn resolve_toncore_pool(
     validator_addr: &MsgAddressInt,
     validator_share: u16,
-    even_pool_address: Option<&str>,
-    odd_pool_address: Option<&str>,
+    pool_address: Option<&str>,
     max_nominators: Option<u16>,
     min_validator_stake: Option<u64>,
     min_nominator_stake: Option<u64>,
-) -> anyhow::Result<ResolvedTonCorePools> {
+) -> anyhow::Result<ResolvedTonCorePool> {
     let (max_n, min_v, min_n) =
         resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
 
-    let (even_address, even_state_init) =
+    let (address, state_init) =
         NominatorPoolWrapperImpl::calculate_address_with_state_init(
             validator_addr, validator_share, max_n, min_v, min_n,
         )?;
-    if let Some(addr) = even_pool_address {
+    if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
-            .context(format!("invalid TONCore even_pool_address: {addr}"))?;
+            .context(format!("invalid TONCore pool address: {addr}"))?;
         anyhow::ensure!(
-            explicit == even_address,
-            "TONCore even_pool_address ({explicit}) does not match derived address ({even_address})"
+            explicit == address,
+            "TONCore pool address ({explicit}) does not match derived address ({address})"
         );
     }
 
-    let min_v_odd = min_v.saturating_add(1);
-    let (odd_address, odd_state_init) =
-        NominatorPoolWrapperImpl::calculate_address_with_state_init(
-            validator_addr, validator_share, max_n, min_v_odd, min_n,
-        )?;
-    if let Some(addr) = odd_pool_address {
-        let explicit = addr
-            .parse::<MsgAddressInt>()
-            .context(format!("invalid TONCore odd_pool_address: {addr}"))?;
-        anyhow::ensure!(
-            explicit == odd_address,
-            "TONCore odd_pool_address ({explicit}) does not match derived address ({odd_address})"
-        );
-    }
-
-    Ok(ResolvedTonCorePools {
+    Ok(ResolvedTonCorePool {
         reward_share: validator_share,
         max_nominators: max_n,
         min_validator_stake: min_v,
         min_nominator_stake: min_n,
-        even_address,
-        even_state_init,
-        odd_address,
-        odd_state_init,
+        address,
+        state_init,
     })
 }
 
@@ -135,6 +115,15 @@ impl NominatorPoolWrapperImpl {
     /// Wrap an already-deployed pool at the given address.
     pub fn new(provider: Arc<dyn ContractProvider>, pool_addr: MsgAddressInt) -> Self {
         Self { provider, pool_addr, state_init: None }
+    }
+
+    /// Wrap a pool at a known address with a pre-computed `StateInit` (for deployment).
+    pub fn new_with_state_init(
+        provider: Arc<dyn ContractProvider>,
+        pool_addr: MsgAddressInt,
+        state_init: StateInit,
+    ) -> Self {
+        Self { provider, pool_addr, state_init: Some(state_init) }
     }
 
     /// Create a wrapper with deployment data (for pools that are not yet deployed).

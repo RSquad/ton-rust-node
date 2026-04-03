@@ -7,7 +7,6 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::SmartContract;
-use std::sync::Arc;
 use ton_block::{MsgAddressInt, StateInit};
 
 /// Trait for interacting with single-nominator smart contract
@@ -69,31 +68,4 @@ pub struct PoolData {
     pub validator_set_change_time: u64,
     /// Stake held for duration
     pub stake_held_for: u64,
-}
-
-/// Pool wrappers for a single node binding.
-///
-/// - **SNP**: single pool in `even`, `odd` is `None`.
-/// - **TONCore**: `even` for even-round elections, `odd` for odd-round elections.
-#[derive(Clone)]
-pub struct NodePools {
-    pub even: Arc<dyn NominatorWrapper>,
-    pub odd: Option<Arc<dyn NominatorWrapper>>,
-}
-
-impl NodePools {
-    /// Returns the pool that should be used for the given election round.
-    /// For SNP (odd == None) always returns `even`.
-    /// For TONCore selects by `election_id % 2`.
-    pub fn for_election(&self, election_id: u64) -> &Arc<dyn NominatorWrapper> {
-        match &self.odd {
-            Some(odd) if election_id % 2 != 0 => odd,
-            _ => &self.even,
-        }
-    }
-
-    /// Iterates over all pools (1 for SNP, 2 for TONCore).
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn NominatorWrapper>> {
-        std::iter::once(&self.even).chain(self.odd.iter())
-    }
 }

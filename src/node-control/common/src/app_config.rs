@@ -340,14 +340,10 @@ pub enum PoolConfig {
     #[serde(rename = "core")]
     TONCore {
         validator_share: u16,
-        /// Even-round pool address. `None` = not deployed yet (will be derived from validator wallet).
+        /// Pool contract address. `None` = not deployed yet (will be derived from validator wallet).
         #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
-        even_pool_address: Option<String>,
-        /// Odd-round pool address (same params but `min_validator_stake + 1`). `None` = not deployed.
-        #[serde(default)]
-        #[serde(skip_serializing_if = "Option::is_none")]
-        odd_pool_address: Option<String>,
+        address: Option<String>,
         /// Deploy-time pool parameters; if omitted, defaults are applied in `contracts` (`resolve_deploy_pool_params`).
         #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -832,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_config_serde_core_no_addresses() {
+    fn test_pool_config_serde_core_no_address() {
         let value = serde_json::json!({
             "kind": "core",
             "validator_share": 50,
@@ -842,8 +838,7 @@ mod tests {
             cfg,
             PoolConfig::TONCore {
                 validator_share: 50,
-                even_pool_address: None,
-                odd_pool_address: None,
+                address: None,
                 max_nominators: None,
                 min_validator_stake: None,
                 min_nominator_stake: None,
@@ -853,19 +848,16 @@ mod tests {
         let json = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["kind"], "core");
         assert_eq!(json["validator_share"], 50);
-        assert!(json.get("even_pool_address").is_none());
-        assert!(json.get("odd_pool_address").is_none());
+        assert!(json.get("address").is_none());
     }
 
     #[test]
-    fn test_pool_config_serde_core_with_addresses() {
+    fn test_pool_config_serde_core_with_address() {
         let addr1 = ADDR;
-        let addr2 = OWNER;
         let value = serde_json::json!({
             "kind": "core",
             "validator_share": 100,
-            "even_pool_address": addr1.to_string(),
-            "odd_pool_address": addr2.to_string(),
+            "address": addr1.to_string(),
             "max_nominators": 10,
             "min_validator_stake": 5_000_000_000_000u64,
             "min_nominator_stake": 1_000_000_000_000u64,
@@ -875,8 +867,7 @@ mod tests {
             cfg,
             PoolConfig::TONCore {
                 validator_share: 100,
-                even_pool_address: Some(addr1.to_string()),
-                odd_pool_address: Some(addr2.to_string()),
+                address: Some(addr1.to_string()),
                 max_nominators: Some(10),
                 min_validator_stake: Some(5_000_000_000_000),
                 min_nominator_stake: Some(1_000_000_000_000),
