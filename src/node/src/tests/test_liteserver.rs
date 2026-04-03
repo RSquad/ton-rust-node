@@ -1868,7 +1868,11 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
 
     // prev_blocks: zerostate(0), regular(2), key(5), regular(15)
     let mut prev_blocks = OldMcBlocksInfo::default();
-    let mut add_block = |seq_no: u32, key: bool, rh: Option<UInt256>, fh: Option<UInt256>| {
+    let add_block = |prev_blocks: &mut OldMcBlocksInfo,
+                     seq_no: u32,
+                     key: bool,
+                     rh: Option<UInt256>,
+                     fh: Option<UInt256>| {
         let rh = rh.unwrap_or(UInt256::from([seq_no as u8; 32]));
         let fh = fh.unwrap_or(UInt256::from([seq_no as u8 | 0x80; 32]));
         prev_blocks.set_augmentable(
@@ -1884,21 +1888,15 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
             },
         )
     };
-    add_block(0, false, None, None)?;
-    add_block(2, false, None, None)?;
-    add_block(5, true, Some(key_block_id.root_hash.clone()), Some(key_block_id.file_hash.clone()))?;
-    add_block(15, false, None, None)?;
+    add_block(&mut prev_blocks, 0, false, None, None)?;
+    add_block(&mut prev_blocks, 2, false, None, None)?;
 
-    let state_id = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        20,
-        UInt256::from([0x11; 32]),
-        UInt256::from([0x22; 32]),
-    );
+    // Last known state is key block state
     let state = gen_master_state(
         GenMasterStateParams {
-            master_state_id: Some(state_id.clone()),
-            prev_blocks: Some(prev_blocks),
+            master_state_id: Some(key_block_id.clone()),
+            prev_blocks: Some(prev_blocks.clone()),
+            after_key_block: true,
             ..Default::default()
         },
         #[cfg(feature = "telemetry")]
@@ -1907,19 +1905,11 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
     );
 
     let mut engine = LiteServerTestEngine::new().await;
-    engine.add_mock_block_with_handle(key_block_id.clone(), key_block_data).await?;
-    engine.add_ready_state(state_id.clone(), state);
-    engine.set_last_mc_block_id(state_id);
+    engine.add_mock_block_with_handle(key_block_id.clone(), key_block_data.clone()).await?;
+    engine.set_last_mc_block_id(state.block_id().clone());
+    engine.add_ready_state(state.block_id().clone(), state);
     let engine = Arc::new(engine);
 
-    let mc_id = |seq_no: u32| {
-        BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            seq_no,
-            UInt256::from([seq_no as u8; 32]),
-            UInt256::from([seq_no as u8 | 0x80; 32]),
-        )
-    };
     let get_cfg = |engine: &Arc<LiteServerTestEngine>, id: BlockIdExt| {
         let engine = engine.clone() as Arc<dyn EngineOperations>;
         async move {
@@ -1933,6 +1923,47 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
         }
     };
 
+    // Key block → should resolve to itself
+    let result = get_cfg(&engine, key_block_id.clone()).await?;
+    assert_eq!(result.id, key_block_id);
+
+    // Add blocks after key block
+    add_block(
+        &mut prev_blocks,
+        5,
+        true,
+        Some(key_block_id.root_hash.clone()),
+        Some(key_block_id.file_hash.clone()),
+    )?;
+    add_block(&mut prev_blocks, 15, false, None, None)?;
+
+    let mc_id = |seq_no: u32| {
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq_no,
+            UInt256::from([seq_no as u8; 32]),
+            UInt256::from([seq_no as u8 | 0x80; 32]),
+        )
+    };
+
+    let state_id = mc_id(20);
+    let state = gen_master_state(
+        GenMasterStateParams {
+            master_state_id: Some(state_id.clone()),
+            prev_blocks: Some(prev_blocks),
+            ..Default::default()
+        },
+        #[cfg(feature = "telemetry")]
+        None,
+        None,
+    );
+
+    let mut engine = LiteServerTestEngine::new().await;
+    engine.add_mock_block_with_handle(key_block_id.clone(), key_block_data).await?;
+    engine.set_last_mc_block_id(state.block_id().clone());
+    engine.add_ready_state(state.block_id().clone(), state);
+    let engine = Arc::new(engine);
+
     // Block after key block → should resolve to key block at seqno 5
     let result = get_cfg(&engine, mc_id(15)).await?;
     assert_eq!(result.id.seq_no(), 5);
@@ -1940,6 +1971,14 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
     assert!(result.state_proof.is_empty());
     assert!(!result.config_proof.is_empty());
     assert_eq!(result.mode, CFG_FROM_PREV_KEY_BLOCK);
+
+    // Last known block → the same
+    let result = get_cfg(&engine, state_id).await?;
+    assert_eq!(result.id.seq_no(), 5);
+
+    // Key block → should resolve to itself
+    let result = get_cfg(&engine, key_block_id.clone()).await?;
+    assert_eq!(result.id, key_block_id);
 
     // Block before key block → no previous key block, must fail
     assert!(dbg!(get_cfg(&engine, mc_id(2)).await).is_err(), "no key block before seqno 2");

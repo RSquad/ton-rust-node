@@ -2299,7 +2299,11 @@ impl LiteServerQuerySubscriber {
         }
         let state = engine.load_state(&last_block_id).await?;
         let extra = state.shard_state_extra()?;
-        extra.prev_blocks.check_block(id)?;
+        if id != last_block_id.as_ref() {
+            extra.prev_blocks.check_block(id)?;
+        } else if state.shard_state_extra()?.after_key_block {
+            return Ok(last_block_id.as_ref().clone());
+        }
 
         if let Some(prev_key) = extra.prev_blocks.get_prev_key_block(id.seq_no)? {
             return Ok(prev_key.master_block_id().1);

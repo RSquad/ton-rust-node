@@ -345,6 +345,7 @@ pub struct GenMasterStateParams<'a> {
     pub accounts: &'a [&'a Account],
     pub libraries: Libraries,
     pub prev_blocks: Option<OldMcBlocksInfo>,
+    pub after_key_block: bool,
 }
 
 impl Default for GenMasterStateParams<'_> {
@@ -356,6 +357,7 @@ impl Default for GenMasterStateParams<'_> {
             accounts: &[],
             libraries: Libraries::default(),
             prev_blocks: None,
+            after_key_block: false,
         }
     }
 }
@@ -391,6 +393,7 @@ pub fn gen_master_state(
     if let Some(prev_blocks) = params.prev_blocks {
         ms.prev_blocks = prev_blocks;
     }
+    ms.after_key_block = params.after_key_block;
     if let Some(shard_state_id) = params.shard_state_id {
         ms.shards
             .add_workchain(0, 0, shard_state_id.root_hash.clone(), shard_state_id.file_hash.clone())
