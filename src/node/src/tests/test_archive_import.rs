@@ -41,9 +41,22 @@ const WC_ZEROSTATE_PATH: &str =
     "src/tests/static/EE0BEDFE4B32761FB35E9E1D8818EA720CAD1A0E7B4D2ED673C488E72E910342.boc";
 const GLOBAL_CONFIG_PATH: &str = "src/tests/config/mainnet.json";
 
-fn import_config(dir: &Path) -> ImportConfig {
+/// Copy archive files to a temporary directory, restoring colons in filenames
+/// (files are stored with underscores to avoid issues on Windows).
+fn prepare_archives(dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(ARCHIVES_PATH)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let restored_name = name.replacen("0_8000000000000000", "0:8000000000000000", 1);
+        std::fs::copy(entry.path(), dest.join(restored_name))?;
+    }
+    Ok(())
+}
+
+fn import_config(dir: &Path, archives_path: PathBuf) -> ImportConfig {
     ImportConfig {
-        archives_path: PathBuf::from(ARCHIVES_PATH),
+        archives_path,
         epochs_path: dir.join("epochs"),
         epoch_size: 20_000,
         node_db_path: dir.join("node_db"),
@@ -133,7 +146,9 @@ async fn check_imported_block(
 async fn test_import_and_verify() -> Result<()> {
     init_test_log();
     let dir = tempfile::tempdir().unwrap();
-    let config = import_config(dir.path());
+    let archives = dir.path().join("archives");
+    prepare_archives(&archives).unwrap();
+    let config = import_config(dir.path(), archives);
 
     run_import(config).await?;
 
@@ -180,11 +195,14 @@ async fn test_import_and_verify() -> Result<()> {
 async fn test_import_resume() -> Result<()> {
     init_test_log();
     let dir = tempfile::tempdir().unwrap();
+    let all_archives = dir.path().join("archives");
+    prepare_archives(&all_archives).unwrap();
+
     let partial_archives = dir.path().join("partial");
     std::fs::create_dir_all(&partial_archives)?;
 
     // Copy only the first group (archive.00000.*)
-    for entry in std::fs::read_dir(ARCHIVES_PATH)? {
+    for entry in std::fs::read_dir(&all_archives)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with("archive.00000.") {
@@ -215,7 +233,7 @@ async fn test_import_resume() -> Result<()> {
     drop(db1);
 
     // Copy remaining files for second import
-    for entry in std::fs::read_dir(ARCHIVES_PATH)? {
+    for entry in std::fs::read_dir(&all_archives)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.starts_with("archive.00000.") {
@@ -250,7 +268,9 @@ async fn test_import_resume() -> Result<()> {
 async fn test_import_skip_validation() -> Result<()> {
     init_test_log();
     let dir = tempfile::tempdir().unwrap();
-    let mut config = import_config(dir.path());
+    let archives = dir.path().join("archives");
+    prepare_archives(&archives).unwrap();
+    let mut config = import_config(dir.path(), archives);
     config.skip_validation = true;
 
     run_import(config).await?;
