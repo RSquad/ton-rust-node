@@ -299,10 +299,12 @@ impl DeployPoolCmd {
 
         let (config, vault, rpc_client) =
             load_config_vault_rpc_client(Path::new(&self.config)).await.map_err(set_err)?;
+        let wallet_name =
+            config.bindings.get(&self.node).map(|b| b.wallet.as_str()).unwrap_or(&self.node);
         let wallet_cfg = config
             .wallets
-            .get(&self.node)
-            .ok_or_else(|| anyhow::anyhow!("Wallet '{}' not found", &self.node))
+            .get(wallet_name)
+            .ok_or_else(|| anyhow::anyhow!("Wallet '{}' not found", wallet_name))
             .map_err(set_err)?;
 
         if self.verbose {

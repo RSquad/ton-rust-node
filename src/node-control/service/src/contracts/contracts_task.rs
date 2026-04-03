@@ -9,7 +9,10 @@
 use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
-use contracts::{NodePools, NominatorWrapper, TonWallet, contract_provider};
+use contracts::{
+    NodePools, NominatorWrapper, TonWallet, contract_provider,
+    ton_core_nominator::messages as tc_messages,
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -92,6 +95,9 @@ impl ContractsMonitor {
             return Ok(());
         }
         if !self.ensure_wallet_balances(&mut seqno).await? {
+            return Ok(());
+        }
+        if !self.ensure_pool_validator_sets_updated(&mut seqno).await? {
             return Ok(());
         }
         tracing::info!(target: "contracts", "all contracts are ready");
@@ -328,6 +334,9 @@ impl ContractsMonitor {
     }
 
     /// Step 4: Top up active wallets whose balance is below the minimum threshold.
+    ///
+    /// Step 5 (`ensure_pool_validator_sets_updated`) depends on the pools being
+    /// deployed and wallets funded, so this step runs first.
     async fn ensure_wallet_balances(&self, seqno: &mut i64) -> anyhow::Result<bool> {
         let mut all_topped_up = true;
         let mut processed_wallets = HashSet::new();
@@ -401,6 +410,75 @@ impl ContractsMonitor {
             }
         }
         Ok(all_topped_up)
+    }
+
+    /// Step 5: Send `update_validator_set` (opcode 6) to TonCore pool controllers
+    /// that are in staking state (state == 2) but haven't detected enough validator
+    /// set changes for recovery.
+    ///
+    /// The TonCore pool contract tracks the on-chain validator set hash
+    /// (config param 34) and increments an internal counter each time it changes.
+    /// Recovery is only allowed once `validator_set_changes_count >= 2`.
+    /// Without this step, the counter stays at 0 and recovery is permanently blocked.
+    async fn ensure_pool_validator_sets_updated(&self, seqno: &mut i64) -> anyhow::Result<bool> {
+        let mut all_updated = true;
+        tracing::info!(
+            target: "contracts",
+            "ensure_pool_validator_sets_updated: checking {} nodes",
+            self.pools.len()
+        );
+        for (node_id, node_pools) in self.pools.iter() {
+            for pool in node_pools.all() {
+                let pool_data = match pool.get_pool_data().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "contracts",
+                            "[{}] get_pool_data error (skipping update_validator_set): pool={} {:#}",
+                            node_id, pool.address(), e
+                        );
+                        continue;
+                    }
+                };
+
+                tracing::info!(
+                    target: "contracts",
+                    "[{}] pool={} state={} vsc_count={}",
+                    node_id, pool.address(), pool_data.state, pool_data.validator_set_changes_count
+                );
+
+                if pool_data.state != 2 || pool_data.validator_set_changes_count >= 2 {
+                    continue;
+                }
+
+                tracing::info!(
+                    target: "contracts",
+                    "[{}] update_validator_set: pool={}, state={}, vsc_count={}",
+                    node_id,
+                    pool.address(),
+                    pool_data.state,
+                    pool_data.validator_set_changes_count,
+                );
+
+                let body = tc_messages::update_validator_set(0)?;
+                let msg = self
+                    .master_wallet
+                    .build_message(
+                        pool.address(),
+                        WALLET_GAS,
+                        body,
+                        true,
+                        Some(u32::try_from(*seqno)?),
+                        None,
+                        None,
+                    )
+                    .await?;
+                self.broadcast(&msg).await?;
+                *seqno += 1;
+                all_updated = false;
+            }
+        }
+        Ok(all_updated)
     }
 }
 

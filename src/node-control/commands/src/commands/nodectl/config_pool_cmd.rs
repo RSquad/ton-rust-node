@@ -304,6 +304,8 @@ struct PoolView {
     #[serde(skip_serializing_if = "Option::is_none")]
     addresses: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    balances: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     validator_share: Option<u16>,
 }
 
@@ -392,31 +394,89 @@ async fn collect_pool_views(
                     address: addr_result.ok(),
                     owner: display_owner,
                     addresses: None,
+                    balances: None,
                     validator_share: None,
                 });
             }
             PoolConfig::TONCore { validator_share, address, .. } => {
+                let resolved_addr = if address.is_some() {
+                    address.clone()
+                } else {
+                    resolve_toncore_pool_address_via_binding(
+                        name,
+                        pool,
+                        config,
+                        &mut vault,
+                        warn_on_error,
+                    )
+                    .await
+                    .ok()
+                };
+
+                let balance_result = if let Some(ref addr_str) = resolved_addr {
+                    resolve_pool_balance(&Ok(addr_str.clone()), rpc_client).await.ok()
+                } else {
+                    None
+                };
+
                 views.push(PoolView {
                     name: name.clone(),
                     kind: "Core".to_string(),
-                    balance: None,
-                    address: address.clone(),
+                    balance: balance_result,
+                    address: resolved_addr,
                     owner: None,
                     addresses: None,
+                    balances: None,
                     validator_share: Some(*validator_share),
                 });
             }
             PoolConfig::TONCoreRouter { validator_share, addresses, .. } => {
-                let addrs = addresses.as_ref().map(|a| {
-                    a.iter().map(|o| o.clone().unwrap_or_else(|| "<not deployed>".into())).collect()
-                });
+                let has_stored = addresses.as_ref().is_some_and(|a| a.iter().any(|o| o.is_some()));
+
+                let resolved_addrs = if has_stored {
+                    addresses.as_ref().map(|a| {
+                        a.iter()
+                            .map(|o| o.clone().unwrap_or_else(|| "<not deployed>".into()))
+                            .collect()
+                    })
+                } else {
+                    resolve_toncore_router_addresses_via_binding(
+                        name,
+                        pool,
+                        config,
+                        &mut vault,
+                        warn_on_error,
+                    )
+                    .await
+                    .ok()
+                };
+
+                let pool_balances =
+                    if let (Some(addrs), Some(client)) = (&resolved_addrs, rpc_client) {
+                        let mut bals = Vec::new();
+                        for addr_str in addrs {
+                            if let Ok(addr) = MsgAddressInt::from_str(addr_str) {
+                                match client.get_address_information(&addr).await {
+                                    Ok(info) => bals.push(display_tons(info.balance)),
+                                    Err(_) => bals.push("-".to_string()),
+                                }
+                            } else {
+                                bals.push("-".to_string());
+                            }
+                        }
+                        Some(bals)
+                    } else {
+                        None
+                    };
+
                 views.push(PoolView {
                     name: name.clone(),
                     kind: "Router".to_string(),
                     balance: None,
                     address: None,
                     owner: None,
-                    addresses: addrs,
+                    addresses: resolved_addrs,
+                    balances: pool_balances,
                     validator_share: Some(*validator_share),
                 });
             }
@@ -459,10 +519,11 @@ fn print_pools_table(views: &[PoolView]) {
             }
             "Core" => {
                 let display_addr = v.address.as_deref().unwrap_or("<not deployed>");
-                let share = v.validator_share.map(|s| s.to_string()).unwrap_or_default();
+                let display_balance =
+                    v.balance.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
                 println!(
-                    "  {:<15} {:<6} {:<14} {:<50} share={}",
-                    v.name, "Core", "-", display_addr, share,
+                    "  {:<15} {:<6} {:<14} {:<50} {}",
+                    v.name, "Core", display_balance, display_addr, "-",
                 );
             }
             "Router" => {
@@ -471,11 +532,9 @@ fn print_pools_table(views: &[PoolView]) {
                     .as_deref()
                     .map(|a| a.join(", "))
                     .unwrap_or_else(|| "<not deployed>".into());
-                let share = v.validator_share.map(|s| s.to_string()).unwrap_or_default();
-                println!(
-                    "  {:<15} {:<6} {:<14} {:<50} share={}",
-                    v.name, "Router", "-", addrs, share,
-                );
+                let display_balance =
+                    v.balances.as_deref().map(|b| b.join(" | ")).unwrap_or_else(|| "-".into());
+                println!("  {:<15} {:<8} {:<28} {}", v.name, "Router", display_balance, addrs,);
             }
             _ => {}
         }
@@ -563,6 +622,122 @@ async fn resolve_pool_address(
         .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
         .map_err(|_| "failed to convert address to string")?;
     Ok(addr_str)
+}
+
+async fn resolve_validator_addr_via_binding(
+    pool_name: &str,
+    config: &AppConfig,
+    vault: &mut Option<Option<Arc<SecretVault>>>,
+    warn_on_error: bool,
+) -> Result<MsgAddressInt, String> {
+    if vault.is_none() {
+        *vault = Some(match SecretVaultBuilder::from_env().await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                if warn_on_error {
+                    println!(
+                        "{}: {}",
+                        "Warning: failed to initialize secret vault".yellow(),
+                        e.to_string().yellow()
+                    );
+                }
+                None
+            }
+        });
+    }
+    let vault_arc = vault.as_ref().and_then(|v| v.clone()).ok_or("vault unavailable")?;
+
+    let mut matching: Vec<_> =
+        config.bindings.iter().filter(|(_, b)| b.pool.as_deref() == Some(pool_name)).collect();
+    if matching.is_empty() {
+        return Err("no binding found".to_string());
+    }
+    matching.sort_by_key(|(k, b)| (!b.enable, k.as_str()));
+    let (_, binding) = matching[0];
+
+    let wallet_cfg = config.wallets.get(&binding.wallet).ok_or("wallet not configured")?;
+    let secret =
+        wallet_cfg.key.read_secret(Some(vault_arc)).await.map_err(|_| "get wallet key error")?;
+    let keypair = secret.as_keypair().map_err(|_| "wallet key is not a keypair")?;
+    let pub_key = keypair
+        .public_key()
+        .await
+        .map_err(|_| "get public key error")?
+        .ok_or("empty public key")?;
+    calculate_wallet_address(wallet_cfg, &pub_key)
+        .map_err(|_| "address calculation error".to_string())
+}
+
+async fn resolve_toncore_pool_address_via_binding(
+    pool_name: &str,
+    pool: &PoolConfig,
+    config: &AppConfig,
+    vault: &mut Option<Option<Arc<SecretVault>>>,
+    warn_on_error: bool,
+) -> Result<String, String> {
+    let PoolConfig::TONCore {
+        validator_share,
+        max_nominators,
+        min_validator_stake,
+        min_nominator_stake,
+        ..
+    } = pool
+    else {
+        return Err("not a TONCore pool".into());
+    };
+    let wallet_addr =
+        resolve_validator_addr_via_binding(pool_name, config, vault, warn_on_error).await?;
+    let resolved = resolve_toncore_pool(
+        &wallet_addr,
+        *validator_share,
+        None,
+        max_nominators.as_ref().copied(),
+        min_validator_stake.as_ref().copied(),
+        min_nominator_stake.as_ref().copied(),
+    )
+    .map_err(|e| format!("resolve error: {e}"))?;
+    resolved
+        .address
+        .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
+        .map_err(|_| "address conversion error".into())
+}
+
+async fn resolve_toncore_router_addresses_via_binding(
+    pool_name: &str,
+    pool: &PoolConfig,
+    config: &AppConfig,
+    vault: &mut Option<Option<Arc<SecretVault>>>,
+    warn_on_error: bool,
+) -> Result<Vec<String>, String> {
+    let PoolConfig::TONCoreRouter {
+        validator_share,
+        max_nominators,
+        min_validator_stake,
+        min_nominator_stake,
+        ..
+    } = pool
+    else {
+        return Err("not a TONCoreRouter pool".into());
+    };
+    let wallet_addr =
+        resolve_validator_addr_via_binding(pool_name, config, vault, warn_on_error).await?;
+    let resolved = resolve_toncore_router(
+        &wallet_addr,
+        *validator_share,
+        None,
+        max_nominators.as_ref().copied(),
+        min_validator_stake.as_ref().copied(),
+        min_nominator_stake.as_ref().copied(),
+    )
+    .map_err(|e| format!("resolve error: {e}"))?;
+    resolved
+        .iter()
+        .map(|r| {
+            r.address
+                .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
+                .map_err(|_| "address conversion error".to_string())
+        })
+        .collect()
 }
 
 fn normalize_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<String> {
