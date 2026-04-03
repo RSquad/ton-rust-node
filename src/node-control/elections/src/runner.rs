@@ -581,7 +581,31 @@ impl ElectionRunner {
             node.accepted_stake_amount = None;
             node.submission_time = None;
             node.stake_submissions.clear();
-            node.participant = participant.clone();
+            let wallet_addr = node.wallet_addr();
+            node.participant = match (participant.as_ref(), validator_key.as_ref()) {
+                (Some(p), _) => Some(p.clone()),
+                (None, Some(v)) => {
+                    let adnl_addr = v
+                        .adnl_addr()
+                        .ok_or_else(|| anyhow::anyhow!("validator has no adnl address"))?;
+                    if adnl_addr.is_empty() {
+                        anyhow::bail!("validator adnl address is empty");
+                    }
+                    if v.public_key.is_empty() {
+                        anyhow::bail!("validator public key is empty");
+                    }
+                    Some(Participant {
+                        stake_message_boc: None,
+                        pub_key: v.public_key.clone(),
+                        adnl_addr,
+                        election_id,
+                        wallet_addr,
+                        stake: 0,
+                        max_factor,
+                    })
+                }
+                (None, None) => None
+            };
             node.key_id =
                 validator_key.as_ref().map(|entry| entry.key_id.clone()).unwrap_or_default();
         }
