@@ -3930,17 +3930,17 @@ impl Collator {
         let mut value_flow = collator_data.value_flow.clone();
         value_flow.imported = collator_data.in_msgs.root_extra().value_imported.clone();
         value_flow.exported = collator_data.out_msgs.root_extra().clone();
-        value_flow.fees_collected = accounts.root_extra().clone();
-        value_flow.fees_collected.coins.add(&collator_data.in_msgs.root_extra().fees_collected)?;
+        let mut total_fees = accounts.root_extra().clone();
+        total_fees.coins.add(&collator_data.in_msgs.root_extra().fees_collected)?;
+
+        value_flow.fees_collected.add(&total_fees)?;
         if self.shard.is_masterchain() {
             if let Some(burning_cfg) = collator_data.config.burning_config() {
-                let burned =
-                    burning_cfg.calculate_burned_fees(value_flow.fees_collected.coins.as_u128())?;
+                let burned = burning_cfg.calculate_burned_fees(total_fees.coins.as_u128())?;
                 value_flow.fees_collected.coins.sub(&burned)?;
                 value_flow.burned.coins.add(&burned)?;
             }
         }
-        value_flow.fees_collected.add(&value_flow.fees_imported)?;
         value_flow.fees_collected.add(&value_flow.created)?;
         value_flow.to_next_blk = new_accounts.full_balance().clone();
         //value_flow.to_next_blk.add(&value_flow.recovered)?;
