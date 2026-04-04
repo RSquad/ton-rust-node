@@ -30,10 +30,9 @@ use crate::{
     },
 };
 use std::{
-    cmp::{max, min},
+    cmp::max,
     collections::{HashMap, HashSet},
     convert::TryFrom,
-    fs,
     ops::RangeInclusive,
     sync::{atomic::Ordering, Arc},
     time::{Duration, SystemTime},
@@ -77,6 +76,16 @@ fn format_duration_short(d: Duration) -> String {
         format!("{}m{}s", secs / 60, secs % 60)
     } else {
         format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn validation_state_phase_label(status: ValidatorGroupStatus) -> &'static str {
+    match status {
+        ValidatorGroupStatus::Created | ValidatorGroupStatus::EngineCreated => "pre-start",
+        ValidatorGroupStatus::Sync => "pre-commit",
+        ValidatorGroupStatus::Active => "post-commit",
+        ValidatorGroupStatus::Stopping => "stopping",
+        ValidatorGroupStatus::Stopped => "stopped",
     }
 }
 
@@ -492,49 +501,25 @@ fn get_session_options(
     result
 }
 
-async fn clear_catchains_cache(path_str: String) -> Result<()> {
-    log::info!(target: "validator_manager", "Clearing catchains cache...");
-    let removed = tokio::task::spawn_blocking(move || -> Result<u32> {
-        let entries = fs::read_dir(path_str)?;
-        let mut removed = 0;
-        for entry in entries {
-            let path = entry?.path();
-            if path.is_dir() {
-                if let Err(err) = fs::remove_dir_all(path.clone()) {
-                    log::warn!("Error clearing catchains cache {}: {}", path.display(), err);
-                } else {
-                    removed += 1;
-                }
-            }
-        }
-        Ok(removed)
-    })
-    .await??;
-    log::info!(target: "validator_manager", "Cleared catchains cache, removed {} entries", removed);
-    Ok(())
-}
-
 #[repr(u8)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum ValidationStatus {
     Disabled = 0,
     Waiting = 1,
-    Countdown = 2,
-    Active = 3,
+    Active = 2,
 }
 
 impl ValidationStatus {
     fn allows_validate(&self) -> bool {
         match self {
             Self::Disabled | Self::Waiting => false,
-            Self::Countdown | Self::Active => true,
+            Self::Active => true,
         }
     }
     pub fn from_u8(value: u8) -> Self {
         match value {
             1 => ValidationStatus::Waiting,
-            2 => ValidationStatus::Countdown,
-            3 => ValidationStatus::Active,
+            2 => ValidationStatus::Active,
             _ => ValidationStatus::Disabled,
         }
     }
@@ -641,7 +626,7 @@ struct ValidatorManagerImpl {
     /// Persisted in the validator-state DB and cleared when `rotate_all_shards()` returns
     /// true, matching the C++ lifecycle around init-block updates.
     destroyed_sessions: HashSet<UInt256>,
-    /// Set to `true` once `check_sync()` succeeds, enabling `Waiting -> Countdown`.
+    /// Set to `true` once `check_sync()` succeeds, enabling `Waiting -> Active`.
     sync_complete: bool,
     /// Wall-clock timestamp of the last full metrics dump.
     last_metrics_dump: tokio::time::Instant,
@@ -829,9 +814,7 @@ impl ValidatorManagerImpl {
         for group in self.current_sessions.values().chain(self.future_sessions.values()) {
             if group.shard() == shard {
                 match group.get_status().await {
-                    ValidatorGroupStatus::Sync
-                    | ValidatorGroupStatus::Active
-                    | ValidatorGroupStatus::Countdown { .. } => return true,
+                    ValidatorGroupStatus::Sync | ValidatorGroupStatus::Active => return true,
                     _ => (),
                 }
             }
@@ -1267,7 +1250,7 @@ impl ValidatorManagerImpl {
                     }
                 }
 
-                // Phase 2: transition Waiting -> Countdown/Active.
+                // Phase 2: transition Waiting -> Active.
                 // C++ parity: allow_validate_ is set purely from
                 // rotated_all_shards() || seqno==0 plus the fork check
                 // (manager.cpp update_shards).  sync_complete (started_)
@@ -1276,48 +1259,22 @@ impl ValidatorManagerImpl {
                 let rotated =
                     rotate_all_shards(mc_state_extra) || last_masterchain_block.seq_no == 0;
                 if rotated && later_than_hardfork {
-                    if last_masterchain_block.seq_no == 0 && self.config.no_countdown_for_zerostate
-                    {
-                        log::info!(target: "validator_manager",
-                            "VALIDATION_STATUS: Waiting -> Active (zerostate, no countdown)");
-                        self.engine.set_validation_status(ValidationStatus::Active);
-                    } else {
-                        log::info!(target: "validator_manager",
-                            "VALIDATION_STATUS: Waiting -> Countdown \
-                             (rotated_all_shards={}, mc_seqno={}, sync_complete={})",
-                            rotate_all_shards(mc_state_extra),
-                            last_masterchain_block.seq_no,
-                            self.sync_complete);
-                        self.engine.set_validation_status(ValidationStatus::Countdown);
-                    }
+                    let bootstrap = last_masterchain_block.seq_no == 0;
+                    log::info!(target: "validator_manager",
+                        "VALIDATION_STATUS: Waiting -> Active \
+                         (rotated_all_shards={}, mc_seqno={}, sync_complete={}, bootstrap={}, \
+                         no_countdown_for_zerostate={})",
+                        rotate_all_shards(mc_state_extra),
+                        last_masterchain_block.seq_no,
+                        self.sync_complete,
+                        bootstrap,
+                        self.config.no_countdown_for_zerostate);
+                    self.engine.set_validation_status(ValidationStatus::Active);
                 } else if !rotated {
                     log::trace!(target: "validator_manager",
                         "update_validation_status: rotated_all_shards=false, \
-                         deferring Waiting -> Countdown (mc_seqno={})",
+                         deferring Waiting -> Active (mc_seqno={})",
                         last_masterchain_block.seq_no);
-                }
-            }
-            ValidationStatus::Countdown => {
-                // C++ parity: transition only after a session has genuinely accepted
-                // a committed block (ValidatorGroupStatus::Active), not merely
-                // entered Sync. Combined with the deferred Sync->Active in
-                // on_block_committed(), this prevents false-positive activation
-                // from stale or duplicate commit events.
-                for (_, group) in self.current_sessions.iter() {
-                    let status = group.get_status().await;
-                    if status == ValidatorGroupStatus::Active {
-                        let path_str: String = self.engine.db_root_dir()?.to_owned() + "/catchains";
-                        tokio::spawn(async move {
-                            if let Err(err) = clear_catchains_cache(path_str).await {
-                                log::warn!("Error clearing catchains cache: {}", err);
-                            }
-                        });
-                        log::info!(target: "validator_manager",
-                            "VALIDATION_STATUS: Countdown -> Active (session shard={} reached {})",
-                            group.shard(), status);
-                        self.engine.set_validation_status(ValidationStatus::Active);
-                        break;
-                    }
                 }
             }
             ValidationStatus::Disabled | ValidationStatus::Active => {}
@@ -1364,7 +1321,7 @@ impl ValidatorManagerImpl {
         self.engine.set_will_validate(true);
         let current = self.engine.validation_status();
         // C++ parity: enable_validation() only ensures we are at least
-        // Waiting.  The Waiting -> Countdown promotion is handled by
+        // Waiting. The Waiting -> Active promotion is handled by
         // update_validation_status() based on rotated_all_shards(),
         // matching C++'s allow_validate_ which is independent of sync.
         let target = max(current, ValidationStatus::Waiting);
@@ -1414,17 +1371,7 @@ impl ValidatorManagerImpl {
         };
         let full_validator_set = mc_state_extra.config.validator_set()?;
 
-        let validation_status = self.engine.validation_status();
         let catchain_config = self.read_catchain_config(mc_state)?;
-        let group_start_status = if validation_status == ValidationStatus::Countdown {
-            let session_lifetime =
-                min(catchain_config.mc_catchain_lifetime, catchain_config.shard_catchain_lifetime);
-            let start_at =
-                tokio::time::Instant::now() + Duration::from_secs((session_lifetime / 2).into());
-            ValidatorGroupStatus::Countdown { start_at }
-        } else {
-            ValidatorGroupStatus::Sync
-        };
 
         let do_unsafe_catchain_rotate = self
             .config
@@ -1586,15 +1533,14 @@ impl ValidatorManagerImpl {
                 };
 
                 let session_status = session.get_status().await;
-                if session.try_prepare_start(group_start_status).await? {
+                if session.try_prepare_start().await? {
                     log::trace!(
                         target: "validator_manager",
                         "Current shard {ident}, session {session_id:x}: starting"
                     );
 
                     session
-                        .start_with_status(
-                            group_start_status,
+                        .start_session(
                             prev.get_prevs().to_vec(),
                             last_masterchain_block.clone(),
                             SystemTime::UNIX_EPOCH + Duration::from_secs(mc_now as u64),
@@ -2125,21 +2071,20 @@ impl ValidatorManagerImpl {
             log::warn!(target: "validator_manager",
                 "HEALTH_CHECK: {} session(s) stalled (validation queue inactive)", stalled_count);
         }
-        if in_current_set
-            && self.current_sessions.is_empty()
-            && validation_status >= ValidationStatus::Countdown
+        if in_current_set && self.current_sessions.is_empty() && validation_status.allows_validate()
         {
             log::warn!(target: "validator_manager",
                 "HEALTH_CHECK: node is in current validator set but has no current sessions \
                  (validation_status={:?})", validation_status);
         }
-        if validation_status == ValidationStatus::Countdown {
-            let has_active_or_sync = state_counts.get("active").copied().unwrap_or(0) > 0
-                || state_counts.get("sync").copied().unwrap_or(0) > 0;
-            if !has_active_or_sync && !self.current_sessions.is_empty() {
+        if validation_status.allows_validate() {
+            let sync_count = state_counts.get("sync").copied().unwrap_or(0);
+            let active_count = state_counts.get("active").copied().unwrap_or(0);
+            if sync_count == 0 && active_count == 0 && !self.current_sessions.is_empty() {
                 log::warn!(target: "validator_manager",
-                    "HEALTH_CHECK: validation_status=Countdown but no session reached sync/active \
-                     (possible TN-1050 regression)");
+                    "HEALTH_CHECK: validation enabled but no current session reached sync yet \
+                     (possible startup/session-start regression, validation_status={:?})",
+                    validation_status);
             }
         }
 
@@ -2314,24 +2259,19 @@ impl ValidatorManagerImpl {
                 let age = now.duration_since(snap.created_at).unwrap_or_default();
                 let val_ago = format_time_ago(now_unix, *last_val);
                 let col_ago = format_time_ago(now_unix, *last_col);
-                let countdown_str = match snap.status {
-                    ValidatorGroupStatus::Countdown { start_at } => {
-                        let remaining =
-                            start_at.saturating_duration_since(tokio::time::Instant::now());
-                        format!("countdown({}s)", remaining.as_secs())
-                    }
-                    _ => format!("{}", snap.status),
-                };
+                let status_str = format!("{}", snap.status);
                 let last_mc =
                     snap.last_accepted_mc_seqno.map_or("-".to_string(), |s| s.to_string());
+                let phase_str = validation_state_phase_label(snap.status);
                 lines.push(format!(
-                    "    {:<8} cc={:<4} {:<4} {:<14} rnd={:<4} collator={:<3} collating={:<3} \
-                     stall={:<3} val_ago={:<6} col_ago={:<6} mc_init={:<6} mc_last={:<6} \
-                     age={} id={:x}",
+                    "    {:<8} cc={:<4} {:<4} {:<14} phase={:<13} rnd={:<4} collator={:<3} \
+                     collating={:<3} stall={:<3} val_ago={:<6} col_ago={:<6} \
+                     mc_init={:<6} mc_last={:<6} age={} id={:x}",
                     shard_str,
                     snap.cc_seqno,
                     consensus_str,
-                    countdown_str,
+                    status_str,
+                    phase_str,
                     snap.round,
                     if snap.is_collator { "yes" } else { "no" },
                     if *is_collating { "yes" } else { "no" },

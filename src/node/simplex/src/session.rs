@@ -762,6 +762,10 @@ impl SessionImpl {
         let mut next_profiling_dump_time = next_metrics_dump_time;
         let mut next_health_check_time = next_metrics_dump_time;
 
+        // Arm FSM skip timeouts now that overlay warmup and bootstrap
+        // recovery are complete.  Matches C++ Start event timing.
+        processor.start();
+
         loop {
             {
                 session_activity_node.tick();

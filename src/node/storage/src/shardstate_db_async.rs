@@ -11,11 +11,12 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
+    cell_db::CellByHashStorageAdapter,
     db::{
         rocksdb::{RocksDb, RocksDbTable},
         DbKey,
     },
-    dynamic_boc_rc_db::{AsyncCellsStorageAdapter, CellByHashStorageAdapter, DynamicBocDb},
+    dynamic_boc_rc_db::{AsyncCellsStorageAdapter, DynamicBocDb},
     error::StorageError,
     traits::Serializable,
     StorageAlloc, TARGET,
@@ -489,7 +490,11 @@ impl ShardStateDb {
         root: Option<&Cell>,
         max_inmemory_cells: usize,
     ) -> Result<impl CellsStorage> {
-        CellByHashStorageAdapter::new(self.dynamic_boc_db.clone(), root, max_inmemory_cells)
+        CellByHashStorageAdapter::new(
+            self.dynamic_boc_db.cell_db().clone(),
+            root,
+            max_inmemory_cells,
+        )
     }
 
     pub fn create_fast_cell_storage(
@@ -500,7 +505,7 @@ impl ShardStateDb {
     }
 
     pub fn cells_factory(&self) -> Result<Arc<dyn CellsFactory>> {
-        Ok(self.dynamic_boc_db.clone() as Arc<dyn CellsFactory>)
+        Ok(self.dynamic_boc_db.cells_factory())
     }
 
     pub fn enumerate_ids(

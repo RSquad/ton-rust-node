@@ -1493,9 +1493,11 @@ impl SimplexState {
         // (available_base is optional-of-optional; RawParentId{} = nullopt = genesis)
         window.slots[0].available_base = Some(None);
 
-        // Set initial timeouts
-        // Reference: C++ start_up() → set_timeouts(window)
-        state.set_timeouts(desc);
+        // Timeouts are NOT armed here.  The FSM starts with skip_timestamp=None
+        // so that no skip cascade fires before the session is actually started.
+        // SessionProcessor::start() calls set_timeouts() at the correct moment
+        // (after overlay warmup and bootstrap recovery), matching C++ where
+        // timeouts are only armed after the Start event.
 
         Ok(state)
     }
@@ -1912,6 +1914,11 @@ impl SimplexState {
     /// Used in unit tests to satisfy SessionProcessor assertions when
     /// injecting events without running full FSM vote accumulation.
     #[cfg(test)]
+    pub fn try_skip_window_for_test(&mut self, window_idx: WindowIndex) {
+        self.try_skip_window(window_idx);
+    }
+
+    #[cfg(test)]
     pub fn set_first_non_finalized_slot_for_test(&mut self, slot: SlotIndex) {
         self.first_non_finalized_slot = slot;
         // Also advance first_non_progressed_slot to match (finalized implies progressed)
@@ -2187,7 +2194,7 @@ impl SimplexState {
     ///   for i ∈ windowSlots(s) do   // set timeouts for all slots
     ///     schedule event Timeout(i) at time clock()+Δtimeout+(i−s+1)·Δblock
     /// ```
-    fn set_timeouts(&mut self, desc: &SessionDescription) {
+    pub(crate) fn set_timeouts(&mut self, desc: &SessionDescription) {
         let window_start = self.current_leader_window_idx * self.slots_per_leader_window;
 
         self.skip_slot = window_start;
@@ -4741,7 +4748,13 @@ impl SimplexState {
                 window.slots[offset].is_voted = true;
                 window.slots[offset].voted_skip = true;
                 window.slots[offset].is_bad_window = true;
-                window.slots[offset].pending_block = None;
+                // C++ alarm() only sets voted_skip — it does NOT clear pending_block.
+                // The async try_notarize() coroutine can still complete after a skip
+                // vote, producing both Skip and Notar votes for the same slot.
+                // Only clear pending_block in Alpenglow mode (strict Voted gate).
+                if enable_fallback {
+                    window.slots[offset].pending_block = None;
+                }
             }
         }
     }

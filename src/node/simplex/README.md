@@ -544,7 +544,6 @@ Cryptographic and utility functions:
 | `max_collated_data_size` | `usize` | 4 MB | Max collated data |
 | `collation_retry_timeout` | `Duration` | 1s | Collation retry timeout |
 | `collation_retry_max_attempts` | `u32` | 3 | Max collation retries |
-| `max_precollated_blocks` | `u32` | 10 | Max precollated blocks |
 | `use_callback_thread` | `bool` | true | Use separate callback thread |
 
 ## Integration

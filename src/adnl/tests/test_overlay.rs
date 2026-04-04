@@ -98,6 +98,9 @@ pub fn build_dht_node_info_ex(
 }
 */
 
+/// Base port for test_broadcast nodes (range 4210..4219, does not overlap with other tests).
+const BROADCAST_TEST_BASE_PORT: u16 = 4210;
+
 fn init_overlay_simple_compatibility_test(
     local_ip_template: &str,
     #[cfg(feature = "dump")] dump_path: Option<&str>,
@@ -817,12 +820,11 @@ fn test_broadcast(
     test: impl Fn(&[LocalNode], &[Arc<Vec<Arc<KeyId>>>], Protocol) -> RunResult,
     protocol: Protocol,
 ) {
-    const FIRST_PORT: usize = 4181;
-
     init_test();
     let mut nodes = Vec::new();
     for i in 0..n {
-        let ip = format!("127.0.0.1:{}", FIRST_PORT + i);
+        let port = BROADCAST_TEST_BASE_PORT + i as u16;
+        let ip = format!("127.0.0.1:{port}");
         nodes.push(init_local_node(ip, 100 / n as u8));
     }
 

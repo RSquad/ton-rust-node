@@ -636,6 +636,13 @@ pub trait EngineOperations: Sync + Send {
     ) -> Result<Arc<ShardStateStuff>> {
         unimplemented!()
     }
+    async fn store_state_update(
+        &self,
+        handle: &Arc<BlockHandle>,
+        state_update: Cell,
+    ) -> Result<()> {
+        unimplemented!()
+    }
     async fn store_zerostate(
         &self,
         state: Arc<ShardStateStuff>,
@@ -990,6 +997,10 @@ pub trait EngineOperations: Sync + Send {
         config: &ConfigParams,
     ) -> Result<()> {
         Ok(())
+    }
+
+    fn is_archival_mode(&self) -> bool {
+        false
     }
 }
 

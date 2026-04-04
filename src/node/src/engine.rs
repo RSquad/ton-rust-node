@@ -518,7 +518,11 @@ impl Engine {
         });
 
         let archives_life_time_hours = general_config.gc_archives_life_time_hours();
-        let cells_lifetime_sec = general_config.cells_gc_config().cells_lifetime_sec;
+        let cells_lifetime_sec = if general_config.archival_mode().is_none() {
+            general_config.cells_gc_config().cells_lifetime_sec
+        } else {
+            u64::MAX
+        };
         let enable_shard_state_persistent_gc = general_config.enable_shard_state_persistent_gc();
         let skip_saving_persistent_states = general_config.skip_saving_persistent_states();
         let states_cache_mode = general_config.states_cache_mode();
@@ -529,6 +533,7 @@ impl Engine {
             db_directory: general_config.internal_db_path().to_string(),
             cells_gc_interval_sec: general_config.cells_gc_config().gc_interval_sec,
             cells_db_config: cells_db_config.clone(),
+            archival_mode: general_config.archival_mode().cloned(),
         };
         let control_config = general_config.control_server()?;
         let collator_config = general_config.collator_config().clone();
@@ -2110,7 +2115,7 @@ async fn boot(
     let (last_applied_mc_block, cold) = match result {
         Ok(block_id) => (block_id.clone(), false),
         Err(err) => {
-            log::debug!("before cold boot: {}", err);
+            log::warn!("Before cold boot: {err}");
             engine.acquire_stop(Engine::MASK_SERVICE_BOOT);
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
@@ -2563,7 +2568,7 @@ pub fn init_prometheus_recorder(
     // -- validator
     metrics::describe_gauge!(
         "ton_node_validator_status",
-        "Validation state (0=Disabled, 1=Waiting, 2=Countdown, 3=Active)"
+        "Validation state (0=Disabled, 1=Waiting, 2=Active)"
     );
     metrics::describe_gauge!(
         "ton_node_validator_in_current_set",
