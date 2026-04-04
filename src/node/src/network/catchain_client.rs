@@ -89,7 +89,7 @@ impl CatchainClient {
             overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        network_context.stack.overlay.add_private_overlay(params, local_adnl_key, &peers)?;
+        network_context.stack.overlay.add_private_overlay(params, local_adnl_key, &peers, false)?;
         let consumer = Arc::new(CatchainClientConsumer::new(overlay_id.clone(), catchain_listener));
         network_context.stack.overlay.add_consumer(overlay_id, consumer.clone())?;
 

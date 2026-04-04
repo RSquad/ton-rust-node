@@ -63,7 +63,7 @@ fn test_private_overlay_adnl_message_rust_to_cpp() {
 
     // Rust creates TRUE private overlay (not public shortcut) with ADNL transport
     let cpp_key_id = RustQuicTestNode::cpp_key_id(&cpp);
-    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()]);
+    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()], true);
 
     // Exchange ADNL peers
     rust_node.add_cpp_peer(&cpp);
@@ -127,7 +127,7 @@ fn test_private_overlay_quic_message_rust_to_cpp() {
 
     // Rust creates private overlay with QUIC transport
     let cpp_key_id = RustQuicTestNode::cpp_key_id(&cpp);
-    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()]);
+    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()], true);
 
     // Exchange ADNL peers (needed for peer identity resolution)
     rust_node.add_cpp_peer(&cpp);
@@ -191,7 +191,7 @@ fn test_private_overlay_quic_message_burst() {
         .expect("C++ create private overlay");
 
     let cpp_key_id = RustQuicTestNode::cpp_key_id(&cpp);
-    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()]);
+    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()], true);
 
     rust_node.add_cpp_peer(&cpp);
     let rust_pubkey = rust_node.pubkey_tl_b64();
@@ -266,7 +266,7 @@ fn test_private_overlay_quic_query_rust_to_cpp() {
 
     // Rust creates private overlay with QUIC transport
     let cpp_key_id = RustQuicTestNode::cpp_key_id(&cpp);
-    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()]);
+    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()], true);
 
     rust_node.add_cpp_peer(&cpp);
     let rust_pubkey = rust_node.pubkey_tl_b64();
@@ -330,7 +330,7 @@ fn test_private_overlay_message_cpp_to_rust() {
     // Rust creates private overlay with ADNL (inbound transport doesn't matter —
     // incoming messages arrive via ADNL subscriber regardless)
     let cpp_key_id = RustQuicTestNode::cpp_key_id(&cpp);
-    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()]);
+    rust_node.add_private_overlay(&overlay_short_id, &[cpp_key_id.clone()], true);
 
     // Register message collector to verify receipt on Rust side
     let collector = MessageCollector::new();

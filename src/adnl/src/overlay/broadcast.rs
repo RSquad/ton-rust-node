@@ -343,12 +343,16 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
             return Ok(());
         }
         let info = self.check_broadcast(&bcast, &ctx)?;
+        let bcast_id = base64_encode(&info.bcast_id);
         if info.dup {
-            let bcast_id = base64_encode(&info.bcast_id);
             log::info!(target: TARGET, "Received duplicated {bcast_type} broadcast {bcast_id}");
             return Ok(());
         };
-        log::trace!(target: TARGET, "Received {bcast_type} broadcast, {} bytes", info.data_len);
+        log::trace!(
+            target: TARGET,
+            "Received {bcast_type} broadcast {bcast_id}, {} bytes",
+            info.data_len
+        );
         #[cfg(feature = "telemetry")]
         let tag = info.maybe_tag.unwrap_or(bcast.default_tag());
         #[cfg(feature = "telemetry")]

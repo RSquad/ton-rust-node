@@ -572,7 +572,7 @@ impl Peer {
 
             // Try to fetch address from DHT
             match self.dht_node.fetch_address(&self.dst_adnl_addr).await {
-                Ok(Some((addr, key))) => {
+                Ok(Some((adnl_addr, quic_addr, key))) => {
                     // Check if address changed (first time or address different)
                     let addr_changed = current_addr.is_none();
 
@@ -591,9 +591,10 @@ impl Peer {
                         }
 
                         // Add new address
-                        let add_result = self
-                            .overlay_node
-                            .add_private_peers(&self.src_adnl_addr, vec![(addr, key)]);
+                        let add_result = self.overlay_node.add_private_peers(
+                            &self.src_adnl_addr,
+                            vec![(adnl_addr, quic_addr, key)],
+                        );
 
                         if let Err(e) = add_result {
                             log::warn!(target: LOG_TARGET, "Error adding peer address: {:?}", e);
@@ -939,7 +940,7 @@ impl AdnlOverlay {
             if let Some(quic) = &stack.quic {
                 // Register local validator's ADNL key as a TLS identity on a per-port endpoint
                 let key_bytes: [u8; 32] = *local_adnl_key.pvt_key()?;
-                let ip_addr = stack.adnl.ip_address();
+                let ip_addr = stack.adnl.ip_address_adnl();
                 let quic_port =
                     ip_addr.port().checked_add(adnl::QuicNode::OFFSET_PORT).ok_or_else(|| {
                         error!(
@@ -982,7 +983,7 @@ impl AdnlOverlay {
             overlay_id: &overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        stack.overlay.add_private_overlay(params, &local_adnl_key, &peers)?;
+        stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic)?;
 
         let stop_requested = Arc::new(AtomicBool::new(false));
 
@@ -1019,11 +1020,8 @@ impl AdnlOverlay {
                 stop_requested.clone(),
             ));
 
-            // Point-to-point multicast is used for broadcasts when TCP or QUIC
-            // transport is available (FEC/UDP broadcast has no peers in private overlays).
-            let is_tcp_available =
-                (stack.is_tcp_available() && allow_tcp_communication) || quic_enabled;
-
+            // Point-to-point multicast is used for broadcasts when TCP transport is available
+            let is_tcp_available = stack.is_tcp_available() && allow_tcp_communication;
             if is_tcp_available {
                 log::debug!(
                     target: LOG_TARGET,
@@ -1680,13 +1678,13 @@ impl ConsensusOverlay for AdnlOverlay {
         }
 
         if self.is_quic_available || !self.is_tcp_available {
-            // QUIC or UDP path
+            // QUIC or ADNL/UDP path
             // If extra given, use two-step broadcast via QUIC/RLDP
             // Otherwise use canonic broadcast via ADNL
             let msg = payload.clone();
             let overlay_node = self.stack.overlay.clone();
             let local_validator_key = self.local_validator_key.clone();
-            let transport = if self.is_quic_available { "QUIC" } else { "UDP" };
+            let transport = if self.is_quic_available { "QUIC" } else { "ADNL/UDP" };
 
             self.runtime_handle.spawn(async move {
                 if stop_requested.load(Ordering::Relaxed) {

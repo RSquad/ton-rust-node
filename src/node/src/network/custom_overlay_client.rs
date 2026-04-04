@@ -130,7 +130,7 @@ impl CustomOverlayClient {
             };
             let params =
                 OverlayParams { flags: 0, hops: None, overlay_id: &self.id, runtime: None };
-            if let Err(e) = self.overlay_node.add_private_overlay(params, &key, &peers) {
+            if let Err(e) = self.overlay_node.add_private_overlay(params, &key, &peers, false) {
                 attempt += 1;
                 if attempt >= 10 {
                     fail!("Error while adding custom overlay \"{}\": {}", self.config.name, e);
@@ -439,9 +439,14 @@ impl CustomOverlayClient {
                 )?)
                 .await
             {
-                Ok(Some((ip, key))) => {
-                    log::debug!("{}: peer {}: found ip: {ip:?}, key: {key:x?}", self.id, peer);
-                    self.overlay_node.add_private_peers(&local_key, vec![(ip, key)])?;
+                Ok(Some((adnl_addr, quic_addr, key))) => {
+                    log::debug!(
+                        "{}: peer {}: found ip: {adnl_addr:?}, key: {key:x?}",
+                        self.id,
+                        peer
+                    );
+                    self.overlay_node
+                        .add_private_peers(&local_key, vec![(adnl_addr, quic_addr, key)])?;
                 }
                 Ok(None) => {
                     log::warn!("{}: find address for {} failed", self.id, &peer);

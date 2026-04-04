@@ -8,7 +8,7 @@
  *   {"cmd": "ping"}
  *   {"cmd": "get_info"}
  *   {"cmd": "compute_overlay_id", "name": "BASE64_BYTES"}
- *   {"cmd": "add_peer", "pubkey": "BASE64_TL_PUBKEY", "ip": "127.0.0.1", "port": 14001}
+ *   {"cmd": "add_peer", "pubkey": "BASE64_TL_PUBKEY", "ip": "127.0.0.1", "port": 14001, "quic_port": 0}
  *   {"cmd": "create_overlay", "type": "public|private|semiprivate",
  *           "overlay_name": "BASE64_TL_BYTES",
  *           "peers": ["ADNL_ID_HEX", ...],
@@ -366,6 +366,12 @@ void CompatTestNode::cmd_add_peer(td::JsonObject &obj) {
     // Build address list for the peer
     ton::adnl::AdnlAddressList peer_addr_list;
     peer_addr_list.add_udp_adnl_address(addr).ensure();
+    auto quic_port = static_cast<td::uint16>(get_int(obj, "quic_port"));
+    if (quic_port != 0) {
+        td::IPAddress quic_addr;
+        quic_addr.init_ipv4_port(ip, quic_port).ensure();
+        peer_addr_list.add_quic_addr(quic_addr).ensure();
+    }
     peer_addr_list.set_version(static_cast<td::int32>(td::Clocks::system()));
     peer_addr_list.set_reinit_date(ton::adnl::Adnl::adnl_start_time());
 

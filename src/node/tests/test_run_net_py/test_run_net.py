@@ -258,7 +258,10 @@ def build_node_work_path(node_index: int) -> Path:
     return work_dirs_path / f"node_{node_index}"
 
 
-def prepare_default_config(node_index: int, config_blank: str, log_config_blank: str):
+def prepare_default_config(
+    node_index: int, config_blank: str, log_config_blank: str,
+    use_quic: bool = False, quic_port_offset: int = 1000,
+):
     node_work_path = build_node_work_path(node_index)
     node_work_path.mkdir(parents=True, exist_ok=True)
 
@@ -281,7 +284,11 @@ def prepare_default_config(node_index: int, config_blank: str, log_config_blank:
     config["log_config_name"] = str(node_work_path / "log_cfg.yml")
     config["ton_global_config_name"] = str(common_config_path / "global_config.json")
     config["internal_db_path"] = str(node_work_path)
-    config["ip_address"] = f"{ip_address}:{main_port_base + node_index}"
+    adnl_port = main_port_base + node_index
+    config["ip_address"] = f"{ip_address}:{adnl_port}"
+    if use_quic:
+        quic_port = adnl_port + quic_port_offset
+        config["ip_address_quic"] = f"{ip_address}:{quic_port}"
     config["control_server_port"] = control_port_base + node_index
     config["lite_server_port"] = liteserver_port_base + node_index
     config["json_rpc_server"] = {"address": f"0.0.0.0:{jsonrpc_port_base + node_index}"}
@@ -411,14 +418,18 @@ def export_validator_pubkey(
 
 
 def prepare_node(
-    node_index: int, config_blank: str, log_config_blank: str
+    node_index: int, config_blank: str, log_config_blank: str,
+    use_quic: bool = False, quic_port_offset: int = 1000,
 ) -> str | None:
 
     # Prepare console key
     keygen_result = run_command([str(bins_path / "crypto"), "gen", "key"], cwd=bins_path)
     console_key_json = json.loads(keygen_result.stdout)
 
-    prepare_default_config(node_index, config_blank, log_config_blank)
+    prepare_default_config(
+        node_index, config_blank, log_config_blank,
+        use_quic=use_quic, quic_port_offset=quic_port_offset,
+    )
 
     #  Run node
     console_public = {"type_id": 1209251014, "pub_key": console_key_json["pubkey"]}
@@ -507,7 +518,7 @@ def extract_keys_from_rust_config(rust_config: dict):
     return dht_pvt_key, fullnode_pvt_key
 
 
-def transform_configs_for_cpp(node_index: int):
+def transform_configs_for_cpp(node_index: int, use_quic: bool = False, quic_port_offset: int = 1000):
     print(f"Transforming configs for C++ node {node_index}...", end="")
 
     node_work_path = build_node_work_path(node_index)
@@ -624,6 +635,20 @@ def transform_configs_for_cpp(node_index: int):
     add_to_cpp_keyring(node_index, dht_pvt_key, base64.b64decode(dht_key_id_b64))
     add_to_cpp_keyring(node_index, console_srv_secret_b64, base64.b64decode(console_srv_id))
     add_to_cpp_keyring(node_index, liteserver_pvt_key, base64.b64decode(liteserver_key_id_b64))
+
+    # add QUIC address if enabled
+    if use_quic:
+        import ipaddress
+        adnl_port = main_port_base + node_index
+        quic_port = adnl_port + quic_port_offset
+        ip_int = int(ipaddress.IPv4Address(ip_address))
+        cpp_config.setdefault("addrs", []).append({
+            "@type": "engine.quicAddr",
+            "ip": ip_int,
+            "port": quic_port,
+            "categories": [0, 1, 2, 3],
+            "priority_categories": [],
+        })
 
     # save modified cpp config
     with open(node_work_path / "config.json", "w") as f:
@@ -872,8 +897,18 @@ def main():
         action="store_true",
         help="Enable QUIC overlay transport in ConfigParam 30 (use_quic flag). Implies --simplex.",
     )
+    parser.add_argument(
+        "--quic_custom_port",
+        action="store_true",
+        help="Use QUIC port offset 2000 (instead of 1000) to verify DHT announces. "
+             "Nodes bind QUIC on adnl_port+2000 but the auto-derive fallback is adnl_port+1000, "
+             "so QUIC connections only work if advertised addresses are used. Implies --quic.",
+    )
     args = parser.parse_args()
 
+    # --quic_custom_port implies --quic
+    if args.quic_custom_port:
+        args.quic = True
     # --quic implies --simplex
     if args.quic:
         args.simplex = True
@@ -919,8 +954,12 @@ def main():
             test_root_path / "global_config_blank.json",
             common_config_path / "global_config.json",
         )
+        quic_port_offset = 2000 if args.quic_custom_port else 1000
         for n in range(0 if run_fullnode else 1, nodes_count + 1):
-            vk = prepare_node(n, node_config_blank, log_config_blank)
+            vk = prepare_node(
+                n, node_config_blank, log_config_blank,
+                use_quic=args.quic, quic_port_offset=quic_port_offset,
+            )
             if n != 0:
                 validator_pub_keys.append(vk)
 
@@ -965,7 +1004,9 @@ def main():
 
         # Transform configs for C++ nodes
         for node_index in range(rust_nodes_count + 1, nodes_count + 1):
-            transform_configs_for_cpp(node_index)
+            transform_configs_for_cpp(
+                node_index, use_quic=args.quic, quic_port_offset=quic_port_offset,
+            )
 
     if start:
         # Start nodes
