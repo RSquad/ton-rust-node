@@ -59,7 +59,7 @@ use ton_block::{
     Serializable, ShardAccount, ShardAccountBlocks, ShardAccounts, ShardDescr, ShardFees,
     ShardHashes, ShardIdent, ShardStateSplit, ShardStateUnsplit, SliceData, StorageStatDict,
     TopBlockDescrSet, Transaction, TransactionTickTock, UInt256, UsageTree, ValidatorSet,
-    ValidatorsStat, ValueFlow, WorkchainDescr, Workchains, MASTERCHAIN_ID,
+    ValueFlow, WorkchainDescr, Workchains, MASTERCHAIN_ID,
 };
 #[cfg(feature = "xp25")]
 use ton_block::{RefShardBlocks, ShardBlockRef, WcExtra};
@@ -4408,8 +4408,6 @@ impl Collator {
                 None
             };
 
-        let validators_stat = ValidatorsStat::default();
-
         Ok((
             McStateExtra {
                 shards: collator_data.shards()?.clone(),
@@ -4420,7 +4418,6 @@ impl Collator {
                 last_key_block,
                 block_create_stats,
                 global_balance,
-                validators_stat,
             },
             min_ref_mc_seqno,
         ))

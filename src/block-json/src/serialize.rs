@@ -763,14 +763,6 @@ fn serialize_out_msg(msg: &OutMsg, mode: SerializationMode) -> Result<Value> {
     Ok(map.into())
 }
 
-fn serialize_validators_stat(stat: &ValidatorsStat) -> Result<Value> {
-    let mut map = Map::new();
-    for i in 0..stat.len() as u16 {
-        serialize_field(&mut map, &i.to_string(), stat.get(i)?);
-    }
-    Ok(map.into())
-}
-
 fn serialize_shard_descr(descr: &ShardDescr, mode: SerializationMode) -> Result<Value> {
     let mut map = Map::new();
     serialize_field(&mut map, "seq_no", descr.seq_no);
@@ -1644,13 +1636,6 @@ fn serialize_mc_state_extra(
         serialize_block_create_stats(&mut extra_map, "block_create_stats", stats, mode)?;
     }
     serialize_cc(&mut extra_map, "global_balance", &extra.global_balance, mode)?;
-    if !extra.validators_stat.is_empty() {
-        serialize_field(
-            &mut extra_map,
-            "validators_unreliability",
-            serialize_validators_stat(&extra.validators_stat)?,
-        );
-    }
     map.insert(id_str.to_string(), extra_map.into());
     Ok(())
 }
