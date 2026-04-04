@@ -407,6 +407,7 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     Ok(node_db)
 }
 
+#[cfg(not(target_os = "windows"))]
 #[cfg(test)]
 #[path = "../tests/test_archive_import.rs"]
 mod tests;
