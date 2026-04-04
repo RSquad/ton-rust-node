@@ -147,6 +147,7 @@ pub trait TransactionExecutor {
     /// If account does not exist - phase skipped.
     /// Calculates storage fees and substracts them from account balance.
     /// If account balance becomes negative after that, then account is frozen.
+    /// is_special - flag indicating that account is in list of special smart contracts, for which storage fees are not applied
     fn storage_phase(
         &self,
         acc: &mut Account,
@@ -159,23 +160,12 @@ pub trait TransactionExecutor {
         if tr.now() < acc.last_paid() {
             fail!("transaction timestamp must be greater then account timestamp")
         }
-
-        if is_special {
-            log::debug!(target: "executor", "Special account: AccStatusChange::Unchanged");
-            return Ok(TrStoragePhase::with_params(
-                Coins::zero(),
-                acc.due_payment().cloned(),
-                AccStatusChange::Unchanged,
-            ));
-        }
+        let original_due_payment = acc.due_payment().cloned();
         let mut fee = match acc.storage_info() {
-            Some(storage_info) => {
+            Some(storage_info) if !is_special => {
                 self.config().calc_storage_fees(storage_info, is_masterchain, tr.now())?
             }
-            None => {
-                log::debug!(target: "executor", "Account::None");
-                return Ok(Default::default());
-            }
+            _ => Default::default(),
         };
         if let Some(due_payment) = acc.due_payment() {
             fee.add(due_payment)?;
@@ -192,6 +182,15 @@ pub trait TransactionExecutor {
             let storage_fees_collected = std::mem::take(&mut acc_balance.coins);
             tr.add_fee_coins(&storage_fees_collected)?;
             fee.sub(&storage_fees_collected)?;
+            if is_special {
+                log::debug!(target: "executor", "special account, due payment {fee} still active");
+                acc.set_due_payment(original_due_payment);
+                return Ok(TrStoragePhase::with_params(
+                    storage_fees_collected,
+                    Some(fee),
+                    AccStatusChange::Unchanged,
+                ));
+            }
             let need_freeze = acc.is_active()
                 && fee > self.config().get_gas_config(is_masterchain).freeze_due_limit;
             let need_delete = (acc.is_uninit() || acc.is_frozen())
