@@ -160,6 +160,7 @@ pub trait TransactionExecutor {
         if tr.now() < acc.last_paid() {
             fail!("transaction timestamp must be greater then account timestamp")
         }
+        let original_due_payment = acc.due_payment().cloned();
         let mut fee = match acc.storage_info() {
             Some(storage_info) if !is_special => {
                 self.config().calc_storage_fees(storage_info, is_masterchain, tr.now())?
@@ -183,7 +184,7 @@ pub trait TransactionExecutor {
             fee.sub(&storage_fees_collected)?;
             if is_special {
                 log::debug!(target: "executor", "special account, due payment {fee} still active");
-                acc.set_due_payment(Some(fee));
+                acc.set_due_payment(original_due_payment);
                 return Ok(TrStoragePhase::with_params(
                     storage_fees_collected,
                     Some(fee),
