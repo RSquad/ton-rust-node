@@ -115,7 +115,7 @@ struct ValidateResult {
     removed_dispatch_queue_messages: lockfree::map::Map<(AccountId, u64), Cell>,
     new_dispatch_queue_messages: lockfree::map::Map<(AccountId, u64), Cell>,
     account_expected_defer_all_messages: lockfree::set::Set<AccountId>,
-    blackhole_burned: Mutex<CurrencyCollection>,
+    blackhole_burned: Mutex<Coins>,
 }
 
 impl Default for ValidateResult {
@@ -136,7 +136,7 @@ impl Default for ValidateResult {
             removed_dispatch_queue_messages: lockfree::map::Map::new(),
             new_dispatch_queue_messages: lockfree::map::Map::new(),
             account_expected_defer_all_messages: lockfree::set::Set::new(),
-            blackhole_burned: Mutex::new(CurrencyCollection::default()),
+            blackhole_burned: Mutex::new(Coins::default()),
         }
     }
 }
@@ -2383,15 +2383,14 @@ impl ValidateQuery {
         fees_import: &CurrencyCollection,
     ) -> Result<CurrencyCollection> {
         if !base.shard().is_masterchain() {
-            return Ok(CurrencyCollection::default());
+            return Ok(Default::default());
         }
-        let Some(ConfigParamEnum::ConfigParam5(burning)) = base.config_params.config(5)? else {
-            return Ok(CurrencyCollection::default());
+        let Some(ConfigParamEnum::ConfigParam5(burning_cfg)) = base.config_params.config(5)? else {
+            return Ok(Default::default());
         };
 
-        let mut total_fees = transaction_fees.clone();
-        total_fees.add(fees_import)?;
-        let mut burned = burning.calculate_burned_fees(&total_fees)?;
+        let total_fees = transaction_fees.coins.as_u128() + fees_import.coins.as_u128();
+        let mut burned = burning_cfg.calculate_burned_fees(total_fees)?;
 
         let mut imported_base = base.value_flow.fees_imported.clone();
         if !imported_base.sub(&base.mc_extra.fees().root_extra().create)? {
@@ -2401,9 +2400,9 @@ impl ValidateQuery {
                 base.mc_extra.fees().root_extra().create
             );
         }
-        let burned_imported = burning.calculate_burned_fees(&imported_base)?;
+        let burned_imported = burning_cfg.calculate_burned_fees(imported_base.coins.as_u128())?;
         burned.add(&burned_imported)?;
-        Ok(burned)
+        Ok(CurrencyCollection::from_coins(burned))
     }
 
     fn check_burned_value_flow(base: &ValidateBase) -> Result<()> {
@@ -2417,19 +2416,19 @@ impl ValidateQuery {
             base.account_blocks.full_transaction_fees(),
             &fees_import,
         )?;
-        let blackhole_burned = base
-            .result
-            .blackhole_burned
-            .lock()
-            .map_err(|_| error!("blackhole burned accumulator is poisoned"))?
-            .clone();
-        expected_burned.add(&blackhole_burned)?;
+        expected_burned.coins.add(
+            &*base
+                .result
+                .blackhole_burned
+                .lock()
+                .map_err(|_| error!("blackhole burned accumulator is poisoned"))?,
+        )?;
         if base.value_flow.burned != expected_burned {
             reject_query!(
                 "ValueFlow of block {} declares burned fees {}, but the expected value is {}",
                 base.block_id(),
                 base.value_flow.burned.coins,
-                expected_burned.coins
+                expected_burned
             )
         }
         Ok(())
@@ -5465,7 +5464,7 @@ impl ValidateQuery {
         let old_account_root = account_root.clone();
         #[cfg(test)]
         let mut our_trans = None;
-        let mut blackhole_burned = CurrencyCollection::default();
+        let mut blackhole_burned = Coins::default();
         let mut error = None;
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
@@ -5504,7 +5503,7 @@ impl ValidateQuery {
                     }
                     base.transactions_executed.fetch_add(1, Ordering::Relaxed);
                     blackhole_burned = trans_execute.blackhole_burned().clone();
-                    if !blackhole_burned.is_zero()? {
+                    if !blackhole_burned.is_zero() {
                         base.result
                             .blackhole_burned
                             .lock()
@@ -5536,7 +5535,7 @@ impl ValidateQuery {
             let mut right_balance = new_balance.clone();
             right_balance.add(&money_exported)?;
             right_balance.add(trans.total_fees())?;
-            right_balance.add(&blackhole_burned)?;
+            right_balance.coins.add(&blackhole_burned)?;
             if left_balance != right_balance {
                 error = Some(error!(
                     "transaction {} of {:x} violates the currency flow condition: \
@@ -5549,7 +5548,7 @@ impl ValidateQuery {
                     new_balance.coins,
                     money_exported.coins,
                     trans.total_fees().coins,
-                    blackhole_burned.coins
+                    blackhole_burned
                 ));
             }
         }

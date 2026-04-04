@@ -1265,7 +1265,7 @@ pub struct Transaction {
     pub in_msg: ChildCell<Message>,
     pub out_msgs: OutMessages,
     total_fees: CurrencyCollection,
-    blackhole_burned: CurrencyCollection,
+    blackhole_burned: Coins,
     state_update: ChildCell<HashUpdate>,
     description: ChildCell<TransactionDescr>,
 }
@@ -1286,7 +1286,7 @@ impl Transaction {
             in_msg: ChildCell::default(),
             out_msgs: OutMessages::default(),
             total_fees: CurrencyCollection::default(),
-            blackhole_burned: CurrencyCollection::default(),
+            blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
         }
@@ -1310,7 +1310,7 @@ impl Transaction {
             in_msg: ChildCell::with_struct(msg)?,
             out_msgs: OutMessages::default(),
             total_fees: CurrencyCollection::default(),
-            blackhole_burned: CurrencyCollection::default(),
+            blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
         })
@@ -1374,11 +1374,11 @@ impl Transaction {
         &mut self.total_fees
     }
 
-    pub fn blackhole_burned(&self) -> &CurrencyCollection {
+    pub fn blackhole_burned(&self) -> &Coins {
         &self.blackhole_burned
     }
 
-    pub fn set_blackhole_burned(&mut self, burned: CurrencyCollection) {
+    pub fn set_blackhole_burned(&mut self, burned: Coins) {
         self.blackhole_burned = burned;
     }
 
@@ -1568,7 +1568,7 @@ impl Default for Transaction {
             in_msg: ChildCell::default(),
             out_msgs: OutMessages::default(),
             total_fees: CurrencyCollection::default(),
-            blackhole_burned: CurrencyCollection::default(),
+            blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
         }

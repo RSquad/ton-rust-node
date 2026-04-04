@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use ton_block::{
     error, fail, AccStatusChange, Account, AddSub, Cell, Coins, CommonMsgInfo, ComputeSkipReason,
-    ConfigParamEnum, CurrencyCollection, Deserializable, Message, MsgAddressInt, Result,
-    Serializable, StorageUsageCalc, TrBouncePhase, TrComputePhase, Transaction, TransactionDescr,
-    TransactionDescrOrdinary, MASTERCHAIN_ID, MAX_MSG_MERKLE_DEPTH,
+    Deserializable, Message, MsgAddressInt, Result, Serializable, StorageUsageCalc, TrBouncePhase,
+    TrComputePhase, Transaction, TransactionDescr, TransactionDescrOrdinary, MASTERCHAIN_ID,
+    MAX_MSG_MERKLE_DEPTH,
 };
 use ton_vm::{
     boolean, int,
@@ -178,23 +178,17 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             tr.add_fee_coins(&in_fwd_fee)?;
         }
 
-        if is_masterchain {
-            if let Some(ConfigParamEnum::ConfigParam5(burning)) =
-                self.config.raw_config().config(5)?
+        if let Some(burning_cfg) = self.config.burning_config() {
+            if is_masterchain
+                && !msg_balance.coins.is_zero()
+                && burning_cfg.blackhole_addr.as_ref() == Some(&account_id)
             {
-                if burning.blackhole_addr.as_ref() == Some(&account_id)
-                    && !msg_balance.coins.is_zero()
-                {
-                    let burned =
-                        CurrencyCollection::from_coins(std::mem::take(&mut msg_balance.coins));
-                    log::debug!(
-                        target: "executor",
-                        "Burning {} nanoton for blackhole account {:x}",
-                        burned.coins,
-                        account_id
-                    );
-                    tr.set_blackhole_burned(burned);
-                }
+                let burned = std::mem::take(&mut msg_balance.coins);
+                log::debug!(
+                    target: "executor",
+                    "Burning {burned} nanocoins for blackhole account {account_id:x}",
+                );
+                tr.set_blackhole_burned(burned);
             }
         }
 

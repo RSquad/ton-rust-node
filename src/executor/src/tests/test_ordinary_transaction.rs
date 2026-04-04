@@ -4127,8 +4127,8 @@ fn test_masterchain_blackhole_burns_inbound_value() {
         Some(&blackhole_tr),
     );
 
-    assert_eq!(*regular_tr.blackhole_burned(), CurrencyCollection::default());
-    assert_eq!(*blackhole_tr.blackhole_burned(), CurrencyCollection::with_coins(msg_value));
+    assert_eq!(*regular_tr.blackhole_burned(), Coins::default());
+    assert_eq!(*blackhole_tr.blackhole_burned(), msg_value);
     assert_eq!(
         regular_acc.balance().unwrap().coins.as_u128()
             - blackhole_acc.balance().unwrap().coins.as_u128(),
