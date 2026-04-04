@@ -44,6 +44,7 @@ fmt:
 	@cargo +nightly fmt $(check) --manifest-path ./node/consensus-common/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node/simplex/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node/storage/Cargo.toml
+	@cargo +nightly fmt $(check) --manifest-path ./node/tests/compat_test/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node/validator-session/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/commands/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/common/Cargo.toml

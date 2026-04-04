@@ -232,6 +232,7 @@ async fn test_overlay_client() {
         .add_peer(
             this_key.id(),
             &IpAddress::from_versioned_string("127.0.0.1:5000", None).unwrap(),
+            None,
             &peer_key,
         )
         .unwrap()

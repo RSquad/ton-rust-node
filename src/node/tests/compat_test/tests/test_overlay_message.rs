@@ -58,7 +58,7 @@ fn test_overlay_message_cpp_to_rust() {
     // Must be private overlay — the overlay dispatcher only calls try_consume_custom
     // on the consumer for private overlays.
     let cpp_key_id = RustTestNode::cpp_key_id(&cpp);
-    rust_node.add_true_private_overlay(&overlay_short_id, &[cpp_key_id]);
+    rust_node.add_true_private_overlay(&overlay_short_id, &[cpp_key_id], false);
     let collector = MessageCollector::new();
     rust_node.overlay.add_consumer(&overlay_short_id, collector.clone()).expect("add consumer");
 

@@ -353,7 +353,10 @@ struct SlaveInfo {
 enum OverlayType {
     Public,
     // Overlay with fixed members set
-    Private(Arc<dyn KeyOption>),
+    Private {
+        key: Arc<dyn KeyOption>,
+        use_quic: bool,
+    },
     // Overlay with externally certified members
     CertifiedMembers {
         key: Option<Arc<dyn KeyOption>>,
@@ -369,15 +372,13 @@ enum OverlayType {
 impl OverlayType {
     fn bcast_prefix(&self) -> Option<Vec<u8>> {
         match self {
-            OverlayType::Public => None,
-            OverlayType::Private(_) => None,
             OverlayType::CertifiedMembers { bcast_prefix, .. } => Some(bcast_prefix.clone()),
+            OverlayType::Public | OverlayType::Private { .. } => None,
         }
     }
 
     fn calc_message_prefix(&self, overlay_id: &OverlayShortId) -> Result<Vec<u8>> {
         match self {
-            Self::Public | Self::Private(_) => OverlayUtils::calc_message_prefix(overlay_id),
             Self::CertifiedMembers { certificate, .. } => serialize_boxed(
                 &OverlayMessageWithExtra {
                     overlay: UInt256::with_array(*overlay_id.data()),
@@ -387,27 +388,30 @@ impl OverlayType {
                 }
                 .into_boxed(),
             ),
+            OverlayType::Public | OverlayType::Private { .. } => {
+                OverlayUtils::calc_message_prefix(overlay_id)
+            }
         }
     }
 
     fn calc_query_prefix(&self, overlay_id: &OverlayShortId) -> Result<Vec<u8>> {
         match self {
-            Self::Public | Self::Private(_) => {
-                serialize_boxed(&OverlayQuery { overlay: UInt256::with_array(*overlay_id.data()) })
-            }
             Self::CertifiedMembers { certificate, .. } => serialize_boxed(&OverlayQueryWithExtra {
                 overlay: UInt256::with_array(*overlay_id.data()),
                 extra: MessageExtra {
                     certificate: certificate.as_ref().map(|cert| cert.clone().into_boxed()),
                 },
             }),
+            OverlayType::Public | OverlayType::Private { .. } => {
+                serialize_boxed(&OverlayQuery { overlay: UInt256::with_array(*overlay_id.data()) })
+            }
         }
     }
 
     fn certificate(&self) -> Option<&MemberCertificate> {
         match self {
-            OverlayType::Public | OverlayType::Private(_) => None,
             OverlayType::CertifiedMembers { certificate, .. } => certificate.as_ref(),
+            OverlayType::Public | OverlayType::Private { .. } => None,
         }
     }
 
@@ -611,8 +615,8 @@ impl Overlay {
     fn check_peer(&self, peer: &Arc<KeyId>, certificate: Option<&MemberCertificate>) -> Result<()> {
         match &self.overlay_type {
             OverlayType::Public => Ok(()),
-            OverlayType::Private(own_key) => {
-                if !(peer == own_key.id() || self.known_peers.all().contains(peer)) {
+            OverlayType::Private { key, .. } => {
+                if !(peer == key.id() || self.known_peers.all().contains(peer)) {
                     fail!("Peer {peer} is not a member of the private overlay {}", self.overlay_id)
                 }
                 Ok(())
@@ -702,13 +706,14 @@ impl Overlay {
                     if let Some(quic) = self.quic.as_ref() {
                         quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
                     } else {
-                        let Some(rldp) = self.rldp.as_ref() else {
+                        let Some(_rldp) = self.rldp.as_ref() else {
                             fail!(
                                 "Neither QUIC nor RLDP sender is set in overlay {}",
                                 self.overlay_id
                             );
                         };
-                        rldp.message(data, peers, true, None).await.err()
+                        //rldp.message(data, peers, true, None).await.err()
+                        None
                     }
                 }
                 BroadcastSendMethod::Safe => {
@@ -821,7 +826,7 @@ impl Overlay {
 
     fn overlay_key(&self) -> Option<&Arc<dyn KeyOption>> {
         match &self.overlay_type {
-            OverlayType::Private(key) => Some(key),
+            OverlayType::Private { key, .. } => Some(key),
             OverlayType::CertifiedMembers { key, .. } => key.as_ref(),
             _ => None,
         }
@@ -1428,8 +1433,9 @@ impl OverlayNode {
         params: OverlayParams,
         overlay_key: &Arc<dyn KeyOption>,
         peers: &[Arc<KeyId>],
+        use_quic: bool,
     ) -> Result<bool> {
-        let overlay_type = OverlayType::Private(overlay_key.clone());
+        let overlay_type = OverlayType::Private { key: overlay_key.clone(), use_quic };
         self.add_typed_private_overlay(overlay_type, params, peers)
     }
 
@@ -1460,11 +1466,11 @@ impl OverlayNode {
     pub fn add_private_peers(
         &self,
         local_adnl_key: &Arc<KeyId>,
-        peers: Vec<(IpAddress, Arc<dyn KeyOption>)>,
+        peers: Vec<(IpAddress, Option<IpAddress>, Arc<dyn KeyOption>)>,
     ) -> Result<Vec<Arc<KeyId>>> {
         let mut ret = Vec::new();
-        for (ip, key) in peers {
-            if let Some(peer) = self.adnl.add_peer(local_adnl_key, &ip, &key)? {
+        for (ip, quic_ip, key) in peers {
+            if let Some(peer) = self.adnl.add_peer(local_adnl_key, &ip, quic_ip.as_ref(), &key)? {
                 ret.push(peer)
             }
         }
@@ -1511,7 +1517,7 @@ impl OverlayNode {
             log::warn!(target: TARGET, "Error when verifying overlay peer {}: {e}", key.id());
             return Ok(None);
         }
-        let Some(ret) = self.adnl.add_peer(self.node_key.id(), peer_ip_address, &key)? else {
+        let Some(ret) = self.adnl.add_peer(self.node_key.id(), peer_ip_address, None, &key)? else {
             return Ok(None);
         };
         overlay.known_peers.add(&ret)?;
@@ -1971,10 +1977,15 @@ impl OverlayNode {
             penalty: 1,
             to_block: Self::MAX_FAIL_COUNT,
         };
+        let quic = if let OverlayType::Private { use_quic: true, .. } = &overlay_type {
+            self.quic.get().cloned()
+        } else {
+            None
+        };
         let overlay = Overlay {
             adnl: self.adnl.clone(),
             rldp: self.rldp.get().cloned(),
-            quic: self.quic.get().cloned(),
+            quic,
             flags: params.flags,
             hops: params.hops,
             known_peers: AddressCacheWithBads::with_params(Self::MAX_PEERS, policy),

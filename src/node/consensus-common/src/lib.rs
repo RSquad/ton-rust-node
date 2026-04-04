@@ -644,7 +644,7 @@ pub enum OverlayTransportType {
 
 impl OverlayTransportType {
     pub fn allow_tcp(&self) -> bool {
-        matches!(self, Self::CatchainTcp | Self::Simplex)
+        matches!(self, Self::CatchainTcp)
     }
 
     pub fn use_quic(&self) -> bool {

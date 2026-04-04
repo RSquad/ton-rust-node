@@ -343,6 +343,18 @@ struct EndpointState {
     last_added_name: Arc<Mutex<Option<String>>>,
 }
 
+/// Command sent to the background Tokio task that manages QUIC key operations.
+/// Quinn endpoint creation requires a Tokio runtime context, but callers may run
+/// on bare OS threads (e.g. Simplex SXMAIN). The channel decouples the two.
+enum KeyCommand {
+    AddKey {
+        key: [u8; Ed25519KeyOption::PVT_KEY_SIZE],
+        key_id: Arc<KeyId>,
+        bind_addr: SocketAddr,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+}
+
 pub struct QuicNode {
     cancellation_token: tokio_util::sync::CancellationToken,
     /// One entry per local identity; each carries its own client config and outbound pool.
@@ -358,6 +370,8 @@ pub struct QuicNode {
     inbound_pools: Mutex<Vec<Arc<QuicInboundMap>>>,
     /// Per-TL-tag message counters for the stats dumper.
     msg_stats: Arc<MsgStats>,
+    /// Channel for dispatching key operations to a Tokio-hosted background task.
+    key_cmd_tx: tokio::sync::mpsc::UnboundedSender<KeyCommand>,
 }
 
 impl QuicNode {
@@ -374,10 +388,14 @@ impl QuicNode {
 
     /// Create a new QuicNode. No endpoints are bound — they are created lazily
     /// by `add_key()` when the first identity for a given port is registered.
+    ///
+    /// `runtime_handle` is used to spawn a background task that processes key
+    /// operations requiring Tokio context (Quinn endpoint creation).
     pub fn new(
         subscribers: Vec<Arc<dyn Subscriber>>,
         cancellation_token: tokio_util::sync::CancellationToken,
         max_streams_per_connection: Option<usize>,
+        runtime_handle: tokio::runtime::Handle,
     ) -> Arc<Self> {
         let max_streams_per_connection =
             max_streams_per_connection.unwrap_or(Self::DEFAULT_MAX_STREAMS_PER_CONNECTION);
@@ -387,6 +405,7 @@ impl QuicNode {
                 .install_default()
                 .expect("Failed to install default Rustls CryptoProvider");
         });
+        let (key_cmd_tx, mut key_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<KeyCommand>();
         let transport = Arc::new(Self {
             cancellation_token: cancellation_token.clone(),
             local_keys: lockfree::map::Map::new(),
@@ -396,6 +415,30 @@ impl QuicNode {
             max_streams_per_connection,
             inbound_pools: Mutex::new(Vec::new()),
             msg_stats: MsgStats::new(),
+            key_cmd_tx,
+        });
+        // Spawn background task that processes key commands inside the Tokio runtime.
+        let weak = Arc::downgrade(&transport);
+        let token = cancellation_token.clone();
+        runtime_handle.spawn(async move {
+            loop {
+                tokio::select! {
+                    cmd = key_cmd_rx.recv() => {
+                        let Some(cmd) = cmd else { break };
+                        match cmd {
+                            KeyCommand::AddKey { key, key_id, bind_addr, reply } => {
+                                let result = if let Some(this) = weak.upgrade() {
+                                    this.add_key_inner(&key, &key_id, bind_addr)
+                                } else {
+                                    Err(error!("QuicNode dropped"))
+                                };
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
+                    _ = token.cancelled() => break,
+                }
+            }
         });
         Self::spawn_connection_checker(Arc::downgrade(&transport), cancellation_token.clone());
         Self::spawn_stats_dumper(Arc::downgrade(&transport), cancellation_token);
@@ -404,7 +447,40 @@ impl QuicNode {
 
     /// Register a local identity on a specific bind address.
     /// Creates a new endpoint if one doesn't exist for this port yet.
+    ///
+    /// Safe to call from any thread — the actual work is dispatched to a
+    /// Tokio-hosted background task via an internal channel.
     pub fn add_key(
+        &self,
+        key: &[u8; Ed25519KeyOption::PVT_KEY_SIZE],
+        key_id: &Arc<KeyId>,
+        bind_addr: SocketAddr,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.key_cmd_tx
+            .send(KeyCommand::AddKey {
+                key: *key,
+                key_id: key_id.clone(),
+                bind_addr,
+                reply: reply_tx,
+            })
+            .map_err(|_| error!("QuicNode key command channel closed"))?;
+        // Use blocking_recv on bare OS threads, tokio::block_in_place on Tokio workers.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| {
+                reply_rx
+                    .blocking_recv()
+                    .map_err(|_| error!("QuicNode key command reply channel dropped"))?
+            }),
+            Err(_) => reply_rx
+                .blocking_recv()
+                .map_err(|_| error!("QuicNode key command reply channel dropped"))?,
+        }
+    }
+
+    /// Internal implementation of add_key — always runs inside the Tokio runtime
+    /// (called by the background key-command task).
+    fn add_key_inner(
         &self,
         key: &[u8; Ed25519KeyOption::PVT_KEY_SIZE],
         key_id: &Arc<KeyId>,
@@ -690,9 +766,16 @@ impl QuicNode {
         let Some(adnl) = adnl else {
             fail!("QUIC peer {dst} is not registered and no ADNL node provided");
         };
-        let mut addr = adnl
+        // Get peer's ADNL and optional QUIC addresses
+        let (adnl_addr, quic_addr) = adnl
             .peer_ip_address(peers.local(), dst)?
             .ok_or_else(|| error!("QUIC peer {dst} IP is not known in ADNL"))?;
+        // Prefer explicit QUIC address from peer's address list (adnl.address.quic)
+        if let Some(quic_addr) = quic_addr {
+            return self.add_peer_key(dst.clone(), quic_addr);
+        }
+        // Fallback: derive QUIC port from ADNL port + offset
+        let mut addr = adnl_addr;
         let quic_port = addr.port().checked_add(Self::OFFSET_PORT).ok_or_else(|| {
             error!("QUIC port overflow for peer {dst}: ADNL port {}", addr.port())
         })?;

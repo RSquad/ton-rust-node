@@ -68,9 +68,9 @@ fn init_rldp_compatibility_test(
         #[cfg(feature = "dump")]
         None,
     );
-    let ours_ip = format!("{}", ctx_test.adnl.ip_address());
+    let ours_ip = format!("{}", ctx_test.adnl.ip_address_adnl());
     let pos = ours_ip.find(":").unwrap();
-    let ours_ip = format!("{}:{}", &ours_ip[..pos], ctx_test.adnl.ip_address().port() + 1);
+    let ours_ip = format!("{}:{}", &ours_ip[..pos], ctx_test.adnl.ip_address_adnl().port() + 1);
     let config =
         ctx_test.rt.block_on(get_adnl_config("rldp", &ours_ip, vec![KEY_TAG], true)).unwrap();
     let adnl = ctx_test.rt.block_on(AdnlNode::with_config(config)).unwrap();
@@ -97,7 +97,7 @@ fn find_rldp_peer(
     let (peer_ip, peer_node) = find_overlay_peer(overlay_peers, ctx_search, ctx_test, TARGET);
     let ours_id = adnl.key_by_tag(KEY_TAG).unwrap().id().clone();
     let peer_key: Arc<dyn KeyOption> = (&peer_node.id).try_into().unwrap();
-    let peer_id = adnl.add_peer(&ours_id, &peer_ip, &peer_key).unwrap().unwrap();
+    let peer_id = adnl.add_peer(&ours_id, &peer_ip, None, &peer_key).unwrap().unwrap();
     (peer_id, ours_id)
 }
 
@@ -193,8 +193,8 @@ fn init_local_test(
     rt.block_on(adnl2.start_over_udp(vec![rldp2.clone()])).unwrap();
     let peer1 = adnl1.key_by_tag(KEY_TAG).unwrap();
     let peer2 = adnl2.key_by_tag(KEY_TAG).unwrap();
-    adnl1.add_peer(peer1.id(), adnl2.ip_address(), &peer2).unwrap();
-    adnl2.add_peer(peer2.id(), adnl1.ip_address(), &peer1).unwrap();
+    adnl1.add_peer(peer1.id(), adnl2.ip_address_adnl(), None, &peer2).unwrap();
+    adnl2.add_peer(peer2.id(), adnl1.ip_address_adnl(), None, &peer1).unwrap();
     let ctx1 = RldpContext { adnl: adnl1, peer: peer1.id().clone(), rldp: rldp1 };
     let ctx2 = RldpContext { adnl: adnl2, peer: peer2.id().clone(), rldp: rldp2 };
     (rt, ctx1, ctx2)
