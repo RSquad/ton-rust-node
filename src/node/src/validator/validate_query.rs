@@ -41,16 +41,14 @@ use std::{
     mem,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Instant,
 };
 #[cfg(test)]
 use ton_block::{base64_encode, write_boc, UsageTree};
-#[cfg(feature = "xp25")]
-use ton_block::{fail, ShardDescr, SHARD_FULL};
 use ton_block::{
-    read_boc, Account, AccountBlock, AccountDispatchQueue, AccountId, AccountIdPrefixFull,
+    fail, read_boc, Account, AccountBlock, AccountDispatchQueue, AccountId, AccountIdPrefixFull,
     AccountStatus, AccountStorageDictProof, AddSub, Block, BlockCreateStats, BlockError,
     BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, Coins, ConfigParamEnum,
     ConfigParams, ConsensusExtraData, Counters, CreatorStats, CurrencyCollection, DepthBalanceInfo,
@@ -63,6 +61,8 @@ use ton_block::{
     TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr,
     INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
 };
+#[cfg(feature = "xp25")]
+use ton_block::{ShardDescr, SHARD_FULL};
 use ton_executor::{
     BlockchainConfig, ExecuteParams, OrdinaryTransactionExecutor, TickTockTransactionExecutor,
     TransactionExecutor,
@@ -115,6 +115,7 @@ struct ValidateResult {
     removed_dispatch_queue_messages: lockfree::map::Map<(AccountId, u64), Cell>,
     new_dispatch_queue_messages: lockfree::map::Map<(AccountId, u64), Cell>,
     account_expected_defer_all_messages: lockfree::set::Set<AccountId>,
+    blackhole_burned: Mutex<Coins>,
 }
 
 impl Default for ValidateResult {
@@ -135,6 +136,7 @@ impl Default for ValidateResult {
             removed_dispatch_queue_messages: lockfree::map::Map::new(),
             new_dispatch_queue_messages: lockfree::map::Map::new(),
             account_expected_defer_all_messages: lockfree::set::Set::new(),
+            blackhole_burned: Mutex::new(Coins::default()),
         }
     }
 }
@@ -2343,23 +2345,90 @@ impl ValidateQuery {
             )
         }
         let transaction_fees = base.account_blocks.full_transaction_fees();
+        let expected_fee_burned = Self::expected_fee_burned(&base, transaction_fees, &fees_import)?;
+        if !base.shard().is_masterchain() && !base.value_flow.burned.is_zero()? {
+            reject_query!(
+                "ValueFlow of block {} is invalid (non-zero burned value in a non-masterchain block)",
+                base.block_id()
+            )
+        }
+
         let mut expected_fees = transaction_fees.clone();
         expected_fees.add(&base.value_flow.fees_imported)?;
         expected_fees.add(&base.value_flow.created)?;
         expected_fees.add(&fees_import)?;
+        expected_fees.sub(&expected_fee_burned)?;
         if base.value_flow.fees_collected != expected_fees {
             reject_query!(
                 "ValueFlow for {} declares fees_collected={} but \
                 the total message import fees are {}, the total transaction fees are {}, \
                 creation fee for this block is {} and the total imported fees from shards \
-                are {} with a total of {}",
+                are {}, the burned fees are {} with a total of {}",
                 base.block_id(),
                 base.value_flow.fees_collected.coins,
                 fees_import,
                 transaction_fees.coins,
                 base.value_flow.created.coins,
                 base.value_flow.fees_imported.coins,
+                expected_fee_burned.coins,
                 expected_fees.coins
+            )
+        }
+        Ok(())
+    }
+
+    fn expected_fee_burned(
+        base: &ValidateBase,
+        transaction_fees: &CurrencyCollection,
+        fees_import: &CurrencyCollection,
+    ) -> Result<CurrencyCollection> {
+        if !base.shard().is_masterchain() {
+            return Ok(Default::default());
+        }
+        let Some(ConfigParamEnum::ConfigParam5(burning_cfg)) = base.config_params.config(5)? else {
+            return Ok(Default::default());
+        };
+
+        let total_fees = transaction_fees.coins.as_u128() + fees_import.coins.as_u128();
+        let mut burned = burning_cfg.calculate_burned_fees(total_fees)?;
+
+        let mut imported_base = base.value_flow.fees_imported.clone();
+        if !imported_base.sub(&base.mc_extra.fees().root_extra().create)? {
+            fail!(
+                "fees_imported ({}) is smaller than imported created fees ({})",
+                base.value_flow.fees_imported,
+                base.mc_extra.fees().root_extra().create
+            );
+        }
+        let burned_imported = burning_cfg.calculate_burned_fees(imported_base.coins.as_u128())?;
+        burned.add(&burned_imported)?;
+        Ok(CurrencyCollection::from_coins(burned))
+    }
+
+    fn check_burned_value_flow(base: &ValidateBase) -> Result<()> {
+        if !base.shard().is_masterchain() {
+            return Ok(());
+        }
+        let fees_import =
+            CurrencyCollection::from_coins(base.in_msg_descr.full_import_fees().fees_collected);
+        let mut expected_burned = Self::expected_fee_burned(
+            base,
+            base.account_blocks.full_transaction_fees(),
+            &fees_import,
+        )?;
+        expected_burned.coins.add(
+            &*base
+                .result
+                .blackhole_burned
+                .lock()
+                .map_err(|_| error!("blackhole burned accumulator is poisoned"))?,
+        )?;
+        if base.value_flow.burned != expected_burned {
+            reject_query!(
+                "ValueFlow of block {} declares burned fees {}, but the expected value is {}",
+                base.block_id(),
+                base.value_flow.burned.coins,
+                expected_burned
             )
         }
         Ok(())
@@ -5395,6 +5464,7 @@ impl ValidateQuery {
         let old_account_root = account_root.clone();
         #[cfg(test)]
         let mut our_trans = None;
+        let mut blackhole_burned = Coins::default();
         let mut error = None;
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
@@ -5432,6 +5502,14 @@ impl ValidateQuery {
                         base.gas_used.fetch_add(compute_ph.gas_used.as_u64(), Ordering::Relaxed);
                     }
                     base.transactions_executed.fetch_add(1, Ordering::Relaxed);
+                    blackhole_burned = trans_execute.blackhole_burned().clone();
+                    if !blackhole_burned.is_zero() {
+                        base.result
+                            .blackhole_burned
+                            .lock()
+                            .map_err(|_| error!("blackhole burned accumulator is poisoned"))?
+                            .add(&blackhole_burned)?;
+                    }
 
                     // we cannot know prev transaction in executor
                     trans_execute.set_prev_trans_hash(trans.prev_trans_hash().clone());
@@ -5457,18 +5535,20 @@ impl ValidateQuery {
             let mut right_balance = new_balance.clone();
             right_balance.add(&money_exported)?;
             right_balance.add(trans.total_fees())?;
+            right_balance.coins.add(&blackhole_burned)?;
             if left_balance != right_balance {
                 error = Some(error!(
                     "transaction {} of {:x} violates the currency flow condition: \
                     old balance={} + imported={} does not equal new balance={} + exported=\
-                    {} + total_fees={}",
+                    {} + total_fees={} + burned={}",
                     lt,
                     account_addr,
                     old_balance.coins,
                     money_imported.coins,
                     new_balance.coins,
                     money_exported.coins,
-                    trans.total_fees().coins
+                    trans.total_fees().coins,
+                    blackhole_burned
                 ));
             }
         }
@@ -6801,6 +6881,7 @@ impl ValidateQuery {
         // Self::check_delivered_dequeued(&base, &manager)?;
         Self::check_all_ticktock_processed(&base)?;
         Self::check_message_processing_order(&mut base)?;
+        Self::check_burned_value_flow(&base)?;
         Self::check_new_state(&mut base, &mc_data, &manager)?;
         Self::check_mc_block_extra(&base, &mc_data)?;
         self.check_mc_state_extra(&base, &mc_data)?;
