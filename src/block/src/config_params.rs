@@ -938,6 +938,13 @@ impl BurningConfig {
         }
         Ok(())
     }
+
+    pub fn calculate_burned_fees(&self, value: u128) -> Result<Coins> {
+        if self.fee_burn_num == 0 || value == 0 {
+            return Ok(Coins::default());
+        }
+        (value * self.fee_burn_num as u128 / self.fee_burn_denom as u128).try_into()
+    }
 }
 
 impl Deserializable for BurningConfig {

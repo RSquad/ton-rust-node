@@ -28,6 +28,11 @@ use std::{
 use ton_api::{
     deserialize_boxed, serialize_boxed, serialize_boxed_append,
     ton::{
+        adnl::{
+            address::address::{Quic as AdnlAddrQuic, Udp as AdnlAddrUdp},
+            addresslist::AddressList,
+            Address as AdnlAddress,
+        },
         overlay::{
             message::Message as OverlayMessage, node::Node as OverlayNodeV1,
             nodev2::NodeV2 as OverlayNodeV2, Node as OverlayNodeBoxed,
@@ -173,7 +178,12 @@ impl RustTestNode {
     /// Unlike `add_private_overlay` (which creates a public overlay as shortcut),
     /// this creates a real private overlay where `try_consume_custom` is dispatched
     /// to the registered consumer.
-    pub fn add_true_private_overlay(&self, overlay_id: &Arc<OverlayShortId>, peers: &[Arc<KeyId>]) {
+    pub fn add_true_private_overlay(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        peers: &[Arc<KeyId>],
+        use_quic: bool,
+    ) {
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
         let params = OverlayParams {
             flags: 0,
@@ -182,7 +192,7 @@ impl RustTestNode {
             runtime: Some(self.rt.handle().clone()),
         };
         self.overlay
-            .add_private_overlay(params, &local_key, peers)
+            .add_private_overlay(params, &local_key, peers, use_quic)
             .expect("add_private_overlay failed");
     }
 
@@ -204,7 +214,7 @@ impl RustTestNode {
             .expect("parse IP");
 
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
-        self.adnl.add_peer(local_key.id(), &ip, &pubkey).expect("add_peer");
+        self.adnl.add_peer(local_key.id(), &ip, None, &pubkey).expect("add_peer");
     }
 
     /// Add the C++ node as an ADNL peer AND to a specific public overlay via signed node.
@@ -215,7 +225,7 @@ impl RustTestNode {
             .expect("parse IP");
 
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
-        self.adnl.add_peer(local_key.id(), &ip, &pubkey).expect("add_peer");
+        self.adnl.add_peer(local_key.id(), &ip, None, &pubkey).expect("add_peer");
 
         let signed_node = Self::get_cpp_signed_node(cpp, overlay_id);
         self.overlay.add_public_peer(&ip, &signed_node, overlay_id).expect("add_public_peer");
@@ -231,7 +241,7 @@ impl RustTestNode {
         let other_ip = IpAddress::from_versioned_string(&other.addr, None).expect("parse other IP");
 
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
-        self.adnl.add_peer(local_key.id(), &other_ip, &other_pubkey).expect("add_peer");
+        self.adnl.add_peer(local_key.id(), &other_ip, None, &other_pubkey).expect("add_peer");
 
         let signed_node =
             other.overlay.get_signed_node(overlay_id, false).expect("get_signed_node");
@@ -517,10 +527,15 @@ impl RustQuicTestNode {
             let _guard = rt.enter();
             let quic_subscribers: Vec<Arc<dyn Subscriber>> =
                 vec![test_sub as Arc<dyn Subscriber>, overlay.clone()];
-            let quic = QuicNode::new(quic_subscribers, cancellation_token.clone(), None);
+            let quic = QuicNode::new(
+                quic_subscribers,
+                cancellation_token.clone(),
+                None,
+                rt.handle().clone(),
+            );
             let bind_addr = SocketAddr::new(
-                Ipv4Addr::from(adnl.ip_address().ip()).into(),
-                adnl.ip_address().port() + QuicNode::OFFSET_PORT,
+                Ipv4Addr::from(adnl.ip_address_adnl().ip()).into(),
+                adnl.ip_address_adnl().port() + QuicNode::OFFSET_PORT,
             );
             quic.add_key(&key_data, &key_id, bind_addr).expect("QUIC add_key failed");
             quic
@@ -573,7 +588,7 @@ impl RustQuicTestNode {
         let ip = IpAddress::from_versioned_string(&format!("127.0.0.1:{}", cpp.udp_port()), None)
             .expect("parse IP");
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
-        self.adnl.add_peer(local_key.id(), &ip, &pubkey).expect("add_peer");
+        self.adnl.add_peer(local_key.id(), &ip, None, &pubkey).expect("add_peer");
     }
 
     /// Add the C++ node as a QUIC peer (registers its QUIC address = udp_port + 1000)
@@ -585,6 +600,49 @@ impl RustQuicTestNode {
         self.quic.add_peer_key(pubkey.id().clone(), quic_addr).expect("add_quic_peer");
     }
 
+    /// Add the C++ node as both ADNL and QUIC peer by simulating reception of an
+    /// AddressList that contains adnl.address.quic (the new address type from C++ PR #2184).
+    /// The QUIC address is discovered via `parse_quic_address` — no hardcoded offset.
+    pub fn add_cpp_peer_via_address_list(&self, cpp: &CppTestNode, quic_port: u16) {
+        let raw_key = RustTestNode::parse_cpp_pubkey(cpp.pubkey());
+        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+
+        // Build an AddressList as a C++ node with PR #2184 would advertise:
+        // both adnl.address.udp and adnl.address.quic
+        let ip: u32 = u32::from(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let addr_list = AddressList {
+            addrs: vec![
+                AdnlAddress::Adnl_Address_Udp(AdnlAddrUdp {
+                    ip: ip as i32,
+                    port: cpp.udp_port() as i32,
+                }),
+                AdnlAddress::Adnl_Address_Quic(AdnlAddrQuic {
+                    ip: ip as i32,
+                    port: quic_port as i32,
+                }),
+            ]
+            .into(),
+            version: adnl::common::Version::get(),
+            reinit_date: adnl::common::Version::get(),
+            priority: 0,
+            expire_at: 0,
+        };
+
+        // Parse ADNL and QUIC addresses from the address list
+        let (adnl_addr, quic_addr) =
+            AdnlNode::parse_address_list(&addr_list).expect("parse").expect("has ADNL addr");
+
+        // Add ADNL peer using the UDP address, passing QUIC address too
+        let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
+        let quic_addr = quic_addr.expect("AddressList should contain adnl.address.quic");
+        self.adnl
+            .add_peer(local_key.id(), &adnl_addr, Some(&quic_addr), &pubkey)
+            .expect("add_peer");
+
+        // Do NOT call quic.add_peer_key — let ensure_peer_registered discover
+        // the QUIC address via adnl.peer_ip_address() at connection time.
+    }
+
     /// Add C++ node as both ADNL peer (UDP) and QUIC peer, and to overlay
     pub fn add_cpp_peer_full(&self, cpp: &mut CppTestNode, overlay_id: &Arc<OverlayShortId>) {
         let raw_key = RustTestNode::parse_cpp_pubkey(cpp.pubkey());
@@ -592,7 +650,7 @@ impl RustQuicTestNode {
         let ip = IpAddress::from_versioned_string(&format!("127.0.0.1:{}", cpp.udp_port()), None)
             .expect("parse IP");
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
-        self.adnl.add_peer(local_key.id(), &ip, &pubkey).expect("add_peer");
+        self.adnl.add_peer(local_key.id(), &ip, None, &pubkey).expect("add_peer");
 
         // Add to overlay via signed node
         let signed_node = RustTestNode::get_cpp_signed_node(cpp, overlay_id);
@@ -761,7 +819,12 @@ impl RustQuicTestNode {
     }
 
     /// Create a private overlay with signing key and peer list.
-    pub fn add_private_overlay(&self, overlay_id: &Arc<OverlayShortId>, peers: &[Arc<KeyId>]) {
+    pub fn add_private_overlay(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        peers: &[Arc<KeyId>],
+        use_quic: bool,
+    ) {
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
         let params = OverlayParams {
             flags: 0,
@@ -770,7 +833,7 @@ impl RustQuicTestNode {
             runtime: Some(self.rt.handle().clone()),
         };
         self.overlay
-            .add_private_overlay(params, &local_key, peers)
+            .add_private_overlay(params, &local_key, peers, use_quic)
             .expect("add_private_overlay failed");
     }
 

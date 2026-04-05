@@ -197,8 +197,8 @@ fn bench_rldp(loopback: bool, v2: bool, #[cfg(feature = "debug")] loss_percentag
         #[cfg(feature = "debug")]
         loss_percentage,
     );
-    adnl1.add_peer(key1.id(), adnl2.ip_address(), &key2).unwrap();
-    adnl2.add_peer(key2.id(), adnl1.ip_address(), &key1).unwrap();
+    adnl1.add_peer(key1.id(), adnl2.ip_address_adnl(), None, &key2).unwrap();
+    adnl2.add_peer(key2.id(), adnl1.ip_address_adnl(), None, &key1).unwrap();
     if let Some(rt2) = &rt2 {
         rt1.block_on(adnl1.start_over_udp(vec![rldp1.clone()])).unwrap();
         rt2.block_on(adnl2.start_over_udp(vec![rldp2.clone()])).unwrap();

@@ -28,7 +28,7 @@ use catchain::{
 };
 use std::{
     hash::Hash,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicI32, Ordering},
         Arc,
@@ -43,6 +43,8 @@ pub struct NetworkContext {
     pub stack: Arc<NetworkStack>,
     pub catchain_overlay_manager: CatchainOverlayManagerPtr,
     pub broadcast_hops: Option<u8>,
+    /// Explicit QUIC address from config (None = derive as same_ip:adnl_port+1000)
+    pub quic_address: Option<SocketAddr>,
     #[cfg(feature = "telemetry")]
     pub telemetry: FullNodeNetworkTelemetry,
     #[cfg(feature = "telemetry")]
@@ -161,7 +163,12 @@ impl NodeNetwork {
         // Initialize QUIC transport (lazy: no endpoint bound until add_key() is called).
         // Validator ADNL keys are registered when a validator set is activated.
         let quic = {
-            let quic = adnl::QuicNode::new(vec![overlay.clone()], cancellation_token.clone(), None);
+            let quic = adnl::QuicNode::new(
+                vec![overlay.clone()],
+                cancellation_token.clone(),
+                None,
+                tokio::runtime::Handle::current(),
+            );
             overlay.set_quic(quic.clone())?;
             Some(quic)
         };
@@ -169,6 +176,13 @@ impl NodeNetwork {
         let nodes = global_config.dht_nodes()?;
         for peer in nodes.iter() {
             dht.add_peer(peer)?;
+        }
+
+        let default_rldp_roundtrip = config.default_rldp_roundtrip();
+        let quic_address = config.quic_address();
+
+        if quic_address.is_some() {
+            log::info!("QUIC address set for advertising: {:?}", adnl.ip_address_quic());
         }
 
         let dht_key = adnl.key_by_tag(Self::TAG_DHT_KEY)?;
@@ -181,8 +195,6 @@ impl NodeNetwork {
             None,
             cancellation_token.clone(),
         );
-
-        let default_rldp_roundtrip = config.default_rldp_roundtrip();
 
         NodeNetwork::find_dht_nodes(dht.clone(), cancellation_token.clone());
 
@@ -213,6 +225,7 @@ impl NodeNetwork {
             stack,
             catchain_overlay_manager,
             broadcast_hops,
+            quic_address,
             #[cfg(feature = "telemetry")]
             telemetry: FullNodeNetworkTelemetry::new_client(),
             #[cfg(feature = "telemetry")]
@@ -242,7 +255,7 @@ impl NodeNetwork {
     pub async fn start(&self) -> Result<()> {
         log::info!(
             "start network: ip: {}, adnl_id: {}",
-            self.network_context.stack.adnl.ip_address(),
+            self.network_context.stack.adnl.ip_address_adnl(),
             self.network_context.stack.adnl.key_by_tag(Self::TAG_OVERLAY_KEY)?.id()
         );
         self.network_context.stack.start_over_udp_tcp().await?;
@@ -414,15 +427,23 @@ impl NodeNetwork {
                 )?)
                 .await
             {
-                Ok(Some((ip, key))) => {
-                    log::info!("peer {}: found ip: {ip:?}, key: {key:x?}", val.adnl_id);
+                Ok(Some((adnl_addr, quic_addr, key))) => {
+                    log::info!("peer {}: found ip: {adnl_addr:?}, key: {key:x?}", val.adnl_id);
                     match full_node_callback {
                         Some(ref callback) => {
-                            adnl.add_peer(&local_adnl_id, &ip, &Arc::new(key))?;
+                            adnl.add_peer(
+                                &local_adnl_id,
+                                &adnl_addr,
+                                quic_addr.as_ref(),
+                                &Arc::new(key),
+                            )?;
                             callback(val.adnl_id.clone());
                         }
                         None => {
-                            overlay.add_private_peers(&local_adnl_id, vec![(ip, key)])?;
+                            overlay.add_private_peers(
+                                &local_adnl_id,
+                                vec![(adnl_addr, quic_addr, key)],
+                            )?;
                         }
                     }
                 }
@@ -484,15 +505,33 @@ impl NodeNetwork {
             |e| error!("Cannot add validator ADNL key {key_id} for election {election_id}: {e}"),
         )?;
         if let Some(quic) = &self.network_context.stack.quic {
-            let ip_addr = self.network_context.stack.adnl.ip_address();
-            let Some(quic_port) = ip_addr.port().checked_add(adnl::QuicNode::OFFSET_PORT) else {
-                log::warn!(
-                    "QUIC port overflow for ADNL port {}, skipping QUIC key {key_id}",
-                    ip_addr.port()
-                );
-                return Ok(true);
+            let adnl_ip = self.network_context.stack.adnl.ip_address_adnl();
+            let quic_addr = if let Some(addr) = self.network_context.quic_address {
+                addr
+            } else {
+                let Some(quic_port) = adnl_ip.port().checked_add(adnl::QuicNode::OFFSET_PORT)
+                else {
+                    log::warn!(
+                        "QUIC port overflow for ADNL port {}, skipping QUIC key {key_id}",
+                        adnl_ip.port()
+                    );
+                    return Ok(true);
+                };
+                SocketAddr::new(Ipv4Addr::from(adnl_ip.ip()).into(), quic_port)
             };
-            let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_port);
+            let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_addr.port());
+            if quic_addr.ip() != IpAddr::from(Ipv4Addr::UNSPECIFIED)
+                && quic_addr.ip() != IpAddr::from(Ipv4Addr::from(adnl_ip.ip()))
+            {
+                log::warn!(
+                    "QUIC configured address {} differs from ADNL IP {}; \
+                     binding to {} but advertising {}",
+                    quic_addr,
+                    adnl_ip,
+                    bind_addr,
+                    quic_addr
+                );
+            }
             match adnl_key.pvt_key() {
                 Ok(pvt_key) => {
                     if let Err(e) = quic.add_key(pvt_key, &key_id, bind_addr) {
@@ -674,9 +713,9 @@ impl PrivateOverlayOperations for NodeNetwork {
             }
             peers_ids.push(val.adnl_id.clone());
             match self.network_context.stack.dht.fetch_address(&val.adnl_id).await {
-                Ok(Some((addr, key))) => {
-                    log::info!("addr: {:?}, key: {:x?}", &addr, &key);
-                    peers.push((addr, key));
+                Ok(Some((adnl_addr, quic_addr, key))) => {
+                    log::info!("addr: {:?}, key: {:x?}", &adnl_addr, &key);
+                    peers.push((adnl_addr, quic_addr, key));
                 }
                 Ok(None) => {
                     log::info!("addr: {:?} skipped.", &val.adnl_id);

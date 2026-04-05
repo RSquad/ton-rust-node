@@ -233,12 +233,11 @@ pub extern "C" fn transaction_emulator_set_prev_blocks_info(
             match SliceData::load_cell(info_cell).and_then(|mut slice| read_stack_item(&mut slice))
             {
                 Ok(info) => {
-                    if info.is_tuple() {
-                        transaction_emulator.prev_blocks_info = PrevBlocksInfo::Tuple(info);
+                    transaction_emulator.prev_blocks_info = if info.is_tuple() {
+                        PrevBlocksInfo::Tuple(info)
                     } else {
-                        transaction_emulator.prev_blocks_info =
-                            PrevBlocksInfo::Tuple(StackItem::tuple(Vec::new()));
-                    }
+                        PrevBlocksInfo::Tuple(StackItem::tuple(Vec::new()))
+                    };
                 }
                 Err(err) => {
                     log::error!("Failed to parse info_cell: {err}");

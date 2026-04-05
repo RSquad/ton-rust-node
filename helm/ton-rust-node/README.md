@@ -21,6 +21,7 @@ A TON node can run in two roles — **validator** or **fullnode** — using the 
 
 **Validator** participates in network consensus: it validates blocks, votes in elections, and earns rewards. Validator is currently supported on **mainnet** only — testnet validator support is not yet available. A validator is a critical infrastructure component, so:
 
+- **Enable `ports.simplex: true`** — the network uses simplex consensus and validators will not work without it.
 - Never expose `liteserver` or `jsonRpc` ports on a validator. Every open port is an attack surface and adds unnecessary load to a machine that must stay performant and stable.
 - Allocate more resources (see [docs/resources.md](docs/resources.md) for recommended values).
 
@@ -53,6 +54,9 @@ Minimal deployment:
 ```yaml
 # values.yaml
 replicas: 2
+
+ports:
+  simplex: true
 
 services:
   perReplica:
@@ -240,14 +244,14 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### Port parameters
 
-| Name               | Description                                                                                                                                                                 | Value   |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `ports.adnl`       | ADNL port (UDP)                                                                                                                                                             | `30303` |
-| `ports.simplex`    | Simplex consensus port (UDP). Only needed for validators after switching to simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port. | `false` |
-| `ports.control`    | Control port (TCP). Set to null to disable.                                                                                                                                 | `50000` |
-| `ports.liteserver` | Liteserver port (TCP). Set to enable.                                                                                                                                       | `nil`   |
-| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.                                                                                                                                         | `nil`   |
-| `ports.metrics`    | Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable.                                                                                          | `nil`   |
+| Name               | Description                                                                                                                                                              | Value   |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| `ports.adnl`       | ADNL port (UDP)                                                                                                                                                          | `30303` |
+| `ports.simplex`    | Simplex consensus port (UDP). Required for validators — the network uses simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port. | `false` |
+| `ports.control`    | Control port (TCP). Set to null to disable.                                                                                                                              | `50000` |
+| `ports.liteserver` | Liteserver port (TCP). Set to enable.                                                                                                                                    | `nil`   |
+| `ports.jsonRpc`    | JSON-RPC port (TCP). Set to enable.                                                                                                                                      | `nil`   |
+| `ports.metrics`    | Metrics/probes HTTP port (TCP). Serves /metrics, /healthz, /readyz. Set to enable.                                                                                       | `nil`   |
 
 ### Service parameters
 
@@ -318,6 +322,7 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 | Name                  | Description                                                                                                                                                                                            | Value   |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
 | `hostNetwork`         | Bind pods directly to the host network. The pod gets the node's IP with zero NAT overhead. Requires one pod per node — use nodeSelector or podAntiAffinity to spread replicas. See docs/networking.md. | `false` |
+| `dnsPolicy`           | Pod DNS policy (only applies when hostNetwork is true). Defaults to ClusterFirstWithHostNet. Supported values: ClusterFirstWithHostNet, ClusterFirst, Default, None.                                   | `""`    |
 | `hostPort.adnl`       | Expose the ADNL port on the host IP via hostPort                                                                                                                                                       | `false` |
 | `hostPort.simplex`    | Expose the simplex port on the host IP via hostPort                                                                                                                                                    | `false` |
 | `hostPort.control`    | Expose the control port on the host IP via hostPort                                                                                                                                                    | `false` |
@@ -344,11 +349,12 @@ When an `existing*Name` is set, the chart does not create that resource — it o
 
 ### ServiceAccount parameters
 
-| Name                         | Description                                                                   | Value   |
-| ---------------------------- | ----------------------------------------------------------------------------- | ------- |
-| `serviceAccount.enabled`     | Create a ServiceAccount for the pods                                          | `false` |
-| `serviceAccount.name`        | ServiceAccount name. Defaults to the release fullname if not set.             | `""`    |
-| `serviceAccount.annotations` | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding) | `{}`    |
+| Name                            | Description                                                                                                                                                                                                                                      | Value   |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| `serviceAccount.enabled`        | Create a ServiceAccount for the pods                                                                                                                                                                                                             | `false` |
+| `serviceAccount.name`           | ServiceAccount name. Defaults to the release fullname if not set.                                                                                                                                                                                | `""`    |
+| `serviceAccount.annotations`    | Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding)                                                                                                                                                                    | `{}`    |
+| `terminationGracePeriodSeconds` | Time (in seconds) given to the node process to shut down gracefully before SIGKILL. The default Kubernetes value (30s) is too short for a TON node — an unclean kill may corrupt the database and forces a cold boot. Set this to at least 300s. | `300`   |
 
 ### Scheduling parameters
 

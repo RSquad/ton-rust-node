@@ -94,4 +94,5 @@ pub trait ElectionsProvider: Send + Sync {
     async fn account(&mut self, address: &str) -> anyhow::Result<Account>;
     async fn export_public_key(&mut self, key_id: &[u8]) -> anyhow::Result<Vec<u8>>;
     async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet>;
+    async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>>;
 }

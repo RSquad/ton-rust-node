@@ -208,6 +208,7 @@ impl RldpNode {
     const MAX_OUTBOUNDS_PER_PEER: u32 = 3;
     const SIZE_TRANSFER_WAVE: u32 = 10;
     const SPINNER_MS: u64 = 1;
+    const SPINNER_V1_SEND_MS: u64 = 10;
     const TIMEOUT_MAX_MS: u64 = 10000;
     const TIMEOUT_MIN_MS: u64 = 500;
     const TIMEOUT_WARN_MS: u64 = 5000;
@@ -1261,9 +1262,12 @@ impl RldpNode {
                         break 'part;
                     }
                 }
-                tokio::time::timeout(Duration::from_millis(Self::SPINNER_MS), context.pong.recv())
-                    .await
-                    .ok();
+                tokio::time::timeout(
+                    Duration::from_millis(Self::SPINNER_V1_SEND_MS),
+                    context.pong.recv(),
+                )
+                .await
+                .ok();
                 if transfer.state().is_transfer_finished_or_next_part(part)? {
                     #[cfg(feature = "debug")]
                     Self::check_timestamp(

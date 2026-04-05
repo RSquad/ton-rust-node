@@ -1,6 +1,6 @@
 [package]
 name = "contracts"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = 'GPL-3.0'
 
@@ -10,7 +10,6 @@ async-trait = "0.1.89"
 common = { path = "../common" }
 ton_block = { path = "../../block" }
 hex = "0.4.3"
-serde = { version = "1.0.228", features = ["derive"] }
 ton_api = { version = "0.4.32", path = "../../tl/ton_api" }
 ton-http-api-client = { path = "../ton-http-api-client" }
 

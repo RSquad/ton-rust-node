@@ -366,6 +366,9 @@ pub struct TonNodeConfig {
     unsafe_catchain_patches_path: Option<String>,
     #[serde(skip_serializing)]
     ip_address: Option<String>,
+    /// Explicit QUIC address (ip:port). If absent, derived as same_ip:adnl_port+1000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_address_quic: Option<String>,
     adnl_node: Option<AdnlNodeConfigJson>,
     json_rpc_server: Option<JsonRpcServerConfigJson>,
     metrics: Option<MetricsConfigJson>,
@@ -567,6 +570,9 @@ impl TonNodeConfig {
         if let Some(port) = self.port {
             ret.set_port(port)
         }
+        if let Some(quic_addr) = self.quic_address() {
+            ret.set_ip_address_quic(quic_addr);
+        }
         Ok(ret)
     }
 
@@ -685,6 +691,31 @@ impl TonNodeConfig {
 
     pub fn is_accelerated_consensus_disabled(&self) -> bool {
         self.accelerated_consensus_disabled
+    }
+
+    pub fn quic_address(&self) -> Option<SocketAddr> {
+        self.ip_address_quic.as_ref().and_then(|s| match s.parse::<SocketAddr>() {
+            Ok(addr) => {
+                if !addr.ip().is_ipv4() {
+                    log::warn!(
+                        "ip_address_quic \"{s}\" is not an IPv4 address. \
+                         ADNL/TL address lists only support IPv4, so this QUIC address \
+                         cannot be advertised. QUIC address will not be used, \
+                         node will fall back to derived port."
+                    );
+                    None
+                } else {
+                    Some(addr)
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to parse ip_address_quic \"{s}\": {e}. \
+                     QUIC address will not be used, node will fall back to derived port."
+                );
+                None
+            }
+        })
     }
 
     #[cfg(test)]

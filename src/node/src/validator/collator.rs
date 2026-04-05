@@ -59,7 +59,7 @@ use ton_block::{
     Serializable, ShardAccount, ShardAccountBlocks, ShardAccounts, ShardDescr, ShardFees,
     ShardHashes, ShardIdent, ShardStateSplit, ShardStateUnsplit, SliceData, StorageStatDict,
     TopBlockDescrSet, Transaction, TransactionTickTock, UInt256, UsageTree, ValidatorSet,
-    ValidatorsStat, ValueFlow, WorkchainDescr, Workchains, MASTERCHAIN_ID,
+    ValueFlow, WorkchainDescr, Workchains, MASTERCHAIN_ID,
 };
 #[cfg(feature = "xp25")]
 use ton_block::{RefShardBlocks, ShardBlockRef, WcExtra};
@@ -1142,6 +1142,9 @@ impl ExecutionManager {
             msg_metadata,
             is_special,
         )?;
+        if !tr.blackhole_burned().is_zero() {
+            collator_data.value_flow.burned.coins.add(tr.blackhole_burned())?;
+        }
 
         collator_data.update_lt(self.max_lt.load(Ordering::Relaxed));
 
@@ -1623,7 +1626,7 @@ impl Collator {
                 self.after_split,
                 false,
                 &self.prev_blocks_ids,
-                mc_data.config(),
+                collator_data.config.raw_config(),
                 mc_data.mc_state_extra(),
                 false,
                 now,
@@ -1643,7 +1646,7 @@ impl Collator {
             self.collator_settings.is_fake,
         )?;
 
-        self.check_utime(&mc_data, &prev_data, &mut collator_data)?;
+        self.check_utime(&prev_data, &mut collator_data)?;
 
         if is_masterchain {
             self.adjust_shard_config(&mc_data, &mut collator_data)?;
@@ -1767,16 +1770,9 @@ impl Collator {
 
         // tick & special transactions
         if self.shard.is_masterchain() {
-            self.create_ticktock_transactions(
-                false,
-                mc_data,
-                prev_data,
-                collator_data,
-                &mut exec_manager,
-            )
-            .await?;
-            self.create_special_transactions(mc_data, prev_data, collator_data, &mut exec_manager)
+            self.create_ticktock_transactions(false, prev_data, collator_data, &mut exec_manager)
                 .await?;
+            self.create_special_transactions(prev_data, collator_data, &mut exec_manager).await?;
         }
 
         // merge prepare / merge install
@@ -1891,14 +1887,8 @@ impl Collator {
 
         // tock transactions
         if self.shard.is_masterchain() {
-            self.create_ticktock_transactions(
-                true,
-                mc_data,
-                prev_data,
-                collator_data,
-                &mut exec_manager,
-            )
-            .await?;
+            self.create_ticktock_transactions(true, prev_data, collator_data, &mut exec_manager)
+                .await?;
         }
 
         // process newly-generated messages (only by including them into output queue)
@@ -2245,12 +2235,7 @@ impl Collator {
         (gen_utime, gen_utime_ms)
     }
 
-    fn check_utime(
-        &self,
-        mc_data: &McData,
-        prev_data: &PrevData,
-        collator_data: &mut CollatorData,
-    ) -> Result<()> {
+    fn check_utime(&self, prev_data: &PrevData, collator_data: &mut CollatorData) -> Result<()> {
         let now = collator_data.gen_utime;
         if now > collator_data.now_upper_limit() {
             fail!(
@@ -2261,7 +2246,7 @@ impl Collator {
 
         // check whether masterchain catchain rotation is overdue
         let prev_now = prev_data.prev_state_utime();
-        let ccvc = mc_data.config().catchain_config()?;
+        let ccvc = collator_data.config.raw_config().catchain_config()?;
         let lifetime = ccvc.mc_catchain_lifetime;
         if self.shard.is_masterchain()
             && now / lifetime > prev_now / lifetime
@@ -2390,7 +2375,7 @@ impl Collator {
         log::trace!("{}: adjust_shard_config", self.collated_block_descr);
         CHECK!(self.shard.is_masterchain());
         collator_data.set_shards(mc_data.state().shards()?.clone())?;
-        let wc_set = mc_data.config().workchains()?;
+        let wc_set = collator_data.config.raw_config().workchains()?;
         wc_set.iterate_with_keys(|wc_id: i32, wc_info| {
             log::trace!(
                 "
@@ -2445,7 +2430,8 @@ impl Collator {
         let mut cancelled = false;
         let mut new_shard_descrs = collator_data.shards()?.clone();
 
-        let lt_limit = prev_data.prev_state_lt() + mc_data.config().get_max_lt_growth();
+        let lt_limit =
+            prev_data.prev_state_lt() + collator_data.config.raw_config().get_max_lt_growth();
         shard_top_blocks.sort_by(|a, b| cmp_shard_block_descr(a, b));
         let mut shards_updated = HashSet::new();
         let mut tb_act = 0;
@@ -2719,6 +2705,22 @@ impl Collator {
         let shard_fees = collator_data.shard_fees().root_extra().clone();
 
         collator_data.value_flow.fees_collected.add(&shard_fees.fees)?;
+        if let Some(burning_cfg) = collator_data.config.burning_config() {
+            let Some(imported_base) =
+                shard_fees.fees.coins.as_u128().checked_sub(shard_fees.create.coins.as_u128())
+            else {
+                fail!(
+                    "fees_imported is smaller than imported created fees: {} < {}",
+                    shard_fees.fees.coins,
+                    shard_fees.create.coins
+                )
+            };
+            let burned = burning_cfg.calculate_burned_fees(imported_base)?;
+            if !burned.is_zero() {
+                collator_data.value_flow.burned.coins.add(&burned)?;
+                collator_data.value_flow.fees_collected.coins.sub(&burned)?;
+            }
+        }
         collator_data.value_flow.fees_imported = shard_fees.fees;
 
         Ok(())
@@ -2950,7 +2952,8 @@ impl Collator {
         log::trace!("{}: update_value_flow", self.collated_block_descr);
 
         if self.shard.is_masterchain() {
-            collator_data.value_flow.created.coins = mc_data.config().block_create_fees(true)?;
+            collator_data.value_flow.created.coins =
+                collator_data.config.raw_config().block_create_fees(true)?;
 
             collator_data.value_flow.recovered = collator_data.value_flow.created.clone();
             collator_data.value_flow.recovered.add(&collator_data.value_flow.fees_collected)?;
@@ -2959,7 +2962,7 @@ impl Collator {
                 .recovered
                 .add(mc_data.state().state()?.total_validator_fees())?;
 
-            match mc_data.config().fee_collector_address() {
+            match collator_data.config.raw_config().fee_collector_address() {
                 Err(_) => {
                     log::debug!(
                         "{}: fee recovery disabled \
@@ -2980,10 +2983,10 @@ impl Collator {
                 }
             };
 
-            collator_data.value_flow.minted = self.compute_minted_amount(mc_data)?;
+            collator_data.value_flow.minted = self.compute_minted_amount(mc_data, collator_data)?;
 
             if !collator_data.value_flow.minted.is_zero()?
-                && mc_data.config().minter_address().is_err()
+                && collator_data.config.raw_config().minter_address().is_err()
             {
                 log::warn!(
                     "{}: minting of {} disabled: no minting smart contract defined",
@@ -2993,20 +2996,25 @@ impl Collator {
                 collator_data.value_flow.minted = CurrencyCollection::default();
             }
         } else {
-            collator_data.value_flow.created.coins = mc_data.config().block_create_fees(false)?;
+            collator_data.value_flow.created.coins =
+                collator_data.config.raw_config().block_create_fees(false)?;
             collator_data.value_flow.created.coins >>= self.shard.prefix_len();
         }
         collator_data.value_flow.from_prev_blk = prev_data.total_balance().clone();
         Ok(())
     }
 
-    fn compute_minted_amount(&self, mc_data: &McData) -> Result<CurrencyCollection> {
+    fn compute_minted_amount(
+        &self,
+        mc_data: &McData,
+        collator_data: &CollatorData,
+    ) -> Result<CurrencyCollection> {
         log::trace!("{}: compute_minted_amount", self.collated_block_descr);
 
         CHECK!(self.shard.is_masterchain());
         let mut to_mint = CurrencyCollection::default();
 
-        let to_mint_cp = match mc_data.config().to_mint() {
+        let to_mint_cp = match collator_data.config.raw_config().to_mint() {
             Err(e) => {
                 log::warn!(
                     "{}: Can't get config param 7 (to_mint): {}",
@@ -3266,13 +3274,12 @@ impl Collator {
     async fn create_ticktock_transactions(
         &self,
         tock: bool,
-        mc_data: &McData,
         prev_data: &PrevData,
         collator_data: &mut CollatorData,
         exec_manager: &mut ExecutionManager,
     ) -> Result<()> {
         log::trace!("{}: create_ticktock_transactions", self.collated_block_descr);
-        let fundamental_dict = mc_data.config().fundamental_smc_addr()?;
+        let fundamental_dict = collator_data.config.raw_config().fundamental_smc_addr()?;
         for res in &fundamental_dict {
             let account_id = SliceData::load_bitstring(res?.0)?;
             self.create_ticktock_transaction(
@@ -3285,7 +3292,7 @@ impl Collator {
             .await?;
             self.check_stop_flag()?;
         }
-        let account_id = mc_data.config().config_addr.clone();
+        let account_id = collator_data.config.raw_config().config_addr.clone();
         self.create_ticktock_transaction(account_id, tock, prev_data, collator_data, exec_manager)
             .await?;
         exec_manager.wait_transactions(collator_data).await?;
@@ -3334,7 +3341,6 @@ impl Collator {
 
     async fn create_special_transactions(
         &self,
-        mc_data: &McData,
         prev_data: &PrevData,
         collator_data: &mut CollatorData,
         exec_manager: &mut ExecutionManager,
@@ -3344,7 +3350,7 @@ impl Collator {
         }
         log::debug!("{}: create_special_transactions", self.collated_block_descr);
 
-        let account_id = mc_data.config().fee_collector_address()?;
+        let account_id = collator_data.config.raw_config().fee_collector_address()?;
         self.create_special_transaction(
             account_id,
             collator_data.value_flow.recovered.clone(),
@@ -3356,7 +3362,7 @@ impl Collator {
         .await?;
         self.check_stop_flag()?;
 
-        let account_id = mc_data.config().minter_address()?;
+        let account_id = collator_data.config.raw_config().minter_address()?;
         self.create_special_transaction(
             account_id,
             collator_data.value_flow.minted.clone(),
@@ -3924,12 +3930,17 @@ impl Collator {
         let mut value_flow = collator_data.value_flow.clone();
         value_flow.imported = collator_data.in_msgs.root_extra().value_imported.clone();
         value_flow.exported = collator_data.out_msgs.root_extra().clone();
-        value_flow.fees_collected = accounts.root_extra().clone();
-        value_flow.fees_collected.coins.add(&collator_data.in_msgs.root_extra().fees_collected)?;
+        let mut total_fees = accounts.root_extra().clone();
+        total_fees.coins.add(&collator_data.in_msgs.root_extra().fees_collected)?;
 
-        // value_flow.fees_collected.coins.add(&out_msg_dscr.root_extra().coins)?; // TODO: Why only coins?
-
-        value_flow.fees_collected.add(&value_flow.fees_imported)?;
+        value_flow.fees_collected.add(&total_fees)?;
+        if self.shard.is_masterchain() {
+            if let Some(burning_cfg) = collator_data.config.burning_config() {
+                let burned = burning_cfg.calculate_burned_fees(total_fees.coins.as_u128())?;
+                value_flow.fees_collected.coins.sub(&burned)?;
+                value_flow.burned.coins.add(&burned)?;
+            }
+        }
         value_flow.fees_collected.add(&value_flow.created)?;
         value_flow.to_next_blk = new_accounts.full_balance().clone();
         //value_flow.to_next_blk.add(&value_flow.recovered)?;
@@ -3977,7 +3988,7 @@ impl Collator {
         info.set_prev_key_block_seqno(mc_data.prev_key_block_seqno());
         info.write_master_ref(master_ref.as_ref())?;
 
-        if mc_data.config().has_capability(GlobalCapabilities::CapReportVersion) {
+        if collator_data.config.raw_config().has_capability(GlobalCapabilities::CapReportVersion) {
             info.set_gen_software(Some(GlobalVersion {
                 version: supported_version(),
                 capabilities: supported_capabilities(),
@@ -4408,8 +4419,6 @@ impl Collator {
                 None
             };
 
-        let validators_stat = ValidatorsStat::default();
-
         Ok((
             McStateExtra {
                 shards: collator_data.shards()?.clone(),
@@ -4420,7 +4429,6 @@ impl Collator {
                 last_key_block,
                 block_create_stats,
                 global_balance,
-                validators_stat,
             },
             min_ref_mc_seqno,
         ))

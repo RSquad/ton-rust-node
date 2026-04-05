@@ -138,12 +138,6 @@ fn test_mc_state_extra() {
         .unwrap();
 
     write_read_and_assert(extra.clone());
-
-    extra.validators_stat = ValidatorsStat::new(3);
-    extra.validators_stat.update(1, |_| 123).unwrap();
-    extra.validators_stat.update(2, |_| 456).unwrap();
-
-    write_read_and_assert(extra.clone());
 }
 
 fn build_mc_block_extra() -> McBlockExtra {

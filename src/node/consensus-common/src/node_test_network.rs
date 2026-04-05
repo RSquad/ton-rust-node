@@ -243,8 +243,12 @@ impl<'a> NodeTestNetwork<'a> {
                 overlay.set_rldp(rldp.clone()).unwrap();
 
                 let quic = if is_quic_enabled {
-                    let quic =
-                        QuicNode::new(vec![overlay.clone()], cancellation_token.clone(), None);
+                    let quic = QuicNode::new(
+                        vec![overlay.clone()],
+                        cancellation_token.clone(),
+                        None,
+                        tokio::runtime::Handle::current(),
+                    );
                     overlay.set_quic(quic.clone()).unwrap();
                     Some(quic)
                 } else {

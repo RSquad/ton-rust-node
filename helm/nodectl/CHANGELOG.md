@@ -5,6 +5,26 @@ All notable changes to the nodectl Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/nodectl/v0.1.0`).
 
+## [0.2.0] - 2026-03-24
+
+appVersion: `v0.3.0`
+
+### Added
+
+- `service.nodePort` — fixed node port when `service.type` is `NodePort`
+- `service.clusterIP` — explicit ClusterIP (set to `None` for headless)
+- `service.loadBalancerIP` — static IP for cloud load balancers
+- `service.externalTrafficPolicy` — `Local` or `Cluster` for NodePort/LoadBalancer
+- `networkPolicy.allowFrom` — flexible network policy peers (ipBlock, podSelector, namespaceSelector)
+
+### Changed
+
+- Default image updated to nodectl `v0.3.0`
+
+### Removed
+
+- `networkPolicy.allowCIDRs` — replaced by `networkPolicy.allowFrom` which accepts standard NetworkPolicy peers
+
 ## [0.1.4] - 2026-03-19
 
 appVersion: `v0.2.1`

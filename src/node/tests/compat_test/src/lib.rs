@@ -135,6 +135,9 @@ pub enum CppCommand {
         pubkey: String,
         ip: String,
         port: u16,
+        /// Optional explicit QUIC port (included as adnl.address.quic in address list)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quic_port: Option<u16>,
     },
 
     #[serde(rename = "create_overlay")]
@@ -516,10 +519,22 @@ impl CppTestNode {
 
     /// Add a peer to the ADNL peer table
     pub fn add_peer(&mut self, pubkey_tl_b64: &str, ip: &str, port: u16) -> Result<String> {
+        self.add_peer_with_quic(pubkey_tl_b64, ip, port, None)
+    }
+
+    /// Add a peer with an optional explicit QUIC address (adnl.address.quic)
+    pub fn add_peer_with_quic(
+        &mut self,
+        pubkey_tl_b64: &str,
+        ip: &str,
+        port: u16,
+        quic_port: Option<u16>,
+    ) -> Result<String> {
         let result = self.expect_result(&CppCommand::AddPeer {
             pubkey: pubkey_tl_b64.to_string(),
             ip: ip.to_string(),
             port,
+            quic_port,
         })?;
         result["peer_id"]
             .as_str()
