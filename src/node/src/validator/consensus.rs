@@ -146,11 +146,15 @@ impl ConsensusOptions {
         }
     }
 
-    /// Check if accelerated consensus is enabled (catchain-specific)
+    /// Check if accelerated consensus is enabled.
+    ///
+    /// Simplex always uses the pipeline context for precollation (chained block
+    /// generation), so it must return `true` here so that freshly collated states
+    /// are kept in `PipelineContext` and available for the next collation round.
     pub fn is_accelerated_consensus_enabled(&self) -> bool {
         match self {
             ConsensusOptions::Catchain(opts) => opts.accelerated_consensus_enabled,
-            ConsensusOptions::Simplex(_) => false,
+            ConsensusOptions::Simplex(_) => true,
         }
     }
 }
