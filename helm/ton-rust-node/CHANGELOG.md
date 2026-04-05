@@ -5,6 +5,14 @@ All notable changes to the Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/v0.3.0`).
 
+## [0.4.5] - 2026-04-05
+
+appVersion: `v0.4.0`
+
+### Changed
+
+- Default image tag and appVersion updated to `v0.4.0`
+
 ## [0.4.4] - 2026-04-02
 
 appVersion: `v0.3.0`
