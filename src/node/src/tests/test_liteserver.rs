@@ -33,11 +33,12 @@ use ton_api::{
     ton::lite_server::{accountid::AccountId as AccountIdTl, BlockHeader, LookupBlockResult},
 };
 use ton_block::{
-    fail, read_single_root_boc, write_boc, AccountDispatchQueue, BlkPrevInfo, Block, BlockExtra,
-    BlockIdExt, BlockInfo, ChildCell, CurrencyCollection, DispatchQueue, EnqueuedMsg, ExtBlkRef,
-    GetRepresentationHash, IntermediateAddress, InternalMessageHeader, KeyId, MerkleUpdate,
-    Message, MsgAddressInt, MsgEnvelope, OutMsgQueue, OutMsgQueueExtra, OutMsgQueueInfo,
-    OutMsgQueueKey, ShardIdent, UInt256, ValueFlow,
+    fail, read_single_root_boc, write_boc, AccountBlock, AccountDispatchQueue, AccountStatus,
+    BlkPrevInfo, Block, BlockExtra, BlockIdExt, BlockInfo, ChildCell, CurrencyCollection,
+    DispatchQueue, EnqueuedMsg, ExtBlkRef, GetRepresentationHash, HashUpdate, IntermediateAddress,
+    InternalMessageHeader, KeyId, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope,
+    OutMsgQueue, OutMsgQueueExtra, OutMsgQueueInfo, OutMsgQueueKey, ShardAccountBlocks, ShardIdent,
+    Transaction, Transactions, UInt256, ValueFlow,
 };
 
 //static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -2510,4 +2511,273 @@ async fn test_account_state_lru_eviction() -> Result<()> {
     assert_eq!(compute_count.load(Ordering::SeqCst), 5);
 
     Ok(())
+}
+
+// list_block_transactions tests
+fn build_block_with_txs(
+    shard: ShardIdent,
+    seq_no: u32,
+    txs: &[(UInt256, u64)],
+) -> Result<(Vec<u8>, BlockIdExt)> {
+    let mut sab = ShardAccountBlocks::default();
+    for (account_id, lt) in txs {
+        let mut tx = Transaction::with_address_and_status(
+            account_id.clone().into(),
+            AccountStatus::AccStateActive,
+        );
+        tx.set_logical_time(*lt);
+        let acc_block = AccountBlock::with_transaction(account_id.clone().into(), &tx)?;
+        sab.insert(&acc_block)?;
+    }
+    let mut extra = BlockExtra::default();
+    extra.write_account_blocks(&sab)?;
+
+    let mut info = BlockInfo::default();
+    info.set_shard(shard.clone());
+    info.set_seq_no(seq_no)?;
+    info.set_prev_stuff(
+        false,
+        &BlkPrevInfo::Block {
+            prev: ExtBlkRef {
+                end_lt: 1,
+                seq_no: seq_no.saturating_sub(1),
+                root_hash: UInt256::from([0xAB; 32]),
+                file_hash: UInt256::from([0xCD; 32]),
+            },
+        },
+    )?;
+    let block = Block::with_params(0, info, ValueFlow::default(), MerkleUpdate::default(), extra)?;
+    finalize_block_to_boc(
+        BlockIdExt {
+            shard_id: shard,
+            seq_no,
+            root_hash: UInt256::default(),
+            file_hash: UInt256::default(),
+        },
+        &block,
+    )
+}
+
+fn build_block_with_multi_tx_account(
+    shard: ShardIdent,
+    seq_no: u32,
+    account_id: &UInt256,
+    lts: &[u64],
+) -> Result<(Vec<u8>, BlockIdExt)> {
+    let account_addr: AccountId = account_id.clone().into();
+    let mut transactions = Transactions::default();
+    for lt in lts {
+        let mut tx = Transaction::with_address_and_status(
+            account_addr.clone(),
+            AccountStatus::AccStateActive,
+        );
+        tx.set_logical_time(*lt);
+        transactions.insert(&tx)?;
+    }
+    let hash_update = HashUpdate::with_hashes(UInt256::default(), UInt256::default());
+    let acc_block = AccountBlock::with_params(&account_addr, &transactions, &hash_update)?;
+    let mut sab = ShardAccountBlocks::default();
+    sab.insert(&acc_block)?;
+
+    let mut extra = BlockExtra::default();
+    extra.write_account_blocks(&sab)?;
+
+    let mut info = BlockInfo::default();
+    info.set_shard(shard.clone());
+    info.set_seq_no(seq_no)?;
+    info.set_prev_stuff(
+        false,
+        &BlkPrevInfo::Block {
+            prev: ExtBlkRef {
+                end_lt: 1,
+                seq_no: seq_no.saturating_sub(1),
+                root_hash: UInt256::from([0xAB; 32]),
+                file_hash: UInt256::from([0xCD; 32]),
+            },
+        },
+    )?;
+    let block = Block::with_params(0, info, ValueFlow::default(), MerkleUpdate::default(), extra)?;
+    finalize_block_to_boc(
+        BlockIdExt {
+            shard_id: shard,
+            seq_no,
+            root_hash: UInt256::default(),
+            file_hash: UInt256::default(),
+        },
+        &block,
+    )
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_empty_block() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let (data, block_id) = build_block_with_txs(shard, 200, &[])?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.ids.len(), 0);
+    assert_eq!(result.incomplete, false.into());
+    assert_eq!(result.req_count, 100);
+    assert_eq!(result.id, block_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_single_tx() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let acc = UInt256::from([0x11; 32]);
+    let (data, block_id) = build_block_with_txs(shard, 201, &[(acc.clone(), 100)])?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.ids.len(), 1);
+    assert_eq!(result.incomplete, false.into());
+    let tid = &result.ids[0];
+    assert_eq!(tid.account.as_ref().unwrap(), &acc);
+    assert_eq!(tid.lt.unwrap(), 100);
+    assert!(tid.hash.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_with_proof() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let txs = vec![(UInt256::from([0x11; 32]), 100)];
+    let (data, block_id) = build_block_with_txs(shard, 206, &txs)?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result_no_proof = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+    assert!(result_no_proof.proof.is_empty());
+
+    let result_with_proof = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0x20, // WANT_PROOF
+        100,
+        None,
+    )
+    .await?;
+    assert!(!result_with_proof.proof.is_empty());
+    let proof_cell = read_single_root_boc(&result_with_proof.proof)?;
+    let _proof = MerkleProof::construct_from_cell(proof_cell)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_ext_returns_tx_cells() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let txs = vec![(UInt256::from([0x11; 32]), 100), (UInt256::from([0x22; 32]), 200)];
+    let (data, block_id) = build_block_with_txs(shard, 207, &txs)?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions_ext(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.id, block_id);
+    assert_eq!(result.incomplete, false.into());
+    assert!(!result.transactions.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_multiple_txs_per_account() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let acc = UInt256::from([0x42; 32]);
+    let (data, block_id) = build_block_with_multi_tx_account(shard, 210, &acc, &[10, 20, 30])?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.ids.len(), 3);
+    assert_eq!(result.ids[0].lt.unwrap(), 10);
+    assert_eq!(result.ids[1].lt.unwrap(), 20);
+    assert_eq!(result.ids[2].lt.unwrap(), 30);
+    for tid in &result.ids {
+        assert_eq!(tid.account.as_ref().unwrap(), &acc);
+    }
+    Ok(())
+}
+
+// VM stack BOC serialization roundtrip tests
+#[test]
+fn test_vm_stack_boc_roundtrip_mixed_types() {
+    let empty_cell = ton_block::BuilderData::new().into_cell().unwrap();
+    let cases: Vec<Vec<StackItem>> = vec![
+        vec![],
+        vec![StackItem::int(0)],
+        vec![StackItem::int(42), StackItem::int(-1)],
+        vec![StackItem::int(1), StackItem::int(2), StackItem::int(3)],
+        vec![StackItem::cell(empty_cell), StackItem::None],
+    ];
+    for items in &cases {
+        let boc = serialize_vm_stack_boc(items).unwrap();
+        let decoded = deserialize_vm_stack_boc(&boc).unwrap();
+        assert_eq!(decoded.len(), items.len(), "length mismatch for {:?}", items);
+    }
+}
+
+#[test]
+fn test_vm_stack_boc_roundtrip_extreme_ints() {
+    let items = vec![StackItem::int(i64::MAX), StackItem::int(i64::MIN)];
+    let boc = serialize_vm_stack_boc(&items).unwrap();
+    let decoded = deserialize_vm_stack_boc(&boc).unwrap();
+    assert_eq!(decoded.len(), 2);
+    match &decoded[0] {
+        StackItem::Integer(v) => {
+            assert_eq!(v.as_integer_value(i64::MIN..=i64::MAX).unwrap(), i64::MAX)
+        }
+        other => panic!("expected int(MAX), got {:?}", other),
+    }
+    match &decoded[1] {
+        StackItem::Integer(v) => {
+            assert_eq!(v.as_integer_value(i64::MIN..=i64::MAX).unwrap(), i64::MIN)
+        }
+        other => panic!("expected int(MIN), got {:?}", other),
+    }
 }

@@ -49,12 +49,12 @@ use ton_api::{
             libraryresultwithproof::LibraryResultWithProof, lookupblockresult::LookupBlockResult,
             masterchaininfo::MasterchainInfo, masterchaininfoext::MasterchainInfoExt,
             outmsgqueuesize::OutMsgQueueSize, outmsgqueuesizes::OutMsgQueueSizes,
-            partialblockproof::PartialBlockProof, sendmsgstatus::SendMsgStatus,
-            shardblocklink::ShardBlockLink, shardblockproof::ShardBlockProof, shardinfo::ShardInfo,
-            transactionid::TransactionId, transactionid3::TransactionId3,
-            transactioninfo::TransactionInfo, transactionlist::TransactionList,
-            transactionmetadata::TransactionMetadata, validatorstats::ValidatorStats,
-            version::Version, BlockTransactions as BlockTxEnum,
+            partialblockproof::PartialBlockProof, runmethodresult::RunMethodResult,
+            sendmsgstatus::SendMsgStatus, shardblocklink::ShardBlockLink,
+            shardblockproof::ShardBlockProof, shardinfo::ShardInfo, transactionid::TransactionId,
+            transactionid3::TransactionId3, transactioninfo::TransactionInfo,
+            transactionlist::TransactionList, transactionmetadata::TransactionMetadata,
+            validatorstats::ValidatorStats, version::Version, BlockTransactions as BlockTxEnum,
             BlockTransactionsExt as BlockTxExtEnum, Error as ErrorEnum,
         },
         rpc::lite_server::{
@@ -64,7 +64,7 @@ use ton_api::{
             GetMasterchainInfo, GetMasterchainInfoExt, GetOneTransaction, GetOutMsgQueueSizes,
             GetShardBlockProof, GetShardInfo, GetState, GetTime, GetTransactions,
             GetValidatorStats, GetVersion, ListBlockTransactions, ListBlockTransactionsExt,
-            LookupBlock, LookupBlockWithProof, Query, QueryPrefix, SendMessage,
+            LookupBlock, LookupBlockWithProof, Query, QueryPrefix, RunSmcMethod, SendMessage,
             WaitMasterchainSeqno,
         },
         ton_node::{blockid::BlockId, zerostateidext::ZeroStateIdExt},
@@ -74,9 +74,13 @@ use ton_api::{
 use ton_block::{
     error, fail, read_single_root_boc, write_boc, write_boc_multi, Account, AccountId,
     AccountIdPrefixFull, Block, BlockError, BlockIdExt, BocWriter, BuilderData, Cell,
-    Deserializable, HashmapAugType, HashmapType, MerkleProof, MsgAddrStd, MsgAddressInt, Result,
-    Serializable, ShardIdent, ShardStateUnsplit, SliceData, Transaction, UInt256, UsageTree,
-    INVALID_WORKCHAIN_ID, MASTERCHAIN_ID,
+    Deserializable, HashmapAugType, HashmapType, IBitstring, MerkleProof, MsgAddrStd,
+    MsgAddressInt, Result, Serializable, ShardIdent, ShardStateUnsplit, SliceData, Transaction,
+    UInt256, UsageTree, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID,
+};
+use ton_vm::{
+    smart_contract_info::{convert_stack, convert_ton_stack},
+    stack::StackItem,
 };
 
 pub type LookupMode = i32;
@@ -707,6 +711,146 @@ impl LiteServerQuerySubscriber {
             Ok(AccountState { id, shardblk, shard_proof, proof, state })
         })
         .await?
+    }
+
+    async fn run_smc_method(
+        engine: &Arc<dyn EngineOperations>,
+        mode: i32,
+        block_id: BlockIdExt,
+        account_id: AccountIdTl,
+        method_id: i64,
+        params: Vec<u8>,
+    ) -> Result<RunMethodResult> {
+        if block_id.shard().workchain_id() == INVALID_WORKCHAIN_ID {
+            fail!("Reference block id for runSmcMethod is invalid");
+        }
+        if params.len() >= 65536 {
+            fail!("more than 64k parameter bytes passed");
+        }
+        if mode & !0x3f != 0 {
+            fail!("unsupported mode in runSmcMethod");
+        }
+
+        let account_address = MsgAddressInt::AddrStd(MsgAddrStd {
+            anycast: None,
+            workchain_id: account_id.workchain as i8,
+            address: account_id.id.clone().into(),
+        });
+
+        let id;
+        let shardblk;
+        let shard_state;
+        let mc_state_root;
+        let mut shard_proof_bytes = vec![];
+
+        if !block_id.shard_id.is_masterchain() {
+            id = block_id.clone();
+            shardblk = block_id.clone();
+            shard_state = engine.load_and_pin_state(&block_id).await?;
+            let master_ref = shard_state
+                .state()
+                .state()?
+                .master_ref()
+                .ok_or_else(|| error!("shard state has no master_ref"))?;
+            let mc_block_id = BlockIdExt::from_ext_blk(master_ref.master.clone());
+            let mc_state = engine.load_and_pin_state(&mc_block_id).await?;
+            mc_state_root = mc_state.state().root_cell().clone();
+        } else {
+            id = if block_id.seq_no != !0 {
+                block_id.clone()
+            } else {
+                (*get_last_liteserver_state_block(engine)?).clone()
+            };
+            let mc_state = engine.load_and_pin_state(&id).await?;
+            mc_state_root = mc_state.state().root_cell().clone();
+
+            if account_id.workchain == MASTERCHAIN_ID {
+                shard_state = mc_state;
+                shardblk = id.clone();
+            } else {
+                let mut sb_id = None;
+                for top_id in mc_state.state().top_blocks(account_address.workchain_id())? {
+                    if top_id.shard().contains_address(&account_address)? {
+                        sb_id = Some(top_id);
+                        break;
+                    }
+                }
+                shardblk =
+                    sb_id.ok_or_else(|| error!("No shard found for address {account_address}"))?;
+                shard_state = engine.load_and_pin_state(&shardblk).await?;
+
+                if mode & 1 != 0 {
+                    let mc_state_proof_cell = state_header_proof(engine, &id).await?;
+                    let shard_id = shardblk.shard_id.clone();
+                    let mc_root_for_proof = mc_state_root.clone();
+                    shard_proof_bytes = tokio::task::spawn_blocking(move || {
+                        let shard_header = create_shard_proof(&mc_root_for_proof, &shard_id)?;
+                        BocWriter::with_roots([mc_state_proof_cell, shard_header.serialize()?])?
+                            .write_to_vec()
+                    })
+                    .await??;
+                }
+            }
+        }
+
+        let state_proof_cell =
+            if mode & 1 != 0 { Some(state_header_proof(engine, &shardblk).await?) } else { None };
+
+        let shard_root = shard_state.state().root_cell().clone();
+        let addr = account_address.clone();
+        let (exit_code, result_bytes, proof_bytes) = tokio::task::spawn_blocking(
+            move || -> Result<(i32, Option<Vec<u8>>, Option<Vec<u8>>)> {
+                let usage_tree = UsageTree::with_params(shard_root.clone(), true);
+                let uss = ShardStateUnsplit::construct_from_cell(usage_tree.root_cell())?;
+                let shard_account =
+                    uss.read_accounts()?.account(&addr.address())?.unwrap_or_default();
+
+                let proof = if let Some(spc) = state_proof_cell {
+                    let acc_proof = MerkleProof::create_by_usage_tree(&shard_root, &usage_tree)?;
+                    Some(BocWriter::with_roots([spc, acc_proof.serialize()?])?.write_to_vec()?)
+                } else {
+                    None
+                };
+
+                let account = shard_account.read_account()?;
+                if account.get_code().is_none() {
+                    return Ok((-256, None, proof));
+                }
+
+                let input_stack = deserialize_vm_stack_boc(&params)?;
+                let input_entries = convert_stack(&input_stack)?;
+
+                let run_result = ton_vm::run_smc_method(
+                    &shard_account,
+                    mc_state_root,
+                    method_id as u32,
+                    input_entries,
+                )?;
+
+                let result_bytes = if mode & 4 != 0 {
+                    let result_items = convert_ton_stack(&run_result.stack)?;
+                    Some(serialize_vm_stack_boc(&result_items)?)
+                } else {
+                    None
+                };
+
+                Ok((run_result.exit_code, result_bytes, proof))
+            },
+        )
+        .await??;
+
+        Ok(RunMethodResult {
+            mode,
+            id: id.into(),
+            shardblk: shardblk.into(),
+            shard_proof: if mode & 1 != 0 { Some(shard_proof_bytes) } else { None },
+            proof: proof_bytes,
+            state_proof: None,
+            init_c7: None,
+            lib_extras: None,
+            exit_code,
+            result: result_bytes,
+        })
     }
 
     async fn get_account_state_coalesced(
@@ -2521,6 +2665,8 @@ impl LiteServerQuerySubscriber {
                     q.lt,
                     q.utime
                 ),
+            RunSmcMethod =>
+                |q| Self::run_smc_method(engine, q.mode, q.id, q.account, q.method_id, q.params),
             SendMessage =>
                 |q| Self::send_message(engine, q.body),
         );
@@ -2781,7 +2927,8 @@ impl Subscriber for LiteServerQuerySubscriber {
             || query.is::<GetShardBlockProof>()
             || query.is::<ListBlockTransactions>()
             || query.is::<ListBlockTransactionsExt>()
-            || query.is::<LookupBlockWithProof>();
+            || query.is::<LookupBlockWithProof>()
+            || query.is::<RunSmcMethod>();
 
         // Wait-prefixed queries go through the shared wait registry
         if let Some((want_seqno, timeout_ms)) = maybe_wait {
@@ -2816,6 +2963,238 @@ impl Subscriber for LiteServerQuerySubscriber {
         });
         Ok(QueryResult::Consumed(QueryAnswer::Pending(handle)))
     }
+}
+
+// VmStack BOC serialization helpers (C++ compatible format)
+// Format: vm_stack#_ depth:(## 24) stack:(VmStackList depth) = VmStack;
+//  vm_stk_nil#_ = VmStackList 0;
+//  vm_stk_cons#_ {n:#} rest:^(VmStackList n) tos:VmStackValue = VmStackList (n + 1);
+
+fn deserialize_vm_stack_boc(boc: &[u8]) -> Result<Vec<StackItem>> {
+    if boc.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = read_single_root_boc(boc)?;
+    let mut cs = SliceData::load_cell(root)?;
+    let depth = cs.get_next_int(24)? as usize;
+    if depth == 0 {
+        return Ok(Vec::new());
+    }
+    if depth > 1024 {
+        fail!("VmStack depth {} exceeds limit 1024", depth);
+    }
+    let rest = cs.checked_drain_reference()?;
+    let top = read_vm_stack_value(&mut cs)?;
+    let mut items = vec![top];
+
+    let mut rest_cell = rest;
+    for _ in 0..depth - 1 {
+        let mut rest_cs = SliceData::load_cell(rest_cell)?;
+        let next_rest = rest_cs.checked_drain_reference()?;
+        let item = read_vm_stack_value(&mut rest_cs)?;
+        items.push(item);
+        rest_cell = next_rest;
+    }
+    items.reverse();
+    Ok(items)
+}
+
+fn serialize_vm_stack_boc(items: &[StackItem]) -> Result<Vec<u8>> {
+    let n = items.len();
+    let mut cb = BuilderData::new();
+    cb.append_bits(n, 24)?;
+    if n == 0 {
+        return write_boc(&cb.into_cell()?);
+    }
+    // vm_stk_nil = empty cell
+    let mut rest = BuilderData::new().into_cell()?;
+    for item in items.iter().take(n - 1) {
+        let mut cons = BuilderData::new();
+        cons.checked_append_reference(rest)?;
+        write_vm_stack_value(item, &mut cons)?;
+        rest = cons.into_cell()?;
+    }
+    cb.checked_append_reference(rest)?;
+    write_vm_stack_value(&items[n - 1], &mut cb)?;
+    write_boc(&cb.into_cell()?)
+}
+
+fn read_vm_stack_value(cs: &mut SliceData) -> Result<StackItem> {
+    let tag = cs.get_next_byte()?;
+    match tag {
+        0x00 => Ok(StackItem::None),
+        0x01 => {
+            let val = cs.get_next_i64()?;
+            Ok(StackItem::int(val))
+        }
+        0x02 => {
+            let next = cs.get_next_byte()?;
+            match next {
+                0xFF => Ok(StackItem::integer(ton_vm::stack::integer::IntegerData::nan())),
+                0x00 => {
+                    let bytes = cs.get_next_u256()?;
+                    Ok(StackItem::integer(ton_vm::stack::integer::IntegerData::from_bytes(
+                        bytes, 256, false, true,
+                    )?))
+                }
+                0x01 => {
+                    let bytes_256 = cs.get_next_u256()?;
+                    let mut bytes = vec![0xff];
+                    bytes.extend_from_slice(&bytes_256);
+                    Ok(StackItem::integer(ton_vm::stack::integer::IntegerData::from_bytes(
+                        &bytes, 264, true, true,
+                    )?))
+                }
+                _ => fail!("VmStackValue: invalid big int subtag 0x{:02x}", next),
+            }
+        }
+        0x03 => {
+            let cell = cs.checked_drain_reference()?;
+            Ok(StackItem::cell(cell))
+        }
+        0x04 => {
+            let cell = cs.checked_drain_reference()?;
+            let st_bits = cs.get_next_int(10)? as usize;
+            let end_bits = cs.get_next_int(10)? as usize;
+            let st_ref = cs.get_next_int(3)? as usize;
+            let end_ref = cs.get_next_int(3)? as usize;
+            if st_bits > end_bits || st_ref > end_ref {
+                fail!("VmStackValue: invalid slice window");
+            }
+            let slice = SliceData::load_cell_with_window(cell, st_bits..end_bits, st_ref..end_ref)?;
+            Ok(StackItem::slice(slice))
+        }
+        0x05 => {
+            let cell = cs.checked_drain_reference()?;
+            let cell_slice = SliceData::load_cell(cell)?;
+            let mut builder = BuilderData::new();
+            builder.checked_append_references_and_data(&cell_slice)?;
+            Ok(StackItem::builder(builder))
+        }
+        0x07 => {
+            let n = cs.get_next_u16()? as usize;
+            read_vm_tuple(cs, n)
+        }
+        _ => fail!("VmStackValue: unknown tag 0x{:02x}", tag),
+    }
+}
+
+fn read_vm_tuple(cs: &mut SliceData, n: usize) -> Result<StackItem> {
+    if n == 0 {
+        return Ok(StackItem::tuple(Vec::new()));
+    }
+    if n == 1 {
+        let cell = cs.checked_drain_reference()?;
+        let mut item_cs = SliceData::load_cell(cell)?;
+        let item = read_vm_stack_value(&mut item_cs)?;
+        return Ok(StackItem::tuple(vec![item]));
+    }
+    let mut head = cs.checked_drain_reference()?;
+    let tail = cs.checked_drain_reference()?;
+    let mut tail_cs = SliceData::load_cell(tail)?;
+    let last = read_vm_stack_value(&mut tail_cs)?;
+
+    let mut remaining = n - 1;
+    let mut items = Vec::with_capacity(n);
+    while remaining > 1 {
+        let mut head_cs = SliceData::load_cell(head)?;
+        let next_head = head_cs.checked_drain_reference()?;
+        let item_cell = head_cs.checked_drain_reference()?;
+        let mut item_cs = SliceData::load_cell(item_cell)?;
+        items.push(read_vm_stack_value(&mut item_cs)?);
+        head = next_head;
+        remaining -= 1;
+    }
+    let mut head_cs = SliceData::load_cell(head)?;
+    let first = read_vm_stack_value(&mut head_cs)?;
+    items.push(first);
+    items.reverse();
+    items.push(last);
+    Ok(StackItem::tuple(items))
+}
+
+fn write_vm_stack_value(item: &StackItem, cb: &mut BuilderData) -> Result<()> {
+    match item {
+        StackItem::None => {
+            cb.append_bits(0x00, 8)?;
+        }
+        StackItem::Integer(value) => {
+            if value.is_nan() {
+                cb.append_bits(0x02FF, 16)?;
+            } else if value.fits_in(64)? {
+                cb.append_bits(0x01, 8)?;
+                let v: i64 = value.as_integer_value(i64::MIN..=i64::MAX)?;
+                cb.append_i64(v)?;
+            } else {
+                cb.append_bits(0x0100, 15)?;
+                let int_builder = value.as_builder(257, true, true)?;
+                cb.append_builder(&int_builder)?;
+            }
+        }
+        StackItem::Cell(cell) => {
+            cb.append_bits(0x03, 8)?;
+            cb.checked_append_reference(cell.clone())?;
+        }
+        StackItem::Slice(slice) => {
+            cb.append_bits(0x04, 8)?;
+            cb.checked_append_reference(slice.cell()?)?;
+            let refs = slice.get_references();
+            cb.append_bits(slice.pos(), 10)?;
+            cb.append_bits(slice.pos() + slice.remaining_bits(), 10)?;
+            cb.append_bits(refs.start, 3)?;
+            cb.append_bits(refs.end, 3)?;
+        }
+        StackItem::Builder(bd) => {
+            cb.append_bits(0x05, 8)?;
+            cb.checked_append_reference(bd.as_ref().clone().into_cell()?)?;
+        }
+        StackItem::Tuple(items) => {
+            write_vm_tuple(items, cb)?;
+        }
+        StackItem::Continuation(_) => {
+            fail!("Cannot serialize continuation in liteserver response");
+        }
+    }
+    Ok(())
+}
+
+fn write_vm_tuple(items: &[StackItem], cb: &mut BuilderData) -> Result<()> {
+    let n = items.len();
+    cb.append_bits(0x07, 8)?;
+    cb.append_u16(n as u16)?;
+    if n == 0 {
+        return Ok(());
+    }
+    if n == 1 {
+        let cell = serialize_single_vm_value(&items[0])?;
+        cb.checked_append_reference(cell)?;
+        return Ok(());
+    }
+    let mut head: Option<Cell> = None;
+    let mut tail: Option<Cell> = None;
+    for (i, item) in items.iter().enumerate() {
+        std::mem::swap(&mut head, &mut tail);
+        if i > 1 {
+            let mut chain = BuilderData::new();
+            chain.checked_append_reference(tail.take().unwrap())?;
+            chain.checked_append_reference(head.take().unwrap())?;
+            head = Some(chain.into_cell()?);
+        }
+        tail = Some(serialize_single_vm_value(item)?);
+    }
+    if let Some(h) = head {
+        cb.checked_append_reference(h)?;
+    }
+    if let Some(t) = tail {
+        cb.checked_append_reference(t)?;
+    }
+    Ok(())
+}
+
+fn serialize_single_vm_value(item: &StackItem) -> Result<Cell> {
+    let mut cb = BuilderData::new();
+    write_vm_stack_value(item, &mut cb)?;
+    cb.into_cell()
 }
 
 #[cfg(test)]
