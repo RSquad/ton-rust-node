@@ -45,8 +45,8 @@ async fn scan(adnlid: &str, cfgfile: &str) -> Result<()> {
     let mut index = 0;
     println!("Searching DHT for {}...", keyid);
     loop {
-        if let Ok(Some((ip, key))) = dht.find_address(&mut context).await {
-            println!("Found {} / {}", ip, key.id());
+        if let Ok(Some((adnl_addr, quic_addr, key))) = dht.find_address(&mut context).await {
+            println!("Found ADNL={} QUIC={:?} / {}", adnl_addr, quic_addr, key.id());
             return Ok(());
         }
         if index >= nodes.len() {

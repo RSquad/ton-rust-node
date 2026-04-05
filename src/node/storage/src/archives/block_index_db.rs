@@ -164,25 +164,40 @@ impl BlockIndexDb {
             offset,
             block.masterchain_ref_seq_no()
         );
+        self.put_raw(
+            block.id().shard(),
+            block.id().seq_no(),
+            block.end_lt(),
+            block.gen_utime(),
+            block.masterchain_ref_seq_no(),
+            offset,
+        )
+    }
 
+    /// Write block index entries from raw values (for archive import).
+    pub fn put_raw(
+        &self,
+        shard: &ShardIdent,
+        seq_no: u32,
+        end_lt: u64,
+        gen_utime: u32,
+        mc_ref_seq_no: u32,
+        offset: u32,
+    ) -> Result<()> {
         let cf = self.cf()?;
 
-        let value = Self::serialize_value(block.masterchain_ref_seq_no(), offset);
+        let value = Self::serialize_value(mc_ref_seq_no, offset);
         let mut transaction = rocksdb::WriteBatch::default();
 
-        let key = BlocksIndexKey::key_with_lt(block.id().shard(), block.end_lt());
+        let key = BlocksIndexKey::key_with_lt(shard, end_lt);
         log::trace!("Putting key: {}", key);
         transaction.put_cf(&cf, &key, value);
 
-        let key = BlocksIndexKey::key_with_seqno(block.id().shard(), block.id().seq_no());
+        let key = BlocksIndexKey::key_with_seqno(shard, seq_no);
         log::trace!("Putting key: {}", key);
         transaction.put_cf(&cf, &key, value);
 
-        let key = BlocksIndexKey::key_with_utime(
-            block.id().shard(),
-            block.gen_utime(),
-            block.id().seq_no(),
-        );
+        let key = BlocksIndexKey::key_with_utime(shard, gen_utime, seq_no);
         log::trace!("Putting key: {}", key);
         transaction.put_cf(&cf, &key, value);
 

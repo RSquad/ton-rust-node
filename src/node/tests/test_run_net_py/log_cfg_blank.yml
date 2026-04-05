@@ -99,4 +99,9 @@ loggers:
   simplex:
     level: debug
 
+  quic:
+    level: debug
+
+  consensus_adnl_overlay:
+    level: debug
 

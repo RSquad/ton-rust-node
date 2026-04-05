@@ -11,8 +11,10 @@ use crate::StorageTelemetry;
 use crate::{
     archives::{
         archive_manager::ArchiveManager,
+        db_provider::{ArchiveDbProvider, EpochDbProvider, SingleDbProvider},
+        epoch::{ArchivalModeConfig, EpochRouter},
         package_entry_id::{GetFileName, PackageEntryId},
-        ARCHIVE_PACKAGE_SIZE,
+        ARCHIVE_PACKAGE_SIZE, ARCHIVE_SLICE_SIZE,
     },
     block_handle_db::{BlockHandleStorage, FLAG_KEY_BLOCK},
     db::rocksdb::{destroy_rocks_db, AccessType, RocksDb},
@@ -44,9 +46,12 @@ async fn create_manager(
         std::fs::remove_dir_all(&path).ok();
     }
     let db = RocksDb::new(root, name, None, AccessType::ReadWrite)?;
+    let db_root_path = Arc::new(path);
+    let db_provider = Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()));
     let manager = ArchiveManager::with_data(
         db.clone(),
-        Arc::new(path),
+        db_root_path,
+        db_provider,
         0,
         Arc::new(AtomicU8::new(0)),
         #[cfg(feature = "telemetry")]
@@ -363,6 +368,11 @@ async fn test_block_index() -> Result<()> {
         data.extend_from_slice(&id.seq_no().to_le_bytes());
         data
     }
+    fn make_proof(id: &BlockIdExt) -> Vec<u8> {
+        let mut data = id.shard().shard_prefix_with_tag().to_be_bytes().to_vec();
+        data.extend_from_slice(&id.seq_no().to_be_bytes());
+        data
+    }
 
     const DB_NAME: &str = "test_block_index";
 
@@ -382,7 +392,7 @@ async fn test_block_index() -> Result<()> {
         for mc_seqno in 1..total_mc_blocks {
             let id = generate_block_id(-1, 0x8000_0000_0000_0000, mc_seqno);
             manager.add_file(&PackageEntryId::Block(&id), &make_data(&id)).await?;
-            manager.add_file(&PackageEntryId::Proof(&id), &[1, 2, 3]).await?;
+            manager.add_file(&PackageEntryId::Proof(&id), &make_proof(&id)).await?;
             let flags = if rand::random::<u16>() % 12345 == 0 { FLAG_KEY_BLOCK } else { 0 };
             let block_meta = BlockMeta::with_data(flags, gen_utime, lt, mc_seqno, 0);
             let handle = block_handle_storage.create_handle(id.clone(), block_meta, None)?.unwrap();
@@ -401,7 +411,7 @@ async fn test_block_index() -> Result<()> {
                         *seqno,
                     );
                     manager.add_file(&PackageEntryId::Block(&id), &make_data(&id)).await?;
-                    manager.add_file(&PackageEntryId::ProofLink(&id), &[1, 2, 3]).await?;
+                    manager.add_file(&PackageEntryId::ProofLink(&id), &make_proof(&id)).await?;
                     let block_meta =
                         BlockMeta::with_data(0, gen_utime, lt + i as u64 * 1_000_000, mc_seqno, 0);
                     let handle =
@@ -443,8 +453,11 @@ async fn test_block_index() -> Result<()> {
         let prefix = AccountIdPrefixFull { workchain_id: -1, prefix: rand::random::<u64>() };
         let (id, data) = manager.lookup_block_by_seqno(&prefix, seqno).await?.unwrap();
         assert_eq!(data, make_data(&id));
+        let (id, data) = manager.lookup_proof_by_seqno(&prefix, seqno).await?.unwrap();
+        assert_eq!(data, make_proof(&id));
 
         let mut found = 0;
+        let mut ids = vec![];
         let utime = init_utime + (rand::random::<u32>() % (gen_utime - init_utime)) - 100;
         log::info!("lookup by utime {}", utime);
         let prefix = AccountIdPrefixFull { workchain_id: 0, prefix: rand::random::<u64>() };
@@ -455,12 +468,21 @@ async fn test_block_index() -> Result<()> {
                 Box::new(|id, data| {
                     assert_eq!(data, make_data(&id));
                     found += 1;
+                    ids.push(id);
                     Ok(true)
                 }),
             )
             .await?;
         assert!(found > 0);
+        for id in ids {
+            let (id, data) = manager
+                .lookup_proof_by_seqno(&id.shard().account_id_prefix(), id.seq_no())
+                .await?
+                .unwrap();
+            assert_eq!(data, make_proof(&id));
+        }
     }
+    assert_eq!(manager.get_max_mc_seqno().await, Some(total_mc_blocks - 1));
 
     drop(block_handle_storage);
     drop(manager);
@@ -484,6 +506,8 @@ async fn test_block_index() -> Result<()> {
     assert_eq!(data, make_data(&id));
     assert_eq!(id.seq_no(), 20_000);
 
+    assert_eq!(manager.get_max_mc_seqno().await, Some(total_mc_blocks - 1));
+
     for _ in 0..20_000 {
         let lt = rand::random::<u64>() % lt;
         log::info!("lookup by lt {}", lt);
@@ -497,8 +521,12 @@ async fn test_block_index() -> Result<()> {
         if let Some((id, data)) = manager.lookup_block_by_seqno(&prefix, seqno).await? {
             assert_eq!(data, make_data(&id));
         }
+        if let Some((id, data)) = manager.lookup_proof_by_seqno(&prefix, seqno).await? {
+            assert_eq!(data, make_proof(&id));
+        }
 
         let mut found = 0;
+        let mut ids = vec![];
         let utime = init_utime + rand::random::<u32>() % (gen_utime - init_utime) - 100;
         log::info!("lookup by utime {}", utime);
         let prefix = AccountIdPrefixFull { workchain_id: -1, prefix: rand::random::<u64>() };
@@ -509,15 +537,200 @@ async fn test_block_index() -> Result<()> {
                 Box::new(|id, data| {
                     assert_eq!(data, make_data(&id));
                     found += 1;
+                    ids.push(id);
                     Ok(true)
                 }),
             )
             .await?;
         assert!(found > 0);
+        for id in ids {
+            let (id, data) = manager
+                .lookup_proof_by_seqno(&id.shard().account_id_prefix(), id.seq_no())
+                .await?
+                .unwrap();
+            assert_eq!(data, make_proof(&id));
+        }
     }
 
     drop(manager);
     drop(db);
     destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();
+    Ok(())
+}
+
+// --- Archival mode (epoch-based) tests ---
+
+fn mc_block_id(mc_seq_no: u32) -> BlockIdExt {
+    BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        mc_seq_no,
+        UInt256::from_le_bytes(&mc_seq_no.to_le_bytes()),
+        UInt256::default(),
+    )
+}
+
+async fn write_blocks(
+    manager: &ArchiveManager,
+    bhs: &BlockHandleStorage,
+    range: std::ops::Range<u32>,
+    data: &[u8],
+) -> Result<()> {
+    for mc_seq_no in range {
+        let block_id = mc_block_id(mc_seq_no);
+        let meta = BlockMeta::with_data(0, 0, 0, 0, 0);
+        let handle = bhs
+            .create_handle(block_id.clone(), meta, None)?
+            .ok_or_else(|| error!("Cannot create handle for block {}", block_id))?;
+        manager.add_file(&PackageEntryId::Proof(&block_id), data).await?;
+        handle.set_proof();
+        handle.set_block_applied();
+        manager.move_to_archive(&handle, || Ok(())).await?;
+        handle.set_archived();
+        bhs.save_handle(&handle, None)?;
+    }
+    Ok(())
+}
+
+async fn read_block(
+    manager: &ArchiveManager,
+    bhs: &BlockHandleStorage,
+    mc_seq_no: u32,
+) -> Result<Vec<u8>> {
+    let block_id = mc_block_id(mc_seq_no);
+    let handle = bhs.load_handle_by_id(&block_id)?.unwrap();
+    manager.get_file(&handle, &PackageEntryId::Proof(&block_id)).await
+}
+
+async fn create_epoch_manager(
+    dir: &Path,
+) -> Result<(ArchiveManager, Arc<RocksDb>, Arc<EpochRouter>)> {
+    let db_root = dir.join("main_db");
+    let new_epochs_path = dir.join("new_epochs");
+
+    let config = ArchivalModeConfig {
+        epoch_size: ARCHIVE_SLICE_SIZE,
+        new_epochs_path,
+        existing_epochs: vec![],
+    };
+
+    let db = RocksDb::new(&db_root, "db", None, AccessType::ReadWrite)?;
+    let db_root_path = Arc::new(db_root);
+
+    let router = Arc::new(EpochRouter::new(&config).await?);
+    let db_provider: Arc<dyn ArchiveDbProvider> = Arc::new(EpochDbProvider::new(router.clone()));
+
+    let manager = ArchiveManager::with_data(
+        db.clone(),
+        db_root_path,
+        db_provider,
+        0,
+        Arc::new(AtomicU8::new(0)),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )
+    .await?;
+
+    Ok((manager, db, router))
+}
+
+#[tokio::test]
+async fn test_archival_mode_minimal() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, db, router) = create_epoch_manager(dir.path()).await?;
+    let (bhs, _) = create_block_handle_storage(db.clone());
+    router.resolve_or_create(0).await?;
+
+    write_blocks(&manager, &bhs, 50..51, &[1, 2, 3]).await?;
+
+    let result = read_block(&manager, &bhs, 50).await?;
+    assert_eq!(result, vec![1, 2, 3]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_archival_mode_write_and_read() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, db, router) = create_epoch_manager(dir.path()).await?;
+    let (bhs, _) = create_block_handle_storage(db.clone());
+    router.resolve_or_create(0).await?;
+
+    let data = vec![1, 2, 3, 4, 5];
+    write_blocks(&manager, &bhs, 0..150, &data).await?;
+
+    for mc_seq_no in 0..150 {
+        assert_eq!(read_block(&manager, &bhs, mc_seq_no).await?, data);
+    }
+
+    // Verify .pack files are in epoch directory, not main db
+    let epoch_dir = dir.path().join("new_epochs").join("epoch_0");
+    assert!(epoch_dir.exists(), "Epoch directory should exist");
+    assert!(
+        epoch_dir.join("archive").join("packages").exists(),
+        "Pack files should be in epoch directory"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_archival_mode_multiple_epochs() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, db, router) = create_epoch_manager(dir.path()).await?;
+    let (bhs, _) = create_block_handle_storage(db.clone());
+
+    router.resolve_or_create(0).await?;
+    router.resolve_or_create(20_000).await?;
+
+    let data_epoch0 = vec![10, 20, 30];
+    let data_epoch1 = vec![40, 50, 60];
+
+    write_blocks(&manager, &bhs, 0..100, &data_epoch0).await?;
+    assert_eq!(read_block(&manager, &bhs, 50).await?, data_epoch0);
+
+    write_blocks(&manager, &bhs, 20_000..20_100, &data_epoch1).await?;
+
+    assert_eq!(read_block(&manager, &bhs, 50).await?, data_epoch0);
+    assert_eq!(read_block(&manager, &bhs, 20_050).await?, data_epoch1);
+
+    assert!(dir.path().join("new_epochs").join("epoch_0").exists());
+    assert!(dir.path().join("new_epochs").join("epoch_1").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_archival_mode_restart_preserves_data() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let data = vec![7, 8, 9];
+
+    // First "run": write some blocks
+    let db = {
+        let (manager, db, router) = create_epoch_manager(dir.path()).await?;
+        let (bhs, _bh_db) = create_block_handle_storage(db.clone());
+        router.resolve_or_create(0).await?;
+        write_blocks(&manager, &bhs, 0..50, &data).await?;
+        db
+    };
+
+    // BlockHandleStorage has background task which holds RocksDB instance
+    while Arc::strong_count(&db) > 1 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    drop(db);
+
+    // Second "run": recreate manager, verify data is accessible
+    let (manager, db, _router) = create_epoch_manager(dir.path()).await?;
+    let (bhs, _) = create_block_handle_storage(db.clone());
+
+    for mc_seq_no in 0..50 {
+        assert_eq!(
+            read_block(&manager, &bhs, mc_seq_no).await?,
+            data,
+            "Block {} data mismatch after restart",
+            mc_seq_no
+        );
+    }
+
     Ok(())
 }

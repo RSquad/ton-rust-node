@@ -45,27 +45,36 @@ async fn read_header<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Resu
 
 impl Package {
     pub async fn open(path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
-        let mut file = Self::open_file_ext(read_only, create, path.as_path()).await?;
-        let mut size = file.metadata().await?.len();
-
-        file.seek(SeekFrom::Start(0)).await?;
-        if size < PKG_HEADER_SIZE as u64 {
-            if !create {
+        let (file, size) = if read_only {
+            let size = tokio::fs::metadata(&path).await?.len();
+            if size < PKG_HEADER_SIZE as u64 {
                 fail!("Package file is too short")
             }
-            file.write_all(&PKG_HEADER_MAGIC.to_le_bytes()).await?;
-            file.flush().await?;
-            size = PKG_HEADER_SIZE as u64;
+            (None, size)
         } else {
-            read_header(&mut file).await?;
-            file.seek(SeekFrom::End(0)).await?;
-        }
+            let mut file = Self::open_file_ext(read_only, create, path.as_path()).await?;
+            let mut size = file.metadata().await?.len();
+
+            file.seek(SeekFrom::Start(0)).await?;
+            if size < PKG_HEADER_SIZE as u64 {
+                if !create {
+                    fail!("Package file is too short")
+                }
+                file.write_all(&PKG_HEADER_MAGIC.to_le_bytes()).await?;
+                file.flush().await?;
+                size = PKG_HEADER_SIZE as u64;
+            } else {
+                read_header(&mut file).await?;
+                file.seek(SeekFrom::End(0)).await?;
+            }
+            (Some(file), size)
+        };
 
         Ok(Self {
             path,
             read_only,
             size: AtomicU64::new(size),
-            write_mutex: tokio::sync::Mutex::new(Some(file)),
+            write_mutex: tokio::sync::Mutex::new(file),
         })
     }
 
@@ -102,22 +111,21 @@ impl Package {
 
     pub async fn truncate(&self, size: u64) -> Result<()> {
         let new_size = PKG_HEADER_SIZE as u64 + size;
-        // let md = tokio::fs::metadata(self.path()).await?;
-        // if md.len() == new_size {
-        //     return Ok(())
-        // }
-        log::debug!(
-            target: TARGET,
-            "Truncating package {}, new size: {new_size} bytes",
-            self.path.display()
-        );
-        self.size.store(new_size, Ordering::SeqCst);
         let Some(file) = &*self.write_mutex.lock().await else {
             fail!(
                 "Cannot truncate package file {}, because it was not opened",
                 self.path().display()
             )
         };
+        let old_raw = self.size.load(Ordering::SeqCst);
+        let old_file_len = file.metadata().await?.len();
+        log::warn!(
+            target: TARGET,
+            "Truncating package {}: raw_size {old_raw} -> {new_size}, \
+            file_len {old_file_len} -> {new_size}",
+            self.path.display()
+        );
+        self.size.store(new_size, Ordering::SeqCst);
         file.set_len(new_size).await?;
         Ok(())
     }
@@ -164,23 +172,34 @@ impl Package {
                 self.path().display()
             )
         };
-        let actual = file.metadata().await?.len();
-        let entry_offset = self.size();
-        if entry_offset + PKG_HEADER_SIZE as u64 != actual {
+        let actual_before = file.metadata().await?.len();
+        let raw_size = self.size.load(Ordering::SeqCst);
+        let entry_offset = raw_size - PKG_HEADER_SIZE as u64;
+        if raw_size != actual_before {
             log::error!(
                 target: TARGET,
-                "Package entry {} offset mismatch: expected {entry_offset} vs {actual}",
-                entry.filename()
+                "Package {} entry {} offset mismatch BEFORE write: \
+                raw_size={raw_size}, file_len={actual_before}, \
+                diff={}, entry_data_len={}, entry_filename={}",
+                self.path.display(),
+                entry.filename(),
+                actual_before as i64 - raw_size as i64,
+                entry.data().len(),
+                entry.filename(),
             )
         }
         let entry_size = entry.write_to(file).await?;
         let total_size = self.size.fetch_add(entry_size, Ordering::SeqCst) + entry_size;
-        let actual = file.metadata().await?.len();
-        if total_size != actual {
+        let actual_after = file.metadata().await?.len();
+        if total_size != actual_after {
             log::error!(
                 target: TARGET,
-                "Package entry {} size mismatch: expected {total_size} vs {actual}",
-                entry.filename()
+                "Package {} entry {} size mismatch AFTER write: \
+                expected_total={total_size}, file_len={actual_after}, \
+                diff={}, entry_size={entry_size}, raw_size_before={raw_size}",
+                self.path.display(),
+                entry.filename(),
+                actual_after as i64 - total_size as i64,
             )
         }
         after_append(entry_offset, entry_offset + entry_size)

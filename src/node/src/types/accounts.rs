@@ -12,8 +12,8 @@ use crate::engine_traits::EngineOperations;
 use std::sync::Arc;
 use ton_block::{
     fail, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell, HashUpdate,
-    HashmapAugType, HashmapRemover, LibDescr, Libraries, Result, Serializable, ShardAccount,
-    ShardAccounts, StateInitLib, Transaction, Transactions, UInt256, UsageTree,
+    HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries, Result, Serializable,
+    ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions, UInt256, UsageTree,
 };
 
 pub struct ShardAccountStuff {
@@ -124,6 +124,10 @@ impl ShardAccountStuff {
 
     pub fn original_root(&self) -> &Cell {
         &self.original_root
+    }
+
+    pub fn is_touched(&self) -> bool {
+        !self.transactions.is_empty()
     }
 
     pub fn add_transaction(

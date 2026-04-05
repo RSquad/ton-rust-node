@@ -192,7 +192,7 @@ fn set_library_test() {
 fn set_ext_library_test() {
     // library code and data
     let mut state_lib = HashmapE::with_bit_len(256);
-    state_lib.setref(LIBRARY_CELL.repr_hash().into(), &LIBRARY_CELL).unwrap();
+    state_lib.setref(LIBRARY_CELL.repr_hash().into(), LIBRARY_CELL.clone()).unwrap();
 
     let code = format!(
         "
@@ -357,7 +357,7 @@ fn test_library_cell_code() {
     .unwrap();
     let mut library = ton_block::HashmapE::with_bit_len(256);
     let key = my_code.repr_hash().write_to_bitstring().unwrap();
-    library.setref(key.clone(), &my_code).unwrap();
+    library.setref(key, my_code.clone()).unwrap();
 
     let code = my_code.as_library_cell();
     let data = Cell::default();

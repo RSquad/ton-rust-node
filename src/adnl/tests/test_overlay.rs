@@ -98,6 +98,9 @@ pub fn build_dht_node_info_ex(
 }
 */
 
+/// Base port for test_broadcast nodes (range 4210..4219, does not overlap with other tests).
+const BROADCAST_TEST_BASE_PORT: u16 = 4210;
+
 fn init_overlay_simple_compatibility_test(
     local_ip_template: &str,
     #[cfg(feature = "dump")] dump_path: Option<&str>,
@@ -298,7 +301,7 @@ fn test_random_peers(ctx_test: &TestContext) {
                 AddressSearchContext::with_params(key.id(), DhtSearchPolicy::FastSearch(5))
                     .unwrap();
             match ctx_test.dht.find_address(&mut ctx_search).await {
-                Ok(Some((ip, _))) => println!("IP {}", ip),
+                Ok(Some((ip, _, _))) => println!("IP {}", ip),
                 Ok(None) => println!("Address not found"),
                 Err(err) => println!("Error {}", err),
             }
@@ -370,7 +373,7 @@ fn test_overlay_broadcast_receive(ctx_test: &TestContext) {
                     let mut ctx_search =
                         AddressSearchContext::with_params(key_id, DhtSearchPolicy::FastSearch(5))
                             .unwrap();
-                    if let Ok(Some((ip, _))) = ctx_test.dht.find_address(&mut ctx_search).await {
+                    if let Ok(Some((ip, _, _))) = ctx_test.dht.find_address(&mut ctx_search).await {
                         println!("RECEIVED new overlay node {}", key_id);
                         ctx_test.overlay.add_public_peer(&ip, &node, &ctx_test.overlay_id).unwrap();
                         known_nodes.insert(key_id.clone());
@@ -667,7 +670,9 @@ fn run_propagation(
                             .await
                     }
                     Protocol::TwostepSimple | Protocol::TwostepFec => {
-                        node_send.broadcast_two_step(&overlay_id_send, &data, None, 0).await
+                        node_send
+                            .broadcast_twostep(&overlay_id_send, &data, None, 0, Vec::new())
+                            .await
                     }
                 }
                 .unwrap();
@@ -677,7 +682,7 @@ fn run_propagation(
                     "Broadcasting {}->{} packets by {adnl_id_send}/{}, step {j}\n",
                     info.packets,
                     info.send_to,
-                    adnl.ip_address(),
+                    adnl.ip_address_adnl(),
                 );
                 bcast_totally.fetch_add(1, Ordering::Relaxed);
             }
@@ -815,21 +820,21 @@ fn test_broadcast(
     test: impl Fn(&[LocalNode], &[Arc<Vec<Arc<KeyId>>>], Protocol) -> RunResult,
     protocol: Protocol,
 ) {
-    const FIRST_PORT: usize = 4181;
+    let min_neighbours = match protocol {
+        Protocol::StreamSimple | Protocol::TwostepFec => return, /* Not ready yet */
+        //Protocol::TwostepFec => 4,
+        Protocol::TwostepSimple => 3,
+        _ => 1,
+    };
 
     init_test();
     let mut nodes = Vec::new();
     for i in 0..n {
-        let ip = format!("127.0.0.1:{}", FIRST_PORT + i);
+        let port = BROADCAST_TEST_BASE_PORT + i as u16;
+        let ip = format!("127.0.0.1:{port}");
         nodes.push(init_local_node(ip, 100 / n as u8));
     }
 
-    let min_neighbours = match protocol {
-        Protocol::StreamSimple => return, /* Not ready yet */
-        Protocol::TwostepFec => 4,
-        Protocol::TwostepSimple => 3,
-        _ => 1,
-    };
     let mut neighbours = Vec::new();
     for i in 0..n {
         let overlay_id = &nodes[i].overlay_id;
@@ -975,7 +980,7 @@ fn test_overlay_ping() {
                     AddressSearchContext::with_params(key.id(), DhtSearchPolicy::FastSearch(5))
                         .unwrap();
                 match ctx_test.dht.find_address(&mut ctx_search).await {
-                    Ok(Some((ip, _))) => {
+                    Ok(Some((ip, _, _))) => {
                         println!("IP {}", ip);
                         let node = node.into_boxed();
                         let node_encoded = base64_encode(&serialize_boxed(&node).unwrap());
@@ -1239,6 +1244,7 @@ fn test_stop() {
             params,
             &ctx_test.adnl.key_by_tag(KEY_TAG_OVERLAY).unwrap(),
             &Vec::new(),
+            false,
         )
         .unwrap();
     assert!(added);

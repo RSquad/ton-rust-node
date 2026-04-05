@@ -616,12 +616,13 @@ pub trait ConsensusOverlay: Send + Sync {
         v2: bool,
     );
 
-    /// Send broadcast
+    /// Send broadcast with optional extra metadata (e.g. consensus.broadcastExtra for slot info)
     fn send_broadcast_fec_ex(
         &self,
         sender_id: &PublicKeyHash,
         send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
+        extra: Option<Vec<u8>>,
     );
 
     /// Implementation specific
@@ -643,7 +644,7 @@ pub enum OverlayTransportType {
 
 impl OverlayTransportType {
     pub fn allow_tcp(&self) -> bool {
-        matches!(self, Self::CatchainTcp | Self::Simplex)
+        matches!(self, Self::CatchainTcp)
     }
 
     pub fn use_quic(&self) -> bool {
@@ -1032,6 +1033,18 @@ pub trait SessionListener: Send + Sync {
 /// This is the common interface for all consensus session implementations
 /// (both catchain-based validator-session and simplex).
 pub trait Session: fmt::Display + Send + Sync {
+    /// Signal the session to begin active consensus processing.
+    ///
+    /// For Simplex sessions, `initial_block_seqno` is the expected seqno of
+    /// the first block to be produced (derived from prev_block_ids).  The
+    /// session overlay is created at `create()` time so it can warm up
+    /// connections to peers.  The FSM timeout clock only starts after
+    /// `start()` is called, preventing premature skip-votes on an
+    /// unconnected overlay.
+    ///
+    /// For Catchain sessions, the parameter is ignored (no-op).
+    fn start(&self, initial_block_seqno: u32);
+
     /// Stop the session (blocks until all threads have stopped)
     /// Database is preserved for potential restart/recovery.
     fn stop(&self);

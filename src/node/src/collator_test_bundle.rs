@@ -1497,6 +1497,10 @@ impl EngineOperations for CollatorTestBundle {
         self.index.now
     }
 
+    fn now_ms(&self) -> u64 {
+        self.index.now as u64 * 1000
+    }
+
     fn load_block_handle(&self, id: &BlockIdExt) -> Result<Option<Arc<BlockHandle>>> {
         let handle =
             self.block_handle_storage.create_handle(id.clone(), BlockMeta::default(), None)?;
@@ -1745,6 +1749,7 @@ pub async fn try_collate(
                 engine,
                 true,
                 true,
+                false,
             );
             validator_query.try_validate().await?;
         }
@@ -1790,6 +1795,7 @@ pub async fn try_validate(
         validator_set,
         engine,
         true,
+        false,
         false,
     );
     validator_query.try_validate().await

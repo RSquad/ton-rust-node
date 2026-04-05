@@ -17,7 +17,7 @@ use super::consensus::{
 use crate::validator::validator_group::{ValidatorGroup, ValidatorGroupStatus};
 use std::{
     fmt,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, SystemTime, SystemTimeError},
 };
 use ton_block::{BlockIdExt, BlockSignaturesVariant, ShardIdent};
@@ -399,23 +399,22 @@ pub async fn process_validation_queue(
                 );
                 break 'queue_loop;
             }
-            Err(_elapsed) => {
-                // Timeout occurred, queue is empty
-                match (last_action + VALIDATION_QUEUE_EMPTY_TOO_LONG).elapsed() {
-                    Ok(_) => {
-                        log::info!(
-                            target: "validator",
-                            "({}): Session {}: validation action queue empty",
-                            next_block_descr,
-                            g_info
-                        );
-                        last_action = SystemTime::now();
-                    }
-                    Err(SystemTimeError { .. }) => (),
+            Err(_elapsed) => match (last_action + VALIDATION_QUEUE_EMPTY_TOO_LONG).elapsed() {
+                Ok(_) => {
+                    g.stalled.store(true, Ordering::Relaxed);
+                    log::info!(
+                        target: "validator",
+                        "({}): Session {}: validation action queue empty (stalled=true)",
+                        next_block_descr,
+                        g_info
+                    );
+                    last_action = SystemTime::now();
                 }
-            }
+                Err(SystemTimeError { .. }) => (),
+            },
             Ok(Some(action)) => {
                 last_action = SystemTime::now();
+                g.stalled.store(false, Ordering::Relaxed);
                 let action_str = action.to_string();
 
                 log::info!(

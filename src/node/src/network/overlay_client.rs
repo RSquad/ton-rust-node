@@ -767,7 +767,14 @@ async fn resolve_peer_ips(
         }
         log::trace!("{}: resolve_peer_ips: searching IP for peer {}...", ctx.id, peer.key_id());
         if let Some(ip) = peer.resolve(ctx.dht_node()).await? {
-            ctx.overlay_node().add_public_peer(&ip, peer.node(), &ctx.id)?;
+            if let Err(e) = ctx.overlay_node().add_public_peer(&ip, peer.node(), &ctx.id) {
+                log::warn!(
+                    "{}: resolve_peer_ips: failed to add peer {}, IP {ip} to overlay: {e}",
+                    ctx.id,
+                    peer.key_id()
+                );
+                continue;
+            }
             if ctx.neighbours_manager.add_overlay_peer(peer.key_id().clone()) {
                 log::trace!("{}: resolve_peer_ips: added peer {}, IP {ip}", ctx.id, peer.key_id());
             } else {

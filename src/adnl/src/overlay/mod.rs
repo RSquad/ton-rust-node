@@ -35,8 +35,8 @@ use std::{
     time::{Duration, Instant},
 };
 use ton_api::{
-    deserialize_boxed_bundle_with_suffix, deserialize_boxed_with_suffix, serialize_boxed,
-    serialize_boxed_append,
+    deserialize_boxed, deserialize_boxed_bundle_with_suffix, deserialize_boxed_with_suffix,
+    serialize_boxed, serialize_boxed_append,
     ton::{
         adnl::id::short::Short as AdnlShortId,
         catchain::{
@@ -353,7 +353,10 @@ struct SlaveInfo {
 enum OverlayType {
     Public,
     // Overlay with fixed members set
-    Private(Arc<dyn KeyOption>),
+    Private {
+        key: Arc<dyn KeyOption>,
+        use_quic: bool,
+    },
     // Overlay with externally certified members
     CertifiedMembers {
         key: Option<Arc<dyn KeyOption>>,
@@ -369,15 +372,13 @@ enum OverlayType {
 impl OverlayType {
     fn bcast_prefix(&self) -> Option<Vec<u8>> {
         match self {
-            OverlayType::Public => None,
-            OverlayType::Private(_) => None,
             OverlayType::CertifiedMembers { bcast_prefix, .. } => Some(bcast_prefix.clone()),
+            OverlayType::Public | OverlayType::Private { .. } => None,
         }
     }
 
     fn calc_message_prefix(&self, overlay_id: &OverlayShortId) -> Result<Vec<u8>> {
         match self {
-            Self::Public | Self::Private(_) => OverlayUtils::calc_message_prefix(overlay_id),
             Self::CertifiedMembers { certificate, .. } => serialize_boxed(
                 &OverlayMessageWithExtra {
                     overlay: UInt256::with_array(*overlay_id.data()),
@@ -387,27 +388,30 @@ impl OverlayType {
                 }
                 .into_boxed(),
             ),
+            OverlayType::Public | OverlayType::Private { .. } => {
+                OverlayUtils::calc_message_prefix(overlay_id)
+            }
         }
     }
 
     fn calc_query_prefix(&self, overlay_id: &OverlayShortId) -> Result<Vec<u8>> {
         match self {
-            Self::Public | Self::Private(_) => {
-                serialize_boxed(&OverlayQuery { overlay: UInt256::with_array(*overlay_id.data()) })
-            }
             Self::CertifiedMembers { certificate, .. } => serialize_boxed(&OverlayQueryWithExtra {
                 overlay: UInt256::with_array(*overlay_id.data()),
                 extra: MessageExtra {
                     certificate: certificate.as_ref().map(|cert| cert.clone().into_boxed()),
                 },
             }),
+            OverlayType::Public | OverlayType::Private { .. } => {
+                serialize_boxed(&OverlayQuery { overlay: UInt256::with_array(*overlay_id.data()) })
+            }
         }
     }
 
     fn certificate(&self) -> Option<&MemberCertificate> {
         match self {
-            OverlayType::Public | OverlayType::Private(_) => None,
             OverlayType::CertifiedMembers { certificate, .. } => certificate.as_ref(),
+            OverlayType::Public | OverlayType::Private { .. } => None,
         }
     }
 
@@ -466,6 +470,7 @@ declare_counted!(
 declare_counted!(
     struct Overlay {
         adnl: Arc<AdnlNode>,
+        quic: Option<Arc<QuicNode>>,
         rldp: Option<Arc<RldpNode>>,
         options: Arc<AtomicU32>,
         overlay_type: OverlayType,
@@ -610,8 +615,8 @@ impl Overlay {
     fn check_peer(&self, peer: &Arc<KeyId>, certificate: Option<&MemberCertificate>) -> Result<()> {
         match &self.overlay_type {
             OverlayType::Public => Ok(()),
-            OverlayType::Private(own_key) => {
-                if !(peer == own_key.id() || self.known_peers.all().contains(peer)) {
+            OverlayType::Private { key, .. } => {
+                if !(peer == key.id() || self.known_peers.all().contains(peer)) {
                     fail!("Peer {peer} is not a member of the private overlay {}", self.overlay_id)
                 }
                 Ok(())
@@ -697,11 +702,19 @@ impl Overlay {
                 BroadcastSendMethod::Fast => {
                     self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Fast).await.err()
                 }
-                BroadcastSendMethod::Rldp => {
-                    let Some(rldp) = self.rldp.as_ref() else {
-                        fail!("No RLDP sender is set in overlay {}", self.overlay_id);
-                    };
-                    rldp.message(data, peers, true, None).await.err()
+                BroadcastSendMethod::QuicOrRldp => {
+                    if let Some(quic) = self.quic.as_ref() {
+                        quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
+                    } else {
+                        let Some(_rldp) = self.rldp.as_ref() else {
+                            fail!(
+                                "Neither QUIC nor RLDP sender is set in overlay {}",
+                                self.overlay_id
+                            );
+                        };
+                        //rldp.message(data, peers, true, None).await.err()
+                        None
+                    }
                 }
                 BroadcastSendMethod::Safe => {
                     self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Safe).await.err()
@@ -813,7 +826,7 @@ impl Overlay {
 
     fn overlay_key(&self) -> Option<&Arc<dyn KeyOption>> {
         match &self.overlay_type {
-            OverlayType::Private(key) => Some(key),
+            OverlayType::Private { key, .. } => Some(key),
             OverlayType::CertifiedMembers { key, .. } => key.as_ref(),
             _ => None,
         }
@@ -1420,8 +1433,9 @@ impl OverlayNode {
         params: OverlayParams,
         overlay_key: &Arc<dyn KeyOption>,
         peers: &[Arc<KeyId>],
+        use_quic: bool,
     ) -> Result<bool> {
-        let overlay_type = OverlayType::Private(overlay_key.clone());
+        let overlay_type = OverlayType::Private { key: overlay_key.clone(), use_quic };
         self.add_typed_private_overlay(overlay_type, params, peers)
     }
 
@@ -1452,11 +1466,11 @@ impl OverlayNode {
     pub fn add_private_peers(
         &self,
         local_adnl_key: &Arc<KeyId>,
-        peers: Vec<(IpAddress, Arc<dyn KeyOption>)>,
+        peers: Vec<(IpAddress, Option<IpAddress>, Arc<dyn KeyOption>)>,
     ) -> Result<Vec<Arc<KeyId>>> {
         let mut ret = Vec::new();
-        for (ip, key) in peers {
-            if let Some(peer) = self.adnl.add_peer(local_adnl_key, &ip, &key)? {
+        for (ip, quic_ip, key) in peers {
+            if let Some(peer) = self.adnl.add_peer(local_adnl_key, &ip, quic_ip.as_ref(), &key)? {
                 ret.push(peer)
             }
         }
@@ -1503,7 +1517,7 @@ impl OverlayNode {
             log::warn!(target: TARGET, "Error when verifying overlay peer {}: {e}", key.id());
             return Ok(None);
         }
-        let Some(ret) = self.adnl.add_peer(self.node_key.id(), peer_ip_address, &key)? else {
+        let Some(ret) = self.adnl.add_peer(self.node_key.id(), peer_ip_address, None, &key)? else {
             return Ok(None);
         };
         overlay.known_peers.add(&ret)?;
@@ -1594,12 +1608,13 @@ impl OverlayNode {
     }
 
     /// Two-step message broadcast
-    pub async fn broadcast_two_step(
+    pub async fn broadcast_twostep(
         &self,
         overlay_id: &Arc<OverlayShortId>,
         data: &TaggedByteSlice<'_>,
         src_key: Option<&Arc<dyn KeyOption>>,
         flags: u32,
+        extra: Vec<u8>,
     ) -> Result<BroadcastSendInfo> {
         log::trace!(target: TARGET, "Two-step broadcast {} bytes", data.object.len());
         let overlay =
@@ -1614,9 +1629,9 @@ impl OverlayNode {
         let neighbours = overlay.calc_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
         if big_data && (neighbours >= Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST) {
-            BroadcastTwostepFecProtocol::for_send(data.object, neighbours)?.send(ctx).await
+            BroadcastTwostepFecProtocol::for_send(data.object, neighbours, extra)?.send(ctx).await
         } else {
-            BroadcastTwostepSimpleProtocol::new(big_data).send(ctx).await
+            BroadcastTwostepSimpleProtocol::for_send(big_data, extra).send(ctx).await
         }
     }
 
@@ -1768,7 +1783,7 @@ impl OverlayNode {
                 "Sending QUIC message to unknown overlay",
             )
             .await?;
-        quic.message(data, Some(&self.adnl), peers.local(), peers.other()).await?;
+        quic.message(data, Some(&self.adnl), &peers).await?;
         Ok(())
     }
 
@@ -1849,7 +1864,10 @@ impl OverlayNode {
             .await?;
         let mut data = overlay.query_prefix.clone();
         serialize_boxed_append(&mut data, &query.object)?;
-        quic.query(data, Some(&self.adnl), peers.local(), peers.other(), timeout_ms).await
+        match quic.query(data, Some(&self.adnl), &peers, timeout_ms).await? {
+            Some(raw) => Ok(Some(deserialize_boxed(&raw)?)),
+            None => Ok(None),
+        }
     }
 
     /// Send query via RLDP
@@ -1959,9 +1977,15 @@ impl OverlayNode {
             penalty: 1,
             to_block: Self::MAX_FAIL_COUNT,
         };
+        let quic = if let OverlayType::Private { use_quic: true, .. } = &overlay_type {
+            self.quic.get().cloned()
+        } else {
+            None
+        };
         let overlay = Overlay {
             adnl: self.adnl.clone(),
             rldp: self.rldp.get().cloned(),
+            quic,
             flags: params.flags,
             hops: params.hops,
             known_peers: AddressCacheWithBads::with_params(Self::MAX_PEERS, policy),
@@ -2136,7 +2160,7 @@ impl OverlayNode {
 
     fn delete_overlay(&self, overlay_id: &Arc<OverlayShortId>, is_private: bool) -> Result<bool> {
         let type_of = if is_private { "private" } else { "public" };
-        log::debug!(target: TARGET, "Delete {} overlay {}", type_of, overlay_id);
+        log::info!(target: TARGET, "Delete {} overlay {}", type_of, overlay_id);
         if let Some(overlay) = self.overlays.get(overlay_id) {
             let overlay = overlay.val();
             if is_private {
@@ -2383,7 +2407,7 @@ impl Subscriber for OverlayNode {
                 }
                 Ok(Broadcast::Overlay_BroadcastTwostepSimple(bcast)) => {
                     let big_data = bcast.data.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
-                    BroadcastTwostepSimpleProtocol::new(big_data).recv(bcast, ctx).await?;
+                    BroadcastTwostepSimpleProtocol::for_recv(big_data).recv(bcast, ctx).await?;
                     return Ok(true);
                 }
                 Ok(bcast) => fail!("Unsupported overlay broadcast message {:?}", bcast),

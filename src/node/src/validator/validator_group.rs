@@ -68,6 +68,23 @@ fn is_simplex_roundless(round: u32) -> bool {
     round == SIMPLEX_ROUNDLESS
 }
 
+/// Snapshot of session state for monitoring dumps.
+/// Captured atomically from the inner mutex to avoid multiple async calls.
+pub struct SessionSnapshot {
+    pub session_id: UInt256,
+    pub shard: ShardIdent,
+    pub cc_seqno: u32,
+    pub status: ValidatorGroupStatus,
+    pub consensus_type: ConsensusType,
+    pub round: u32,
+    pub mc_initial_seqno: u32,
+    pub has_engine: bool,
+    pub is_collator: bool,
+    pub created_at: SystemTime,
+    pub key_seqno: u32,
+    pub last_accepted_mc_seqno: Option<u32>,
+}
+
 /// When true, non-accelerated consensus (Catchain / Simplex) will block the
 /// validator-group message loop while a validation task runs.
 /// Set to false (default) to let those tasks run in the background, keeping
@@ -116,7 +133,7 @@ fn should_reject_stale_mc_candidate(
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum ValidatorGroupStatus {
     Created,
-    Countdown { start_at: tokio::time::Instant },
+    EngineCreated,
     Sync,
     Active,
     Stopping,
@@ -127,10 +144,7 @@ impl Display for ValidatorGroupStatus {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidatorGroupStatus::Created => write!(f, "created"),
-            ValidatorGroupStatus::Countdown { start_at: at } => {
-                let now = tokio::time::Instant::now();
-                write!(f, "cntdwn {}", at.saturating_duration_since(now).as_secs())
-            }
+            ValidatorGroupStatus::EngineCreated => write!(f, "engine_created"),
             ValidatorGroupStatus::Sync => write!(f, "sync"),
             ValidatorGroupStatus::Active => write!(f, "active"),
             ValidatorGroupStatus::Stopping => write!(f, "stopping"),
@@ -140,13 +154,21 @@ impl Display for ValidatorGroupStatus {
 }
 
 impl ValidatorGroupStatus {
-    pub fn before(&self, of: &ValidatorGroupStatus) -> bool {
-        match (&self, of) {
-            (ValidatorGroupStatus::Countdown { .. }, ValidatorGroupStatus::Countdown { .. }) => {
-                false
-            }
-            _ => self <= of,
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::EngineCreated => "engine_created",
+            Self::Sync => "sync",
+            Self::Active => "active",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
         }
+    }
+}
+
+impl ValidatorGroupStatus {
+    pub fn before(&self, of: &ValidatorGroupStatus) -> bool {
+        self <= of
     }
 }
 
@@ -244,6 +266,7 @@ pub struct ValidatorGroupImpl {
     replay_finished: bool,
 
     status: ValidatorGroupStatus,
+    start_pending: bool,
 
     /// Highest MC block seqno accepted (committed) in this session.
     /// Used for MC fork prevention: reject candidates building on stale heads.
@@ -252,14 +275,48 @@ pub struct ValidatorGroupImpl {
 
 impl Drop for ValidatorGroupImpl {
     fn drop(&mut self) {
-        // Important: does not stop the session -- to avoid database deletion,
-        // which otherwise would happen each time the validator-manager crashes.
-        log::info!(target: "validator", "ValidatorGroupImpl: dropping session {}", self.info());
+        // Does not stop the session to avoid database deletion on validator-manager crash.
+        log::info!(target: "validator",
+            "SESSION_LIFECYCLE: dropped shard={} cc_seqno={} session_id={:x} final_status={} \
+             has_engine={}",
+            self.shard, self.cc_seqno, self.session_id, self.status, self.session.is_some());
     }
 }
 
 impl ValidatorGroupImpl {
-    // Creates and starts session
+    /// Create the consensus engine (session) without starting the validation queue.
+    ///
+    /// Two-phase activation (C++ parity): `create_engine()` materializes the consensus
+    /// session so future groups have a pre-initialized engine. `start()` then spawns
+    /// the validation queue processor and calls `Session::start(initial_block_seqno)`
+    /// to begin consensus. If `create_engine()` was not called (e.g. the group was
+    /// promoted directly), `start()` creates the session inline as a fallback.
+    fn create_engine(
+        &mut self,
+        g: Arc<ValidatorGroup>,
+        session_listener: SessionListenerPtr,
+    ) -> Result<()> {
+        if self.session.is_some() {
+            log::debug!(target: "validator",
+                "create_engine: session already exists for shard={} cc_seqno={}, skipping",
+                self.shard, self.cc_seqno);
+            return Ok(());
+        }
+        if self.status >= ValidatorGroupStatus::Stopping {
+            fail!("Inactive session cannot have engine created! {}", self.info())
+        }
+
+        log::info!(target: "validator",
+            "SESSION_LIFECYCLE: create_engine shard={} cc_seqno={} session_id={:x} \
+             consensus={} status={} -> engine_created",
+            self.shard, self.cc_seqno, self.session_id,
+            self.consensus_type, self.status);
+        let session = self.create_consensus_session(g, session_listener)?;
+        self.session = Some(session);
+        self.status = ValidatorGroupStatus::EngineCreated;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
@@ -274,21 +331,35 @@ impl ValidatorGroupImpl {
             fail!("Inactive session cannot be started! {}", self.info())
         }
 
-        self.status = ValidatorGroupStatus::Sync;
-
-        log::info!(target: "validator", "Starting session {}", self.info());
-
         self.prev_block_ids.update_prev(prev);
         self.min_masterchain_block_id = Some(min_masterchain_block_id.clone());
         self.min_ts = min_ts;
         if self.shard.is_masterchain() {
-            // Seed stale-head guard baseline at session start so fork prevention
-            // is active before the first local on_block_committed callback.
             self.last_accepted_mc_seqno = Some(min_masterchain_block_id.seq_no);
         }
 
-        // Create session using unified factory
-        let session = self.create_consensus_session(g.clone(), session_listener)?;
+        if self.session.is_none() {
+            log::info!(target: "validator",
+                "SESSION_LIFECYCLE: create_session_at_start shard={} cc_seqno={} consensus={}",
+                self.shard, self.cc_seqno, self.consensus_type);
+            let session = self.create_consensus_session(g.clone(), session_listener)?;
+            self.session = Some(session);
+        }
+
+        let initial_block_seqno = self.prev_block_ids.get_next_seqno().unwrap_or(1);
+        if let Some(session) = &self.session {
+            log::info!(target: "validator",
+                "SESSION_LIFECYCLE: session.start(seqno={}) shard={} cc_seqno={}",
+                initial_block_seqno, self.shard, self.cc_seqno);
+            session.start(initial_block_seqno);
+        }
+
+        log::info!(target: "validator",
+            "SESSION_LIFECYCLE: start shard={} cc_seqno={} session_id={:x} consensus={} \
+             mc_init_seqno={} status={} -> sync",
+            self.shard, self.cc_seqno, self.session_id, self.consensus_type,
+            self.min_masterchain_block_id.as_ref().map_or(0, |id| id.seq_no),
+            self.status);
 
         let g_clone = g.clone();
         let receiver = g.receiver.lock().unwrap().take().ok_or_else(|| {
@@ -298,12 +369,34 @@ impl ValidatorGroupImpl {
             process_validation_queue(receiver, g_clone.clone(), rt).await;
         });
 
-        log::trace!(target: "validator", "Started session {}, options {:?}, ref.cnt = {}",
-            self.info(), g.consensus_options, Arc::strong_count(&session)
-        );
+        log::debug!(target: "validator",
+            "Validation queue spawned for shard={} cc_seqno={}, options={:?}",
+            self.shard, self.cc_seqno, g.consensus_options);
 
-        self.session = Some(session);
+        self.status = ValidatorGroupStatus::Sync;
         Ok(())
+    }
+
+    fn prepare_start(&mut self) -> bool {
+        if self.start_pending {
+            return false;
+        }
+        match self.status {
+            ValidatorGroupStatus::Created | ValidatorGroupStatus::EngineCreated => {}
+            _ => return false,
+        }
+        self.start_pending = true;
+        true
+    }
+
+    fn reset_after_start_failure(&mut self) {
+        log::warn!(target: "validator",
+            "SESSION_LIFECYCLE: reset_after_failure shard={} cc_seqno={} session_id={:x} \
+             status={} -> created (session dropped, will retry)",
+            self.shard, self.cc_seqno, self.session_id, self.status);
+        self.session = None;
+        self.start_pending = false;
+        self.status = ValidatorGroupStatus::Created;
     }
 
     /// Get the consensus type for this validator group
@@ -319,8 +412,7 @@ impl ValidatorGroupImpl {
     }
 
     /// Get simplex session pointer for simplex-specific operations (e.g., MC finalization)
-    /// Returns None if this is not a simplex session or simplex feature is not enabled
-    #[cfg(feature = "simplex")]
+    /// Returns None if this is not a simplex session
     #[allow(dead_code)]
     pub fn get_simplex_session(&self) -> Option<super::consensus::SimplexSessionPtr> {
         self.session.as_ref().and_then(|s| s.get_simplex_session())
@@ -370,14 +462,10 @@ impl ValidatorGroupImpl {
                 )
             }
             ConsensusOptions::Simplex(simplex_options) => {
-                //TODO: check initial seqno for simplex
-                let initial_block_seqno = self.prev_block_ids.get_next_seqno().unwrap_or(1);
-
                 ConsensusFactory::create_simplex_based_session(
                     simplex_options,
                     &g.session_id,
                     &g.shard,
-                    initial_block_seqno,
                     nodes,
                     &g.local_key,
                     db_root,
@@ -420,8 +508,9 @@ impl ValidatorGroupImpl {
         is_accelerated_consensus_enabled: bool,
         consensus_type: ConsensusType,
     ) -> ValidatorGroupImpl {
-        log::info!(target: "validator", "Initializing session {:x}, shard {}, consensus_type {}", 
-            session_id, shard, consensus_type);
+        log::info!(target: "validator",
+            "SESSION_LIFECYCLE: created shard={} cc_seqno={} session_id={:x} consensus={} local_id={}",
+            shard, cc_seqno, session_id, consensus_type, local_id);
 
         let prev_block_ids = PrevBlockHistory::with_shard(&shard);
         ValidatorGroupImpl {
@@ -431,6 +520,7 @@ impl ValidatorGroupImpl {
             cc_seqno,
             min_ts: SystemTime::now(),
             status: ValidatorGroupStatus::Created,
+            start_pending: false,
             expected_current_round: 0,
             expected_collation_round: 0,
             is_collator: false,
@@ -548,10 +638,8 @@ pub struct ValidatorGroup {
     is_accelerated_consensus_enabled: bool,
     session_id: SessionId,
     shard: ShardIdent,
-    //catchain_seqno: u32,
     validator_list_id: ValidatorListHash,
 
-    //shard: ShardIdent,
     engine: Arc<dyn EngineOperations>,
     validator_set: ValidatorSet,
     #[allow(dead_code)]
@@ -564,6 +652,8 @@ pub struct ValidatorGroup {
     last_validation_time: Arc<AtomicU64>,
     last_collation_time: Arc<AtomicU64>,
     is_collating: Arc<AtomicBool>,
+    /// Set by the validation queue on prolonged inactivity, cleared on any action.
+    pub stalled: Arc<AtomicBool>,
 }
 
 impl ValidatorGroup {
@@ -613,6 +703,7 @@ impl ValidatorGroup {
             last_validation_time: Arc::new(AtomicU64::new(0)),
             last_collation_time: Arc::new(AtomicU64::new(0)),
             is_collating: Arc::new(AtomicBool::new(false)),
+            stalled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -627,8 +718,32 @@ impl ValidatorGroup {
         &self.general_session_info.shard
     }
 
+    pub fn cc_seqno(&self) -> u32 {
+        self.general_session_info.catchain_seqno
+    }
+
     pub fn is_simplex(&self) -> bool {
         matches!(self.consensus_options, ConsensusOptions::Simplex(_))
+    }
+
+    pub async fn snapshot(&self) -> SessionSnapshot {
+        let key_seqno = self.general_session_info.key_seqno;
+        self.group_impl
+            .execute_sync(|g| SessionSnapshot {
+                session_id: g.session_id.clone(),
+                shard: g.shard.clone(),
+                cc_seqno: g.cc_seqno,
+                status: g.status,
+                consensus_type: g.consensus_type,
+                round: g.expected_current_round,
+                mc_initial_seqno: g.min_masterchain_block_id.as_ref().map_or(0, |id| id.seq_no),
+                has_engine: g.session.is_some(),
+                is_collator: g.is_collator,
+                created_at: g.min_ts,
+                key_seqno,
+                last_accepted_mc_seqno: g.last_accepted_mc_seqno,
+            })
+            .await
     }
 
     /// Notify this session about masterchain finalization.
@@ -657,6 +772,10 @@ impl ValidatorGroup {
             .await;
     }
 
+    pub fn is_collating(&self) -> bool {
+        self.is_collating.load(Ordering::Relaxed)
+    }
+
     pub fn last_validation_time(&self) -> u64 {
         self.last_validation_time.load(Ordering::Relaxed)
     }
@@ -669,42 +788,59 @@ impl ValidatorGroup {
         Arc::downgrade(&self.callback)
     }
 
+    /// Pre-create the consensus engine without starting the validation queue.
+    /// Called for future-validator groups to warm up the session ahead of time.
+    pub async fn pre_create_engine(self: Arc<ValidatorGroup>) -> Result<()> {
+        let callback = self.make_validator_session_callback();
+        self.group_impl
+            .execute_sync(|group_impl| {
+                if let Err(e) = group_impl.create_engine(self.clone(), callback) {
+                    log::error!(target: "validator",
+                        "SESSION_LIFECYCLE: pre_create_engine failed shard={} cc_seqno={} \
+                         session_id={:x}: {}",
+                        group_impl.shard, group_impl.cc_seqno, group_impl.session_id, e);
+                }
+            })
+            .await;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_with_status(
+    pub async fn start_session(
         self: Arc<ValidatorGroup>,
-        validation_start_status: ValidatorGroupStatus,
         prev: Vec<BlockIdExt>,
         min_masterchain_block_id: BlockIdExt,
         min_ts: SystemTime,
         rt: tokio::runtime::Handle,
     ) -> Result<()> {
-        self.set_status(validation_start_status).await?;
-        rt.clone().spawn (async move {
-            if let ValidatorGroupStatus::Countdown { start_at } = validation_start_status {
-                log::trace!(target: "validator", "Session delay started: {}", self.info().await);
-                tokio::time::sleep_until(start_at).await;
-            }
-
+        rt.clone().spawn(async move {
             let callback = self.make_validator_session_callback();
-            self.group_impl.execute_sync(|group_impl|
-            {
-                if group_impl.status <= ValidatorGroupStatus::Active {
-                    if let Err(e) = group_impl.start(
-                        callback,
-                        prev,
-                        min_masterchain_block_id,
-                        min_ts,
-                        self.clone(),
-                        rt
-                    )
-                    {
-                        log::error!(target: "validator", "Cannot start group: {}", e);
+            self.group_impl
+                .execute_sync(|group_impl| {
+                    if group_impl.status <= ValidatorGroupStatus::Active {
+                        if let Err(e) = group_impl.start(
+                            callback,
+                            prev,
+                            min_masterchain_block_id,
+                            min_ts,
+                            self.clone(),
+                            rt,
+                        ) {
+                            group_impl.reset_after_start_failure();
+                            log::error!(
+                                target: "validator",
+                                "Cannot start group: {}; resetting session to Created for retry",
+                                e
+                            );
+                        } else {
+                            group_impl.start_pending = false;
+                        }
+                    } else {
+                        group_impl.start_pending = false;
+                        log::trace!(target: "validator", "Session deleted before start: {}", group_impl.info());
                     }
-                }
-                else {
-                    log::trace!(target: "validator", "Session deleted before countdown: {}", group_impl.info());
-                }
-            }).await;
+                })
+                .await;
         });
         Ok(())
     }
@@ -715,39 +851,40 @@ impl ValidatorGroup {
         destroy_database: bool,
     ) -> Result<()> {
         self.set_status(ValidatorGroupStatus::Stopping).await?;
-        log::info!(target: "validator", "Stopping group: {} (destroy database {})", self.info().await, destroy_database);
+        let consensus_label = if self.is_simplex() { "simplex" } else { "catchain" };
+        metrics::counter!("ton_node_validator_session_stopped_total", "consensus" => consensus_label)
+            .increment(1);
+        let shard = self.shard.clone();
+        let cc_seqno = self.cc_seqno();
+        log::info!(target: "validator",
+            "SESSION_LIFECYCLE: stop_initiated shard={} cc_seqno={} destroy_db={}",
+            shard, cc_seqno, destroy_database);
         let group_impl = self.group_impl.clone();
         let self_clone = self.clone();
         rt.spawn({
             async move {
-                log::debug!(target: "validator", "Stopping group (spawn): {}", self_clone.info().await);
-                let session_ptr = group_impl.execute_sync(
-                    |group_impl| group_impl.session.clone()).await;
+                let session_ptr =
+                    group_impl.execute_sync(|group_impl| group_impl.session.clone()).await;
                 if let Some(s_ptr) = session_ptr {
-                    log::debug!(target: "validator", "Stopping catchain: {}", self_clone.info().await);
+                    log::debug!(target: "validator",
+                        "Stopping consensus engine for shard={} cc_seqno={}", shard, cc_seqno);
                     if destroy_database {
-                        s_ptr.destroy(); // Blocking, destroys catchain DB
+                        s_ptr.destroy();
                     } else {
-                        s_ptr.stop();    // Blocking, preserves catchain DB
+                        s_ptr.stop();
                     }
                 }
-                log::debug!(target: "validator", "Group stopped: {}", self_clone.info().await);
                 let _ = self_clone.set_status(ValidatorGroupStatus::Stopped).await;
-                log::info!(target: "validator", "Status set: {}", self_clone.info().await);
                 if destroy_database {
                     let _ = self_clone.destroy_db().await;
-                    log::debug!(target: "validator", "Db destroyed: {}", self_clone.info().await);
+                    log::debug!(target: "validator",
+                        "DB destroyed for shard={} cc_seqno={}", shard, cc_seqno);
                 }
-                else {
-                    log::debug!(
-                        target: "validator",
-                        "Db destroy skipped (destroy_databse option set to false): {}",
-                        self_clone.info().await
-                    );
-                }
+                log::info!(target: "validator",
+                    "SESSION_LIFECYCLE: stopped shard={} cc_seqno={} destroy_db={}",
+                    shard, cc_seqno, destroy_database);
             }
         });
-        log::debug!(target: "validator", "Stopping group {}, stop spawned", self.info().await);
         Ok(())
     }
 
@@ -769,13 +906,30 @@ impl ValidatorGroup {
         self.group_impl.execute_sync(|group_impl| group_impl.status).await
     }
 
+    pub async fn is_start_pending(&self) -> bool {
+        self.group_impl.execute_sync(|group_impl| group_impl.start_pending).await
+    }
+
+    pub async fn try_prepare_start(&self) -> Result<bool> {
+        self.group_impl.execute_sync(|group_impl| Ok(group_impl.prepare_start())).await
+    }
+
     pub async fn set_status(&self, status: ValidatorGroupStatus) -> Result<()> {
         self.group_impl
             .execute_sync(|group_impl| {
                 if group_impl.status.before(&status) {
+                    let from = group_impl.status;
                     group_impl.status = status;
+                    log::info!(target: "validator",
+                        "SESSION_LIFECYCLE: transition shard={} cc_seqno={} session_id={:x} {} -> {}",
+                        group_impl.shard, group_impl.cc_seqno, group_impl.session_id, from, status);
                     Ok(())
                 } else {
+                    log::error!(target: "validator",
+                        "SESSION_LIFECYCLE: invalid transition shard={} cc_seqno={} session_id={:x} \
+                         {} -> {} (monotonic violation)",
+                        group_impl.shard, group_impl.cc_seqno, group_impl.session_id,
+                        group_impl.status, status);
                     fail!("Status cannot retreat, from {} to {}", group_impl.status, status)
                 }
             })
@@ -968,11 +1122,14 @@ impl ValidatorGroup {
             ConsensusOptions::Catchain(opts) => {
                 opts.accelerated_consensus_max_precollated_blocks as usize
             }
-            ConsensusOptions::Simplex(opts) => opts.max_precollated_blocks as usize,
+            ConsensusOptions::Simplex(opts) => {
+                opts.slots_per_leader_window.saturating_sub(1) as usize
+            }
         };
         let request_clone = request.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
+        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
 
         let collation_task = tokio::spawn(async move {
             log::info!(
@@ -1007,6 +1164,7 @@ impl ValidatorGroup {
                             local_key,
                             validator_set.clone(),
                             engine.clone(),
+                            is_simplex,
                         )
                         .await
                         {
@@ -1173,6 +1331,7 @@ impl ValidatorGroup {
         let last_validation_time = self.last_validation_time.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
+        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
         let (
             expected_current_round,
             prev_block_ids,
@@ -1273,8 +1432,12 @@ impl ValidatorGroup {
                         candidate_block_id
                     );
 
-                    let validation_completion_time =
-                        run_validate_query_any_candidate(candidate.clone(), engine.clone()).await?;
+                    let validation_completion_time = run_validate_query_any_candidate(
+                        candidate.clone(),
+                        engine.clone(),
+                        is_simplex,
+                    )
+                    .await?;
 
                     // Post-validation: broadcast + save (shared with legacy path)
                     Self::post_validation_actions(
@@ -1353,6 +1516,7 @@ impl ValidatorGroup {
                         candidate.clone(),
                         validator_set.clone(),
                         engine.clone(),
+                        is_simplex,
                     )
                     .await?;
 
@@ -1553,6 +1717,30 @@ impl ValidatorGroup {
                         if !group_impl.prev_block_ids.same_prevs(&prev_block_history) {
                             Err(error!("Sync error: two requests at a time, prevs have changed!!!"))
                         } else {
+                            // Block verified and accepted: transition Sync -> Active.
+                            // Deferred to this point (after ensure_next_block_new +
+                            // run_accept_block_query) so stale/duplicate commits don't
+                            // produce false-positive activation.
+                            if group_impl.status == ValidatorGroupStatus::Sync {
+                                group_impl.status = ValidatorGroupStatus::Active;
+                                let cl = if group_impl.consensus_type == ConsensusType::Simplex {
+                                    "simplex"
+                                } else {
+                                    "catchain"
+                                };
+                                metrics::counter!(
+                                    "ton_node_validator_session_activated_total",
+                                    "consensus" => cl
+                                )
+                                .increment(1);
+                                log::info!(target: "validator",
+                                    "SESSION_LIFECYCLE: transition shard={} cc_seqno={} \
+                                     session_id={:x} sync -> active \
+                                     (first committed block accepted)",
+                                    group_impl.shard,
+                                    group_impl.cc_seqno,
+                                    group_impl.session_id);
+                            }
                             Ok(())
                         }
                     }
@@ -1707,6 +1895,18 @@ impl Drop for ValidatorGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ton_block::KeyId;
+
+    fn make_group_impl_for_start_tests() -> ValidatorGroupImpl {
+        ValidatorGroupImpl::new(
+            &KeyId::from_data([0u8; 32]),
+            ShardIdent::masterchain(),
+            1,
+            UInt256::default(),
+            false,
+            ConsensusType::Catchain,
+        )
+    }
 
     #[test]
     fn test_mc_fork_prevention_none_allows() {
@@ -1730,5 +1930,219 @@ mod tests {
         assert!(should_reject_stale_mc_candidate(Some(10), 9));
         assert!(should_reject_stale_mc_candidate(Some(10), 0));
         assert!(should_reject_stale_mc_candidate(Some(100), 50));
+    }
+
+    #[test]
+    fn test_prepare_start_immediate_keeps_created_and_marks_pending() {
+        let mut group = make_group_impl_for_start_tests();
+
+        assert!(group.prepare_start());
+        assert!(group.status == ValidatorGroupStatus::Created);
+        assert!(group.start_pending);
+    }
+
+    #[test]
+    fn test_prepare_start_keeps_created_status() {
+        let mut group = make_group_impl_for_start_tests();
+
+        assert!(group.prepare_start());
+        assert!(group.status == ValidatorGroupStatus::Created);
+        assert!(group.start_pending);
+    }
+
+    #[test]
+    fn test_prepare_start_rejects_duplicate_pending_start() {
+        let mut group = make_group_impl_for_start_tests();
+
+        assert!(group.prepare_start());
+        assert!(!group.prepare_start());
+        assert!(group.status == ValidatorGroupStatus::Created);
+        assert!(group.start_pending);
+    }
+
+    #[test]
+    fn test_reset_after_start_failure_restores_retryable_state() {
+        let mut group = make_group_impl_for_start_tests();
+
+        assert!(group.prepare_start());
+        group.reset_after_start_failure();
+
+        assert!(group.status == ValidatorGroupStatus::Created);
+        assert!(!group.start_pending);
+        assert!(group.session.is_none());
+    }
+
+    // --- Status ordering / transition table tests (WS6) ---
+
+    #[test]
+    fn test_status_ordering_is_monotonic() {
+        let states = [
+            ValidatorGroupStatus::Created,
+            ValidatorGroupStatus::EngineCreated,
+            ValidatorGroupStatus::Sync,
+            ValidatorGroupStatus::Active,
+            ValidatorGroupStatus::Stopping,
+            ValidatorGroupStatus::Stopped,
+        ];
+        for i in 0..states.len() {
+            for j in i + 1..states.len() {
+                assert!(states[i] < states[j], "{} must be < {}", states[i], states[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_before_allows_forward_transitions() {
+        let created = ValidatorGroupStatus::Created;
+        let engine_created = ValidatorGroupStatus::EngineCreated;
+        let sync = ValidatorGroupStatus::Sync;
+        let active = ValidatorGroupStatus::Active;
+        let stopping = ValidatorGroupStatus::Stopping;
+
+        assert!(created.before(&engine_created));
+        assert!(engine_created.before(&sync));
+        assert!(sync.before(&active));
+        assert!(active.before(&stopping));
+    }
+
+    #[test]
+    fn test_before_rejects_backward_transitions() {
+        let sync = ValidatorGroupStatus::Sync;
+        let active = ValidatorGroupStatus::Active;
+        let created = ValidatorGroupStatus::Created;
+
+        assert!(!active.before(&sync));
+        assert!(!sync.before(&created));
+    }
+
+    #[test]
+    fn test_engine_created_state_between_created_and_sync() {
+        let created = ValidatorGroupStatus::Created;
+        let engine_created = ValidatorGroupStatus::EngineCreated;
+        let sync = ValidatorGroupStatus::Sync;
+
+        assert!(created < engine_created);
+        assert!(engine_created < sync);
+        assert!(created.before(&engine_created));
+        assert!(engine_created.before(&sync));
+    }
+
+    #[test]
+    fn test_prepare_start_accepts_engine_created_state() {
+        let mut group = make_group_impl_for_start_tests();
+        group.status = ValidatorGroupStatus::EngineCreated;
+
+        assert!(group.prepare_start());
+        assert!(group.status == ValidatorGroupStatus::EngineCreated);
+        assert!(group.start_pending);
+    }
+
+    #[test]
+    fn test_prepare_start_rejects_sync_and_later_states() {
+        for status in [
+            ValidatorGroupStatus::Sync,
+            ValidatorGroupStatus::Active,
+            ValidatorGroupStatus::Stopping,
+            ValidatorGroupStatus::Stopped,
+        ] {
+            let mut group = make_group_impl_for_start_tests();
+            group.status = status;
+            assert!(!group.prepare_start(), "prepare_start should reject status {}", status);
+        }
+    }
+
+    // --- Stale-future culling predicate tests (mirrors manager.cpp equal+related) ---
+
+    /// Reproduces the stale-future culling predicate from validator_manager.rs
+    /// to verify correctness in isolation with various shard topologies.
+    fn should_cull_future(
+        active_shard: &ShardIdent,
+        active_cc: u32,
+        future_shard: &ShardIdent,
+        future_cc: u32,
+    ) -> bool {
+        let shards_equal = active_shard == future_shard;
+        let shards_related = active_shard.is_ancestor_for(future_shard)
+            || future_shard.is_ancestor_for(active_shard);
+        let equal_condition = shards_equal && active_cc >= future_cc;
+        let related_condition = shards_related && active_cc > future_cc;
+        equal_condition || related_condition
+    }
+
+    #[test]
+    fn test_cull_same_shard_equal_seqno() {
+        let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+        assert!(should_cull_future(&shard, 5, &shard, 5));
+    }
+
+    #[test]
+    fn test_cull_same_shard_higher_active_seqno() {
+        let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+        assert!(should_cull_future(&shard, 6, &shard, 5));
+    }
+
+    #[test]
+    fn test_no_cull_same_shard_lower_active_seqno() {
+        let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+        assert!(!should_cull_future(&shard, 4, &shard, 5));
+    }
+
+    #[test]
+    fn test_cull_ancestor_shard_higher_seqno() {
+        let parent = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+        let child = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
+        assert!(parent.is_ancestor_for(&child));
+        assert!(should_cull_future(&parent, 6, &child, 5));
+    }
+
+    #[test]
+    fn test_cull_descendant_shard_higher_seqno() {
+        let parent = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+        let child = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
+        assert!(should_cull_future(&child, 6, &parent, 5));
+    }
+
+    #[test]
+    fn test_no_cull_related_shard_equal_seqno() {
+        let parent = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+        let child = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
+        // For related (non-equal) shards, the condition is strict >
+        assert!(!should_cull_future(&parent, 5, &child, 5));
+    }
+
+    #[test]
+    fn test_no_cull_unrelated_shards() {
+        let shard_a = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
+        let shard_b = ShardIdent::with_tagged_prefix(0, 0xC000_0000_0000_0000).unwrap();
+        assert!(!shard_a.is_ancestor_for(&shard_b));
+        assert!(!shard_b.is_ancestor_for(&shard_a));
+        assert!(!should_cull_future(&shard_a, 100, &shard_b, 1));
+    }
+
+    #[test]
+    fn test_no_cull_different_workchain() {
+        let shard_wc0 = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+        let shard_wc1 = ShardIdent::with_tagged_prefix(1, 0x8000_0000_0000_0000).unwrap();
+        assert!(!should_cull_future(&shard_wc0, 10, &shard_wc1, 5));
+    }
+
+    #[test]
+    fn test_metric_label_covers_all_states() {
+        let states = vec![
+            (ValidatorGroupStatus::Created, "created"),
+            (ValidatorGroupStatus::EngineCreated, "engine_created"),
+            (ValidatorGroupStatus::Sync, "sync"),
+            (ValidatorGroupStatus::Active, "active"),
+            (ValidatorGroupStatus::Stopping, "stopping"),
+            (ValidatorGroupStatus::Stopped, "stopped"),
+        ];
+        for (status, expected_label) in states {
+            assert_eq!(
+                status.metric_label(),
+                expected_label,
+                "metric_label mismatch for {}",
+                status
+            );
+        }
     }
 }

@@ -161,6 +161,7 @@ async fn test_address(
         .add_peer(
             src.id(),
             &IpAddress::from_versioned_string(ip, Some(version)).unwrap(),
+            None,
             &node2.key_by_tag(KEY_TAG).unwrap(),
         )
         .unwrap()
@@ -320,7 +321,8 @@ fn node_async_query() {
         let peer1 = node2
             .add_peer(
                 node2.key_by_tag(KEY_TAG).unwrap().id(),
-                node1.ip_address(),
+                node1.ip_address_adnl(),
+                None,
                 &node1.key_by_tag(KEY_TAG).unwrap(),
             )
             .unwrap()
@@ -328,7 +330,8 @@ fn node_async_query() {
         let peer2 = node1
             .add_peer(
                 node1.key_by_tag(KEY_TAG).unwrap().id(),
-                node2.ip_address(),
+                node2.ip_address_adnl(),
+                None,
                 &node2.key_by_tag(KEY_TAG).unwrap(),
             )
             .unwrap()

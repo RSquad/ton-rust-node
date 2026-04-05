@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use ton_block::{fail, Result, ShardIdent};
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum PackageType {
+pub enum PackageType {
     Blocks,
     KeyBlocks, //Temp
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PackageId {
+pub struct PackageId {
     id: u32,
     package_type: PackageType,
 }
