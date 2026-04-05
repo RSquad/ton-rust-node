@@ -30,14 +30,23 @@ pub const SEND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs
 pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
 pub fn warn_missing_secret(secret_name: &str) {
+    println!("\n{} {}", "[WARNING]".yellow().bold(), "Vault secret is missing".yellow(),);
     println!(
-        "{}",
-        format!(
-            "Warning: Secret '{}' does not exist in vault. Create it with: nodectl key add --name {}",
-            secret_name, secret_name
-        )
-        .yellow()
+        "  {} Secret '{}' does not exist in vault",
+        "Reason:".yellow().bold(),
+        secret_name.yellow()
     );
+    println!(
+        "  {} {}",
+        "Note:".yellow().bold(),
+        format!("Create it with `nodectl key add --name {secret_name}`").yellow().italic()
+    );
+}
+
+pub fn warn_ton_api_unavailable(error: &anyhow::Error, note: &str) {
+    println!("\n{} {}", "[WARNING]".yellow().bold(), "Failed to connect to TON API".yellow(),);
+    println!("  {} {}", "Reason:".yellow().bold(), error.root_cause().to_string());
+    println!("  {} {}", "Note:".yellow().bold(), note.yellow().italic());
 }
 
 pub fn save_config(config: &AppConfig, path: &Path) -> anyhow::Result<()> {
@@ -55,7 +64,7 @@ pub async fn load_config_vault(
     Ok((config, vault))
 }
 
-async fn check_ton_api_connection(rpc_client: &ClientJsonRpc) -> anyhow::Result<()> {
+pub async fn check_ton_api_connection(rpc_client: &ClientJsonRpc) -> anyhow::Result<()> {
     rpc_client.get_config_param(1).await.map(|_| ())
 }
 
@@ -82,11 +91,10 @@ pub async fn load_config_vault_rpc_client(
     Ok((config, vault, rpc_client))
 }
 
-pub async fn wallet_info(
-    rpc_client: Arc<ClientJsonRpc>,
+pub async fn wallet_address(
     wallet_cfg: &WalletConfig,
     vault: Arc<SecretVault>,
-) -> anyhow::Result<(MsgAddressInt, GetWalletInformationRes, Secret)> {
+) -> anyhow::Result<(MsgAddressInt, Secret)> {
     let secret = wallet_cfg.key.read_secret(Some(vault)).await?;
     let keypair = secret.as_keypair()?;
 
@@ -95,9 +103,17 @@ pub async fn wallet_info(
         .await?
         .ok_or_else(|| anyhow::anyhow!(VaultError::empty_public_key("Empty public key")))?;
 
-    let wallet_address =
-        calculate_wallet_address(wallet_cfg, &pub_key).context("calculate_address")?;
+    let address = calculate_wallet_address(wallet_cfg, &pub_key).context("calculate_address")?;
 
+    Ok((address, secret))
+}
+
+pub async fn wallet_info(
+    rpc_client: Arc<ClientJsonRpc>,
+    wallet_cfg: &WalletConfig,
+    vault: Arc<SecretVault>,
+) -> anyhow::Result<(MsgAddressInt, GetWalletInformationRes, Secret)> {
+    let (wallet_address, secret) = wallet_address(wallet_cfg, vault).await?;
     let wallet_info = rpc_client.get_wallet_information(&wallet_address).await?;
 
     Ok((wallet_address, wallet_info, secret))

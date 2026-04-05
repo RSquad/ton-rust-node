@@ -234,7 +234,9 @@ For a validator, add `control-server` and `control-client` to the loop.
 
 ## Archival node
 
-By default the node prunes old archives and state snapshots via the `gc` section. To keep the **full** blockchain history, override the GC settings in your node config:
+By default the node prunes old archives and state snapshots via the `gc` section. To keep the **full** blockchain history, override the GC settings in your node config.
+
+> **See also:** For epoch-based archival storage with historical archive import, see [archival-node.md](archival-node.md). That approach is needed when you want to serve the full blockchain history from imported block archives.
 
 ```json
 {

@@ -6,7 +6,10 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::utils::{save_config, warn_missing_secret};
+use crate::commands::nodectl::{
+    output_format::OutputFormat,
+    utils::{save_config, warn_missing_secret},
+};
 use adnl::common::Timeouts;
 use anyhow::Context;
 use colored::Colorize;
@@ -59,7 +62,10 @@ pub struct NodeAddCmd {
 
 #[derive(clap::Args, Clone)]
 #[command(about = "List all configured nodes")]
-pub struct NodeLsCmd {}
+pub struct NodeLsCmd {
+    #[arg(long = "format", default_value = "table", help = "Output format: table or json")]
+    format: OutputFormat,
+}
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Remove a node from the configuration")]
@@ -125,12 +131,24 @@ impl NodeAddCmd {
     }
 }
 
+#[derive(serde::Serialize)]
+struct NodeView {
+    name: String,
+    control_server_endpoint: String,
+    control_server_pubkey: String,
+    control_client_secret: String,
+    status: String,
+}
+
 impl NodeLsCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
         let config = AppConfig::load(path)?;
 
         if config.nodes.is_empty() {
-            println!("\n{}\n", "No nodes configured".yellow());
+            match self.format {
+                OutputFormat::Json => println!("[]"),
+                OutputFormat::Table => println!("\n{}\n", "No nodes configured".yellow()),
+            }
             return Ok(());
         }
 
@@ -150,48 +168,72 @@ impl NodeLsCmd {
             }
         }
 
-        println!("\n{} {} ({})\n", "OK".green().bold(), "Nodes:".green(), config.nodes.len());
-        println!(
-            "  {:<20} {:<25} {:<48} {:<30} {}",
-            "Name".cyan().bold(),
-            "Control Server Endpoint".cyan().bold(),
-            "Control Server Pubkey".cyan().bold(),
-            "Control Client Secret".cyan().bold(),
-            "Status".cyan().bold(),
-        );
-        println!("  {}", "─".repeat(150).dimmed());
-
-        let mut sorted_nodes: Vec<_> = config.nodes.iter().collect();
-        sorted_nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        for (name, adnl) in sorted_nodes {
-            let control_server_pubkey = match &adnl.server_key {
-                KeyConfig::PublicKey { pub_key, .. } => {
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pub_key)
-                }
-                _ => "-".to_string(),
-            };
-            let control_client_secret_name = match &adnl.client_key {
-                KeyConfig::VaultKey { name } => name.clone(),
-                _ => "-".to_string(),
-            };
-            let status_display = match statuses.get(name) {
-                Some(Ok(())) => "OK".green().to_string(),
-                Some(Err(msg)) => msg.red().to_string(),
-                None => "unknown".dimmed().to_string(),
-            };
-            println!(
-                "  {:<20} {:<25} {:<48} {:<30} {}",
+        let mut views: Vec<NodeView> = config
+            .nodes
+            .into_iter()
+            .map(|(name, adnl)| NodeView {
+                control_server_pubkey: match &adnl.server_key {
+                    KeyConfig::PublicKey { pub_key, .. } => {
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pub_key)
+                    }
+                    _ => "-".to_string(),
+                },
+                control_client_secret: match &adnl.client_key {
+                    KeyConfig::VaultKey { name } => name.clone(),
+                    _ => "-".to_string(),
+                },
+                status: match statuses.get(&name) {
+                    Some(Ok(())) => "ok".to_string(),
+                    Some(Err(msg)) => msg.clone(),
+                    None => "unknown".to_string(),
+                },
+                control_server_endpoint: adnl.server_address,
                 name,
-                adnl.server_address,
-                control_server_pubkey,
-                control_client_secret_name,
-                status_display,
-            );
+            })
+            .collect();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+
+        match self.format {
+            OutputFormat::Json => print_nodes_json(&views)?,
+            OutputFormat::Table => print_nodes_table(&views),
         }
-        println!();
         Ok(())
     }
+}
+
+fn print_nodes_json(views: &[NodeView]) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(views)?);
+    Ok(())
+}
+
+fn print_nodes_table(views: &[NodeView]) {
+    println!("\n{} {} ({})\n", "OK".green().bold(), "Nodes:".green(), views.len());
+    println!(
+        "  {:<20} {:<25} {:<48} {:<30} {}",
+        "Name".cyan().bold(),
+        "Control Server Endpoint".cyan().bold(),
+        "Control Server Pubkey".cyan().bold(),
+        "Control Client Secret".cyan().bold(),
+        "Status".cyan().bold(),
+    );
+    println!("  {}", "─".repeat(150).dimmed());
+
+    for v in views {
+        let status_display = match v.status.as_str() {
+            "ok" => "OK".green().to_string(),
+            "unknown" => "unknown".dimmed().to_string(),
+            msg => msg.red().to_string(),
+        };
+        println!(
+            "  {:<20} {:<25} {:<48} {:<30} {}",
+            v.name,
+            v.control_server_endpoint,
+            v.control_server_pubkey,
+            v.control_client_secret,
+            status_display,
+        );
+    }
+    println!();
 }
 
 const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;

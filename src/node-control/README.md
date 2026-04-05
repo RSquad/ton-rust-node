@@ -15,6 +15,7 @@
 - [Commands](#commands)
   - [Configuration Commands](#configuration-commands)
   - [Key Management Commands](#key-management-commands)
+  - [Authentication Commands](#authentication-commands)
   - [Deploy Commands](#deploy-commands)
   - [Service Command](#service-command)
   - [Service API Commands](#service-api-commands)
@@ -181,6 +182,8 @@ List all configured nodes.
 
 ```bash
 nodectl config node ls
+# or with json format
+nodectl config node ls --format json
 ```
 
 ##### `config node rm`
@@ -229,6 +232,8 @@ List all configured wallets.
 
 ```bash
 nodectl config wallet ls
+# or with json format
+nodectl config wallet ls --format json
 ```
 
 ##### `config wallet rm`
@@ -303,6 +308,8 @@ List all configured pools.
 
 ```bash
 nodectl config pool ls
+# or with json format
+nodectl config pool ls --format json
 ```
 
 ##### `config pool rm`
@@ -352,6 +359,8 @@ List all node bindings.
 
 ```bash
 nodectl config bind ls
+# or with json format
+nodectl config bind ls --format json
 ```
 
 ##### `config bind rm`
@@ -403,6 +412,8 @@ Display information about the configured master wallet (address, version, workch
 
 ```bash
 nodectl config master-wallet info
+# or with json format
+nodectl config master-wallet info --format json
 ```
 
 ---
@@ -415,15 +426,12 @@ Manage log configuration settings (level, output mode, rotation, file path).
 
 Display the current log settings.
 
-| Flag | Description |
-|------|-------------|
-| `--format <FORMAT>` | Output format: `table` or `json` (default: `table`) |
+| Flag | Short form | Description |
+|------|------------|-------------|
+| `--format <FORMAT>` | | Output format: `table` or `json` (default: `table`) |
 
 ```bash
-# Show log config as table
 nodectl config log ls
-
-# Show log config as JSON
 nodectl config log ls --format json
 ```
 
@@ -461,15 +469,12 @@ Manage elections configuration, including stake policies, tick intervals, and pe
 
 Display the current elections configuration.
 
-| Flag | Description |
-|------|-------------|
-| `--format <FORMAT>` | Output format: `table` or `json` (default: `table`) |
+| Flag | Short form | Description |
+|------|------------|-------------|
+| `--format <FORMAT>` | | Output format: `table` or `json` (default: `table`) |
 
 ```bash
-# Show elections config as table
 nodectl config elections show
-
-# Show elections config as JSON
 nodectl config elections show --format json
 ```
 
@@ -647,6 +652,87 @@ nodectl key rm --name "old-key"
 
 ---
 
+### Authentication Commands
+
+Commands for managing REST API users and tokens. User credentials are stored in the vault. For a detailed description of roles, token lifecycle, revocation, rate limiting, and monitoring, see the **[Security Guide](./docs/nodectl-security.md)**.
+
+#### `auth add`
+
+Create a new API user. The password is entered interactively and confirmed.
+
+| Flag | Description |
+|------|-------------|
+| `--username <NAME>` | Username (alphanumeric, `_`, `-`, max 64 chars) |
+| `--role <ROLE>` | User role: `operator` or `nominator` |
+
+```bash
+# Create an operator user (full operational access)
+nodectl auth add --username admin --role operator
+
+# Create a nominator user (read-only status access)
+nodectl auth add --username viewer --role nominator
+```
+
+---
+
+#### `auth ls`
+
+List all configured users.
+
+```bash
+nodectl auth ls
+```
+
+---
+
+#### `auth rm`
+
+Remove a user.
+
+| Argument | Description |
+|----------|-------------|
+| `<USERNAME>` | Username to remove |
+
+```bash
+nodectl auth rm admin
+```
+
+---
+
+#### `auth revoke`
+
+Revoke all tokens issued to a user. After revocation the user can log in again to obtain a new token.
+
+| Argument / Flag | Description |
+|-----------------|-------------|
+| `<USERNAME>` | Username whose tokens to revoke |
+| `--at <TIMESTAMP>` | Optional unix timestamp cutoff (default: now) |
+
+```bash
+# Revoke all current tokens
+nodectl auth revoke admin
+
+# Revoke tokens issued before a specific time
+nodectl auth revoke admin --at 1710000000
+```
+
+---
+
+#### `auth set ttl`
+
+Configure token TTL (time-to-live) for each role.
+
+| Flag | Description |
+|------|-------------|
+| `--operator <DURATION>` | Operator token TTL (e.g. `3600`, `30s`, `60m`, `8h`) |
+| `--nominator <DURATION>` | Nominator token TTL |
+
+```bash
+nodectl auth set ttl --operator 8h --nominator 1h
+```
+
+---
+
 ### Deploy Commands
 
 Commands for deploying contracts to the blockchain. Requires a configuration file with `ton_http_api` and `wallets` sections.
@@ -723,7 +809,7 @@ RUST_LOG=debug nodectl service -c config.json
 
 ### Service API Commands
 
-Commands for interacting with the nodectl service REST API. The service URL is resolved in this order: explicit `--url`, then `http.bind` from `--config`, then default `http://127.0.0.1:8080`.
+Commands for interacting with the nodectl service REST API. The service URL is resolved in this order: explicit `--url`, then `http.bind` from `--config`. If neither is available, the command fails. When connecting from a remote machine, pass `--url` explicitly.
 
 #### `api`
 
@@ -731,11 +817,36 @@ Client for the nodectl service REST API. Use this to interact with a running nod
 
 | Flag | Short form | Description |
 |------|------------|-------------|
-| `--config <FILE>` | `-c` | Path to configuration file (reads `http.bind` for the service URL). Can also be set as an environment variable CONFIG_PATH |
-| `--url <URL>` | `-u` | URL to the node control service API (overrides config; default: `http://127.0.0.1:8080`) |
-| `--token <TOKEN>` | | JWT token for authentication (optional) |
+| `--config <FILE>` | `-c` | Path to configuration file (reads `http.bind` for the service URL; default: `nodectl-config.json`). Can also be set via `CONFIG_PATH` env var |
+| `--url <URL>` | `-u` | URL to the node control service API. Takes precedence over `--config` when both are provided |
+| `--token <TOKEN>` | | JWT token for authentication (env: `NODECTL_API_TOKEN`) |
 
 **Subcommands:**
+
+##### `api login`
+
+Authenticate with the REST API and obtain a JWT token. The password is entered interactively unless `--password-stdin` is used.
+
+| Argument / Flag | Description |
+|-----------------|-------------|
+| `<USERNAME>` | Username to authenticate with |
+| `--password-stdin` | Read password from stdin (for non-interactive use) |
+
+```bash
+# Interactive login
+nodectl api login admin
+
+# Non-interactive (e.g. in scripts)
+echo "$PASSWORD" | nodectl api login admin --password-stdin
+```
+
+The command returns the JWT token, its expiration time, and the user role. Store the token for subsequent API calls:
+
+```bash
+export NODECTL_API_TOKEN="<token from login>"
+```
+
+Once the token is exported, all `nodectl api` commands use it automatically.
 
 ##### `api health`
 
@@ -842,7 +953,9 @@ nodectl config-param -c config.json 34
 
 ## REST API Endpoints
 
-When running in service mode, nodectl exposes a REST API for monitoring and management.
+When running in service mode, nodectl exposes a REST API for monitoring and management. By default, the HTTP server listens on all interfaces (`0.0.0.0:8080`) with authentication enabled and no users — all protected endpoints return `401` until at least one user is created via `nodectl auth add`. Protected endpoints require a JWT token in the `Authorization: Bearer <token>` header. See the **[Security Guide](./docs/nodectl-security.md)** for full details on roles, rate limiting, and token revocation.
+
+> **Warning:** nodectl serves plain HTTP. If the API is reachable outside your trusted network, terminate TLS at a reverse proxy or load balancer — otherwise passwords (`/auth/login`) and JWT tokens (`Authorization` header) travel in plain text.
 
 ### Configuration
 
@@ -851,7 +964,7 @@ The HTTP server is configured in the `http` section of the config:
 ```json
 {
   "http": {
-    "bind": "127.0.0.1:8080",
+    "bind": "0.0.0.0:8080",
     "enable_swagger": true
   }
 }
@@ -879,9 +992,69 @@ Health check endpoint.
 
 ---
 
+#### `POST /auth/login`
+
+Authenticate and obtain a JWT token. Rate-limited: 5 failed attempts per 60s window, then blocked for 120s.
+
+**Request:**
+
+```json
+{
+  "username": "admin",
+  "password": "secret"
+}
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "token": "<JWT>",
+  "expires_in": 2592000,
+  "role": "operator"
+}
+```
+
+---
+
+#### `GET /auth/me`
+
+Return the identity of the authenticated user. Requires: `nominator` or `operator` role.
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "username": "admin",
+  "role": "operator"
+}
+```
+
+---
+
+#### `GET /auth/users`
+
+List all users. Requires: `operator` role.
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "users": [
+    { "username": "admin", "role": "operator" },
+    { "username": "viewer", "role": "nominator" }
+  ]
+}
+```
+
+---
+
 #### `GET /v1/elections`
 
-Get current elections snapshot.
+Get current elections snapshot. Requires: `nominator` or `operator` role.
 
 **Response:**
 
@@ -1107,7 +1280,7 @@ Configuration is specified in JSON format.
     "api_key": "<OPTIONAL_API_KEY>" | null
   },
   "http": {
-    "bind": "127.0.0.1:8080",
+    "bind": "0.0.0.0:8080",
     "enable_swagger": true,
     "api_key": null
   },
@@ -1199,9 +1372,23 @@ TON HTTP API configuration:
 
 HTTP REST API server configuration:
 
-- `bind` — address and port to bind (default: `127.0.0.1:8080`)
+- `bind` — address and port to bind (default: `0.0.0.0:8080`)
 - `enable_swagger` — enable Swagger UI at `/swagger` (default: `true`)
-- `api_key` — API key for authentication (optional)
+- `auth` — JWT authentication configuration (see below)
+
+#### `http.auth`
+
+REST API authentication settings. **Authentication is enabled by default** — a freshly generated config includes the `http.auth` section with an empty user list, so all protected endpoints return `401` until at least one user is created via `nodectl auth add`. To disable authentication and open all endpoints, remove the `http.auth` section from the config (or set it to `null`).
+
+> **Note:** On first start the service creates a JWT signing key in the vault (secret `auth.jwt-signing-key`).
+>
+> **No restart required:** The service hot-reloads the configuration, so changes to users or auth settings take effect immediately.
+
+- `operator_token_ttl` — operator token TTL in seconds (default: `2592000` — 30 days)
+- `nominator_token_ttl` — nominator token TTL in seconds (default: `86400` — 1 day)
+- `min_password_length` — minimum password length (default: `8`)
+- `jwt_secret` — base64-encoded JWT signing key (optional; falls back to vault secret `auth.jwt-signing-key`)
+- `users` — list of user entries (managed via `nodectl auth` commands)
 
 #### `master_wallet` (optional)
 
@@ -1258,7 +1445,7 @@ Logging configuration:
     "tick_interval": 40
   },
   "http": {
-    "bind": "127.0.0.1:8080",
+    "bind": "0.0.0.0:8080",
     "enable_swagger": true
   },
   "master_wallet": {
@@ -1437,6 +1624,37 @@ nodectl config elections tick-interval 60
 nodectl config elections max-factor 2.5
 ```
 
+### Authentication Setup
+
+```bash
+# Create an operator user
+nodectl auth add --username admin --role operator
+
+# Create a read-only nominator user
+nodectl auth add --username viewer --role nominator
+
+# List users
+nodectl auth ls
+
+# Configure token TTL
+nodectl auth set ttl --operator 8h --nominator 1h
+
+# Log in and obtain a JWT token
+nodectl api login admin
+
+# Non-interactive login (for scripts)
+echo "$PASSWORD" | nodectl api login admin --password-stdin
+
+# Export the token for subsequent commands
+export NODECTL_API_TOKEN="<token>"
+
+# Revoke all tokens for a user
+nodectl auth revoke admin
+
+# Remove a user
+nodectl auth rm viewer
+```
+
 ### Key Management
 
 ```bash
@@ -1489,6 +1707,28 @@ nodectl config wallet send \
   --to "-1:destination_address" \
   --amount 10.0
 ```
+
+### Manual staking
+
+`nodectl config wallet stake` sends an election stake through a nominator pool. Use it to participate in elections manually.
+
+```bash
+nodectl config wallet stake -b <BINDING> -a <AMOUNT> [-m <MAX_FACTOR>]
+```
+
+| Flag | Long | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `-b` | `--binding` | Yes | — | Binding name (node-wallet-pool triple) |
+| `-a` | `--amount` | Yes | — | Stake amount in TON |
+| `-m` | `--max-factor` | No | `3.0` | Max factor (`1.0`–`3.0`) |
+
+Example:
+
+```bash
+nodectl config wallet stake -b node0 -a 50000 -m 2.5
+```
+
+The command validates that elections are active, manages validator keys and ADNL addresses automatically, builds and sends the stake transaction, and polls the Elector until the stake is confirmed.
 
 ### Starting the Service Daemon
 
@@ -1553,33 +1793,44 @@ nodectl api stake-policy --node node0 --fixed 500000000000
 ### Using REST API Directly
 
 ```bash
-# Health check
+# Login and obtain a token
+TOKEN=$(curl -s -X POST http://127.0.0.1:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "secret"}' | jq -r '.token')
+
+# Health check (public, no token required)
 curl http://127.0.0.1:8080/health
 
 # Get elections
-curl http://127.0.0.1:8080/v1/elections
+curl http://127.0.0.1:8080/v1/elections \
+  -H "Authorization: Bearer $TOKEN"
 
 # Get validators
-curl http://127.0.0.1:8080/v1/validators
+curl http://127.0.0.1:8080/v1/validators \
+  -H "Authorization: Bearer $TOKEN"
 
 # Exclude nodes
 curl -X POST http://127.0.0.1:8080/v1/elections/exclude \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"nodes": ["node0"]}'
 
 # Set default stake policy
 curl -X POST http://127.0.0.1:8080/v1/stake_strategy \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"policy": "minimum"}'
 
 # Set per-node policy override
 curl -X POST http://127.0.0.1:8080/v1/stake_strategy \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"policy": {"fixed": 500000000000}, "node": "node0"}'
 
 # Control elections task
 curl -X POST http://127.0.0.1:8080/v1/task/elections \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"action": "restart"}'
 ```
 
@@ -1589,3 +1840,4 @@ curl -X POST http://127.0.0.1:8080/v1/task/elections \
 
 - [Hashicorp Vault Dedicated Setup](./docs/hcp-vault-setup.md)
 - [Node Control Service Setup](./docs/nodectl-setup.md)
+- [Security Guide](./docs/nodectl-security.md) — roles, token lifecycle, rate limiting, monitoring

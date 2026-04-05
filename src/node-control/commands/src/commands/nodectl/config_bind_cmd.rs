@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::utils::save_config;
+use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
 use colored::Colorize;
 use common::app_config::{AppConfig, BindingStatus, NodeBinding};
 use std::path::Path;
@@ -48,7 +48,10 @@ pub struct BindRmCmd {
 
 #[derive(clap::Args, Clone)]
 #[command(about = "List all node bindings")]
-pub struct BindLsCmd {}
+pub struct BindLsCmd {
+    #[arg(long = "format", default_value = "table", help = "Output format: table or json")]
+    format: OutputFormat,
+}
 
 impl BindCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
@@ -134,41 +137,75 @@ impl BindRmCmd {
     }
 }
 
+#[derive(serde::Serialize)]
+struct BindingView {
+    node: String,
+    wallet: String,
+    pool: Option<String>,
+    enable: bool,
+    status: String,
+}
+
 impl BindLsCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
         let config = AppConfig::load(path)?;
 
         if config.bindings.is_empty() {
-            println!("\n{}\n", "No bindings configured".yellow());
+            match self.format {
+                OutputFormat::Json => println!("[]"),
+                OutputFormat::Table => println!("\n{}\n", "No bindings configured".yellow()),
+            }
             return Ok(());
         }
 
-        println!("\n{} {} ({})\n", "OK".green().bold(), "Bindings:".green(), config.bindings.len());
-        println!(
-            "  {:<20} {:<20} {:<20} {:<12} {}",
-            "Node".cyan().bold(),
-            "Wallet".cyan().bold(),
-            "Pool".cyan().bold(),
-            "Enable".cyan().bold(),
-            "Status".cyan().bold(),
-        );
-        println!("  {}", "─".repeat(90).dimmed());
+        let mut views: Vec<BindingView> = config
+            .bindings
+            .into_iter()
+            .map(|(node, b)| BindingView {
+                node,
+                wallet: b.wallet,
+                pool: b.pool,
+                enable: b.enable,
+                status: b.status.to_string(),
+            })
+            .collect();
+        views.sort_by(|a, b| a.node.cmp(&b.node));
 
-        let mut sorted: Vec<_> = config.bindings.iter().collect();
-        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
-        for (node_name, binding) in sorted {
-            let enable_str =
-                if binding.enable { "yes".green().to_string() } else { "no".red().to_string() };
-            println!(
-                "  {:<20} {:<20} {:<20} {:<21} {}",
-                node_name,
-                binding.wallet,
-                binding.pool.as_deref().unwrap_or("-"),
-                enable_str,
-                binding.status,
-            );
+        match self.format {
+            OutputFormat::Json => print_bindings_json(&views)?,
+            OutputFormat::Table => print_bindings_table(&views),
         }
-        println!();
         Ok(())
     }
+}
+
+fn print_bindings_json(views: &[BindingView]) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(views)?);
+    Ok(())
+}
+
+fn print_bindings_table(views: &[BindingView]) {
+    println!("\n{} {} ({})\n", "OK".green().bold(), "Bindings:".green(), views.len());
+    println!(
+        "  {:<20} {:<20} {:<20} {:<12} {}",
+        "Node".cyan().bold(),
+        "Wallet".cyan().bold(),
+        "Pool".cyan().bold(),
+        "Enable".cyan().bold(),
+        "Status".cyan().bold(),
+    );
+    println!("  {}", "─".repeat(90).dimmed());
+
+    for v in views {
+        let enable_str = if v.enable { "yes".green().to_string() } else { "no".red().to_string() };
+        println!(
+            "  {:<20} {:<20} {:<20} {:<21} {}",
+            v.node,
+            v.wallet,
+            v.pool.as_deref().unwrap_or("-"),
+            enable_str,
+            v.status,
+        );
+    }
+    println!();
 }

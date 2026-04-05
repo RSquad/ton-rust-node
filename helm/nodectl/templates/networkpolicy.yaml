@@ -15,12 +15,9 @@ spec:
     - ports:
         - port: {{ .Values.port }}
           protocol: TCP
-      {{- if .Values.networkPolicy.allowCIDRs }}
+      {{- with .Values.networkPolicy.allowFrom }}
       from:
-        {{- range .Values.networkPolicy.allowCIDRs }}
-        - ipBlock:
-            cidr: {{ . }}
-        {{- end }}
+        {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- with .Values.networkPolicy.extraIngress }}
     {{- toYaml . | nindent 4 }}

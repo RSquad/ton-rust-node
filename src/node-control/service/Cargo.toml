@@ -1,6 +1,6 @@
 [package]
 name = "service"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = 'GPL-3.0'
 
@@ -13,7 +13,6 @@ contracts = { path = "../contracts" }
 control-client = { path = "../control-client" }
 elections = { path = "../elections" }
 hex = "0.4.3"
-scopeguard = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }

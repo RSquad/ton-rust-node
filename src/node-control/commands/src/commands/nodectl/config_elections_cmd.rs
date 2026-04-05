@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::utils::save_config;
+use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
 use colored::Colorize;
 use common::{
     app_config::{AppConfig, BindingStatus, ElectionsConfig, StakePolicy},
@@ -35,13 +35,6 @@ pub enum ElectionsAction {
     Enable(EnableCmd),
     /// Disable elections for binding(s)
     Disable(DisableCmd),
-}
-
-#[derive(clap::ValueEnum, Clone, Default)]
-pub enum OutputFormat {
-    #[default]
-    Table,
-    Json,
 }
 
 #[derive(clap::Args, Clone)]
