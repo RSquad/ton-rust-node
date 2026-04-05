@@ -1,17 +1,82 @@
 # Nodectl Security Guide (for operators)
 
 This document explains how `nodectl` REST API security works in day-to-day operations.
-It is written for trained system operators, not software developers.
 
 ## 1) Quick overview
 
+| State | `http.auth` section | Users | Result |
+|-------|---------------------|-------|--------|
+| **Locked (default)** | present | empty | All protected endpoints return `401`. No one can log in. |
+| **Protected** | present | ≥ 1 | Endpoints require a valid JWT. Users log in with username/password. |
+| **Open access** | removed (`null` or absent) | — | All endpoints are accessible without a token. |
+
+- **Authentication is enabled by default.** A freshly generated config (`nodectl config generate`) includes the `http.auth` section with an empty user list — all protected endpoints return `401` until at least one user is created via `nodectl auth add`.
+- On first start the service creates a JWT signing key in the vault (secret `auth.jwt-signing-key`).
+- **No service restart is required** to enable or disable authentication — the service hot-reloads the configuration.
 - A user logs in to the REST API with `username/password`.
 - The API returns a JWT token with a limited lifetime.
 - The token is sent in `Authorization: Bearer <token>`.
 - Allowed actions are determined by user role.
 - Token revocation is done via CLI (`nodectl auth ...`), not via REST API.
 
-## 2) Roles and permissions
+## 2) Three operational states
+
+### Locked (default for new installations)
+
+The generated config contains the `http.auth` section but no users:
+
+```json
+{
+  "http": {
+    "bind": "0.0.0.0:8080",
+    "enable_swagger": true,
+    "auth": {
+      "operator_token_ttl": 2592000,
+      "nominator_token_ttl": 86400,
+      "min_password_length": 8
+    }
+  }
+}
+```
+
+In this state every protected endpoint returns `401 Unauthorized`. The `/health` endpoint remains accessible. To unlock the API, create at least one user (see [Step-by-step](#step-by-step-enable-api-access)).
+
+### Protected
+
+After adding one or more users the API requires a valid JWT on every protected request. See [How to log in and use a token](#4-how-to-log-in-and-use-a-token).
+
+### Open access (auth disabled)
+
+To disable authentication and make all endpoints accessible without a token, explicitly remove the `http.auth` section from `config.json` (or set it to `null`):
+
+```json
+{
+  "http": {
+    "bind": "0.0.0.0:8080",
+    "enable_swagger": true
+  }
+}
+```
+
+> **Warning:** Before disabling auth, make sure the API is not exposed externally. If `http.bind` is `0.0.0.0:…` and the service port is reachable from outside the pod/host, anyone can call any endpoint.
+
+The service picks up the change automatically — no restart required.
+
+### Step-by-step: enable API access
+
+```bash
+# 1. Create a user (inside the pod or on the host)
+nodectl auth add -u <username> -r operator
+
+# 2. Log in
+nodectl api login <username>
+
+# 3. Use the token
+export NODECTL_API_TOKEN="<jwt>"
+nodectl api elections
+```
+
+## 3) Roles and permissions
 
 ### `nominator`
 
@@ -48,7 +113,7 @@ Cannot:
 
 ### `nodectl admin` (infrastructure/admin host role)
 
-This is **not** a REST role and not a JWT claim.  
+This is **not** a REST role and not a JWT claim.
 It is a person/process with host/Pod access where `nodectl` can be executed.
 
 Can:
@@ -63,7 +128,48 @@ Important:
 - this path works directly via config/CLI;
 - REST auth middleware is bypassed because access is at infrastructure level.
 
-## 3) How to log in and use a token
+## 4) Token TTL (time-to-live)
+
+Each role has an independent token lifetime. The TTL determines how long a JWT remains valid after login.
+
+| Role | Default TTL | Seconds |
+|------|-------------|---------|
+| `operator` | 30 days | 2 592 000 |
+| `nominator` | 1 day | 86 400 |
+
+### View current TTLs
+
+The values are stored in `http.auth` inside `config.json`:
+
+```json
+{
+  "http": {
+    "auth": {
+      "operator_token_ttl": 2592000,
+      "nominator_token_ttl": 86400
+    }
+  }
+}
+```
+
+### Change TTLs
+
+Use `nodectl auth set ttl`. Values can be plain seconds or human-friendly suffixes (`s`, `m`, `h`):
+
+```bash
+# Set operator TTL to 8 hours, nominator to 1 hour
+nodectl auth set ttl --operator 8h --nominator 1h
+
+# Set only operator TTL (nominator stays unchanged)
+nodectl auth set ttl --operator 3600
+
+# Set nominator TTL to 30 minutes
+nodectl auth set ttl --nominator 30m
+```
+
+Changes take effect immediately — the service hot-reloads the config. Existing tokens keep their original expiration; new tokens issued after the change use the updated TTL.
+
+## 5) How to log in and use a token
 
 ### Get a token
 
@@ -81,7 +187,7 @@ Interactive:
   - `nodectl api validators`
   - `nodectl api task elections disable`
 
-## 4) How to revoke tokens (CLI only)
+## 6) How to revoke tokens (CLI only)
 
 Who can revoke tokens:
 
@@ -102,20 +208,21 @@ Effect:
 
 - When you revoke a user, any token for that user with an issued-at time (`iat`) less than or equal to the set `revoked_after` timestamp will no longer be accepted. This means all previously issued tokens before or at the revocation cutoff are immediately invalidated, and only tokens created after the `revoked_after` time will be valid.
 
-## 5) What the API validates on each protected request
+## 7) What the API validates on each protected request
 
 For each Bearer token, checks are applied in this order:
 
-1. header format is valid;
-2. JWT signature and expiration (`exp`) are valid;
-3. user exists in current config;
-4. token role matches current user role;
-5. revocation condition passes (`iat > revoked_after`, otherwise rejected);
-6. role is sufficient for the requested endpoint.
+1. `http.auth` section exists in config — if missing, all routes pass through (open access);
+2. header format is valid;
+3. JWT signature and expiration (`exp`) are valid;
+4. user exists in current config;
+5. token role matches current user role;
+6. revocation condition passes (`iat > revoked_after`, otherwise rejected);
+7. role is sufficient for the requested endpoint.
 
 If validation fails, response is `401` or `403`.
 
-## 6) Login brute-force protection
+## 8) Login brute-force protection
 
 `POST /auth/login` is protected by rate limiting:
 
@@ -135,17 +242,28 @@ Response codes:
 - `401` for invalid credentials (before threshold);
 - `429` when attempt threshold is exceeded.
 
-## 7) Secure Kubernetes profile (single instance)
+## 9) TLS requirement for external access
+
+nodectl serves plain HTTP — it does **not** terminate TLS. If the API is reachable from outside the pod or host, you **must** terminate TLS at the Ingress controller, load balancer, or reverse proxy in front of it.
+
+Without TLS:
+
+- Passwords sent to `POST /auth/login` travel in plain text and can be intercepted.
+- JWT tokens in `Authorization: Bearer` headers travel in plain text. A captured token grants API access until it expires or is revoked.
+
+> **Rule of thumb:** If traffic crosses a network boundary you do not fully control, encrypt it with TLS.
+
+## 10) Secure Kubernetes profile (single instance)
 
 - run a single service replica;
 - expose externally only through Ingress/LB;
 - block direct access to Pod IP/NodePort;
-- enforce TLS at Ingress;
+- enforce TLS at Ingress (see [TLS requirement](#9-tls-requirement-for-external-access));
 - trust `x-forwarded-for` only when traffic is forced through trusted Ingress;
 - store JWT key and password hashes in Vault;
 - do not use `jwt_secret` fallback in production.
 
-## 8) Logs and monitoring
+## 11) Logs and monitoring
 
 Auth logs use `target="auth"` and structured fields for machine parsing.
 

@@ -188,7 +188,7 @@ impl KeyConfig {
 }
 
 fn default_http_bind() -> String {
-    "127.0.0.1:8080".to_owned()
+    "0.0.0.0:8080".to_owned()
 }
 
 fn default_http_enable_swagger() -> bool {
@@ -299,7 +299,10 @@ pub struct HttpConfig {
     pub enable_swagger: bool,
 
     /// Authentication and authorization configuration.
-    /// When `None`, all routes are open (no auth).
+    /// When `Some`, all protected routes require a valid JWT token.
+    /// When `None`, all routes are open (auth explicitly disabled).
+    /// Default: enabled with no users — all protected endpoints return 401
+    /// until at least one user is created via `nodectl auth add`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfig>,
 }
@@ -309,7 +312,7 @@ impl Default for HttpConfig {
         Self {
             bind: default_http_bind(),
             enable_swagger: default_http_enable_swagger(),
-            auth: None,
+            auth: Some(AuthConfig::default()),
         }
     }
 }

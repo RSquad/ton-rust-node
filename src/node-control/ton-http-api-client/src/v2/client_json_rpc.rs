@@ -10,6 +10,7 @@ use crate::v2::data_models::{
     GetAddressInformationRes, GetExtendedAddressInformationRes, GetWalletInformationRes,
     RunGetMethodParams, RunGetMethodRes,
 };
+use anyhow::Context;
 use base64::Engine;
 use std::{
     collections::HashSet,
@@ -144,7 +145,7 @@ impl ClientJsonRpc {
         }
 
         if let Some(err) = last_error {
-            Err(err.context(format!("all {} endpoints failed", total)))
+            Err(err.context(format!("all endpoints ({}) failed", total)))
         } else {
             anyhow::bail!("request failed")
         }
@@ -155,9 +156,10 @@ impl ClientJsonRpc {
             "config_id": param_id,
         });
 
-        let config_info = self.json_rpc("getConfigParam", json_params).await.map_err(|e| {
-            anyhow::anyhow!("Request `getConfigParam({})` return error: {}", param_id, e)
-        })?;
+        let config_info = self
+            .json_rpc("getConfigParam", json_params)
+            .await
+            .with_context(|| format!("getConfigParam({})", param_id))?;
 
         let b64 = config_info
             .get("config")
