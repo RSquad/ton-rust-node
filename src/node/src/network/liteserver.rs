@@ -802,8 +802,7 @@ impl LiteServerQuerySubscriber {
             move || -> Result<(i32, Option<Vec<u8>>, Option<Vec<u8>>)> {
                 let usage_tree = UsageTree::with_params(shard_root.clone(), true);
                 let uss = ShardStateUnsplit::construct_from_cell(usage_tree.root_cell())?;
-                let shard_account =
-                    uss.read_accounts()?.account(&addr.address())?.unwrap_or_default();
+                let shard_account_opt = uss.read_accounts()?.account(&addr.address())?;
 
                 let proof = if let Some(spc) = state_proof_cell {
                     let acc_proof = MerkleProof::create_by_usage_tree(&shard_root, &usage_tree)?;
@@ -812,10 +811,10 @@ impl LiteServerQuerySubscriber {
                     None
                 };
 
-                let account = shard_account.read_account()?;
-                if account.get_code().is_none() {
-                    return Ok((-256, None, proof));
-                }
+                let shard_account = match shard_account_opt {
+                    Some(sa) if sa.read_account()?.get_code().is_some() => sa,
+                    _ => return Ok((-256, None, proof)),
+                };
 
                 let input_stack = deserialize_vm_stack_boc(&params)?;
                 let input_entries = convert_stack(&input_stack)?;
