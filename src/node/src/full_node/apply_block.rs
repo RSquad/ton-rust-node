@@ -37,7 +37,7 @@ pub async fn apply_block(
     check_prev_blocks(&prev_ids, engine, mc_seq_no, pre_apply, recursion_depth).await?;
 
     if !handle.has_state() {
-        store_state_update(handle, block, &prev_ids, engine).await?;
+        calc_and_store_state(handle, block, &prev_ids, engine).await?;
     }
     set_prev_ids(handle, &prev_ids, engine.deref())?;
     if !pre_apply {
@@ -94,7 +94,7 @@ async fn check_prev_blocks(
 
 // Normal mode - gets prev block(s) state and applies merkle update from block to calculate new state
 // Archival mode - just saves state update from block, without applying it
-pub async fn store_state_update(
+pub async fn calc_and_store_state(
     handle: &Arc<BlockHandle>,
     block: &BlockStuff,
     prev_ids: &(BlockIdExt, Option<BlockIdExt>),
@@ -138,15 +138,26 @@ pub async fn store_state_update(
             let now = std::time::Instant::now();
             let cf = engine_cloned.db_cells_factory()?;
             let cl = engine_cloned.db_cells_loader()?;
+            let mut fast_attempt = true;
             let (ss_root, _metrics) =
-                merkle_update.apply_for_ex(&prev_ss_root, &cf, cl.deref()).map_err(|e| {
-                    error!(
-                        "Error applying Merkle update for block {}: {}\
-                        prev_ss_root: {:#.2}\
-                        merkle_update: {}",
-                        block_id, e, prev_ss_root, merkle_update
-                    )
-                })?;
+                match merkle_update.apply_for_ex(&prev_ss_root, &cf, cl.deref()) {
+                    Err(e) => {
+                        log::debug!(
+                            "Failed the fast attempt of Merkle update applying for block {}: {}. Trying classic approach...",
+                            block_id, e
+                        );
+                        fast_attempt = false;
+                        merkle_update.apply_for(&prev_ss_root).map_err(|e| {
+                            error!(
+                                "Error applying Merkle update for block {}: {}\
+                                prev_ss_root: {:#.2}\
+                                merkle_update: {}",
+                                block_id, e, prev_ss_root, merkle_update
+                            )
+                        })?
+                    }
+                    Ok(r) => r
+                };
             let elapsed = now.elapsed();
             log::debug!(
                 "({}): TIME: store_state_update: applied Merkle update {}ms   {}",
@@ -155,7 +166,11 @@ pub async fn store_state_update(
                 block_id
             );
             #[cfg(feature = "telemetry")]
-            log::debug!(target: "telemetry", "({}): applying Merkle update: \n{}", block_descr_clone, _metrics);
+            log::debug!(target: "telemetry", "({}): applied Merkle update ({}): \ntime:{}\n{}",
+                block_descr_clone,
+                if fast_attempt { "fast" } else { "classic" },
+                elapsed.as_millis(),
+                _metrics);
             metrics::histogram!("ton_node_db_calc_merkle_update_seconds").record(elapsed);
             ShardStateStuff::from_root_cell(
                 block_id.clone(),
