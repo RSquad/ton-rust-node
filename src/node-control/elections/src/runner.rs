@@ -604,7 +604,7 @@ impl ElectionRunner {
                         max_factor,
                     })
                 }
-                (None, None) => None
+                (None, None) => None,
             };
             node.key_id =
                 validator_key.as_ref().map(|entry| entry.key_id.clone()).unwrap_or_default();
