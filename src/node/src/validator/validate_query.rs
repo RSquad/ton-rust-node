@@ -39,6 +39,7 @@ use std::fs;
 use std::{
     collections::HashMap,
     mem,
+    ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
@@ -926,7 +927,11 @@ impl ValidateQuery {
      *
      */
 
-    fn compute_next_state(&mut self, base: &mut ValidateBase, mc_data: &McData) -> Result<()> {
+    async fn compute_next_state(
+        &mut self,
+        base: &mut ValidateBase,
+        mc_data: &McData,
+    ) -> Result<()> {
         let prev_state = base.prev_states[0].clone();
         base.prev_state = Some(prev_state.clone());
         let prev_state_root = if base.after_merge && base.prev_states.len() == 2 {
@@ -941,9 +946,33 @@ impl ValidateQuery {
             base.prev_states[0].root_cell().clone()
         };
         log::debug!(target: "validate_query", "({}): computing next state", self.next_block_descr);
-        let next_state_root = base.state_update.apply_for(&prev_state_root).map_err(|err| {
-            error!("cannot apply Merkle update from block to compute new state : {}", err)
-        })?;
+        let engine = self.engine.clone();
+        let state_update = base.state_update.clone();
+        let next_block_descr = self.next_block_descr.clone();
+        let is_fake = base.is_fake;
+        let (next_state_root, _) = tokio::task::spawn_blocking(move || {
+            let fast_result = if is_fake {
+                Err(error!("not supported in test env"))
+            } else {
+                engine.db_cells_factory()
+                    .and_then(|cf| engine.db_cells_loader().map(|cl| (cf, cl)))
+                    .and_then(|(cf, cl)| {
+                        state_update.apply_for_ex(&prev_state_root, &cf, cl.deref())
+                    })
+            };
+            match fast_result {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    log::debug!(
+                        "({}): Failed the fast attempt of Merkle update applying: {}. Trying classic approach...",
+                        next_block_descr, e
+                    );
+                    state_update.apply_for(&prev_state_root).map_err(|err| {
+                        error!("cannot apply Merkle update from block to compute new state : {}", err)
+                    })
+                }
+            }
+        }).await??;
         log::debug!(target: "validate_query", "({}): next state computed", self.next_block_descr);
         let next_state = ShardStateStuff::from_root_cell(
             base.block_id().clone(),
@@ -6780,7 +6809,7 @@ impl ValidateQuery {
         let mut base = self.init_base()?;
         let mc_data = self.init_mc_data(&mut base).await?;
         // stage 0
-        self.compute_next_state(&mut base, &mc_data)?;
+        self.compute_next_state(&mut base, &mc_data).await?;
         self.unpack_prev_state(&mut base)?;
         self.unpack_next_state(&mut base, &mc_data)?;
         base.prev_blocks_info = PrevBlocksInfo::Raw(
