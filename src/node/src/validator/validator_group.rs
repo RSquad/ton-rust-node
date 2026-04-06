@@ -1335,6 +1335,7 @@ impl ValidatorGroup {
         let (
             expected_current_round,
             prev_block_ids,
+            pipeline_context,
             mc_block_id_opt,
             min_ts,
             last_accepted_mc_seqno,
@@ -1343,6 +1344,7 @@ impl ValidatorGroup {
                 (
                     group_impl.expected_current_round,
                     group_impl.prev_block_ids.clone(),
+                    group_impl.pipeline_context.clone(), //TODO: optimize
                     group_impl.min_masterchain_block_id.clone(),
                     group_impl.min_ts,
                     group_impl.last_accepted_mc_seqno,
@@ -1435,6 +1437,7 @@ impl ValidatorGroup {
                     let validation_completion_time = run_validate_query_any_candidate(
                         candidate.clone(),
                         engine.clone(),
+                        pipeline_context,
                         is_simplex,
                     )
                     .await?;

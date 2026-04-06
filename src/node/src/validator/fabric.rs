@@ -39,6 +39,7 @@ use ton_block::{
 pub async fn run_validate_query_any_candidate(
     block_candidate: BlockCandidate,
     engine: Arc<dyn EngineOperations>,
+    pipeline_context: PipelineContext,
     is_simplex: bool,
 ) -> Result<SystemTime> {
     let block_id = block_candidate.block_id.clone();
@@ -77,6 +78,7 @@ pub async fn run_validate_query_any_candidate(
         info.shard().clone(),
         min_mc_seqno,
         prev_blocks_ids,
+        pipeline_context,
         block_candidate,
         validator_set,
         engine.clone(),
@@ -172,6 +174,7 @@ pub async fn run_validate_query(
             shard.clone(),
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
+            Default::default(),
             block,
             set,
             engine.clone(),
@@ -186,6 +189,7 @@ pub async fn run_validate_query(
             shard.clone(),
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
+            Default::default(),
             block.clone(),
             set,
             engine.clone(),
