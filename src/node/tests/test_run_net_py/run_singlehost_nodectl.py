@@ -172,6 +172,7 @@ class Bootstrap:
         self.phase7_start_service()
         wallet_addrs, pool_addrs = self.phase8_wait_and_topup()
         last_count = self.phase9_wait_participants()
+        self._setup_auth()
         self.phase10_validate_api()
         self.phase11_summary(master_addr, wallet_addrs, pool_addrs, last_count)
 
@@ -529,6 +530,30 @@ class Bootstrap:
             if cnt > 0 or time.time() >= deadline:
                 return cnt
             time.sleep(5)
+
+    # ── Auth setup (before phase 10) ────────────────────────────────────────
+
+    def _setup_auth(self) -> None:
+        """Create an API user, log in, and export NODECTL_API_TOKEN."""
+        self.log.info("Setting up API authentication...")
+        password = secrets.token_hex(16)
+
+        # Create operator user (--password-stdin to avoid interactive prompt)
+        subprocess.run(
+            [str(self.paths.nodectl_bin), "auth", "add",
+             "--username", "admin", "--role", "operator", "--password-stdin"],
+            input=password, text=True, check=True,
+        )
+        self.log.info("  Created auth user 'admin' (operator)")
+
+        # Login and capture the JWT token
+        result = subprocess.run(
+            [str(self.paths.nodectl_bin), "api", "login", "admin", "--password-stdin"],
+            input=password, capture_output=True, text=True, check=True,
+        )
+        token = json.loads(result.stdout)["token"]
+        os.environ["NODECTL_API_TOKEN"] = token
+        self.log.info("  Logged in and exported NODECTL_API_TOKEN")
 
     # ── Phase 10: REST API stake validation ───────────────────────────────────
 
