@@ -683,7 +683,7 @@ impl Overlay {
         let mut addrs = Vec::new();
         for neighbour in neighbours.iter() {
             #[cfg(feature = "telemetry")]
-            if let Err(e) = self.update_stats(neighbour, data.tag, true).await {
+            if let Err(e) = self.update_stats(neighbour, data.tag, true) {
                 log::warn!(
                     target: TARGET,
                     "Cannot update statistics in overlay {} for {neighbour} during broadcast: {e}",
@@ -901,7 +901,7 @@ impl Overlay {
         let src = self.overlay_key().unwrap_or(default_key).id();
         let peers = AdnlPeers::with_keys(src.clone(), dst.clone());
         #[cfg(feature = "telemetry")]
-        self.update_stats(dst, tag, true).await?;
+        self.update_stats(dst, tag, true)?;
         Ok(peers)
     }
 
@@ -1230,18 +1230,7 @@ impl Overlay {
     }
 
     #[cfg(feature = "telemetry")]
-    async fn update_stats(&self, dst: &Arc<KeyId>, tag: u32, is_send: bool) -> Result<()> {
-        const PRINT_BIT: u64 = 1 << 63;
-        let elapsed = self.start.elapsed().as_secs();
-        let printed = loop {
-            let printed = self.print.fetch_max(elapsed, Ordering::Relaxed);
-            if (printed & PRINT_BIT) != 0 {
-                // In print now, wait
-                tokio::task::yield_now().await;
-            } else {
-                break printed;
-            }
-        };
+    fn update_stats(&self, dst: &Arc<KeyId>, tag: u32, is_send: bool) -> Result<()> {
         let stats = if is_send { &self.stats_per_peer_send } else { &self.stats_per_peer_recv };
         let stats = if let Some(stats) = stats.get(dst) {
             stats
@@ -1282,24 +1271,24 @@ impl Overlay {
         } else {
             self.messages_recv.fetch_add(1, Ordering::Relaxed);
         }
-        drop(stats);
-        if printed == elapsed {
-            // Exceeded assigned time
-            let next = elapsed + 5;
+        Ok(())
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn try_print_stats(&self) {
+        let elapsed = self.start.elapsed().as_secs();
+        let printed = self.print.load(Ordering::Relaxed);
+        if elapsed > printed {
             if self
                 .print
-                .compare_exchange(printed, next | PRINT_BIT, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(printed, elapsed + 5, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                // Print only once
-                let ret = self.print_stats();
-                self.print
-                    .compare_exchange(next | PRINT_BIT, next, Ordering::Relaxed, Ordering::Relaxed)
-                    .ok();
-                ret?;
+                if let Err(e) = self.print_stats() {
+                    log::warn!(target: TARGET, "Error printing overlay stats: {e}");
+                }
             }
         }
-        Ok(())
     }
 }
 
@@ -2271,6 +2260,9 @@ impl Subscriber for OverlayNode {
         self.telemetry.send_transfers.update(self.allocated.send_transfers.load(Ordering::Relaxed));
         self.telemetry.stats_peer.update(self.allocated.stats_peer.load(Ordering::Relaxed));
         self.telemetry.stats_transfer.update(self.allocated.stats_transfer.load(Ordering::Relaxed));
+        for overlay in self.overlays.iter() {
+            overlay.val().try_print_stats();
+        }
     }
 
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
@@ -2325,7 +2317,7 @@ impl Subscriber for OverlayNode {
                             u32::from_le_bytes([suffix[0], suffix[1], suffix[2], suffix[3]])
                         };
                         #[cfg(feature = "telemetry")]
-                        overlay.update_stats(peers.other(), tag, false).await?;
+                        overlay.update_stats(peers.other(), tag, false)?;
                         return Ok(true);
                     }
                     _ => (),
@@ -2343,7 +2335,7 @@ impl Subscriber for OverlayNode {
         let have_postfix = postfix_offset < suffix.len();
 
         #[cfg(feature = "telemetry")]
-        overlay.update_stats(peers.other(), bundle[0].bare_object().constructor(), false).await?;
+        overlay.update_stats(peers.other(), bundle[0].bare_object().constructor(), false)?;
         if bundle.len() == 2 {
             // Catchain/validator session messages in private overlay
             let catchain_update = match bundle.remove(0).downcast::<CatchainBlockUpdateBoxed>() {
@@ -2461,9 +2453,7 @@ impl Subscriber for OverlayNode {
         let other_workchain = (overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0;
         #[cfg(feature = "telemetry")]
         if !other_workchain {
-            overlay
-                .update_stats(peers.other(), objects[0].bare_object().constructor(), false)
-                .await?;
+            overlay.update_stats(peers.other(), objects[0].bare_object().constructor(), false)?;
         }
         let object = match objects.remove(0).downcast::<GetRandomPeers>() {
             Ok(query) => {

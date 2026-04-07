@@ -24,7 +24,7 @@ use std::{
 mod tests;
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
-pub struct MerkleUdateApplyMetrics {
+pub struct MerkleUpdateApplyMetrics {
     pub old_cells: usize,
     pub old_pruned: usize,
     pub new_cells: usize,
@@ -32,7 +32,7 @@ pub struct MerkleUdateApplyMetrics {
     pub created_new_cells: usize,
 }
 
-impl Display for MerkleUdateApplyMetrics {
+impl Display for MerkleUpdateApplyMetrics {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -333,8 +333,9 @@ impl MerkleUpdate {
     }
 
     /// Applies update to given tree of cells by returning new updated one
-    pub fn apply_for(&self, old_root: &Cell) -> Result<Cell> {
-        let old_cells_hashes = self.check(old_root, None)?;
+    pub fn apply_for(&self, old_root: &Cell) -> Result<(Cell, MerkleUpdateApplyMetrics)> {
+        let mut metrics = MerkleUpdateApplyMetrics::default();
+        let old_cells_hashes = self.check(old_root, Some(&mut metrics))?;
         let mut old_cells = ahash::AHashMap::new();
         Self::collect_old_cells(
             old_root,
@@ -346,7 +347,7 @@ impl MerkleUpdate {
 
         // cells for new bag
         if self.new_hash == self.old_hash {
-            Ok(old_root.clone())
+            Ok((old_root.clone(), MerkleUpdateApplyMetrics::default()))
         } else {
             let loader = |hash: &UInt256| {
                 old_cells
@@ -354,20 +355,22 @@ impl MerkleUpdate {
                     .cloned()
                     .ok_or_else(|| error!("Can't load cell with hash {:x}", hash))
             };
+            let mut new_cells = ahash::AHashMap::new();
             let new_root = self.traverse_on_apply(
                 &self.new,
                 &loader,
-                &mut ahash::AHashMap::new(),
+                &mut new_cells,
                 0,
                 &(Arc::new(DefaultCellsFactory) as Arc<dyn CellsFactory>),
             )?;
+            metrics.created_new_cells = new_cells.len();
 
             // constructed tree's hash have to coinside with self.new_hash
             if new_root.repr_hash() != self.new_hash {
                 fail!(BlockError::WrongMerkleUpdate("new bag's hash mismatch".to_string()))
             }
 
-            Ok(new_root)
+            Ok((new_root, metrics))
         }
     }
 
@@ -376,13 +379,13 @@ impl MerkleUpdate {
         old_root: &Cell,
         factory: &Arc<dyn CellsFactory>,
         loader: &dyn Fn(&UInt256) -> Result<Cell>,
-    ) -> Result<(Cell, MerkleUdateApplyMetrics)> {
-        let mut metrics = MerkleUdateApplyMetrics::default();
+    ) -> Result<(Cell, MerkleUpdateApplyMetrics)> {
+        let mut metrics = MerkleUpdateApplyMetrics::default();
         let _ = self.check(old_root, Some(&mut metrics))?;
 
         // cells for new bag
         if self.new_hash == self.old_hash {
-            Ok((old_root.clone(), MerkleUdateApplyMetrics::default()))
+            Ok((old_root.clone(), MerkleUpdateApplyMetrics::default()))
         } else {
             let mut new_cells = ahash::AHashMap::new();
             let new_root = self.traverse_on_apply(&self.new, loader, &mut new_cells, 0, factory)?;
@@ -402,7 +405,7 @@ impl MerkleUpdate {
     fn check(
         &self,
         old_root: &Cell,
-        mut metrics: Option<&mut MerkleUdateApplyMetrics>,
+        mut metrics: Option<&mut MerkleUpdateApplyMetrics>,
     ) -> Result<ahash::AHashSet<UInt256>> {
         // check that hash of `old_tree` is equal old hash from `self`
         if self.old_hash != old_root.repr_hash() {
