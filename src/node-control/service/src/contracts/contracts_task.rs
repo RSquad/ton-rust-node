@@ -26,8 +26,12 @@ use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::Accou
 const DEPLOY_AMOUNT: u64 = 1_100_000_000; // 1.1 TON
 /// Minimal required balance for a wallet before it will be topped up.
 const MIN_WALLET_BALANCE: u64 = 5_000_000_000; // 5 TON
-/// Gas cost for sending message from a wallet.
+/// Gas cost for sending a simple message from a wallet (deploy, top-up).
 const WALLET_GAS: u64 = 100_000_000; // 0.1 TON
+/// Gas for masterchain pool operations (update_validator_set, etc.)
+/// Masterchain gas prices are ~25x basechain; 0.1 TON is not enough
+/// for load_data + get_current_validator_set + cell_hash + save_data.
+const POOL_OP_GAS: u64 = 500_000_000; // 0.5 TON
 /// Amount to top up a wallet if its balance is below the minimum threshold.
 const TOP_UP_AMOUNT: u64 = 10_000_000_000; // 10 TON
 
@@ -444,7 +448,7 @@ impl ContractsMonitor {
 
                 tracing::info!(
                     target: "contracts",
-                    "[{}] pool={} state={} vsc_count={}",
+                    "[{}] pool={} state={} ={}",
                     node_id, pool.address(), pool_data.state, pool_data.validator_set_changes_count
                 );
 
@@ -466,7 +470,7 @@ impl ContractsMonitor {
                     .master_wallet
                     .build_message(
                         pool.address(),
-                        WALLET_GAS,
+                        POOL_OP_GAS,
                         body,
                         true,
                         Some(u32::try_from(*seqno)?),
