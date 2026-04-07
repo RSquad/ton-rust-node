@@ -251,6 +251,7 @@ pub struct ValidatorGroupImpl {
     expected_collation_round: u32,
     is_collator: bool,
     is_accelerated_consensus_enabled: bool,
+    is_pipeline_context_enabled: bool,
 
     shard: ShardIdent,
     session_id: SessionId,
@@ -506,6 +507,7 @@ impl ValidatorGroupImpl {
         cc_seqno: u32,
         session_id: SessionId,
         is_accelerated_consensus_enabled: bool,
+        is_pipeline_context_enabled: bool,
         consensus_type: ConsensusType,
     ) -> ValidatorGroupImpl {
         log::info!(target: "validator",
@@ -516,6 +518,7 @@ impl ValidatorGroupImpl {
         ValidatorGroupImpl {
             local_id: local_id.clone(),
             is_accelerated_consensus_enabled,
+            is_pipeline_context_enabled,
             min_masterchain_block_id: None,
             cc_seqno,
             min_ts: SystemTime::now(),
@@ -670,6 +673,7 @@ impl ValidatorGroup {
     ) -> Self {
         let consensus_type = consensus_options.consensus_type();
         let is_accelerated = consensus_options.is_accelerated_consensus_enabled();
+        let is_pipeline_context_enabled = consensus_options.is_pipeline_context_enabled();
 
         let group_impl = ValidatorGroupImpl::new(
             local_key.id(),
@@ -677,6 +681,7 @@ impl ValidatorGroup {
             general_session_info.catchain_seqno,
             session_id.clone(),
             is_accelerated,
+            is_pipeline_context_enabled,
             consensus_type,
         );
         let id = format!("Val. group {} {:x}", general_session_info.shard, session_id);
@@ -1233,7 +1238,7 @@ impl ValidatorGroup {
                                 group_impl.expected_collation_round = round + 1;
                             }
 
-                            if group_impl.is_accelerated_consensus_enabled {
+                            if group_impl.is_pipeline_context_enabled {
                                 group_impl.pipeline_context.add(
                                     new_state,
                                     new_block,
@@ -1906,6 +1911,7 @@ mod tests {
             ShardIdent::masterchain(),
             1,
             UInt256::default(),
+            false,
             false,
             ConsensusType::Catchain,
         )
