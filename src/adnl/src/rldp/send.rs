@@ -44,7 +44,7 @@ pub struct RaptorqEncoder {
 
 impl RaptorqEncoder {
     /// Construct over data
-    pub fn with_data(data: &[u8], symbol: Option<u16>) -> Self {
+    pub fn with_data(data: &[u8], symbol: Option<u32>) -> Self {
         let engine =
             if let Some(symbol_size) = symbol.filter(|&s| s as usize != Constraints::SYMBOL) {
                 // symbol_size is set for the two-step FEC broadcast case where data is
@@ -59,8 +59,8 @@ impl RaptorqEncoder {
                 // and k is bounded by the neighbour count (typically a few dozen, at most
                 // ~130), which is far below K'_max = 56403 (RFC 6330 max symbols per block).
                 //
-                // sub_blocks=1: the data fits comfortably in memory since part_size < 65536
-                // and kt <= k << K'_max, so no sub-block splitting is needed.
+                // sub_blocks=1: the data fits comfortably in memory since
+                // kt <= k << K'_max, so no sub-block splitting is needed.
                 let config = raptorq::ObjectTransmissionInformation::new(
                     data.len() as u64,
                     symbol_size,

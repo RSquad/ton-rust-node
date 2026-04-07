@@ -1675,8 +1675,6 @@ pub(crate) struct BroadcastTwostepFecProtocol {
 }
 
 impl BroadcastTwostepFecProtocol {
-    const MAX_PART_SIZE: usize = 65536;
-
     pub(crate) fn for_recv() -> Self {
         Self { extra: None, send_ctx: None }
     }
@@ -1690,9 +1688,6 @@ impl BroadcastTwostepFecProtocol {
         }
         let k = ((neighbours as usize) * 2 - 2) / 3;
         let part_size = (data.len() + k - 1) / k;
-        if part_size >= Self::MAX_PART_SIZE {
-            fail!("Too big part size {part_size} in {} broadcast", Self::broadcast_type());
-        }
         let ctx = BroadcastTwostepSendContext { neighbours, part_size };
         Ok(Self { extra: Some(extra), send_ctx: Some(ctx) })
     }
@@ -1819,7 +1814,7 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
             bcast_id: *bcast_id,
             data_hash: sha256_digest(ctx.data.object),
             date,
-            encoder: RaptorqEncoder::with_data(ctx.data.object, Some(send_ctx.part_size as u16)),
+            encoder: RaptorqEncoder::with_data(ctx.data.object, Some(send_ctx.part_size as u32)),
             extra: self.extra.take().unwrap_or_default(),
             flags: ctx.flags,
             seqno: 0,

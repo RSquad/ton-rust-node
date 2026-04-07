@@ -220,7 +220,11 @@ void CompatTestNode::process_stdin() {
 void CompatTestNode::handle_command(std::string cmd_line) {
     if (cmd_line.empty()) return;
 
-    LOG(INFO) << "CMD: " << cmd_line;
+    if (cmd_line.size() <= 250) {
+        LOG(INFO) << "CMD: " << cmd_line;
+    } else {
+        LOG(INFO) << "CMD: " << cmd_line.substr(0, 250) << "... (" << cmd_line.size() << " bytes)";
+    }
 
     auto json_res = td::json_decode(cmd_line);
     if (json_res.is_error()) {
@@ -288,6 +292,10 @@ void CompatTestNode::handle_command(std::string cmd_line) {
         cmd_send_quic_message(obj);
     } else if (cmd == "send_quic_query") {
         cmd_send_quic_query(obj);
+    } else if (cmd == "raptorq_encode") {
+        cmd_raptorq_encode(obj);
+    } else if (cmd == "raptorq_decode") {
+        cmd_raptorq_decode(obj);
     } else if (cmd == "shutdown") {
         respond("{\"result\": \"shutting_down\"}");
         std::_Exit(0);  // Force immediate exit
@@ -1259,6 +1267,156 @@ void CompatTestNode::cmd_send_quic_query(td::JsonObject &obj) {
                 td::actor::send_closure(SelfId, &CompatTestNode::respond, oss.str());
             }),
         timeout, std::move(data));
+}
+
+void CompatTestNode::cmd_raptorq_encode(td::JsonObject &obj) {
+    auto data_b64 = get_string(obj, "data");
+    auto symbol_size_raw = get_int(obj, "symbol_size", 768);
+    if (symbol_size_raw <= 0) {
+        respond_error("symbol_size must be positive");
+        return;
+    }
+    auto symbol_size = static_cast<size_t>(symbol_size_raw);
+
+    if (data_b64.empty()) {
+        respond_error("Missing 'data' (base64)");
+        return;
+    }
+
+    auto data_res = td::base64_decode(data_b64);
+    if (data_res.is_error()) {
+        respond_error("Invalid base64 data: " + data_res.error().message().str());
+        return;
+    }
+    auto data = td::BufferSlice(data_res.move_as_ok());
+
+    auto encoder = td::fec::RaptorQEncoder::create(std::move(data), symbol_size);
+    if (!encoder) {
+        respond_error("Failed to create RaptorQ encoder");
+        return;
+    }
+
+    auto params = encoder->get_parameters();
+
+    // How many symbols to generate: all source + some repair
+    auto num_repair_raw = get_int(obj, "repair_count", 0);
+    auto num_repair = static_cast<size_t>(num_repair_raw < 0 ? 0 : num_repair_raw);
+    auto total = params.symbols_count + num_repair;
+
+    // Need precalc to generate repair symbols
+    if (num_repair > 0) {
+        encoder->prepare_more_symbols();
+    }
+
+    std::ostringstream oss;
+    oss << "{\"result\": {"
+        << "\"data_size\": " << params.data_size
+        << ", \"symbol_size\": " << params.symbol_size
+        << ", \"symbols_count\": " << params.symbols_count
+        << ", \"symbols\": [";
+
+    for (size_t i = 0; i < total; i++) {
+        auto sym = encoder->gen_symbol(static_cast<td::uint32>(i));
+        if (i > 0) oss << ", ";
+        oss << "{\"id\": " << sym.id
+            << ", \"data\": \"" << td::base64_encode(sym.data.as_slice()) << "\"}";
+    }
+
+    oss << "]}}";
+    respond(oss.str());
+}
+
+void CompatTestNode::cmd_raptorq_decode(td::JsonObject &obj) {
+    auto data_size_raw = get_int(obj, "data_size", 0);
+    auto symbol_size_raw = get_int(obj, "symbol_size", 768);
+    auto symbols_count_raw = get_int(obj, "symbols_count", 0);
+
+    if (data_size_raw <= 0 || symbol_size_raw <= 0 || symbols_count_raw <= 0) {
+        respond_error("Missing required params: data_size, symbol_size, symbols_count");
+        return;
+    }
+    auto data_size = static_cast<size_t>(data_size_raw);
+    auto symbol_size = static_cast<size_t>(symbol_size_raw);
+    auto symbols_count = static_cast<size_t>(symbols_count_raw);
+
+    // Parse symbols array from JSON
+    // We need to manually walk the JSON array
+    td::JsonValue *symbols_val = nullptr;
+    for (auto &kv : obj.field_values_) {
+        if (kv.first == "symbols") {
+            symbols_val = &kv.second;
+            break;
+        }
+    }
+
+    if (!symbols_val || symbols_val->type() != td::JsonValue::Type::Array) {
+        respond_error("Missing or invalid 'symbols' array");
+        return;
+    }
+
+    td::fec::RaptorQEncoder::Parameters params;
+    params.data_size = data_size;
+    params.symbol_size = symbol_size;
+    params.symbols_count = symbols_count;
+
+    auto decoder_res = td::fec::RaptorQDecoder::create(params);
+    if (decoder_res.is_error()) {
+        respond_error("Failed to create decoder: " + decoder_res.error().message().str());
+        return;
+    }
+    auto decoder = decoder_res.move_as_ok();
+
+    auto &arr = symbols_val->get_array();
+    for (auto &elem : arr) {
+        if (elem.type() != td::JsonValue::Type::Object) {
+            respond_error("Symbol must be a JSON object");
+            return;
+        }
+        auto &sym_obj = elem.get_object();
+
+        td::uint32 sym_id = 0;
+        std::string sym_data_b64;
+        for (auto &skv : sym_obj.field_values_) {
+            if (skv.first == "id") {
+                if (skv.second.type() == td::JsonValue::Type::Number) {
+                    sym_id = static_cast<td::uint32>(td::to_integer<td::int64>(skv.second.get_number()));
+                }
+            } else if (skv.first == "data") {
+                if (skv.second.type() == td::JsonValue::Type::String) {
+                    sym_data_b64 = skv.second.get_string().str();
+                }
+            }
+        }
+
+        auto sym_data_res = td::base64_decode(sym_data_b64);
+        if (sym_data_res.is_error()) {
+            respond_error("Invalid base64 in symbol data");
+            return;
+        }
+
+        td::fec::Symbol sym{sym_id, td::BufferSlice(sym_data_res.move_as_ok())};
+        auto status = decoder->add_symbol(std::move(sym));
+        if (status.is_error()) {
+            respond_error("add_symbol failed: " + status.message().str());
+            return;
+        }
+    }
+
+    if (!decoder->may_try_decode()) {
+        respond_error("Not enough symbols to decode");
+        return;
+    }
+
+    auto decode_res = decoder->try_decode(false);
+    if (decode_res.is_error()) {
+        respond_error("Decode failed: " + decode_res.error().message().str());
+        return;
+    }
+
+    auto decoded = decode_res.move_as_ok();
+    auto decoded_b64 = td::base64_encode(decoded.data.as_slice());
+
+    respond_ok("\"data\": \"" + decoded_b64 + "\"");
 }
 
 } // namespace compat_test
