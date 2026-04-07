@@ -531,6 +531,8 @@ fn setup_default_provider_without_account(
     provider.expect_export_public_key().returning(|_key_id| Ok(PUB_KEY.to_vec()));
     provider.expect_sign().returning(|_key, _data| Ok(SIGNATURE.to_vec()));
     provider.expect_send_boc().returning(|_boc| Ok(()));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 }
 
@@ -2687,6 +2689,8 @@ async fn test_router_recover_stake_both_pools() {
         .expect_account()
         .returning(move |_address| Ok(fake_account(WALLET_BALANCE)));
     harness.provider_mock.expect_send_boc().returning(|_boc| Ok(()));
+    harness.provider_mock.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    harness.provider_mock.expect_config_param_17().returning(|| Ok(default_cfg17()));
     harness.provider_mock.expect_shutdown().returning(|| Ok(()));
 
     let mut runner = harness.build(node_id);

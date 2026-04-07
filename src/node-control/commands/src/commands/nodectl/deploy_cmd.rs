@@ -16,7 +16,10 @@ use common::{
     task_cancellation::CancellationCtx,
     ton_utils::{nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
-use contracts::{NominatorWrapperImpl, TonWallet, resolve_toncore_pool, resolve_toncore_router};
+use contracts::{
+    NominatorWrapperImpl, TonWallet, resolve_toncore_pool, resolve_toncore_router,
+    ton_core_nominator::messages as pool_messages,
+};
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
@@ -385,6 +388,13 @@ impl DeployPoolCmd {
 
         let amount_to_send_nano = tons_f64_to_nanotons(self.amount);
 
+        let deploy_body = match pool_cfg_opt {
+            Some(PoolConfig::TONCore { .. }) | Some(PoolConfig::TONCoreRouter { .. }) => {
+                pool_messages::deposit_validator(0).map_err(set_err)?
+            }
+            _ => Cell::default(),
+        };
+
         let wallet = make_wallet(rpc_client.clone(), wallet_cfg, secret, &self.node)
             .await
             .map_err(set_err)?;
@@ -438,7 +448,7 @@ impl DeployPoolCmd {
                     .build_message(
                         pool_address.clone(),
                         amount_to_send_nano,
-                        Cell::default(),
+                        deploy_body.clone(),
                         false,
                         seqno,
                         None,
