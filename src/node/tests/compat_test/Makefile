@@ -12,6 +12,13 @@ BUILD_DIR := $(ROOT_DIR)/build
 CPP_BUILD_DIR ?= $(BUILD_DIR)/cpp
 RUST_TARGET_DIR := $(BUILD_DIR)/rust
 
+# Resolve CPP_SRC_PATH to absolute to avoid breakage when CMake runs from build dir
+CPP_SRC_PATH_ORIG := $(CPP_SRC_PATH)
+CPP_SRC_PATH := $(shell cd "$(CPP_SRC_PATH)" 2>/dev/null && pwd)
+ifeq ($(CPP_SRC_PATH),)
+$(error CPP_SRC_PATH "$(CPP_SRC_PATH_ORIG)" is not a valid directory)
+endif
+
 # C++ source files location
 CPP_TEST_SRC := $(ROOT_DIR)/cpp_src
 

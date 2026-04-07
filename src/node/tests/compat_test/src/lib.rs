@@ -270,8 +270,31 @@ pub enum CppCommand {
         timeout_ms: i64,
     },
 
+    #[serde(rename = "raptorq_encode")]
+    RaptorqEncode {
+        /// base64-encoded data to encode
+        data: String,
+        symbol_size: u32,
+        repair_count: u32,
+    },
+
+    #[serde(rename = "raptorq_decode")]
+    RaptorqDecode {
+        data_size: u32,
+        symbol_size: u32,
+        symbols_count: u32,
+        symbols: Vec<EncodedSymbol>,
+    },
+
     #[serde(rename = "shutdown")]
     Shutdown,
+}
+
+/// A single RaptorQ encoded symbol (id + base64 data)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EncodedSymbol {
+    pub id: u32,
+    pub data: String, // base64
 }
 
 /// Ready response from C++ node
@@ -309,6 +332,15 @@ pub struct ReceivedMessage {
     pub size: usize,
     pub data: String, // base64 encoded
     pub timestamp: i32,
+}
+
+/// Result from RaptorQ encode command
+#[derive(Debug, Clone)]
+pub struct RaptorqEncodeResult {
+    pub data_size: u32,
+    pub symbol_size: u32,
+    pub symbols_count: u32,
+    pub symbols: Vec<EncodedSymbol>,
 }
 
 /// Info about the C++ node
@@ -433,11 +465,20 @@ impl CppTestNode {
 
     /// Send a command and get response
     pub fn send_command(&mut self, cmd: &CppCommand) -> Result<CppResponse> {
+        self.send_command_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT)
+    }
+
+    /// Send a command and get response with a custom timeout
+    pub fn send_command_with_timeout(
+        &mut self,
+        cmd: &CppCommand,
+        timeout: Duration,
+    ) -> Result<CppResponse> {
         let json = serde_json::to_string(cmd)?;
         writeln!(self.stdin, "{}", json)?;
         self.stdin.flush()?;
 
-        let line = self.recv_line(DEFAULT_COMMAND_TIMEOUT)?;
+        let line = self.recv_line(timeout)?;
 
         if line.is_empty() {
             return Err(CompatTestError::InvalidResponse(
@@ -451,7 +492,16 @@ impl CppTestNode {
 
     /// Extract result value, returning error if response is an error
     fn expect_result(&mut self, cmd: &CppCommand) -> Result<serde_json::Value> {
-        let response = self.send_command(cmd)?;
+        self.expect_result_with_timeout(cmd, DEFAULT_COMMAND_TIMEOUT)
+    }
+
+    /// Extract result value with a custom timeout
+    fn expect_result_with_timeout(
+        &mut self,
+        cmd: &CppCommand,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let response = self.send_command_with_timeout(cmd, timeout)?;
         match response {
             CppResponse::Result { result } => Ok(result),
             CppResponse::Error { error } => Err(CompatTestError::CommandFailed(error)),
@@ -854,6 +904,65 @@ impl CppTestNode {
             .ok_or_else(|| CompatTestError::InvalidResponse("Expected answer".to_string()))?;
         b64_decode(answer_b64)
             .map_err(|e| CompatTestError::InvalidResponse(format!("Invalid base64 answer: {}", e)))
+    }
+
+    // ---- RaptorQ ----
+
+    /// Longer timeout for RaptorQ commands that transfer large base64 payloads.
+    const RAPTORQ_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Encode data using C++ RaptorQ encoder.
+    /// Returns (params, symbols) where params = (data_size, symbol_size, symbols_count).
+    pub fn raptorq_encode(
+        &mut self,
+        data: &[u8],
+        symbol_size: u32,
+        repair_count: u32,
+    ) -> Result<RaptorqEncodeResult> {
+        let result = self.expect_result_with_timeout(
+            &CppCommand::RaptorqEncode { data: b64_encode(data), symbol_size, repair_count },
+            Self::RAPTORQ_COMMAND_TIMEOUT,
+        )?;
+        let data_size = result["data_size"]
+            .as_u64()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Missing data_size".into()))?
+            as u32;
+        let sym_size = result["symbol_size"]
+            .as_u64()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Missing symbol_size".into()))?
+            as u32;
+        let symbols_count = result["symbols_count"]
+            .as_u64()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Missing symbols_count".into()))?
+            as u32;
+        let symbols: Vec<EncodedSymbol> = serde_json::from_value(result["symbols"].clone())
+            .map_err(|e| CompatTestError::InvalidResponse(format!("Bad symbols: {}", e)))?;
+        Ok(RaptorqEncodeResult { data_size, symbol_size: sym_size, symbols_count, symbols })
+    }
+
+    /// Decode symbols using C++ RaptorQ decoder.
+    /// Returns decoded data bytes.
+    pub fn raptorq_decode(
+        &mut self,
+        data_size: u32,
+        symbol_size: u32,
+        symbols_count: u32,
+        symbols: &[EncodedSymbol],
+    ) -> Result<Vec<u8>> {
+        let result = self.expect_result_with_timeout(
+            &CppCommand::RaptorqDecode {
+                data_size,
+                symbol_size,
+                symbols_count,
+                symbols: symbols.to_vec(),
+            },
+            Self::RAPTORQ_COMMAND_TIMEOUT,
+        )?;
+        let data_b64 = result["data"]
+            .as_str()
+            .ok_or_else(|| CompatTestError::InvalidResponse("Expected 'data'".to_string()))?;
+        b64_decode(data_b64)
+            .map_err(|e| CompatTestError::InvalidResponse(format!("Invalid base64: {}", e)))
     }
 
     // ---- Lifecycle ----

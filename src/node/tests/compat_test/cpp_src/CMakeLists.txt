@@ -56,6 +56,7 @@ target_include_directories(compat_test_node PRIVATE
     ${TON_SRC_PATH}/rldp
     ${TON_SRC_PATH}/rldp2
     ${TON_SRC_PATH}/fec
+    ${TON_SRC_PATH}/tdfec
     ${TON_SRC_PATH}/quic
     ${TON_SRC_PATH}/metrics
     ${TON_SRC_PATH}/tddb
