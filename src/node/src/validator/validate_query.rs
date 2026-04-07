@@ -28,6 +28,7 @@ use crate::{
     },
     validator::{
         out_msg_queue::{MsgQueueManager, StatesManager},
+        validator_group::PipelineContext,
         validator_utils::calc_subset_for_masterchain,
         BlockCandidate, McData,
     },
@@ -277,6 +278,10 @@ pub struct ValidateQuery {
 
     engine: Arc<dyn EngineOperations>,
 
+    /// In-memory pipeline of recently collated states (accelerated consensus / Simplex).
+    /// Used to find prev states that haven't been persisted to DB yet.
+    pipeline_context: PipelineContext,
+
     next_block_descr: Arc<String>,
 }
 
@@ -296,6 +301,7 @@ impl ValidateQuery {
         shard: ShardIdent,
         min_mc_seqno: u32,
         prev_blocks_ids: Vec<BlockIdExt>,
+        pipeline_context: PipelineContext,
         block_candidate: BlockCandidate,
         validator_set: ValidatorSet,
         engine: Arc<dyn EngineOperations>,
@@ -321,6 +327,7 @@ impl ValidateQuery {
             create_stats_enabled: Default::default(),
             block_create_total: Default::default(),
             block_create_count: Default::default(),
+            pipeline_context,
             next_block_descr,
         }
     }
@@ -452,6 +459,8 @@ impl ValidateQuery {
                     self.engine.engine_telemetry(),
                     self.engine.engine_allocated(),
                 )?
+            } else if let Some(state) = self.pipeline_context.try_get_state(block_id) {
+                state
             } else {
                 self.engine.clone().wait_state(block_id, Some(1_000), true).await?
             };

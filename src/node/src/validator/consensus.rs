@@ -153,6 +153,18 @@ impl ConsensusOptions {
             ConsensusOptions::Simplex(_) => false,
         }
     }
+
+    /// Check if pipeline context updates are enabled.
+    ///
+    /// Pipeline context keeps recently collated block states so that subsequent
+    /// collations can chain on top of them (precollation).  Simplex always needs
+    /// this; for Catchain it mirrors the accelerated-consensus flag.
+    pub fn is_pipeline_context_enabled(&self) -> bool {
+        match self {
+            ConsensusOptions::Catchain(opts) => opts.accelerated_consensus_enabled,
+            ConsensusOptions::Simplex(_) => true,
+        }
+    }
 }
 
 impl Default for ConsensusOptions {
