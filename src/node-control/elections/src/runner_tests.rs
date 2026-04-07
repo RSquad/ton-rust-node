@@ -2068,7 +2068,8 @@ async fn test_router_selects_free_pool() {
 
     setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
 
-    let expected_stake = (POOL_BALANCE - MIN_NANOTON_FOR_STORAGE) / 2;
+    // Router + split50: stake entire liquid balance of the active (free) pool.
+    let expected_stake = POOL_BALANCE - MIN_NANOTON_FOR_STORAGE;
     harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
 
     let mut runner = harness.build(node_id);

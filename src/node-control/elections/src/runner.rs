@@ -891,6 +891,28 @@ impl ElectionRunner {
                 min_stake as f64 / 1_000_000_000.0
             );
         }
+
+        // TONCore router: two pools alternate rounds — reserve is the *other* pool.
+        // Split50 would halve (frozen + pool + elections) and under-stake the active pool;
+        // instead stake the full liquid balance of the selected pool (still >= min_stake).
+        if matches!(
+            (&node.pools, &node.stake_policy),
+            (Some(NodePools::Router(_)), StakePolicy::Split50)
+        ) {
+            if pool_free_balance < min_stake {
+                anyhow::bail!(
+                    "not enough funds: pool_available={} TON, min_stake={} TON",
+                    pool_free_balance as f64 / 1_000_000_000.0,
+                    min_stake as f64 / 1_000_000_000.0
+                );
+            }
+            tracing::info!(
+                "node [{}] split50 on router: use full active pool balance (not half of total_balance)",
+                node_id
+            );
+            return Ok(pool_free_balance);
+        }
+
         node.stake_policy.calculate_stake(min_stake, total_balance)
     }
 
