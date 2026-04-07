@@ -8,7 +8,10 @@
  */
 use control_client::client_api::Account as ControlClientAccount;
 use std::collections::HashMap;
-use ton_block::{ValidatorSet, config_params::ConfigParam15};
+use ton_block::{
+    ValidatorSet,
+    config_params::{ConfigParam15, ConfigParam16, ConfigParam17},
+};
 
 fn serialize_hex<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -94,5 +97,11 @@ pub trait ElectionsProvider: Send + Sync {
     async fn account(&mut self, address: &str) -> anyhow::Result<Account>;
     async fn export_public_key(&mut self, key_id: &[u8]) -> anyhow::Result<Vec<u8>>;
     async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet>;
+    async fn config_param_16(&mut self) -> anyhow::Result<ConfigParam16> {
+        anyhow::bail!("config_param_16 not implemented")
+    }
+    async fn config_param_17(&mut self) -> anyhow::Result<ConfigParam17> {
+        anyhow::bail!("config_param_17 not implemented")
+    }
     async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>>;
 }

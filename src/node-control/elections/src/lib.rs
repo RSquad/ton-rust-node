@@ -6,6 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+pub(crate) mod adaptive_strategy;
+pub mod election_emulator;
 pub mod election_task;
 pub mod providers;
 pub(crate) mod runner;
