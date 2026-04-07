@@ -45,12 +45,14 @@ pub struct ShowCmd {
 
 #[derive(clap::Args, Clone)]
 pub struct StakePolicySetCmd {
-    #[arg(long = "fixed", conflicts_with_all = ["split50", "minimum"], help = "Fixed stake amount in TON")]
+    #[arg(long = "fixed", conflicts_with_all = ["split50", "minimum", "adaptive_split50"], help = "Fixed stake amount in TON")]
     fixed: Option<f64>,
-    #[arg(long = "split50", conflicts_with_all = ["fixed", "minimum"], help = "Use 50% of available balance")]
+    #[arg(long = "split50", conflicts_with_all = ["fixed", "minimum", "adaptive_split50"], help = "Use 50% of available balance")]
     split50: bool,
-    #[arg(long = "minimum", conflicts_with_all = ["fixed", "split50"], help = "Use minimum required stake")]
+    #[arg(long = "minimum", conflicts_with_all = ["fixed", "split50", "adaptive_split50"], help = "Use minimum required stake")]
     minimum: bool,
+    #[arg(long = "adaptive-split50", conflicts_with_all = ["fixed", "split50", "minimum"], help = "Adaptive split: splits when half exceeds effective minimum, otherwise stakes all")]
+    adaptive_split50: bool,
     #[arg(
         short = 'n',
         long = "node",
@@ -170,8 +172,12 @@ impl StakePolicySetCmd {
             StakePolicy::Split50
         } else if self.minimum {
             StakePolicy::Minimum
+        } else if self.adaptive_split50 {
+            StakePolicy::AdaptiveSplit50
         } else {
-            anyhow::bail!("No policy specified. Use --fixed, --split50, or --minimum");
+            anyhow::bail!(
+                "No policy specified. Use --fixed, --split50, --minimum, or --adaptive-split50"
+            );
         };
 
         if let Some(elections) = &mut config.elections {

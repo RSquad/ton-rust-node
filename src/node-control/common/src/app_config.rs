@@ -450,6 +450,8 @@ pub enum StakePolicy {
     Split50,
     #[serde(rename = "minimum")]
     Minimum,
+    #[serde(rename = "adaptive_split50")]
+    AdaptiveSplit50,
 }
 
 impl std::fmt::Display for StakePolicy {
@@ -465,6 +467,7 @@ impl std::fmt::Display for StakePolicy {
             }
             StakePolicy::Split50 => write!(f, "split50"),
             StakePolicy::Minimum => write!(f, "minimum"),
+            StakePolicy::AdaptiveSplit50 => write!(f, "adaptive_split50"),
         }
     }
 }
@@ -481,7 +484,9 @@ impl StakePolicy {
         let stake = match self {
             StakePolicy::Fixed(v) => v.to_owned().max(min_stake).min(available_stake),
             StakePolicy::Minimum => min_stake,
-            StakePolicy::Split50 => (available_stake / 2).max(min_stake),
+            StakePolicy::Split50 | StakePolicy::AdaptiveSplit50 => {
+                (available_stake / 2).max(min_stake)
+            }
         };
         Ok(stake)
     }
@@ -498,6 +503,15 @@ fn default_max_factor() -> f32 {
 fn default_tick_interval() -> u64 {
     40
 }
+
+fn default_waiting_pct() -> f64 {
+    0.4
+}
+
+fn default_sleep_pct() -> f64 {
+    0.2
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct ElectionsConfig {
     #[serde(default)]
@@ -512,6 +526,14 @@ pub struct ElectionsConfig {
     /// Interval for elections runner in seconds
     #[serde(default = "default_tick_interval")]
     pub tick_interval: u64,
+    /// Minimum wait time as fraction of election duration (0.0 - 1.0).
+    /// Algorithm waits at least this long from election start, even if min_validators is reached.
+    #[serde(default = "default_sleep_pct")]
+    pub sleep_period_pct: f64,
+    /// Maximum wait time as fraction of election duration (0.0 - 1.0).
+    /// If min_validators is not reached within this period, proceed without waiting.
+    #[serde(default = "default_waiting_pct")]
+    pub waiting_period_pct: f64,
 }
 
 impl ElectionsConfig {
@@ -525,6 +547,15 @@ impl ElectionsConfig {
         if !(1.0..=3.0).contains(&self.max_factor) {
             anyhow::bail!("max_factor must be in range [1.0..3.0]");
         }
+        if !(0.0..=1.0).contains(&self.sleep_period_pct) {
+            anyhow::bail!("sleep_period_pct must be in range [0.0..1.0]");
+        }
+        if !(0.0..=1.0).contains(&self.waiting_period_pct) {
+            anyhow::bail!("waiting_period_pct must be in range [0.0..1.0]");
+        }
+        if self.sleep_period_pct > self.waiting_period_pct {
+            anyhow::bail!("sleep_period_pct must be <= waiting_period_pct");
+        }
         Ok(())
     }
 }
@@ -536,6 +567,8 @@ impl Default for ElectionsConfig {
             policy_overrides: HashMap::new(),
             max_factor: default_max_factor(),
             tick_interval: default_tick_interval(),
+            sleep_period_pct: default_sleep_pct(),
+            waiting_period_pct: default_waiting_pct(),
         }
     }
 }

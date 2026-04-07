@@ -21,8 +21,10 @@ use contracts::{
 use mockall::mock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use ton_block::{
-    BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, SliceData,
-    ValidatorSet, read_single_root_boc,
+    BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, Number16, SliceData,
+    ValidatorSet,
+    config_params::{ConfigParam16, ConfigParam17},
+    read_single_root_boc,
 };
 
 // ---- Address helpers ----
@@ -56,6 +58,23 @@ fn default_cfg15() -> ConfigParam15 {
         elections_start_before: 1800,
         elections_end_before: 600,
         stake_held_for: 7200,
+    }
+}
+
+fn default_cfg16() -> ConfigParam16 {
+    ConfigParam16 {
+        max_validators: Number16::from(400u16),
+        max_main_validators: Number16::from(100u16),
+        min_validators: Number16::from(13u16),
+    }
+}
+
+fn default_cfg17() -> ConfigParam17 {
+    ConfigParam17 {
+        min_stake: Coins::from(10_000_000_000_000u64), // 10,000 TON
+        max_stake: Coins::from(10_000_000_000_000_000u64), // 10,000,000 TON
+        min_total_stake: Coins::from(100_000_000_000_000u64), // 100,000 TON
+        max_stake_factor: 3 * 65536,                   // 3x
     }
 }
 
@@ -95,6 +114,8 @@ mock! {
         async fn account(&mut self, address: &str) -> anyhow::Result<crate::providers::Account>;
         async fn export_public_key(&mut self, key_id: &[u8]) -> anyhow::Result<Vec<u8>>;
         async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet>;
+        async fn config_param_16(&mut self) -> anyhow::Result<ton_block::config_params::ConfigParam16>;
+        async fn config_param_17(&mut self) -> anyhow::Result<ton_block::config_params::ConfigParam17>;
         async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>>;
     }
 }
@@ -344,6 +365,8 @@ impl TestHarness {
                 policy_overrides: HashMap::new(),
                 max_factor: 3.0,
                 tick_interval: 10,
+                sleep_period_pct: 0.0,
+                waiting_period_pct: 0.3,
             },
             bindings: HashMap::new(),
         }
@@ -440,6 +463,12 @@ fn setup_default_provider(
 
     // send_boc
     provider.expect_send_boc().returning(|_boc| Ok(()));
+
+    // config_param_16
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+
+    // config_param_17
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
 
     // shutdown
     provider.expect_shutdown().returning(|| Ok(()));
@@ -694,6 +723,8 @@ async fn test_stake_already_accepted() {
 
     provider.expect_export_public_key().returning(|_| Ok(PUB_KEY.to_vec()));
     provider.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
     let mut runner = harness.build(node_id);
@@ -729,6 +760,8 @@ async fn test_recover_stake_returns_funds() {
     provider.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
     // Expect send_boc to be called for recover
     provider.expect_send_boc().times(1).returning(|_| Ok(()));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
     let mut runner = harness.build(node_id);
@@ -760,6 +793,8 @@ async fn test_recover_stake_low_wallet_balance() {
     provider.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
 
     provider.expect_account().returning(move |_| Ok(fake_account(low_wallet_balance)));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
     let mut runner = harness.build(node_id);
@@ -852,6 +887,8 @@ async fn test_excluded_node_skips_elections() {
 
     provider.expect_export_public_key().returning(|_| Ok(PUB_KEY.to_vec()));
     provider.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
     let mut runner = harness.build(node_id);
@@ -1137,6 +1174,8 @@ async fn test_low_stake_balance() {
     provider.expect_account().returning(move |_| Ok(fake_account(low_balance)));
     provider.expect_new_validator_key().returning(|_, _| Ok((KEY_ID.to_vec(), PUB_KEY.to_vec())));
     provider.expect_new_adnl_addr().returning(|_, _| Ok(ADNL_ADDR.to_vec()));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
 
     provider.expect_shutdown().returning(|| Ok(()));
 
@@ -1194,6 +1233,8 @@ async fn test_multiple_nodes_one_excluded() {
         policy_overrides: HashMap::new(),
         max_factor: 3.0,
         tick_interval: 10,
+        sleep_period_pct: 0.0,
+        waiting_period_pct: 0.3,
     };
 
     let mut bindings = HashMap::new();
@@ -1238,6 +1279,8 @@ async fn test_multiple_nodes_one_excluded() {
     provider2.expect_get_next_vset().returning(|| Ok(None));
     provider2.expect_export_public_key().returning(|_| Ok(PUB_KEY.to_vec()));
     provider2.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
+    provider2.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider2.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider2.expect_shutdown().returning(|| Ok(()));
 
     let mut providers: HashMap<String, Box<dyn ElectionsProvider>> = HashMap::new();
@@ -1412,6 +1455,8 @@ async fn test_new_validator_key_failure() {
     provider.expect_export_public_key().returning(|_| Ok(PUB_KEY.to_vec()));
     provider.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
     provider.expect_new_validator_key().returning(|_, _| Err(anyhow::anyhow!("keygen failed")));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
     let mut runner = harness.build(node_id);
@@ -1450,6 +1495,8 @@ async fn test_send_boc_failure() {
     provider.expect_new_adnl_addr().returning(|_, _| Ok(ADNL_ADDR.to_vec()));
 
     provider.expect_send_boc().returning(|_| Err(anyhow::anyhow!("broadcast failed")));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
     provider.expect_sign().returning(|_key, _data| Ok(SIGNATURE.to_vec()));
 
@@ -1624,6 +1671,8 @@ async fn test_node_without_wallet_skipped() {
         policy_overrides: HashMap::new(),
         max_factor: 3.0,
         tick_interval: 10,
+        sleep_period_pct: 0.0,
+        waiting_period_pct: 0.3,
     };
 
     let mut bindings = HashMap::new();
@@ -1924,6 +1973,486 @@ fn test_compute_status_idle_when_enabled_no_recover_no_participant() {
     assert_eq!(status, BindingStatus::Idle);
 }
 
+const NANO: u64 = 1_000_000_000;
+const FACTOR_3X: u32 = 3 * 65536;
+
+// =====================================================
+// AdaptiveSplit50: wait/sleep integration tests
+// =====================================================
+
+/// Helper: set up elector with a future elect_close and given participants.
+/// past_elections_factory: a closure that produces Vec<PastElections> (since PastElections is not Clone).
+fn setup_adaptive_elector(
+    elector: &mut MockElectorWrapperImpl,
+    election_id: u64,
+    elect_close: u64,
+    participants: Vec<Participant>,
+    past_elections_factory: impl Fn() -> Vec<PastElections> + Send + 'static,
+) {
+    elector.expect_address().returning(|| elector_address());
+    elector.expect_get_active_election_id().returning(move || Ok(election_id));
+
+    let total_stake: u64 = participants.iter().map(|p| p.stake).sum();
+    elector.expect_elections_info().returning(move || {
+        Ok(ElectionsInfo {
+            election_id,
+            elect_close,
+            min_stake: MIN_STAKE,
+            total_stake,
+            failed: false,
+            finished: false,
+            participants: participants.clone(),
+        })
+    });
+
+    elector.expect_past_elections().returning(move || Ok(past_elections_factory()));
+    elector.expect_compute_returned_stake().returning(|_| Ok(0));
+}
+
+#[tokio::test]
+async fn test_adaptive_wait_for_participants() {
+    // Elections just opened. Only 5 participants (< min_validators=13).
+    // elect_close is far in the future → within waiting_period.
+    // Expected: stake=0, node defers.
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
+    harness.elections_config.sleep_period_pct = 0.0;
+    harness.elections_config.waiting_period_pct = 0.3;
+
+    // elect_close far in the future (now + 10_000s) so we're early in the election.
+    let now = common::time_format::now();
+    let elect_close = now + 10_000;
+    let participants = (0..5u8)
+        .map(|i| Participant {
+            pub_key: vec![i; 32],
+            adnl_addr: vec![0xEE; 32],
+            wallet_addr: vec![i; 32],
+            stake: 300_000 * NANO,
+            max_factor: FACTOR_3X,
+            election_id: ELECTION_ID,
+            stake_message_boc: None,
+        })
+        .collect();
+
+    setup_adaptive_elector(
+        &mut harness.elector_mock,
+        ELECTION_ID,
+        elect_close,
+        participants,
+        || vec![],
+    );
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id);
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    // Node should NOT have participated (deferred).
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.participant.is_none(), "should defer staking when not enough participants");
+}
+
+#[tokio::test]
+async fn test_adaptive_proceed_after_wait_timeout() {
+    // Elections almost over. Only 5 participants (< min_validators=13).
+    // elect_close is very close (now + 10s) → waiting_period has expired.
+    // prev_min_eff available from past elections.
+    // Expected: proceeds to stake despite few participants.
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
+    harness.elections_config.sleep_period_pct = 0.0;
+    harness.elections_config.waiting_period_pct = 0.3;
+
+    let now = common::time_format::now();
+    let elect_close = now + 10; // almost closed
+
+    let participants = (0..5u8)
+        .map(|i| Participant {
+            pub_key: vec![i; 32],
+            adnl_addr: vec![0xEE; 32],
+            wallet_addr: vec![i; 32],
+            stake: 300_000 * NANO,
+            max_factor: FACTOR_3X,
+            election_id: ELECTION_ID,
+            stake_message_boc: None,
+        })
+        .collect();
+
+    // Provide past elections with a known frozen stake so prev_min_eff is available.
+    // prev_min_eff = 10_000 TON (well below free_balance ~49k).
+    setup_adaptive_elector(
+        &mut harness.elector_mock,
+        ELECTION_ID,
+        elect_close,
+        participants,
+        || {
+            let mut frozen_map = HashMap::new();
+            frozen_map.insert(
+                [0xAA; 32],
+                FrozenParticipant {
+                    wallet_addr: [0xBB; 32],
+                    weight: 1,
+                    stake: 10_000 * NANO,
+                    banned: false,
+                },
+            );
+            vec![PastElections {
+                election_id: ELECTION_ID - 3600,
+                unfreeze_at: ELECTION_ID,
+                stake_held: 7200,
+                vset_hash: vec![],
+                frozen_map,
+                total_stake: 10_000 * NANO,
+                bonuses: 0,
+            }]
+        },
+    );
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id);
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    // Node SHOULD have participated (timeout expired, fallback to prev).
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.participant.is_some(), "should proceed to stake after waiting_period expires");
+}
+
+#[tokio::test]
+async fn test_adaptive_sleep_period_delays_even_with_enough_participants() {
+    // Enough participants (20 > min_validators=13) but sleep_period = 0.99
+    // (almost the entire election duration) and election just started.
+    // Expected: defers despite having enough participants.
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
+    harness.elections_config.sleep_period_pct = 0.99;
+    harness.elections_config.waiting_period_pct = 0.99;
+
+    let now = common::time_format::now();
+    let elect_close = now + 10_000; // election just started
+
+    let participants: Vec<Participant> = (0..20u8)
+        .map(|i| Participant {
+            pub_key: vec![i; 32],
+            adnl_addr: vec![0xEE; 32],
+            wallet_addr: vec![i; 32],
+            stake: 300_000 * NANO,
+            max_factor: FACTOR_3X,
+            election_id: ELECTION_ID,
+            stake_message_boc: None,
+        })
+        .collect();
+
+    setup_adaptive_elector(
+        &mut harness.elector_mock,
+        ELECTION_ID,
+        elect_close,
+        participants,
+        || vec![],
+    );
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id);
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(
+        node.participant.is_none(),
+        "should defer staking during sleep_period even with enough participants"
+    );
+}
+
+// =====================================================
+// AdaptiveSplit50: config validation tests
+// =====================================================
+
+// =====================================================
+// AdaptiveSplit50: three-tick top-up integration test
+// =====================================================
+
+#[tokio::test]
+async fn test_adaptive_topup_three_ticks() {
+    // Full adaptive cycle with election emulation and top-up.
+    // Uses 13 other participants (= min_validators, boundary value) so emulation works.
+    //
+    // Tick 1: 13 participants at 100k TON → emulate → curr_min_eff ≈ 32.5k.
+    //         wallet = 100k, half ≈ 50k >= min_eff → stake half.
+    //
+    // Tick 2: Elector sees our stake (~50k) → stake_accepted=true.
+    //         current_stake (~50k) >= min_eff (~32.5k) → no top-up.
+    //
+    // Tick 3: One participant raises stake to 240k → curr_min_eff jumps to ≈ 60k.
+    //         Our entry in elector is filtered out before emulation.
+    //         current_stake (~50k) < min_eff (~60k) → sends additional stake to elector.
+    //         remaining ≈ 50k, total ≈ 100k, half ≈ 50k < min_eff → stake all remaining.
+
+    let node_id = "node-1";
+    let wallet_balance = 100_000 * NANO;
+    let mut harness = TestHarness::new();
+    harness.elections_config.policy = StakePolicy::AdaptiveSplit50;
+    let wallet_addr = addr_bytes(&wallet_address());
+
+    let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
+    let pool_free_balance = wallet_balance - fee - MIN_NANOTON_FOR_STORAGE;
+    let initial_stake = pool_free_balance / 2; // stake half on tick 1
+
+    // --- Helper: build participants with given stakes ---
+    fn make_participants(stakes: &[(u64, u8)]) -> Vec<Participant> {
+        stakes
+            .iter()
+            .map(|(stake, id)| {
+                let mut pubkey = [0u8; 32];
+                pubkey[0] = 0x10 + id; // distinct from PUB_KEY
+                Participant {
+                    pub_key: pubkey.to_vec(),
+                    adnl_addr: vec![0xEE; 32],
+                    wallet_addr: pubkey.to_vec(),
+                    stake: *stake,
+                    max_factor: FACTOR_3X,
+                    election_id: ELECTION_ID,
+                    stake_message_boc: None,
+                }
+            })
+            .collect()
+    }
+
+    // 13 participants at 100k each
+    let base_stakes: Vec<(u64, u8)> = (0..13u8).map(|i| (100_000 * NANO, i)).collect();
+    // Participant #0 raises to 240k on tick 3
+    let raised_stakes: Vec<(u64, u8)> =
+        (0..13u8).map(|i| (if i == 0 { 240_000 * NANO } else { 100_000 * NANO }, i)).collect();
+
+    // --- Elector: elections_info varies per tick ---
+    let ei_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let ei_cc = ei_count.clone();
+    let wallet_addr_clone = wallet_addr.clone();
+    let base_stakes_clone = base_stakes.clone();
+    harness.elector_mock.expect_elections_info().times(3).returning(move || {
+        let n = ei_cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match n {
+            0 => {
+                // Tick 1: 13 participants at 100k, our node not yet in elector
+                let participants = make_participants(&base_stakes_clone);
+                let total: u64 = participants.iter().map(|p| p.stake).sum();
+                Ok(ElectionsInfo {
+                    election_id: ELECTION_ID,
+                    elect_close: ELECTION_ID - 300,
+                    min_stake: MIN_STAKE,
+                    total_stake: total,
+                    failed: false,
+                    finished: false,
+                    participants,
+                })
+            }
+            1 => {
+                // Tick 2: same 13 at 100k + our node in elector
+                let mut participants = make_participants(&base_stakes_clone);
+                participants.push(Participant {
+                    pub_key: PUB_KEY.to_vec(),
+                    adnl_addr: ADNL_ADDR.to_vec(),
+                    wallet_addr: wallet_addr_clone.clone(),
+                    stake: initial_stake,
+                    max_factor: FACTOR_3X,
+                    election_id: ELECTION_ID,
+                    stake_message_boc: None,
+                });
+                let total: u64 = participants.iter().map(|p| p.stake).sum();
+                Ok(ElectionsInfo {
+                    election_id: ELECTION_ID,
+                    elect_close: ELECTION_ID - 300,
+                    min_stake: MIN_STAKE,
+                    total_stake: total,
+                    failed: false,
+                    finished: false,
+                    participants,
+                })
+            }
+            _ => {
+                // Tick 3: participant #0 doubled to 200k, rest at 100k + our node
+                let mut participants = make_participants(&raised_stakes);
+                participants.push(Participant {
+                    pub_key: PUB_KEY.to_vec(),
+                    adnl_addr: ADNL_ADDR.to_vec(),
+                    wallet_addr: wallet_addr_clone.clone(),
+                    stake: initial_stake,
+                    max_factor: FACTOR_3X,
+                    election_id: ELECTION_ID,
+                    stake_message_boc: None,
+                });
+                let total: u64 = participants.iter().map(|p| p.stake).sum();
+                Ok(ElectionsInfo {
+                    election_id: ELECTION_ID,
+                    elect_close: ELECTION_ID - 300,
+                    min_stake: MIN_STAKE,
+                    total_stake: total,
+                    failed: false,
+                    finished: false,
+                    participants,
+                })
+            }
+        }
+    });
+
+    // --- Elector: past_elections (fetched once, cached for same election_id) ---
+    // prev_min = 30k — only used as fallback if emulation fails.
+    harness.elector_mock.expect_past_elections().times(1).returning(|| {
+        let mut frozen_map = HashMap::new();
+        frozen_map.insert(
+            [0xAA; 32],
+            FrozenParticipant {
+                wallet_addr: [0xBB; 32],
+                weight: 1,
+                stake: 30_000 * NANO,
+                banned: false,
+            },
+        );
+        Ok(vec![PastElections {
+            election_id: ELECTION_ID - 3600,
+            unfreeze_at: ELECTION_ID,
+            stake_held: 7200,
+            vset_hash: vec![],
+            frozen_map,
+            total_stake: 30_000 * NANO,
+            bonuses: 0,
+        }])
+    });
+
+    // --- Provider: validator_config varies per tick ---
+    let vc_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let vcc = vc_count.clone();
+    harness.provider_mock.expect_validator_config().times(3).returning(move || {
+        let n = vcc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            // Tick 1: no existing key → runner generates new key
+            Ok(ValidatorConfig::new())
+        } else {
+            // Tick 2-3: key available
+            let mut keys = HashMap::new();
+            keys.insert(
+                ELECTION_ID,
+                ValidatorEntry {
+                    key_id: KEY_ID.to_vec(),
+                    public_key: PUB_KEY.to_vec(),
+                    adnl_addrs: vec![(ADNL_ADDR.to_vec(), ELECTION_ID + 7200)],
+                    expired_at: ELECTION_ID + 7200,
+                },
+            );
+            Ok(ValidatorConfig { keys })
+        }
+    });
+
+    // --- Provider: dynamic account balance (decreases after staking) ---
+    let account_bal = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(wallet_balance));
+    let ab = account_bal.clone();
+    harness
+        .provider_mock
+        .expect_account()
+        .returning(move |_| Ok(fake_account(ab.load(std::sync::atomic::Ordering::SeqCst))));
+
+    // --- Rest of elector/provider/wallet setup ---
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_default_provider(&mut harness.provider_mock, wallet_balance, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id);
+
+    // === Tick 1: emulate election → stake half ===
+    runner.refresh_validator_configs().await;
+    runner.refresh_validator_set().await;
+    let r1 = runner.run().await;
+    assert!(r1.is_ok(), "tick 1 failed: {:?}", r1.err());
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.participant.is_some(), "should participate after tick 1");
+    assert!(!node.stake_accepted, "stake not yet accepted after tick 1");
+    assert_eq!(
+        node.participant.as_ref().unwrap().stake,
+        initial_stake,
+        "tick 1: should stake half of pool_free"
+    );
+    // Simulate wallet balance decrease after staking
+    account_bal.store(wallet_balance - initial_stake - fee, std::sync::atomic::Ordering::SeqCst);
+
+    // === Tick 2: elector accepted, no top-up (current_stake >= min_eff) ===
+    runner.refresh_validator_configs().await;
+    runner.refresh_validator_set().await;
+    let r2 = runner.run().await;
+    assert!(r2.is_ok(), "tick 2 failed: {:?}", r2.err());
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.stake_accepted, "stake should be accepted on tick 2");
+    let tick2_stake = node.participant.as_ref().unwrap().stake;
+    assert_eq!(
+        tick2_stake, initial_stake,
+        "tick 2: no top-up needed (current_stake >= curr_min_eff)"
+    );
+
+    // === Tick 3: one participant raised stake → top-up ===
+    runner.refresh_validator_configs().await;
+    runner.refresh_validator_set().await;
+    let r3 = runner.run().await;
+    assert!(r3.is_ok(), "tick 3 failed: {:?}", r3.err());
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.stake_accepted, "stake should still be accepted on tick 3");
+    let tick3_stake = node.participant.as_ref().unwrap().stake;
+
+    // Remaining wallet ≈ 50k, current_stake ≈ 50k in elector.
+    // total ≈ 100k, half ≈ 50k < min_eff (~60k) → stake all remaining.
+    let remaining_balance = wallet_balance - initial_stake - fee;
+    let pool_free_tick3 = remaining_balance - fee - MIN_NANOTON_FOR_STORAGE;
+    assert!(
+        tick3_stake > tick2_stake,
+        "tick 3: stake should increase via top-up: tick2={}, tick3={}",
+        tick2_stake,
+        tick3_stake
+    );
+    assert_eq!(
+        tick3_stake,
+        tick2_stake + pool_free_tick3,
+        "tick 3: should stake all remaining (half < min_eff)"
+    );
+}
+
+#[test]
+fn test_elections_config_validate_sleep_gt_waiting() {
+    let config = ElectionsConfig {
+        sleep_period_pct: 0.5,
+        waiting_period_pct: 0.3, // sleep > waiting → invalid
+        ..ElectionsConfig::default()
+    };
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn test_elections_config_validate_sleep_out_of_range() {
+    let config = ElectionsConfig {
+        sleep_period_pct: 1.5, // > 1.0 → invalid
+        ..ElectionsConfig::default()
+    };
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn test_elections_config_validate_valid() {
+    let config = ElectionsConfig {
+        sleep_period_pct: 0.1,
+        waiting_period_pct: 0.5,
+        ..ElectionsConfig::default()
+    };
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_elections_config_defaults() {
+    let config = ElectionsConfig::default();
+    assert_eq!(config.sleep_period_pct, 0.2);
+    assert_eq!(config.waiting_period_pct, 0.4);
+}
 // Participation status transitions across election lifecycle
 // Simulates: Idle → Participating → Submitted → Accepted → Elected → Validating
 // Also verifies that stale election flags don't leak after elections close.
