@@ -63,4 +63,9 @@ singlehost-sh: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
 	  PARTICIPANTS_WAIT_SECONDS=$(PARTICIPANTS_WAIT) \
 	  bash run_singlehost_nodectl.sh
 
+stop-singlehost:
+	cd $(SINGLEHOST_DIR) && \
+	  .venv/bin/python3 test_run_net.py --stop
+	  pkill -9 nodectl
+
 .PHONY: singlehost singlehost-sh singlehost-venv

@@ -108,7 +108,7 @@ class Paths:
             nodectl_config  = tmp_dir / "nodectl-config.json",
             vault_file      = script_dir / "vault.json",
             nodectl_log     = tmp_dir / _log_name("NODECTL_LOG", "nodectl-service.log"),
-            script_log      = tmp_dir / _log_name("SCRIPT_LOG",  "singlehost-bootstrap.log"),
+            script_log      = script_dir / _log_name("SCRIPT_LOG",  "singlehost-bootstrap.log"),
         )
 
 
@@ -172,12 +172,16 @@ class Bootstrap:
         self.phase7_start_service()
         wallet_addrs, pool_addrs = self.phase8_wait_and_topup()
         last_count = self.phase9_wait_participants()
-        self._setup_auth()
-        self.phase10_validate_api()
+        if last_count > 0:
+            self._setup_auth()
+            self.phase10_validate_api()
+        else:
+            self.log.warn("Skipping auth setup and API validation — no participants found")
         self.phase11_summary(master_addr, wallet_addrs, pool_addrs, last_count)
 
     def shutdown(self, *, force: bool = False) -> None:
-        """Terminate the nodectl service if needed. force=True ignores keep_on_success."""
+        """Terminate the nodectl service and network nodes if needed.
+        force=True ignores keep_on_success."""
         if self._proc and self._proc.poll() is None:
             if force or not self.cfg.keep_on_success:
                 self.log.info(f"Stopping nodectl (pid {self._proc.pid})")
@@ -186,6 +190,26 @@ class Bootstrap:
                     self._proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._proc.kill()
+                    self._proc.wait()
+        if hasattr(self, "_service_log_fh") and self._service_log_fh:
+            self._service_log_fh.close()
+            self._service_log_fh = None
+        if force:
+            self._stop_network()
+
+    def _stop_network(self) -> None:
+        """Stop singlehost network nodes via test_run_net.py --stop."""
+        try:
+            py = self.paths.run_net_dir / ".venv" / "bin" / "python3"
+            if not py.exists():
+                py = Path(sys.executable)
+            subprocess.run(
+                [str(py), "test_run_net.py", "--stop"],
+                cwd=self.paths.run_net_dir, check=False, timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -197,15 +221,27 @@ class Bootstrap:
         self.log.error(msg)
         raise BootstrapError(msg)
 
-    def _nctl(self, *args: str) -> None:
+    def _nctl(self, *args: str, timeout: int = 30) -> None:
         """Run nodectl and let its output stream to the terminal."""
-        subprocess.run([str(self.paths.nodectl_bin), *args], check=True)
+        result = subprocess.run(
+            [str(self.paths.nodectl_bin), *args],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=timeout,
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode != 0:
+            self._fail(
+                f"nodectl {' '.join(args)} failed (exit {result.returncode})"
+                + (f": {result.stderr.strip()}" if result.stderr.strip() else "")
+            )
 
-    def _nctl_output(self, *args: str, check: bool = True) -> str:
+    def _nctl_output(self, *args: str, check: bool = True, timeout: int = 30) -> str:
         """Run nodectl and return captured stdout."""
         result = subprocess.run(
             [str(self.paths.nodectl_bin), *args],
             capture_output=True, text=True, check=check,
+            stdin=subprocess.DEVNULL, timeout=timeout,
         )
         return result.stdout
 
@@ -257,7 +293,8 @@ class Bootstrap:
 
     def _bun_topup(self, address: str, amount: str) -> None:
         subprocess.run(["bun", "run", "topup", address, amount],
-                       cwd=self.paths.load_net_dir, check=True)
+                       cwd=self.paths.load_net_dir, check=True,
+                       stdin=subprocess.DEVNULL, timeout=30)
 
     def _node_console(self, i: int) -> dict:
         path = self.paths.tmp_dir / f"node_{i}" / "console.json"
@@ -268,8 +305,10 @@ class Bootstrap:
         venv_py = self.paths.run_net_dir / ".venv" / "bin" / "python3"
         if not venv_py.exists():
             subprocess.run([sys.executable, "-m", "venv",
-                            str(self.paths.run_net_dir / ".venv")], check=True)
-            subprocess.run([str(venv_py), "-m", "pip", "install", "-q", "pyyaml"], check=True)
+                            str(self.paths.run_net_dir / ".venv")], check=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+            subprocess.run([str(venv_py), "-m", "pip", "install", "-q", "pyyaml"], check=True,
+                           stdin=subprocess.DEVNULL, timeout=60)
         return str(venv_py)
 
     # ── Phase 1: Build ────────────────────────────────────────────────────────
@@ -282,12 +321,14 @@ class Bootstrap:
                 self._fail(f"NOBUILD=1 but binary not found: {self.paths.nodectl_src_bin}")
         else:
             subprocess.run(["cargo", "build", "--release", "-p", "nodectl"],
-                           cwd=self.paths.repo_root, check=True)
+                           cwd=self.paths.repo_root, check=True,
+                           stdin=subprocess.DEVNULL)
         # Copy to tmp/ so all invocations run from a self-contained working directory
         shutil.copy2(self.paths.nodectl_src_bin, self.paths.nodectl_bin)
         self.log.info(f"  Copied binary → {self.paths.nodectl_bin}")
         ver = subprocess.run([str(self.paths.nodectl_bin), "--version"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=10)
 
         self.log.info(f"  {(ver.stdout or ver.stderr).strip() or 'version unknown'}")
     # ── Phase 2: Generate config ──────────────────────────────────────────────
@@ -331,19 +372,15 @@ class Bootstrap:
         py  = self._venv_python()
         rnd = self.paths.run_net_dir
 
-        subprocess.run([py, "test_run_net.py", "--stop"], cwd=rnd, check=False)
+        subprocess.run([py, "test_run_net.py", "--stop"], cwd=rnd, check=False,
+                       stdin=subprocess.DEVNULL, timeout=30)
 
         net_args = ["--elections", "--control-client-public-key", pub_key_shared]
         if self.cfg.nobuild:
             net_args.append("--nobuild")
         subprocess.run([py, "test_run_net.py"] + net_args, cwd=rnd, check=True,
+                       stdin=subprocess.DEVNULL,
                        env={**os.environ, "PYTHONUNBUFFERED": "1"})
-        subprocess.run([py, "test_run_net.py", "--stop"], cwd=rnd, check=True)
-
-        self.log.info(f"  Starting {self.cfg.node_cnt} node(s)...")
-        for i in range(1, self.cfg.node_cnt + 1):
-            subprocess.run([py, "test_run_net.py", "--start", str(i), "--nobuild"],
-                           cwd=rnd, check=True)
         time.sleep(5)
 
     # ── Phase 4: Wait for progress ────────────────────────────────────────────
@@ -399,15 +436,17 @@ class Bootstrap:
                        "-n", f"wallet{i}", "-s", f"wallet{i}-secret", "-v", version)
             self.log.info(f"    wallet{i} → {version}")
 
-    def _wait_http_api(self) -> None:
-        self.log.info(f"  Waiting for HTTP API ({self.cfg.http_api_url})...")
-        while True:
+    def _wait_http_api(self, timeout: int = 120) -> None:
+        self.log.info(f"  Waiting for HTTP API ({self.cfg.http_api_url}, timeout {timeout}s)...")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             try:
                 urllib.request.urlopen(self.cfg.http_api_url, timeout=2)
-                break
+                self.log.info("  HTTP API available")
+                return
             except Exception:
                 time.sleep(2)
-        self.log.info("  HTTP API available")
+        self._fail(f"HTTP API not available after {timeout}s")
 
     def _resolve_master_wallet(self) -> str:
         self.log.info("  Resolving master wallet address...")
@@ -469,11 +508,13 @@ class Bootstrap:
         log_path = self.paths.nodectl_log
         log_path.write_text("")   # truncate from any previous run
         self._nodectl_log = log_path
+        self._service_log_fh = open(log_path, "w")
         self._proc = subprocess.Popen(
             [str(self.paths.nodectl_bin), "service",
              "--config", str(self.paths.nodectl_config)],
-            stdout=open(log_path, "w"),
+            stdout=self._service_log_fh,
             stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
             env={**os.environ, "RUST_LOG": "info"},
         )
         time.sleep(2)
@@ -523,13 +564,19 @@ class Bootstrap:
     # ── Phase 9: Wait for election participants ────────────────────────────────
 
     def phase9_wait_participants(self) -> int:
-        self._phase(9, f"Waiting for election participants (up to {self.cfg.participants_wait}s)...")
+        expected = self.cfg.node_cnt
+        self._phase(9, f"Waiting for {expected} election participants (up to {self.cfg.participants_wait}s)...")
         deadline = time.time() + self.cfg.participants_wait
-        while True:
+        while time.time() < deadline:
             cnt = self._participant_count()
-            if cnt > 0 or time.time() >= deadline:
+            if cnt >= expected:
                 return cnt
+            self.log.info(f"  participants: {cnt}/{expected}")
             time.sleep(5)
+        cnt = self._participant_count()
+        if cnt < expected:
+            self._fail(f"Expected {expected} participants but got {cnt} after {self.cfg.participants_wait}s")
+        return cnt
 
     # ── Auth setup (before phase 10) ────────────────────────────────────────
 
@@ -539,17 +586,26 @@ class Bootstrap:
         password = secrets.token_hex(16)
 
         # Create operator user (--password-stdin to avoid interactive prompt)
-        subprocess.run(
+        result = subprocess.run(
             [str(self.paths.nodectl_bin), "auth", "add",
              "--username", "admin", "--role", "operator", "--password-stdin"],
-            input=password, text=True, check=True,
+            input=password, text=True, capture_output=True, timeout=15,
         )
+        if result.returncode != 0:
+            self.log.error(
+                f"Failed to add auth user (exit {result.returncode}): {result.stderr.strip()}"
+            )
+            raise BootstrapError("failed to create nodectl user")
+   
         self.log.info("  Created auth user 'admin' (operator)")
+
+        # Wait for the service to reload config from file (every 10s)
+        time.sleep(12)
 
         # Login and capture the JWT token
         result = subprocess.run(
             [str(self.paths.nodectl_bin), "api", "login", "admin", "--password-stdin"],
-            input=password, capture_output=True, text=True, check=True,
+            input=password, capture_output=True, text=True, check=True, timeout=15,
         )
         token = json.loads(result.stdout)["token"]
         os.environ["NODECTL_API_TOKEN"] = token
@@ -574,6 +630,7 @@ class Bootstrap:
         result = subprocess.run(
             [str(self.paths.nodectl_bin), "api", "elections", "--format=json"],
             capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=15,
         )
         if result.returncode != 0:
             stderr = result.stderr.strip()
@@ -607,15 +664,17 @@ class Bootstrap:
 
         result = {}
         try:
-            # Stack entry format: ["num", "0x<HEX>"] — handles both hex and decimal pubkeys
+            # Each element is a StackEntryJson dict: {"@type": "tvm.stackEntry*", ...}
+            # Numbers: {"@type": "tvm.stackEntryNumber", "number": {"@type": "tvm.numberDecimal", "number": "<decimal>"}}
+            # Tuples:  {"@type": "tvm.stackEntryTuple",  "tuple":  {"@type": "tvm.tuple", "elements": [...]}}
             for entry in resp["result"]["stack"][4][1].get("elements", []):
-                inner      = entry[1]["elements"]
-                pubkey_str = inner[0][1]
-                stake_str  = inner[1][1]["elements"][0][1]
+                inner      = entry["tuple"]["elements"]
+                pubkey_str = inner[0]["number"]["number"]
+                stake_str  = inner[1]["tuple"]["elements"][0]["number"]["number"]
                 n = int(pubkey_str, 16) if pubkey_str.lower().startswith("0x") else int(pubkey_str)
                 result[n.to_bytes(32, "big")] = stake_str
-        except Exception as e:
-            self.log.warn(f"  Could not parse elector participant list: {e}; skipping")
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            self.log.warn(f"  Could not parse elector participant list: {type(e).__name__}: {e}; skipping")
             return None
 
         return result
@@ -683,40 +742,24 @@ class Bootstrap:
 
     def _ensure_bun_deps(self) -> None:
         if not (self.paths.load_net_dir / "node_modules").exists():
-            subprocess.run(["bun", "install", "--silent"], cwd=self.paths.load_net_dir, check=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Environment helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_dotenv(path: Path) -> None:
-    """Load KEY=VALUE pairs from a .env file into os.environ (existing vars win)."""
-    try:
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            k, v = k.strip(), v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
-    except FileNotFoundError:
-        pass
-
+            subprocess.run(["bun", "install", "--silent"], cwd=self.paths.load_net_dir, check=True,
+                           stdin=subprocess.DEVNULL, timeout=60)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    paths = Paths.from_script_dir(Path(__file__).resolve().parent)
-    cfg   = Config.from_env()
+    try:
+        paths = Paths.from_script_dir(Path(__file__).resolve().parent)
+        cfg   = Config.from_env()
+        paths.tmp_dir.mkdir(parents=True, exist_ok=True)
+        log = Logger(paths.script_log)
+    except Exception as e:
+        print(f"\033[31m[FATAL]\033[0m Failed during early init: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    paths.tmp_dir.mkdir(parents=True, exist_ok=True)
-    log = Logger(paths.script_log)
-
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     log.info(f"=== {ts} run_singlehost_nodectl.py started ===")
     log.info(f"Script log: {paths.script_log}")
 
@@ -736,8 +779,6 @@ def main() -> None:
         if not shutil.which(cmd):
             log.error(f"Missing required command: {cmd}")
             sys.exit(1)
-
-    load_dotenv(paths.load_net_dir / ".env")
 
     if not os.environ.get("MASTER_WALLET_KEY"):
         log.error("MASTER_WALLET_KEY is not set.")
