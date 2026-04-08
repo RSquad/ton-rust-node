@@ -120,7 +120,12 @@ pub struct WalletStakeCmd {
     binding: String,
     #[arg(short = 'a', long = "amount", help = "Stake amount in TONs")]
     amount: f64,
-    #[arg(short = 'm', long = "max-factor", default_value = "3.0", help = "Max factor (1.0..3.0)")]
+    #[arg(
+        short = 'm',
+        long = "max-factor",
+        default_value = "3.0",
+        help = "Max factor from 1.0 up to the network limit (config param 17)"
+    )]
     max_factor: f32,
 }
 
@@ -430,11 +435,17 @@ impl WalletSendCmd {
 
 impl WalletStakeCmd {
     pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
-        if !(1.0..=3.0).contains(&self.max_factor) {
-            anyhow::bail!("max-factor must be between 1.0 and 3.0");
-        }
-
         let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+        let network_max = rpc_client
+            .network_max_stake_factor_multiplier()
+            .await
+            .context("read max_stake_factor from chain (config param 17)")?;
+        if !(1.0..=network_max).contains(&self.max_factor) {
+            anyhow::bail!(
+                "max-factor must be in range [1.0..{}] (network max_stake_factor from config param 17)",
+                network_max
+            );
+        }
 
         // Resolve binding → wallet, pool, node
         let binding = config

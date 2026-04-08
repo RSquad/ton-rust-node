@@ -549,7 +549,8 @@ impl ElectionRunner {
         election_id: u64,
         params: &ConfigParams<'_>,
     ) -> anyhow::Result<()> {
-        let max_factor = (self.calc_max_factor() * 65536.0) as u32;
+        let max_factor = ((self.calc_max_factor() * 65536.0) as u32)
+            .clamp(common::ton_utils::MAX_STAKE_FACTOR_SCALE, params.cfg17.max_stake_factor);
         let stake_ctx = StakeContext {
             past_elections: &self.past_elections,
             our_max_factor: max_factor,
@@ -691,7 +692,7 @@ impl ElectionRunner {
                     max_factor,
                 });
                 node.key_id = key_id;
-                Self::send_stake(node_id, node, stake).await?;
+                Self::send_stake(node_id, node, stake, params.cfg17.max_stake_factor).await?;
                 Ok(())
             }
             Some(entry) => {
@@ -717,7 +718,8 @@ impl ElectionRunner {
                                 nanotons_to_tons_f64(old_stake + stake),
                                 nanotons_to_tons_f64(stake),
                             );
-                            Self::send_stake(node_id, node, stake).await?;
+                            Self::send_stake(node_id, node, stake, params.cfg17.max_stake_factor)
+                                .await?;
                             node.participant.as_mut().map(|p| p.stake += stake);
                         }
                     }
@@ -726,7 +728,8 @@ impl ElectionRunner {
                         if let Some(p) = node.participant.as_mut() {
                             p.stake = stake;
                         }
-                        Self::send_stake(node_id, node, stake).await?;
+                        Self::send_stake(node_id, node, stake, params.cfg17.max_stake_factor)
+                            .await?;
                     }
                 }
                 Ok(())
@@ -734,9 +737,15 @@ impl ElectionRunner {
         }
     }
 
-    async fn send_stake(node_id: &str, node: &mut Node, stake: u64) -> anyhow::Result<()> {
+    async fn send_stake(
+        node_id: &str,
+        node: &mut Node,
+        stake: u64,
+        network_max_stake_factor: u32,
+    ) -> anyhow::Result<()> {
         tracing::info!("node [{}] build stake message", node_id);
-        let payload = Self::build_new_stake_payload(node_id, node, stake).await?;
+        let payload =
+            Self::build_new_stake_payload(node_id, node, stake, network_max_stake_factor).await?;
         // For simplicity we always assume that the node has nominator pool.
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
         let stake_balance = node.stake_balance(fee).await?;
@@ -782,6 +791,7 @@ impl ElectionRunner {
         node_id: &str,
         node: &mut Node,
         stake: u64,
+        network_max_stake_factor: u32,
     ) -> anyhow::Result<Cell> {
         let Some(participant) = &mut node.participant else {
             anyhow::bail!("node [{}] no participant info", node_id);
@@ -798,8 +808,12 @@ impl ElectionRunner {
                 participant.adnl_addr.as_slice()
             )
         );
-        if !(1.0..=3.0).contains(&(participant.max_factor as f32 / 65536.0)) {
-            anyhow::bail!("<max-factor> must be a real number 1..3");
+        let scale = common::ton_utils::MAX_STAKE_FACTOR_SCALE;
+        if participant.max_factor < scale || participant.max_factor > network_max_stake_factor {
+            anyhow::bail!(
+                "<max-factor> must be between 1.0 and {} (network max_stake_factor from config param 17)",
+                common::ton_utils::max_stake_factor_raw_to_multiplier(network_max_stake_factor)
+            );
         }
         // todo: move to ElectorWrapper
         // validator-elect-req.fif

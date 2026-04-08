@@ -18,6 +18,15 @@ pub fn nanotons_to_tons_f64(nanotons: u64) -> f64 {
     nanotons as f64 / 1_000_000_000.0
 }
 
+/// Elector uses fixed-point `max_stake_factor`: raw value is multiplier × 65536 (e.g. 3× → `3 * 65536`).
+pub const MAX_STAKE_FACTOR_SCALE: u32 = 65536;
+
+/// Converts chain `max_stake_factor` (raw) to float multiplier (e.g. `196608` → `3.0`).
+#[inline]
+pub fn max_stake_factor_raw_to_multiplier(raw: u32) -> f32 {
+    raw as f32 / MAX_STAKE_FACTOR_SCALE as f32
+}
+
 pub fn display_tons(nanotons: u64) -> String {
     format!("{:.4}", nanotons_to_tons_f64(nanotons))
         .trim_end_matches('0')

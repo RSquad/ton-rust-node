@@ -177,6 +177,20 @@ impl ClientJsonRpc {
         Ok(config_param)
     }
 
+    /// Global `max_stake_factor` from config param 17 (raw fixed-point, multiplier ×65536).
+    pub async fn network_max_stake_factor_raw(&self) -> anyhow::Result<u32> {
+        match self.get_config_param(17).await? {
+            ConfigParamEnum::ConfigParam17(c) => Ok(c.max_stake_factor),
+            _ => anyhow::bail!("expected config param 17 (stakes config)"),
+        }
+    }
+
+    /// Same as [`Self::network_max_stake_factor_raw`], as float multiplier (e.g. `3.0`).
+    pub async fn network_max_stake_factor_multiplier(&self) -> anyhow::Result<f32> {
+        let raw = self.network_max_stake_factor_raw().await?;
+        Ok(common::ton_utils::max_stake_factor_raw_to_multiplier(raw))
+    }
+
     pub async fn run_get_method(
         &self,
         args: &RunGetMethodParams,

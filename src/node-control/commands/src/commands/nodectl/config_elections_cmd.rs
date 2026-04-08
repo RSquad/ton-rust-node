@@ -6,7 +6,11 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
+use crate::commands::nodectl::{
+    output_format::OutputFormat,
+    utils::{load_config_vault_rpc_client, save_config},
+};
+use anyhow::Context;
 use colored::Colorize;
 use common::{
     app_config::{AppConfig, BindingStatus, ElectionsConfig, StakePolicy},
@@ -71,7 +75,9 @@ pub struct TickIntervalCmd {
 
 #[derive(clap::Args, Clone)]
 pub struct MaxFactorCmd {
-    #[arg(help = "Max factor (1.0..3.0)")]
+    #[arg(
+        help = "Max factor: from 1.0 up to the network limit (config param 17 max_stake_factor)"
+    )]
     value: f32,
 }
 
@@ -220,8 +226,16 @@ impl TickIntervalCmd {
 
 impl MaxFactorCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if !(1.0..=3.0).contains(&self.value) {
-            anyhow::bail!("max-factor must be in range [1.0..3.0]");
+        let (_app, _vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+        let network_max = rpc_client
+            .network_max_stake_factor_multiplier()
+            .await
+            .context("read max_stake_factor from chain (config param 17)")?;
+        if !(1.0..=network_max).contains(&self.value) {
+            anyhow::bail!(
+                "max-factor must be in range [1.0..{}] (network max_stake_factor from config param 17)",
+                network_max
+            );
         }
         let mut config = AppConfig::load(path)?;
         config

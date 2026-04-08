@@ -2382,7 +2382,7 @@ fn test_elections_config_validate_sleep_gt_waiting() {
         waiting_period_pct: 0.3, // sleep > waiting → invalid
         ..ElectionsConfig::default()
     };
-    assert!(config.validate().is_err());
+    assert!(config.validate(None).is_err());
 }
 
 #[test]
@@ -2391,7 +2391,7 @@ fn test_elections_config_validate_sleep_out_of_range() {
         sleep_period_pct: 1.5, // > 1.0 → invalid
         ..ElectionsConfig::default()
     };
-    assert!(config.validate().is_err());
+    assert!(config.validate(None).is_err());
 }
 
 #[test]
@@ -2401,7 +2401,7 @@ fn test_elections_config_validate_valid() {
         waiting_period_pct: 0.5,
         ..ElectionsConfig::default()
     };
-    assert!(config.validate().is_ok());
+    assert!(config.validate(None).is_ok());
 }
 
 #[test]

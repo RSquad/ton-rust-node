@@ -93,6 +93,15 @@ impl RuntimeConfigStore {
 
         let vault = Some(SecretVaultBuilder::from_env().await?);
         let rpc_client = Self::load_rpc_client(&app_cfg).await?;
+        if let Some(elections) = app_cfg.elections.as_ref() {
+            let network_max = rpc_client
+                .network_max_stake_factor_multiplier()
+                .await
+                .context("read max_stake_factor for elections config validation")?;
+            elections
+                .validate(Some(network_max))
+                .context("elections max_factor vs chain (config param 17)")?;
+        }
         let master_wallet =
             Self::load_master_wallet(&app_cfg, rpc_client.clone(), vault.clone()).await?;
         let wallets = Self::load_wallets(&app_cfg, rpc_client.clone(), vault.clone()).await?;
@@ -116,6 +125,15 @@ impl RuntimeConfigStore {
     async fn reload(&self, new_config: AppConfig) -> anyhow::Result<()> {
         let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
         let rpc_client = Self::load_rpc_client(&new_config).await?;
+        if let Some(elections) = new_config.elections.as_ref() {
+            let network_max = rpc_client
+                .network_max_stake_factor_multiplier()
+                .await
+                .context("read max_stake_factor for elections config validation")?;
+            elections
+                .validate(Some(network_max))
+                .context("elections max_factor vs chain (config param 17)")?;
+        }
         let master_wallet =
             Self::load_master_wallet(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
         let wallets =
