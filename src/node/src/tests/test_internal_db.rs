@@ -551,6 +551,39 @@ async fn test_full_node_state_impl() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_validator_state_raw() {
+    clean_up(true, "test_validator_state_raw").await;
+    let r = test_validator_state_raw_impl().await;
+    clean_up(false, "test_validator_state_raw").await;
+    r.unwrap();
+}
+
+async fn test_validator_state_raw_impl() -> Result<()> {
+    let bytes = vec![1u8, 2, 3, 4, 5, 6];
+
+    {
+        let db = create_db("test_validator_state_raw", 0).await?;
+
+        db.save_validator_state_raw("test_raw", &bytes)?;
+        assert_eq!(db.load_validator_state_raw("test_raw")?.unwrap(), bytes);
+
+        db.drop_validator_state_raw("test_raw")?;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(db.load_validator_state_raw("test_raw")?.is_none());
+        stop_db(&db).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let db = create_db("test_validator_state_raw", 0).await?;
+        assert!(db.load_validator_state_raw("test_raw")?.is_none());
+        stop_db(&db).await;
+    }
+
+    Ok(())
+}
+
 const SHARD_PREFIX_LEN: u8 = 5;
 const THREADS: u64 = 10;
 const MC_BLOCKS: u32 = 500;

@@ -29,24 +29,26 @@ use ton_block::{error, fail, BlockIdExt, Result, ShardIdent, UInt256};
 #[path = "tests/test_block_handle_db.rs"]
 mod tests;
 
-const FLAG_DATA: u32 = 0x00000001;
-const FLAG_PROOF: u32 = 0x00000002;
-const FLAG_PROOF_LINK: u32 = 0x00000004;
+pub(crate) const FLAG_DATA: u32 = 0x00000001;
+pub(crate) const FLAG_PROOF: u32 = 0x00000002;
+pub(crate) const FLAG_PROOF_LINK: u32 = 0x00000004;
 //const FLAG_EXT_DB: u32                         = 0x00000008;
-const FLAG_STATE: u32 = 0x00000010;
+pub(crate) const FLAG_STATE: u32 = 0x00000010;
 const FLAG_PERSISTENT_STATE: u32 = 0x00000020;
 const FLAG_NEXT_1: u32 = 0x00000040;
 const FLAG_NEXT_2: u32 = 0x00000080;
-const FLAG_PREV_1: u32 = 0x00000100;
-const FLAG_PREV_2: u32 = 0x00000200;
-const FLAG_APPLIED: u32 = 0x00000400;
+pub(crate) const FLAG_PREV_1: u32 = 0x00000100;
+pub(crate) const FLAG_PREV_2: u32 = 0x00000200;
+pub(crate) const FLAG_APPLIED: u32 = 0x00000400;
 pub(crate) const FLAG_KEY_BLOCK: u32 = 0x00000800;
-const FLAG_MOVED_TO_ARCHIVE: u32 = 0x00002000;
-const FLAG_STATE_SAVED: u32 = 0x00010000;
+pub(crate) const FLAG_MOVED_TO_ARCHIVE: u32 = 0x00002000;
+pub(crate) const FLAG_STATE_SAVED: u32 = 0x00010000;
 const FLAG_HAS_FULL_ID: u32 = 0x00020000;
 
 // not serializing flags (possible flags - 1, 2, 4, 8)
 const FLAG_ARCHIVING: u32 = 0x80000000;
+
+pub const VALIDATOR_STATE_DB_NAME: &str = "validator_state_db";
 
 db_impl_base!(NodeStateDb, &'static str);
 
@@ -436,6 +438,8 @@ impl Drop for BlockHandle {
 // Real value is
 // - BlockMeta if FLAG_HAS_FULL_ID is not set
 // - BlockMeta + wc (i32) + shard (u64) + seqno (u32) + file_hash (UInt256) if FLAG_HAS_FULL_ID is set
+pub const BLOCK_HANDLE_DB_NAME: &str = "block_handle_db";
+
 db_impl_base!(BlockHandleDb, BlockIdExt);
 
 declare_counted!(
@@ -464,6 +468,7 @@ pub trait Callback: Sync + Send {
 pub struct BlockHandleStorage {
     handle_db: Arc<BlockHandleDb>,
     handle_cache: Arc<BlockHandleCache>,
+    no_cache: bool,
     full_node_state_db: Arc<NodeStateDb>,
     validator_state_db: Arc<NodeStateDb>,
     state_cache: lockfree::map::Map<String, Arc<BlockIdExt>>,
@@ -485,6 +490,7 @@ impl BlockHandleStorage {
         let ret = Self {
             handle_db: handle_db.clone(),
             handle_cache: Arc::new(lockfree::map::Map::new()),
+            no_cache: false,
             full_node_state_db: full_node_state_db.clone(),
             validator_state_db: validator_state_db.clone(),
             state_cache: lockfree::map::Map::new(),
@@ -578,6 +584,10 @@ impl BlockHandleStorage {
         ret
     }
 
+    pub fn set_no_cache(&mut self) {
+        self.no_cache = true;
+    }
+
     pub fn create_handle(
         &self,
         id: BlockIdExt,
@@ -613,10 +623,13 @@ impl BlockHandleStorage {
 
     pub fn load_full_block_id(&self, root_hash: &UInt256) -> Result<Option<BlockIdExt>> {
         log::trace!(target: TARGET, "load_full_block_id {:x}", root_hash);
-        let weak = self.handle_cache.get(root_hash);
-        if let Some(Some(handle)) = weak.map(|weak| weak.val().object.upgrade()) {
-            Ok(Some(handle.id.clone()))
-        } else if let Some(data) = self.handle_db.try_get_raw(root_hash.as_slice())? {
+        if !self.no_cache {
+            let weak = self.handle_cache.get(root_hash);
+            if let Some(Some(handle)) = weak.map(|weak| weak.val().object.upgrade()) {
+                return Ok(Some(handle.id.clone()));
+            }
+        }
+        if let Some(data) = self.handle_db.try_get_raw(root_hash.as_slice())? {
             Ok(BlockHandle::deserialize_full_id(root_hash, &data)?)
         } else {
             Ok(None)
@@ -635,11 +648,18 @@ impl BlockHandleStorage {
         self.load_state(key, &self.validator_state_db)
     }
 
+    pub fn load_validator_state_raw(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.validator_state_db.try_get_raw(key.as_bytes())?.map(|value| value.to_vec()))
+    }
+
     pub fn save_handle(
         &self,
         handle: &Arc<BlockHandle>,
-        callback: Option<Arc<dyn Callback>>,
+        callback: Option<Arc<dyn Callback>>, // not invoked in no-cache mode
     ) -> Result<()> {
+        if self.no_cache {
+            return self.handle_db.put_raw(handle.id().root_hash().as_slice(), &handle.serialize());
+        }
         self.storer
             .send((StoreJob::SaveHandle(handle.clone()), callback))
             .map_err(|_| error!("Cannot store handle {}: storer thread dropped", handle.id()))
@@ -657,6 +677,16 @@ impl BlockHandleStorage {
         self.storer
             .send((StoreJob::SaveValidatorState((key, refid)), None))
             .map_err(|_| error!("Cannot store validator state {}: storer thread dropped", id))
+    }
+
+    pub fn save_validator_state_raw(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.delete_state(key)?;
+        self.validator_state_db.put_raw(key.as_bytes(), data)
+    }
+
+    pub fn drop_validator_state_raw(&self, key: &str) -> Result<()> {
+        self.delete_state(key)?;
+        self.validator_state_db.delete_raw(key.as_bytes())
     }
 
     pub fn drop_handle(&self, id: BlockIdExt, callback: Option<Arc<dyn Callback>>) -> Result<()> {
@@ -691,23 +721,35 @@ impl BlockHandleStorage {
     ) -> Result<Option<Arc<BlockHandle>>> {
         let rh = id.root_hash().clone();
         let ret = Arc::new(BlockHandle::with_values(id, meta, self.handle_cache.clone()));
-        let added = add_counted_object_to_map(&self.handle_cache, rh, || {
-            let ret = HandleObject {
-                object: Arc::downgrade(&ret),
-                counter: self.allocated.handles.clone().into(),
-            };
-            #[cfg(feature = "telemetry")]
-            self.telemetry.handles.update(self.allocated.handles.load(Ordering::Relaxed));
-            Ok(ret)
-        })?;
-        if added {
-            if store {
-                self.save_handle(&ret, callback)?
+        let ret = if self.no_cache {
+            if self.handle_db.try_get_raw(rh.as_slice())?.is_some() {
+                None
+            } else {
+                if store {
+                    self.save_handle(&ret, callback)?
+                }
+                Some(ret)
             }
-            Ok(Some(ret))
         } else {
-            Ok(None)
-        }
+            let added = add_counted_object_to_map(&self.handle_cache, rh, || {
+                let ret = HandleObject {
+                    object: Arc::downgrade(&ret),
+                    counter: self.allocated.handles.clone().into(),
+                };
+                #[cfg(feature = "telemetry")]
+                self.telemetry.handles.update(self.allocated.handles.load(Ordering::Relaxed));
+                Ok(ret)
+            })?;
+            if added {
+                if store {
+                    self.save_handle(&ret, callback)?
+                }
+                Some(ret)
+            } else {
+                None
+            }
+        };
+        Ok(ret)
     }
 
     fn create_state(&self, key: String, id: &BlockIdExt) -> Result<Arc<BlockIdExt>> {
@@ -731,11 +773,7 @@ impl BlockHandleStorage {
         } else {
             log::trace!(target: TARGET, "load block handle by id {id}")
         }
-        let ret = loop {
-            let weak = self.handle_cache.get(id.root_hash());
-            if let Some(Some(handle)) = weak.map(|weak| weak.val().object.upgrade()) {
-                break Some(handle);
-            }
+        let ret = if self.no_cache {
             if let Some(data) = self.handle_db.try_get_raw(id.root_hash().as_slice())? {
                 let meta = if rh_only {
                     BlockHandle::deserialize_nonchecked(&mut id, &data)?
@@ -744,12 +782,31 @@ impl BlockHandleStorage {
                     meta.set_flags(FLAG_HAS_FULL_ID);
                     meta
                 };
-                let handle = self.create_handle_and_store(id.clone(), meta, None, false)?;
-                if let Some(handle) = handle {
+                Some(Arc::new(BlockHandle::with_values(id, meta, self.handle_cache.clone())))
+            } else {
+                None
+            }
+        } else {
+            loop {
+                let weak = self.handle_cache.get(id.root_hash());
+                if let Some(Some(handle)) = weak.map(|weak| weak.val().object.upgrade()) {
                     break Some(handle);
                 }
-            } else {
-                break None;
+                if let Some(data) = self.handle_db.try_get_raw(id.root_hash().as_slice())? {
+                    let meta = if rh_only {
+                        BlockHandle::deserialize_nonchecked(&mut id, &data)?
+                    } else {
+                        let meta = BlockHandle::deserialize(&id, &data)?;
+                        meta.set_flags(FLAG_HAS_FULL_ID);
+                        meta
+                    };
+                    let handle = self.create_handle_and_store(id.clone(), meta, None, false)?;
+                    if let Some(handle) = handle {
+                        break Some(handle);
+                    }
+                } else {
+                    break None;
+                }
             }
         };
         Ok(ret)

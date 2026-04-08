@@ -21,7 +21,7 @@ The chart manages six ports. Each port is optional (set to `null` to disable) ex
 | Port | Protocol | Default | Purpose |
 |------|----------|---------|---------|
 | `ports.adnl` | UDP | `30303` | Peer-to-peer protocol. Must be publicly reachable. |
-| `ports.simplex` | UDP | `false` | Simplex consensus protocol. Only needed for validators after switching to simplex consensus. `true` = adnl + 1000, or set an explicit port number. |
+| `ports.simplex` | UDP | `false` | Simplex consensus protocol. **Required for validators** — the network uses simplex consensus. `true` = adnl + 1000, or set an explicit port number. |
 | `ports.control` | TCP | `50000` | Node management (stop, restart, elections). Recommended to keep internal. |
 | `ports.liteserver` | TCP | `null` | Liteserver API for external consumers. |
 | `ports.jsonRpc` | TCP | `null` | JSON-RPC API for external consumers. |
@@ -188,6 +188,13 @@ The pod uses the host's network stack directly. All container ports bind on the 
 
 ```yaml
 hostNetwork: true
+```
+
+The chart automatically sets `dnsPolicy: ClusterFirstWithHostNet` when `hostNetwork` is enabled. This ensures pods can still resolve cluster DNS names. Override with `dnsPolicy` if needed:
+
+```yaml
+hostNetwork: true
+dnsPolicy: Default
 ```
 
 **When to use:** bare-metal deployments where you need zero NAT overhead and accept the security trade-off.

@@ -13,13 +13,16 @@ use crate::{
     block_proof::BlockProofStuff,
     config::{CollatorConfig, CollatorTestBundlesGeneralConfig},
     engine::{Engine, EngineFlags, SplitQueues},
-    engine_traits::{EngineAlloc, EngineOperations, PrivateOverlayOperations},
+    engine_traits::{
+        EngineAlloc, EngineOperations, PrivateOverlayOperations, ValidatorKeyBinding,
+        ValidatorListOutcome,
+    },
     error::NodeError,
     ext_messages::{create_ext_message, EXT_MESSAGES_TRACE_TARGET},
     full_node::shard_client::{process_block_broadcast, process_block_broadcast_v2},
     internal_db::{
-        BlockResult, INITIAL_MC_BLOCK, LAST_APPLIED_MC_BLOCK, LAST_ROTATION_MC_BLOCK,
-        SHARD_CLIENT_MC_BLOCK,
+        BlockResult, DESTROYED_VALIDATOR_SESSIONS, INITIAL_MC_BLOCK, LAST_APPLIED_MC_BLOCK,
+        LAST_ROTATION_MC_BLOCK, SHARD_CLIENT_MC_BLOCK,
     },
     shard_state::ShardStateStuff,
     shard_states_keeper::PinnedShardStateGuard,
@@ -44,10 +47,43 @@ use ton_api::ton::{
 };
 use ton_block::{
     error, fail, AccountIdPrefixFull, BlockIdExt, BlockSignaturesVariant, Cell, CellsFactory,
-    ConfigParams, CryptoSignaturePair, KeyId, KeyOption, Message, OutMsgQueue, Result, ShardIdent,
-    UInt256,
+    ConfigParams, CryptoSignaturePair, KeyId, Message, OutMsgQueue, Result, ShardIdent, UInt256,
 };
 use validator_session::{BlockHash, SessionId, ValidatorBlockCandidate};
+
+fn serialize_destroyed_session_ids(ids: &HashSet<UInt256>) -> Vec<u8> {
+    let mut sorted_ids = ids.iter().cloned().collect::<Vec<_>>();
+    sorted_ids.sort_by(|left, right| left.as_slice().cmp(right.as_slice()));
+
+    let mut data = Vec::with_capacity(4 + sorted_ids.len() * 32);
+    data.extend_from_slice(&(sorted_ids.len() as u32).to_le_bytes());
+    for id in sorted_ids {
+        data.extend_from_slice(id.as_slice());
+    }
+    data
+}
+
+fn deserialize_destroyed_session_ids(data: &[u8]) -> Result<Vec<UInt256>> {
+    if data.len() < 4 {
+        fail!("Destroyed-session payload is too short: {}", data.len());
+    }
+
+    let count = u32::from_le_bytes(data[..4].try_into()?) as usize;
+    let expected_len = 4 + count * 32;
+    if data.len() != expected_len {
+        fail!(
+            "Destroyed-session payload has invalid length: expected {}, got {}",
+            expected_len,
+            data.len()
+        );
+    }
+
+    let mut ids = Vec::with_capacity(count);
+    for chunk in data[4..].chunks_exact(32) {
+        ids.push(UInt256::from_slice(chunk));
+    }
+    Ok(ids)
+}
 
 #[async_trait::async_trait]
 impl EngineOperations for Engine {
@@ -91,23 +127,28 @@ impl EngineOperations for Engine {
         Engine::validator_network(self)
     }
 
+    /// Register the local node's participation in a validator list and update network overlays.
+    ///
+    /// Delegates to [`PrivateOverlayOperations::set_validator_list`] for key matching and
+    /// ADNL setup, then refreshes private and custom overlays **only** when the network
+    /// layer is fully ready (`network_ready == true`). Overlay updates require the ADNL key
+    /// to be loaded into the ADNL stack first, which is why they happen here rather than
+    /// at the call site.
     async fn set_validator_list(
         &self,
         validator_list_id: UInt256,
         validators: &[CatchainNode],
-    ) -> Result<Option<Arc<dyn KeyOption>>> {
-        let key =
+    ) -> Result<ValidatorListOutcome> {
+        let outcome =
             self.validator_network().set_validator_list(validator_list_id, validators).await?;
 
-        // Private overlays updated here, because we don't have the needed keys in adnl
-        // before set_validator_list call.
-        let state = self.load_last_applied_mc_state().await?;
-        let config = state.config_params()?;
-        self.overlays_router()?.update_private_overlays(config).await?;
-
-        // Update custom overlays as well, because some of them can become active with new keys
-        self.overlays_router()?.update_custom_overlays(None).await?;
-        Ok(key)
+        if matches!(&outcome, ValidatorListOutcome::Selected { network_ready: true, .. }) {
+            let state = self.load_last_applied_mc_state().await?;
+            let config = state.config_params()?;
+            self.overlays_router()?.update_private_overlays(config).await?;
+            self.overlays_router()?.update_custom_overlays(None).await?;
+        }
+        Ok(outcome)
     }
 
     fn activate_validator_list(&self, validator_list_id: UInt256) -> Result<()> {
@@ -120,6 +161,19 @@ impl EngineOperations for Engine {
 
     fn validation_status(&self) -> ValidationStatus {
         self.validation_status()
+    }
+
+    fn get_validator_key_bindings(&self) -> Result<Vec<ValidatorKeyBinding>> {
+        let keys = self.network().config_handler().get_actual_validator_keys()?;
+        Ok(keys
+            .into_iter()
+            .map(|k| ValidatorKeyBinding {
+                election_id: k.election_id,
+                validator_key_id: k.validator_key_id,
+                validator_adnl_key_id: k.validator_adnl_key_id,
+                expire_at: k.expire_at,
+            })
+            .collect())
     }
 
     fn set_validation_status(&self, status: ValidationStatus) {
@@ -337,6 +391,26 @@ impl EngineOperations for Engine {
 
     fn clear_last_rotation_block_id(&self) -> Result<()> {
         self.db().drop_validator_state(LAST_ROTATION_MC_BLOCK)
+    }
+
+    fn load_destroyed_session_ids(&self) -> Result<Vec<UInt256>> {
+        match self.db().load_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)? {
+            Some(data) => deserialize_destroyed_session_ids(&data),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn save_destroyed_session_ids(&self, ids: &HashSet<UInt256>) -> Result<()> {
+        if ids.is_empty() {
+            self.db().drop_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)
+        } else {
+            let data = serialize_destroyed_session_ids(ids);
+            self.db().save_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS, &data)
+        }
+    }
+
+    fn clear_destroyed_session_ids(&self) -> Result<()> {
+        self.db().drop_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)
     }
 
     fn save_block_candidate(
@@ -671,6 +745,16 @@ impl EngineOperations for Engine {
             .do_or_wait(state.block_id(), None, async { Ok(state.clone()) })
             .await?;
         Ok(state)
+    }
+
+    async fn store_state_update(
+        &self,
+        handle: &Arc<BlockHandle>,
+        state_update: Cell,
+    ) -> Result<()> {
+        self.db().store_state_update(handle, state_update).await?;
+        self.shard_states_awaiters().shunt_async(handle.id(), self.load_state(handle.id())).await?;
+        Ok(())
     }
 
     async fn store_zerostate(
@@ -1174,6 +1258,10 @@ impl EngineOperations for Engine {
     ) -> Result<()> {
         self.update_public_overlays(keyblock_id, config).await
     }
+
+    fn is_archival_mode(&self) -> bool {
+        self.db().is_archival_mode()
+    }
 }
 
 async fn redirect_external_message(
@@ -1198,3 +1286,7 @@ async fn redirect_external_message(
         fail!("External message is not properly formatted: {}", message)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_engine_operations.rs"]
+mod tests;

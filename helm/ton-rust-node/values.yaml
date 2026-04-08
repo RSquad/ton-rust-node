@@ -16,7 +16,7 @@ command: []
 ##
 image:
   repository: ghcr.io/rsquad/ton-rust-node/node
-  tag: v0.3.0
+  tag: v0.4.0
   pullPolicy: IfNotPresent
 
 ## @param imagePullSecrets [array] Image pull secrets for private registries
@@ -133,7 +133,7 @@ storage:
 ## @section Port parameters
 
 ## @param ports.adnl ADNL port (UDP)
-## @param ports.simplex [nullable] Simplex consensus port (UDP). Only needed for validators after switching to simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port.
+## @param ports.simplex [nullable] Simplex consensus port (UDP). Required for validators — the network uses simplex consensus. false/null = disabled (default), true = adnl + 1000, number = explicit port.
 ## @param ports.control Control port (TCP). Set to null to disable.
 ## @param ports.liteserver [nullable] Liteserver port (TCP). Set to enable.
 ## @param ports.jsonRpc [nullable] JSON-RPC port (TCP). Set to enable.
@@ -319,6 +319,11 @@ vault:
 ##
 hostNetwork: false
 
+## @param dnsPolicy Pod DNS policy (only applies when hostNetwork is true). Defaults to ClusterFirstWithHostNet. Supported values: ClusterFirstWithHostNet, ClusterFirst, Default, None.
+## ref: https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-s-dns-policy
+##
+dnsPolicy: ""
+
 ## @param hostPort.adnl Expose the ADNL port on the host IP via hostPort
 ## @param hostPort.simplex Expose the simplex port on the host IP via hostPort
 ## @param hostPort.control Expose the control port on the host IP via hostPort
@@ -406,6 +411,10 @@ serviceAccount:
   enabled: false
   name: ""
   annotations: {}
+
+## @param terminationGracePeriodSeconds Time (in seconds) given to the node process to shut down gracefully before SIGKILL. The default Kubernetes value (30s) is too short for a TON node — an unclean kill may corrupt the database and forces a cold boot. Set this to at least 300s.
+##
+terminationGracePeriodSeconds: 300
 
 ## @section Scheduling parameters
 

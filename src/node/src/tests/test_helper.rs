@@ -808,6 +808,7 @@ impl TestEngine {
             self.clone(),
             true,
             false,
+            false,
         );
         validator_query.try_validate().await?;
         Ok(())
@@ -847,6 +848,7 @@ impl TestEngine {
             validator_set.clone(),
             self.clone(),
             true,
+            false,
             false,
         );
         validator_query.try_validate().await?;
@@ -957,6 +959,7 @@ impl TestEngine {
             self.clone(),
             true,
             false,
+            false,
         );
         validator_query.try_validate().await?;
 
@@ -981,6 +984,10 @@ impl TestEngine {
 impl EngineOperations for TestEngine {
     fn now(&self) -> u32 {
         self.now.load(Ordering::Relaxed)
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.now() as u64 * 1000
     }
 
     async fn lookup_block_by_seqno(

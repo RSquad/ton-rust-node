@@ -9,11 +9,8 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    error::{BlockError, Error},
-    fail,
-    messages::Message,
-    types::CurrencyCollection,
-    BuilderData, Cell, Deserializable, IBitstring, Result, Serializable, SliceData, UInt256,
+    error::BlockError, fail, messages::Message, types::CurrencyCollection, BuilderData, Cell,
+    Deserializable, IBitstring, Result, Serializable, SliceData, UInt256,
 };
 use std::collections::LinkedList;
 
@@ -56,19 +53,6 @@ pub fn unpack_out_action_slices(mut cell: SliceData) -> Result<Vec<SliceData>> {
     Ok(slices_rev)
 }
 
-pub fn deserialize_out_action_slices(
-    action_slices: Vec<SliceData>,
-) -> std::result::Result<Vec<OutAction>, (usize, Error)> {
-    let mut parsed_actions = Vec::with_capacity(action_slices.len());
-    for (i, mut action_slice) in action_slices.into_iter().enumerate() {
-        match OutAction::construct_from(&mut action_slice) {
-            Ok(action) => parsed_actions.push(action),
-            Err(err) => return Err((i, err)),
-        }
-    }
-    Ok(parsed_actions)
-}
-
 ///
 /// Implementation of Serializable for OutActions
 ///
@@ -95,11 +79,10 @@ impl Serializable for OutActions {
 ///
 impl Deserializable for OutActions {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        let actions = match deserialize_out_action_slices(unpack_out_action_slices(cell.clone())?) {
-            Ok(actions) => actions,
-            Err((_, err)) => return Err(err),
-        };
-        self.extend(actions);
+        let action_slices = unpack_out_action_slices(cell.clone())?;
+        for mut action_slice in action_slices {
+            self.push_back(OutAction::construct_from(&mut action_slice)?);
+        }
         Ok(())
     }
 }
@@ -123,7 +106,7 @@ pub enum OutAction {
     ///
     /// Action for reserving some account balance.
     /// It is roughly equivalent to creating an output
-    /// message carrying x nanocoins to oneself,so that
+    /// message carrying x nanocoins to oneself, so that
     /// the subsequent output actions would not be able
     /// to spend more money than the remainder.
     ///
@@ -248,42 +231,46 @@ impl Serializable for OutAction {
 }
 
 impl Deserializable for OutAction {
-    fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        if cell.remaining_bits() < std::mem::size_of::<u32>() * 8 {
+    fn construct_from(slice: &mut SliceData) -> Result<Self> {
+        if slice.remaining_bits() < std::mem::size_of::<u32>() * 8 {
             fail!(BlockError::InvalidArg("cell can't be shorter than 32 bits".to_string()))
         }
-        let tag = cell.get_next_u32()?;
-        match tag {
+        let tag = slice.get_next_u32()?;
+        let action = match tag {
             ACTION_SEND_MSG => {
-                let mode = cell.get_next_byte()?;
-                let msg = Message::construct_from_reference(cell)?;
-                *self = OutAction::new_send(mode, msg);
+                let mode = slice.get_next_byte()?;
+                match Message::construct_from_reference(slice) {
+                    Ok(msg) => OutAction::new_send(mode, msg),
+                    Err(err) => fail!(BlockError::OutActionError(err, mode)),
+                }
             }
-            ACTION_SET_CODE => *self = OutAction::new_set(cell.checked_drain_reference()?),
+            ACTION_SET_CODE => OutAction::new_set(slice.checked_drain_reference()?),
             ACTION_RESERVE => {
-                let mode = cell.get_next_byte()?;
-                let value = Deserializable::construct_from(cell)?;
-                *self = OutAction::new_reserve(mode, value);
+                let mode = slice.get_next_byte()?;
+                match Deserializable::construct_from(slice) {
+                    Ok(value) => OutAction::new_reserve(mode, value),
+                    Err(err) => fail!(BlockError::OutActionError(err, mode)),
+                }
             }
             ACTION_CHANGE_LIB => {
-                let mode = cell.get_next_byte()?;
+                let mode = slice.get_next_byte()?;
                 let flags = (mode >> 1) & SET_LIB_CODE_ADD_PRIVATE_OR_PUBLIC_MASK;
                 match (mode & CHANGE_SET_LIB_MASK, flags) {
                     (CHANGE_LIB_MODE, 0) => {
-                        let hash = UInt256::construct_from(cell)?;
-                        *self = OutAction::new_change_library(mode, None, Some(hash));
+                        let hash = UInt256::construct_from(slice)?;
+                        OutAction::new_change_library(mode, None, Some(hash))
                     }
                     (SET_LIB_CODE_MODE, SET_LIB_CODE_REMOVE)
                     | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PRIVATE)
                     | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PUBLIC) => {
-                        let code = cell.checked_drain_reference()?;
-                        *self = OutAction::new_change_library(mode, Some(code), None);
+                        let code = slice.checked_drain_reference()?;
+                        OutAction::new_change_library(mode, Some(code), None)
                     }
                     _ => fail!("wrong mode for ChangeLibrary action: {mode}"),
                 }
             }
             tag => fail!(BlockError::InvalidConstructorTag { t: tag, s: "OutAction".to_string() }),
-        }
-        Ok(())
+        };
+        Ok(action)
     }
 }

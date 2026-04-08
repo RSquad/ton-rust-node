@@ -30,7 +30,7 @@ use std::{
     cmp::{max, min},
     convert::TryInto,
     fmt::{self, Debug, Display, Formatter},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
@@ -50,7 +50,7 @@ use ton_api::{
     deserialize_boxed, deserialize_typed, serialize_boxed,
     ton::{
         adnl::{
-            address::address::Udp,
+            address::address::{Quic, Udp},
             addresslist::AddressList,
             id::short::Short as AdnlIdShort,
             message::message::{
@@ -75,15 +75,15 @@ macro_rules! adnl_node_test_key {
         format!(
             "{{
                 \"tag\": {},
-                \"data\": {{         
+                \"data\": {{
                     \"type_id\": 1209251014,
                     \"pvt_key\": \"{}\"
                 }}
             }}",
-            $tag,
-            $key
-        ).as_str()
-    }
+            $tag, $key
+        )
+        .as_str()
+    };
 }
 
 #[macro_export]
@@ -92,28 +92,27 @@ macro_rules! adnl_node_test_config {
         format!(
             "{{
                 \"ip_address\": \"{}\",
-                \"keys\": [ 
-                    {} 
+                \"keys\": [
+                    {}
                 ]
             }}",
-            $ip,
-            $key
-        ).as_str()
+            $ip, $key
+        )
+        .as_str()
     };
     ($ip: expr, $key1:expr, $key2:expr) => {
         format!(
             "{{
                 \"ip_address\": \"{}\",
-                \"keys\": [ 
-                    {}, 
-                    {} 
+                \"keys\": [
+                    {},
+                    {}
                 ]
             }}",
-            $ip,
-            $key1,
-            $key2
-        ).as_str()
-    }
+            $ip, $key1, $key2
+        )
+        .as_str()
+    };
 }
 
 /// ADNL addresses cache iterator
@@ -630,24 +629,43 @@ impl AdnlChannel {
 
 struct AdnlNodeAddress {
     channel_key: Arc<dyn KeyOption>,
-    ip_version_address: AtomicPair,
+    ip_version_address_adnl: AtomicPair,
+    ip_version_address_quic: AtomicPair,
     key: Arc<dyn KeyOption>,
 }
 
 impl AdnlNodeAddress {
-    fn from_ip_address_and_key(ip_address: &IpAddress, key: &Arc<dyn KeyOption>) -> Result<Self> {
+    fn from_ip_addresses_and_key(
+        ip_address_adnl: &IpAddress,
+        ip_address_quic: Option<&IpAddress>,
+        key: &Arc<dyn KeyOption>,
+    ) -> Result<Self> {
         let ret = Self {
             channel_key: Ed25519KeyOption::generate()?,
-            ip_version_address: AtomicPair::new(ip_address.version as u64, ip_address.address),
+            ip_version_address_adnl: AtomicPair::new(
+                ip_address_adnl.version as u64,
+                ip_address_adnl.address,
+            ),
+            ip_version_address_quic: match ip_address_quic {
+                Some(q) => AtomicPair::new(q.version as u64, q.address),
+                None => AtomicPair::new(0, 0),
+            },
             key: key.clone(),
         };
         Ok(ret)
     }
 
-    fn update(&self, ip_address: &IpAddress) -> bool {
-        self.ip_version_address.update(
-            ip_address.version as u64,
-            ip_address.address,
+    fn update(&self, ip_address_adnl: &IpAddress, ip_address_quic: Option<&IpAddress>) -> bool {
+        if let Some(q) = ip_address_quic {
+            self.ip_version_address_quic.update(
+                q.version as u64,
+                q.address,
+                |old_version, new_version| old_version < new_version,
+            );
+        }
+        self.ip_version_address_adnl.update(
+            ip_address_adnl.version as u64,
+            ip_address_adnl.address,
             |old_version, new_version| old_version < new_version,
         )
     }
@@ -656,6 +674,7 @@ impl AdnlNodeAddress {
 /// ADNL node configuration
 pub struct AdnlNodeConfig {
     ip_address: IpAddress,
+    ip_address_quic: Option<IpAddress>,
     keys: lockfree::map::Map<Arc<KeyId>, Arc<dyn KeyOption>>,
     tags: lockfree::map::Map<usize, Arc<KeyId>>,
     recv_pipeline_pool: Option<u8>, // %% of cpu cores to assign for recv workers
@@ -677,6 +696,8 @@ struct AdnlNodeKeyJson {
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlNodeConfigJson {
     ip_address: String,
+    #[serde(default)]
+    ip_address_quic: Option<String>,
     keys: Vec<AdnlNodeKeyJson>,
     recv_pipeline_pool: Option<u8>, // %% of cpu cores to assign for recv workers
     recv_priority_pool: Option<u8>, // %% of workers to assign for priority recv
@@ -692,6 +713,14 @@ impl AdnlNodeConfigJson {
     /// Get IP address
     pub fn ip_address(&self) -> Result<IpAddress> {
         IpAddress::from_versioned_string(&self.ip_address, None)
+    }
+
+    /// Get QUIC IP address
+    pub fn ip_address_quic(&self) -> Result<Option<IpAddress>> {
+        self.ip_address_quic
+            .as_deref()
+            .map(|s| IpAddress::from_versioned_string(s, None))
+            .transpose()
     }
 
     /// Get key by tag
@@ -718,10 +747,14 @@ impl AdnlNodeConfig {
     /// Construct from IP address and key data
     pub fn from_ip_address_and_keys(
         ip_address: &str,
+        ip_address_quic: Option<&str>,
         keys: Vec<(Arc<dyn KeyOption>, usize)>,
     ) -> Result<Self> {
+        let ip_address_quic =
+            ip_address_quic.map(|s| IpAddress::from_versioned_string(s, None)).transpose()?;
         let ret = AdnlNodeConfig {
             ip_address: IpAddress::from_versioned_string(ip_address, None)?,
+            ip_address_quic,
             keys: lockfree::map::Map::new(),
             tags: lockfree::map::Map::new(),
             recv_pipeline_pool: None,
@@ -762,6 +795,7 @@ impl AdnlNodeConfig {
     pub fn from_json_config(json_config: &AdnlNodeConfigJson) -> Result<Self> {
         let ret = AdnlNodeConfig {
             ip_address: json_config.ip_address()?,
+            ip_address_quic: json_config.ip_address_quic()?,
             keys: lockfree::map::Map::new(),
             tags: lockfree::map::Map::new(),
             recv_pipeline_pool: json_config.recv_pipeline_pool,
@@ -825,6 +859,16 @@ impl AdnlNodeConfig {
         self.ip_address.set_port(port)
     }
 
+    /// Set QUIC address
+    pub fn set_ip_address_quic(&mut self, addr: SocketAddr) {
+        if let IpAddr::V4(ipv4) = addr.ip() {
+            self.ip_address_quic =
+                Some(IpAddress::from_versioned_parts(u32::from(ipv4), addr.port(), None));
+        } else {
+            log::warn!(target: TARGET, "IPv6 QUIC address {} ignored, only IPv4 is supported", addr);
+        }
+    }
+
     /// Set worker pools
     pub fn set_recv_worker_pools(
         &mut self,
@@ -873,6 +917,7 @@ impl AdnlNodeConfig {
         }
         let json = AdnlNodeConfigJson {
             ip_address: ip_address.to_string(),
+            ip_address_quic: None,
             keys: json_keys,
             recv_pipeline_pool: None,
             recv_priority_pool: None,
@@ -883,7 +928,7 @@ impl AdnlNodeConfig {
             timeout_check_packet_processing_mcs: None,
             timeout_expire_queued_packet_sec: None,
         };
-        Ok((json, Self::from_ip_address_and_keys(ip_address, tags_keys)?))
+        Ok((json, Self::from_ip_address_and_keys(ip_address, None, tags_keys)?))
     }
 
     fn delete_key(&self, key: &Arc<KeyId>, tag: usize) -> Result<bool> {
@@ -2799,6 +2844,7 @@ impl AdnlNode {
         &self,
         local_key: &Arc<KeyId>,
         peer_ip_address: &IpAddress,
+        peer_ip_address_quic: Option<&IpAddress>,
         peer_key: &Arc<dyn KeyOption>,
     ) -> Result<Option<Arc<KeyId>>> {
         if peer_key.id() == local_key {
@@ -2810,14 +2856,17 @@ impl AdnlNode {
             self.peers(local_key)?.map_of.insert_with(ret.clone(), |key, inserted, found| {
                 if let Some((_, found)) = found {
                     ret = key.clone();
-                    found.address.update(peer_ip_address);
+                    found.address.update(peer_ip_address, peer_ip_address_quic);
                     lockfree::map::Preview::Discard
                 } else if inserted.is_some() {
                     ret = key.clone();
                     lockfree::map::Preview::Keep
                 } else {
-                    let address =
-                        AdnlNodeAddress::from_ip_address_and_key(peer_ip_address, peer_key);
+                    let address = AdnlNodeAddress::from_ip_addresses_and_key(
+                        peer_ip_address,
+                        peer_ip_address_quic,
+                        peer_key,
+                    );
                     match address {
                         Ok(address) => {
                             #[cfg(feature = "telemetry")]
@@ -2873,11 +2922,17 @@ impl AdnlNode {
         Ok(Some(ret))
     }
 
-    /// Build address list for given node
+    /// Build address list for given node.
     pub fn build_address_list(&self, expire_at: Option<i32>) -> Result<AddressList> {
         let version = Version::get();
+        let mut addrs: Vec<Address> = vec![self.config.ip_address.to_udp().into_boxed()];
+        if let Some(quic_addr) = self.ip_address_quic() {
+            addrs.push(
+                Quic { ip: quic_addr.ip() as i32, port: quic_addr.port() as i32 }.into_boxed(),
+            );
+        }
         let ret = AddressList {
-            addrs: vec![self.config.ip_address.to_udp().into_boxed()].into(),
+            addrs: addrs.into(),
             version,
             reinit_date: self.start_timestamp,
             priority: 0,
@@ -2941,9 +2996,14 @@ impl AdnlNode {
         (self.options.load(Ordering::Relaxed) & Self::OPTION_MASK_TIMEOUT_CHANNEL_RESET_SEC) as u64
     }
 
-    /// Node IP address
-    pub fn ip_address(&self) -> &IpAddress {
-        self.config.ip_address()
+    /// Node ADNL IP address
+    pub fn ip_address_adnl(&self) -> &IpAddress {
+        &self.config.ip_address
+    }
+
+    /// Node QUIC IP address (None = not configured).
+    pub fn ip_address_quic(&self) -> Option<&IpAddress> {
+        self.config.ip_address_quic.as_ref()
     }
 
     /// Node key by ID
@@ -2957,7 +3017,35 @@ impl AdnlNode {
     }
 
     /// Parse other's address list
-    pub fn parse_address_list(list: &AddressList) -> Result<Option<IpAddress>> {
+    pub fn parse_address_list(
+        list: &AddressList,
+    ) -> Result<Option<(IpAddress, Option<IpAddress>)>> {
+        fn parse_addr(
+            out: &mut Option<IpAddress>,
+            kind: &str,
+            ip: i32,
+            port: i32,
+            version: i32,
+        ) -> bool {
+            if out.is_some() {
+                log::warn!(target: TARGET, "Duplicate {kind} address in address list");
+                return false;
+            }
+            if ip == 0 {
+                log::warn!(target: TARGET, "{kind} address with zero IP in address list");
+                return false;
+            }
+            if (port <= 0) || (port > 65535) {
+                log::warn!(
+                    target: TARGET,
+                    "{kind} address with invalid port {port} in address list"
+                );
+                return false;
+            }
+            *out = Some(IpAddress::from_versioned_parts(ip as u32, port as u16, Some(version)));
+            true
+        }
+
         if list.addrs.is_empty() {
             log::warn!(target: TARGET, "Address list is empty");
             return Ok(None);
@@ -2978,37 +3066,58 @@ impl AdnlNode {
             log::warn!(target: TARGET, "Address list is expired");
             return Ok(None);
         }
-        match &list.addrs[0] {
-            Address::Adnl_Address_Udp(x) => {
-                let ret =
-                    IpAddress::from_versioned_parts(x.ip as u32, x.port as u16, Some(list.version));
-                Ok(Some(ret))
+        let mut adnl_addr = None;
+        let mut quic_addr = None;
+        for addr in list.addrs.iter() {
+            match addr {
+                Address::Adnl_Address_Udp(x) => {
+                    if !parse_addr(&mut adnl_addr, "ADNL", x.ip, x.port, list.version) {
+                        return Ok(None);
+                    }
+                }
+                Address::Adnl_Address_Quic(x) => {
+                    if !parse_addr(&mut quic_addr, "QUIC", x.ip, x.port, list.version) {
+                        return Ok(None);
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                log::warn!(target: TARGET, "Only IPv4 address format is supported");
+        }
+        match adnl_addr {
+            Some(ip) => Ok(Some((ip, quic_addr))),
+            None => {
+                log::warn!(target: TARGET, "No IPv4 ADNL address in address list");
                 Ok(None)
             }
         }
     }
 
-    /// Get peer's socket address if known.
+    /// Get peer's ADNL and QUIC socket addresses if known
     pub fn peer_ip_address(
         &self,
         local_key: &Arc<KeyId>,
         peer_key: &Arc<KeyId>,
-    ) -> Result<Option<SocketAddr>> {
+    ) -> Result<Option<(SocketAddr, Option<SocketAddr>)>> {
         let peers = self.peers(local_key)?;
         let Some(peer) = peers.map_of.get(peer_key) else {
             return Ok(None);
         };
-        let (_, address) = peer.val().address.ip_version_address.get();
-        if address == 0 {
-            Ok(None)
-        } else {
-            let ip = (address >> 16) as u32;
-            let port = address as u16;
-            Ok(Some(SocketAddr::new(IpAddr::V4(ip.into()), port)))
+        let (_, adnl_address) = peer.val().address.ip_version_address_adnl.get();
+        if adnl_address == 0 {
+            return Ok(None);
         }
+        let adnl_ip = (adnl_address >> 16) as u32;
+        let adnl_port = adnl_address as u16;
+        let adnl_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(adnl_ip)), adnl_port);
+        let (_, quic_address) = peer.val().address.ip_version_address_quic.get();
+        let quic_addr = if quic_address != 0 {
+            let quic_ip = (quic_address >> 16) as u32;
+            let quic_port = quic_address as u16;
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(quic_ip)), quic_port))
+        } else {
+            None
+        };
+        Ok(Some((adnl_addr, quic_addr)))
     }
 
     /// Send query
@@ -3177,9 +3286,10 @@ impl AdnlNode {
         })?;
         log::warn!(target: TARGET, "Resetting peer pair {} -> {}", local_key, other_key);
         let peer = peer.val();
-        let (_, address) = peer.address.ip_version_address.get();
-        let address = AdnlNodeAddress::from_ip_address_and_key(
+        let (_, address) = peer.address.ip_version_address_adnl.get();
+        let address = AdnlNodeAddress::from_ip_addresses_and_key(
             &IpAddress { address, version: Version::get() },
+            None,
             &peer.address.key,
         )?;
         peers
@@ -3449,8 +3559,8 @@ impl AdnlNode {
                 } else {
                     Some(address.reinit_date)
                 };
-                if let Some(ip_address) = Self::parse_address_list(address)? {
-                    self.add_peer(local_key, &ip_address, &key)?;
+                if let Some((adnl_addr, quic_addr)) = Self::parse_address_list(address)? {
+                    self.add_peer(local_key, &adnl_addr, quic_addr.as_ref(), &key)?;
                     (other_key, Cow::Borrowed("from-with-ip-address"), address_reinit_date, false)
                 } else {
                     let disposition = Cow::Owned(format!("from-without-ip-address {address:?}"));
@@ -4478,7 +4588,7 @@ impl AdnlNode {
                 .send(LoopbackData::Packet(data))
                 .map_err(|e| error!("Error when sending loopback ADNL packet: {e}"))?
         } else {
-            let (_, address) = peer.address.ip_version_address.get();
+            let (_, address) = peer.address.ip_version_address_adnl.get();
             let job = SendData { destination: address, data, method: method.clone() };
             if method == AdnlSendMethodDetailed::FastUrgent {
                 self.send_pipeline.put_urgent(SendJob::Data(job))
