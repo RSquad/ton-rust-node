@@ -157,9 +157,10 @@ class Bootstrap:
         self.cfg   = cfg
         self.paths = paths
         self.log   = log
-        # Mutable runtime state — set during phase 7
-        self._proc:        Optional[subprocess.Popen] = None
-        self._nodectl_log: Optional[Path]             = None
+        # Runtime state — populated during phase 7 (start service)
+        self._proc:           Optional[subprocess.Popen] = None
+        self._nodectl_log:    Optional[Path]             = None
+        self._service_log_fh: Optional[object]           = None
 
     # ── Orchestration ─────────────────────────────────────────────────────────
 
@@ -168,15 +169,15 @@ class Bootstrap:
         self.phase3_start_network(pub_key)
         self.phase4_wait_progress()
         master_addr = self.phase5_complete_config()
+        self._ensure_bun_deps()
         self.phase6_topup_master(master_addr)
         self.phase7_start_service()
         wallet_addrs, pool_addrs = self.phase8_wait_and_topup()
         last_count = self.phase9_wait_participants()
         if last_count > 0:
-            self._setup_auth()
             self.phase10_validate_api()
         else:
-            self.log.warn("Skipping auth setup and API validation — no participants found")
+            self.log.warn("Skipping API validation — no participants found")
         self.phase11_summary(master_addr, wallet_addrs, pool_addrs, last_count)
 
     def shutdown(self, *, force: bool = False) -> None:
@@ -191,7 +192,7 @@ class Bootstrap:
                 except subprocess.TimeoutExpired:
                     self._proc.kill()
                     self._proc.wait()
-        if hasattr(self, "_service_log_fh") and self._service_log_fh:
+        if self._service_log_fh:
             self._service_log_fh.close()
             self._service_log_fh = None
         if force:
@@ -361,9 +362,28 @@ class Bootstrap:
                 return parts[-1]
 
         self._fail("Failed to extract pub key for control-client-secret")
-        raise AssertionError("unreachable")
 
     # ── Phase 3: Start network ────────────────────────────────────────────────
+
+    def _ensure_test_run_net_config(self) -> None:
+        """Generate test_run_net.json with correct node counts if it doesn't exist."""
+        cfg_path = self.paths.run_net_dir / "test_run_net.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            if cfg.get("rust_nodes_count") == self.cfg.node_cnt and cfg.get("cpp_nodes_count") == 0:
+                return
+            self.log.info(f"  Updating test_run_net.json: rust={self.cfg.node_cnt}, cpp=0")
+        else:
+            # Run test_run_net.py once to generate defaults, then patch
+            py = self._venv_python()
+            subprocess.run([py, "test_run_net.py"], cwd=self.paths.run_net_dir,
+                           check=False, stdin=subprocess.DEVNULL, timeout=30)
+            self.log.info(f"  Generated test_run_net.json: rust={self.cfg.node_cnt}, cpp=0")
+
+        cfg = json.loads(cfg_path.read_text())
+        cfg["rust_nodes_count"] = self.cfg.node_cnt
+        cfg["cpp_nodes_count"] = 0
+        cfg_path.write_text(json.dumps(cfg, indent=2))
 
     def phase3_start_network(self, pub_key_shared: str) -> None:
         """Start the singlehost network with the shared key pre-injected into every
@@ -371,6 +391,8 @@ class Bootstrap:
         self._phase(3, "Starting singlehost network (--elections)...")
         py  = self._venv_python()
         rnd = self.paths.run_net_dir
+
+        self._ensure_test_run_net_config()
 
         subprocess.run([py, "test_run_net.py", "--stop"], cwd=rnd, check=False,
                        stdin=subprocess.DEVNULL, timeout=30)
@@ -412,7 +434,7 @@ class Bootstrap:
         self._add_wallets()
         self._wait_http_api()
         master_addr = self._resolve_master_wallet()
-        self._add_nodes(master_addr)
+        self._add_nodes()
         self._configure_elections(master_addr)
 
         return master_addr
@@ -461,9 +483,8 @@ class Bootstrap:
                 pass
             time.sleep(3)
         self._fail("Could not resolve master wallet address")
-        raise AssertionError("unreachable")
 
-    def _add_nodes(self, master_addr: str) -> None:
+    def _add_nodes(self) -> None:
         self.log.info("  Adding nodes...")
         for i in range(1, self.cfg.node_cnt + 1):
             console = self._node_console(i)
@@ -498,17 +519,14 @@ class Bootstrap:
 
     def phase6_topup_master(self, master_addr: str) -> None:
         self._phase(6, f"Topping up master wallet ({self.cfg.master_topup} TON)...")
-        self._ensure_bun_deps()
         self._bun_topup(master_addr, self.cfg.master_topup)
 
     # ── Phase 7: Start nodectl service ────────────────────────────────────────
 
     def phase7_start_service(self) -> None:
         self._phase(7, "Starting nodectl service...")
-        log_path = self.paths.nodectl_log
-        log_path.write_text("")   # truncate from any previous run
-        self._nodectl_log = log_path
-        self._service_log_fh = open(log_path, "w")
+        self._nodectl_log = self.paths.nodectl_log
+        self._service_log_fh = open(self._nodectl_log, "w")  # truncates previous run
         self._proc = subprocess.Popen(
             [str(self.paths.nodectl_bin), "service",
              "--config", str(self.paths.nodectl_config)],
@@ -552,7 +570,6 @@ class Bootstrap:
         pool_addrs   = sorted(set(re.findall(r"opened nominator pool: address=(\S+)", log_text)))
         self.log.info(f"  Wallets opened: {len(wallet_addrs)}, pools opened: {len(pool_addrs)}")
 
-        self._ensure_bun_deps()
         for addr in pool_addrs:
             self.log.info(f"  Top up pool   {addr} ({self.cfg.pool_topup} TON)")
             self._bun_topup(addr, self.cfg.pool_topup)
@@ -578,43 +595,31 @@ class Bootstrap:
             self._fail(f"Expected {expected} participants but got {cnt} after {self.cfg.participants_wait}s")
         return cnt
 
-    # ── Auth setup (before phase 10) ────────────────────────────────────────
+    # ── Phase 10: Auth + REST API stake validation ──────────────────────────
 
-    def _setup_auth(self) -> None:
-        """Create an API user, log in, and export NODECTL_API_TOKEN."""
-        self.log.info("Setting up API authentication...")
+    def phase10_validate_api(self) -> None:
+        self._phase(10, "Setting up auth and validating REST API stakes...")
+
+        # Create API user and obtain JWT token
         password = secrets.token_hex(16)
-
-        # Create operator user (--password-stdin to avoid interactive prompt)
         result = subprocess.run(
             [str(self.paths.nodectl_bin), "auth", "add",
              "--username", "admin", "--role", "operator", "--password-stdin"],
             input=password, text=True, capture_output=True, timeout=15,
         )
         if result.returncode != 0:
-            self.log.error(
-                f"Failed to add auth user (exit {result.returncode}): {result.stderr.strip()}"
-            )
-            raise BootstrapError("failed to create nodectl user")
-   
+            self._fail(f"auth add failed (exit {result.returncode}): {result.stderr.strip()}")
         self.log.info("  Created auth user 'admin' (operator)")
 
-        # Wait for the service to reload config from file (every 10s)
+        # Service reloads config from disk every 10s — wait for it to pick up the new user
         time.sleep(12)
 
-        # Login and capture the JWT token
         result = subprocess.run(
             [str(self.paths.nodectl_bin), "api", "login", "admin", "--password-stdin"],
             input=password, capture_output=True, text=True, check=True, timeout=15,
         )
-        token = json.loads(result.stdout)["token"]
-        os.environ["NODECTL_API_TOKEN"] = token
+        os.environ["NODECTL_API_TOKEN"] = json.loads(result.stdout)["token"]
         self.log.info("  Logged in and exported NODECTL_API_TOKEN")
-
-    # ── Phase 10: REST API stake validation ───────────────────────────────────
-
-    def phase10_validate_api(self) -> None:
-        self._phase(10, "Validating election REST API stakes against elector contract...")
 
         elections = self._fetch_nodectl_elections()
         if elections is None:
@@ -632,22 +637,15 @@ class Bootstrap:
             capture_output=True, text=True,
             stdin=subprocess.DEVNULL, timeout=15,
         )
+        stderr = result.stderr.strip()
         if result.returncode != 0:
-            stderr = result.stderr.strip()
-            self.log.warn(
-                f"  nodectl api elections failed (exit {result.returncode})"
-                + (f": {stderr}" if stderr else "")
-            )
+            self.log.warn(f"  nodectl api elections failed (exit {result.returncode})"
+                          + (f": {stderr}" if stderr else ""))
             return None
         try:
             return json.loads(result.stdout)
         except Exception as e:
-            stderr = result.stderr.strip()
-            self.log.warn(
-                f"  Could not parse nodectl api elections response: {e}"
-                + (f" | stderr: {stderr}" if stderr else "")
-                + "; skipping"
-            )
+            self.log.warn(f"  Could not parse elections response: {e}; skipping")
             return None
 
     def _fetch_elector_stake_map(self) -> Optional[dict]:
@@ -766,7 +764,7 @@ def main() -> None:
     bootstrap = Bootstrap(cfg, paths, log)
 
     # Signal handling — needs a bootstrap reference for clean shutdown
-    def on_signal(sig: int, frame: object) -> None:
+    def on_signal(_sig: int, _frame: object) -> None:
         bootstrap.shutdown(force=True)
         log.close()
         sys.exit(130)
