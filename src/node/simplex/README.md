@@ -7,6 +7,12 @@ Rust implementation of the Simplex consensus protocol for TON blockchain.
 > **C++ Reference**: Primary tracking is `ton-blockchain/ton/tree/simplex` (main repo).  
 > Secondary: `DanShaders/ton/tree/alpenglow` (superseded).
 
+> **Current semantics (Apr 2026):**
+> - Simplex is finalized-driven.
+> - Finalized blocks are delivered through `on_block_finalized()` and may arrive out of order.
+> - `on_block_committed()` remains part of the shared listener interface for legacy sequential acceptance, but Simplex must not use it.
+> - Missing-body handling uses `finalized_pending_body`: a finalized block can be known before its body arrives locally.
+
 ## Overview
 
 Simplex is a consensus protocol based on the Solana Alpenglow White Paper (May 2025 v1) with modifications for TON:
@@ -67,7 +73,8 @@ This crate targets wire-compatibility with the upstream **C++ Simplex** implemen
 - Overlay ID computation (node ordering, short ID)
 - `candidateAndCert.notar` encoding (voteSignatureSet)
 - Handle incoming `consensus.simplex.certificate` on vote channel
-- `requestCandidate2` removed — replaced by `get_committed_candidate`
+- `requestCandidate2` removed
+- `get_committed_candidate` / `CommittedBlockProof*` removed; current Simplex relies on finalized delivery plus deferred body materialization
 - Shard `before_split` empty block rule
 - Restart support (DB persistence + startup recovery)
 - Certificate rebroadcast on restart
@@ -88,7 +95,7 @@ This crate targets wire-compatibility with the upstream **C++ Simplex** implemen
 │  │  │ SessionProcessor             │  │   │  - pull callback queue           │ │
 │  │  │  - consensus FSM             │  │   │  - invoke SessionListener:       │ │
 │  │  │  - slot state management     │  │   │    - on_candidate                │ │
-│  │  │  - vote tracking             │  │   │    - on_block_committed          │ │
+│  │  │  - vote tracking             │  │   │    - on_block_finalized          │ │
 │  │  └──────────────────────────────┘  │   │    - on_generate_slot            │ │
 │  │                                    │   └──────────────────────────────────┘ │
 │  │  - pull main task queue            │                                        │
@@ -146,7 +153,7 @@ This crate targets wire-compatibility with the upstream **C++ Simplex** implemen
 │ SessionListener (implemented by caller)                                     │
 │  - on_candidate: validate block                                             │
 │  - on_generate_slot: create new block                                       │
-│  - on_block_committed: finalization notification                            │
+│  - on_block_finalized: finalized-block delivery                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -190,7 +197,7 @@ The original Alpenglow White Paper specifies 5 vote types for consensus. However
 
 When 2/3 stake weight is reached for a vote type, a certificate is formed:
 - **NotarizationCert**: Block is notarized
-- **FinalizationCert**: Block is finalized (committed)
+- **FinalizationCert**: Block is finalized
 - **SkipCert**: Slot is skipped
 
 Certificates are implicit (derived from vote counts), not explicit on-wire objects.
@@ -228,7 +235,7 @@ let validators re-vote on the previous block to attempt getting a FinalizeCertif
 Each slot follows this flow:
 
 ```
-Collate → Broadcast → Validate → Notarize → Vote → Collect → Finalize → Commit → next slot
+Collate → Broadcast → Validate → Notarize → Vote → Collect → Finalize → Deliver → next slot
 ```
 
 | Phase | SessionProcessor | SimplexState | Output |
@@ -240,7 +247,7 @@ Collate → Broadcast → Validate → Notarize → Vote → Collect → Finaliz
 | **Vote** | `broadcast_vote()` | - | Vote to network |
 | **Collect** | `on_vote()` | `on_vote()` → thresholds | Threshold events |
 | **Finalize** | - | `try_final()` | `BroadcastVote(Final)` |
-| **Commit** | `handle_block_finalized()` | `BlockFinalized` event | `on_block_committed()` |
+| **Deliver** | `handle_block_finalized()` | `BlockFinalized` event | `on_block_finalized()` |
 
 ## Package Structure
 
@@ -253,7 +260,7 @@ node/simplex/
 │   ├── lib.rs                 # Public API: Session, SimplexSession, SessionOptions, SessionFactory
 │   ├── block.rs               # Block candidate types: RawCandidateId, Candidate, etc.
 │   ├── certificate.rs         # Certificate types: VoteSignature, Certificate<T> (crate-private)
-│   ├── database.rs            # DB persistence for restart/recommit (crate-private)
+│   ├── database.rs            # DB persistence for restart recovery (crate-private)
 │   ├── simplex_state.rs       # Core consensus FSM with event-based output
 │   ├── session.rs             # Session actor (multi-threaded wrapper, task queues)
 │   ├── session_processor.rs   # Integrates SimplexState with network (crate-private)
@@ -296,7 +303,7 @@ Entry point for integration. See `lib.rs` documentation for detailed API referen
 | `ConsensusSession` | Base session interface (trait, from consensus-common) |
 | `SimplexSession` | Simplex-specific session operations (extends `Session`) |
 | `SessionListener` | Callback trait (from consensus-common) |
-| `SessionStats` | Session health metrics passed to `on_block_committed` |
+| `SessionStats` | Session health metrics passed alongside validator callbacks |
 | `Receiver` | Network sender interface (trait) |
 | `ReceiverListener` | Network receiver callbacks (trait) |
 
@@ -346,11 +353,12 @@ Single-threaded consensus algorithm (crate-private):
 - ✅ MC finalization callback - `SimplexSession::notify_mc_finalized()` posts to `set_mc_finalized_seqno()`
 - ✅ Missing block requests - `schedule_request_candidate()` → delayed action → `receiver.request_candidate()`
 - ✅ Recursive parent resolution - `PendingParentResolution`, `update_resolution_cache_chain()`, `find_first_missing_parent()`
-- ✅ Round tracking - `current_round` field tracks sequential commit counter (independent of slots)
+- ✅ Finalized-driven delivery - `handle_block_finalized()`, `maybe_emit_out_of_order_finalized()`, `maybe_apply_finalized_state()`
+- ✅ Roundless listener model - round is not used for Simplex sequencing logic
 - ✅ Standstill coordination - calls `receiver.reschedule_standstill()` on finalization, `set_standstill_slots()` on finalization/skip
 - ✅ DB persistence - finalized blocks, candidate infos, notar certs, votes, pool state persisted to RocksDB
-- ✅ Startup recovery - bootstrap load, vote replay, receiver cache restore, recommit to ValidatorGroup
-- ✅ Download committed block via full-node proof for MC gap recovery (replaces requestCandidate2)
+- ✅ Startup recovery - bootstrap load, vote replay, receiver cache restore, finalized-boundary restoration
+- ✅ Late-join handling - finalized blocks can be known before body arrival via `finalized_pending_body`
 - ⚠️ Precollation parent tracking - needs fix for cross-window scenarios
 
 **Key methods:**
@@ -375,15 +383,18 @@ Single-threaded consensus algorithm (crate-private):
 - `simplex_time:collation_latency` - Histogram for collation time
 - `simplex_active_weight` - Gauge for current network active weight
 - `simplex_validates.*` - ResultStatusCounter for validation requests
-- `simplex_collates.*` - ResultStatusCounter for collation requests
-- `simplex_commits.*` - ResultStatusCounter for commit requests
+- `simplex_collates.*` - ResultStatusCounter for collation completion results
+- `simplex_collation_starts` - Counter for all collation entry attempts
+- `simplex_commits.*` - legacy-named ResultStatusCounter for finalized-delivery/apply outcomes
 - `simplex_precollation_requests` - Counter for precollation requests
 - `simplex_precollation_results` - Counter for precollation completions
 - `simplex_collates_precollated.*` - ResultStatusCounter for precollated block hits
+- `simplex_candidate_received_broadcast` - Counter for peer-delivered broadcast candidate bodies
+- `simplex_candidate_received_query` - Counter for peer-delivered query-response candidate bodies
 - `simplex_skipped_slots` - Counter for skipped slots
-- `simplex_batch_commits` - Counter for batch commit operations
-- `simplex_batch_commit_size` - Histogram for batch commit sizes
-- `simplex_current_round` - Gauge for current round (sequential commit counter)
+- `simplex_batch_commits` - legacy-named batch finalized-apply metric
+- `simplex_batch_commit_size` - legacy-named histogram for finalized batch size
+- `simplex_finalized_pending_body_count` - Gauge for finalized blocks waiting for body arrival
 
 ### SimplexState (`simplex_state.rs`)
 
@@ -396,7 +407,7 @@ Core consensus state machine (crate-private):
 
 **Event model**: Instead of callbacks, SimplexState produces events:
 - `BroadcastVote(vote)` - Vote to broadcast to all validators
-- `BlockFinalized(slot, block)` - Block finalized (triggers `on_block_committed`)
+- `BlockFinalized(slot, block)` - Block finalized (triggers `on_block_finalized`)
 - `SlotSkipped(slot)` - Slot skipped (handled internally, no callback)
 
 **API**:
@@ -598,8 +609,12 @@ impl SessionListener for MyListener {
         // Call callback with block candidate
     }
 
+    fn on_block_finalized(&self, block_id, round, source, root_hash, file_hash, data, signatures, approve_signatures) {
+        // Finalized block delivered by Simplex (may be out of order)
+    }
+
     fn on_block_committed(&self, source_info, root_hash, file_hash, data, signatures, approve_signatures, stats) {
-        // Block was finalized in consensus
+        unreachable!("Simplex must not call on_block_committed()");
     }
 
     fn on_block_skipped(&self, round: u32) {
@@ -655,7 +670,7 @@ Multi-instance consensus tests with in-process overlay.
 |------|-------------|--------|
 | `test_simplex_consensus_basic` | Basic consensus with 7 nodes, 100 rounds | ✅ |
 | `test_simplex_consensus_with_failures` | Consensus with simulated failures | ✅ |
-| `test_simplex_consensus_finalcert_recovery` | FinalCert recovery via `get_committed_candidate` | ✅ |
+| `test_simplex_consensus_finalcert_recovery` | FinalCert recovery and finalized delivery without the old proof callback path | ✅ |
 | `test_simplex_consensus_shard_with_mc_notifications` | MC finalization forwarding to shards | ✅ |
 | `test_simplex_consensus_adnl_overlay` | ADNL overlay-based consensus | ✅ |
 | `test_simplex_consensus_adnl_net_gremlin` | ADNL net gremlin (packet loss/delay simulation) | ✅ |
@@ -665,7 +680,7 @@ Multi-instance consensus tests with in-process overlay.
 
 **Test Configuration:**
 - `total_slots: u32` - Number of slots to complete (default: 100)
-- `min_commit_percent: f64` - Minimum required commit rate (default: 0.5 = 50%)
+- `min_finalized_percent: f64` - Minimum required finalized-delivery rate (default varies by test)
 - `test_timeout: Duration` - Maximum time to wait
 - `expect_timeout: bool` - If true, test passes on timeout
 
@@ -692,8 +707,7 @@ Restart integration tests (public API only) validating DB-backed stop/restart re
 
 | Test | Description |
 |------|-------------|
-| `test_single_session_restart_round_monotonicity_full_replay` | Restart with full replay; round/slot stream remains monotonic |
-| `test_single_session_restart_round_monotonicity_first_commit_after_finalized` | Restart after finalized boundary; first post-restart commit keeps monotonicity |
+| `test_single_session_restart_round_monotonicity_first_commit_after_finalized` | Restart after finalized boundary; resumed session keeps finalized state consistent without historical recommit |
 
 **Running:**
 ```bash
@@ -805,7 +819,7 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_process_events_calls` | FSM event processing calls | `process_simplex_events()` |
 | `simplex_errors` | Protocol-breaking errors | `increment_error()` |
 | `simplex_misbehavior` | Detected misbehavior events | `on_vote()` conflict detection |
-| `simplex_batch_commits` | Batch commit operations | `try_commit_finalized_chains()` |
+| `simplex_batch_commits` | Legacy batch finalized-apply metric | historical naming; sequential commit scheduler removed |
 | `simplex_skip_total` | Total slot skip events | `handle_slot_skipped()` |
 | `simplex_votes_in_notarize` | Inbound notarize votes | `on_vote()` |
 | `simplex_votes_in_finalize` | Inbound finalize votes | `on_vote()` |
@@ -820,6 +834,9 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_validation_reject` | Validation rejections | `candidate_decision_fail()` |
 | `simplex_validation_late_callback` | Late validation callbacks | `candidate_decision_ok/fail()` |
 | `simplex_health_warnings` | Health anomaly warnings (not errors) | `run_health_checks()` |
+| `simplex_candidate_received_broadcast` | Peer-delivered broadcast candidate bodies (excludes local self-loop) | `on_candidate_received()` |
+| `simplex_candidate_received_query` | Peer-delivered requestCandidate/query-response candidate bodies (excludes local self-loop) | `on_candidate_received()` |
+| `simplex_collation_starts` | Unified collation entry attempts across async, retry, precollated, and empty-block paths | `check_collation()`, `invoke_collation()`, `invoke_collation_retry()` |
 | `simplex_precollation_requests` | Precollation requests sent | `invoke_precollation()` |
 | `simplex_precollation_results` | Precollation results received | `precollation_result()` |
 
@@ -828,8 +845,8 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | Metric | Description |
 |--------|-------------|
 | `simplex_validates` | Block validation results |
-| `simplex_collates` | Block collation results |
-| `simplex_commits` | Block commit results |
+| `simplex_collates` | Block collation completion results (`.total` only covers async listener requests) |
+| `simplex_commits` | Finalized-delivery/apply results (legacy metric family name) |
 | `simplex_collates_precollated` | Precollated block hits |
 | `simplex_collates_expire` | Expired collation time slots |
 
@@ -840,7 +857,8 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_active_weight` | Active validator weight | `check_all()` |
 | `simplex_total_weight` | Total validator weight | `init_metrics()` |
 | `simplex_threshold_66` | 2/3 weight threshold | `init_metrics()` |
-| `simplex_last_finalized_slot` | Last finalized slot index | `commit_single_block()` |
+| `simplex_last_finalized_slot` | Last finalized slot index | `maybe_apply_finalized_state()` |
+| `simplex_finalized_pending_body_count` | Finalized blocks waiting for body arrival | `handle_block_finalized()`, cleanup, materialization |
 | `simplex_first_non_finalized_slot` | First non-finalized slot (FSM) | `check_all()` |
 | `simplex_first_non_progressed_slot` | First non-progressed slot (FSM) | `check_all()` |
 
@@ -855,7 +873,7 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `time:slot_stage1_received_latency` | ms | Slot start to first candidate received |
 | `time:slot_stage2_notarized_latency` | ms | Slot start to first notarize vote |
 | `time:slot_stage3_finalized_latency` | ms | Slot start to first finalize vote |
-| `simplex_batch_commit_size` | count | Blocks committed per batch |
+| `simplex_batch_commit_size` | count | Blocks applied per finalized batch (legacy metric name) |
 
 #### Receiver Counters
 
@@ -888,8 +906,10 @@ All counters and progress gauges are registered as derivative metrics via `Metri
 
 - `simplex_last_finalized_slot` -- finalized slots per second
 - `simplex_first_non_finalized_slot` -- FSM advancement rate
-- `simplex_commits.total` -- commit throughput
+- `simplex_commits.total` -- finalized-delivery throughput (legacy metric name)
 - `simplex_validates.total` -- validation throughput
+- `simplex_collation_starts` -- collation entry attempts per second
+- `simplex_candidate_received_broadcast` + `simplex_candidate_received_query` -- peer-delivered candidate-body ingress rate (sum them for total ingress)
 
 ### Health Checks
 

@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
+    sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
     Ed25519KeyOption, ShardIdent, UInt256,
 };
 
@@ -60,10 +60,10 @@ struct ValidationTestListener {
     collation_count: Arc<AtomicU32>,
     /// Public key for generating candidates
     public_key: PublicKey,
-    /// Next expected seqno for collation - increases after each successful collation
+    /// Next expected seqno for collation — updated on finalization
     next_expected_collation_seqno: Arc<AtomicU32>,
-    /// Next expected seqno for commit - initialized with initial_block_seqno, +1 for each commit
-    next_expected_commit_seqno: Arc<AtomicU32>,
+    /// Maximum finalized seqno observed (monotonically advances via fetch_max)
+    max_finalized_seqno: Arc<AtomicU32>,
 }
 
 impl SessionListener for ValidationTestListener {
@@ -111,20 +111,11 @@ impl SessionListener for ValidationTestListener {
         self.collation_requested.store(true, Ordering::Release);
         self.collation_count.fetch_add(1, Ordering::Relaxed);
 
-        // Derive seqno from explicit parent hint or use stable counter value for implicit case
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                // Keep seqno stable across retries for the same slot.
-                // The counter is advanced on commit.
-                self.next_expected_collation_seqno.load(Ordering::SeqCst)
+                self.max_finalized_seqno.load(Ordering::SeqCst)
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => {
-                // Explicit parent: derive seqno from parent (parent_seqno + 1)
-                let derived_seqno = parent_id.seq_no + 1;
-                // Update counter to match derived seqno for next iteration
-                self.next_expected_collation_seqno.store(derived_seqno + 1, Ordering::SeqCst);
-                derived_seqno
-            }
+            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
         };
 
         // Generate dummy candidate with proper hashes
@@ -175,28 +166,41 @@ impl SessionListener for ValidationTestListener {
 
     fn on_block_committed(
         &self,
-        source_info: simplex::BlockSourceInfo,
-        root_hash: BlockHash,
+        _source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
         _file_hash: BlockHash,
         _data: BlockPayloadPtr,
         _signatures: BlockSignaturesVariant,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
         _stats: consensus_common::SessionStats,
     ) {
-        let slot = source_info.priority.round;
+        panic!(
+            "on_block_committed must not be called for Simplex sessions (finalized-driven only)"
+        );
+    }
 
-        // Increment next_expected_commit_seqno and update next_expected_collation_seqno
-        let committed_seqno = self.next_expected_commit_seqno.fetch_add(1, Ordering::SeqCst);
-        let next_commit_seqno = committed_seqno + 1;
-        self.next_expected_collation_seqno.store(next_commit_seqno, Ordering::SeqCst);
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
+        source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
+        _file_hash: BlockHash,
+        _data: BlockPayloadPtr,
+        _signatures: BlockSignaturesVariant,
+        _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+    ) {
+        let slot = source_info.priority.round;
+        let seqno = block_id.seq_no;
+
+        self.max_finalized_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
+        self.next_expected_collation_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
 
         log::info!(
-            "ValidationTestListener[{}]::on_block_committed: slot={}, hash={:?}, committed_seqno={}, next_expected={}",
+            "ValidationTestListener[{}]::on_block_finalized: slot={}, seqno={}, block_id={}",
             self.node_idx,
             slot,
-            root_hash,
-            committed_seqno,
-            next_commit_seqno
+            seqno,
+            block_id,
         );
     }
 
@@ -213,15 +217,6 @@ impl SessionListener for ValidationTestListener {
         _callback: ValidatorBlockCandidateCallback,
     ) {
         // Not used in this test
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
     }
 }
 
@@ -374,7 +369,7 @@ fn run_validation_test() {
         collation_count: collation_count_0.clone(),
         public_key: private_key_0.clone(),
         next_expected_collation_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
-        next_expected_commit_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
+        max_finalized_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
     });
 
     let listener_1 = Arc::new(ValidationTestListener {
@@ -385,7 +380,7 @@ fn run_validation_test() {
         collation_count: collation_count_1.clone(),
         public_key: private_key_1.clone(),
         next_expected_collation_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
-        next_expected_commit_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
+        max_finalized_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
     });
 
     let session_listener_0: Arc<dyn SessionListener + Send + Sync> = listener_0.clone();

@@ -1946,16 +1946,16 @@ impl BroadcastParsed for BroadcastTwostepSimple {
 }
 
 pub(crate) struct BroadcastTwostepSimpleProtocol {
-    big_data: bool,
     extra: Option<Vec<u8>>,
+    reliable: bool,
 }
 
 impl BroadcastTwostepSimpleProtocol {
-    pub(crate) fn for_recv(big_data: bool) -> Self {
-        Self { big_data, extra: None }
+    pub(crate) fn for_recv(reliable: bool) -> Self {
+        Self { reliable, extra: None }
     }
-    pub(crate) fn for_send(big_data: bool, extra: Vec<u8>) -> Self {
-        Self { big_data, extra: Some(extra) }
+    pub(crate) fn for_send(reliable: bool, extra: Vec<u8>) -> Self {
+        Self { reliable, extra: Some(extra) }
     }
     fn calc_to_sign(bcast_id: BroadcastId, data: &[u8]) -> Result<Vec<u8>> {
         let to_sign =
@@ -1992,7 +1992,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
     }
 
     fn send_method(&self) -> BroadcastSendMethod {
-        if self.big_data {
+        if self.reliable {
             BroadcastSendMethod::QuicOrRldp
         } else {
             BroadcastSendMethod::Fast

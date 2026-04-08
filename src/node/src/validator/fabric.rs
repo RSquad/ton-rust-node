@@ -343,7 +343,6 @@ pub async fn run_collate_query(
     let labels = [("shard", shard.to_string())];
     metrics::counter!("ton_node_collator_failures_total", &labels).increment(1);
     let test_bundles_config = &engine.test_bundles_config().collator;
-
     let err_str = if test_bundles_config.is_enable() { err.to_string() } else { String::default() };
 
     #[cfg(feature = "telemetry")]

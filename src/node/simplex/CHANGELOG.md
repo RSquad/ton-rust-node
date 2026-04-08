@@ -2,6 +2,13 @@
 
 All notable changes to the Simplex Consensus Protocol implementation will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Observability: peer-delivered candidate ingress counters
+  (`simplex_candidate_received_broadcast`, `simplex_candidate_received_query`) and a unified
+  `simplex_collation_starts` counter, with derivative `/s` dump support for operator debugging.
+
 ## [0.5.0] - 2026-03-20
 
 ### Added

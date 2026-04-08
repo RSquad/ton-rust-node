@@ -92,7 +92,7 @@ use ton_api::ton::consensus::{
     simplex::{Certificate, Vote},
     CandidateData,
 };
-use ton_block::{error, Error, Result, ShardIdent, UInt256};
+use ton_block::{error, BlockIdExt, Error, Result, ShardIdent, UInt256};
 
 /*
     Constants
@@ -105,6 +105,8 @@ const TASK_QUEUE_LATENCY_WARN_DUMP_PERIOD: Duration = Duration::from_millis(2000
 const SESSION_METRICS_DUMP_PERIOD_MS: u64 = 15000; // period of metrics dump
 const SESSION_PROFILING_DUMP_PERIOD_MS: u64 = 30000; // period of profiling dump
 const SESSION_HEALTH_CHECK_PERIOD_MS: u64 = 20000;
+//LK: for debugging only; need to be removed in future
+const SESSION_MAX_LEADER_WINDOW_DESYNC_MARGIN: u32 = 0;
 const LOG_TARGET_PROFILING: &str = "simplex_profiling"; // log target for profiling
 
 /*
@@ -146,6 +148,12 @@ impl ReceiverListener for ReceiverListenerImpl {
         }));
     }
 
+    fn on_standstill_trigger(&self, notification: crate::receiver::StandstillTriggerNotification) {
+        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
+            processor.on_standstill_trigger(notification);
+        }));
+    }
+
     /// Handle incoming certificate from network
     fn on_certificate(&self, source_idx: u32, certificate: Certificate) {
         self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
@@ -158,6 +166,7 @@ impl ReceiverListener for ReceiverListenerImpl {
         &self,
         slot: crate::block::SlotIndex,
         block_hash: UInt256,
+        want_candidate: bool,
         want_notar: bool,
         response_callback: consensus_common::QueryResponseCallback,
     ) {
@@ -165,6 +174,7 @@ impl ReceiverListener for ReceiverListenerImpl {
             processor.handle_candidate_query_fallback(
                 slot,
                 block_hash,
+                want_candidate,
                 want_notar,
                 response_callback,
             );
@@ -407,11 +417,11 @@ impl ConsensusSession for SessionImpl {
 }
 
 impl SimplexSession for SessionImpl {
-    fn notify_mc_finalized(&self, mc_block_seqno: u32) {
-        // Post closure to main queue for thread-safe update of last_mc_finalized_seqno
-        // in SessionProcessor. This is used for shard empty block decisions.
+    fn notify_mc_finalized(&self, applied_top: BlockIdExt) {
+        // Post closure to the main queue for thread-safe applied-top tracking updates
+        // in SessionProcessor. This drives empty-block policy and MC validation gating.
         self.main_task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.set_mc_finalized_seqno(mc_block_seqno);
+            processor.set_mc_finalized_block(applied_top);
         }));
     }
 
@@ -488,7 +498,7 @@ impl SessionImpl {
         panicked_flag: Arc<AtomicBool>,
         task_queue: TaskQueuePtr,
         callbacks_task_queue: CallbackTaskQueuePtr,
-        options: SessionOptions,
+        mut options: SessionOptions,
         session_id: SessionId,
         shard: ShardIdent,
         ids: Vec<SessionNode>,
@@ -509,6 +519,19 @@ impl SessionImpl {
             session thread creation time is {:.3}ms",
             session_id.to_hex_string(),
             get_elapsed_time(&session_creation_time).as_secs_f64() * 1000.0,
+        );
+
+        // Inflate the future-window bound at session bootstrap so receiver/state ingress
+        // checks tolerate a much larger slot skew during debugging.
+        let original_max_leader_window_desync = options.max_leader_window_desync;
+        options.max_leader_window_desync = options
+            .max_leader_window_desync
+            .saturating_add(SESSION_MAX_LEADER_WINDOW_DESYNC_MARGIN);
+        log::info!(
+            "Session {} bootstrap desync margin: max_leader_window_desync {} -> {}",
+            session_id.to_hex_string(),
+            original_max_leader_window_desync,
+            options.max_leader_window_desync,
         );
 
         // Signal thread start based on wait_for_db_init option:
@@ -587,9 +610,13 @@ impl SessionImpl {
             overlay_manager.clone(),
             receiver_listener,
             options.standstill_timeout,
+            options.standstill_max_egress_bytes_per_s,
+            options.slots_per_leader_window,
+            options.max_leader_window_desync,
             panicked_flag.clone(),
             options.use_quic,
             health_counters.clone(),
+            crate::receiver::CandidateResolveConfig::from_session_options(&options),
         ) {
             Ok(r) => r,
             Err(err) => {
@@ -673,6 +700,8 @@ impl SessionImpl {
             initial_block_seqno
         );
 
+        receiver.start();
+
         // Phase 4a: Create session description (immutable session configuration)
         let description = match SessionDescription::new(
             &options,
@@ -717,10 +746,7 @@ impl SessionImpl {
         // This replays votes, sets finalized boundary, applies local flags,
         // generates skip votes, and restores receiver cache.
         if !is_fresh_start {
-            let recovery_options = SessionStartupRecoveryOptions {
-                restart_recommit_strategy: options.restart_recommit_strategy,
-                initial_block_seqno,
-            };
+            let recovery_options = SessionStartupRecoveryOptions { initial_block_seqno };
 
             let recovery_processor = SessionStartupRecoveryProcessor::new(
                 session_id.clone(),
@@ -816,13 +842,16 @@ impl SessionImpl {
 
                 metrics_dumper.update(processor.get_metrics_receiver());
 
-                if log::log_enabled!(log::Level::Debug) {
+                if log::log_enabled!(log::Level::Info) {
                     let session_id_str = session_id.to_hex_string();
-                    log::debug!("SimplexSession {} metrics:", &session_id_str);
+                    log::info!("SimplexSession {} metrics:", &session_id_str);
 
-                    metrics_dumper.dump(|string| {
-                        log::debug!("{}{}", session_id_str, string);
-                    });
+                    {
+                        check_execution_time!(10_000);
+                        metrics_dumper.dump(|string| {
+                            log::info!("{}{}", session_id_str, string);
+                        });
+                    }
                 }
 
                 next_metrics_dump_time = processor.get_description().get_time()
@@ -989,6 +1018,9 @@ impl SessionImpl {
         metrics_dumper.add_derivative_metric("simplex_collates.total");
         metrics_dumper.add_derivative_metric("simplex_collates.success");
         metrics_dumper.add_derivative_metric("simplex_collates.failure");
+        metrics_dumper.add_derivative_metric("simplex_collation_starts");
+        metrics_dumper.add_derivative_metric("simplex_candidate_received_broadcast");
+        metrics_dumper.add_derivative_metric("simplex_candidate_received_query");
         metrics_dumper.add_derivative_metric("simplex_commits.total");
         metrics_dumper.add_derivative_metric("simplex_commits.success");
         metrics_dumper.add_derivative_metric("simplex_commits.failure");
@@ -1045,9 +1077,11 @@ impl SessionImpl {
         metrics_dumper.add_derivative_metric("simplex_first_non_progressed_slot");
 
         metrics_dumper.add_derivative_metric("simplex_skip_total");
+        metrics_dumper.add_derivative_metric("simplex_votes_in_total");
         metrics_dumper.add_derivative_metric("simplex_votes_in_notarize");
         metrics_dumper.add_derivative_metric("simplex_votes_in_finalize");
         metrics_dumper.add_derivative_metric("simplex_votes_in_skip");
+        metrics_dumper.add_derivative_metric("simplex_votes_out_total");
         metrics_dumper.add_derivative_metric("simplex_votes_out_notarize");
         metrics_dumper.add_derivative_metric("simplex_votes_out_finalize");
         metrics_dumper.add_derivative_metric("simplex_votes_out_skip");
@@ -1058,6 +1092,43 @@ impl SessionImpl {
         metrics_dumper.add_derivative_metric("simplex_validation_reject");
         metrics_dumper.add_derivative_metric("simplex_validation_late_callback");
         metrics_dumper.add_derivative_metric("simplex_health_warnings");
+
+        // Vote-mix ratios for skip/notar/final observability.
+        add_compute_percentage_metric(
+            &mut metrics_dumper,
+            "simplex_votes_in_skip_share",
+            "simplex_votes_in_skip",
+            "simplex_votes_in_total",
+            0.0,
+        );
+        add_compute_percentage_metric(
+            &mut metrics_dumper,
+            "simplex_votes_in_notarize_share",
+            "simplex_votes_in_notarize",
+            "simplex_votes_in_total",
+            0.0,
+        );
+        add_compute_percentage_metric(
+            &mut metrics_dumper,
+            "simplex_votes_in_finalize_share",
+            "simplex_votes_in_finalize",
+            "simplex_votes_in_total",
+            0.0,
+        );
+        add_compute_relative_metric(
+            &mut metrics_dumper,
+            "simplex_votes_in_skip_to_notar_ratio",
+            "simplex_votes_in_skip",
+            "simplex_votes_in_notarize",
+            0.0,
+        );
+        add_compute_relative_metric(
+            &mut metrics_dumper,
+            "simplex_votes_in_skip_to_finalize_ratio",
+            "simplex_votes_in_skip",
+            "simplex_votes_in_finalize",
+            0.0,
+        );
 
         metrics_dumper
     }

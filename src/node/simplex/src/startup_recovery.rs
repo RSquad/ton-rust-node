@@ -27,13 +27,11 @@
 //! │     - vote replay (Phase 6.6 order)                             │
 //! │     - set finalized boundary + apply local flags                │
 //! │     - restore receiver caches                                   │
-//! │     - recommit to ValidatorGroup                                │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Key Components
 //!
-//! - [`RestartRoundAction`]: Action to take for each round during restart replay
 //! - [`SessionStartupRecoveryListener`]: Object-safe trait for recovery operations
 //! - [`SessionStartupRecoveryProcessor`]: Coordinator that loads bootstrap and drives recovery
 //!
@@ -49,9 +47,8 @@ use crate::{
     session_description::SessionDescription,
     simplex_state::Vote,
     utils::extract_vote_and_signature,
-    BlockHash, RawVoteData, RestartRecommitStrategy, SessionId,
+    RawVoteData, SessionId,
 };
-use consensus_common::ValidatorBlockCandidatePtr;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -64,7 +61,7 @@ use ton_api::{
     },
     IntoBoxed,
 };
-use ton_block::{error, fail, BlockIdExt, Result, UInt256};
+use ton_block::{error, BlockIdExt, Result, UInt256};
 
 /*
     Constants
@@ -82,46 +79,6 @@ pub(crate) type CandidateHash = UInt256;
 
 /// Signature bytes (Ed25519 signature)
 pub(crate) type SignatureBytes = Vec<u8>;
-
-/*
-    RestartRoundAction - action for each round during restart replay
-*/
-
-/// Action to take for each round during restart replay to ValidatorGroup.
-///
-/// Built by `SessionStartupRecoveryProcessor::build_restart_recommit_actions()`
-/// based on `RestartRecommitStrategy` and finalized block records from bootstrap.
-#[derive(Debug, Clone)]
-pub(crate) enum RestartRoundAction {
-    /// Replay this finalized record through the commit path.
-    ///
-    /// Non-empty records fetch approved candidate payload and emit
-    /// `on_block_committed`. Empty records are replayed as internal cursor
-    /// progress only (no `on_block_skipped` callbacks in roundless mode).
-    Commit {
-        /// Slot index
-        slot: SlotIndex,
-        /// Block ID with seqno
-        block_id: BlockIdExt,
-        /// Leader validator index
-        leader_idx: ValidatorIndex,
-        /// Root hash for candidate lookup
-        root_hash: BlockHash,
-        /// File hash for candidate lookup
-        file_hash: BlockHash,
-        /// Collated data hash for candidate lookup
-        _collated_data_hash: BlockHash,
-        /// Candidate hash for certificate lookup
-        candidate_hash: CandidateHash,
-        /// Pre-serialized CandidateHashData bytes (for BlockSignaturesVariant::Simplex)
-        candidate_hash_data_bytes: Vec<u8>,
-        /// Whether this finalized record is an empty block.
-        ///
-        /// Empty records are still part of deterministic replay ordering, but
-        /// they do not emit `on_block_committed` callbacks.
-        is_empty: bool,
-    },
-}
 
 /*
     SessionStartupRecoveryListener - object-safe trait for recovery operations
@@ -190,7 +147,7 @@ pub(crate) trait SessionStartupRecoveryListener {
 
     /// Restore kept `BroadcastVote` events to the front of the queue.
     ///
-    /// Called after recommit replay so votes are broadcast on first `check_all()`.
+    /// Called after startup cache restoration so votes are broadcast on first `check_all()`.
     fn recovery_restore_startup_votes(&mut self, votes: Vec<Vote>);
 
     // ========================================================================
@@ -313,9 +270,8 @@ pub(crate) trait SessionStartupRecoveryListener {
     /// Seed notarization certificate into simplex_state.
     ///
     /// Used during restart to populate simplex_state.slot_votes with parsed
-    /// notar certs so that `get_notarize_signatures` can find them during recommit.
-    /// This is separate from `recovery_cache_notarization_cert` which only caches
-    /// raw bytes in receiver for network queries.
+    /// notar certs. This is separate from `recovery_cache_notarization_cert`
+    /// which only caches raw bytes in receiver for network queries.
     fn recovery_seed_notarize_certificate(
         &mut self,
         slot: SlotIndex,
@@ -333,24 +289,6 @@ pub(crate) trait SessionStartupRecoveryListener {
     /// This is intentionally separate from `recovery_restore_startup_votes`: it restores
     /// historical state from DB, whereas startup votes are freshly generated on restart.
     fn recovery_restore_receiver_standstill_cache(&mut self, votes: &[VoteRecord]);
-
-    // ========================================================================
-    // Recommit replay (applies existing notify paths internally)
-    // ========================================================================
-
-    /// Apply restart recommit actions using existing notify paths.
-    ///
-    /// Full replay in roundless mode is commit-path only:
-    /// - non-empty records emit `notify_block_committed()`
-    /// - empty records advance internal replay cursors only
-    ///
-    /// The `get_candidate` closure is used to fetch candidate payloads for
-    /// non-empty records.
-    fn recovery_apply_restart_recommit_actions(
-        &mut self,
-        actions: &[RestartRoundAction],
-        get_candidate: &mut dyn FnMut(&RestartRoundAction) -> Result<ValidatorBlockCandidatePtr>,
-    ) -> Result<()>;
 }
 
 /*
@@ -362,20 +300,16 @@ pub(crate) trait SessionStartupRecoveryListener {
 /// Extracted to simplify testing and reduce coupling.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionStartupRecoveryOptions {
-    /// Strategy for replaying finalized blocks
-    pub restart_recommit_strategy: RestartRecommitStrategy,
-    /// Initial block seqno (for seqno matching during recommit)
+    /// Initial block seqno passed by session start; kept for future policy hooks.
+    #[allow(dead_code)] // Reserved for future restart policies.
     pub initial_block_seqno: u32,
 }
 
 impl SessionStartupRecoveryOptions {
     /// Create from SessionOptions and initial_block_seqno
     #[allow(dead_code)] // Available for future use
-    pub fn new(
-        restart_recommit_strategy: RestartRecommitStrategy,
-        initial_block_seqno: u32,
-    ) -> Self {
-        Self { restart_recommit_strategy, initial_block_seqno }
+    pub fn new(initial_block_seqno: u32) -> Self {
+        Self { initial_block_seqno }
     }
 }
 
@@ -388,7 +322,7 @@ impl SessionStartupRecoveryOptions {
 /// Coordinates the startup recovery stage:
 /// 1. Loads bootstrap from DB (in constructor, cancellable)
 /// 2. Computes recovery identity (self_idx, validator keys)
-/// 3. Builds restore/recommit plans
+/// 3. Builds restore plans
 /// 4. Drives recovery through `SessionStartupRecoveryListener`
 ///
 /// Dropped before entering the main processing loop.
@@ -398,9 +332,6 @@ pub(crate) struct SessionStartupRecoveryProcessor {
 
     /// Session description (for leader key lookup during candidate reconstruction)
     _description: Arc<SessionDescription>,
-
-    /// Recovery options (strategy, initial seqno)
-    options: SessionStartupRecoveryOptions,
 
     /// Self validator index (cached from description)
     self_idx: ValidatorIndex,
@@ -428,7 +359,7 @@ impl SessionStartupRecoveryProcessor {
     pub fn new(
         session_id: SessionId,
         description: Arc<SessionDescription>,
-        options: SessionStartupRecoveryOptions,
+        _options: SessionStartupRecoveryOptions,
         bootstrap: Bootstrap,
     ) -> Self {
         let self_idx = description.get_self_idx();
@@ -447,7 +378,6 @@ impl SessionStartupRecoveryProcessor {
         Self {
             session_id,
             _description: description,
-            options,
             self_idx,
             bootstrap: Some(bootstrap),
             candidate_info_map,
@@ -485,8 +415,7 @@ impl SessionStartupRecoveryProcessor {
     /// 2. Generates restart skip votes
     /// 3. Drains startup events (keeps BroadcastVote only)
     /// 4. Restores receiver caches (notar certs, candidate bytes)
-    /// 5. Builds and applies restart recommit actions
-    /// 6. Restores kept votes
+    /// 5. Restores kept votes
     ///
     /// After this method returns, the processor is consumed and can be dropped.
     ///
@@ -582,12 +511,11 @@ impl SessionStartupRecoveryProcessor {
             kept_votes.len()
         );
 
-        // Step 6: Seed current_round for restart replay
+        // Step 6: Seed current_round compatibility hook.
         //
-        // Startup recommit actions (step 11) replay historical rounds to ValidatorGroup.
-        // To keep round accounting consistent (and avoid double-counting), we start the
-        // replay from round 0 and let step 11 advance `current_round` as it applies
-        // skip/commit actions.
+        // Simplex now restores finalized state directly without historical recommit,
+        // so this remains a compatibility callback for the recovery pipeline. The
+        // slot-based SessionProcessor currently treats it as a no-op.
         log::debug!(
             target: LOG_TARGET,
             "Session {}: step 6/12 - seeding current_round=0 (finalized_blocks={})",
@@ -662,32 +590,23 @@ impl SessionStartupRecoveryProcessor {
         );
         listener.recovery_restore_receiver_standstill_cache(&session_boot.votes);
 
-        // Step 11: Build and apply restart recommit actions
+        // Step 11: Restore kept votes
         log::debug!(
             target: LOG_TARGET,
-            "Session {}: step 11/12 - applying restart recommit actions (strategy={:?})",
-            self.session_id.to_hex_string(),
-            self.options.restart_recommit_strategy
-        );
-        self.apply_restart_recommit(listener, &session_boot.finalized_blocks)?;
-
-        // Step 12: Restore kept votes
-        log::debug!(
-            target: LOG_TARGET,
-            "Session {}: step 12/12 - restoring {} kept votes",
+            "Session {}: step 11/12 - restoring {} kept votes",
             self.session_id.to_hex_string(),
             kept_votes.len()
         );
         listener.recovery_restore_startup_votes(kept_votes);
 
-        // Step 13: Finalize parent chain setup
-        // IMPORTANT: This must happen AFTER step 12 (kept votes restoration) because
+        // Step 12: Finalize parent chain setup
+        // IMPORTANT: This must happen AFTER step 11 (kept votes restoration) because
         // the kept votes may finalize additional slots, advancing first_non_finalized_slot.
         // We need to set available_base for the CURRENT first_non_finalized_slot, not the
         // one from the DB (which was outdated).
         log::debug!(
             target: LOG_TARGET,
-            "Session {}: step 13/13 - finalizing parent chain setup",
+            "Session {}: step 12/12 - finalizing parent chain setup",
             self.session_id.to_hex_string()
         );
         listener.recovery_finalize_parent_chain();
@@ -915,7 +834,7 @@ impl SessionStartupRecoveryProcessor {
     ///
     /// This does two things:
     /// 1. Cache raw bytes in receiver for network queries (`requestCandidate(want_notar=true)`)
-    /// 2. Parse and seed into simplex_state for restart recommit (`get_notarize_signatures`)
+    /// 2. Parse and seed into simplex_state for restored certificate state
     fn restore_notar_cert_cache(
         &self,
         listener: &mut dyn SessionStartupRecoveryListener,
@@ -932,7 +851,7 @@ impl SessionStartupRecoveryProcessor {
                 cert.notar_cert_bytes.to_vec(),
             );
 
-            // 2. Parse and seed into simplex_state for recommit
+            // 2. Parse and seed into simplex_state for restored certificate state
             match crate::certificate::NotarCert::from_tl_bytes_for_candidate(
                 &cert.notar_cert_bytes,
                 cert.candidate_id.slot,
@@ -1258,167 +1177,6 @@ impl SessionStartupRecoveryProcessor {
         }
     }
 
-    /// Build and apply restart recommit actions.
-    fn apply_restart_recommit(
-        &self,
-        listener: &mut dyn SessionStartupRecoveryListener,
-        finalized_blocks: &[FinalizedBlockRecord],
-    ) -> Result<()> {
-        // Build recommit actions based on strategy
-        let actions = self.build_restart_recommit_actions(finalized_blocks)?;
-
-        if actions.is_empty() {
-            log::info!(
-                target: LOG_TARGET,
-                "Session {}: no recommit actions to apply",
-                self.session_id.to_hex_string()
-            );
-            return Ok(());
-        }
-
-        log::info!(
-            target: LOG_TARGET,
-            "Session {}: applying {} recommit actions (strategy={:?})",
-            self.session_id.to_hex_string(),
-            actions.len(),
-            self.options.restart_recommit_strategy
-        );
-
-        // Apply actions through listener.
-        // Non-empty blocks cannot be fetched (no get_approved_candidate delegation in
-        // simplex -- C++ resolves candidates from its own DB, not validator manager).
-        // The get_candidate closure returns an error for non-empty blocks, causing
-        // the replay to skip them gracefully.
-        listener.recovery_apply_restart_recommit_actions(&actions, &mut |action| {
-            let RestartRoundAction::Commit { slot, is_empty, .. } = action;
-            if *is_empty {
-                fail!("fetch called for empty replay action at slot {}", slot.value());
-            }
-
-            Err(error!(
-                "non-empty block candidate fetch not supported in simplex recovery (slot {})",
-                slot.value()
-            ))
-        })?;
-
-        Ok(())
-    }
-
-    /// Build restart recommit actions based on strategy.
-    pub fn build_restart_recommit_actions(
-        &self,
-        finalized_blocks: &[FinalizedBlockRecord],
-    ) -> Result<Vec<RestartRoundAction>> {
-        match self.options.restart_recommit_strategy {
-            RestartRecommitStrategy::FullReplay => self.build_full_replay_actions(finalized_blocks),
-            RestartRecommitStrategy::FirstCommitAfterFinalized => {
-                // C++-like mode: restore state only, no historical replay callbacks.
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    /// Build full replay actions (all finalized blocks in order).
-    fn build_full_replay_actions(
-        &self,
-        finalized_blocks: &[FinalizedBlockRecord],
-    ) -> Result<Vec<RestartRoundAction>> {
-        let mut actions = Vec::with_capacity(finalized_blocks.len());
-        let mut expected_parent: Option<RawCandidateId> = None;
-        let mut last_slot: Option<SlotIndex> = None;
-        let mut last_committed_seqno = self.options.initial_block_seqno.checked_sub(1);
-
-        for block in finalized_blocks {
-            let slot = block.candidate_id.slot;
-            let candidate_hash = block.candidate_id.hash.clone();
-            let block_seqno = block.block_id.seq_no();
-
-            if let Some(prev_slot) = last_slot {
-                if slot.value() <= prev_slot.value() {
-                    fail!(
-                        "full replay requires strict slot monotonicity: prev_slot={}, slot={}",
-                        prev_slot.value(),
-                        slot.value()
-                    );
-                }
-            }
-
-            if block.parent != expected_parent {
-                fail!(
-                    "full replay chain discontinuity at slot {}: expected parent {:?}, actual {:?}",
-                    slot.value(),
-                    expected_parent,
-                    block.parent
-                );
-            }
-
-            // Look up candidate info
-            let candidate_info = self.candidate_info_map.get(&candidate_hash).ok_or_else(|| {
-                error!(
-                    "missing candidate info for replay slot {} hash {}",
-                    slot.value(),
-                    candidate_hash.to_hex_string()
-                )
-            })?;
-            let is_empty =
-                Self::is_empty_block_candidate_hash_data(&candidate_info.candidate_hash_data);
-
-            let expected_seqno = match (is_empty, last_committed_seqno) {
-                (false, Some(prev)) => prev.saturating_add(1),
-                (false, None) => self.options.initial_block_seqno,
-                (true, Some(prev)) => prev,
-                (true, None) => {
-                    fail!("full replay cannot start from empty block at slot {}", slot.value());
-                }
-            };
-
-            if block_seqno != expected_seqno {
-                fail!(
-                    "full replay seqno mismatch at slot {}: expected {}, actual {}, is_empty={}",
-                    slot.value(),
-                    expected_seqno,
-                    block_seqno,
-                    is_empty
-                );
-            }
-
-            // Extract block_id and collated_data_hash from CandidateHashData
-            let (root_hash, file_hash, collated_data_hash) =
-                Self::extract_hashes_from_candidate_hash_data(&candidate_info.candidate_hash_data)
-                    .ok_or_else(|| {
-                        error!(
-                            "failed to extract hashes from candidate hash data for replay slot {}",
-                            slot.value()
-                        )
-                    })?;
-
-            // Serialize CandidateHashData to bytes
-            let candidate_hash_data_bytes =
-                Self::serialize_candidate_hash_data(&candidate_info.candidate_hash_data);
-
-            // Build commit action
-            actions.push(RestartRoundAction::Commit {
-                slot,
-                block_id: block.block_id.clone(),
-                leader_idx: ValidatorIndex(candidate_info.leader_idx),
-                root_hash,
-                file_hash,
-                _collated_data_hash: collated_data_hash,
-                candidate_hash,
-                candidate_hash_data_bytes,
-                is_empty,
-            });
-
-            if !is_empty {
-                last_committed_seqno = Some(block_seqno);
-            }
-            last_slot = Some(slot);
-            expected_parent = Some(block.candidate_id.clone());
-        }
-
-        Ok(actions)
-    }
-
     /// Deserialize a vote record into (Vote, SignatureBytes).
     fn deserialize_vote_record(vote_record: &VoteRecord) -> Option<(Vote, SignatureBytes)> {
         let msg = match deserialize_boxed(vote_record.data.as_slice()) {
@@ -1449,32 +1207,5 @@ impl SessionStartupRecoveryProcessor {
                 None
             }
         }
-    }
-
-    /// Extract root_hash, file_hash, and collated_data_hash from CandidateHashData.
-    fn extract_hashes_from_candidate_hash_data(
-        data: &CandidateHashData,
-    ) -> Option<(BlockHash, BlockHash, BlockHash)> {
-        match data {
-            CandidateHashData::Consensus_CandidateHashDataOrdinary(ordinary) => {
-                let root_hash = UInt256::from_slice(ordinary.block.root_hash.as_slice());
-                let file_hash = UInt256::from_slice(ordinary.block.file_hash.as_slice());
-                let collated_data_hash =
-                    UInt256::from_slice(ordinary.collated_file_hash.as_slice());
-                Some((root_hash, file_hash, collated_data_hash))
-            }
-            CandidateHashData::Consensus_CandidateHashDataEmpty(empty) => {
-                // Empty blocks don't have collated_data_hash
-                let root_hash = UInt256::from_slice(empty.block.root_hash.as_slice());
-                let file_hash = UInt256::from_slice(empty.block.file_hash.as_slice());
-                let collated_data_hash = UInt256::default();
-                Some((root_hash, file_hash, collated_data_hash))
-            }
-        }
-    }
-
-    /// Serialize CandidateHashData to TL bytes.
-    fn serialize_candidate_hash_data(data: &CandidateHashData) -> Vec<u8> {
-        serialize_boxed(data).map(|v| v.into()).unwrap_or_default()
     }
 }

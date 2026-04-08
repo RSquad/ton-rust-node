@@ -237,9 +237,12 @@ fn test_merge_candidate_response_parts_body_then_notar_completes_merge() {
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
         source_idx: ValidatorIndex::new(0),
         cached_notar: None,
         cached_candidate: None,
+        giveup_reports: 0,
     };
 
     // First partial response: candidate body only -> notar remains missing.
@@ -288,9 +291,12 @@ fn test_merge_candidate_response_parts_uses_locally_cached_notar() {
         start_time: SystemTime::now(),
         retry_count: 0,
         current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
         source_idx: ValidatorIndex::new(1),
         cached_notar: None,
         cached_candidate: None,
+        giveup_reports: 0,
     };
 
     // No notar in this response, but resolver cache already has one.
@@ -307,4 +313,65 @@ fn test_merge_candidate_response_parts_uses_locally_cached_notar() {
         merged_notar, cached_notar,
         "candidate-only response should complete when notar already exists in local cache"
     );
+}
+
+#[test]
+fn test_merge_candidate_response_parts_notar_then_body_completes_merge() {
+    let slot = SlotIndex::new(99);
+    let block_hash = UInt256::rand();
+    let candidate_bytes = vec![5, 4, 3, 2, 1];
+    let notar_bytes = vec![9, 9, 9];
+
+    let mut cache = super::CandidateResolverCache::new();
+    let mut state = super::CandidateRequestState {
+        start_time: SystemTime::now(),
+        retry_count: 0,
+        current_timeout: Duration::from_millis(500),
+        attempt_id: 0,
+        in_flight: false,
+        source_idx: ValidatorIndex::new(1),
+        cached_notar: None,
+        cached_candidate: None,
+        giveup_reports: 0,
+    };
+
+    // First partial response: notar only.
+    let (merged_candidate_1, merged_notar_1) = super::ReceiverImpl::merge_candidate_response_parts(
+        &mut cache,
+        Some(&mut state),
+        slot,
+        &block_hash,
+        &[],
+        &notar_bytes,
+    );
+    assert!(
+        merged_candidate_1.is_empty(),
+        "notar-only partial response must not be considered complete"
+    );
+    assert_eq!(merged_notar_1, notar_bytes);
+
+    // Second partial response: candidate only, merged result should include cached notar.
+    let (merged_candidate_2, merged_notar_2) = super::ReceiverImpl::merge_candidate_response_parts(
+        &mut cache,
+        Some(&mut state),
+        slot,
+        &block_hash,
+        &candidate_bytes,
+        &[],
+    );
+    assert_eq!(merged_candidate_2, candidate_bytes);
+    assert_eq!(merged_notar_2, notar_bytes);
+}
+
+#[test]
+fn test_sliding_window_rate_limiter_enforces_window_limit() {
+    let mut limiter = super::SlidingWindowRateLimiter::default();
+    let window = Duration::from_secs(1);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+    assert!(limiter.allow(now, window, 2));
+    assert!(limiter.allow(now, window, 2));
+    assert!(!limiter.allow(now, window, 2));
+    assert!(limiter.allow(now + Duration::from_millis(1_001), window, 2));
+    assert!(!limiter.allow(now + Duration::from_millis(1_001), window, 0));
 }

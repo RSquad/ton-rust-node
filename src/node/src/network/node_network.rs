@@ -87,11 +87,11 @@ struct ValidatorContext {
 /// Select the local node's entry from the validator list by local-key order.
 ///
 /// Returns `(Some(node), adnl_missing)` where `adnl_missing` is true when the matched
-/// validator's ADNL ID is not among the locally known ADNL keys. This mirrors the C++
+/// validator's ADNL identity cannot be resolved from locally known ADNL keys, including
+/// C++-parity fallback to validator pubkey short ID. This mirrors the C++
 /// `get_validator()` function (`manager.cpp`) which iterates `temp_keys_` and returns the
 /// first local key that belongs to the validator set. C++ does not consider ADNL readiness
-/// at this layer; the `adnl_missing` flag is a Rust-specific diagnostic for the
-/// network-readiness model.
+/// at this layer; the `adnl_missing` flag is a Rust-side diagnostic only.
 fn select_local_validator_candidate<'a>(
     validators: &'a [CatchainNode],
     validator_key_ids: &[Arc<KeyId>],
@@ -99,7 +99,8 @@ fn select_local_validator_candidate<'a>(
 ) -> (Option<&'a CatchainNode>, bool) {
     for key_id in validator_key_ids {
         if let Some(local_validator) = validators.iter().find(|val| val.public_key.id() == key_id) {
-            let adnl_missing = !validator_adnl_key_ids.contains(&local_validator.adnl_id);
+            let adnl_missing = !validator_adnl_key_ids.contains(&local_validator.adnl_id)
+                && !validator_adnl_key_ids.contains(local_validator.public_key.id());
             return (Some(local_validator), adnl_missing);
         }
     }
@@ -116,12 +117,20 @@ fn collect_local_validator_candidates<'a>(
         .collect()
 }
 
+fn local_validator_adnl_candidates(local_validator: &CatchainNode) -> Vec<Arc<KeyId>> {
+    let mut ids = vec![local_validator.adnl_id.clone()];
+    let fallback = local_validator.public_key.id().clone();
+    if fallback != local_validator.adnl_id.clone() {
+        ids.push(fallback);
+    }
+    ids
+}
+
 declare_counted!(
     struct ValidatorSetContext {
         validator_peers: Vec<Arc<KeyId>>,
         validator_key: Arc<dyn KeyOption>,
         validator_adnl_key: Arc<dyn KeyOption>,
-        election_id: usize,
     }
 );
 
@@ -440,7 +449,7 @@ impl NodeNetwork {
                             callback(val.adnl_id.clone());
                         }
                         None => {
-                            overlay.add_private_peers(
+                            overlay.add_private_peers_to_adnl(
                                 &local_adnl_id,
                                 vec![(adnl_addr, quic_addr, key)],
                             )?;
@@ -553,6 +562,72 @@ impl NodeNetwork {
         );
         Ok(true)
     }
+
+    async fn resolve_validator_adnl_key(
+        &self,
+        validator_list_id: UInt256,
+        local_validator: &CatchainNode,
+        election_id: i32,
+    ) -> Option<Arc<dyn KeyOption>> {
+        let candidate_ids = local_validator_adnl_candidates(local_validator);
+
+        for candidate_id in &candidate_ids {
+            if let Ok(adnl_key) = self.network_context.stack.adnl.key_by_id(candidate_id) {
+                if candidate_id.as_ref() != local_validator.adnl_id.as_ref() {
+                    log::warn!(
+                        target: "validator_manager",
+                        "set_validator_list {:x}: using validator-pubkey ADNL fallback {} \
+                         instead of descriptor ADNL {}",
+                        validator_list_id,
+                        candidate_id,
+                        local_validator.adnl_id.as_ref()
+                    );
+                }
+                return Some(adnl_key);
+            }
+        }
+
+        for candidate_id in &candidate_ids {
+            if let Err(e) =
+                self.load_and_store_validator_adnl_key(candidate_id.clone(), election_id).await
+            {
+                log::warn!(
+                    target: "validator_manager",
+                    "set_validator_list {:x}: cannot load/store ADNL key {} (election_id={}): {}",
+                    validator_list_id,
+                    candidate_id,
+                    election_id,
+                    e
+                );
+                continue;
+            }
+
+            if let Ok(adnl_key) = self.network_context.stack.adnl.key_by_id(candidate_id) {
+                if candidate_id.as_ref() != local_validator.adnl_id.as_ref() {
+                    log::warn!(
+                        target: "validator_manager",
+                        "set_validator_list {:x}: loaded validator-pubkey ADNL fallback {} \
+                         instead of descriptor ADNL {}",
+                        validator_list_id,
+                        candidate_id,
+                        local_validator.adnl_id.as_ref()
+                    );
+                }
+                return Some(adnl_key);
+            }
+        }
+
+        log::warn!(
+            target: "validator_manager",
+            "set_validator_list {:x}: validator pubkey {} matched but no ADNL key is available \
+             yet (descriptor_adnl={}, pubkey_fallback={}); continuing with membership only",
+            validator_list_id,
+            hex::encode(local_validator.public_key.id().data()),
+            local_validator.adnl_id.as_ref(),
+            local_validator.public_key.id().as_ref(),
+        );
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -565,8 +640,11 @@ impl PrivateOverlayOperations for NodeNetwork {
     /// 3. Fetch peer addresses via DHT; queue missing peers for background resolution
     /// 4. Create the `ValidatorSetContext` and register overlay peers
     ///
-    /// Returns `Selected { network_ready: false }` when the pubkey matches but ADNL setup
-    /// fails -- the caller should retry next round without treating this as non-membership.
+    /// Returns `Selected` whenever pubkey membership is confirmed.
+    ///
+    /// ADNL/network setup is best-effort: if ADNL key/context cannot be prepared yet,
+    /// the function logs warnings and returns membership-only `Selected` so validator
+    /// lifecycle decisions are not blocked by transport readiness.
     async fn set_validator_list(
         &self,
         validator_list_id: UInt256,
@@ -631,76 +709,22 @@ impl PrivateOverlayOperations for NodeNetwork {
             log::warn!(
                 target: "validator_manager",
                 "set_validator_list {:x}: public key {} matches local key but ADNL id {} \
-                 is not in actual ADNL key set ({} keys). Possible config/key-binding issue.",
+                 is not in actual ADNL key set ({} keys). Will also try C++-style \
+                 pubkey-derived ADNL fallback.",
                 validator_list_id,
                 hex::encode(local_validator.public_key.id().data()),
                 hex::encode(local_validator.adnl_id.data()),
                 validator_adnl_key_ids.len()
             );
         }
-        let local_validator_adnl_key = match self
-            .network_context
-            .stack
-            .adnl
-            .key_by_id(&local_validator.adnl_id)
-        {
-            Ok(adnl_key) => adnl_key,
-            Err(e) => {
-                log::warn!("error load adnl validator key (first attempt): {e}");
-                match self
-                    .load_and_store_validator_adnl_key(local_validator.adnl_id.clone(), election_id)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) if pubkey_matched_but_adnl_missing => {
-                        log::warn!(
-                            target: "validator_manager",
-                            "set_validator_list {:x}: ADNL key {} not available yet \
-                             (pubkey matched, network not ready; will retry next round)",
-                            validator_list_id, local_validator.adnl_id,
-                        );
-                        return Ok(ValidatorListOutcome::Selected {
-                            key: local_validator_key.clone(),
-                            matching_keys: matching_local_keys.clone(),
-                            network_ready: false,
-                        });
-                    }
-                    Ok(false) => {
-                        fail!("can't load and store adnl key (id: {})", &local_validator.adnl_id);
-                    }
-                    Err(e) if pubkey_matched_but_adnl_missing => {
-                        log::warn!(
-                            target: "validator_manager",
-                            "set_validator_list {:x}: ADNL key {} load failed for matched \
-                             validator pubkey (network pending, will retry): {e}",
-                            validator_list_id, local_validator.adnl_id,
-                        );
-                        return Ok(ValidatorListOutcome::Selected {
-                            key: local_validator_key.clone(),
-                            matching_keys: matching_local_keys.clone(),
-                            network_ready: false,
-                        });
-                    }
-                    Err(e) => return Err(e),
-                }
-                match self.network_context.stack.adnl.key_by_id(&local_validator.adnl_id) {
-                    Ok(key) => key,
-                    Err(e) if pubkey_matched_but_adnl_missing => {
-                        log::warn!(
-                            target: "validator_manager",
-                            "set_validator_list {:x}: ADNL key {} still not loadable \
-                             after store (pubkey matched, network pending): {e}",
-                            validator_list_id, local_validator.adnl_id,
-                        );
-                        return Ok(ValidatorListOutcome::Selected {
-                            key: local_validator_key.clone(),
-                            matching_keys: matching_local_keys.clone(),
-                            network_ready: false,
-                        });
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        let local_validator_adnl_key = self
+            .resolve_validator_adnl_key(validator_list_id.clone(), &local_validator, election_id)
+            .await;
+        let Some(local_validator_adnl_key) = local_validator_adnl_key else {
+            return Ok(ValidatorListOutcome::Selected {
+                key: local_validator_key.clone(),
+                matching_keys: matching_local_keys,
+            });
         };
 
         let mut peers = Vec::new();
@@ -731,7 +755,7 @@ impl PrivateOverlayOperations for NodeNetwork {
         self.network_context
             .stack
             .overlay
-            .add_private_peers(local_validator_adnl_key.id(), peers)?;
+            .add_private_peers_to_adnl(local_validator_adnl_key.id(), peers)?;
 
         let context = self.try_add_counted_object(
             &self.validator_context.sets_contexts,
@@ -741,7 +765,6 @@ impl PrivateOverlayOperations for NodeNetwork {
                     validator_peers: peers_ids.clone(),
                     validator_key: local_validator_key.clone(),
                     validator_adnl_key: local_validator_adnl_key.clone(),
-                    election_id: election_id as usize,
                     counter: self.network_context.engine_allocated.validator_sets.clone().into(),
                 };
                 #[cfg(feature = "telemetry")]
@@ -812,8 +835,11 @@ impl PrivateOverlayOperations for NodeNetwork {
         Ok(ValidatorListOutcome::Selected {
             key: context.validator_key.clone(),
             matching_keys: matching_local_keys,
-            network_ready: true,
         })
+    }
+
+    fn has_validator_list_context(&self, validator_list_id: &UInt256) -> bool {
+        self.validator_context.sets_contexts.get(validator_list_id).is_some()
     }
 
     fn activate_validator_list(&self, validator_list_id: UInt256) -> Result<()> {
@@ -873,10 +899,25 @@ impl PrivateOverlayOperations for NodeNetwork {
     ) -> Result<Arc<dyn CatchainOverlay + Send>> {
         let validator_set_context =
             self.validator_context.sets_contexts.get(&validator_list_id).ok_or_else(|| {
-                error!("bad validator_list_id ({})!", validator_list_id.to_hex_string())
+                error!(
+                    "validator list context is not ready ({})",
+                    validator_list_id.to_hex_string()
+                )
             })?;
-        let adnl_key =
-            self.network_context.stack.adnl.key_by_tag(validator_set_context.val().election_id)?;
+        let adnl_key = self
+            .network_context
+            .stack
+            .adnl
+            .key_by_id(validator_set_context.val().validator_adnl_key.id())
+            .map_err(|e| {
+                error!(
+                    "validator list context exists but ADNL key is not loaded \
+                     ({}, key={}): {}",
+                    validator_list_id.to_hex_string(),
+                    validator_set_context.val().validator_adnl_key.id(),
+                    e
+                )
+            })?;
 
         if USE_CATCHAIN_ADNL_OVERLAY {
             let overlay = self.network_context.catchain_overlay_manager.start_overlay(
@@ -957,14 +998,43 @@ impl NodeConfigSubscriber for NodeNetwork {
         match sender {
             ConfigEvent::AddValidatorAdnlKey(validator_adnl_key_id, election_id) => {
                 self.load_and_store_validator_adnl_key(validator_adnl_key_id, election_id).await
-            } // Unused
-              // ConfigEvent::RemoveValidatorAdnlKey(validator_adnl_key_id, election_id) => {
-              //     log::info!("config event (RemoveValidatorAdnlKey) id: {}.", &validator_adnl_key_id);
-              //     self.network_context.adnl.delete_key(&validator_adnl_key_id, election_id as usize)?;
-              //     let status = self.validator_context.actual_local_adnl_keys.remove(&validator_adnl_key_id).is_some();
-              //     log::info!("config event (RemoveValidatorAdnlKey) id: {} finished({}).", &validator_adnl_key_id, &status);
-              //     return Ok(status);
-              // }
+            }
+            ConfigEvent::RemoveValidatorAdnlKey(validator_adnl_key_id, election_id) => {
+                log::info!(
+                    "config event (RemoveValidatorAdnlKey) id: {} election: {}",
+                    &validator_adnl_key_id,
+                    election_id
+                );
+                // Remove from ADNL peer table and key config
+                self.network_context
+                    .stack
+                    .adnl
+                    .delete_key(&validator_adnl_key_id, election_id as usize)?;
+                // Remove from QUIC server cert resolver
+                if let Some(quic) = &self.network_context.stack.quic {
+                    let adnl_ip = self.network_context.stack.adnl.ip_address_adnl();
+                    let quic_port = if let Some(addr) = self.network_context.quic_address {
+                        addr.port()
+                    } else {
+                        adnl_ip.port().saturating_add(adnl::QuicNode::OFFSET_PORT)
+                    };
+                    let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_port);
+                    if let Err(e) = quic.remove_key(&validator_adnl_key_id, bind_addr) {
+                        log::warn!(
+                            "Cannot remove validator ADNL key {} from QUIC: {e}",
+                            validator_adnl_key_id
+                        );
+                    }
+                }
+                // Remove from adnl_key_ids — this causes periodic_store_ip_addr
+                // to exit its loop, stopping DHT announcements for this key.
+                let removed = self.validator_context.adnl_key_ids.remove(&election_id).is_some();
+                log::info!(
+                    "config event (RemoveValidatorAdnlKey) id: {} finished (removed={removed})",
+                    &validator_adnl_key_id
+                );
+                Ok(removed)
+            }
         }
     }
 }

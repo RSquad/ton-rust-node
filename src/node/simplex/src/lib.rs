@@ -92,7 +92,8 @@
 //! Implements callbacks via [`SessionListener`] trait (from validator-session):
 //! - `on_candidate` - Validate incoming block candidate
 //! - `on_generate_slot` - Generate new block when leader
-//! - `on_block_committed` - Block finalized in consensus
+//! - `on_block_finalized` - Finalized block delivered to validator side
+//! - `on_block_committed` - legacy sequential callback; not used by Simplex
 //! - `on_block_skipped` - Slot was skipped
 //!
 //! ## Type Relationships
@@ -111,7 +112,7 @@
 //! SessionListener (trait, implemented by caller)
 //!     ├── on_candidate()
 //!     ├── on_generate_slot()
-//!     ├── on_block_committed()
+//!     ├── on_block_finalized()
 //!     └── on_block_skipped()
 //!
 //! Receiver (trait) ──sends──► Votes, BlockBroadcasts
@@ -220,7 +221,7 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-use ton_block::{fail, Result, ShardIdent};
+use ton_block::{fail, BlockIdExt, Result, ShardIdent};
 
 /*
     Shared Raw Vote Data (memory-efficient storage)
@@ -314,7 +315,7 @@ pub mod ton {
 /// Sentinel value indicating Simplex roundless mode.
 ///
 /// When Simplex uses this value for the `round` field in callbacks (`on_candidate`,
-/// `on_generate_slot`, `on_block_committed`), it signals to `ValidatorGroup` that
+/// `on_generate_slot`, `on_block_finalized`), it signals to `ValidatorGroup` that
 /// round-based invariants should be bypassed.
 ///
 /// # Rationale
@@ -349,40 +350,6 @@ pub type SessionListenerPtr = Weak<dyn SessionListener + Send + Sync>;
 
 /// Log replay listener pointer
 pub type SessionReplayListenerPtr = consensus_common::ConsensusReplayListenerPtr;
-
-/*
-    RestartRecommitStrategy for session restart behavior
-*/
-
-/// Strategy for replaying finalized blocks to ValidatorGroup on restart.
-///
-/// After session restart, the consensus state is restored from the database.
-/// This strategy controls how persisted finalized history is replayed in
-/// roundless mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RestartRecommitStrategy {
-    /// Replay the full persisted finalized chain in deterministic order.
-    ///
-    /// Replay uses commit-path semantics only:
-    /// - non-empty finalized records emit `on_block_committed`
-    /// - empty finalized records are replayed internally without
-    ///   `on_block_skipped` callbacks
-    ///
-    /// The replay source must be consistent (parent-chain continuity and seqno
-    /// invariants); inconsistencies fail startup recovery.
-    #[default]
-    FullReplay,
-
-    /// Do not replay historical finalized records (C++-like behavior).
-    ///
-    /// Only restore receiver caches and resume from first new block.
-    /// The first `on_block_committed` after restart will be for a newly
-    /// produced block, not a historical one.
-    ///
-    /// **Caution**: This assumes engine state is already consistent with
-    /// consensus progress. Use only when that invariant is guaranteed.
-    FirstCommitAfterFinalized,
-}
 
 /*
     SessionOptions for Simplex consensus
@@ -460,16 +427,6 @@ pub struct SessionOptions {
     /// Default: false (non-blocking)
     pub wait_for_db_init: bool,
 
-    /// Strategy for replaying finalized blocks to ValidatorGroup on restart.
-    ///
-    /// Controls how the session handles the gap between restored consensus state
-    /// (from DB) and ValidatorGroup's `expected_current_round` (starts at 0).
-    ///
-    /// See [`RestartRecommitStrategy`] for available options.
-    ///
-    /// Default: `FullReplay`
-    pub restart_recommit_strategy: RestartRecommitStrategy,
-
     /// Use QUIC overlay transport instead of ADNL UDP for this session.
     /// When true, overlay messages/queries are sent via QUIC streams.
     /// Default: false
@@ -507,12 +464,12 @@ pub struct SessionOptions {
     pub candidate_resolve_timeout_cap: Duration,
     pub candidate_resolve_cooldown: Duration,
 
-    // TODO: wire into standstill recovery egress shaping. C++ pool.cpp uses this to
-    //   rate-limit bytes/s during standstill_resolution_task.
+    // Wired into Receiver standstill replay token-bucket shaping.
+    // C++ parity: pool.cpp standstill_resolution_task byte budget.
     pub standstill_max_egress_bytes_per_s: u32,
 
-    // TODO: wire into slot/vote acceptance bounds. C++ consensus.cpp and pool.cpp use this
-    //   to reject candidates/votes from too-far-future windows.
+    // Wired into slot/vote acceptance bounds in SimplexState + Receiver.
+    // C++ parity: consensus.cpp/pool.cpp future-window rejection.
     pub max_leader_window_desync: u32,
 
     // TODO: wire into peer ban logic. C++ pool.cpp bans peers with bad vote/cert signatures
@@ -522,6 +479,17 @@ pub struct SessionOptions {
     // TODO: wire into candidate resolver rate limiting. C++ candidate-resolver.cpp uses a
     //   1-second sliding window with this limit per peer for requestCandidate.
     pub candidate_resolve_rate_limit: u32,
+
+    /// When true, collation for non-first slots in a leader window waits until
+    /// the parent slot is notarized (or finalized) before producing the next
+    /// candidate. This avoids broadcasting blocks that validators cannot yet
+    /// accept because C++ `WaitForParent` defers until the parent is notarized.
+    ///
+    /// When false, in-window candidate chaining uses the locally generated
+    /// parent immediately (optimistic pipelining).
+    ///
+    /// Default: true
+    pub require_notarized_parent_for_collation: bool,
 }
 
 impl Default for SessionOptions {
@@ -543,7 +511,6 @@ impl Default for SessionOptions {
             standstill_timeout: Duration::from_secs(10),
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
-            restart_recommit_strategy: RestartRecommitStrategy::default(),
             use_quic: false,
             health_alert_cooldown: Duration::from_secs(30),
             health_stall_warning_secs: 15,
@@ -560,6 +527,7 @@ impl Default for SessionOptions {
             max_leader_window_desync: 250,
             bad_signature_ban_duration: Duration::from_secs(5),
             candidate_resolve_rate_limit: 10,
+            require_notarized_parent_for_collation: true,
         }
     }
 }
@@ -691,43 +659,38 @@ impl SessionOptions {
 ///
 /// # MC Finalization Notification
 ///
-/// For **shard chains**, empty block generation depends on masterchain
-/// finalization status. When `last_mc_finalized_seqno + 8 < new_seqno`,
-/// the session generates empty blocks instead of normal blocks.
+/// For **shard chains**, empty block generation depends on the masterchain-applied
+/// top for that shard. When `last_mc_finalized_seqno + 8 < new_seqno`, the session
+/// generates empty blocks instead of normal blocks.
 ///
 /// The higher layer (ValidatorManager) should call `notify_mc_finalized()`
-/// when masterchain blocks are finalized to enable this functionality.
+/// when masterchain state is updated, passing the current applied top for
+/// each simplex session shard.
 ///
 /// # Example
 ///
 /// ```ignore
-/// // When MC block is finalized, notify shard sessions
-/// if !shard.is_masterchain() {
-///     simplex_session.notify_mc_finalized(mc_block_seqno);
-/// }
+/// // When MC state is updated, notify simplex sessions with their applied top.
+/// simplex_session.notify_mc_finalized(applied_top_for_session_shard);
 /// ```
 pub trait SimplexSession: ConsensusSession {
-    /// Notify session about masterchain finalization
+    /// Notify session about the current applied top for its shard
     ///
     /// # Purpose
     ///
-    /// For shard sessions, this updates `last_mc_finalized_seqno` which is used by
-    /// `should_generate_empty_block()` to decide if an empty block should be generated.
+    /// This updates session-local applied-top tracking:
+    /// - shard sessions use it for empty-block recovery against MC-registered tops
+    /// - masterchain sessions use it to mirror the applied MC head for validation/empty logic
     ///
     /// # When to Call
     ///
-    /// When a masterchain block is finalized, ValidatorManager should call this for all
-    /// shard validator sessions with the MC block's seqno.
-    ///
-    /// # For Masterchain Sessions
-    ///
-    /// This method is a no-op for masterchain sessions (they track their own finalization
-    /// internally via `last_committed_seqno`).
+    /// When masterchain state is updated, ValidatorManager should call this for all
+    /// simplex validator sessions with the current applied top for that session shard.
     ///
     /// # Arguments
     ///
-    /// * `mc_block_seqno` - The seqno of the finalized masterchain block
-    fn notify_mc_finalized(&self, mc_block_seqno: u32);
+    /// * `applied_top` - Current applied top for this session shard
+    fn notify_mc_finalized(&self, applied_top: BlockIdExt);
 
     /// Check if the session has fully stopped (all threads have terminated).
     ///
