@@ -11,12 +11,16 @@
 use super::*;
 use crate::validator::{log_parser::LogParser, validator_utils::GeneralSessionInfo};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::{self, BufRead},
     sync::Arc,
     time::Duration,
 };
-use ton_block::{signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption};
+use ton_block::{
+    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, FutureSplitMerge,
+    McStateExtra, ShardDescr, ShardIdent,
+};
 
 fn parse_shard_ident(parser: &LogParser, name: &str) -> ShardIdent {
     ShardIdent::with_tagged_prefix(
@@ -328,8 +332,8 @@ fn test_validator_list_status_get_local_key_for_list() {
     let list_curr = UInt256::from_slice(&[1u8; 32]);
     let list_next = UInt256::from_slice(&[2u8; 32]);
 
-    status.add_list(list_curr.clone(), vec![key_a.clone()], true);
-    status.add_list(list_next.clone(), vec![key_b.clone()], true);
+    status.add_list(list_curr.clone(), vec![key_a.clone()]);
+    status.add_list(list_next.clone(), vec![key_b.clone()]);
     status.curr = Some(list_curr.clone());
     status.next = Some(list_next.clone());
 
@@ -355,7 +359,7 @@ fn test_validator_list_status_get_local_key_curr_none() {
     let key = make_test_key();
     let list_next = UInt256::from_slice(&[2u8; 32]);
 
-    status.add_list(list_next.clone(), vec![key.clone()], true);
+    status.add_list(list_next.clone(), vec![key.clone()]);
     status.next = Some(list_next.clone());
     // curr is None
 
@@ -375,8 +379,8 @@ fn test_validator_list_status_actual_or_coming() {
     let list_next = UInt256::from_slice(&[2u8; 32]);
     let list_old = UInt256::from_slice(&[3u8; 32]);
 
-    status.add_list(list_curr.clone(), vec![key.clone()], true);
-    status.add_list(list_next.clone(), vec![key.clone()], true);
+    status.add_list(list_curr.clone(), vec![key.clone()]);
+    status.add_list(list_next.clone(), vec![key.clone()]);
     status.curr = Some(list_curr.clone());
     status.next = Some(list_next.clone());
 
@@ -386,56 +390,155 @@ fn test_validator_list_status_actual_or_coming() {
 }
 
 #[test]
-fn test_validator_list_status_network_readiness() {
+fn test_validator_list_status_add_list_replaces_existing_entry() {
     let mut status = ValidatorListStatus::default();
-    let key = make_test_key();
+    let key_a = make_test_key();
+    let key_b = make_test_key();
     let list_id = UInt256::from_slice(&[9u8; 32]);
 
-    status.add_list(list_id.clone(), vec![key.clone()], false);
-    assert!(!status.is_list_network_ready(&list_id));
-    assert_eq!(status.get_local_keys_for_list(&list_id).unwrap()[0].id(), key.id());
+    status.add_list(list_id.clone(), vec![key_a.clone()]);
+    assert_eq!(status.get_local_keys_for_list(&list_id).unwrap()[0].id(), key_a.id());
 
-    status.add_list(list_id.clone(), vec![key], true);
-    assert!(status.is_list_network_ready(&list_id));
+    status.add_list(list_id.clone(), vec![key_b.clone()]);
+    assert_eq!(status.get_local_keys_for_list(&list_id).unwrap()[0].id(), key_b.id());
 }
 
 #[test]
-fn test_validator_list_status_ready_current_list_requires_network_readiness() {
-    let mut status = ValidatorListStatus::default();
-    let key = make_test_key();
-    let list_id = UInt256::from_slice(&[7u8; 32]);
-
-    status.add_list(list_id.clone(), vec![key.clone()], false);
-    status.curr = Some(list_id.clone());
-    assert!(status.get_ready_current_list().is_none());
-
-    status.add_list(list_id.clone(), vec![key], true);
-    assert_eq!(status.get_ready_current_list(), Some(&list_id));
-}
-
-#[test]
-fn test_validator_list_status_ready_current_list_ignores_next_only_membership() {
-    let mut status = ValidatorListStatus::default();
-    let key = make_test_key();
-    let next_list = UInt256::from_slice(&[8u8; 32]);
-
-    status.add_list(next_list.clone(), vec![key], true);
-    status.next = Some(next_list);
-
-    assert!(status.get_ready_current_list().is_none());
-}
-
-#[test]
-fn test_validator_list_status_next_only_ready_list_remains_usable_for_future_sessions() {
+fn test_validator_list_status_next_only_membership_remains_usable_for_future_sessions() {
     let mut status = ValidatorListStatus::default();
     let key = make_test_key();
     let next_list = UInt256::from_slice(&[10u8; 32]);
+    let validators = vec![make_validator_descr_from_key(&key)];
 
-    status.add_list(next_list.clone(), vec![key], true);
+    status.add_list(next_list.clone(), vec![key.clone()]);
     status.next = Some(next_list.clone());
 
-    assert!(status.get_ready_current_list().is_none());
-    assert!(status.is_list_network_ready(&next_list));
+    let selected =
+        find_local_validator_key(&validators, status.get_local_keys_for_list(&next_list))
+            .expect("next-list pubkey membership should stay usable for future sessions");
+    assert_eq!(selected.id(), key.id());
+}
+
+#[test]
+fn test_curr_membership_remains_usable_without_context_gate() {
+    let mut status = ValidatorListStatus::default();
+    let key = make_test_key();
+    let curr_list = UInt256::from_slice(&[11u8; 32]);
+    let validators = vec![make_validator_descr_from_key(&key)];
+
+    status.add_list(curr_list.clone(), vec![key.clone()]);
+    status.curr = Some(curr_list);
+
+    let selected = find_local_validator_key(&validators, status.get_local_keys())
+        .expect("curr-list pubkey membership should stay usable without context gate");
+    assert_eq!(selected.id(), key.id());
+}
+
+#[test]
+fn test_next_membership_remains_usable_without_context_gate() {
+    let mut status = ValidatorListStatus::default();
+    let key = make_test_key();
+    let next_list = UInt256::from_slice(&[12u8; 32]);
+    let validators = vec![make_validator_descr_from_key(&key)];
+
+    status.add_list(next_list.clone(), vec![key.clone()]);
+    status.next = Some(next_list.clone());
+
+    let selected =
+        find_local_validator_key(&validators, status.get_local_keys_for_list(&next_list))
+            .expect("next-list pubkey membership should stay usable without context gate");
+    assert_eq!(selected.id(), key.id());
+}
+
+#[test]
+fn test_select_existing_session_prefers_current_over_future() {
+    let session_id = UInt256::from_slice(&[13u8; 32]);
+    let current_sessions = HashMap::from([(session_id.clone(), "current")]);
+    let mut future_sessions = HashMap::from([(session_id.clone(), "future")]);
+
+    match select_existing_session_for_current_map(
+        &session_id,
+        &current_sessions,
+        &mut future_sessions,
+    ) {
+        Some(ExistingSessionSource::Current(selected)) => assert_eq!(selected, "current"),
+        _ => panic!("expected current session to be selected first"),
+    }
+
+    assert!(
+        future_sessions.contains_key(&session_id),
+        "future session should remain untouched when current is selected"
+    );
+}
+
+#[test]
+fn test_select_existing_session_promotes_future_when_current_absent() {
+    let session_id = UInt256::from_slice(&[14u8; 32]);
+    let current_sessions: HashMap<UInt256, &str> = HashMap::new();
+    let mut future_sessions = HashMap::from([(session_id.clone(), "future")]);
+
+    match select_existing_session_for_current_map(
+        &session_id,
+        &current_sessions,
+        &mut future_sessions,
+    ) {
+        Some(ExistingSessionSource::Future(selected)) => assert_eq!(selected, "future"),
+        _ => panic!("expected future session promotion when current is absent"),
+    }
+
+    assert!(
+        !future_sessions.contains_key(&session_id),
+        "promoted future session must be removed from future map"
+    );
+}
+
+#[test]
+fn test_current_map_swap_model_leaves_unselected_old_session_for_destroy() {
+    let keep_current_id = UInt256::from_slice(&[15u8; 32]);
+    let drop_current_id = UInt256::from_slice(&[16u8; 32]);
+    let promote_future_id = UInt256::from_slice(&[17u8; 32]);
+
+    let current_sessions = HashMap::from([
+        (keep_current_id.clone(), "current-keep"),
+        (drop_current_id.clone(), "current-drop"),
+    ]);
+    let mut future_sessions = HashMap::from([(promote_future_id.clone(), "future-promote")]);
+    let mut gc_sessions: HashSet<UInt256> =
+        current_sessions.keys().chain(future_sessions.keys()).cloned().collect();
+    let mut new_current_sessions = HashMap::new();
+
+    for selected_id in [keep_current_id.clone(), promote_future_id.clone()] {
+        let selected = match select_existing_session_for_current_map(
+            &selected_id,
+            &current_sessions,
+            &mut future_sessions,
+        ) {
+            Some(ExistingSessionSource::Current(value)) => value,
+            Some(ExistingSessionSource::Future(value)) => value,
+            None => panic!("selected session should exist in either current or future maps"),
+        };
+        new_current_sessions.insert(selected_id.clone(), selected);
+        gc_sessions.remove(&selected_id);
+    }
+
+    assert_eq!(
+        new_current_sessions.get(&keep_current_id),
+        Some(&"current-keep"),
+        "kept current session should stay in rebuilt current map"
+    );
+    assert_eq!(
+        new_current_sessions.get(&promote_future_id),
+        Some(&"future-promote"),
+        "future session should be promoted into rebuilt current map"
+    );
+    assert!(
+        !new_current_sessions.contains_key(&drop_current_id),
+        "unselected old current session should not remain in rebuilt current map"
+    );
+    assert!(
+        gc_sessions.contains(&drop_current_id),
+        "unselected old current session must stay in GC set for destruction"
+    );
 }
 
 #[test]
@@ -581,4 +684,70 @@ fn test_get_session_unsafe_id_skips_patch_when_flag_false() {
     let id_with_flag_true =
         get_session_unsafe_id(session_info, &[val], true, true, Some(100), &config, false);
     assert_ne!(id_with_flag_true, plain_id, "flag=true must apply the unsafe rotation patch");
+}
+
+#[test]
+fn test_simplex_empty_block_lag_threshold_matches_cpp_policy() {
+    assert_eq!(simplex_empty_block_lag_threshold(&ShardIdent::masterchain()), None);
+
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+    assert_eq!(simplex_empty_block_lag_threshold(&shard), Some(8));
+}
+
+#[test]
+fn test_runtime_simplex_options_use_temporary_strict_collation_mode() {
+    let catchain_options = CatchainSessionOptions {
+        proto_version: 4,
+        max_block_size: 1024,
+        max_collated_data_size: 2048,
+        ..Default::default()
+    };
+
+    let mc_opts = build_runtime_simplex_session_options(
+        &ShardIdent::masterchain(),
+        &SimplexConfig::default(),
+        &catchain_options,
+    );
+    assert!(
+        mc_opts.require_notarized_parent_for_collation,
+        "runtime manager-built simplex sessions must currently stay in strict mode"
+    );
+    assert_eq!(mc_opts.empty_block_mc_lag_threshold, None);
+
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+    let shard_opts =
+        build_runtime_simplex_session_options(&shard, &SimplexConfig::default(), &catchain_options);
+    assert!(
+        shard_opts.require_notarized_parent_for_collation,
+        "runtime shard sessions must currently stay in strict mode"
+    );
+    assert_eq!(shard_opts.empty_block_mc_lag_threshold, Some(8));
+
+    let default_opts = simplex::SessionOptions::default();
+    assert!(
+        default_opts.require_notarized_parent_for_collation,
+        "default session options must remain in strict mode for tests/manual sessions"
+    );
+}
+
+#[test]
+fn test_mc_registered_top_for_shard_returns_session_specific_block_id() {
+    let mut mc_state_extra = McStateExtra::default();
+    let root_hash = UInt256::rand();
+    let shard_descr =
+        ShardDescr::with_params(321, 100, 200, root_hash.clone(), FutureSplitMerge::None);
+    let shard = mc_state_extra.add_workchain(0, &shard_descr).unwrap();
+
+    let block = mc_registered_top_for_shard(&mc_state_extra, &shard)
+        .unwrap()
+        .expect("registered top block should be present for known shard");
+    assert_eq!(block.shard(), &shard);
+    assert_eq!(block.seq_no, 321);
+    assert_eq!(block.root_hash(), &root_hash);
+
+    let unknown_shard = ShardIdent::masterchain();
+    assert!(
+        mc_registered_top_for_shard(&mc_state_extra, &unknown_shard).unwrap().is_none(),
+        "unknown shard must not produce MC-registered top block id"
+    );
 }

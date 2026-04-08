@@ -199,6 +199,49 @@ fn test_save_finalized_block_with_parent() {
 }
 
 #[test]
+fn test_load_finalized_blocks_keeps_empty_mc_immediate_parent_chain() {
+    let (_db_root, db) = create_test_db("test_load_finalized_blocks_keeps_empty_mc_chain");
+
+    let c1 = create_candidate_id(1, 0xA1);
+    let c2 = create_candidate_id(2, 0xA2);
+    let c3 = create_candidate_id(3, 0xA3);
+
+    db.save_finalized_block(&FinalizedBlockRecord {
+        candidate_id: c1.clone(),
+        block_id: create_block_id(1000),
+        parent: None,
+        is_final: true,
+    })
+    .unwrap();
+    db.save_finalized_block(&FinalizedBlockRecord {
+        candidate_id: c2.clone(),
+        block_id: create_block_id(1000),
+        parent: Some(c1.clone()),
+        is_final: true,
+    })
+    .unwrap();
+    db.save_finalized_block(&FinalizedBlockRecord {
+        candidate_id: c3.clone(),
+        block_id: create_block_id(1001),
+        parent: Some(c2.clone()),
+        is_final: true,
+    })
+    .unwrap();
+
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+
+    let records = db.load_finalized_blocks().unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(records[0].parent.is_none());
+    assert_eq!(records[1].parent.as_ref(), Some(&c1));
+    assert_eq!(records[1].block_id.seq_no, 1000);
+    assert_eq!(records[2].parent.as_ref(), Some(&c2));
+    assert_eq!(records[2].block_id.seq_no, 1001);
+
+    db.mark_for_destroy();
+}
+
+#[test]
 fn test_load_multiple_finalized_blocks_sorted() {
     let (_db_root, db) = create_test_db("test_load_multiple_finalized_blocks_sorted");
 

@@ -543,8 +543,8 @@ impl FullNodeOverlaysRouter {
     /// Look up the local ADNL key for the given validator set.
     ///
     /// Returns `None` both when the node is not a validator and when it is a validator
-    /// but the ADNL/overlay context is not yet ready (the `network_ready == false` case
-    /// in [`ValidatorListOutcome`]). Callers must tolerate `None` gracefully.
+    /// but the ADNL/overlay context is not yet ready. Callers must tolerate `None`
+    /// gracefully.
     fn try_get_our_key(
         self: &Arc<Self>,
         validators: &ValidatorSet,

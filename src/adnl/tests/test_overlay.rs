@@ -56,7 +56,8 @@ use ton_block::{
 #[path = "./test_utils.rs"]
 mod test_utils;
 use test_utils::{
-    find_overlay_peer, get_adnl_config, init_compatibility_test, init_test, TestContext,
+    find_overlay_peer, get_adnl_config, init_compatibility_test, init_test, init_test_log,
+    TestContext,
 };
 
 const KEY_TAG_DHT: usize = 1;
@@ -1459,7 +1460,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
     const SLAVE3: &str = "127.0.0.1:4206";
     const SLAVE4: &str = "127.0.0.1:4207";
 
-    crate::test_utils::init_test_log();
+    init_test_log();
 
     let mut peers = Vec::new();
 

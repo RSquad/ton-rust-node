@@ -17,7 +17,11 @@ use crate::{
     misbehavior::VoteResult,
     RawVoteData, SessionId, SessionNode,
 };
-use std::{iter::from_fn, sync::Arc, time::SystemTime};
+use std::{
+    iter::from_fn,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256};
 
 /// Test helper trait to provide on_vote with default raw_vote
@@ -119,20 +123,9 @@ fn opts_cpp() -> SimplexStateOptions {
     SimplexStateOptions::cpp_compatible()
 }
 
-/// Helper to create SimplexStateOptions for legacy (finalization-driven) mode.
-///
-/// This keeps the old ParentReady / `available_bases` behavior for window progression.
-fn opts_cpp_legacy() -> SimplexStateOptions {
-    let mut opts = opts_cpp();
-    opts.use_notarized_parent_chain = false;
-    opts
-}
-
 /// Helper to create SimplexStateOptions with notarized-parent chain enabled (pool.cpp parity mode)
 fn opts_notarized_parent_chain() -> SimplexStateOptions {
-    let mut opts = opts_cpp();
-    opts.use_notarized_parent_chain = true;
-    opts
+    opts_cpp()
 }
 
 /// Helper to create test candidate for FSM tests
@@ -194,7 +187,6 @@ fn test_new_creates_initial_state() {
     assert_eq!(state.first_non_finalized_slot, SlotIndex::new(0));
     assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
     assert!(!state.has_pending_events());
-    // Timeouts start unarmed; SessionProcessor::start() calls set_timeouts().
     assert!(state.get_next_timeout().is_none());
 
     // Window 0 should have None (genesis) as available base
@@ -839,235 +831,6 @@ fn test_finalize_threshold_66_triggers_block_finalized() {
 }
 
 #[test]
-fn test_block_finalized_triggers_parent_ready_for_next_window() {
-    // When a block is finalized, it should become an available parent for the next window
-    // This is the "ParentReady" publishing that was missing from C++ reference
-    let desc = create_test_desc(4, 2); // 2 slots per window
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
-
-    // Window 0 starts with genesis (None) as available base
-    assert!(state.get_window(WindowIndex::new(0)).unwrap().available_bases.contains(&None));
-
-    // Finalize slot 0 (in window 0)
-    let mut block = BlockIdExt::default();
-    block.root_hash = UInt256::from_slice(&[0xAA; 32]);
-
-    let vote = Vote::Finalize(FinalizeVote {
-        slot: SlotIndex::new(0),
-        block_hash: block.root_hash.clone(),
-    });
-
-    // Need 3 out of 4 for threshold_66
-    state.on_vote_test(&desc, ValidatorIndex::new(0), vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(1), vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(2), vote, Vec::new()).unwrap();
-
-    // Clear events
-    while state.pull_event().is_some() {}
-
-    // Check that window 1 now has the finalized block as an available parent
-    let next_window = state.get_window(WindowIndex::new(1));
-    assert!(next_window.is_some(), "Window 1 should exist after finalization");
-
-    let expected_parent =
-        Some(CandidateParentInfo { slot: SlotIndex::new(0), hash: block.root_hash.clone() });
-    assert!(
-        next_window.unwrap().available_bases.contains(&expected_parent),
-        "Window 1 should have finalized block from slot 0 as available parent. Got: {:?}",
-        next_window.unwrap().available_bases
-    );
-
-    // Verify current_leader_window_idx was updated
-    assert_eq!(
-        state.current_leader_window_idx,
-        WindowIndex::new(1),
-        "Should advance to next window"
-    );
-}
-
-#[test]
-fn test_parent_ready_enables_pending_block_notarization() {
-    // When ParentReady is triggered (via finalization), pending blocks should be checked
-    let desc = create_test_desc(4, 2); // 2 slots per window
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
-
-    // Create a candidate for slot 2 (first slot of window 1) that references a parent
-    let parent_hash = UInt256::from_slice(&[0xBB; 32]);
-
-    // This candidate needs a parent from slot 0
-    let candidate = create_test_candidate(
-        2,
-        UInt256::from_slice(&[0xCC; 32]),
-        BlockIdExt::default(),
-        Some((0, parent_hash.clone())),
-        0,
-    );
-
-    // Submit candidate - it should be stored as pending (no parent available)
-    state.on_candidate(&desc, candidate).unwrap();
-    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
-    assert!(
-        !events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(_)))),
-        "Should NOT broadcast notarize vote - parent not available yet"
-    );
-
-    // Verify candidate is pending
-    assert!(
-        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_some(),
-        "Candidate should be stored as pending"
-    );
-
-    // Now finalize slot 0 with matching parent hash
-    let mut block = BlockIdExt::default();
-    block.root_hash = parent_hash.clone();
-
-    let vote = Vote::Finalize(FinalizeVote {
-        slot: SlotIndex::new(0),
-        block_hash: block.root_hash.clone(),
-    });
-
-    state.on_vote_test(&desc, ValidatorIndex::new(0), vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(1), vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(2), vote, Vec::new()).unwrap();
-
-    // Check that BlockFinalized was emitted and ParentReady logic ran
-    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
-    assert!(
-        events.iter().any(|e| matches!(e, SimplexEvent::BlockFinalized(_))),
-        "Should emit BlockFinalized"
-    );
-
-    // The pending candidate should now have been processed via check_pending_blocks
-    // and a NotarVote should have been broadcast
-    assert!(
-        events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(_)))),
-        "Should broadcast NotarVote for pending candidate after parent ready"
-    );
-
-    // Pending block should be cleared
-    assert!(
-        state.get_window(WindowIndex::new(1)).unwrap().slots[0].pending_block.is_none(),
-        "Pending block should be cleared after notarization"
-    );
-}
-
-#[test]
-fn test_genesis_propagates_to_next_window_on_full_skip() {
-    // When an entire window is skipped (no finalization), the genesis (None) parent
-    // should propagate to the next window as an available base.
-    // This handles the startup case where network is slow and first window times out.
-    let desc = create_test_desc(4, 2); // 2 slots per window
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
-
-    // Window 0 starts with genesis (None) as available base
-    assert!(state.get_window(WindowIndex::new(0)).unwrap().available_bases.contains(&None));
-
-    // Skip slot 0 (need 3 out of 4 for threshold_66)
-    let skip_vote_0 = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
-    state.on_vote_test(&desc, ValidatorIndex::new(0), skip_vote_0.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(1), skip_vote_0.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(2), skip_vote_0, Vec::new()).unwrap();
-
-    // Clear events
-    while state.pull_event().is_some() {}
-
-    // Slot 0 should be skipped; C++ parity: first_non_finalized_slot stays at 0
-    assert_eq!(state.first_non_finalized_slot, SlotIndex::new(0));
-    // But first_non_progressed_slot advances
-    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(1));
-
-    // Window 1 should NOT have genesis yet (slot 0 was not the last slot in window 0)
-    // Note: window 1 may or may not exist at this point
-    let window1_has_genesis = state
-        .get_window(WindowIndex::new(1))
-        .map(|w| w.available_bases.contains(&None))
-        .unwrap_or(false);
-    assert!(
-        !window1_has_genesis,
-        "Window 1 should not have genesis yet (slot 0 is not last in window)"
-    );
-
-    // Skip slot 1 (last slot in window 0)
-    let skip_vote_1 = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
-    state.on_vote_test(&desc, ValidatorIndex::new(0), skip_vote_1.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(1), skip_vote_1.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(2), skip_vote_1, Vec::new()).unwrap();
-
-    // Clear events
-    while state.pull_event().is_some() {}
-
-    // C++ parity: first_non_finalized_slot still at 0, progress cursor at 2
-    assert_eq!(state.first_non_finalized_slot, SlotIndex::new(0));
-    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(2));
-
-    // Window 1 should now have genesis (None) as available base
-    // This was propagated from window 0 since no finalization occurred
-    let window1 = state.get_window(WindowIndex::new(1));
-    assert!(window1.is_some(), "Window 1 should exist");
-    assert!(
-        window1.unwrap().available_bases.contains(&None),
-        "Window 1 should have genesis (None) as available base after window 0 was fully skipped. Got: {:?}",
-        window1.unwrap().available_bases
-    );
-}
-
-#[test]
-fn test_genesis_not_propagated_if_finalization_occurred() {
-    // If a block was finalized in the window, genesis should NOT be propagated
-    // (the finalized block becomes the parent instead)
-    let desc = create_test_desc(4, 2); // 2 slots per window
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
-
-    // Finalize slot 0
-    let mut block = BlockIdExt::default();
-    block.root_hash = UInt256::from_slice(&[0xAA; 32]);
-
-    let finalize_vote = Vote::Finalize(FinalizeVote {
-        slot: SlotIndex::new(0),
-        block_hash: block.root_hash.clone(),
-    });
-    state.on_vote_test(&desc, ValidatorIndex::new(0), finalize_vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(1), finalize_vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(2), finalize_vote, Vec::new()).unwrap();
-
-    // Clear events
-    while state.pull_event().is_some() {}
-
-    // Window 1 should have the finalized block as parent, not genesis
-    let window1 = state.get_window(WindowIndex::new(1)).expect("Window 1 should exist");
-    let expected_parent =
-        Some(CandidateParentInfo { slot: SlotIndex::new(0), hash: block.root_hash.clone() });
-    assert!(
-        window1.available_bases.contains(&expected_parent),
-        "Window 1 should have finalized block as parent"
-    );
-
-    // Now skip slot 1 (last slot in window 0)
-    let skip_vote = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
-    state.on_vote_test(&desc, ValidatorIndex::new(0), skip_vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(1), skip_vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(2), skip_vote, Vec::new()).unwrap();
-
-    // Clear events
-    while state.pull_event().is_some() {}
-
-    // Window 1 should still NOT have genesis (None) - only the finalized block
-    let window1 = state.get_window(WindowIndex::new(1)).expect("Window 1 should exist");
-    assert!(
-        !window1.available_bases.contains(&None),
-        "Window 1 should NOT have genesis - finalization already provided a parent"
-    );
-    assert!(
-        window1.available_bases.contains(&expected_parent),
-        "Window 1 should still have finalized block as parent"
-    );
-}
-
-#[test]
 fn test_safe_to_skip_broadcasts_skip_fallback_but_no_slot_skipped() {
     // SafeToSkip triggers at 1/3 threshold and calls try_skip_window
     // which broadcasts Skip votes for unvoted slots.
@@ -1588,47 +1351,6 @@ fn test_invalid_leader_in_candidate() {
     assert!(result.is_err(), "Invalid leader should return error");
 }
 
-#[test]
-fn test_on_window_base_ready_makes_pending_available() {
-    let desc = create_test_desc(4, 2);
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
-
-    // Test scenario: window 1 (slots 2-3), parent from slot 1
-    // First, create window 1
-    state.ensure_window_exists(WindowIndex::new(1));
-
-    // Create candidate for slot 2 (first slot in window 1) with a parent from slot 1
-    let parent_hash = UInt256::from_slice(&[0xAA; 32]);
-    let parent_info = CandidateParentInfo { slot: SlotIndex::new(1), hash: parent_hash.clone() };
-
-    let candidate = create_test_candidate(
-        2, // First slot in window 1
-        UInt256::default(),
-        BlockIdExt::default(),
-        Some((1, parent_hash.clone())),
-        0,
-    );
-
-    // Candidate should be stored as pending (parent not available in window 1)
-    state.on_candidate(&desc, candidate).unwrap();
-    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
-    assert!(
-        !events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(_)))),
-        "Should not broadcast without parent"
-    );
-
-    // Now make the parent available for window 1
-    state.on_window_base_ready(&desc, WindowIndex::new(1), Some(parent_info)).unwrap();
-
-    // Should now have broadcast NotarVote
-    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
-    assert!(
-        events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(_)))),
-        "Should broadcast after parent ready"
-    );
-}
-
 /*
     ========================================================================
     Timeout Tests
@@ -1638,11 +1360,16 @@ fn test_on_window_base_ready_makes_pending_available() {
 #[test]
 fn test_timeout_management() {
     let desc = create_test_desc(4, 2);
-    let state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
 
     // FSM is created with unarmed timeouts (skip_timestamp = None).
-    // SessionProcessor::start() is responsible for calling set_timeouts().
+    // SessionProcessor::start() is responsible for calling reset_timeouts_on_start().
     assert!(state.get_next_timeout().is_none(), "FSM must start with unarmed timeouts");
+    assert_eq!(state.skip_slot, SlotIndex::new(0));
+
+    // Arm timeouts (simulating start())
+    state.reset_timeouts_on_start(&desc);
+    assert!(state.get_next_timeout().is_some(), "reset_timeouts_on_start must set skip_timestamp");
     assert_eq!(state.skip_slot, SlotIndex::new(0));
 }
 
@@ -1653,8 +1380,8 @@ fn test_unarmed_fsm_no_skip_cascade_after_delay() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
 
-    // Simulate 60 s overlay warmup delay
-    let future = desc.get_time() + std::time::Duration::from_secs(60);
+    // Simulate 60 s overlay warmup delay without arming timeouts
+    let future = desc.get_time() + Duration::from_secs(60);
     desc.set_time(future);
 
     state.check_all(&desc);
@@ -1669,16 +1396,16 @@ fn test_unarmed_fsm_no_skip_cascade_after_delay() {
 }
 
 #[test]
-fn test_set_timeouts_enables_skip_after_expiry() {
-    // After set_timeouts() the skip timer fires once the deadline elapses.
+fn test_armed_timeouts_enable_skip_after_expiry() {
+    // After reset_timeouts_on_start() the skip timer fires once the deadline elapses.
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
 
     let t0 = desc.get_time();
 
     // Arm at t0
-    state.set_timeouts(&desc);
-    assert!(state.get_next_timeout().is_some(), "set_timeouts must set skip_timestamp");
+    state.reset_timeouts_on_start(&desc);
+    assert!(state.get_next_timeout().is_some());
 
     // Immediately after arming, check_all should produce no skips
     state.check_all(&desc);
@@ -1691,7 +1418,7 @@ fn test_set_timeouts_enables_skip_after_expiry() {
     assert_eq!(skip_count, 0, "no skip votes before timeout expires");
 
     // Advance past first_block_timeout + target_rate (defaults: 3s + 1s = 4s)
-    desc.set_time(t0 + std::time::Duration::from_secs(5));
+    desc.set_time(t0 + Duration::from_secs(5));
     state.check_all(&desc);
 
     let mut skip_count = 0;
@@ -2007,122 +1734,6 @@ fn test_get_available_parent_nonexistent_window() {
 
     Tests for scenarios where votes arrive before the block candidate.
 */
-
-#[test]
-fn test_late_candidate_finalization_still_proceeds() {
-    // Scenario: Finalize votes arrive and reach threshold BEFORE the candidate arrives.
-    // The FSM should:
-    // 1. Emit BlockFinalized event (with block_id = None since candidate wasn't seen)
-    // 2. Advance to next slot
-    // 3. Ignore the late candidate when it arrives (slot already finalized)
-    // 4. Continue processing the next slot normally
-
-    let desc = create_test_desc(4, 2); // 4 validators, 2 slots per window
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
-
-    // Create a candidate hash (the hash that will be in the votes)
-    let candidate_hash = UInt256::from_slice(&[0xAA; 32]);
-
-    // Step 1: Send finalize votes for slot 0 (without having received the candidate)
-    // Need 3 out of 4 for threshold_66
-    let vote = Vote::Finalize(FinalizeVote {
-        slot: SlotIndex::new(0),
-        block_hash: candidate_hash.clone(),
-    });
-
-    state.on_vote_test(&desc, ValidatorIndex::new(0), vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(1), vote.clone(), Vec::new()).unwrap();
-    state.on_vote_test(&desc, ValidatorIndex::new(2), vote, Vec::new()).unwrap();
-
-    // Step 2: Verify BlockFinalized was emitted
-    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
-
-    let finalized_event = events.iter().find_map(|e| {
-        if let SimplexEvent::BlockFinalized(ev) = e {
-            Some(ev)
-        } else {
-            None
-        }
-    });
-
-    assert!(finalized_event.is_some(), "Expected BlockFinalized event");
-    let finalized = finalized_event.unwrap();
-
-    // block_id should be None because on_candidate wasn't called
-    assert_eq!(finalized.slot, SlotIndex::new(0));
-    assert_eq!(finalized.block_hash, candidate_hash);
-    assert!(finalized.block_id.is_none(), "block_id should be None for late candidate scenario");
-
-    // Step 3: State should have advanced
-    assert_eq!(
-        state.first_non_finalized_slot,
-        SlotIndex::new(1),
-        "Should advance to slot 1 after finalization"
-    );
-
-    // Step 4: Now the late candidate arrives for slot 0
-    let block_id = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        0,
-        candidate_hash.clone(),
-        UInt256::default(),
-    );
-    let late_candidate = create_test_candidate(0, candidate_hash.clone(), block_id, None, 0);
-
-    // on_candidate should succeed but do nothing (slot already finalized)
-    let result = state.on_candidate(&desc, late_candidate);
-    assert!(result.is_ok(), "on_candidate should succeed for late candidate");
-
-    // No new events should be generated
-    let events_after: Vec<_> = from_fn(|| state.pull_event()).collect();
-    assert!(
-        events_after.is_empty(),
-        "No events should be generated for late candidate in finalized slot"
-    );
-
-    // Step 5: Continue with slot 1 - the FSM should still work normally
-    // Window 1 should have the finalized block from slot 0 as an available parent
-    let window1 = state.get_window(WindowIndex::new(1));
-    assert!(window1.is_some(), "Window 1 should exist");
-
-    let expected_parent =
-        Some(CandidateParentInfo { slot: SlotIndex::new(0), hash: candidate_hash.clone() });
-    assert!(
-        window1.unwrap().available_bases.contains(&expected_parent),
-        "Window 1 should have finalized slot 0 as available parent"
-    );
-
-    // Create a candidate for slot 2 (first slot of window 1) with parent from slot 0
-    let slot2_hash = UInt256::from_slice(&[0xBB; 32]);
-    let slot2_block_id = BlockIdExt::with_params(
-        ShardIdent::masterchain(),
-        1,
-        slot2_hash.clone(),
-        UInt256::default(),
-    );
-    let slot2_candidate = create_test_candidate(
-        2,
-        slot2_hash.clone(),
-        slot2_block_id,
-        Some((0, candidate_hash.clone())), // Parent is the finalized slot 0
-        1,                                 // Leader for window 1
-    );
-
-    // This should trigger a notarize vote (ParentReady was set by finalization)
-    state.on_candidate(&desc, slot2_candidate).unwrap();
-
-    let slot2_events: Vec<_> = from_fn(|| state.pull_event()).collect();
-    let has_notarize = slot2_events.iter().any(|e| {
-        matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(v)) if v.slot == SlotIndex::new(2))
-    });
-
-    assert!(
-        has_notarize,
-        "FSM should broadcast notarize vote for slot 2 after late candidate scenario. Events: {:?}",
-        slot2_events
-    );
-}
 
 #[test]
 fn test_late_candidate_with_notarize_votes_also_proceeds() {
@@ -3259,8 +2870,7 @@ fn test_skip_events_emitted_when_threshold_reached() {
     // Test that SlotSkipped events are emitted immediately when
     // threshold is reached, regardless of slot order.
     let desc = create_test_desc(4, 2);
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create SimplexState");
 
     // Skip slot 1 first (before slot 0)
     let vote1 = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
@@ -4057,46 +3667,11 @@ fn test_cpp_mode_local_notarize_after_skip() {
 }
 
 #[test]
-fn test_restart_voted_notar_parent_chain() {
-    // After restart with voted_notar(parent) in slot 0, try_notar for slot 1 (same window)
-    // must accept that parent and broadcast NotarizeVote.
-    // Reference: C++ consensus.cpp try_notarize() uses voted_notar from prev slot as parent.
-    let desc = create_test_desc(4, 2);
-    let mut state =
-        SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create SimplexState");
-
-    let parent_hash = UInt256::from([0x44u8; 32]);
-    state.mark_slot_voted_on_restart(
-        &desc,
-        &Vote::Notarize(NotarizeVote { slot: SlotIndex::new(0), block_hash: parent_hash.clone() }),
-    );
-
-    // Non-first slot in same window: slot 1 uses voted_notar(slot 0) as parent proof.
-    let child_hash = UInt256::from([0x55u8; 32]);
-    let ok = state.try_notar(
-        &desc,
-        SlotIndex::new(1),
-        &child_hash,
-        Some(&crate::block::CandidateParentInfo { slot: SlotIndex::new(0), hash: parent_hash }),
-    );
-    assert!(ok, "try_notar should succeed when parent matches voted_notar(prev_slot)");
-
-    let mut saw_notar_1 = false;
-    while let Some(ev) = state.pull_event() {
-        if matches!(ev, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if slot == SlotIndex::new(1))
-        {
-            saw_notar_1 = true;
-        }
-    }
-    assert!(saw_notar_1, "expected notarize broadcast for slot 1");
-}
-
-#[test]
 fn test_notarized_parent_chain_state_tracked_in_default_mode_on_notarization() {
-    // Notarized-parent chain fields (`available_base`, `skipped`, `first_non_progressed_slot`) are maintained
-    // in all modes for state consistency, even when `use_notarized_parent_chain=false`.
+    // Notarized-parent chain fields (`available_base`, `skipped`,
+    // `first_non_progressed_slot`) are maintained in the active C++-parity mode.
     let desc = create_test_desc(4, 2);
-    let mut state = SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create state");
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
 
     let h0 = UInt256::from([0xC0u8; 32]);
     let vote0 = Vote::Notarize(NotarizeVote { slot: SlotIndex::new(0), block_hash: h0.clone() });
@@ -4113,16 +3688,15 @@ fn test_notarized_parent_chain_state_tracked_in_default_mode_on_notarization() {
         "slot1 base must be set from notarized slot0 (tracking only)"
     );
 
-    // Behavior remains legacy: window progression is still driven by ParentReady/finalization.
+    // Slot 0 is still inside window 0, so the leader window does not advance yet.
     assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
 }
 
 #[test]
 fn test_notarized_parent_chain_state_tracked_in_default_mode_on_skip_cert() {
-    // Notarized-parent chain fields are maintained in all modes for state consistency,
-    // even when `use_notarized_parent_chain=false`.
+    // Skip certificates must update the active C++-parity tracking state too.
     let desc = create_test_desc(4, 2);
-    let mut state = SimplexState::new(&desc, opts_cpp_legacy()).expect("Failed to create state");
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
 
     let vote0 = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
     state.on_vote_test(&desc, ValidatorIndex::new(0), vote0.clone(), vec![1]).unwrap();
@@ -4139,7 +3713,7 @@ fn test_notarized_parent_chain_state_tracked_in_default_mode_on_skip_cert() {
         "slot1 base must be propagated genesis from skipped slot0"
     );
 
-    // Behavior remains legacy: window progression is still driven by ParentReady/finalization.
+    // Slot 0 is still inside window 0, so the leader window does not advance yet.
     assert_eq!(state.current_leader_window_idx, WindowIndex::new(0));
 }
 
@@ -4177,11 +3751,11 @@ fn test_alpenglow_mode_with_notarized_parent_chain_tracking() {
         "slot1 base must be set in Alpenglow mode"
     );
 
-    // Behavioral mode is still legacy (finalization-driven) unless use_notarized_parent_chain=true
+    // Slot 0 is still inside window 0, so the leader window does not advance yet.
     assert_eq!(
         state.current_leader_window_idx,
         WindowIndex::new(0),
-        "Alpenglow mode should use legacy window advancement (finalization-driven)"
+        "Alpenglow mode should still remain in window 0 until progress crosses the boundary"
     );
 }
 
@@ -4869,6 +4443,54 @@ fn test_external_finalize_certificate_for_missed_finalization_recovery() {
 }
 
 #[test]
+fn test_set_finalize_certificate_advances_progress_cursor_past_pre_skipped_slots() {
+    // Regression: if slots after the finalized slot are already skipped,
+    // finalization must run progress-cursor advancement (`advance_present` parity)
+    // before leader-window advancement so we don't stop on a baseless skipped slot.
+    let desc = create_test_desc(4, 4); // 4 slots per window
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Pre-mark slots 1..3 as skipped (out of order, before slot 0 finalization).
+    for s in 1..=3u32 {
+        let cert = create_test_skip_cert(&desc, SlotIndex::new(s), &signers);
+        state.set_skip_certificate(&desc, SlotIndex::new(s), cert).unwrap();
+    }
+    drain_events(&mut state);
+
+    // Slot 0 is still not progressed, so cursor must stay at 0.
+    assert_eq!(state.get_first_non_progressed_slot(), SlotIndex::new(0));
+
+    // Finalize slot 0 (without prior explicit notarization event ingestion).
+    let slot0 = SlotIndex::new(0);
+    let block_hash = UInt256::from([0xA5; 32]);
+    let final_cert = create_test_final_cert(&desc, slot0, block_hash.clone(), &signers);
+    let stored = state
+        .set_finalize_certificate(&desc, slot0, &block_hash, final_cert)
+        .expect("set_finalize_certificate should succeed");
+    assert!(stored, "finalize certificate should be stored");
+
+    // Cursor must skip over already-progressed slots 1..3 and land on slot 4.
+    assert_eq!(
+        state.get_first_non_progressed_slot(),
+        SlotIndex::new(4),
+        "progress cursor must advance past pre-skipped slots after finalization"
+    );
+
+    // Slot 4 must have finalized parent as available base.
+    let expected_parent = Some(CandidateParentInfo { slot: slot0, hash: block_hash });
+    assert_eq!(
+        state.get_slot_available_base(&desc, SlotIndex::new(4)),
+        Some(expected_parent),
+        "slot 4 must inherit base from finalized slot 0"
+    );
+
+    // Window should advance from 0 to 1 (slot 4 is first slot of window 1).
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(1));
+}
+
+#[test]
 fn test_set_finalize_certificate_emits_block_finalized_and_finalization_reached_for_tracked_slot() {
     // External finalize cert ingestion must emit:
     // - BlockFinalized (commit trigger), and
@@ -4948,7 +4570,7 @@ fn test_set_finalize_certificate_emits_block_finalized_and_finalization_reached_
       - First increase backoff, then complete a window without timeouts and verify restore path.
 
     - test_notarized_parent_chain_advances_window_on_full_window_skip:
-      - With `use_notarized_parent_chain=true`, skip-cert all slots in a window and verify
+      - With the default C++-parity progression path, skip-cert all slots in a window and verify
         `first_non_progressed_slot` crosses the boundary and timeouts are scheduled for the next window.
 
     - test_notarized_parent_chain_base_propagation_with_multiple_skipped_intervals:
@@ -4964,9 +4586,8 @@ fn test_set_finalize_certificate_emits_block_finalized_and_finalization_reached_
 fn test_reject_far_future_vote() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("create");
+    let far_slot = state.first_too_new_vote_slot();
 
-    // first_non_finalized_slot = 0, so max acceptable = MAX_FUTURE_SLOTS
-    let far_slot = SlotIndex::new(MAX_FUTURE_SLOTS + 1);
     let vote = Vote::Notarize(NotarizeVote { slot: far_slot, block_hash: UInt256::rand() });
 
     let result = state.on_vote_test(&desc, ValidatorIndex::new(1), vote, vec![]);
@@ -4982,10 +4603,10 @@ fn test_reject_far_future_vote() {
 fn test_accept_vote_at_boundary() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("create");
+    let boundary_slot = state.first_too_new_vote_slot() - 1;
 
-    // Slot exactly at the boundary should be accepted (not rejected by bounds check).
+    // Slot immediately before first_too_new should be accepted (not rejected by bounds check).
     // It may still return Rejected/Applied depending on FSM state, but NOT "too far ahead".
-    let boundary_slot = SlotIndex::new(MAX_FUTURE_SLOTS);
     let vote = Vote::Notarize(NotarizeVote { slot: boundary_slot, block_hash: UInt256::rand() });
 
     let result = state.on_vote_test(&desc, ValidatorIndex::new(1), vote, vec![]);
@@ -5005,8 +4626,10 @@ fn test_accept_vote_at_boundary() {
 fn test_reject_far_future_candidate() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("create");
+    let max_future_slots =
+        desc.opts().max_leader_window_desync.saturating_mul(desc.opts().slots_per_leader_window);
 
-    let far_slot = MAX_FUTURE_SLOTS + 1;
+    let far_slot = max_future_slots + 1;
     let candidate =
         create_test_candidate(far_slot, UInt256::rand(), BlockIdExt::default(), None, 0);
 
@@ -5027,8 +4650,10 @@ fn test_reject_far_future_candidate() {
 fn test_reject_far_future_window_base_ready() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("create");
+    let max_future_slots =
+        desc.opts().max_leader_window_desync.saturating_mul(desc.opts().slots_per_leader_window);
 
-    let far_window = WindowIndex::new((MAX_FUTURE_SLOTS / 2) + 100);
+    let far_window = WindowIndex::new((max_future_slots / 2) + 100);
     let initial_len = state.leader_windows.len();
     let result = state.on_window_base_ready(&desc, far_window, None);
     assert!(result.is_ok(), "far-future window base should be silently dropped");
@@ -5055,23 +4680,27 @@ fn test_ensure_window_exists_capped() {
     assert_eq!(
         state.leader_windows.len(),
         initial_len,
-        "ensure_window_exists should refuse to allocate beyond MAX_FUTURE_SLOTS cap"
+        "ensure_window_exists should refuse to allocate beyond configured desync cap"
     );
 }
 
 #[test]
-fn test_far_future_with_advanced_finalization() {
+fn test_vote_bound_with_advanced_finalization() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc, opts_cpp()).expect("create");
+    let expected_first_too_new = SlotIndex::new(
+        ((5000 / desc.opts().slots_per_leader_window) + desc.opts().max_leader_window_desync + 1)
+            * desc.opts().slots_per_leader_window,
+    );
 
     // Advance finalization cursor
     state.set_first_non_finalized_slot(SlotIndex::new(5000));
 
-    // Now max acceptable = 5000 + MAX_FUTURE_SLOTS
-    assert_eq!(state.max_acceptable_slot(), SlotIndex::new(5000 + MAX_FUTURE_SLOTS));
+    let first_too_new = state.first_too_new_vote_slot();
+    assert_eq!(first_too_new, expected_first_too_new);
 
-    // Vote at max + 1 should be rejected
-    let vote = Vote::Skip(SkipVote { slot: SlotIndex::new(5000 + MAX_FUTURE_SLOTS + 1) });
+    // Vote at first_too_new must be rejected.
+    let vote = Vote::Skip(SkipVote { slot: first_too_new });
     let result = state.on_vote_test(&desc, ValidatorIndex::new(1), vote, vec![]);
     match result {
         VoteResult::Rejected(reason) => {
@@ -5080,8 +4709,8 @@ fn test_far_future_with_advanced_finalization() {
         other => panic!("Expected Rejected, got {:?}", other),
     }
 
-    // Vote at max should be accepted (bounds-wise)
-    let vote = Vote::Skip(SkipVote { slot: SlotIndex::new(5000 + MAX_FUTURE_SLOTS) });
+    // Vote immediately before first_too_new should still pass the bounds check.
+    let vote = Vote::Skip(SkipVote { slot: first_too_new - 1 });
     let result = state.on_vote_test(&desc, ValidatorIndex::new(1), vote, vec![]);
     match result {
         VoteResult::Rejected(reason) => {
@@ -5099,11 +4728,64 @@ fn test_far_future_with_advanced_finalization() {
 fn test_is_slot_too_far_ahead_helper() {
     let desc = create_test_desc(4, 2);
     let state = SimplexState::new(&desc, opts_cpp()).expect("create");
+    let max_future_slots =
+        desc.opts().max_leader_window_desync.saturating_mul(desc.opts().slots_per_leader_window);
 
     assert!(!state.is_slot_too_far_ahead(SlotIndex::new(0)));
-    assert!(!state.is_slot_too_far_ahead(SlotIndex::new(MAX_FUTURE_SLOTS)));
-    assert!(state.is_slot_too_far_ahead(SlotIndex::new(MAX_FUTURE_SLOTS + 1)));
+    assert!(!state.is_slot_too_far_ahead(SlotIndex::new(max_future_slots)));
+    assert!(state.is_slot_too_far_ahead(SlotIndex::new(max_future_slots + 1)));
     assert!(state.is_slot_too_far_ahead(SlotIndex::new(u32::MAX)));
+}
+
+#[test]
+fn test_is_vote_slot_too_far_ahead_helper() {
+    let desc = create_test_desc(4, 2);
+    let state = SimplexState::new(&desc, opts_cpp()).expect("create");
+    let first_too_new = state.first_too_new_vote_slot();
+
+    assert!(!state.is_vote_slot_too_far_ahead(first_too_new - 1));
+    assert!(state.is_vote_slot_too_far_ahead(first_too_new));
+    assert!(state.is_vote_slot_too_far_ahead(SlotIndex::new(u32::MAX)));
+}
+
+#[test]
+fn test_max_acceptable_slot_uses_progress_cursor_after_skip() {
+    let desc = create_test_desc(4, 2);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+    let max_future_slots =
+        desc.opts().max_leader_window_desync.saturating_mul(desc.opts().slots_per_leader_window);
+
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+    let skip_cert = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(0), skip_cert).expect("should not error");
+
+    assert_eq!(state.get_first_non_finalized_slot(), SlotIndex::new(0));
+    assert_eq!(state.get_first_non_progressed_slot(), SlotIndex::new(1));
+    assert_eq!(state.max_acceptable_slot(), SlotIndex::new(1 + max_future_slots));
+    assert!(!state.is_slot_too_far_ahead(SlotIndex::new(1 + max_future_slots)));
+    assert!(state.is_slot_too_far_ahead(SlotIndex::new(2 + max_future_slots)));
+}
+
+#[test]
+fn test_vote_bound_uses_progress_cursor_after_skip() {
+    let desc = create_test_desc(4, 2);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+    let expected_first_too_new = SlotIndex::new(
+        ((1 / desc.opts().slots_per_leader_window) + desc.opts().max_leader_window_desync + 1)
+            * desc.opts().slots_per_leader_window,
+    );
+
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+    let skip_cert = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(0), skip_cert).expect("should not error");
+
+    assert_eq!(state.get_first_non_finalized_slot(), SlotIndex::new(0));
+    assert_eq!(state.get_first_non_progressed_slot(), SlotIndex::new(1));
+    assert_eq!(state.first_too_new_vote_slot(), expected_first_too_new);
+    assert!(!state.is_vote_slot_too_far_ahead(expected_first_too_new - 1));
+    assert!(state.is_vote_slot_too_far_ahead(expected_first_too_new));
 }
 
 #[test]
@@ -5200,6 +4882,57 @@ fn test_standstill_slot_grid_dump_with_certs() {
     // Slot 0 should have 4 N's, 1 dot, and " notar" cert flag
     assert!(lines[0].contains("notar"), "Expected notar cert flag in: {}", lines[0]);
     assert!(lines[0].starts_with("0: NNNN."), "Expected NNNN. in: {}", lines[0]);
+}
+
+#[test]
+fn test_standstill_diagnostic_dump_includes_last_final_cert_summary() {
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("create");
+
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([3u8; 32]),
+        UInt256::from([4u8; 32]),
+    );
+    let candidate_hash = UInt256::from([0xCCu8; 32]);
+    let candidate = create_test_candidate(0, candidate_hash.clone(), block_id, None, 0);
+    state.on_candidate(&desc, candidate).unwrap();
+
+    for v in 0..3 {
+        let notar_vote = Vote::Notarize(NotarizeVote {
+            slot: SlotIndex::new(0),
+            block_hash: candidate_hash.clone(),
+        });
+        state.on_vote_test(&desc, ValidatorIndex::new(v), notar_vote, vec![v as u8]).unwrap();
+    }
+    for v in 0..3 {
+        let finalize_vote = Vote::Finalize(FinalizeVote {
+            slot: SlotIndex::new(0),
+            block_hash: candidate_hash.clone(),
+        });
+        state
+            .on_vote_test(&desc, ValidatorIndex::new(v), finalize_vote, vec![10 + v as u8])
+            .unwrap();
+    }
+
+    while state.has_pending_events() {
+        let _ = state.pull_event();
+    }
+
+    let dump = state.standstill_diagnostic_dump(&desc);
+    assert!(
+        dump.contains("Last final cert is for slot=0"),
+        "expected last-final summary in diagnostic dump: {dump}"
+    );
+    assert!(
+        dump.contains(&candidate_hash.to_hex_string()),
+        "expected final-cert hash in diagnostic dump: {dump}"
+    );
+    assert!(
+        dump.lines().any(|line| line.starts_with("1: ")),
+        "expected slot-grid line in diagnostic dump: {dump}"
+    );
 }
 
 #[test]
@@ -5440,6 +5173,146 @@ fn test_candidate_stored_as_pending_despite_skip_vote_cpp_mode() {
     assert!(
         w1.slots[0].pending_block.is_some(),
         "candidate must be stored as pending_block despite local skip vote (C++ parity)"
+    );
+}
+
+#[test]
+fn test_cpp_mode_try_skip_window_preserves_existing_pending_block() {
+    // Regression: in C++ mode, Skip must NOT drop an already buffered candidate.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
+
+    let parent_hash = UInt256::from([0x91; 32]);
+    let child_hash = UInt256::from([0x92; 32]);
+    let candidate =
+        create_test_candidate(1, child_hash, BlockIdExt::default(), Some((0, parent_hash)), 0);
+    state.on_candidate(&desc, candidate).unwrap();
+
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some(),
+        "precondition: slot 1 candidate must be pending before skip"
+    );
+
+    state.try_skip_window(WindowIndex::new(0));
+
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some(),
+        "C++ mode must preserve pending_block on skip"
+    );
+}
+
+#[test]
+fn test_cpp_mode_restart_skip_paths_preserve_existing_pending_block() {
+    // Regression: restart skip paths in C++ mode must preserve pending candidates.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
+
+    let parent_hash = UInt256::from([0xA1; 32]);
+    let child_hash = UInt256::from([0xA2; 32]);
+    let candidate =
+        create_test_candidate(1, child_hash, BlockIdExt::default(), Some((0, parent_hash)), 0);
+    state.on_candidate(&desc, candidate).unwrap();
+
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some(),
+        "precondition: slot 1 candidate must be pending before restart skips"
+    );
+
+    // 1) Direct restart-skip replay
+    state.mark_slot_voted_on_restart(&desc, &Vote::Skip(SkipVote { slot: SlotIndex::new(1) }));
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some(),
+        "mark_slot_voted_on_restart(skip) must preserve pending_block in C++ mode"
+    );
+
+    // 2) Startup-generated restart skips for previous window [0,1]
+    let _ = state.generate_restart_skip_votes(WindowIndex::new(1), 2);
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some(),
+        "generate_restart_skip_votes must preserve pending_block in C++ mode"
+    );
+}
+
+#[test]
+fn test_cold_start_delayed_parent_recovery_notarizes_pending_cpp_mode() {
+    // Regression scenario:
+    // - cold startup delay before first active tick
+    // - candidate buffered while parent/state is unavailable
+    // - later parent availability must notarize buffered candidate (no deadlock)
+    let desc = create_test_desc(4, 2);
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    desc.set_time(base_time);
+
+    let mut state = SimplexState::new(&desc, opts_cpp()).expect("Failed to create state");
+    assert!(state.get_next_timeout().is_none(), "constructor path must not arm startup timeout");
+
+    // Candidate for slot 1 depends on slot 0 parent that is not available yet.
+    let parent_hash = UInt256::from([0xB1; 32]);
+    let child_hash = UInt256::from([0xB2; 32]);
+    let candidate = create_test_candidate(
+        1,
+        child_hash.clone(),
+        BlockIdExt::default(),
+        Some((0, parent_hash.clone())),
+        0,
+    );
+    state.on_candidate(&desc, candidate).unwrap();
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some(),
+        "candidate should be buffered while parent/state is unavailable"
+    );
+
+    // Simulate long cold-start delay before the first active processing tick.
+    desc.set_time(base_time + Duration::from_secs(120));
+    state.reset_timeouts_on_start(&desc);
+    state.check_all(&desc);
+
+    // Timeout must be anchored at startup readiness, so there is no immediate skip storm.
+    let early_events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        !early_events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Skip(_)))),
+        "must not emit immediate SkipVote right after startup timeout reset"
+    );
+
+    // Delayed parent availability: notarization for slot 0 arrives later.
+    let notarize_slot0 =
+        Vote::Notarize(NotarizeVote { slot: SlotIndex::new(0), block_hash: parent_hash });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), notarize_slot0.clone(), vec![1]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), notarize_slot0.clone(), vec![2]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), notarize_slot0, vec![3]).unwrap();
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, block_hash }))
+                if *slot == SlotIndex::new(1) && *block_hash == child_hash
+        )),
+        "pending child candidate must be retried and notarized after parent becomes available"
+    );
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_none(),
+        "pending_block must be cleared after successful notarization"
+    );
+}
+
+#[test]
+fn test_alpenglow_mode_skip_clears_existing_pending_block() {
+    // Guardrail: fallback/Alpenglow mode keeps pendingBlocks[k] <- ⊥ on skip.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc, opts_alpenglow()).expect("Failed to create state");
+
+    let parent_hash = UInt256::from([0xC1; 32]);
+    let child_hash = UInt256::from([0xC2; 32]);
+    let candidate =
+        create_test_candidate(1, child_hash, BlockIdExt::default(), Some((0, parent_hash)), 0);
+    state.on_candidate(&desc, candidate).unwrap();
+    assert!(state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_some());
+
+    state.try_skip_window(WindowIndex::new(0));
+    assert!(
+        state.get_window(WindowIndex::new(0)).unwrap().slots[1].pending_block.is_none(),
+        "Alpenglow mode must clear pending_block on skip"
     );
 }
 
@@ -5828,8 +5701,8 @@ fn test_try_notar_not_blocked_by_its_over_after_finalize_restart_cpp_mode() {
 
 #[test]
 fn test_notarized_parent_chain_genesis_base_propagates_across_skipped_windows() {
-    // Regression test for bootstrap deadlock: when use_notarized_parent_chain=true (default
-    // C++ compat mode), skipping an entire window must propagate the available base to the
+    // Regression test for bootstrap deadlock: in the default C++-parity progression path,
+    // skipping an entire window must propagate the available base to the
     // next window via advance_leader_window_on_progress_cursor().
     //
     // Without the fix, advance_leader_window_on_progress_cursor() only advanced the window
@@ -5945,5 +5818,422 @@ fn test_notarized_parent_chain_base_propagates_across_multiple_skipped_windows()
     assert!(
         state.has_available_parent(&desc, SlotIndex::new(3)),
         "window 3 must have available parent after windows 0+1+2 all skipped"
+    );
+}
+
+// =========================================================================
+// Fixed-base deadline tests (C++ timeout_base_ parity)
+//
+// C++ consensus.cpp stores a fixed per-window timeout_base_ and computes
+// all slot deadlines as:  timeout_base + (offset) * target_rate.
+// These tests verify that Rust reproduces the exact same schedule.
+// =========================================================================
+
+#[test]
+fn test_set_timeouts_arms_timeout_base() {
+    // set_timeouts must set timeout_base = now + first_block_timeout
+    // and skip_timestamp = timeout_base + target_rate.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    let first_block = desc.opts().first_block_timeout; // 3s default
+    let target_rate = desc.opts().target_rate; // 1s default
+
+    assert_eq!(
+        state.timeout_base,
+        Some(t0 + first_block),
+        "timeout_base must be t0 + first_block_timeout"
+    );
+    assert_eq!(
+        state.skip_timestamp,
+        Some(t0 + first_block + target_rate),
+        "skip_timestamp must be timeout_base + target_rate"
+    );
+    assert_eq!(state.skip_slot, SlotIndex::new(0));
+}
+
+#[test]
+fn test_notarization_rearm_uses_fixed_base_not_sliding() {
+    // Concrete scenario from C++ parity analysis:
+    // first_block_timeout=3s, target_rate=1s, 4 slots per window.
+    //
+    // Window starts at t0:
+    //   timeout_base = t0 + 3s
+    //   slot 0 deadline = t0 + 4s  (base + 1*rate)
+    //
+    // Slot 0 notarizes "early" at t0 + 2s:
+    //   C++ deadline for slot 1 = base + 2*rate = t0 + 5s  (anchored to base)
+    //   Old Rust would give:      max(t0+4, t0+3) = t0 + 4s  (sliding from now)
+    //
+    // After fix, Rust must produce the C++ answer: t0 + 5s.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    let first_block = desc.opts().first_block_timeout; // 3s
+    let target_rate = desc.opts().target_rate; // 1s
+
+    // Advance to t0+2s and notarize slot 0 (3 out of 4 validators)
+    desc.set_time(t0 + Duration::from_secs(2));
+    let block_hash = UInt256::from_slice(&[0xAA; 32]);
+    let vote =
+        Vote::Notarize(NotarizeVote { slot: SlotIndex::new(0), block_hash: block_hash.clone() });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), vote.clone(), vec![1]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), vote.clone(), vec![2]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), vote, vec![3]).unwrap();
+    while state.pull_event().is_some() {}
+
+    // skip_slot should advance to 1 (watching slot 1 now)
+    assert_eq!(
+        state.skip_slot,
+        SlotIndex::new(1),
+        "skip_slot must advance to 1 after notarization"
+    );
+
+    // C++ formula: alarm = timeout_base + (timeout_slot - window_start) * target_rate
+    // timeout_slot = slot+2 = 2, window_start = 0 → offset = 2
+    // deadline = (t0+3) + 2*1 = t0+5
+    let expected_deadline = t0 + first_block + target_rate * 2;
+    assert_eq!(
+        state.skip_timestamp,
+        Some(expected_deadline),
+        "deadline must be anchored to timeout_base, not to 'now' (expected t0+5s, NOT t0+3s)"
+    );
+
+    // timeout_base must NOT change on notarization
+    assert_eq!(
+        state.timeout_base,
+        Some(t0 + first_block),
+        "timeout_base must remain fixed within the window"
+    );
+}
+
+#[test]
+fn test_notarization_rearm_successive_slots() {
+    // Notarize slots 0, 1, 2 in rapid succession — deadlines must follow the
+    // fixed schedule: base+2*rate, base+3*rate, base+4*rate.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    let first_block = desc.opts().first_block_timeout;
+    let target_rate = desc.opts().target_rate;
+    let base = t0 + first_block;
+
+    for slot_num in 0u32..3 {
+        desc.set_time(t0 + Duration::from_millis(500 * (slot_num as u64 + 1)));
+        let hash = UInt256::from_slice(&[slot_num as u8 + 1; 32]);
+
+        let parent = if slot_num == 0 {
+            None
+        } else {
+            Some((slot_num - 1, UInt256::from_slice(&[slot_num as u8; 32])))
+        };
+        let candidate =
+            create_test_candidate(slot_num, hash.clone(), BlockIdExt::default(), parent, 0);
+        let _ = state.on_candidate(&desc, candidate);
+        while state.pull_event().is_some() {}
+
+        let vote =
+            Vote::Notarize(NotarizeVote { slot: SlotIndex::new(slot_num), block_hash: hash });
+        state.on_vote_test(&desc, ValidatorIndex::new(0), vote.clone(), vec![1]).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(1), vote.clone(), vec![2]).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(2), vote, vec![3]).unwrap();
+        while state.pull_event().is_some() {}
+
+        // C++ timeout_slot_ = slot+2 (non-end-of-window) → offset = slot+2
+        let expected = base + target_rate * (slot_num + 2);
+        assert_eq!(
+            state.skip_timestamp,
+            Some(expected),
+            "slot {} deadline must be base + {}*rate",
+            slot_num,
+            slot_num + 2
+        );
+    }
+}
+
+#[test]
+fn test_notarization_window_end_transitions_to_new_window() {
+    // When the last slot of a window is notarized, the progress cursor crosses
+    // into the next window. C++ handles this via LeaderWindowObserved which
+    // resets the timer. In Rust, advance_leader_window_on_progress_cursor →
+    // set_timeouts re-arms with fresh timeout_base for the new window.
+    //
+    // The guard `skip_slot <= slot` (C++ parity) prevents the per-notarization
+    // timer update from overwriting the freshly set window 1 schedule.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    let target_rate = desc.opts().target_rate;
+
+    // Notarize all 4 slots in window 0
+    for slot_num in 0u32..4 {
+        desc.set_time(t0 + Duration::from_millis(500 * (slot_num as u64 + 1)));
+        let hash = UInt256::from_slice(&[slot_num as u8 + 1; 32]);
+
+        let parent = if slot_num == 0 {
+            None
+        } else {
+            Some((slot_num - 1, UInt256::from_slice(&[slot_num as u8; 32])))
+        };
+        let candidate =
+            create_test_candidate(slot_num, hash.clone(), BlockIdExt::default(), parent, 0);
+        let _ = state.on_candidate(&desc, candidate);
+        while state.pull_event().is_some() {}
+
+        let vote =
+            Vote::Notarize(NotarizeVote { slot: SlotIndex::new(slot_num), block_hash: hash });
+        state.on_vote_test(&desc, ValidatorIndex::new(0), vote.clone(), vec![1]).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(1), vote.clone(), vec![2]).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(2), vote, vec![3]).unwrap();
+        while state.pull_event().is_some() {}
+    }
+
+    // Window transition should have occurred
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "window must advance to 1 after all slots notarized"
+    );
+
+    // set_timeouts for window 1 was called at t0+2s (time of last notarization).
+    // No adaptive backoff because window 0 had no timeouts (had_timeouts=false).
+    let t_last = t0 + Duration::from_millis(2000);
+    let first_block = desc.opts().first_block_timeout; // restored to default (no backoff)
+    let new_base = t_last + first_block;
+    assert_eq!(state.timeout_base, Some(new_base), "timeout_base must be freshly set for window 1");
+    assert_eq!(
+        state.skip_timestamp,
+        Some(new_base + target_rate),
+        "skip_timestamp must be base + target_rate for window 1"
+    );
+    assert_eq!(state.skip_slot, SlotIndex::new(4), "skip_slot must be at window 1 start");
+}
+
+#[test]
+fn test_skip_cert_does_not_move_timer() {
+    // C++ does NOT touch the consensus alarm when a skip certificate arrives.
+    // Skip certs flow through the pool layer only.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    let first_block = desc.opts().first_block_timeout;
+    let target_rate = desc.opts().target_rate;
+
+    let skip_slot_before = state.skip_slot;
+    let skip_ts_before = state.skip_timestamp;
+    let base_before = state.timeout_base;
+
+    assert_eq!(skip_slot_before, SlotIndex::new(0));
+    assert_eq!(skip_ts_before, Some(t0 + first_block + target_rate));
+
+    // Advance time and submit skip cert for slot 0 (3 out of 4)
+    desc.set_time(t0 + Duration::from_millis(500));
+    let skip = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    // Timer state must be UNCHANGED (skip_slot, skip_timestamp, timeout_base)
+    assert_eq!(state.skip_slot, skip_slot_before, "skip_slot must NOT advance on skip cert");
+    assert_eq!(state.skip_timestamp, skip_ts_before, "skip_timestamp must NOT change on skip cert");
+    assert_eq!(state.timeout_base, base_before, "timeout_base must NOT change on skip cert");
+}
+
+#[test]
+fn test_window_skip_clears_timeout_base() {
+    // When process_timeouts fires the C++ window-skip, both skip_timestamp
+    // and timeout_base must be cleared (None).
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    assert!(state.timeout_base.is_some(), "base must be armed after start");
+
+    // Advance well past the first deadline to trigger process_timeouts
+    desc.set_time(t0 + Duration::from_secs(10));
+    state.check_all(&desc);
+    while state.pull_event().is_some() {}
+
+    assert!(state.skip_timestamp.is_none(), "skip_timestamp must be None after C++ window-skip");
+    assert!(state.timeout_base.is_none(), "timeout_base must be None after C++ window-skip");
+    // skip_slot should be at window end (4)
+    assert_eq!(
+        state.skip_slot,
+        SlotIndex::new(4),
+        "skip_slot must be at window end after C++ window-skip"
+    );
+}
+
+#[test]
+fn test_new_window_rearms_timeout_base() {
+    // After a window skip, when progress crosses into a new window,
+    // advance_leader_window_on_progress_cursor → set_timeouts must
+    // re-arm timeout_base with (possibly backed-off) first_block_timeout.
+    let desc = create_test_desc(4, 4);
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    let target_rate = desc.opts().target_rate;
+    let backoff_factor = desc.opts().timeout_increase_factor; // 1.05 default
+
+    // Trigger timeout to skip window 0
+    desc.set_time(t0 + Duration::from_secs(10));
+    state.check_all(&desc);
+    while state.pull_event().is_some() {}
+    assert!(state.timeout_base.is_none(), "base cleared after window skip");
+
+    // Now feed skip certs for all 4 slots (to let progress cursor cross window boundary)
+    let t1 = t0 + Duration::from_secs(11);
+    desc.set_time(t1);
+    for slot_num in 0u32..4 {
+        let skip = Vote::Skip(SkipVote { slot: SlotIndex::new(slot_num) });
+        state.on_vote_test(&desc, ValidatorIndex::new(0), skip.clone(), Vec::new()).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(1), skip.clone(), Vec::new()).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(2), skip, Vec::new()).unwrap();
+    }
+    while state.pull_event().is_some() {}
+
+    // Window 0 had timeouts (had_timeouts=true), so adaptive backoff applies:
+    // first_block_timeout *= timeout_increase_factor (1.05)
+    let backed_off_first_block = desc.opts().first_block_timeout.mul_f64(backoff_factor);
+
+    // Progress cursor should have advanced past window 0, triggering
+    // advance_leader_window_on_progress_cursor → set_timeouts for window 1
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "window must advance to 1 after skip certs"
+    );
+    assert_eq!(
+        state.timeout_base,
+        Some(t1 + backed_off_first_block),
+        "timeout_base must be re-armed for new window (with backoff)"
+    );
+    assert_eq!(
+        state.skip_timestamp,
+        Some(t1 + backed_off_first_block + target_rate),
+        "skip_timestamp must be armed for new window (with backoff)"
+    );
+    assert_eq!(state.skip_slot, SlotIndex::new(4), "skip_slot must be at start of window 1");
+}
+
+/// End-to-end: first leader absent -> full first-window skip -> second leader collates & notarizes.
+///
+/// Scenario (4 validators, 2 slots/window):
+///   Window 0 (leader=v0): skip slot 0, skip slot 1 → window 0 fully skipped.
+///   Window 1 (leader=v1): candidate at slot 2 with genesis parent → notarized by quorum.
+///
+/// This closes the test gap identified in the plan: existing tests verify base propagation
+/// across skipped windows but do NOT assert that the second leader can successfully
+/// submit a candidate and achieve notarization after the first window is entirely skipped.
+#[test]
+fn test_second_leader_collates_after_full_first_window_skip() {
+    let desc = create_test_desc(4, 2); // 4 validators, 2 slots per window
+    let mut state =
+        SimplexState::new(&desc, opts_notarized_parent_chain()).expect("Failed to create state");
+
+    // -- Skip entire window 0 (leader=v0 absent) --
+
+    // Skip slot 0 (quorum = 3 out of 4)
+    let skip0 = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip0.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip0.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip0, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    // Skip slot 1 (last slot in window 0)
+    let skip1 = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip1.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip1.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip1, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    // Verify window advanced and second leader has an available parent
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "window must advance to 1 after full first-window skip"
+    );
+    assert_eq!(state.first_non_progressed_slot, SlotIndex::new(2));
+    assert!(
+        state.has_available_parent(&desc, SlotIndex::new(2)),
+        "second leader must have available parent (genesis base propagated)"
+    );
+
+    // -- Second leader (v1) submits candidate for slot 2 with genesis parent --
+
+    let block2 = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([0x22; 32]),
+        UInt256::from([0x33; 32]),
+    );
+    let candidate2 = create_test_candidate(2, UInt256::from([0x22; 32]), block2.clone(), None, 1);
+    state.on_candidate(&desc, candidate2).expect("second leader candidate must be accepted");
+
+    // Drain events — expect our own NotarVote to be broadcast
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(|e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(v))
+            if v.slot == SlotIndex::new(2))),
+        "our node must broadcast a NotarVote for slot 2 after second leader's candidate"
+    );
+
+    // -- Notarize slot 2 with quorum votes --
+
+    let notar2 = Vote::Notarize(NotarizeVote {
+        slot: SlotIndex::new(2),
+        block_hash: block2.root_hash.clone(),
+    });
+    state.on_vote_test(&desc, ValidatorIndex::new(1), notar2.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), notar2.clone(), Vec::new()).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(3), notar2, Vec::new()).unwrap();
+    while state.pull_event().is_some() {}
+
+    // Verify slot 2 is notarized
+    assert!(
+        state.has_notarized_block(SlotIndex::new(2)),
+        "slot 2 must be notarized after quorum votes — second leader recovery works"
+    );
+
+    // Progress cursor must advance past slot 2
+    assert!(
+        state.first_non_progressed_slot > SlotIndex::new(2),
+        "progress cursor must advance past notarized slot 2, got {}",
+        state.first_non_progressed_slot
     );
 }

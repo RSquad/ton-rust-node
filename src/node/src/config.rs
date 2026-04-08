@@ -1177,7 +1177,7 @@ impl TonNodeConfig {
 
 pub enum ConfigEvent {
     AddValidatorAdnlKey(Arc<KeyId>, i32),
-    //RemoveValidatorAdnlKey(Arc<KeyId>, i32)
+    RemoveValidatorAdnlKey(Arc<KeyId>, i32),
 }
 
 #[async_trait::async_trait]
@@ -1484,13 +1484,21 @@ impl NodeConfigHandler {
     }
 
     async fn revision_validator_keys(
+        self: &Arc<Self>,
         validator_keys: &Arc<ValidatorKeys>,
         config: &mut TonNodeConfig,
+        subscribers: &[Arc<dyn NodeConfigSubscriber>],
     ) -> Result<()> {
         if let Some(config_validator_keys) = &config.validator_keys {
             if config_validator_keys.len() > 2 {
                 let oldest_validator_key = NodeConfigHandler::get_oldest_validator_key(config);
                 if let Some(oldest_key) = oldest_validator_key {
+                    log::info!(
+                        "revision_validator_keys: removing oldest key \
+                        election_id={} adnl={:?}",
+                        oldest_key.election_id,
+                        oldest_key.validator_adnl_key_id,
+                    );
                     config
                         .remove_validator_key(
                             oldest_key.validator_key_id.clone(),
@@ -1499,8 +1507,34 @@ impl NodeConfigHandler {
                         .await?;
                     validator_keys.remove(&oldest_key)?;
                     config.remove_key_from_key_ring(&oldest_key.validator_key_id.clone()).await?;
-                    if let Some(adnl_key_id) = oldest_key.validator_adnl_key_id {
-                        config.remove_key_from_key_ring(&adnl_key_id).await?;
+                    if let Some(adnl_key_id) = &oldest_key.validator_adnl_key_id {
+                        config.remove_key_from_key_ring(adnl_key_id).await?;
+                        // Notify subscribers to clean up ADNL/QUIC/DHT state
+                        // for the removed key.
+                        let adnl_key_bytes = base64_decode(adnl_key_id)?;
+                        let adnl_key_id =
+                            KeyId::from_data(adnl_key_bytes[..].try_into().map_err(|_| {
+                                error!("Invalid ADNL key length for {adnl_key_id}")
+                            })?);
+                        let election_id = oldest_key.election_id;
+                        for subscriber in subscribers.iter() {
+                            let subscriber = subscriber.clone();
+                            let adnl_key_id = adnl_key_id.clone();
+                            self.runtime_handle.spawn(async move {
+                                if let Err(e) = subscriber
+                                    .event(ConfigEvent::RemoveValidatorAdnlKey(
+                                        adnl_key_id,
+                                        election_id,
+                                    ))
+                                    .await
+                                {
+                                    log::warn!(
+                                        "revision_validator_keys: \
+                                        RemoveValidatorAdnlKey subscriber error: {e:?}"
+                                    );
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -1537,8 +1571,8 @@ impl NodeConfigHandler {
             });
         }
 
-        // check validator keys
-        Self::revision_validator_keys(validator_keys, config).await?;
+        // check validator keys — remove oldest if more than 2
+        self.revision_validator_keys(validator_keys, config, subscribers).await?;
         config.save_to_file(&config.file_name).await?;
         Ok(())
     }

@@ -67,17 +67,22 @@ struct RestartSingleSessionListener {
 
     // Progress tracking (slot-based, not round-based for SIMPLEX_ROUNDLESS mode)
     last_slot_seen: AtomicU32,
-    last_committed_slot: AtomicU32,
+    last_finalized_slot: AtomicU32,
+    finalized_blocks_count: AtomicU32,
     collation_count: AtomicU32,
 
     // Restart markers
     restart_started: AtomicBool,
     first_slot_after_restart: AtomicU32, // u32::MAX means unset
-    seqno_updates_enabled: AtomicBool,
 
-    // Seqno tracking (simulates engine head in tests)
-    next_expected_collation_seqno: AtomicU32,
-    next_expected_commit_seqno: AtomicU32,
+    /// Maximum finalized seqno observed so far (out-of-order safe).
+    /// Used for `initial_block_seqno` on restart and as fallback in
+    /// `on_generate_slot` Implicit (genesis-only) case.
+    max_finalized_seqno: AtomicU32,
+
+    /// Tracks finalized seqno -> BlockIdExt.
+    /// Invariant: each seqno is finalized exactly once with the same block identity.
+    finalized_seqnos: Mutex<HashMap<u32, BlockIdExt>>,
 
     // Recovery verification
     approved_candidate_requests: AtomicU32,
@@ -92,13 +97,13 @@ impl RestartSingleSessionListener {
             public_key,
             candidates: Mutex::new(HashMap::new()),
             last_slot_seen: AtomicU32::new(0),
-            last_committed_slot: AtomicU32::new(0),
+            last_finalized_slot: AtomicU32::new(0),
+            finalized_blocks_count: AtomicU32::new(0),
             collation_count: AtomicU32::new(0),
             restart_started: AtomicBool::new(false),
             first_slot_after_restart: AtomicU32::new(u32::MAX),
-            seqno_updates_enabled: AtomicBool::new(true),
-            next_expected_collation_seqno: AtomicU32::new(initial_block_seqno),
-            next_expected_commit_seqno: AtomicU32::new(initial_block_seqno),
+            max_finalized_seqno: AtomicU32::new(initial_block_seqno),
+            finalized_seqnos: Mutex::new(HashMap::new()),
             approved_candidate_requests: AtomicU32::new(0),
             max_errors_count: AtomicU32::new(0),
         }
@@ -107,13 +112,10 @@ impl RestartSingleSessionListener {
     fn mark_restart_started(&self) {
         self.restart_started.store(true, Ordering::Release);
         self.first_slot_after_restart.store(u32::MAX, Ordering::Release);
-        // During restart recovery (FullReplay), we may get replay callbacks before
-        // the first new on_generate_slot. Those must NOT advance seqno trackers.
-        self.seqno_updates_enabled.store(false, Ordering::Release);
     }
 
     fn initial_block_seqno_for_restart(&self) -> u32 {
-        self.next_expected_commit_seqno.load(Ordering::SeqCst)
+        self.max_finalized_seqno.load(Ordering::SeqCst)
     }
 
     #[allow(dead_code)]
@@ -121,8 +123,12 @@ impl RestartSingleSessionListener {
         self.last_slot_seen.load(Ordering::SeqCst)
     }
 
-    fn last_committed_slot(&self) -> u32 {
-        self.last_committed_slot.load(Ordering::SeqCst)
+    fn last_finalized_slot(&self) -> u32 {
+        self.last_finalized_slot.load(Ordering::SeqCst)
+    }
+
+    fn finalized_blocks_count(&self) -> u32 {
+        self.finalized_blocks_count.load(Ordering::SeqCst)
     }
 
     fn first_slot_after_restart(&self) -> Option<u32> {
@@ -178,36 +184,19 @@ impl SessionListener for RestartSingleSessionListener {
         let collation_num = self.collation_count.fetch_add(1, Ordering::SeqCst);
 
         if self.restart_started.load(Ordering::Acquire) {
-            // Capture first slot observed after restart (use collation count as proxy)
-            if self
-                .first_slot_after_restart
+            self.first_slot_after_restart
                 .compare_exchange(u32::MAX, collation_num, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                // Now we are in normal operation after restart.
-                self.seqno_updates_enabled.store(true, Ordering::Release);
-            }
+                .ok();
         }
 
         self.last_slot_seen.fetch_max(collation_num, Ordering::SeqCst);
 
-        // Derive seqno from explicit parent hint or use counter for implicit case.
-        //
-        // Important: `on_generate_slot` can be called multiple times for the same slot
-        // (collation retry / timeout). Until a block is actually committed, we MUST
-        // keep returning the same seqno.
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                // Genesis / bootstrap case: use counter (don't increment - may retry)
-                self.next_expected_collation_seqno.load(Ordering::SeqCst)
+                // Genesis only — no parent block exists yet.
+                self.max_finalized_seqno.load(Ordering::SeqCst)
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => {
-                // Explicit parent: derive seqno from parent (parent_seqno + 1)
-                let derived_seqno = parent_id.seq_no + 1;
-                // Update counter to match derived seqno for next iteration
-                self.next_expected_collation_seqno.store(derived_seqno, Ordering::SeqCst);
-                derived_seqno
-            }
+            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
         };
 
         log::info!(
@@ -264,12 +253,26 @@ impl SessionListener for RestartSingleSessionListener {
         _source_info: BlockSourceInfo,
         _root_hash: BlockHash,
         _file_hash: BlockHash,
+        _data: BlockPayloadPtr,
+        _signatures: BlockSignaturesVariant,
+        _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+        _stats: consensus_common::SessionStats,
+    ) {
+        panic!(
+            "on_block_committed must not be called for Simplex sessions (finalized-driven only)"
+        );
+    }
+
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
+        _source_info: BlockSourceInfo,
+        _root_hash: BlockHash,
+        _file_hash: BlockHash,
         data: BlockPayloadPtr,
         signatures: BlockSignaturesVariant,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
-        stats: consensus_common::SessionStats,
     ) {
-        // Extract slot from Simplex signatures (SIMPLEX_ROUNDLESS: round is always u32::MAX)
         let slot = match &signatures {
             BlockSignaturesVariant::Simplex(s) => s.slot,
             _ => unreachable!(
@@ -277,36 +280,31 @@ impl SessionListener for RestartSingleSessionListener {
             ),
         };
         self.last_slot_seen.fetch_max(slot, Ordering::SeqCst);
-        self.last_committed_slot.fetch_max(slot, Ordering::SeqCst);
+        self.last_finalized_slot.fetch_max(slot, Ordering::SeqCst);
+        self.finalized_blocks_count.fetch_add(1, Ordering::SeqCst);
 
-        // Track max errors count
-        self.max_errors_count.fetch_max(stats.errors_count, Ordering::SeqCst);
+        let seqno = block_id.seq_no();
 
-        // For normal operation, advance seqno trackers.
-        // For restart recommit callbacks (before the first on_generate_slot after restart),
-        // keep seqno trackers stable to match engine-head semantics.
-        if self.seqno_updates_enabled.load(Ordering::Acquire) {
-            let is_empty = data.data().is_empty();
-            if is_empty {
-                // Empty blocks inherit parent's seqno, do not advance commit seqno.
-                let current = self.next_expected_commit_seqno.load(Ordering::SeqCst);
-                self.next_expected_collation_seqno.store(current, Ordering::SeqCst);
-            } else {
-                let committed = self.next_expected_commit_seqno.fetch_add(1, Ordering::SeqCst);
-                let next = committed + 1;
-                self.next_expected_collation_seqno.store(next, Ordering::SeqCst);
+        // Invariant: each seqno is finalized exactly once with the same block identity.
+        if let Ok(mut seen) = self.finalized_seqnos.lock() {
+            if let Some(prev) = seen.get(&seqno) {
+                assert_eq!(
+                    *prev, block_id,
+                    "DUPLICATE finalization for seqno {seqno} with different block_id: \
+                    prev={prev:?} new={block_id:?} (slot={slot})"
+                );
+                panic!("DUPLICATE finalization for seqno {} (slot={})", seqno, slot);
             }
+            seen.insert(seqno, block_id.clone());
+        }
+
+        if !data.data().is_empty() {
+            self.max_finalized_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
         }
     }
 
     fn on_block_skipped(&self, _round: u32) {
-        // NOTE: In SIMPLEX_ROUNDLESS mode, on_block_skipped is not called.
-        // Keep this for trait completeness.
-        if self.seqno_updates_enabled.load(Ordering::Acquire) {
-            // Reset collation seqno to commit seqno (flush precollations)
-            let current_commit_seqno = self.next_expected_commit_seqno.load(Ordering::SeqCst);
-            self.next_expected_collation_seqno.store(current_commit_seqno, Ordering::SeqCst);
-        }
+        unreachable!("on_block_skipped should not be called in Simplex");
     }
 
     fn get_approved_candidate(
@@ -335,15 +333,6 @@ impl SessionListener for RestartSingleSessionListener {
                 root_hash.to_hex_string()
             ))),
         }
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
     }
 }
 
@@ -438,7 +427,7 @@ fn init_test_logger(test_name: &str) -> Arc<AtomicU32> {
     Test runner
 */
 
-fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrategy) {
+fn run_single_node_restart_test(test_name: &str) {
     if !is_test_logging_enabled() {
         return;
     }
@@ -467,13 +456,14 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
     let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
 
     // Session options: fast timings for test speed and deterministic init
+    // Keep timings relaxed enough to avoid debug-mode skip storms, which can
+    // produce sparse finalized snapshots and make restart behavior flaky.
     let session_opts = SessionOptions {
         proto_version: 0,
-        target_rate: Duration::from_millis(50),
-        first_block_timeout: Duration::from_millis(300),
+        target_rate: Duration::from_millis(100),
+        first_block_timeout: Duration::from_millis(900),
         slots_per_leader_window: 1,
         wait_for_db_init: true,
-        restart_recommit_strategy: strategy,
         ..Default::default()
     };
 
@@ -484,7 +474,7 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
     let listener =
         Arc::new(RestartSingleSessionListener::new(public_key.clone(), initial_block_seqno));
     let session_listener: Arc<dyn SessionListener + Send + Sync> = listener.clone();
-    log::info!("Starting session phase 1: strategy={:?}, db_path={}", strategy, db_path);
+    log::info!("Starting session phase 1: finalized-driven, db_path={}", db_path);
 
     let session_1 = SessionFactory::create_session(
         &session_opts,
@@ -506,29 +496,28 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
             log::error!("PANIC-1: session panicked during phase 1 (restart test '{}')", test_name);
             panic!("session panicked during phase 1");
         }
-        // Wait for N finalized (committed) slots before restart.
-        // We use `last_committed_slot` to track finalized slots.
-        if listener.last_committed_slot() + 1 >= rounds_before_restart {
+        // Wait for N finalized callbacks before restart.
+        if listener.finalized_blocks_count() >= rounds_before_restart {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    if listener.last_committed_slot() + 1 < rounds_before_restart {
+    if listener.finalized_blocks_count() < rounds_before_restart {
         log::error!(
-            "TIMEOUT in phase 1: did not reach {} committed slots within {:?} (last_committed_slot={})",
-            rounds_before_restart,
-            PHASE_TIMEOUT,
-            listener.last_committed_slot(),
+            "TIMEOUT in phase 1: did not reach {rounds_before_restart} finalized callbacks \
+            within {PHASE_TIMEOUT:?} (finalized_count={}, last_finalized_slot={})",
+            listener.finalized_blocks_count(),
+            listener.last_finalized_slot(),
         );
         panic!(
-            "phase 1 did not reach {} committed slots within {:?} (last_committed_slot={})",
-            rounds_before_restart,
-            PHASE_TIMEOUT,
-            listener.last_committed_slot(),
+            "phase 1 did not reach {rounds_before_restart} finalized callbacks \
+            within {PHASE_TIMEOUT:?} (finalized_count={}, last_finalized_slot={})",
+            listener.finalized_blocks_count(),
+            listener.last_finalized_slot(),
         );
     }
 
-    let last_committed_slot_before = listener.last_committed_slot();
+    let last_finalized_slot_before = listener.last_finalized_slot();
     let collation_before = listener.collation_count();
 
     // Stop session 1 and give some time for DB handles to close
@@ -540,10 +529,9 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
     let restart_initial_seqno = listener.initial_block_seqno_for_restart();
 
     log::info!(
-        "Starting session phase 2 (restart): last_committed_slot_before={}, restart_initial_seqno={}, db_path={}",
-        last_committed_slot_before,
-        restart_initial_seqno,
-        db_path
+        "Starting session phase 2 (restart): \
+        last_finalized_slot_before={last_finalized_slot_before}, \
+        restart_initial_seqno={restart_initial_seqno}, db_path={db_path}"
     );
 
     let session_2 = SessionFactory::create_session(
@@ -582,13 +570,13 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
         }
     };
 
-    // Note: first_after is collation count (starting from 0), last_committed_slot is from signatures
+    // Note: first_after is collation count (starting from 0), last_finalized_slot is from signatures
     // After restart, the collation count resets but we just need to verify we got a collation request
     // The slot monotonicity is now verified by seqno tracking, not by comparing collation counts
     log::info!(
-        "Restart slot check: first_collation_after_restart={}, last_committed_slot_before={}",
+        "Restart slot check: first_collation_after_restart={}, last_finalized_slot_before={}",
         first_after,
-        last_committed_slot_before
+        last_finalized_slot_before
     );
 
     // Also require that collation actually happened after restart
@@ -605,10 +593,9 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
     }
     if listener.collation_count() < collation_before + 2 {
         log::error!(
-            "TIMEOUT in phase 2: expected at least 2 new collations after restart (before={}, after={}) within {:?}",
-            collation_before,
-            listener.collation_count(),
-            PHASE_TIMEOUT
+            "TIMEOUT in phase 2: expected at least 2 new collations after restart \
+            (before={collation_before}, after={}) within {PHASE_TIMEOUT:?}",
+            listener.collation_count()
         );
         panic!(
             "expected at least 2 new collations after restart (before={}, after={}) within {:?}",
@@ -631,12 +618,10 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
     thread::sleep(Duration::from_millis(100));
 
     log::info!(
-        "Restart test '{}' complete: strategy={:?}, last_committed_slot_before={}, first_collation_after_restart={}, collations_before={}, collations_after={}, approved_candidate_requests={}",
-        test_name,
-        strategy,
-        last_committed_slot_before,
-        first_after,
-        collation_before,
+        "Restart test '{test_name}' complete: \
+        last_finalized_slot_before={last_finalized_slot_before}, \
+        first_collation_after_restart={first_after}, collations_before={collation_before}, \
+        collations_after={}, approved_candidate_requests={}",
         listener.collation_count(),
         listener.approved_candidate_requests()
     );
@@ -648,16 +633,5 @@ fn run_single_node_restart_test(test_name: &str, strategy: RestartRecommitStrate
 
 #[test]
 fn test_single_session_restart_round_monotonicity_first_commit_after_finalized() {
-    run_single_node_restart_test(
-        "simplex_restart_single_first_commit",
-        RestartRecommitStrategy::FirstCommitAfterFinalized,
-    );
-}
-
-#[test]
-fn test_single_session_restart_round_monotonicity_full_replay() {
-    run_single_node_restart_test(
-        "simplex_restart_single_full_replay",
-        RestartRecommitStrategy::FullReplay,
-    );
+    run_single_node_restart_test("simplex_restart_single_first_commit");
 }
