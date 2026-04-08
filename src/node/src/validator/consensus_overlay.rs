@@ -8,10 +8,11 @@
  */
 use super::consensus::{
     ConsensusNode, ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListenerPtr,
-    ConsensusOverlayManager, ConsensusOverlayPtr, OverlayTransportType, PrivateKey,
+    ConsensusOverlayManager, ConsensusOverlayPtr, PrivateKey,
 };
 use crate::engine_traits::PrivateOverlayOperations;
 use adnl::PrivateOverlayShortId;
+use consensus_common::OverlayTransportType;
 use std::sync::Arc;
 use ton_block::{Result, UInt256};
 

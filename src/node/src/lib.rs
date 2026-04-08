@@ -8,7 +8,6 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-pub mod archive_import;
 pub mod block;
 pub mod block_proof;
 pub mod boot;

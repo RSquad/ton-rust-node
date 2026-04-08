@@ -238,8 +238,6 @@ These are the targets you can configure in the `loggers` section:
 | `storage` | Data storage |
 | `index` | Data indexing |
 | `ext_messages` | External message handling |
-| `quic` | QUIC transport protocol |
-| `simplex` | Simplex consensus protocol |
 | `telemetry` | Telemetry and metrics |
 
 > **Note:** HTTP requests (JSON-RPC, metrics endpoints) are not logged by the node. There is no logger target for HTTP request tracing.

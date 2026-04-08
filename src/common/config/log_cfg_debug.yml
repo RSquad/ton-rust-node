@@ -45,8 +45,6 @@ loggers:
     level: debug
   rldp:
     level: info
-  quic:
-    level: warn
 
   ton_block:
     level: off

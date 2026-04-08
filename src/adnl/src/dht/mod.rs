@@ -234,7 +234,7 @@ impl OverlayNodeResolveContext {
     }
 
     pub async fn resolve(&mut self, dht: &Arc<DhtNode>) -> Result<Option<IpAddress>> {
-        Ok(dht.find_address(&mut self.search).await?.map(|(ip, _, _)| ip))
+        Ok(dht.find_address(&mut self.search).await?.map(|(ip, _)| ip))
     }
 }
 
@@ -417,7 +417,7 @@ impl DhtNode {
     pub async fn fetch_address(
         &self,
         key_id: &Arc<KeyId>,
-    ) -> Result<Option<(IpAddress, Option<IpAddress>, Arc<dyn KeyOption>)>> {
+    ) -> Result<Option<(IpAddress, Arc<dyn KeyOption>)>> {
         let key = Self::dht_key_from_key_id(key_id, "address");
         let value = self.network.search_dht_key(&hash(key)?);
         if let Some(value) = value {
@@ -432,7 +432,7 @@ impl DhtNode {
     pub async fn find_address(
         self: &Arc<Self>,
         ctx_search: &mut AddressSearchContext,
-    ) -> Result<Option<(IpAddress, Option<IpAddress>, Arc<dyn KeyOption>)>> {
+    ) -> Result<Option<(IpAddress, Arc<dyn KeyOption>)>> {
         let mut addr_list = self
             .find_value(
                 &ctx_search.key_id,
@@ -641,7 +641,7 @@ impl DhtNode {
 
     /// Node IP address
     pub fn ip_address(&self) -> &IpAddress {
-        self.adnl.ip_address_adnl()
+        self.adnl.ip_address()
     }
 
     /// Node key
@@ -666,7 +666,7 @@ impl DhtNode {
     pub async fn store_ip_address(self: &Arc<Self>, key: &Arc<dyn KeyOption>) -> Result<bool> {
         log::debug!(target: TARGET, "Storing key ID {}", key.id());
         let addr_list = self.adnl.build_address_list(None)?;
-        let addrs = AdnlNode::parse_address_list(&addr_list)?
+        let addr = AdnlNode::parse_address_list(&addr_list)?
             .ok_or_else(|| error!("INTERNAL ERROR: cannot parse generated address list"))?;
         let value = serialize_boxed(&addr_list.into_boxed())?;
         let value = Self::sign_value("address", value, key)?;
@@ -683,14 +683,17 @@ impl DhtNode {
                 while let Some((_, object)) = objects.pop() {
                     if let Ok(addr_list) = object.downcast::<AddressListBoxed>() {
                         let addr_list = addr_list.only();
-                        if let Some(stored) = AdnlNode::parse_address_list(&addr_list)? {
-                            if stored == addrs {
-                                log::debug!(target: TARGET, "Checked stored address {stored:?}");
+                        if let Some(ip) = AdnlNode::parse_address_list(&addr_list)? {
+                            if ip == addr {
+                                //dht.adnl.ip_address() {
+                                log::debug!(target: TARGET, "Checked stored address {:?}", ip);
                                 return Ok(true);
                             } else {
                                 log::warn!(
                                     target: TARGET,
-                                    "Found another stored address {stored:?}, expected {addrs:?}"
+                                    "Found another stored address {:?}, expected {:?}",
+                                    ip,
+                                    self.adnl.ip_address()
                                 )
                             }
                         } else {
@@ -767,16 +770,13 @@ impl DhtNode {
             log::warn!(target: TARGET, "Error when verifying DHT peer: {}", e);
             return Ok(None);
         }
-        let (adnl_addr, quic_addr) =
-            if let Some(addrs) = AdnlNode::parse_address_list(&peer.addr_list)? {
-                addrs
-            } else {
-                log::warn!(target: TARGET, "Wrong DHT peer address {:?}", peer.addr_list);
-                return Ok(None);
-            };
-        let peer_key: Arc<dyn KeyOption> = (&peer.id).try_into()?;
-        let ret =
-            self.adnl.add_peer(network.node_key.id(), &adnl_addr, quic_addr.as_ref(), &peer_key)?;
+        let addr = if let Some(addr) = AdnlNode::parse_address_list(&peer.addr_list)? {
+            addr
+        } else {
+            log::warn!(target: TARGET, "Wrong DHT peer address {:?}", peer.addr_list);
+            return Ok(None);
+        };
+        let ret = self.adnl.add_peer(network.node_key.id(), &addr, &((&peer.id).try_into()?))?;
         let ret = if let Some(ret) = ret { ret } else { return Ok(None) };
         if network.known_peers.all().put(ret.clone())? {
             let key1 = network.node_key.id().data();
@@ -964,13 +964,11 @@ impl DhtNode {
     fn parse_value_as_address(
         key: DhtKeyDescription,
         value: TLObject,
-    ) -> Result<(IpAddress, Option<IpAddress>, Arc<dyn KeyOption>)> {
+    ) -> Result<(IpAddress, Arc<dyn KeyOption>)> {
         if let Ok(addr_list) = value.downcast::<AddressListBoxed>() {
-            let addr_list = addr_list.only();
-            let (adnl_addr, quic_addr) = AdnlNode::parse_address_list(&addr_list)?
+            let ip_address = AdnlNode::parse_address_list(&addr_list.only())?
                 .ok_or_else(|| error!("Wrong address list in DHT search"))?;
-            let peer_key: Arc<dyn KeyOption> = (&key.id).try_into()?;
-            Ok((adnl_addr, quic_addr, peer_key))
+            Ok((ip_address, (&key.id).try_into()?))
         } else {
             fail!("Address list type mismatch in DHT search")
         }

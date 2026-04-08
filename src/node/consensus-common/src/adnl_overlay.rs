@@ -36,16 +36,15 @@ use ton_api::{
     deserialize_boxed, serialize_bare, serialize_boxed, serialize_boxed_append,
     ton::{
         catchain::BroadcastWrapper,
-        consensus::simplex::{Certificate as SimplexCertificate, Vote as SimplexVote},
         overlay::{
-            broadcast::BroadcastTwostepSimple, broadcast_twostep::id::Id as BroadcastTwostepId,
+            broadcast::BroadcastTwostepSimple,
             broadcast_twostep_simple::tosign::ToSign as BroadcastTwostepSimpleToSign,
             Certificate as OverlayCertificate,
         },
     },
-    BoxedSerialize, IntoBoxed, Serializer, TLObject,
+    BoxedSerialize, IntoBoxed, TLObject,
 };
-use ton_block::{error, fail, sha256_digest, KeyId, KeyOption, UInt256};
+use ton_block::{error, fail};
 
 const LOG_TARGET: &str = "consensus_adnl_overlay";
 
@@ -121,8 +120,7 @@ impl TaskProcessor {
             const TASK_AGE_WARNING_THRESHOLD: Duration = Duration::from_secs(5);
             const WARNING_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
 
-            // Allow first warning immediately
-            let mut last_warning_time = Instant::now() - WARNING_THROTTLE_INTERVAL;
+            let mut last_warning_time = Instant::now() - WARNING_THROTTLE_INTERVAL; // Allow first warning immediately
 
             log::debug!(target: LOG_TARGET, "TaskProcessor loop started: {}", name_clone);
 
@@ -143,14 +141,8 @@ impl TaskProcessor {
                         if let Ok(elapsed) = task_desc.creation_time.elapsed() {
                             if elapsed > TASK_AGE_WARNING_THRESHOLD {
                                 let now = Instant::now();
-                                if now.duration_since(last_warning_time)
-                                    >= WARNING_THROTTLE_INTERVAL
-                                {
-                                    log::warn!(
-                                        target: LOG_TARGET,
-                                        "TaskProcessor {name_clone}: \
-                                        Processing delayed task (age: {elapsed:?})"
-                                    );
+                                if now.duration_since(last_warning_time) >= WARNING_THROTTLE_INTERVAL {
+                                    log::warn!(target: LOG_TARGET, "TaskProcessor {}: Processing delayed task (age: {:?})", name_clone, elapsed);
                                     last_warning_time = now;
                                 }
                             }
@@ -161,10 +153,7 @@ impl TaskProcessor {
                     }
                     Ok(None) => {
                         // Channel closed
-                        log::debug!(
-                            target: LOG_TARGET,
-                            "TaskProcessor channel closed: {name_clone}"
-                        );
+                        log::debug!(target: LOG_TARGET, "TaskProcessor channel closed: {}", name_clone);
                         break;
                     }
                     Err(_) => {
@@ -189,11 +178,7 @@ impl TaskProcessor {
         F: FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static,
     {
         if self.stop_requested.load(Ordering::Relaxed) {
-            log::trace!(
-                target: LOG_TARGET,
-                "TaskProcessor {} stop requested, ignoring posted closure",
-                self.name
-            );
+            log::trace!(target: LOG_TARGET, "TaskProcessor {} stop requested, ignoring posted closure", self.name);
             return;
         }
 
@@ -226,24 +211,14 @@ impl TaskProcessor {
         while !self.is_stopped.load(Ordering::Relaxed) {
             if wait_count % 10 == 0 {
                 // Log every second
-                log::info!(
-                    target: LOG_TARGET,
-                    "TaskProcessor {}: Waiting for stop completion... ({}ms)",
-                    self.name,
-                    wait_count * 100
-                );
+                log::info!(target: LOG_TARGET, "TaskProcessor {}: Waiting for stop completion... ({}ms)", self.name, wait_count * 100);
             }
 
             std::thread::sleep(STOP_WAIT_DELAY);
             wait_count += 1;
         }
 
-        log::debug!(
-            target: LOG_TARGET,
-            "TaskProcessor {}: Stopped after {}ms",
-            self.name,
-            wait_count * 100
-        );
+        log::debug!(target: LOG_TARGET, "TaskProcessor {}: Stopped after {}ms", self.name, wait_count * 100);
     }
 }
 
@@ -276,10 +251,7 @@ impl TaskProcessorManager {
         num_tags: u32,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
-        log::info!(
-            target: LOG_TARGET,
-            "Creating TaskProcessorManager {name} with {num_tags} tags"
-        );
+        log::info!(target: LOG_TARGET, "Creating TaskProcessorManager {} with {} tags", name, num_tags);
 
         let metrics_handle = MetricsHandle::new(Some(Duration::from_secs(30)));
         let mut processors = HashMap::new();
@@ -300,11 +272,7 @@ impl TaskProcessorManager {
             processors.insert(tag, processor);
         }
 
-        log::info!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {name}: Created and started {} TaskProcessors",
-            processors.len()
-        );
+        log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Created and started {} TaskProcessors", name, processors.len());
 
         let manager = Self {
             name: name.clone(),
@@ -328,10 +296,7 @@ impl TaskProcessorManager {
         let is_stopped = self.is_stopped.clone();
         let manager_name = self.name.clone();
 
-        log::debug!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {manager_name}: Starting metrics reporting"
-        );
+        log::debug!(target: LOG_TARGET, "TaskProcessorManager {}: Starting metrics reporting", manager_name);
 
         let _handle = self.runtime_handle.spawn(async move {
             const METRICS_DUMP_PERIOD: Duration = Duration::from_secs(30);
@@ -339,10 +304,7 @@ impl TaskProcessorManager {
 
             let mut next_metrics_dump_time = SystemTime::now() + METRICS_DUMP_PERIOD;
 
-            log::debug!(
-                target: LOG_TARGET,
-                "TaskProcessorManager {manager_name}: Metrics loop started"
-            );
+            log::debug!(target: LOG_TARGET, "TaskProcessorManager {}: Metrics loop started", manager_name);
 
             while !stop_requested.load(Ordering::Relaxed) {
                 tokio::time::sleep(SLEEP_PERIOD).await;
@@ -354,23 +316,15 @@ impl TaskProcessorManager {
                         let mut metrics_dumper = Self::create_metrics_dumper(&processor_names);
                         metrics_dumper.update(&metrics_handle);
 
-                        log::debug!(
-                            target: LOG_TARGET,
-                            "TaskProcessorManager {manager_name} metrics:"
-                        );
-                        metrics_dumper.dump(
-                            |string| log::debug!(target: LOG_TARGET, "{manager_name}: {string}"),
-                        );
+                        log::debug!(target: LOG_TARGET, "TaskProcessorManager {} metrics:", manager_name);
+                        metrics_dumper.dump(|string| log::debug!(target: LOG_TARGET, "{}: {}", manager_name, string));
                     }
 
                     next_metrics_dump_time = SystemTime::now() + METRICS_DUMP_PERIOD;
                 }
             }
 
-            log::debug!(
-                target: LOG_TARGET,
-                "TaskProcessorManager {manager_name}: Metrics loop finished"
-            );
+            log::debug!(target: LOG_TARGET, "TaskProcessorManager {}: Metrics loop finished", manager_name);
 
             // Mark as actually stopped
             is_stopped.store(true, Ordering::Relaxed);
@@ -406,32 +360,20 @@ impl TaskProcessorManager {
         F: FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static,
     {
         if self.stop_requested.load(Ordering::Relaxed) {
-            log::trace!(
-                target: LOG_TARGET,
-                "TaskProcessorManager {} is stopped, ignoring posted closure",
-                self.name
-            );
+            log::trace!(target: LOG_TARGET, "TaskProcessorManager {} is stopped, ignoring posted closure", self.name);
             return;
         }
 
         if let Some(processor) = self.processors.get(&tag) {
             processor.post_closure(closure);
         } else {
-            log::warn!(
-                target: LOG_TARGET,
-                "TaskProcessorManager {}: No TaskProcessor found for tag {tag}",
-                self.name
-            );
+            log::warn!(target: LOG_TARGET, "TaskProcessorManager {}: No TaskProcessor found for tag {}", self.name, tag);
         }
     }
 
     /// Stop all task processors asynchronously
     pub fn stop_async(&self) {
-        log::info!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {}: Stopping asynchronously",
-            self.name
-        );
+        log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Stopping asynchronously", self.name);
 
         self.stop_requested.store(true, Ordering::Relaxed);
 
@@ -443,11 +385,7 @@ impl TaskProcessorManager {
 
     /// Stop all task processors and wait for completion
     pub fn stop(&self) {
-        log::info!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {}: Stopping synchronously",
-            self.name
-        );
+        log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Stopping synchronously", self.name);
 
         self.stop_async();
 
@@ -458,12 +396,7 @@ impl TaskProcessorManager {
         while !self.is_stopped.load(Ordering::Relaxed) {
             if wait_count % 10 == 0 {
                 // Log every second
-                log::info!(
-                    target: LOG_TARGET,
-                    "TaskProcessorManager {}: Waiting for stop completion... ({}ms)",
-                    self.name,
-                    wait_count * 100
-                );
+                log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Waiting for stop completion... ({}ms)", self.name, wait_count * 100);
             }
 
             std::thread::sleep(STOP_WAIT_DELAY);
@@ -471,39 +404,20 @@ impl TaskProcessorManager {
         }
 
         // Manually stop all task processors
-        log::debug!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {}: Stopping {} TaskProcessors",
-            self.name,
-            self.processors.len()
-        );
+        log::debug!(target: LOG_TARGET, "TaskProcessorManager {}: Stopping {} TaskProcessors", self.name, self.processors.len());
         for (tag, processor) in &self.processors {
-            log::trace!(
-                target: LOG_TARGET,
-                "TaskProcessorManager {}: Stopping TaskProcessor for tag={tag}",
-                self.name
-            );
+            log::trace!(target: LOG_TARGET, "TaskProcessorManager {}: Stopping TaskProcessor for tag={}", self.name, tag);
 
             processor.stop();
         }
 
-        log::info!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {}: Stopped after {}ms",
-            self.name,
-            wait_count * 100
-        );
+        log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Stopped after {}ms", self.name, wait_count * 100);
     }
 }
 
 impl Drop for TaskProcessorManager {
     fn drop(&mut self) {
-        log::info!(
-            target: LOG_TARGET,
-            "TaskProcessorManager {}: Dropping with {} processors",
-            self.name,
-            self.processors.len()
-        );
+        log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Dropping with {} processors", self.name, self.processors.len());
         self.stop();
         log::info!(target: LOG_TARGET, "TaskProcessorManager {}: Dropped", self.name);
     }
@@ -514,8 +428,8 @@ impl Drop for TaskProcessorManager {
 */
 
 struct Peer {
-    src_adnl_addr: Arc<KeyId>,
-    dst_adnl_addr: Arc<KeyId>,
+    src_adnl_addr: Arc<ton_block::KeyId>,
+    dst_adnl_addr: Arc<ton_block::KeyId>,
     overlay_node: Arc<OverlayNode>,
     dht_node: Arc<DhtNode>,
     is_stop_requested: Arc<AtomicBool>,
@@ -525,8 +439,8 @@ struct Peer {
 impl Peer {
     /// Create new peer and start address resolution loop
     fn new(
-        src_adnl_addr: Arc<KeyId>,
-        dst_adnl_addr: Arc<KeyId>,
+        src_adnl_addr: Arc<ton_block::KeyId>,
+        dst_adnl_addr: Arc<ton_block::KeyId>,
         overlay_node: Arc<OverlayNode>,
         dht_node: Arc<DhtNode>,
         runtime_handle: tokio::runtime::Handle,
@@ -572,7 +486,7 @@ impl Peer {
 
             // Try to fetch address from DHT
             match self.dht_node.fetch_address(&self.dst_adnl_addr).await {
-                Ok(Some((adnl_addr, quic_addr, key))) => {
+                Ok(Some((addr, key))) => {
                     // Check if address changed (first time or address different)
                     let addr_changed = current_addr.is_none();
 
@@ -583,44 +497,28 @@ impl Peer {
                                 &self.src_adnl_addr,
                                 &[self.dst_adnl_addr.clone()],
                             ) {
-                                log::warn!(
-                                    target: LOG_TARGET,
-                                    "Error deleting old peer address: {e:?}"
-                                );
+                                log::warn!(target: LOG_TARGET, "Error deleting old peer address: {:?}", e);
                             }
                         }
 
                         // Add new address
-                        let add_result = self.overlay_node.add_private_peers(
-                            &self.src_adnl_addr,
-                            vec![(adnl_addr, quic_addr, key)],
-                        );
+                        let add_result = self
+                            .overlay_node
+                            .add_private_peers(&self.src_adnl_addr, vec![(addr, key)]);
 
                         if let Err(e) = add_result {
                             log::warn!(target: LOG_TARGET, "Error adding peer address: {:?}", e);
                         } else {
-                            log::debug!(
-                                target: LOG_TARGET,
-                                "Peer address updated: {:?}",
-                                self.dst_adnl_addr
-                            );
+                            log::debug!(target: LOG_TARGET, "Peer address updated: {:?}", self.dst_adnl_addr);
                             current_addr = Some(()); // Mark that we have an address
                         }
                     }
                 }
                 Ok(None) => {
-                    log::trace!(
-                        target: LOG_TARGET,
-                        "Peer address not found in DHT: {:?}",
-                        self.dst_adnl_addr
-                    );
+                    log::trace!(target: LOG_TARGET, "Peer address not found in DHT: {:?}", self.dst_adnl_addr);
                 }
                 Err(e) => {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "DHT fetch error for peer {:?}: {e:?}",
-                        self.dst_adnl_addr
-                    );
+                    log::warn!(target: LOG_TARGET, "DHT fetch error for peer {:?}: {:?}", self.dst_adnl_addr, e);
                 }
             }
         }
@@ -644,12 +542,7 @@ impl Peer {
 
     /// Stop peer resolution loop synchronously and wait for completion
     fn stop(&self) {
-        log::trace!(
-            target: LOG_TARGET,
-            "Stopping Peer: {:?} -> {:?}",
-            self.src_adnl_addr,
-            self.dst_adnl_addr
-        );
+        log::trace!(target: LOG_TARGET, "Stopping Peer: {:?} -> {:?}", self.src_adnl_addr, self.dst_adnl_addr);
 
         // Stop the resolution loop
         self.stop_async();
@@ -670,12 +563,7 @@ impl Peer {
             }
         }
 
-        log::trace!(
-            target: LOG_TARGET,
-            "Peer resolution loop finished: {:?} -> {:?}",
-            self.src_adnl_addr,
-            self.dst_adnl_addr
-        );
+        log::trace!(target: LOG_TARGET, "Peer resolution loop finished: {:?} -> {:?}", self.src_adnl_addr, self.dst_adnl_addr);
     }
 }
 
@@ -691,7 +579,8 @@ impl Drop for Peer {
 */
 
 struct PeerStorage {
-    peers: Arc<std::sync::Mutex<HashMap<(Arc<KeyId>, Arc<KeyId>), Weak<Peer>>>>,
+    peers:
+        Arc<std::sync::Mutex<HashMap<(Arc<ton_block::KeyId>, Arc<ton_block::KeyId>), Weak<Peer>>>>,
 }
 
 impl PeerStorage {
@@ -702,8 +591,8 @@ impl PeerStorage {
     /// Get or create peer for given src/dst ADNL addresses
     fn get_peer(
         self: &Arc<Self>,
-        src_adnl_addr: Arc<KeyId>,
-        dst_adnl_addr: Arc<KeyId>,
+        src_adnl_addr: Arc<ton_block::KeyId>,
+        dst_adnl_addr: Arc<ton_block::KeyId>,
         overlay_node: Arc<OverlayNode>,
         dht_node: Arc<DhtNode>,
         runtime_handle: tokio::runtime::Handle,
@@ -777,10 +666,7 @@ impl AdnlOverlayConsumer {
         overlay: Weak<AdnlOverlay>,
         stop_requested: Arc<AtomicBool>,
     ) -> Self {
-        log::debug!(
-            target: LOG_TARGET,
-            "Creating AdnlOverlayConsumer for overlay_id={overlay_id}"
-        );
+        log::debug!(target: LOG_TARGET, "Creating AdnlOverlayConsumer for overlay_id={}", overlay_id);
         Self { overlay_id, overlay, stop_requested }
     }
 }
@@ -805,9 +691,9 @@ impl Subscriber for AdnlOverlayConsumer {
         };
 
         // Handle simplex direct messages (may come as custom messages in some paths)
-        let simplex_kind = if object.is::<SimplexVote>() {
+        let simplex_kind = if object.is::<ton_api::ton::consensus::simplex::Vote>() {
             Some("vote")
-        } else if object.is::<SimplexCertificate>() {
+        } else if object.is::<ton_api::ton::consensus::simplex::Certificate>() {
             Some("certificate")
         } else {
             None
@@ -834,11 +720,7 @@ impl Subscriber for AdnlOverlayConsumer {
     async fn try_consume_query(&self, query: TLObject, _peers: &AdnlPeers) -> Result<QueryResult> {
         // Check if overlay is stopped
         if self.stop_requested.load(Ordering::Relaxed) {
-            log::warn!(
-                target: LOG_TARGET,
-                "AdnlOverlayConsumer: Overlay {} was stopped!",
-                &self.overlay_id
-            );
+            log::warn!(target: LOG_TARGET, "AdnlOverlayConsumer: Overlay {} was stopped!", &self.overlay_id);
             fail!("Overlay {} was stopped!", &self.overlay_id);
         }
 
@@ -846,11 +728,7 @@ impl Subscriber for AdnlOverlayConsumer {
         if let Some(overlay) = self.overlay.upgrade() {
             overlay.process_query(query, _peers).await
         } else {
-            log::warn!(
-                target: LOG_TARGET,
-                "AdnlOverlayConsumer: Overlay {} was dropped!",
-                &self.overlay_id
-            );
+            log::warn!(target: LOG_TARGET, "AdnlOverlayConsumer: Overlay {} was dropped!", &self.overlay_id);
             fail!("Overlay {} was dropped!", &self.overlay_id);
         }
     }
@@ -861,11 +739,11 @@ impl Subscriber for AdnlOverlayConsumer {
 */
 
 struct AdnlOverlay {
-    stack: Arc<NetworkStack>,                //ADNL network stack
-    overlay_id: Arc<PrivateOverlayShortId>,  //private overlay short identifier
-    local_id: PublicKeyHash,                 //local validator key hash
-    local_validator_key: Arc<dyn KeyOption>, //local validator key for signing broadcasts
-    local_adnl_key: Arc<dyn KeyOption>,      //local ADNL key for two-step broadcast signing
+    stack: Arc<NetworkStack>,                           //ADNL network stack
+    overlay_id: Arc<PrivateOverlayShortId>,             //private overlay short identifier
+    local_id: PublicKeyHash,                            //local validator key hash
+    local_validator_key: Arc<dyn ton_block::KeyOption>, //local validator key for signing broadcasts
+    local_adnl_key: Arc<dyn ton_block::KeyOption>, //local ADNL key for two-step broadcast signing
     adnl_to_validator: HashMap<PublicKeyHash, PublicKeyHash>, //ADNL key hash → validator key hash
     all_node_ids: Vec<PublicKeyHash>, //all node ADNL IDs in the overlay for multicast emulation of broadcast messages
     listener: ConsensusOverlayListenerPtr, //consensus overlay listener for incoming events
@@ -907,7 +785,7 @@ impl AdnlOverlay {
         );
 
         // Find local ADNL key from nodes by matching local_id
-        let mut local_adnl_key: Option<Arc<dyn KeyOption>> = None;
+        let mut local_adnl_key: Option<Arc<dyn ton_block::KeyOption>> = None;
         let mut peers = Vec::new();
 
         for node in nodes {
@@ -935,12 +813,12 @@ impl AdnlOverlay {
             peers.len()
         );
 
-        // Register QUIC keys if QUIC is enabled
-        let quic_enabled = if use_quic {
+        // Register QUIC keys and create transport if QUIC is enabled
+        let transport = if use_quic {
             if let Some(quic) = &stack.quic {
                 // Register local validator's ADNL key as a TLS identity on a per-port endpoint
                 let key_bytes: [u8; 32] = *local_adnl_key.pvt_key()?;
-                let ip_addr = stack.adnl.ip_address_adnl();
+                let ip_addr = stack.adnl.ip_address();
                 let quic_port =
                     ip_addr.port().checked_add(adnl::QuicNode::OFFSET_PORT).ok_or_else(|| {
                         error!(
@@ -983,7 +861,7 @@ impl AdnlOverlay {
             overlay_id: &overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        stack.overlay.add_private_overlay(params, &local_adnl_key, &peers, use_quic)?;
+        stack.overlay.add_private_overlay(params, &local_adnl_key, &peers)?;
 
         let stop_requested = Arc::new(AtomicBool::new(false));
 
@@ -1020,8 +898,11 @@ impl AdnlOverlay {
                 stop_requested.clone(),
             ));
 
-            // Point-to-point multicast is used for broadcasts when TCP transport is available
-            let is_tcp_available = stack.is_tcp_available() && allow_tcp_communication;
+            // Point-to-point multicast is used for broadcasts when TCP or QUIC
+            // transport is available (FEC/UDP broadcast has no peers in private overlays).
+            let is_tcp_available =
+                (stack.is_tcp_available() && allow_tcp_communication) || transport;
+
             if is_tcp_available {
                 log::debug!(
                     target: LOG_TARGET,
@@ -1067,7 +948,7 @@ impl AdnlOverlay {
                 peers: peer_objects,
                 peers_storage: peer_storage.clone(),
                 is_tcp_available: is_tcp_available,
-                is_quic_available: quic_enabled,
+                is_quic_available: transport,
                 all_node_ids: all_node_ids,
                 task_processor_manager,
             }
@@ -1094,11 +975,7 @@ impl AdnlOverlay {
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
-            log::trace!(
-                target: LOG_TARGET,
-                "AdnlOverlay already stopped: overlay_id={}",
-                self.overlay_id
-            );
+            log::trace!(target: LOG_TARGET, "AdnlOverlay already stopped: overlay_id={}", self.overlay_id);
             return; // Already stopped
         }
 
@@ -1116,11 +993,7 @@ impl AdnlOverlay {
             }
         });
 
-        log::trace!(
-            target: LOG_TARGET,
-            "AdnlOverlay: Will cleanup {} peers on drop",
-            self.peers.len()
-        );
+        log::trace!(target: LOG_TARGET, "AdnlOverlay: Will cleanup {} peers on drop", self.peers.len());
 
         log::debug!(
             target: LOG_TARGET,
@@ -1132,11 +1005,7 @@ impl AdnlOverlay {
 
     /// Process incoming query from consumer
     pub async fn process_query(&self, query: TLObject, peers: &AdnlPeers) -> Result<QueryResult> {
-        log::trace!(
-            target: LOG_TARGET,
-            "AdnlOverlay::process_query: overlay_id={}",
-            self.overlay_id
-        );
+        log::trace!(target: LOG_TARGET, "AdnlOverlay::process_query: overlay_id={}", self.overlay_id);
 
         let now = Instant::now();
         let data = serialize_boxed(&query).map_err(|e| {
@@ -1180,18 +1049,16 @@ impl AdnlOverlay {
                     Box::new(move |result| {
                         // Check if stopped before responding
                         if stop_requested_clone.load(Ordering::Relaxed) {
-                            log::trace!(
-                                target: LOG_TARGET,
-                                "AdnlOverlay: Query response cancelled - overlay stopped"
-                            );
+                            log::trace!(target: LOG_TARGET, "AdnlOverlay: Query response cancelled - overlay stopped");
                             wait_for_response.respond(None);
                             return;
                         }
 
                         // Transform BlockPayloadPtr result to Answer
                         let answer_result = result.and_then(|payload| {
-                            deserialize_boxed(payload.data())
-                                .map(|answer| Some(Answer::Object(answer.into())))
+                            deserialize_boxed(payload.data()).map(|answer| {
+                                Some(Answer::Object(answer.into()))
+                            })
                         });
                         wait_for_response.respond(Some(answer_result));
                     }),
@@ -1199,25 +1066,16 @@ impl AdnlOverlay {
             }
 
             // Wait for response
-            let res = wait
-                .wait(&mut queue_reader, true)
-                .await
+            let res = wait.wait(&mut queue_reader, true).await
                 .ok_or_else(|| {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "AdnlOverlay: Waiting returned an internal error (query: {query:?})"
-                    );
+                    log::warn!(target: LOG_TARGET, "AdnlOverlay: Waiting returned an internal error (query: {:?})", query);
                     error!("Waiting returned an internal error!")
                 })?
                 .ok_or_else(|| error!("Answer was not set!"))?;
 
             // Log timing and metrics
             let elapsed = now.elapsed();
-            log::trace!(
-                target: LOG_TARGET,
-                "AdnlOverlay: query elapsed: {}ms",
-                elapsed.as_millis()
-            );
+            log::trace!(target: LOG_TARGET, "AdnlOverlay: query elapsed: {}ms", elapsed.as_millis());
             metrics::histogram!("ton_node_network_consensus_overlay_query_seconds").record(elapsed);
 
             Ok(TimedAnswer {
@@ -1262,11 +1120,7 @@ impl AdnlOverlay {
 
     /// Start broadcast listeners (similar to CatchainClient::run_wait_broadcast)
     pub fn run_wait_broadcast(self: Arc<Self>) {
-        log::trace!(
-            target: LOG_TARGET,
-            "Starting broadcast listeners for overlay_id={}",
-            self.overlay_id
-        );
+        log::trace!(target: LOG_TARGET, "Starting broadcast listeners for overlay_id={}", self.overlay_id);
 
         let overlay_id = self.overlay_id.clone();
         let overlay = Arc::downgrade(&self);
@@ -1331,86 +1185,59 @@ impl AdnlOverlay {
 
         // Spawn task for consensus broadcasts
         self.runtime_handle.spawn(async move {
-            log::trace!(
-                target: LOG_TARGET,
-                "AdnlOverlay::wait_consensus_broadcast started for overlay_id={overlay_id}"
-            );
+            log::trace!(target: LOG_TARGET, "AdnlOverlay::wait_consensus_broadcast started for overlay_id={}", overlay_id);
 
             let receiver = overlay_node.clone();
             let consensus_listener = listener.clone();
 
             loop {
                 if stop_requested2.load(Ordering::Relaxed) {
-                    log::trace!(
-                        target: LOG_TARGET,
-                        "AdnlOverlay::wait_consensus_broadcast stopping for overlay_id={overlay_id}"
-                    );
+                    log::trace!(target: LOG_TARGET, "AdnlOverlay::wait_consensus_broadcast stopping for overlay_id={}", overlay_id);
                     break;
                 }
 
                 let message = receiver.wait_for_catchain(&overlay_id).await;
                 match message {
                 Ok(Some((catchain_block_update, inner_update, source_id))) => {
-                    log::trace!(
-                        target: LOG_TARGET,
-                        "AdnlOverlay: catchain broadcast ValidatorSession_BlockUpdate received"
-                    );
+                    log::trace!(target: LOG_TARGET, "AdnlOverlay: catchain broadcast ValidatorSession_BlockUpdate received");
                     if let Some(listener) = consensus_listener.upgrade() {
                         // Serialize catchain block update and inner update similar to reference
                         let mut data: crate::RawBuffer = crate::RawBuffer::default();
-                        let mut serializer = Serializer::new(&mut data);
+                        let mut serializer = ton_api::Serializer::new(&mut data);
 
                         match serializer.write_boxed(&catchain_block_update.into_boxed()) {
                             Ok(_) => {
                                 match inner_update {
                                     CatchainData::Catchain(upd) => {
                                         if let Err(e) = serializer.write_boxed(&upd.into_boxed()) {
-                                            log::error!(
-                                                target: LOG_TARGET,
-                                                "AdnlOverlay: Failed to serialize catchain update: {e}"
-                                            );
+                                            log::error!(target: LOG_TARGET, "AdnlOverlay: Failed to serialize catchain update: {}", e);
                                             continue;
                                         }
                                     }
                                     CatchainData::ValidatorSession(upd) => {
                                         if let Err(e) = serializer.write_boxed(&upd.into_boxed()) {
-                                            log::error!(
-                                                target: LOG_TARGET,
-                                                "AdnlOverlay: Failed to serialize validator session update: {e}"
-                                            );
+                                            log::error!(target: LOG_TARGET, "AdnlOverlay: Failed to serialize validator session update: {}", e);
                                             continue;
                                         }
                                     }
                                 }
 
                                 let data = crate::ConsensusCommonFactory::create_block_payload(data);
-                                log::trace!(
-                                    target: LOG_TARGET,
-                                    "AdnlOverlay: routing consensus broadcast to listener via on_message"
-                                );
+                                log::trace!(target: LOG_TARGET, "AdnlOverlay: routing consensus broadcast to listener via on_message");
                                 listener.on_message(source_id, &data);
                             }
                             Err(e) => {
-                                log::error!(
-                                    target: LOG_TARGET,
-                                    "AdnlOverlay: Failed to serialize catchain block update: {e}"
-                                );
+                                log::error!(target: LOG_TARGET, "AdnlOverlay: Failed to serialize catchain block update: {}", e);
                             }
                         }
                     }
                 }
                     Ok(None) => {
-                        log::trace!(
-                            target: LOG_TARGET,
-                            "AdnlOverlay::wait_consensus_broadcast finished for overlay_id={overlay_id}"
-                        );
+                        log::trace!(target: LOG_TARGET, "AdnlOverlay::wait_consensus_broadcast finished for overlay_id={}", overlay_id);
                         break;
                     }
                     Err(e) => {
-                        log::error!(
-                            target: LOG_TARGET,
-                            "AdnlOverlay: consensus broadcast error: {e}"
-                        );
+                        log::error!(target: LOG_TARGET, "AdnlOverlay: consensus broadcast error: {}", e);
                     }
                 }
             }
@@ -1456,11 +1283,7 @@ impl ConsensusOverlay for AdnlOverlay {
         _is_retransmission: bool,
     ) {
         if self.stop_requested.load(Ordering::Relaxed) {
-            log::warn!(
-                target: LOG_TARGET,
-                "AdnlOverlay: Overlay {} was stopped!",
-                &self.overlay_id
-            );
+            log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &self.overlay_id);
             return;
         }
 
@@ -1628,24 +1451,21 @@ impl ConsensusOverlay for AdnlOverlay {
                 let mut query_data = overlay_node.get_query_prefix(&overlay_id)?;
                 serialize_boxed_append(&mut query_data, &query_body)?;
 
-                let (data, _) = overlay_node
-                    .query_via_rldp(
-                        &dst_adnl_id,
-                        &TaggedByteSlice {
-                            object: &query_data[..],
-                            #[cfg(feature = "telemetry")]
-                            tag: query_body.bare_object().constructor(),
-                        },
-                        &overlay_id,
-                        Some(max_answer_size),
-                        v2,
-                        None,
-                    )
-                    .await?;
+                let (data, _) = overlay_node.query_via_rldp(
+                    &dst_adnl_id,
+                    &TaggedByteSlice {
+                        object: &query_data[..],
+                        #[cfg(feature = "telemetry")]
+                        tag: query_body.bare_object().constructor(),
+                    },
+                    &overlay_id,
+                    Some(max_answer_size),
+                    v2,
+                    None,
+                ).await?;
                 let data = data.ok_or_else(|| error!("answer is None!"))?;
                 Ok(crate::ConsensusCommonFactory::create_block_payload(data))
-            }
-            .await;
+            }.await;
 
             log::info!(target: LOG_TARGET, "AdnlOverlay::send_query_via_rldp: {:?}", result);
 
@@ -1653,10 +1473,7 @@ impl ConsensusOverlay for AdnlOverlay {
             if !stop_requested.load(Ordering::Relaxed) {
                 response_callback(result);
             } else {
-                log::trace!(
-                    target: LOG_TARGET,
-                    "AdnlOverlay: Skipping RLDP query callback - overlay stopped"
-                );
+                log::trace!(target: LOG_TARGET, "AdnlOverlay: Skipping RLDP query callback - overlay stopped");
             }
         });
     }
@@ -1667,71 +1484,16 @@ impl ConsensusOverlay for AdnlOverlay {
         sender_id: &PublicKeyHash,
         _send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
-        extra: Option<Vec<u8>>,
     ) {
         let overlay_id = self.overlay_id.clone();
         let stop_requested = self.stop_requested.clone();
 
         if stop_requested.load(Ordering::Relaxed) {
-            log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {overlay_id} was stopped!");
+            log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &overlay_id);
             return;
         }
 
-        if self.is_quic_available || !self.is_tcp_available {
-            // QUIC or ADNL/UDP path
-            // If extra given, use two-step broadcast via QUIC/RLDP
-            // Otherwise use canonic broadcast via ADNL
-            let msg = payload.clone();
-            let overlay_node = self.stack.overlay.clone();
-            let local_validator_key = self.local_validator_key.clone();
-            let transport = if self.is_quic_available { "QUIC" } else { "ADNL/UDP" };
-
-            self.runtime_handle.spawn(async move {
-                if stop_requested.load(Ordering::Relaxed) {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "AdnlOverlay: Overlay {overlay_id} was stopped!"
-                    );
-                    return;
-                }
-
-                let msg_tagged = TaggedByteSlice {
-                    object: msg.data(),
-                    #[cfg(feature = "telemetry")]
-                    tag: 0x80000002, // Consensus broadcast
-                };
-
-                let result = if let Some(extra) = extra {
-                    // Twostep broadcast with extra
-                    overlay_node
-                        .broadcast_twostep(
-                            &overlay_id,
-                            &msg_tagged,
-                            Some(&local_validator_key),
-                            0,
-                            extra,
-                        )
-                        .await
-                } else {
-                    // Canonic broadcast
-                    overlay_node
-                        .broadcast(
-                            &overlay_id,
-                            &msg_tagged,
-                            Some(&local_validator_key),
-                            0,
-                            AdnlSendMethod::Fast,
-                        )
-                        .await
-                };
-
-                log::debug!(
-                    target: LOG_TARGET,
-                    "AdnlOverlay::send_broadcast_fec_ex ({transport}) status: {result:?}"
-                );
-            });
-        } else {
-            // TCP path: manually build BroadcastTwostepSimple and multicast
+        if self.is_tcp_available {
             const IS_RETRANSMISSION: bool = false;
 
             log::trace!(
@@ -1741,34 +1503,39 @@ impl ConsensusOverlay for AdnlOverlay {
                 payload.data().len(), self.all_node_ids.len(),
             );
 
+            // Build C++-compatible overlay.broadcastTwostepSimple instead of
+            // the Rust-only catchain.BroadcastWrapper.  This uses the local ADNL
+            // key for signing (matching C++ Simplex behaviour) so that both Rust
+            // and C++ nodes can verify and deliver the broadcast.
             let result = (|| -> Result<()> {
                 let data = payload.data().to_vec();
-                let extra = extra.unwrap_or_default();
                 let date = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs() as i32;
                 let flags: i32 = 0;
 
-                let data_hash = sha256_digest(&data);
+                // Compute broadcast_id for to_sign
+                let data_hash = ton_block::sha256_digest(&data);
                 let bcast_id = {
+                    use ton_api::ton::overlay::broadcast_twostep::id::Id as BroadcastTwostepId;
                     let id = BroadcastTwostepId {
                         date,
                         flags,
-                        src: UInt256::from_slice(self.local_adnl_key.id().data()),
-                        src_adnl_id: UInt256::from_slice(self.local_adnl_key.id().data()),
-                        data_hash: UInt256::with_array(data_hash),
-                        // Broadcast simulation over TCP, no partitioning
-                        data_size: data.len() as i32,
+                        src: ton_block::UInt256::from_slice(self.local_adnl_key.id().data()),
+                        src_adnl_id: ton_block::UInt256::from_slice(
+                            self.local_adnl_key.id().data(),
+                        ),
+                        data_hash: ton_block::UInt256::with_array(data_hash),
                         part_size: data.len() as i32,
-                        extra: extra.clone(),
                     };
                     let id_bytes = serialize_bare(&id)?;
-                    sha256_digest(&id_bytes)
+                    ton_block::sha256_digest(&id_bytes)
                 };
 
+                // Sign: BroadcastTwostepSimpleToSign { id, data }
                 let to_sign = BroadcastTwostepSimpleToSign {
-                    id: UInt256::with_array(bcast_id),
+                    id: ton_block::UInt256::with_array(bcast_id),
                     data: data.clone(),
                 };
                 let to_sign_bytes = serialize_bare(&to_sign)?;
@@ -1779,10 +1546,9 @@ impl ConsensusOverlay for AdnlOverlay {
                     date,
                     flags,
                     src: (&self.local_adnl_key).try_into()?,
-                    src_adnl_id: UInt256::from_slice(self.local_adnl_key.id().data()),
+                    src_adnl_id: ton_block::UInt256::from_slice(self.local_adnl_key.id().data()),
                     certificate: OverlayCertificate::Overlay_EmptyCertificate,
                     data,
-                    extra,
                     signature,
                 }
                 .into_boxed();
@@ -1796,7 +1562,7 @@ impl ConsensusOverlay for AdnlOverlay {
                 log::trace!(
                     target: LOG_TARGET,
                     "AdnlOverlay::send_broadcast_fec_ex: sending BroadcastTwostepSimple \
-                    ({} bytes payload) via TCP multicast to {} peers",
+                     ({} bytes payload) via multicast to {} peers",
                     broadcast_payload.data().len(),
                     self.all_node_ids.len(),
                 );
@@ -1813,9 +1579,37 @@ impl ConsensusOverlay for AdnlOverlay {
             if let Err(err) = result {
                 log::error!(
                     target: LOG_TARGET,
-                    "AdnlOverlay::send_broadcast_fec_ex: failed to build/send TCP broadcast: {err}"
+                    "AdnlOverlay::send_broadcast_fec_ex: failed to build/send two-step broadcast: {err}"
                 );
             }
+        } else {
+            let msg = payload.clone();
+            let overlay_node = self.stack.overlay.clone();
+            let local_validator_key = self.local_validator_key.clone();
+            let runtime_handle = self.runtime_handle.clone();
+
+            runtime_handle.spawn(async move {
+                if stop_requested.load(Ordering::Relaxed) {
+                    log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &overlay_id);
+                    return;
+                }
+
+                let msg_tagged = TaggedByteSlice {
+                    object: msg.data(),
+                    #[cfg(feature = "telemetry")]
+                    tag: 0x80000002, // Catchain broadcast
+                };
+
+                let result = overlay_node.broadcast(
+                    &overlay_id,
+                    &msg_tagged,
+                    Some(&local_validator_key),
+                    0,
+                    AdnlSendMethod::Fast,
+                ).await;
+
+                log::debug!(target: LOG_TARGET, "AdnlOverlay::send_broadcast_fec_ex status: {:?}", result);
+            });
         }
     }
 }
@@ -1923,10 +1717,7 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
             // Add to managed overlays atomically
             overlays.insert(overlay_short_id.clone(), overlay.clone());
 
-            log::trace!(
-                target: LOG_TARGET,
-                "Successfully started overlay: overlay_id={overlay_short_id}"
-            );
+            log::trace!(target: LOG_TARGET, "Successfully started overlay: overlay_id={}", overlay_short_id);
 
             overlay
         };
@@ -1950,10 +1741,7 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
             overlay_impl.stop();
             self.overlays.lock().remove(overlay_short_id);
         } else {
-            log::warn!(
-                target: LOG_TARGET,
-                "Cannot downcast overlay to AdnlOverlay: overlay_id={overlay_short_id}"
-            );
+            log::warn!(target: LOG_TARGET, "Cannot downcast overlay to AdnlOverlay: overlay_id={}", overlay_short_id);
         }
     }
 }

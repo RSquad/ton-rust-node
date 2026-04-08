@@ -13,8 +13,6 @@ use crate::block_handle_db::BlockHandle;
 mod package_index_db;
 
 pub mod archive_manager;
-pub mod db_provider;
-pub mod epoch;
 pub mod package;
 pub mod package_entry;
 pub mod package_entry_id;
@@ -23,7 +21,7 @@ mod archive_slice;
 mod block_index_db;
 mod file_maps;
 mod package_entry_meta_db;
-pub mod package_id;
+mod package_id;
 mod package_info;
 mod package_offsets_db;
 mod package_status_db;

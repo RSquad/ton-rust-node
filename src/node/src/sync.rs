@@ -57,9 +57,6 @@ impl ArchiveContext {
             master + self.shards_count
         }
     }
-    fn has_retryable_shards(&self) -> bool {
-        self.absent_shards.values().any(|&retries| retries > 0)
-    }
 }
 
 #[derive(Default, Debug)]
@@ -364,7 +361,8 @@ pub(crate) async fn start_sync(
                 Some(Some((seq_no, Err(e)))) => {
                     log::error!(
                         target: TARGET,
-                        "Error while downloading package seq_no {seq_no}: {e}"
+                        "Error while downloading package seq_no {}: {}",
+                        seq_no, e
                     );
                     download(&mut sync_context, seq_no, None)
                 }
@@ -376,8 +374,8 @@ pub(crate) async fn start_sync(
                         fail!("INTERNAL ERROR: sync queue broken")
                     };
                     sync_context.downloads -= update;
-                    let incomplete =
-                        archive_context.master.is_none() || archive_context.has_retryable_shards();
+                    let incomplete = archive_context.master.is_none()
+                        || !archive_context.absent_shards.is_empty();
                     let archive_context = if incomplete {
                         Some(archive_context)
                     } else if seq_no_recv <= last_mc_block_id.seq_no() + 1 {
@@ -403,7 +401,8 @@ pub(crate) async fn start_sync(
                             Err(e) => {
                                 log::error!(
                                     target: TARGET,
-                                    "Cannot apply downloaded package for MC seq_no = {seq_no_recv}: {e}"
+                                    "Cannot apply downloaded package for MC seq_no = {}: {}",
+                                    seq_no_recv, e
                                 );
                                 download(&mut sync_context, seq_no_recv, None);
                                 None
@@ -416,21 +415,6 @@ pub(crate) async fn start_sync(
                         None
                     };
                     if let Some(mut archive_context) = archive_context {
-                        if !archive_context.has_retryable_shards()
-                            && archive_context.master.is_some()
-                        {
-                            // All absent shard retries exhausted — skip this archive
-                            // and move on rather than looping forever
-                            log::warn!(
-                                target: TARGET,
-                                "Giving up on MC seq_no {seq_no_recv}: \
-                                shard retries exhausted for {:?}",
-                                archive_context.absent_shards.keys().collect::<Vec<_>>()
-                            );
-                            queue.remove(index);
-                            sync_context.concurrency = max_concurrency;
-                            break;
-                        }
                         let mut msg = format!(
                             "{}, need shards {}",
                             if archive_context.master.is_none() {
@@ -440,10 +424,8 @@ pub(crate) async fn start_sync(
                             },
                             archive_context.need_shards,
                         );
-                        for (shard, retries) in &archive_context.absent_shards {
-                            msg.push_str(
-                                format!(", shard {shard} absent (retries={retries})").as_str(),
-                            );
+                        for shard in archive_context.absent_shards.keys() {
+                            msg.push_str(format!(", shard {shard} absent").as_str());
                         }
                         for shard in archive_context.loaded_shards.keys() {
                             msg.push_str(format!(", shard {shard} loaded").as_str());
@@ -453,7 +435,7 @@ pub(crate) async fn start_sync(
                             "Incomplete archive detected for MC seq_no {seq_no_recv}: {msg}"
                         );
                         let (_, status) = &mut queue[index];
-                        if archive_context.has_retryable_shards() {
+                        if !archive_context.absent_shards.is_empty() {
                             archive_context.need_shards = true;
                         }
                         *status = ArchiveStatus::Incomplete(archive_context);
@@ -512,41 +494,26 @@ async fn download_archives(
         tasks.push(task);
     }
     if archive_context.need_shards {
-        let mut scheduled_shards = HashSet::new();
         for i in 0..archive_context.shards_count {
             let shard = ShardIdent::with_tagged_prefix(
                 BASE_WORKCHAIN_ID,
                 ((i as u64) * 2 + 1) << (63 - sync_context.engine.get_monitor_min_split()),
             )?;
-            scheduled_shards.insert(shard.clone());
             if archive_context.loaded_shards.get(&shard).is_some() {
                 continue;
             }
             let retry = archive_context.absent_shards.entry(shard.clone()).or_insert(SHARD_RETRIES);
-            if *retry == 0 {
-                continue;
+            if *retry == 1 {
+                archive_context.absent_shards.remove(&shard);
+            } else {
+                *retry -= 1;
             }
-            *retry -= 1;
             let context = sync_context.clone();
             let task = tokio::spawn(async move {
                 let shard = Some(shard);
                 (shard.clone(), download_archive(&context, shard, mc_seq_no).await)
             });
             tasks.push(task);
-        }
-        // Decrement retries for absent shards not covered by min_split
-        // (e.g. shards from a different split depth in the MC block)
-        for (shard, retries) in archive_context.absent_shards.iter_mut() {
-            if scheduled_shards.contains(shard) || *retries == 0 {
-                continue;
-            }
-            log::warn!(
-                target: TARGET,
-                "Shard {shard} absent but not in min_split layout, \
-                decrementing retries ({retries} -> {})",
-                *retries - 1
-            );
-            *retries -= 1;
         }
     }
     if tasks.is_empty() {
@@ -760,7 +727,7 @@ async fn import_shard_blocks(
                         }
                     };
                     if let Some(block) = block {
-                        engine.apply_block(&handle, &block, mc_handle.id().seq_no(), false).await?;
+                        engine.apply_block(&handle, &block, mc_seq_no, false).await?;
                         return Ok(id);
                     }
                 }
@@ -770,7 +737,7 @@ async fn import_shard_blocks(
                     unapplied blocks. Will try to download it directly"
                 );
                 absent_blocks.fetch_add(1, Ordering::Relaxed);
-                engine.download_and_apply_block(&id, mc_handle.id().seq_no(), false).await?;
+                engine.download_and_apply_block(&id, mc_seq_no, false).await?;
                 Ok(id)
             });
             tasks.push(task)
@@ -787,9 +754,7 @@ async fn import_shard_blocks(
         if !bad_shards.is_empty() {
             for shard in bad_shards {
                 archive_context.loaded_shards.remove(&shard);
-                // Use or_insert to avoid resetting retry counter for
-                // shards that already exhausted their download attempts
-                archive_context.absent_shards.entry(shard).or_insert(SHARD_RETRIES);
+                archive_context.absent_shards.insert(shard, SHARD_RETRIES);
             }
             let Ok(maps) = Arc::try_unwrap(maps) else {
                 fail!("INTERNAL ERROR: archive master maps are locked")

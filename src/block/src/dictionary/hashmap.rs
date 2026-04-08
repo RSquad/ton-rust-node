@@ -136,13 +136,13 @@ impl HashmapE {
         self.hashmap_set_with_mode(key, value, gas_consumer, ADD)
     }
     /// sets value as reference
-    pub fn setref(&mut self, key: SliceData, value: Cell) -> Leaf {
+    pub fn setref(&mut self, key: SliceData, value: &Cell) -> Leaf {
         self.hashmap_setref_with_mode(key, value, &mut 0, ADD | REPLACE)
     }
     pub fn setref_with_gas(
         &mut self,
         key: SliceData,
-        value: Cell,
+        value: &Cell,
         gas_consumer: &mut dyn GasConsumer,
     ) -> Leaf {
         self.hashmap_setref_with_mode(key, value, gas_consumer, ADD | REPLACE)
@@ -150,7 +150,7 @@ impl HashmapE {
     pub fn replaceref_with_gas(
         &mut self,
         key: SliceData,
-        value: Cell,
+        value: &Cell,
         gas_consumer: &mut dyn GasConsumer,
     ) -> Leaf {
         self.hashmap_setref_with_mode(key, value, gas_consumer, REPLACE)
@@ -158,7 +158,7 @@ impl HashmapE {
     pub fn addref_with_gas(
         &mut self,
         key: SliceData,
-        value: Cell,
+        value: &Cell,
         gas_consumer: &mut dyn GasConsumer,
     ) -> Leaf {
         self.hashmap_setref_with_mode(key, value, gas_consumer, ADD)
@@ -478,7 +478,7 @@ macro_rules! define_HashmapE {
                 let value = value.write_to_new_cell()?;
                 self.0.set_builder(key, &value)
             }
-            pub fn setref<K: Serializable>(&mut self, key: &K, value: Cell) -> Result<()> {
+            pub fn setref<K: Serializable>(&mut self, key: &K, value: &Cell) -> Result<()> {
                 let key = key.write_to_bitstring()?;
                 self.0.setref(key, value)?;
                 Ok(())

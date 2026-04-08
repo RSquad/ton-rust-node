@@ -1265,7 +1265,6 @@ pub struct Transaction {
     pub in_msg: ChildCell<Message>,
     pub out_msgs: OutMessages,
     total_fees: CurrencyCollection,
-    blackhole_burned: Coins,
     state_update: ChildCell<HashUpdate>,
     description: ChildCell<TransactionDescr>,
 }
@@ -1286,7 +1285,6 @@ impl Transaction {
             in_msg: ChildCell::default(),
             out_msgs: OutMessages::default(),
             total_fees: CurrencyCollection::default(),
-            blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
         }
@@ -1310,7 +1308,6 @@ impl Transaction {
             in_msg: ChildCell::with_struct(msg)?,
             out_msgs: OutMessages::default(),
             total_fees: CurrencyCollection::default(),
-            blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
         })
@@ -1374,14 +1371,6 @@ impl Transaction {
         &mut self.total_fees
     }
 
-    pub fn blackhole_burned(&self) -> &Coins {
-        &self.blackhole_burned
-    }
-
-    pub fn set_blackhole_burned(&mut self, burned: Coins) {
-        self.blackhole_burned = burned;
-    }
-
     pub fn read_in_msg(&self) -> Result<Option<Message>> {
         match self.in_msg.is_empty() {
             true => Ok(None),
@@ -1425,7 +1414,7 @@ impl Transaction {
 
     /// add output message to Hashmap
     pub fn add_out_message(&mut self, msg: &Message) -> Result<()> {
-        self.out_msgs.setref(&UInt15(self.outmsg_cnt), msg.serialize()?)?;
+        self.out_msgs.setref(&UInt15(self.outmsg_cnt), &msg.serialize()?)?;
         self.outmsg_cnt += 1;
         Ok(())
     }
@@ -1568,7 +1557,6 @@ impl Default for Transaction {
             in_msg: ChildCell::default(),
             out_msgs: OutMessages::default(),
             total_fees: CurrencyCollection::default(),
-            blackhole_burned: Coins::default(),
             state_update: ChildCell::default(),
             description: ChildCell::default(),
         }

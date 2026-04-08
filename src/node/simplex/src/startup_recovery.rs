@@ -49,18 +49,28 @@ use crate::{
     session_description::SessionDescription,
     simplex_state::Vote,
     utils::extract_vote_and_signature,
-    BlockHash, RawVoteData, RestartRecommitStrategy, SessionId,
+    BlockHash, PublicKey, RawVoteData, RestartRecommitStrategy, SessionId,
 };
 use consensus_common::ValidatorBlockCandidatePtr;
 use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
+    collections::HashMap,
+    sync::{
+        mpsc::{channel, RecvTimeoutError},
+        Arc,
+    },
+    time::Duration,
 };
 use ton_api::{
     deserialize_boxed, serialize_boxed,
-    ton::consensus::{
-        candidatedata::Empty as CandidateDataEmpty, candidateid::CandidateId,
-        simplex::Vote as TlVoteBoxed, CandidateData, CandidateHashData,
+    ton::{
+        consensus::{
+            candidatedata::{Block as CandidateDataBlock, Empty as CandidateDataEmpty},
+            candidateid::CandidateId,
+            candidateparent::CandidateParent,
+            simplex::Vote as TlVoteBoxed,
+            CandidateData, CandidateHashData, CandidateParent as CandidateParentBoxed,
+        },
+        validator_session::candidate::Candidate,
     },
     IntoBoxed,
 };
@@ -110,7 +120,7 @@ pub(crate) enum RestartRoundAction {
         /// File hash for candidate lookup
         file_hash: BlockHash,
         /// Collated data hash for candidate lookup
-        _collated_data_hash: BlockHash,
+        collated_data_hash: BlockHash,
         /// Candidate hash for certificate lookup
         candidate_hash: CandidateHash,
         /// Pre-serialized CandidateHashData bytes (for BlockSignaturesVariant::Simplex)
@@ -199,7 +209,7 @@ pub(crate) trait SessionStartupRecoveryListener {
 
     /// Seed the current round counter from finalized block count.
     ///
-    /// After restart, `current_round` should reflect the number
+    /// CERT-1 equivalent: After restart, `current_round` should reflect the number
     /// of finalized blocks so the first new block uses the correct round number.
     ///
     /// Reference: C++ publishes `BlockFinalized(last, true)` after loading finalized
@@ -256,7 +266,7 @@ pub(crate) trait SessionStartupRecoveryListener {
         candidate_hash_data_bytes: Vec<u8>,
     );
 
-    /// Notify about last finalized block after restart (Phase 6.5a).
+    /// Notify about last finalized block after restart (Phase 6.5a / CERT-1).
     ///
     /// C++ equivalent: `consensus.cpp::load_from_db()` publishes
     /// `BlockFinalized(last_known_finalized_block, true)` after loading.
@@ -335,6 +345,25 @@ pub(crate) trait SessionStartupRecoveryListener {
     fn recovery_restore_receiver_standstill_cache(&mut self, votes: &[VoteRecord]);
 
     // ========================================================================
+    // Approved candidate fetch (delegated to SessionListener by SessionProcessor)
+    // ========================================================================
+
+    /// Request approved candidate from validator storage.
+    ///
+    /// This delegates to `SessionListener::get_approved_candidate` internally.
+    /// The coordinator uses this to fetch candidate payloads for recommit.
+    ///
+    /// Note: This is a non-blocking request; the callback is invoked when ready.
+    fn recovery_notify_get_approved_candidate(
+        &self,
+        source: PublicKey,
+        root_hash: BlockHash,
+        file_hash: BlockHash,
+        collated_data_hash: BlockHash,
+        callback: Box<dyn FnOnce(Result<ValidatorBlockCandidatePtr>) + Send>,
+    );
+
+    // ========================================================================
     // Recommit replay (applies existing notify paths internally)
     // ========================================================================
 
@@ -397,7 +426,7 @@ pub(crate) struct SessionStartupRecoveryProcessor {
     session_id: SessionId,
 
     /// Session description (for leader key lookup during candidate reconstruction)
-    _description: Arc<SessionDescription>,
+    description: Arc<SessionDescription>,
 
     /// Recovery options (strategy, initial seqno)
     options: SessionStartupRecoveryOptions,
@@ -446,7 +475,7 @@ impl SessionStartupRecoveryProcessor {
 
         Self {
             session_id,
-            _description: description,
+            description,
             options,
             self_idx,
             bootstrap: Some(bootstrap),
@@ -531,8 +560,8 @@ impl SessionStartupRecoveryProcessor {
             self.session_id.to_hex_string()
         );
 
-        // Split bootstrap into session, receiver, and candidate payload parts
-        let (session_boot, receiver_boot, candidate_payloads) = bootstrap.split();
+        // Split bootstrap into session and receiver parts
+        let (session_boot, receiver_boot) = bootstrap.split();
 
         // Step 1: Replay ALL votes (global pass - restores weights, certificates)
         log::debug!(
@@ -641,11 +670,7 @@ impl SessionStartupRecoveryProcessor {
             "Session {}: step 10/12 - restoring candidate bytes cache",
             self.session_id.to_hex_string()
         );
-        self.restore_candidate_cache(
-            listener,
-            &session_boot.finalized_blocks,
-            &candidate_payloads,
-        )?;
+        self.restore_candidate_cache(listener, &session_boot.finalized_blocks)?;
 
         // Step 10b: Rebuild receiver standstill caches (votes + cert bundles + last_final_cert)
         //
@@ -1013,7 +1038,7 @@ impl SessionStartupRecoveryProcessor {
         );
     }
 
-    /// Notify about the last finalized block (Phase 6.5a).
+    /// Notify about the last finalized block (Phase 6.5a / CERT-1).
     ///
     /// C++ equivalent: `consensus.cpp::load_from_db()` publishes
     /// `BlockFinalized(last_known_finalized_block, true)` after loading.
@@ -1040,7 +1065,7 @@ impl SessionStartupRecoveryProcessor {
 
                 log::info!(
                     target: LOG_TARGET,
-                    "Session {}: notifying last finalized block on restart: slot={}, seqno={}, hash={}",
+                    "Session {}: CERT-1 notifying last finalized block: slot={}, seqno={}, hash={}",
                     self.session_id.to_hex_string(),
                     slot.value(),
                     seqno,
@@ -1052,7 +1077,7 @@ impl SessionStartupRecoveryProcessor {
             None => {
                 log::debug!(
                     target: LOG_TARGET,
-                    "Session {}: no is_final=true block found, skipping last-finalized-cert notification",
+                    "Session {}: no is_final=true block found, skipping CERT-1 notification",
                     self.session_id.to_hex_string()
                 );
             }
@@ -1064,46 +1089,38 @@ impl SessionStartupRecoveryProcessor {
     /// For each finalized block, reconstructs the CandidateData bytes and caches
     /// them so `requestCandidate(want_candidate=true)` queries can be answered.
     ///
-    /// Reference: C++ candidate-resolver.cpp loads full candidate bytes from its
-    /// own consensus DB. The Rust implementation only reconstructs empty blocks
-    /// from metadata; non-empty blocks are skipped and will be resolved via peer
-    /// overlay when requested.
+    /// Reference: C++ candidate-resolver.cpp loads candidate bytes from DB or
+    /// fetches via `get_approved_candidate` when needed.
     ///
     /// # Empty vs Non-empty blocks
     ///
     /// - **Empty blocks**: Reconstruct `CandidateData::Consensus_Empty` from FinalizedBlockRecord
     ///   (block_id, parent info, signature from leader)
-    /// - **Non-empty blocks**: Skipped (will be served from in-memory cache during
-    ///   normal operation, or peers will query other validators)
+    /// - **Non-empty blocks**: Fetch approved candidate via `recovery_notify_get_approved_candidate`,
+    ///   then reconstruct `CandidateData::Consensus_Block`
     fn restore_candidate_cache(
         &self,
         listener: &mut dyn SessionStartupRecoveryListener,
         finalized_blocks: &[FinalizedBlockRecord],
-        candidate_payloads: &[(RawCandidateId, Vec<u8>)],
     ) -> Result<()> {
-        let mut restored_empty = 0u32;
-        let mut restored_payload = 0u32;
+        if finalized_blocks.is_empty() {
+            log::debug!(
+                target: LOG_TARGET,
+                "Session {}: no finalized blocks, skipping candidate cache restore",
+                self.session_id.to_hex_string()
+            );
+            return Ok(());
+        }
+
+        let mut restored = 0u32;
         let mut skipped = 0u32;
         let mut errors = 0u32;
 
-        // 1. Restore from persisted candidate payloads (both empty and non-empty).
-        //    C++ parity: CandidateResolver loads full candidate bytes from DB.
-        let payload_ids: HashSet<_> = candidate_payloads.iter().map(|(id, _)| id.clone()).collect();
-        for (id, bytes) in candidate_payloads {
-            listener.recovery_cache_candidate_bytes(id.slot, id.hash.clone(), bytes.clone());
-            restored_payload += 1;
-        }
-
-        // 2. For finalized empty blocks not already covered by payloads,
-        //    reconstruct from metadata (backward-compat for DBs without payloads).
         for block in finalized_blocks {
             let slot = block.candidate_id.slot;
             let candidate_hash = &block.candidate_id.hash;
 
-            if payload_ids.contains(&block.candidate_id) {
-                continue;
-            }
-
+            // Look up candidate info for this block
             let candidate_info = match self.candidate_info_map.get(candidate_hash) {
                 Some(info) => info,
                 None => {
@@ -1118,15 +1135,13 @@ impl SessionStartupRecoveryProcessor {
                 }
             };
 
+            // Determine if this is an empty block by checking candidate_hash_data variant
+            // Empty blocks use candidateHashDataEmpty, non-empty use candidateHashDataOrdinary
             let is_empty =
                 Self::is_empty_block_candidate_hash_data(&candidate_info.candidate_hash_data);
 
-            if !is_empty {
-                skipped += 1;
-                continue;
-            }
-
-            let candidate_data_bytes =
+            let candidate_data_bytes = if is_empty {
+                // Reconstruct empty block CandidateData
                 match self.reconstruct_empty_candidate_data(block, candidate_info) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -1140,23 +1155,147 @@ impl SessionStartupRecoveryProcessor {
                         errors += 1;
                         continue;
                     }
+                }
+            } else {
+                // Non-empty blocks: fetch via blocking channel and reconstruct
+                let leader_idx = ValidatorIndex(candidate_info.leader_idx);
+                let source = self.description.get_source_public_key(leader_idx).clone();
+
+                // Extract hashes from candidate_hash_data for fetch
+                let (root_hash, file_hash, collated_data_hash) =
+                    match Self::extract_hashes_from_candidate_hash_data(
+                        &candidate_info.candidate_hash_data,
+                    ) {
+                        Some(hashes) => hashes,
+                        None => {
+                            log::warn!(
+                                target: LOG_TARGET,
+                                "Session {}: failed to extract hashes from candidate hash data for slot={}",
+                                self.session_id.to_hex_string(),
+                                slot.value()
+                            );
+                            errors += 1;
+                            continue;
+                        }
+                    };
+
+                // Create one-shot channel for blocking fetch
+                let (tx, rx) = channel();
+
+                log::debug!(
+                    target: LOG_TARGET,
+                    "Session {}: fetching non-empty candidate for slot={}, root_hash={}",
+                    self.session_id.to_hex_string(),
+                    slot.value(),
+                    root_hash.to_hex_string()
+                );
+
+                // Request candidate via listener callback
+                listener.recovery_notify_get_approved_candidate(
+                    source,
+                    root_hash.clone(),
+                    file_hash.clone(),
+                    collated_data_hash.clone(),
+                    Box::new(move |result| {
+                        let _ = tx.send(result);
+                    }),
+                );
+
+                // Block waiting for result with timeout
+                const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+                let fetch_result = match rx.recv_timeout(FETCH_TIMEOUT) {
+                    Ok(Ok(candidate)) => {
+                        log::debug!(
+                            target: LOG_TARGET,
+                            "Session {}: fetched non-empty candidate for slot={}",
+                            self.session_id.to_hex_string(),
+                            slot.value()
+                        );
+                        // Build validator_session.Candidate TL bytes from stored block data + collated data.
+                        //
+                        // IMPORTANT: CandidateData::Consensus_Block.candidate must contain serialized
+                        // `validator_session.candidate::Candidate` bytes (C++ RawCandidate::serialize()).
+                        // The approved candidate storage returns raw block data + collated_data, NOT TL candidate bytes.
+                        let candidate_seqno = block.block_id.seq_no() as i32;
+                        let tl_vs_candidate = Candidate {
+                            src: UInt256::default(),
+                            round: candidate_seqno,
+                            root_hash: root_hash.clone(),
+                            data: candidate.data.data().to_vec(),
+                            collated_data: candidate.collated_data.data().to_vec(),
+                        };
+                        let vs_candidate_bytes = consensus_common::serialize_tl_boxed_object!(
+                            &tl_vs_candidate.into_boxed()
+                        );
+
+                        self.reconstruct_block_candidate_data(
+                            block,
+                            candidate_info,
+                            vs_candidate_bytes,
+                        )
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            target: LOG_TARGET,
+                            "Session {}: candidate fetch failed for slot={}: {}",
+                            self.session_id.to_hex_string(),
+                            slot.value(),
+                            e
+                        );
+                        Err(e)
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        log::warn!(
+                            target: LOG_TARGET,
+                            "Session {}: candidate fetch TIMEOUT for slot={} ({}s)",
+                            self.session_id.to_hex_string(),
+                            slot.value(),
+                            FETCH_TIMEOUT.as_secs()
+                        );
+                        Err(error!("candidate fetch timeout for slot {}", slot.value()))
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        log::error!(
+                            target: LOG_TARGET,
+                            "Session {}: candidate fetch channel disconnected for slot={}",
+                            self.session_id.to_hex_string(),
+                            slot.value()
+                        );
+                        Err(error!("candidate fetch channel disconnected"))
+                    }
                 };
 
+                match fetch_result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::warn!(
+                            target: LOG_TARGET,
+                            "Session {}: failed to reconstruct block candidate for slot={}: {}",
+                            self.session_id.to_hex_string(),
+                            slot.value(),
+                            e
+                        );
+                        errors += 1;
+                        continue;
+                    }
+                }
+            };
+
+            // Cache the reconstructed candidate bytes
             listener.recovery_cache_candidate_bytes(
                 slot,
                 candidate_hash.clone(),
                 candidate_data_bytes,
             );
-            restored_empty += 1;
+            restored += 1;
         }
 
         log::info!(
             target: LOG_TARGET,
-            "Session {}: restored candidate cache: {} from payload DB, {} empty reconstructed, \
-            {} skipped, {} errors",
+            "Session {}: restored {} candidate bytes to cache ({} skipped, {} errors)",
             self.session_id.to_hex_string(),
-            restored_payload,
-            restored_empty,
+            restored,
             skipped,
             errors
         );
@@ -1258,6 +1397,58 @@ impl SessionStartupRecoveryProcessor {
         }
     }
 
+    /// Reconstruct CandidateData::Consensus_Block bytes for a non-empty block.
+    ///
+    /// Reference: C++ RawCandidate::serialize() for block variant
+    fn reconstruct_block_candidate_data(
+        &self,
+        block: &FinalizedBlockRecord,
+        candidate_info: &CandidateInfoRecord,
+        candidate_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let slot = block.candidate_id.slot;
+
+        // Get parent info from candidate_hash_data
+        let parent_opt =
+            Self::extract_parent_id_from_ordinary_hash_data(&candidate_info.candidate_hash_data)?;
+
+        // Build TL parent structure
+        let tl_parent = match parent_opt {
+            Some((parent_slot, parent_hash)) => CandidateParent {
+                id: CandidateId { slot: parent_slot.value() as i32, hash: parent_hash }
+                    .into_boxed(),
+            }
+            .into_boxed(),
+            None => CandidateParentBoxed::Consensus_CandidateWithoutParents,
+        };
+
+        // Use signature from candidate_info (leader's original signature)
+        let signature = candidate_info.signature.clone();
+
+        // Build the TL Block structure
+        let tl_block = CandidateDataBlock {
+            slot: slot.value() as i32,
+            candidate: candidate_bytes.into(),
+            parent: tl_parent,
+            signature,
+        };
+
+        // Wrap in CandidateData enum and serialize
+        let tl_candidate_data = CandidateData::Consensus_Block(tl_block);
+        let bytes = serialize_boxed(&tl_candidate_data)
+            .map_err(|e| error!("Failed to serialize block CandidateData: {}", e))?;
+
+        log::trace!(
+            target: LOG_TARGET,
+            "Session {}: reconstructed block candidate data for slot={}, size={}",
+            self.session_id.to_hex_string(),
+            slot.value(),
+            bytes.len()
+        );
+
+        Ok(bytes)
+    }
+
     /// Build and apply restart recommit actions.
     fn apply_restart_recommit(
         &self,
@@ -1284,21 +1475,111 @@ impl SessionStartupRecoveryProcessor {
             self.options.restart_recommit_strategy
         );
 
-        // Apply actions through listener.
-        // Non-empty blocks cannot be fetched (no get_approved_candidate delegation in
-        // simplex -- C++ resolves candidates from its own DB, not validator manager).
-        // The get_candidate closure returns an error for non-empty blocks, causing
-        // the replay to skip them gracefully.
+        // Pre-fetch candidates for non-empty replay actions.
+        // We do this before calling recovery_apply_restart_recommit_actions to avoid borrow conflicts
+        let mut prefetched: HashMap<SlotIndex, Result<ValidatorBlockCandidatePtr>> = HashMap::new();
+
+        for action in &actions {
+            let RestartRoundAction::Commit {
+                slot,
+                leader_idx,
+                root_hash,
+                file_hash,
+                collated_data_hash,
+                is_empty,
+                ..
+            } = action;
+
+            if *is_empty {
+                continue;
+            }
+
+            let source = self.description.get_source_public_key(*leader_idx).clone();
+
+            // Create one-shot channel for blocking fetch
+            let (tx, rx) = channel();
+
+            log::debug!(
+                target: LOG_TARGET,
+                "Session {}: fetching candidate for slot={}, root_hash={}",
+                self.session_id.to_hex_string(),
+                slot.value(),
+                root_hash.to_hex_string()
+            );
+
+            // Request candidate via listener callback
+            listener.recovery_notify_get_approved_candidate(
+                source,
+                root_hash.clone(),
+                file_hash.clone(),
+                collated_data_hash.clone(),
+                Box::new(move |result| {
+                    // Send result through channel (ignore send error if receiver dropped)
+                    let _ = tx.send(result);
+                }),
+            );
+
+            // Block waiting for result with timeout
+            // Use a generous timeout (30s) for validator storage fetch
+            const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+            let result = match rx.recv_timeout(FETCH_TIMEOUT) {
+                Ok(Ok(candidate)) => {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "Session {}: fetched candidate for slot={}",
+                        self.session_id.to_hex_string(),
+                        slot.value()
+                    );
+                    Ok(candidate)
+                }
+                Ok(Err(e)) => {
+                    log::warn!(
+                        target: LOG_TARGET,
+                        "Session {}: candidate fetch failed for slot={}: {}",
+                        self.session_id.to_hex_string(),
+                        slot.value(),
+                        e
+                    );
+                    Err(e)
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    log::warn!(
+                        target: LOG_TARGET,
+                        "Session {}: candidate fetch TIMEOUT for slot={} ({}s)",
+                        self.session_id.to_hex_string(),
+                        slot.value(),
+                        FETCH_TIMEOUT.as_secs()
+                    );
+                    Err(error!("candidate fetch timeout for slot {}", slot.value()))
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    log::error!(
+                        target: LOG_TARGET,
+                        "Session {}: candidate fetch channel disconnected for slot={}",
+                        self.session_id.to_hex_string(),
+                        slot.value()
+                    );
+                    Err(error!("candidate fetch channel disconnected"))
+                }
+            };
+
+            prefetched.insert(*slot, result);
+        }
+
+        // Apply actions through listener using prefetched candidates
         listener.recovery_apply_restart_recommit_actions(&actions, &mut |action| {
             let RestartRoundAction::Commit { slot, is_empty, .. } = action;
             if *is_empty {
                 fail!("fetch called for empty replay action at slot {}", slot.value());
             }
 
-            Err(error!(
-                "non-empty block candidate fetch not supported in simplex recovery (slot {})",
-                slot.value()
-            ))
+            // Look up prefetched candidate
+            match prefetched.remove(slot) {
+                Some(Ok(candidate)) => Ok(candidate),
+                Some(Err(e)) => Err(error!("prefetch failed: {}", e)),
+                None => Err(error!("no prefetched candidate for slot {}", slot.value())),
+            }
         })?;
 
         Ok(())
@@ -1403,7 +1684,7 @@ impl SessionStartupRecoveryProcessor {
                 leader_idx: ValidatorIndex(candidate_info.leader_idx),
                 root_hash,
                 file_hash,
-                _collated_data_hash: collated_data_hash,
+                collated_data_hash,
                 candidate_hash,
                 candidate_hash_data_bytes,
                 is_empty,

@@ -40,10 +40,7 @@ use std::{
     },
 };
 use storage::{
-    archives::{
-        archive_manager::ArchiveManager,
-        db_provider::{ArchiveDbProvider, SingleDbProvider},
-    },
+    archives::archive_manager::ArchiveManager,
     block_handle_db::BlockHandleStorage,
     db::rocksdb::{AccessType, RocksDb},
     types::{BlockMeta, PersistentStatePartId},
@@ -122,13 +119,9 @@ async fn test_sync() -> Result<()> {
             let allocated = create_engine_allocated();
             #[cfg(feature = "telemetry")]
             let telemetry = create_engine_telemetry();
-            let db_root_path = Arc::new(PathBuf::from(DB_PATH));
-            let db_provider: Arc<dyn ArchiveDbProvider> =
-                Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()));
             let archive_manager = ArchiveManager::with_data(
                 db.clone(),
-                db_root_path,
-                db_provider,
+                Arc::new(PathBuf::from(DB_PATH)),
                 init_mc_block_id.seq_no(),
                 monitor_min_split.clone(),
                 #[cfg(feature = "telemetry")]

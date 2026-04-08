@@ -27,7 +27,7 @@ use crate::{
         validate_query::ValidateQuery,
         validator_group::PipelineContext,
         validator_utils::PrevBlockHistory,
-        BlockCandidate, CollatorSettings,
+        BlockCandidate,
     },
 };
 use std::{sync::Arc, time::SystemTime};
@@ -39,7 +39,6 @@ use ton_block::{
 pub async fn run_validate_query_any_candidate(
     block_candidate: BlockCandidate,
     engine: Arc<dyn EngineOperations>,
-    is_simplex: bool,
 ) -> Result<SystemTime> {
     let block_id = block_candidate.block_id.clone();
     let block_data = block_candidate.data.clone();
@@ -82,7 +81,6 @@ pub async fn run_validate_query_any_candidate(
         engine.clone(),
         false,
         true,
-        is_simplex,
     );
     let validator_result = query.try_validate().await;
 
@@ -151,7 +149,6 @@ pub async fn run_validate_query(
     block: BlockCandidate,
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
-    is_simplex: bool,
 ) -> Result<SystemTime> {
     let next_block_descr = fmt_next_block_descr(&block.block_id);
 
@@ -177,7 +174,6 @@ pub async fn run_validate_query(
             engine.clone(),
             false,
             true,
-            is_simplex,
         )
         .try_validate()
         .await
@@ -191,7 +187,6 @@ pub async fn run_validate_query(
             engine.clone(),
             false,
             true,
-            is_simplex,
         );
         let validator_result = query.try_validate().await;
         if let Err(err) = &validator_result {
@@ -288,7 +283,6 @@ pub async fn run_collate_query(
     collator_id: PublicKey,
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
-    is_simplex: bool,
 ) -> Result<(Arc<ValidatorBlockCandidate>, Arc<ShardStateStuff>, Block, Cell)> {
     let labels = [("shard", shard.to_string())];
     metrics::gauge!("ton_node_collator_active", &labels).increment(1.0);
@@ -304,7 +298,7 @@ pub async fn run_collate_query(
         UInt256::from(collator_id.pub_key()?),
         engine.clone(),
         None,
-        CollatorSettings { is_simplex, ..Default::default() },
+        Default::default(),
     )?;
     let collate_result = collator.collate().await;
 

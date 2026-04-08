@@ -41,14 +41,7 @@ use consensus_common::{
     AsyncKeyValueStorageOptions, AsyncKeyValueStoragePtr, ConsensusCommonFactory, RawBuffer,
     StorageAsyncResultPtr,
 };
-use std::{
-    path::Path,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{path::Path, sync::Arc, time::Duration};
 use ton_api::{
     deserialize_typed, serialize_boxed,
     ton::{
@@ -64,7 +57,6 @@ use ton_api::{
                     },
                     finalizedblock::FinalizedBlock as FinalizedBlockValue,
                     key::{
-                        candidate::Candidate as CandidatePayloadKey,
                         candidate_resolver::{
                             candidateinfo::CandidateInfo as CandidateInfoKey,
                             notarcert::NotarCert as NotarCertKey,
@@ -72,7 +64,6 @@ use ton_api::{
                         },
                         finalizedblock::FinalizedBlock as FinalizedBlockKey,
                         vote::Vote as VoteKey,
-                        Candidate as CandidatePayloadKeyBoxed,
                         FinalizedBlock as FinalizedBlockKeyBoxed, PoolState as PoolStateKey,
                         Vote as VoteKeyBoxed,
                     },
@@ -97,7 +88,7 @@ use ton_block::{error, BlockIdExt, Result, UInt256};
 // ============================================================================
 
 /// Log target for database operations (matches simplex crate log target)
-const TARGET: &str = "simplex";
+const LOG_TARGET: &str = "simplex";
 
 /// Default sync timeout for blocking reads
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -130,13 +121,6 @@ fn prefix_vote() -> u32 {
 fn prefix_pool_state() -> u32 {
     // PoolState key is a zero-arg enum; get constructor from BoxedSerialize
     PoolStateKey::default().bare_object().constructor()
-}
-
-/// Get key prefix for candidate payloads (full serialized CandidateData bytes).
-///
-/// C++ parity: `consensus.simplex.db.key.candidate` TL type in candidate-resolver.cpp.
-fn prefix_candidate_payload() -> u32 {
-    CandidatePayloadKey::constructor_const()
 }
 
 // ============================================================================
@@ -182,10 +166,7 @@ pub struct NotarCertRecord {
 ///
 /// Stores votes by their hash for standstill recovery.
 /// Key: vote_hash (sha256 of serialized vote)
-/// Value: raw vote data + node index + seqno
-///
-/// C++ parity: db.cpp assigns monotonic seqno to each vote for replay ordering.
-/// Votes must be replayed in the order they were originally cast.
+/// Value: raw vote data + node index
 #[derive(Debug, Clone)]
 pub struct VoteRecord {
     /// Hash of the vote (key)
@@ -194,8 +175,6 @@ pub struct VoteRecord {
     pub data: RawBuffer,
     /// Validator index that submitted this vote
     pub node_idx: ValidatorIndex,
-    /// Monotonic sequence number for replay ordering (C++ parity)
-    pub seqno: i64,
 }
 
 /// Pool state record for restart support
@@ -228,8 +207,6 @@ pub struct Bootstrap {
     pub votes: Vec<VoteRecord>,
     /// Pool state (for skip vote generation)
     pub pool_state: Option<PoolStateRecord>,
-    /// Candidate payload bytes (serialized CandidateData, for requestCandidate serving)
-    pub candidate_payloads: Vec<(RawCandidateId, Vec<u8>)>,
 }
 
 /// Bootstrap data for recovery processor (session state only, no candidate_infos).
@@ -257,8 +234,7 @@ impl Bootstrap {
     /// Split bootstrap into component-specific parts.
     ///
     /// Consumes self for zero-copy transfer of vectors.
-    /// Returns (session_boot, receiver_boot, candidate_payloads).
-    pub fn split(self) -> (SessionBootstrap, ReceiverBootstrap, Vec<(RawCandidateId, Vec<u8>)>) {
+    pub fn split(self) -> (SessionBootstrap, ReceiverBootstrap) {
         (
             SessionBootstrap {
                 finalized_blocks: self.finalized_blocks,
@@ -266,7 +242,6 @@ impl Bootstrap {
                 pool_state: self.pool_state,
             },
             ReceiverBootstrap { notar_certs: self.notar_certs },
-            self.candidate_payloads,
         )
     }
 
@@ -277,7 +252,6 @@ impl Bootstrap {
             && self.notar_certs.is_empty()
             && self.votes.is_empty()
             && self.pool_state.is_none()
-            && self.candidate_payloads.is_empty()
     }
 }
 
@@ -364,16 +338,6 @@ fn deserialize_candidate_info(key_bytes: &[u8], value_bytes: &[u8]) -> Result<Ca
     })
 }
 
-fn serialize_candidate_payload_key(candidate_id: &RawCandidateId) -> Result<Vec<u8>> {
-    let key = CandidatePayloadKey { candidateId: raw_candidate_id_to_tl(candidate_id) };
-    serialize_boxed(&key.into_boxed()).map_err(|e| error!("serialization failed: {}", e))
-}
-
-fn deserialize_candidate_payload_key(key_bytes: &[u8]) -> Result<RawCandidateId> {
-    let key: CandidatePayloadKey = deserialize_typed::<CandidatePayloadKeyBoxed>(key_bytes)?.only();
-    Ok(raw_candidate_id_from_tl(key.candidateId))
-}
-
 fn serialize_notar_cert_key(candidate_id: &RawCandidateId) -> Result<Vec<u8>> {
     let key = NotarCertKey { candidateId: raw_candidate_id_to_tl(candidate_id) };
     serialize_boxed(&key.into_boxed()).map_err(|e| error!("serialization failed: {}", e))
@@ -403,11 +367,8 @@ fn serialize_vote_key(vote_hash: &UInt256) -> Result<Vec<u8>> {
 }
 
 fn serialize_vote_value(record: &VoteRecord) -> Result<Vec<u8>> {
-    let value = VoteValue {
-        data: record.data.clone(),
-        node_idx: record.node_idx.value() as i32,
-        seqno: record.seqno,
-    };
+    let value =
+        VoteValue { data: record.data.clone(), node_idx: record.node_idx.value() as i32, seqno: 0 };
     serialize_boxed(&value.into_boxed()).map_err(|e| error!("serialization failed: {}", e))
 }
 
@@ -418,7 +379,6 @@ fn deserialize_vote(key_bytes: &[u8], value_bytes: &[u8]) -> Result<VoteRecord> 
         vote_hash: key.vote_hash.clone(),
         data: value.data,
         node_idx: ValidatorIndex::new(value.node_idx as u32),
-        seqno: value.seqno,
     })
 }
 
@@ -456,7 +416,7 @@ fn filter_finalized_chain(mut records: Vec<FinalizedBlockRecord>) -> Vec<Finaliz
                 if record.parent.is_some() {
                     // No chain root yet (expected no parent), skip this record.
                     log::warn!(
-                        target: TARGET,
+                        target: LOG_TARGET,
                         "SimplexDb: skipping finalized block slot={} (no chain root, parent is set)",
                         record.candidate_id.slot.value()
                     );
@@ -466,7 +426,7 @@ fn filter_finalized_chain(mut records: Vec<FinalizedBlockRecord>) -> Vec<Finaliz
             Some(expected) => {
                 if record.parent.as_ref() != Some(expected) {
                     log::warn!(
-                        target: TARGET,
+                        target: LOG_TARGET,
                         "SimplexDb: skipping finalized block slot={} (parent mismatch)",
                         record.candidate_id.slot.value()
                     );
@@ -499,8 +459,6 @@ pub struct SimplexDb {
     storage: AsyncKeyValueStoragePtr,
     /// Storage ID (for logging)
     storage_id: String,
-    /// Monotonic vote seqno counter (C++ parity: db.cpp next_seqno_)
-    next_vote_seqno: AtomicI64,
 }
 
 impl SimplexDb {
@@ -519,22 +477,11 @@ impl SimplexDb {
         let storage_id = storage_id.to_string();
 
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: opening at {}",
             storage_id,
             db_path.display()
         );
-
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                error!(
-                    "SimplexDb {}: failed to create parent dir {}: {}",
-                    storage_id,
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
 
         // SimplexDb does not use callbacks
         let options = AsyncKeyValueStorageOptions { use_callback_thread: false };
@@ -543,13 +490,13 @@ impl SimplexDb {
             ConsensusCommonFactory::create_async_key_value_storage(db_path, &storage_id, options)?;
 
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: opened at {}",
             storage_id,
             db_path.display()
         );
 
-        Ok(Arc::new(Self { storage, storage_id, next_vote_seqno: AtomicI64::new(0) }))
+        Ok(Arc::new(Self { storage, storage_id }))
     }
 
     // =========================================================================
@@ -573,7 +520,7 @@ impl SimplexDb {
     /// Called when a block is finalized or notarized with a certificate.
     pub fn save_finalized_block(&self, record: &FinalizedBlockRecord) -> Result<()> {
         log::trace!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: save_finalized_block slot={} is_final={}",
             self.storage_id,
             record.candidate_id.slot.value(),
@@ -600,7 +547,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn save_candidate_info(&self, record: &CandidateInfoRecord) -> Result<()> {
         log::trace!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: save_candidate_info slot={} leader={}",
             self.storage_id,
             record.candidate_id.slot.value(),
@@ -628,7 +575,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn save_notar_cert(&self, candidate_id: &RawCandidateId, cert: &NotarCert) -> Result<()> {
         log::trace!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: save_notar_cert slot={} signatures={}",
             self.storage_id,
             candidate_id.slot.value(),
@@ -640,14 +587,9 @@ impl SimplexDb {
     }
 
     /// Save vote record (async result).
-    ///
-    /// Assigns a monotonic seqno for replay ordering (C++ parity: db.cpp next_seqno_++).
     pub fn save_vote_async(&self, record: &VoteRecord) -> Result<StorageAsyncResultPtr<()>> {
-        let seqno = self.next_vote_seqno.fetch_add(1, Ordering::Relaxed);
-        let mut record_with_seqno = record.clone();
-        record_with_seqno.seqno = seqno;
-        let key = serialize_vote_key(&record_with_seqno.vote_hash)?;
-        let value = serialize_vote_value(&record_with_seqno)?;
+        let key = serialize_vote_key(&record.vote_hash)?;
+        let value = serialize_vote_value(record)?;
         Ok(self.storage.set(key, value, None))
     }
 
@@ -657,7 +599,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Convenience wrapper; prefer `_async()` in production code.
     pub fn save_vote(&self, record: &VoteRecord) -> Result<()> {
         log::trace!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: save_vote hash={} node_idx={}",
             self.storage_id,
             hex::encode(&record.vote_hash.as_slice()[..8]),
@@ -684,7 +626,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Convenience wrapper; prefer `_async()` in production code.
     pub fn save_pool_state(&self, record: &PoolStateRecord) -> Result<()> {
         log::trace!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: save_pool_state first_nonannounced_window={}",
             self.storage_id,
             record.first_nonannounced_window
@@ -692,100 +634,6 @@ impl SimplexDb {
 
         self.save_pool_state_async(record)?;
         Ok(())
-    }
-
-    // =========================================================================
-    // Candidate Payload Storage (C++ CandidateResolver::store_candidate parity)
-    // =========================================================================
-
-    /// Save serialized CandidateData bytes (async, fire-and-forget).
-    ///
-    /// C++ parity: `candidate-resolver.cpp store_candidate()` persists the full
-    /// serialized candidate so `requestCandidate(want_candidate=true)` queries
-    /// can be served from DB after restart.
-    pub fn save_candidate_payload_async(
-        &self,
-        candidate_id: &RawCandidateId,
-        candidate_data_bytes: &[u8],
-    ) -> Result<StorageAsyncResultPtr<()>> {
-        let key = serialize_candidate_payload_key(candidate_id)?;
-        Ok(self.storage.set(key, candidate_data_bytes.to_vec(), None))
-    }
-
-    /// Load a single candidate payload by id (blocking, for query fallback).
-    pub fn load_candidate_payload_by_id(
-        &self,
-        candidate_id: &RawCandidateId,
-        timeout: Duration,
-    ) -> Result<Option<Vec<u8>>> {
-        let key = serialize_candidate_payload_key(candidate_id)?;
-        let result = self.storage.get(key, None);
-        match result.wait_timeout(timeout) {
-            Some(Ok(Some(value))) => Ok(Some(value)),
-            Some(Ok(None)) => Ok(None),
-            Some(Err(e)) => Err(e),
-            None => Err(error!("SimplexDb: timeout loading candidate payload by id")),
-        }
-    }
-
-    /// Load all candidate payloads asynchronously (for startup restore).
-    pub fn load_candidate_payloads_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
-        log::debug!(
-            target: TARGET,
-            "SimplexDb {}: load_candidate_payloads_async",
-            self.storage_id
-        );
-        self.storage.get_by_prefix_u32(prefix_candidate_payload(), None)
-    }
-
-    // =========================================================================
-    // Single-Record Lookups (async, for live query fallback)
-    // =========================================================================
-
-    /// Look up a single candidate info record by candidate ID (blocking).
-    ///
-    /// Unlike `load_candidate_infos()` which scans all records, this looks up
-    /// a single record by its exact key. Used by the RequestCandidate fallback
-    /// when resolver_cache misses.
-    ///
-    /// Reference: C++ candidate-resolver.cpp `try_load_candidate_data_from_db()`
-    pub fn load_candidate_info_by_id(
-        &self,
-        candidate_id: &RawCandidateId,
-        timeout: Duration,
-    ) -> Result<Option<CandidateInfoRecord>> {
-        let key = serialize_candidate_info_key(candidate_id)?;
-        let result = self.storage.get(key.clone(), None);
-        match result.wait_timeout(timeout) {
-            Some(Ok(Some(value))) => {
-                let record = deserialize_candidate_info(&key, &value)?;
-                Ok(Some(record))
-            }
-            Some(Ok(None)) => Ok(None),
-            Some(Err(e)) => Err(e),
-            None => Err(error!("SimplexDb: timeout loading candidate info by id")),
-        }
-    }
-
-    /// Look up a single notar cert record by candidate ID (blocking).
-    ///
-    /// Used by the RequestCandidate fallback for notar_cert recovery.
-    pub fn load_notar_cert_by_id(
-        &self,
-        candidate_id: &RawCandidateId,
-        timeout: Duration,
-    ) -> Result<Option<NotarCertRecord>> {
-        let key = serialize_notar_cert_key(candidate_id)?;
-        let result = self.storage.get(key.clone(), None);
-        match result.wait_timeout(timeout) {
-            Some(Ok(Some(value))) => {
-                let record = deserialize_notar_cert(&key, &value)?;
-                Ok(Some(record))
-            }
-            Some(Ok(None)) => Ok(None),
-            Some(Err(e)) => Err(e),
-            None => Err(error!("SimplexDb: timeout loading notar cert by id")),
-        }
     }
 
     // =========================================================================
@@ -798,7 +646,7 @@ impl SimplexDb {
     /// with cancellation support via `wait_cancellable()`.
     pub fn load_finalized_blocks_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_finalized_blocks_async",
             self.storage_id
         );
@@ -808,7 +656,7 @@ impl SimplexDb {
     /// Load all candidate infos asynchronously.
     pub fn load_candidate_infos_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_candidate_infos_async",
             self.storage_id
         );
@@ -818,7 +666,7 @@ impl SimplexDb {
     /// Load all notar certs asynchronously.
     pub fn load_notar_certs_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_notar_certs_async",
             self.storage_id
         );
@@ -828,7 +676,7 @@ impl SimplexDb {
     /// Load all votes asynchronously.
     pub fn load_votes_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_votes_async",
             self.storage_id
         );
@@ -840,7 +688,7 @@ impl SimplexDb {
     /// Returns raw key-value pairs; caller deserializes.
     pub fn load_pool_state_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_pool_state_async",
             self.storage_id
         );
@@ -857,7 +705,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn load_finalized_blocks(&self) -> Result<Vec<FinalizedBlockRecord>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_finalized_blocks",
             self.storage_id
         );
@@ -874,7 +722,7 @@ impl SimplexDb {
                 Ok(record) => records.push(record),
                 Err(e) => {
                     log::error!(
-                        target: TARGET,
+                        target: LOG_TARGET,
                         "SimplexDb {}: failed to deserialize finalized block: {}",
                         self.storage_id,
                         e
@@ -892,7 +740,7 @@ impl SimplexDb {
         let kept = records.len();
 
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: loaded {} finalized blocks (kept {} after chain filter)",
             self.storage_id,
             total,
@@ -908,7 +756,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn load_candidate_infos(&self) -> Result<Vec<CandidateInfoRecord>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_candidate_infos",
             self.storage_id
         );
@@ -925,7 +773,7 @@ impl SimplexDb {
                 Ok(record) => records.push(record),
                 Err(e) => {
                     log::error!(
-                        target: TARGET,
+                        target: LOG_TARGET,
                         "SimplexDb {}: failed to deserialize candidate info: {}",
                         self.storage_id,
                         e
@@ -935,7 +783,7 @@ impl SimplexDb {
         }
 
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: loaded {} candidate infos",
             self.storage_id,
             records.len()
@@ -950,7 +798,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn load_notar_certs(&self) -> Result<Vec<NotarCertRecord>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_notar_certs",
             self.storage_id
         );
@@ -967,7 +815,7 @@ impl SimplexDb {
                 Ok(record) => records.push(record),
                 Err(e) => {
                     log::error!(
-                        target: TARGET,
+                        target: LOG_TARGET,
                         "SimplexDb {}: failed to deserialize notar cert: {}",
                         self.storage_id,
                         e
@@ -977,7 +825,7 @@ impl SimplexDb {
         }
 
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: loaded {} notar certs",
             self.storage_id,
             records.len()
@@ -992,7 +840,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Not used yet; kept for restart/debug parity.
     pub fn load_votes(&self) -> Result<Vec<VoteRecord>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_votes",
             self.storage_id
         );
@@ -1009,7 +857,7 @@ impl SimplexDb {
                 Ok(record) => records.push(record),
                 Err(e) => {
                     log::error!(
-                        target: TARGET,
+                        target: LOG_TARGET,
                         "SimplexDb {}: failed to deserialize vote: {}",
                         self.storage_id,
                         e
@@ -1018,20 +866,11 @@ impl SimplexDb {
             }
         }
 
-        // C++ parity: sort by seqno for deterministic replay order (db.cpp init_votes)
-        records.sort_by_key(|r| r.seqno);
-
-        // Initialize next_vote_seqno from max seqno + 1 (C++ parity: db.cpp next_seqno_)
-        if let Some(max_seqno) = records.last().map(|r| r.seqno) {
-            self.next_vote_seqno.store(max_seqno + 1, Ordering::Relaxed);
-        }
-
         log::info!(
-            target: TARGET,
-            "SimplexDb {}: loaded {} votes (next_seqno={})",
+            target: LOG_TARGET,
+            "SimplexDb {}: loaded {} votes",
             self.storage_id,
-            records.len(),
-            self.next_vote_seqno.load(Ordering::Relaxed)
+            records.len()
         );
 
         Ok(records)
@@ -1043,7 +882,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Not used yet; kept for restart/debug parity.
     pub fn load_pool_state(&self) -> Result<Option<PoolStateRecord>> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_pool_state",
             self.storage_id
         );
@@ -1056,7 +895,7 @@ impl SimplexDb {
 
         if result.is_empty() {
             log::info!(
-                target: TARGET,
+                target: LOG_TARGET,
                 "SimplexDb {}: no pool state found (first run)",
                 self.storage_id
             );
@@ -1066,7 +905,7 @@ impl SimplexDb {
         // Should be exactly one record (singleton)
         if result.len() > 1 {
             log::warn!(
-                target: TARGET,
+                target: LOG_TARGET,
                 "SimplexDb {}: multiple pool state records found ({}), using first",
                 self.storage_id,
                 result.len()
@@ -1077,7 +916,7 @@ impl SimplexDb {
         let record = deserialize_pool_state(value_bytes)?;
 
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: loaded pool state first_nonannounced_window={}",
             self.storage_id,
             record.first_nonannounced_window
@@ -1099,7 +938,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Prefer `load_bootstrap_cancellable()` in session startup.
     pub fn load_bootstrap(&self) -> Result<Bootstrap> {
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_bootstrap",
             self.storage_id
         );
@@ -1110,40 +949,17 @@ impl SimplexDb {
         let votes = self.load_votes()?;
         let pool_state = self.load_pool_state()?;
 
-        // Load candidate payloads (optional, graceful if absent)
-        let payloads_raw = self
-            .load_candidate_payloads_async()
-            .wait_timeout(DEFAULT_SYNC_TIMEOUT)
-            .ok_or_else(|| error!("SimplexDb: timeout loading candidate payloads"))??;
-        let mut candidate_payloads = Vec::with_capacity(payloads_raw.len());
-        for (k, v) in payloads_raw {
-            match deserialize_candidate_payload_key(&k) {
-                Ok(id) => candidate_payloads.push((id, v)),
-                Err(e) => {
-                    log::error!(target: TARGET, "SimplexDb: skip bad candidate payload key: {e}")
-                }
-            }
-        }
-
-        let bootstrap = Bootstrap {
-            finalized_blocks,
-            candidate_infos,
-            notar_certs,
-            votes,
-            pool_state,
-            candidate_payloads,
-        };
+        let bootstrap =
+            Bootstrap { finalized_blocks, candidate_infos, notar_certs, votes, pool_state };
 
         log::info!(
-            target: TARGET,
-            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} certs, {} votes, \
-            {} payloads, pool_state={}",
+            target: LOG_TARGET,
+            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} certs, {} votes, pool_state={}",
             self.storage_id,
             bootstrap.finalized_blocks.len(),
             bootstrap.candidate_infos.len(),
             bootstrap.notar_certs.len(),
             bootstrap.votes.len(),
-            bootstrap.candidate_payloads.len(),
             bootstrap.pool_state.is_some()
         );
 
@@ -1163,7 +979,7 @@ impl SimplexDb {
         step: Duration,
     ) -> Result<Bootstrap> {
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: load_bootstrap_cancellable",
             self.storage_id
         );
@@ -1174,7 +990,6 @@ impl SimplexDb {
         let certs_async = self.load_notar_certs_async();
         let votes_async = self.load_votes_async();
         let pool_state_async = self.load_pool_state_async();
-        let payloads_async = self.load_candidate_payloads_async();
 
         // Wait with cancellation support
         let finalized_raw = finalized_async.wait_cancellable(cancel, step)?;
@@ -1182,7 +997,6 @@ impl SimplexDb {
         let certs_raw = certs_async.wait_cancellable(cancel, step)?;
         let votes_raw = votes_async.wait_cancellable(cancel, step)?;
         let pool_state_raw = pool_state_async.wait_cancellable(cancel, step)?;
-        let payloads_raw = payloads_async.wait_cancellable(cancel, step)?;
 
         // Deserialize results
         let mut finalized_blocks = Vec::with_capacity(finalized_raw.len());
@@ -1190,7 +1004,7 @@ impl SimplexDb {
             match deserialize_finalized_block(&k, &v) {
                 Ok(r) => finalized_blocks.push(r),
                 Err(e) => {
-                    log::error!(target: TARGET, "SimplexDb: skip bad finalized block: {e}")
+                    log::error!(target: LOG_TARGET, "SimplexDb: skip bad finalized block: {}", e)
                 }
             }
         }
@@ -1199,7 +1013,7 @@ impl SimplexDb {
         let finalized_blocks = filter_finalized_chain(finalized_blocks);
         if finalized_blocks.len() != total_finalized_blocks {
             log::warn!(
-                target: TARGET,
+                target: LOG_TARGET,
                 "SimplexDb {}: finalized blocks chain filter dropped {} records",
                 self.storage_id,
                 total_finalized_blocks - finalized_blocks.len()
@@ -1211,7 +1025,7 @@ impl SimplexDb {
             match deserialize_candidate_info(&k, &v) {
                 Ok(r) => candidate_infos.push(r),
                 Err(e) => {
-                    log::error!(target: TARGET, "SimplexDb: skip bad candidate info: {e}")
+                    log::error!(target: LOG_TARGET, "SimplexDb: skip bad candidate info: {}", e)
                 }
             }
         }
@@ -1220,7 +1034,7 @@ impl SimplexDb {
         for (k, v) in certs_raw {
             match deserialize_notar_cert(&k, &v) {
                 Ok(r) => notar_certs.push(r),
-                Err(e) => log::error!(target: TARGET, "SimplexDb: skip bad notar cert: {e}"),
+                Err(e) => log::error!(target: LOG_TARGET, "SimplexDb: skip bad notar cert: {}", e),
             }
         }
 
@@ -1228,16 +1042,8 @@ impl SimplexDb {
         for (k, v) in votes_raw {
             match deserialize_vote(&k, &v) {
                 Ok(r) => votes.push(r),
-                Err(e) => log::error!(target: TARGET, "SimplexDb: skip bad vote: {e}"),
+                Err(e) => log::error!(target: LOG_TARGET, "SimplexDb: skip bad vote: {}", e),
             }
-        }
-
-        // C++ parity: sort by seqno for deterministic replay order (db.cpp init_votes)
-        votes.sort_by_key(|r| r.seqno);
-
-        // Initialize next_vote_seqno from max seqno + 1 (C++ parity: db.cpp next_seqno_)
-        if let Some(max_seqno) = votes.last().map(|r| r.seqno) {
-            self.next_vote_seqno.store(max_seqno + 1, Ordering::Relaxed);
         }
 
         let pool_state = if pool_state_raw.is_empty() {
@@ -1247,41 +1053,23 @@ impl SimplexDb {
             match deserialize_pool_state(v) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    log::error!(target: TARGET, "SimplexDb: skip bad pool state: {e}");
+                    log::error!(target: LOG_TARGET, "SimplexDb: skip bad pool state: {}", e);
                     None
                 }
             }
         };
 
-        let mut candidate_payloads = Vec::with_capacity(payloads_raw.len());
-        for (k, v) in payloads_raw {
-            match deserialize_candidate_payload_key(&k) {
-                Ok(id) => candidate_payloads.push((id, v)),
-                Err(e) => {
-                    log::error!(target: TARGET, "SimplexDb: skip bad candidate payload key: {e}")
-                }
-            }
-        }
-
-        let bootstrap = Bootstrap {
-            finalized_blocks,
-            candidate_infos,
-            notar_certs,
-            votes,
-            pool_state,
-            candidate_payloads,
-        };
+        let bootstrap =
+            Bootstrap { finalized_blocks, candidate_infos, notar_certs, votes, pool_state };
 
         log::info!(
-            target: TARGET,
-            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} certs, {} votes, \
-            {} payloads, pool_state={}",
+            target: LOG_TARGET,
+            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} certs, {} votes, pool_state={}",
             self.storage_id,
             bootstrap.finalized_blocks.len(),
             bootstrap.candidate_infos.len(),
             bootstrap.notar_certs.len(),
             bootstrap.votes.len(),
-            bootstrap.candidate_payloads.len(),
             bootstrap.pool_state.is_some()
         );
 
@@ -1295,7 +1083,7 @@ impl SimplexDb {
     /// Wait for all pending writes to complete.
     pub fn sync(&self, timeout: Option<Duration>) -> Result<()> {
         log::debug!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: sync",
             self.storage_id
         );
@@ -1306,7 +1094,7 @@ impl SimplexDb {
     #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn mark_for_destroy(&self) {
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: marked for destroy",
             self.storage_id
         );
@@ -1317,7 +1105,7 @@ impl SimplexDb {
 impl Drop for SimplexDb {
     fn drop(&mut self) {
         log::info!(
-            target: TARGET,
+            target: LOG_TARGET,
             "SimplexDb {}: dropping, syncing pending writes...",
             self.storage_id
         );
@@ -1325,14 +1113,14 @@ impl Drop for SimplexDb {
         // Force sync to flush all pending writes before closing
         if let Err(e) = self.sync(Some(DEFAULT_SYNC_TIMEOUT)) {
             log::error!(
-                target: TARGET,
+                target: LOG_TARGET,
                 "SimplexDb {}: sync on drop failed: {}",
                 self.storage_id,
                 e
             );
         } else {
             log::info!(
-                target: TARGET,
+                target: LOG_TARGET,
                 "SimplexDb {}: sync complete",
                 self.storage_id
             );

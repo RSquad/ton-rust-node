@@ -10,11 +10,10 @@
  */
 use super::*;
 use crate::{serialize_config, serialize_config_param, SerializationMode};
-use std::fmt::Debug;
 use ton_block::{
-    write_boc, BuilderData, ConfigParam3, ConfigParam32, ConfigParam33, ConfigParam35,
-    ConfigParam36, ConfigParam37, ConfigParam39, ConfigParam4, ConfigParam6, ConfigParamEnum,
-    ConfigVotingSetup, IBitstring, NoncriticalParams, Number16, SigPubKey, VarUInteger32,
+    BuilderData, ConfigParam3, ConfigParam32, ConfigParam33, ConfigParam35, ConfigParam36,
+    ConfigParam37, ConfigParam39, ConfigParam4, ConfigParam6, ConfigVotingSetup, IBitstring,
+    Number16, SigPubKey, VarUInteger32,
 };
 
 include!("./test_common.rs");
@@ -28,75 +27,7 @@ fn test_parse_zerostate() {
     assert_json_eq(&json, &ethalon, "zerostate");
 }
 
-#[test]
-fn test_parse_zerostate_p30_use_quic_survives_into_v2_boc() {
-    let ethalon = std::fs::read_to_string("src/tests/data/zerostate-ethalon.json").unwrap();
-    let mut map = serde_json::from_str::<Map<String, Value>>(&ethalon).unwrap();
-
-    let master = map.get_mut("master").unwrap().as_object_mut().unwrap();
-    let config = master.get_mut("config").unwrap().as_object_mut().unwrap();
-    config.get_mut("p8").unwrap().as_object_mut().unwrap().insert("version".to_string(), 13.into());
-    config.insert(
-        "p30".to_string(),
-        serde_json::json!({
-            "mc": {
-                "use_quic": 1,
-                "slots_per_leader_window": 8,
-                "target_rate_ms": 200,
-                "first_block_timeout_ms": 500,
-                "max_leader_window_desync": 2
-            },
-            "shard": {
-                "use_quic": 1,
-                "slots_per_leader_window": 16,
-                "target_rate_ms": 200,
-                "first_block_timeout_ms": 500,
-                "max_leader_window_desync": 2
-            }
-        }),
-    );
-
-    let state = parse_state(&map).unwrap();
-    let custom = state.read_custom().unwrap().unwrap();
-    let config = custom.config();
-
-    let ConfigParamEnum::ConfigParam30(parsed_p30) = config.config(30).unwrap().unwrap() else {
-        panic!("expected ConfigParam30 in parsed zerostate");
-    };
-
-    let mc = parsed_p30.mc.as_ref().expect("expected MC simplex config");
-    assert!(mc.use_quic);
-    assert_eq!(mc.slots_per_leader_window, 8);
-    assert_eq!(mc.noncritical_params.target_rate_ms, 200);
-    assert_eq!(mc.noncritical_params.first_block_timeout_ms, 500);
-    assert_eq!(mc.noncritical_params.max_leader_window_desync, 2);
-
-    let shard = parsed_p30.shard.as_ref().expect("expected shard simplex config");
-    assert!(shard.use_quic);
-    assert_eq!(shard.slots_per_leader_window, 16);
-    assert_eq!(shard.noncritical_params.target_rate_ms, 200);
-    assert_eq!(shard.noncritical_params.first_block_timeout_ms, 500);
-    assert_eq!(shard.noncritical_params.max_leader_window_desync, 2);
-
-    let key = 30u32.write_to_bitstring().unwrap();
-    let p30_slice = config.config_params.get(key).unwrap().expect("expected raw p30 cell");
-    let p30_cell = p30_slice.reference(0).unwrap();
-    let p30_boc = write_boc(&p30_cell).unwrap();
-
-    let mc_v2_quic = [0x22, 0x01, 0x00, 0x00, 0x00, 0x08];
-    assert!(
-        p30_boc.windows(mc_v2_quic.len()).any(|window| window == mc_v2_quic),
-        "serialized p30 BOC must contain MC simplex_config_v2#22 with use_quic=1"
-    );
-
-    let shard_v2_quic = [0x22, 0x01, 0x00, 0x00, 0x00, 0x10];
-    assert!(
-        p30_boc.windows(shard_v2_quic.len()).any(|window| window == shard_v2_quic),
-        "serialized p30 BOC must contain shard simplex_config_v2#22 with use_quic=1"
-    );
-}
-
-fn check_err<T: Debug>(result: Result<T>, text: &str) {
+fn check_err<T: std::fmt::Debug>(result: Result<T>, text: &str) {
     let len = text.len();
     assert_eq!(&result.expect_err("must generate error").to_string()[0..len], text)
 }
@@ -362,24 +293,16 @@ fn get_config_param63() -> AcceleratedConsensusConfig {
 fn get_config_param30() -> NewConsensusConfigAll {
     NewConsensusConfigAll {
         mc: Some(SimplexConfig {
+            target_rate_ms: 300,
             slots_per_leader_window: 4,
-            noncritical_params: NoncriticalParams {
-                target_rate_ms: 300,
-                first_block_timeout_ms: 1000,
-                max_leader_window_desync: 100,
-                ..Default::default()
-            },
-            ..Default::default()
+            first_block_timeout_ms: 1000,
+            max_leader_window_desync: 100,
         }),
         shard: Some(SimplexConfig {
+            target_rate_ms: 200,
             slots_per_leader_window: 8,
-            noncritical_params: NoncriticalParams {
-                target_rate_ms: 200,
-                first_block_timeout_ms: 500,
-                max_leader_window_desync: 50,
-                ..Default::default()
-            },
-            ..Default::default()
+            first_block_timeout_ms: 500,
+            max_leader_window_desync: 50,
         }),
     }
 }

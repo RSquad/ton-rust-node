@@ -932,7 +932,6 @@ impl ConsensusOverlay for OverlayImpl {
         sender_id: &PublicKeyHash,
         send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
-        _extra: Option<Vec<u8>>,
     ) {
         log::debug!("LogReplay: send broadcast_fec_ex {}/{}: {:?}", sender_id, send_as, payload);
     }

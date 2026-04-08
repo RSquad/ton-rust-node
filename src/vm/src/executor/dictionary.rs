@@ -25,7 +25,7 @@ use ton_block::{
 
 fn try_unref_leaf(slice: SliceData) -> Result<StackItem> {
     match slice.remaining_bits() == 0 && slice.remaining_references() != 0 {
-        true => slice.reference(0).map(StackItem::Cell),
+        true => Ok(StackItem::Cell(slice.reference(0)?)),
         false => fail!(ExceptionCode::DictionaryError),
     }
 }
@@ -85,27 +85,37 @@ fn dict(
     let nbits = engine.cmd.var(0).as_integer_value(0..=1023)?;
     let mut dict = HashmapE::with_hashmap(nbits, engine.cmd.var(1).as_dict()?.cloned());
     let key = keyreader(engine.cmd.var(2), nbits)?;
-    if !key.is_empty_bitstring() {
+    if key.is_empty_bitstring() {
+        if how.any(SET | DEL) {
+            fail!(ExceptionCode::RangeCheckError, "key cannot be empty for set or delete")
+        } else {
+            if how.bit(RET) {
+                engine.cc.stack.push(boolean!(false));
+            }
+            Ok(())
+        }
+    } else {
         let val = handler(engine, &mut dict, key)?;
         if how.any(SET | DEL) {
             engine.cc.stack.push(StackItem::dict(dict.data()));
         }
-        if let Some(val) = val {
-            if how.bit(GET) {
-                engine.cc.stack.push(val);
+        match val {
+            None => {
+                if how.bit(RET) {
+                    engine.cc.stack.push(boolean!(ret));
+                }
             }
-            if how.bit(RET) {
-                engine.cc.stack.push(boolean!(!ret));
+            Some(val) => {
+                if how.bit(GET) {
+                    engine.cc.stack.push(val);
+                }
+                if how.bit(RET) {
+                    engine.cc.stack.push(boolean!(!ret));
+                }
             }
-        } else if how.bit(RET) {
-            engine.cc.stack.push(boolean!(ret));
-        }
-    } else if how.any(SET | DEL) {
-        fail!(ExceptionCode::RangeCheckError, "key cannot be empty for set or delete")
-    } else if how.bit(RET) {
-        engine.cc.stack.push(boolean!(false));
+        };
+        Ok(())
     }
-    Ok(())
 }
 
 // (key slice nbits - )
@@ -119,17 +129,19 @@ fn dictcont(engine: &mut Engine, name: &'static str, keyreader: KeyReader, how: 
         engine.cmd.vars.push(StackItem::continuation(ContinuationData::with_code(data)));
         let n = engine.cmd.var_count() - 1;
         if how.bit(SWITCH) {
-            switch(engine, var!(n))?;
+            switch(engine, var!(n))
         } else if how.bit(CALLX) {
-            callx(engine, n, false)?;
+            callx(engine, n, false)
         } else {
             fail!("dictcont: {:X}", how)
         }
     } else if how.bit(STAY) {
         let var = engine.cmd.vars.remove(2);
         engine.cc.stack.push(var);
+        Ok(())
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 // (key slice nbits - (value' key' -1) | (0))
@@ -381,8 +393,8 @@ fn valwriter_add_ref(
     dict: &mut HashmapE,
     key: SliceData,
 ) -> Result<Option<StackItem>> {
-    let value = engine.cmd.var(3).as_cell()?.clone();
-    match convert_dict_error(dict.addref_with_gas(key, value, engine))? {
+    let new_val = engine.cmd.var(3).as_cell()?.clone();
+    match convert_dict_error(dict.addref_with_gas(key, &new_val, engine))? {
         Some(val) => Ok(Some(try_unref_leaf(val)?)),
         None => Ok(None),
     }
@@ -397,7 +409,7 @@ fn valwriter_add_ref_without_unref(
     match convert_dict_error(dict.get_with_gas(key.clone(), engine))? {
         Some(val) => Ok(Some(StackItem::Slice(val))),
         None => {
-            convert_dict_error(dict.setref_with_gas(key, new_val, engine))?;
+            convert_dict_error(dict.setref_with_gas(key, &new_val, engine))?;
             Ok(None)
         }
     }
@@ -409,7 +421,7 @@ fn valwriter_add_or_remove_refopt(
     key: SliceData,
 ) -> Result<Option<StackItem>> {
     let old_value = match engine.cmd.var(3).as_dict()? {
-        Some(new_val) => convert_dict_error(dict.setref_with_gas(key, new_val.clone(), engine))?,
+        Some(new_val) => convert_dict_error(dict.setref_with_gas(key, &new_val.clone(), engine))?,
         None => convert_dict_error(dict.remove_with_gas(key, engine))?,
     };
     old_value.map(try_unref_leaf).or(Some(Ok(StackItem::None))).transpose()
@@ -460,8 +472,8 @@ fn valwriter_replace_ref(
     dict: &mut HashmapE,
     key: SliceData,
 ) -> Result<Option<StackItem>> {
-    let value = engine.cmd.var(3).as_cell()?.clone();
-    match convert_dict_error(dict.replaceref_with_gas(key, value, engine))? {
+    let val = engine.cmd.var(3).as_cell()?.clone();
+    match convert_dict_error(dict.replaceref_with_gas(key, &val, engine))? {
         Some(val) => Some(try_unref_leaf(val)).transpose(),
         None => Ok(None),
     }
@@ -491,8 +503,8 @@ fn valwriter_to_ref(
     dict: &mut HashmapE,
     key: SliceData,
 ) -> Result<Option<StackItem>> {
-    let value = engine.cmd.var(3).as_cell()?.clone();
-    convert_dict_error(dict.setref_with_gas(key, value, engine))?.map(try_unref_leaf).transpose()
+    let val = engine.cmd.var(3).as_cell()?.clone();
+    convert_dict_error(dict.setref_with_gas(key, &val, engine))?.map(try_unref_leaf).transpose()
 }
 
 const PREV: u8 = 0x00;

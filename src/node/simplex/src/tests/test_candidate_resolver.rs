@@ -11,11 +11,7 @@
 //! These tests verify the `CandidateResolverCache` correctly stores and retrieves
 //! candidate data and notarization certificates for responding to queries.
 
-use crate::{
-    block::{SlotIndex, ValidatorIndex},
-    SessionId, SessionNode,
-};
-use std::time::{Duration, SystemTime};
+use crate::{block::SlotIndex, SessionId, SessionNode};
 use ton_api::{
     ton::{consensus::overlayid::OverlayId, pub_::publickey::Overlay},
     IntoBoxed,
@@ -223,88 +219,4 @@ fn test_candidate_resolver_cache_cleanup_all() {
         let hash = UInt256::from([i as u8; 32]);
         assert!(cache.get_candidate(SlotIndex::new(i), &hash).is_none());
     }
-}
-
-#[test]
-fn test_merge_candidate_response_parts_body_then_notar_completes_merge() {
-    let slot = SlotIndex::new(42);
-    let block_hash = UInt256::rand();
-    let candidate_bytes = vec![1, 2, 3, 4];
-    let notar_bytes = vec![9, 8, 7];
-
-    let mut cache = super::CandidateResolverCache::new();
-    let mut state = super::CandidateRequestState {
-        start_time: SystemTime::now(),
-        retry_count: 0,
-        current_timeout: Duration::from_millis(500),
-        source_idx: ValidatorIndex::new(0),
-        cached_notar: None,
-        cached_candidate: None,
-    };
-
-    // First partial response: candidate body only -> notar remains missing.
-    let (merged_candidate_1, merged_notar_1) = super::ReceiverImpl::merge_candidate_response_parts(
-        &mut cache,
-        Some(&mut state),
-        slot,
-        &block_hash,
-        &candidate_bytes,
-        &[],
-    );
-    assert_eq!(merged_candidate_1, candidate_bytes);
-    assert!(
-        merged_notar_1.is_empty(),
-        "body-only partial response must not be considered complete"
-    );
-    assert_eq!(state.cached_candidate.as_ref(), Some(&candidate_bytes));
-    assert!(state.cached_notar.is_none());
-
-    // Second partial response: notar only -> merged output must include cached body + new notar.
-    let (merged_candidate_2, merged_notar_2) = super::ReceiverImpl::merge_candidate_response_parts(
-        &mut cache,
-        Some(&mut state),
-        slot,
-        &block_hash,
-        &[],
-        &notar_bytes,
-    );
-    assert_eq!(merged_candidate_2, candidate_bytes);
-    assert_eq!(merged_notar_2, notar_bytes);
-    assert_eq!(state.cached_candidate.as_ref(), Some(&candidate_bytes));
-    assert_eq!(state.cached_notar.as_ref(), Some(&notar_bytes));
-}
-
-#[test]
-fn test_merge_candidate_response_parts_uses_locally_cached_notar() {
-    let slot = SlotIndex::new(7);
-    let block_hash = UInt256::rand();
-    let candidate_bytes = vec![11, 22, 33];
-    let cached_notar = vec![44, 55];
-
-    let mut cache = super::CandidateResolverCache::new();
-    cache.cache_notar_cert(slot, block_hash.clone(), cached_notar.clone());
-
-    let mut state = super::CandidateRequestState {
-        start_time: SystemTime::now(),
-        retry_count: 0,
-        current_timeout: Duration::from_millis(500),
-        source_idx: ValidatorIndex::new(1),
-        cached_notar: None,
-        cached_candidate: None,
-    };
-
-    // No notar in this response, but resolver cache already has one.
-    let (merged_candidate, merged_notar) = super::ReceiverImpl::merge_candidate_response_parts(
-        &mut cache,
-        Some(&mut state),
-        slot,
-        &block_hash,
-        &candidate_bytes,
-        &[],
-    );
-    assert_eq!(merged_candidate, candidate_bytes);
-    assert_eq!(
-        merged_notar, cached_notar,
-        "candidate-only response should complete when notar already exists in local cache"
-    );
 }

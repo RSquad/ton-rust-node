@@ -304,7 +304,7 @@ impl Receiver for ReceiverWrapper {
         self.out_bytes.increment(payload.data().len() as u64);
 
         // Send broadcast through overlay directly
-        self.overlay.send_broadcast_fec_ex(&self.local_adnl_id, &self.local_id, payload, None);
+        self.overlay.send_broadcast_fec_ex(&self.local_adnl_id, &self.local_id, payload);
     }
 
     /// Send query via RLDP
@@ -3457,7 +3457,7 @@ impl ReceiverImpl {
 
         //overlay creation
 
-        log::info!(
+        log::debug!(
             "Receiver: starting up overlay for session {:x} with ID {:x}, short_id {}",
             session_id,
             overlay_id,
@@ -3486,7 +3486,7 @@ impl ReceiverImpl {
         let overlay_replay_listener: Arc<dyn CatchainOverlayLogReplayListener + Send + Sync> =
             overlay_listener.clone();
 
-        log::info!(
+        log::debug!(
             "Receiver: starting up overlay for session {:x} with ID/incarnation {:x}, short_id {}",
             session_id,
             overlay_id,

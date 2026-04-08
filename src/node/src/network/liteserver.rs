@@ -1656,7 +1656,7 @@ impl LiteServerQuerySubscriber {
         let result = BlockState {
             id: block_id,
             root_hash: state.root_cell().repr_hash(),
-            file_hash: UInt256::calc_file_hash(&data),
+            file_hash: state.block_id().file_hash.clone(),
             data,
         };
         Ok(result)

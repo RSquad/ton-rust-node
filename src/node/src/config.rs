@@ -44,7 +44,7 @@ use std::{
     },
     time::Duration,
 };
-use storage::{archives::epoch::ArchivalModeConfig, shardstate_db_async::CellsDbConfig};
+use storage::shardstate_db_async::CellsDbConfig;
 use ton_api::{
     ton::{
         self,
@@ -366,9 +366,6 @@ pub struct TonNodeConfig {
     unsafe_catchain_patches_path: Option<String>,
     #[serde(skip_serializing)]
     ip_address: Option<String>,
-    /// Explicit QUIC address (ip:port). If absent, derived as same_ip:adnl_port+1000.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ip_address_quic: Option<String>,
     adnl_node: Option<AdnlNodeConfigJson>,
     json_rpc_server: Option<JsonRpcServerConfigJson>,
     metrics: Option<MetricsConfigJson>,
@@ -411,8 +408,6 @@ pub struct TonNodeConfig {
     sync_by_archives: bool,
     #[serde(default)]
     accelerated_consensus_disabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    archival_mode: Option<ArchivalModeConfig>,
     #[serde(skip)]
     custom_overlays: CustomOverlaysConfigBoxed,
     #[serde(default)]
@@ -570,9 +565,6 @@ impl TonNodeConfig {
         if let Some(port) = self.port {
             ret.set_port(port)
         }
-        if let Some(quic_addr) = self.quic_address() {
-            ret.set_ip_address_quic(quic_addr);
-        }
         Ok(ret)
     }
 
@@ -627,20 +619,12 @@ impl TonNodeConfig {
     }
 
     pub fn gc_archives_life_time_hours(&self) -> Option<u32> {
-        // GC disabled in archival mode
-        if self.archival_mode.is_some() {
-            return None;
-        }
         if let Some(gc) = &self.gc {
             if gc.enable_for_archives {
                 return gc.archives_life_time_hours.or(Some(0));
             }
         }
         None
-    }
-
-    pub fn archival_mode(&self) -> Option<&ArchivalModeConfig> {
-        self.archival_mode.as_ref()
     }
 
     pub fn internal_db_path(&self) -> &str {
@@ -691,31 +675,6 @@ impl TonNodeConfig {
 
     pub fn is_accelerated_consensus_disabled(&self) -> bool {
         self.accelerated_consensus_disabled
-    }
-
-    pub fn quic_address(&self) -> Option<SocketAddr> {
-        self.ip_address_quic.as_ref().and_then(|s| match s.parse::<SocketAddr>() {
-            Ok(addr) => {
-                if !addr.ip().is_ipv4() {
-                    log::warn!(
-                        "ip_address_quic \"{s}\" is not an IPv4 address. \
-                         ADNL/TL address lists only support IPv4, so this QUIC address \
-                         cannot be advertised. QUIC address will not be used, \
-                         node will fall back to derived port."
-                    );
-                    None
-                } else {
-                    Some(addr)
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to parse ip_address_quic \"{s}\": {e}. \
-                     QUIC address will not be used, node will fall back to derived port."
-                );
-                None
-            }
-        })
     }
 
     #[cfg(test)]
@@ -834,7 +793,6 @@ impl TonNodeConfig {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn get_validator_key_info(&self, validator_key_id: &str) -> Result<Option<ValidatorKeysJson>> {
         if let Some(validator_keys) = &self.validator_keys {
             for key_json in validator_keys {
@@ -1063,11 +1021,10 @@ impl TonNodeConfig {
         election_id: i32,
         expire_at: i32,
     ) -> Result<ValidatorKeysJson> {
-        let new_key_id_b64 = base64_encode(key_id);
         let key_info = ValidatorKeysJson {
             expire_at,
             election_id,
-            validator_key_id: new_key_id_b64.clone(),
+            validator_key_id: base64_encode(key_id),
             validator_adnl_key_id: None,
         };
 
@@ -1077,16 +1034,7 @@ impl TonNodeConfig {
         let added_key_info = self.get_validator_key_info_by_election_id(&election_id)?;
         match &mut self.validator_keys {
             Some(validator_keys) => match added_key_info {
-                Some(existing) => {
-                    if existing.validator_key_id != new_key_id_b64 {
-                        log::warn!(
-                            "add_validator_key: OVERWRITING validator key for election_id={}: \
-                             old_key={} -> new_key={} (adnl_key will be cleared)",
-                            election_id,
-                            existing.validator_key_id,
-                            new_key_id_b64,
-                        );
-                    }
+                Some(_) => {
                     self.update_validator_key_info(key_info.clone())?;
                 }
                 None => {
@@ -1106,46 +1054,12 @@ impl TonNodeConfig {
         validator_key_id: &[u8; 32],
         adnl_key_id: &[u8; 32],
     ) -> Result<ValidatorKeysJson> {
-        let key_id_b64 = base64_encode(validator_key_id);
-        let new_adnl_b64 = base64_encode(adnl_key_id);
-
-        let matching: Vec<ValidatorKeysJson> = self
-            .validator_keys
-            .as_ref()
-            .map(|keys| keys.iter().filter(|k| k.validator_key_id == key_id_b64).cloned().collect())
-            .unwrap_or_default();
-
-        if matching.is_empty() {
+        if let Some(mut key_info) = self.get_validator_key_info(&base64_encode(validator_key_id))? {
+            key_info.validator_adnl_key_id = Some(base64_encode(adnl_key_id));
+            self.update_validator_key_info(key_info)
+        } else {
             fail!("Validator key have not been added!")
         }
-
-        let mut last_updated = None;
-        for entry in &matching {
-            if let Some(existing_adnl) = &entry.validator_adnl_key_id {
-                if *existing_adnl != new_adnl_b64 {
-                    log::warn!(
-                        "add_validator_adnl_key: OVERWRITING adnl key for election_id={}: \
-                         old_adnl={} -> new_adnl={} (validator_key={})",
-                        entry.election_id,
-                        existing_adnl,
-                        new_adnl_b64,
-                        key_id_b64,
-                    );
-                }
-            }
-            let mut updated = entry.clone();
-            updated.validator_adnl_key_id = Some(new_adnl_b64.clone());
-            last_updated = Some(self.update_validator_key_info(updated)?);
-        }
-        if matching.len() > 1 {
-            log::info!(
-                "add_validator_adnl_key: updated adnl binding for {} elections sharing \
-                 validator_key={}",
-                matching.len(),
-                key_id_b64,
-            );
-        }
-        Ok(last_updated.unwrap())
     }
 
     async fn remove_validator_key(
@@ -2240,27 +2154,7 @@ impl ValidatorKeys {
         // inserted in sorted order
         let mut first = false;
 
-        add_unbound_object_to_map_with_update(&self.values, key.election_id, |old| {
-            if let Some(existing) = old {
-                if existing.validator_key_id != key.validator_key_id {
-                    log::warn!(
-                        "ValidatorKeys: replacing validator key for election_id={}: \
-                         old_key={} -> new_key={}",
-                        key.election_id,
-                        existing.validator_key_id,
-                        key.validator_key_id,
-                    );
-                }
-                if existing.validator_adnl_key_id != key.validator_adnl_key_id {
-                    log::warn!(
-                        "ValidatorKeys: adnl key changed for election_id={}: \
-                         old_adnl={:?} -> new_adnl={:?}",
-                        key.election_id,
-                        existing.validator_adnl_key_id,
-                        key.validator_adnl_key_id,
-                    );
-                }
-            }
+        add_unbound_object_to_map_with_update(&self.values, key.election_id, |_| {
             if self
                 .first
                 .compare_exchange(

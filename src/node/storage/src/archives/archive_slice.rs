@@ -12,7 +12,7 @@
 use crate::StorageTelemetry;
 use crate::{
     archives::{
-        archive_manager::{ArchiveManager, ImportEntry},
+        archive_manager::ArchiveManager,
         block_index_db::{BlockIndexDb, LookupResult},
         get_mc_seq_no,
         package::{read_package_from, Package},
@@ -159,86 +159,6 @@ impl ArchiveSlice {
         let entry = ret.get_base_entry_info();
         ret.new_package(entry, None, 0, DEFAULT_PKG_VERSION).await?;
         Ok(ret)
-    }
-
-    /// Create a new archive slice for importing existing .pack files.
-    /// Unlike `new_empty()`, this does not create an initial package file.
-    /// Packages are registered later via `import_package_entries()`.
-    pub async fn new_for_import(
-        db: Arc<RocksDb>,
-        db_root_path: Arc<PathBuf>,
-        archive_id: u32,
-        package_type: PackageType,
-        shard_split_depth: u8,
-        #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
-        allocated: Arc<StorageAlloc>,
-    ) -> Result<Self> {
-        let mut ret = Self::create(
-            db,
-            db_root_path,
-            archive_id,
-            package_type,
-            true, // finalized: prevents truncation when opening packages
-            true, // create_if_not_exist
-            shard_split_depth,
-            #[cfg(feature = "telemetry")]
-            telemetry,
-            allocated,
-        )
-        .await?;
-        let mut transaction = ret.package_status_db.begin_transaction()?;
-        if ret.sliced_mode {
-            ret.shard_separated = true;
-            transaction.put(&PackageStatusKey::SlicedMode, &true.serialize())?;
-            transaction.put(&PackageStatusKey::TotalSlices, &0u32.serialize())?;
-            transaction.put(&PackageStatusKey::SliceSize, &ret.slice_size.serialize())?;
-            transaction
-                .put(&PackageStatusKey::ShardSplitDepth, &ret.shard_split_depth.serialize())?;
-        } else {
-            transaction.put(&PackageStatusKey::SlicedMode, &false.serialize())?;
-            transaction.put(&PackageStatusKey::NonSlicedSize, &0u64.serialize())?;
-        }
-        transaction.commit()?;
-        Ok(ret)
-    }
-
-    pub async fn import_package_entries(
-        &self,
-        package_archive_id: u32,
-        shard: &ShardIdent,
-        file_size: u64,
-        entries: &[ImportEntry],
-    ) -> Result<()> {
-        let entry = PackageEntryInfo { seqno: package_archive_id, shard: shard.clone() };
-
-        if self.package_store.get(&entry).is_none() {
-            self.add_package(entry, file_size).await?;
-        }
-
-        for import_entry in entries {
-            let offset_key = (&import_entry.entry_id).into();
-            self.offsets_db.put_value(&offset_key, &import_entry.offset)?;
-            if let (PackageEntryId::Block(_), Some(bm)) =
-                (&import_entry.entry_id, &import_entry.block_meta)
-            {
-                self.block_index_db.put_raw(
-                    &bm.shard,
-                    bm.seq_no,
-                    bm.end_lt,
-                    bm.gen_utime,
-                    bm.mc_ref_seq_no,
-                    u32::try_from(import_entry.offset).map_err(|_| {
-                        error!("entry offset {} exceeds u32 range", import_entry.offset)
-                    })?,
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn db_root_path(&self) -> &std::path::Path {
-        self.db_root_path.as_path()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -424,58 +344,6 @@ impl ArchiveSlice {
         }
     }
 
-    async fn add_package(&self, entry: PackageEntryInfo, size: u64) -> Result<()> {
-        let try_add_package = async |package_count, entry: &PackageEntryInfo| {
-            if self
-                .new_package(entry.clone(), Some(package_count), size, DEFAULT_PKG_VERSION)
-                .await?
-            {
-                let info = if self.shard_separated { Some(entry) } else { None };
-                self.entry_db.put_value(
-                    &package_count.into(),
-                    &PackageEntryMeta::with_data(size, DEFAULT_PKG_VERSION, info),
-                )?;
-                self.package_status_db
-                    .put_value(&PackageStatusKey::TotalSlices, &(package_count + 1))?;
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        };
-        loop {
-            const BUSY: u32 = 0x80000000;
-            let package_count = self.package_count.fetch_or(BUSY, Ordering::Relaxed);
-            if (package_count & BUSY) != 0 {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            let result = try_add_package(package_count, &entry).await;
-            let new_count = match &result {
-                Err(_) | Ok(false) => package_count,
-                Ok(true) => package_count + 1,
-            };
-            if self
-                .package_count
-                .compare_exchange(
-                    package_count | BUSY,
-                    new_count,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-                && result.is_ok()
-            {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            if let Err(e) = result {
-                break Err(e);
-            } else {
-                break Ok(());
-            }
-        }
-    }
-
     pub async fn add_file<B: Borrow<BlockIdExt> + Hash>(
         &self,
         block_handle: &BlockHandle,
@@ -504,7 +372,55 @@ impl ArchiveSlice {
                             mc_seq_no - (mc_seq_no - self.archive_id) / self.slice_size
                         )
                     }
-                    self.add_package(entry, 0).await?;
+                    let try_add_package = async |package_count, entry: &PackageEntryInfo| {
+                        if self
+                            .new_package(entry.clone(), Some(package_count), 0, DEFAULT_PKG_VERSION)
+                            .await?
+                        {
+                            let info = if self.shard_separated { Some(entry) } else { None };
+                            self.entry_db.put_value(
+                                &package_count.into(),
+                                &PackageEntryMeta::with_data(0, DEFAULT_PKG_VERSION, info),
+                            )?;
+                            self.package_status_db
+                                .put_value(&PackageStatusKey::TotalSlices, &(package_count + 1))?;
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    };
+                    loop {
+                        const BUSY: u32 = 0x80000000;
+                        let package_count = self.package_count.fetch_or(BUSY, Ordering::Relaxed);
+                        if (package_count & BUSY) != 0 {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        let result = try_add_package(package_count, &entry).await;
+                        let new_count = match &result {
+                            Err(_) | Ok(false) => package_count,
+                            Ok(true) => package_count + 1,
+                        };
+                        if self
+                            .package_count
+                            .compare_exchange(
+                                package_count | BUSY,
+                                new_count,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .is_err()
+                            && result.is_ok()
+                        {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        if let Err(e) = result {
+                            return Err(e);
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         };
@@ -536,22 +452,13 @@ impl ArchiveSlice {
         block_handle: &BlockHandle,
         entry_id: &PackageEntryId<B>,
     ) -> Result<Option<PackageEntry>> {
-        let mc_seq_no = get_mc_seq_no(block_handle);
-        let shard = block_handle.id().shard();
-        self.get_file_raw(mc_seq_no, &shard, entry_id).await
-    }
-
-    async fn get_file_raw<B: Borrow<BlockIdExt> + Hash>(
-        &self,
-        mc_seq_no: u32,
-        shard: &ShardIdent,
-        entry_id: &PackageEntryId<B>,
-    ) -> Result<Option<PackageEntry>> {
         let offset_key = entry_id.into();
         let offset = match self.offsets_db.try_get_value(&offset_key)? {
             Some(offset) => offset,
             None => return Ok(None),
         };
+        let mc_seq_no = get_mc_seq_no(block_handle);
+        let shard = block_handle.id().shard();
         let package_info = match self.choose_package(mc_seq_no, shard).await? {
             ChosenPackage::Info(info) => info,
             ChosenPackage::Slot(_) => {
@@ -660,31 +567,6 @@ impl ArchiveSlice {
             return Ok(None);
         };
         self.get_block_by_lookup_result(lr).await
-    }
-
-    pub async fn lookup_proof_by_seqno(
-        &self,
-        prefix: &AccountIdPrefixFull,
-        seqno: u32,
-    ) -> Result<Option<(BlockIdExt, Vec<u8>)>> {
-        let Some(lr) = self.block_index_db.lookup_by_seqno(prefix, seqno)? else {
-            return Ok(None);
-        };
-        let mc_seq_no = lr.mc_ref;
-        let Some((block_id, _)) = self.get_block_by_lookup_result(lr).await? else {
-            return Ok(None);
-        };
-
-        // Masterchain blocks store proofs under `Proof`, shard blocks under `ProofLink`.
-        let entry_id = if block_id.shard().is_masterchain() {
-            PackageEntryId::Proof(block_id.clone())
-        } else {
-            PackageEntryId::ProofLink(block_id.clone())
-        };
-
-        self.get_file_raw(mc_seq_no, block_id.shard(), &entry_id)
-            .await
-            .map(|opt_entry| opt_entry.map(|entry| (block_id, entry.take_data())))
     }
 
     pub async fn lookup_block_by_lt(
@@ -1046,7 +928,7 @@ impl ArchiveSlice {
             .map_err(|e| error!("Cannot create directory {} : {e}", parent.display()))?;
         if add_unbound_object_to_map(&self.package_store, entry.clone(), || Ok(OnceLock::new()))? {
             let create_package = async || {
-                let package = match Package::open(path.clone(), self.finalized, true).await {
+                let package = match Package::open(path.clone(), false, true).await {
                     Ok(p) => p,
                     Err(e) => match tokio::fs::remove_file(path.as_path()).await {
                         Ok(_) => fail!(

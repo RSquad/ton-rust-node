@@ -21,7 +21,6 @@ use crate::{
     },
     PublicKey,
 };
-use std::collections::HashMap;
 use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256};
 
 /*
@@ -167,6 +166,8 @@ fn test_slot_index_window_calculations() {
 /// Test SlotIndex hashing (for use in HashMap)
 #[test]
 fn test_slot_index_hash() {
+    use std::collections::HashMap;
+
     let mut map: HashMap<SlotIndex, &str> = HashMap::new();
     map.insert(SlotIndex::new(0), "slot_0");
     map.insert(SlotIndex::new(42), "slot_42");
@@ -261,6 +262,8 @@ fn test_window_index_slot_calculations() {
 /// Test WindowIndex hashing (for use in HashMap)
 #[test]
 fn test_window_index_hash() {
+    use std::collections::HashMap;
+
     let mut map: HashMap<WindowIndex, &str> = HashMap::new();
     map.insert(WindowIndex::new(0), "window_0");
     map.insert(WindowIndex::new(42), "window_42");
@@ -336,6 +339,8 @@ fn test_validator_index_conversions() {
 /// Test ValidatorIndex hashing (for use in HashMap)
 #[test]
 fn test_validator_index_hash() {
+    use std::collections::HashMap;
+
     let mut map: HashMap<ValidatorIndex, &str> = HashMap::new();
     map.insert(ValidatorIndex::new(0), "validator_0");
     map.insert(ValidatorIndex::new(42), "validator_42");

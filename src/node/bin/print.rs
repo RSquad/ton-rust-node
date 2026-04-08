@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
             print_state(&state, brief)?;
         } else if let Ok(account) = Account::construct_from_cell(res.roots[0].clone()) {
             if let Some(data) = account.data().and_then(|data| data.reference(0).ok()) {
-                let config_params = ConfigParams::with_root(data)?;
+                let config_params = ConfigParams::with_root(data);
                 let mut json = Default::default();
                 let mode = ton_block_json::SerializationMode::Debug;
                 if ton_block_json::serialize_config(&mut json, &config_params, mode).is_ok() {

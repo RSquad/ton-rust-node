@@ -76,59 +76,13 @@ pub struct EngineAlloc {
     pub validator_sets: Arc<AtomicU64>,
 }
 
-/// Config-level binding of a validator key to an election.
-///
-/// Each entry represents the `(election_id, validator_key, adnl_key)` tuple
-/// stored in the node configuration. `election_id` is the primary key —
-/// at most one binding must exist per election.
-#[derive(Debug, Clone)]
-pub struct ValidatorKeyBinding {
-    pub election_id: i32,
-    pub validator_key_id: String,
-    pub validator_adnl_key_id: Option<String>,
-    pub expire_at: i32,
-}
-
-/// Outcome of [`PrivateOverlayOperations::set_validator_list`].
-///
-/// Models the result of checking whether the local node belongs to a given validator list.
-///
-/// # C++ counterpart
-///
-/// C++ uses `get_validator()` (`manager.cpp`) which returns a `PublicKeyHash`
-/// (zero = not a validator). There is no explicit `network_ready` concept in C++ because
-/// ADNL identity is always resolvable (falling back to the validator public key hash when
-/// `addr` is zero, see `create_validator_group()` in `manager.cpp`). The `network_ready` flag is a
-/// Rust-specific extension that decouples validator membership from ADNL/overlay readiness.
-/// Rust still records validator membership immediately, while overlay activation is retried
-/// until the network layer finishes loading the ADNL key.
-///
-/// # Variants
-///
-/// - `Selected { key, matching_keys, network_ready }` -- local node's public key is in the
-///   validator set. `key` is the first selected local key used for network setup, while
-///   `matching_keys` preserves all local matches in C++ `temp_keys_` order so shard subsets
-///   can still choose the right local validator key. `network_ready` is `true` when the
-///   corresponding ADNL key and overlay infrastructure are operational; `false` when the
-///   pubkey matched but ADNL setup is still pending.
-/// - `NotValidator` -- no local key matches the validator set.
-#[derive(Debug)]
-pub enum ValidatorListOutcome {
-    Selected {
-        key: Arc<dyn KeyOption>,
-        matching_keys: Vec<Arc<dyn KeyOption>>,
-        network_ready: bool,
-    },
-    NotValidator,
-}
-
 #[async_trait::async_trait]
 pub trait PrivateOverlayOperations: Sync + Send {
     async fn set_validator_list(
         &self,
         validator_list_id: UInt256,
         validators: &[CatchainNode],
-    ) -> Result<ValidatorListOutcome>;
+    ) -> Result<Option<Arc<dyn KeyOption>>>;
 
     fn activate_validator_list(&self, validator_list_id: UInt256) -> Result<()>;
 
@@ -197,13 +151,6 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
-    /// Return all `(election_id, validator_key, adnl_key)` bindings known to this node.
-    ///
-    /// Used by the validator manager to display and verify key uniqueness per election_id.
-    fn get_validator_key_bindings(&self) -> Result<Vec<ValidatorKeyBinding>> {
-        unimplemented!()
-    }
-
     fn set_validation_status(&self, status: ValidationStatus) {
         unimplemented!()
     }
@@ -240,7 +187,7 @@ pub trait EngineOperations: Sync + Send {
         &self,
         validator_list_id: UInt256,
         validators: &[CatchainNode],
-    ) -> Result<ValidatorListOutcome> {
+    ) -> Result<Option<Arc<dyn KeyOption>>> {
         unimplemented!()
     }
 
@@ -345,15 +292,6 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
     fn clear_last_rotation_block_id(&self) -> Result<()> {
-        unimplemented!()
-    }
-    fn load_destroyed_session_ids(&self) -> Result<Vec<UInt256>> {
-        unimplemented!()
-    }
-    fn save_destroyed_session_ids(&self, _ids: &HashSet<UInt256>) -> Result<()> {
-        unimplemented!()
-    }
-    fn clear_destroyed_session_ids(&self) -> Result<()> {
         unimplemented!()
     }
     fn save_block_candidate(
@@ -634,13 +572,6 @@ pub trait EngineOperations: Sync + Send {
         handle: &Arc<BlockHandle>,
         state: Arc<ShardStateStuff>,
     ) -> Result<Arc<ShardStateStuff>> {
-        unimplemented!()
-    }
-    async fn store_state_update(
-        &self,
-        handle: &Arc<BlockHandle>,
-        state_update: Cell,
-    ) -> Result<()> {
         unimplemented!()
     }
     async fn store_zerostate(
@@ -997,10 +928,6 @@ pub trait EngineOperations: Sync + Send {
         config: &ConfigParams,
     ) -> Result<()> {
         Ok(())
-    }
-
-    fn is_archival_mode(&self) -> bool {
-        false
     }
 }
 

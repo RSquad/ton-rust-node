@@ -32,7 +32,14 @@ use crate::{
     utils::sign_vote,
     RawBuffer, RestartRecommitStrategy, SessionId, SessionNode, SessionOptions,
 };
-use std::{sync::Arc, time::SystemTime};
+use consensus_common::ConsensusCommonFactory;
+use std::{
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::SystemTime,
+};
 use ton_api::{
     deserialize_boxed, serialize_boxed,
     ton::{
@@ -42,14 +49,13 @@ use ton_api::{
             candidateparent::CandidateParent as TlCandidateParent,
             CandidateData, CandidateHashData, CandidateId as CandidateIdBoxed, CandidateParent,
         },
-        validator_session::candidate::Candidate as TlCandidate,
+        validator_session::{
+            candidate::Candidate as TlCandidate, Candidate as ValidatorSessionCandidate,
+        },
     },
     IntoBoxed,
 };
-use ton_block::{
-    sha256_digest, BlockIdExt, BocFlags, BocWriter, BuilderData, Ed25519KeyOption, Result,
-    ShardIdent, UInt256,
-};
+use ton_block::{error, sha256_digest, BlockIdExt, Ed25519KeyOption, Result, ShardIdent, UInt256};
 
 #[test]
 fn test_restart_recommit_strategy_default() {
@@ -178,16 +184,6 @@ fn make_candidate_hash_data_empty(
         block: referenced_block,
         parent: tl_parent_id,
     })
-}
-
-/// Create valid BOC bytes from raw data (for tests that need valid BOC input).
-fn make_test_boc(data: &[u8], flags: BocFlags) -> Vec<u8> {
-    let mut b = BuilderData::new();
-    b.append_raw(data, data.len() * 8).unwrap();
-    let cell = b.into_cell().unwrap();
-    let mut buf = Vec::new();
-    BocWriter::with_flags([cell], flags).unwrap().write(&mut buf).unwrap();
-    buf
 }
 
 fn make_validator_session_candidate_bytes(
@@ -679,6 +675,17 @@ impl SessionStartupRecoveryListener for MockRecoveryListener {
         self.cached_candidates.push((slot, candidate_hash, candidate_data_bytes));
     }
 
+    fn recovery_notify_get_approved_candidate(
+        &self,
+        _source: crate::PublicKey,
+        _root_hash: crate::BlockHash,
+        _file_hash: crate::BlockHash,
+        _collated_data_hash: crate::BlockHash,
+        _callback: Box<dyn FnOnce(Result<consensus_common::ValidatorBlockCandidatePtr>) + Send>,
+    ) {
+        panic!("unexpected recovery_notify_get_approved_candidate call in this test");
+    }
+
     fn recovery_apply_restart_recommit_actions(
         &mut self,
         _actions: &[RestartRoundAction],
@@ -702,7 +709,7 @@ fn make_vote_record(
     let tl_vote = sign_vote(&vote, session_id, key).expect("sign_vote failed");
     let serialized = serialize_boxed(&tl_vote).expect("serialize vote failed");
     let vote_hash = UInt256::from_slice(&sha256_digest(&serialized));
-    VoteRecord { vote_hash, data: serialized.into(), node_idx, seqno: 0 }
+    VoteRecord { vote_hash, data: serialized.into(), node_idx }
 }
 
 #[test]
@@ -759,7 +766,6 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         notar_certs,
         votes: votes.clone(),
         pool_state,
-        candidate_payloads: vec![],
     };
 
     let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
@@ -771,7 +777,7 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
     proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
 
     // ------------------------------------------------------------------------
-    // Ordering invariants (Phase 6.6 + last-finalized-cert sequencing)
+    // Ordering invariants (Phase 6.6 + CERT-1 sequencing)
     // ------------------------------------------------------------------------
     //
     // 1) All votes must be replayed BEFORE setting finalized boundary (Phase 6.6)
@@ -801,7 +807,7 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         "Local flags must be applied after finalized boundary is set"
     );
 
-    // 3) Last-finalized-cert notification must happen AFTER seeding finalized tracking set
+    // 3) CERT-1 notification must happen AFTER seeding finalized tracking set
     let last_seed_final_pos = listener
         .call_log
         .iter()
@@ -814,10 +820,10 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         .expect("expected NotifyLastFinalized call");
     assert!(
         last_seed_final_pos < cert1_pos,
-        "Last-finalized-cert notification must happen after seeding finalized blocks set"
+        "CERT-1 notification must happen after seeding finalized blocks set"
     );
 
-    // 4) Standstill cache rebuild must happen after last-finalized-cert notification.
+    // 4) Standstill cache rebuild must happen after CERT-1.
     let standstill_pos = listener
         .call_log
         .iter()
@@ -825,7 +831,7 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         .expect("expected RestoreStandstillCache call");
     assert!(
         cert1_pos < standstill_pos,
-        "Standstill cache rebuild must happen after last-finalized-cert notification"
+        "Standstill cache rebuild must happen after CERT-1 notification"
     );
 
     // Step 1: global replay
@@ -898,7 +904,6 @@ fn test_apply_bootstrap_does_not_generate_skip_votes_when_first_nonannounced_win
         notar_certs: vec![],
         votes: vec![],
         pool_state: Some(PoolStateRecord { first_nonannounced_window: WindowIndex::new(0) }),
-        candidate_payloads: vec![],
     };
 
     let desc = create_test_desc();
@@ -934,10 +939,19 @@ fn test_apply_bootstrap_does_not_generate_skip_votes_when_first_nonannounced_win
 // Candidate bytes cache restoration: TL roundtrip + invariants
 // ============================================================================
 
-/// Listener that captures cached CandidateData bytes during candidate cache restoration.
+/// Listener that supports non-empty candidate fetch and captures cached CandidateData bytes.
 #[derive(Default)]
 struct CandidateCacheListener {
+    // Observations
     cached_candidates: Vec<(SlotIndex, UInt256, Vec<u8>)>,
+    fetched_non_empty: AtomicU32,
+
+    // Expectations for non-empty fetch request
+    expected_root_hash: UInt256,
+    expected_file_hash: UInt256,
+    expected_collated_file_hash: UInt256,
+    candidate_block_data: Vec<u8>,
+    candidate_collated_data: Vec<u8>,
 }
 
 impl SessionStartupRecoveryListener for CandidateCacheListener {
@@ -1024,6 +1038,37 @@ impl SessionStartupRecoveryListener for CandidateCacheListener {
         self.cached_candidates.push((slot, candidate_hash, candidate_data_bytes));
     }
 
+    fn recovery_notify_get_approved_candidate(
+        &self,
+        source: crate::PublicKey,
+        root_hash: crate::BlockHash,
+        file_hash: crate::BlockHash,
+        collated_data_hash: crate::BlockHash,
+        callback: Box<dyn FnOnce(Result<consensus_common::ValidatorBlockCandidatePtr>) + Send>,
+    ) {
+        // This must be called exactly for non-empty candidates only
+        self.fetched_non_empty.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(root_hash, self.expected_root_hash, "unexpected root_hash requested");
+        assert_eq!(file_hash, self.expected_file_hash, "unexpected file_hash requested");
+        assert_eq!(
+            collated_data_hash, self.expected_collated_file_hash,
+            "unexpected collated_data_hash requested"
+        );
+
+        let candidate = consensus_common::ValidatorBlockCandidate {
+            public_key: source,
+            id: BlockIdExt::default(),
+            collated_file_hash: collated_data_hash,
+            data: ConsensusCommonFactory::create_block_payload(self.candidate_block_data.clone()),
+            collated_data: ConsensusCommonFactory::create_block_payload(
+                self.candidate_collated_data.clone(),
+            ),
+        };
+
+        callback(Ok(Arc::new(candidate)));
+    }
+
     fn recovery_apply_restart_recommit_actions(
         &mut self,
         actions: &[RestartRoundAction],
@@ -1072,9 +1117,8 @@ fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
     // ------------------------------------------------------------------------
     let non_empty_round_seqno: i32 = 51; // used as block seqno by extract_block_info_from_candidate
     let non_empty_root_hash = UInt256::from([0x22; 32]);
-    // Use valid BOC bytes — compress_candidate_data requires valid BOC input
-    let non_empty_data = make_test_boc(b"block_data_bytes", BocFlags::all());
-    let non_empty_collated = make_test_boc(b"collated_data_bytes", BocFlags::Crc32);
+    let non_empty_data = b"block_data_bytes".to_vec();
+    let non_empty_collated = b"collated_data_bytes".to_vec();
     let candidate_payload_bytes = make_validator_session_candidate_bytes(
         non_empty_round_seqno,
         non_empty_root_hash.clone(),
@@ -1088,7 +1132,6 @@ fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
         Some((parent_id.slot, &parent_id.hash)),
         &shard,
         max_size,
-        0,
     )
     .expect("compute_candidate_id_hash_from_bytes failed");
     let non_empty_candidate_id = RawCandidateId { slot: SlotIndex::new(11), hash: non_empty_hash };
@@ -1147,41 +1190,80 @@ fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
         notar_certs: vec![],
         votes: vec![],
         pool_state: None,
-        candidate_payloads: vec![],
     };
 
     let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
 
-    let mut listener = CandidateCacheListener::default();
+    let mut listener = CandidateCacheListener {
+        expected_root_hash: non_empty_root_hash.clone(),
+        expected_file_hash: non_empty_file_hash.clone(),
+        expected_collated_file_hash: non_empty_collated_file_hash.clone(),
+        candidate_block_data: non_empty_data.clone(),
+        candidate_collated_data: non_empty_collated.clone(),
+        ..Default::default()
+    };
 
     proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
 
-    // Post-condition: only empty candidate cached; non-empty candidates are skipped
-    // (simplex resolves non-empty candidates via peer overlay, not validator manager)
-    assert_eq!(listener.cached_candidates.len(), 1);
+    // Invariant: exactly one non-empty fetch (empty must not trigger fetch)
+    assert_eq!(listener.fetched_non_empty.load(Ordering::SeqCst), 1);
 
-    let (slot, _hash, bytes) = &listener.cached_candidates[0];
-    let msg = deserialize_boxed(bytes).expect("deserialize CandidateData");
-    let candidate_data = msg.downcast::<CandidateData>().expect("downcast CandidateData");
+    // Post-condition: both candidates cached
+    assert_eq!(listener.cached_candidates.len(), 2);
 
-    match candidate_data {
-        CandidateData::Consensus_Empty(empty) => {
-            assert_eq!(SlotIndex::new(empty.slot as u32), *slot);
-            assert_eq!(empty.signature, empty_info.signature);
-            assert_eq!(empty.block, empty_referenced_block);
+    // Decode and validate cached CandidateData bytes
+    for (slot, _hash, bytes) in &listener.cached_candidates {
+        let msg = deserialize_boxed(bytes).expect("deserialize CandidateData");
+        let candidate_data = msg.downcast::<CandidateData>().expect("downcast CandidateData");
 
-            // Parent is a CandidateId (boxed), verify it matches the empty hash data parent
-            assert_eq!(SlotIndex::new(*empty.parent.slot() as u32), parent_id.slot);
-            assert_eq!(empty.parent.hash(), &parent_id.hash);
-        }
-        CandidateData::Consensus_Block(_) => {
-            panic!("non-empty block should not be cached during startup recovery");
+        match candidate_data {
+            CandidateData::Consensus_Empty(empty) => {
+                assert_eq!(SlotIndex::new(empty.slot as u32), *slot);
+                assert_eq!(empty.signature, empty_info.signature);
+                assert_eq!(empty.block, empty_referenced_block);
+
+                // Parent is a CandidateId (boxed), verify it matches the empty hash data parent
+                assert_eq!(SlotIndex::new(*empty.parent.slot() as u32), parent_id.slot);
+                assert_eq!(empty.parent.hash(), &parent_id.hash);
+            }
+            CandidateData::Consensus_Block(block) => {
+                assert_eq!(SlotIndex::new(block.slot as u32), *slot);
+                assert_eq!(block.signature, non_empty_info.signature);
+                assert_eq!(block.candidate.as_slice(), candidate_payload_bytes.as_slice());
+
+                // Nested candidate bytes MUST be validator_session.Candidate
+                let nested = consensus_common::utils::deserialize_tl_boxed_object::<
+                    ValidatorSessionCandidate,
+                >(&block.candidate)
+                .expect("deserialize nested validator_session.Candidate");
+                match nested {
+                    ValidatorSessionCandidate::ValidatorSession_Candidate(c) => {
+                        assert_eq!(c.src, UInt256::default());
+                        assert_eq!(c.round, non_empty_round_seqno);
+                        assert_eq!(c.root_hash, non_empty_root_hash);
+                        assert_eq!(c.data.to_vec(), non_empty_data);
+                        assert_eq!(c.collated_data.to_vec(), non_empty_collated);
+                    }
+                    _ => panic!("unexpected nested Candidate variant"),
+                }
+
+                // Parent is CandidateParent::CandidateParent with an id
+                match &block.parent {
+                    CandidateParent::Consensus_CandidateParent(p) => {
+                        assert_eq!(SlotIndex::new(*p.id.slot() as u32), parent_id.slot);
+                        assert_eq!(p.id.hash(), &parent_id.hash);
+                    }
+                    CandidateParent::Consensus_CandidateWithoutParents => {
+                        panic!("expected CandidateParent for non-empty candidate");
+                    }
+                }
+            }
         }
     }
 }
 
 #[test]
-fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
+fn test_restart_restore_candidate_bytes_skips_non_empty_on_fetch_error_but_keeps_empty() {
     let session_id = SessionId::default();
     let options =
         SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FirstCommitAfterFinalized, 0);
@@ -1252,7 +1334,6 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
         notar_certs: vec![],
         votes: vec![],
         pool_state: None,
-        candidate_payloads: vec![],
     };
 
     let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
@@ -1333,6 +1414,16 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
         ) {
             self.cached.push((slot, candidate_hash, candidate_data_bytes));
         }
+        fn recovery_notify_get_approved_candidate(
+            &self,
+            _source: crate::PublicKey,
+            _root_hash: crate::BlockHash,
+            _file_hash: crate::BlockHash,
+            _collated_data_hash: crate::BlockHash,
+            callback: Box<dyn FnOnce(Result<consensus_common::ValidatorBlockCandidatePtr>) + Send>,
+        ) {
+            callback(Err(error!("simulated fetch error")));
+        }
         fn recovery_apply_restart_recommit_actions(
             &mut self,
             _actions: &[RestartRoundAction],
@@ -1348,7 +1439,7 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
     let mut listener = FailFetchListener::default();
     proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
 
-    // Post-condition: empty candidate cached, non-empty skipped (not fetched)
+    // Post-condition: empty candidate cached, non-empty skipped due to fetch error
     assert_eq!(listener.cached.len(), 1);
     assert_eq!(listener.cached[0].0, SlotIndex::new(10));
 

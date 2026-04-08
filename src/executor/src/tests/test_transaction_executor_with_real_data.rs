@@ -520,16 +520,6 @@ fn test_bad_action() {
 }
 
 #[test]
-fn test_bad_action_with_ignore_flag() {
-    replay_transaction_by_files(
-        "real_boc/bad_action_with_ignore_flag_account_old.boc",
-        "real_boc/bad_action_with_ignore_flag_account_new.boc",
-        "real_boc/bad_action_with_ignore_flag_transaction.boc",
-        "real_boc/config12.boc",
-    )
-}
-
-#[test]
 fn test_size_limits_v12() {
     replay_transaction_by_files(
         "real_boc/size_limits_v12_account_old.boc",

@@ -35,8 +35,6 @@ pub enum AccessType {
 
 pub const LAST_UNNEEDED_KEY_BLOCK: &str = "LastUnneededKeyBlockId"; // Latest key block we can delete in archives GC
 pub const NODE_STATE_DB_NAME: &str = "node_state_db";
-pub const NODE_DB_NAME: &str = "db";
-pub const CATCHAINS_DB_NAME: &str = "catchains";
 
 pub type DbPredicateMut<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> Result<bool>;
 
@@ -342,7 +340,7 @@ impl<K: DbKey + Send + Sync> RocksDbTable<K> {
 
     /// Returns true, if collection is empty; false otherwise
     pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.db.iterator_cf(&self.cf()?, IteratorMode::Start).next().is_none())
+        Ok(self.len()? == 0)
     }
 
     pub fn destroy(&mut self) -> Result<bool> {

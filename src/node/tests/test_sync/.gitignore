@@ -1,0 +1,12 @@
+# Node modules
+node_modules/
+
+# Runtime files
+watcher.pid
+watcher.log
+server.log
+db/
+
+# Editor directories
+.vscode/
+.idea/

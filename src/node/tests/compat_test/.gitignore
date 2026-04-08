@@ -1,7 +1,0 @@
-# Build artifacts
-/build/
-/target/
-Cargo.lock
-
-# Temporary test databases
-/tmp/

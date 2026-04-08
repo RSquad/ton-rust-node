@@ -25,35 +25,6 @@ pub struct BlockMeta {
 }
 
 impl BlockMeta {
-    /// Create BlockMeta for archive import with all necessary flags pre-set.
-    pub fn for_import(
-        gen_utime: u32,
-        end_lt: u64,
-        masterchain_ref_seq_no: u32,
-        is_key_block: bool,
-        is_masterchain: bool,
-        has_prev2: bool,
-    ) -> Self {
-        let mut flags = block_handle_db::FLAG_DATA
-            | block_handle_db::FLAG_APPLIED
-            | block_handle_db::FLAG_STATE
-            | block_handle_db::FLAG_STATE_SAVED
-            | block_handle_db::FLAG_MOVED_TO_ARCHIVE
-            | block_handle_db::FLAG_PREV_1;
-        if has_prev2 {
-            flags |= block_handle_db::FLAG_PREV_2;
-        }
-        if is_masterchain {
-            flags |= block_handle_db::FLAG_PROOF;
-        } else {
-            flags |= block_handle_db::FLAG_PROOF_LINK;
-        }
-        if is_key_block {
-            flags |= block_handle_db::FLAG_KEY_BLOCK;
-        }
-        Self::with_data(flags, gen_utime, end_lt, masterchain_ref_seq_no, 0)
-    }
-
     pub fn from_block(block: &Block) -> Result<Self> {
         let info = block.read_info()?;
         let flags = if info.key_block() { block_handle_db::FLAG_KEY_BLOCK } else { 0 };

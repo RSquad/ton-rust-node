@@ -869,22 +869,13 @@ impl RawCandidate {
         leader_idx: ValidatorIndex,
         shard: &ShardIdent,
         max_size: usize,
-        proto_version: u32,
     ) -> Result<Self> {
         // Parse TL object
         let data_vec = data.to_vec();
         let candidate_tl =
             consensus_common::utils::deserialize_tl_boxed_object::<CandidateData>(&data_vec)?;
 
-        Self::from_tl(
-            &candidate_tl,
-            session_id,
-            leader_key,
-            leader_idx,
-            shard,
-            max_size,
-            proto_version,
-        )
+        Self::from_tl(&candidate_tl, session_id, leader_key, leader_idx, shard, max_size)
     }
 
     /// Create from already-parsed TL object
@@ -907,14 +898,12 @@ impl RawCandidate {
         leader_idx: ValidatorIndex,
         shard: &ShardIdent,
         max_size: usize,
-        proto_version: u32,
     ) -> Result<Self> {
         // Extract parent
         let parent_id = Self::extract_parent(candidate_tl)?;
 
         // Extract block data - returns CandidateBlockData
-        let block_data =
-            Self::extract_block_data(candidate_tl, leader_key, shard, max_size, proto_version)?;
+        let block_data = Self::extract_block_data(candidate_tl, leader_key, shard, max_size)?;
 
         // Validate invariant: empty blocks must have parent
         if block_data.is_empty() && parent_id.is_none() {
@@ -996,7 +985,6 @@ impl RawCandidate {
         leader_key: &PublicKey,
         shard: &ShardIdent,
         max_size: usize,
-        proto_version: u32,
     ) -> Result<CandidateBlockData> {
         match candidate_tl {
             CandidateData::Consensus_Block(block) => {
@@ -1011,7 +999,6 @@ impl RawCandidate {
                     candidate_bytes,
                     shard,
                     max_size,
-                    proto_version,
                 )?;
 
                 match block_info {

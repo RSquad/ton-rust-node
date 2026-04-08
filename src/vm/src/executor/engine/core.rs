@@ -68,7 +68,7 @@ impl From<&SliceData> for SliceProto {
     }
 }
 
-pub type TraceCallback = dyn Fn(&Engine, &EngineTraceInfo) + Send + Sync + 'static;
+pub type TraceCallback = dyn Fn(&Engine, &EngineTraceInfo) + Send + Sync;
 
 #[derive(Debug)]
 pub struct RunChildVm {
@@ -179,7 +179,7 @@ impl Engine {
         let trace = if cfg!(feature = "verbose") {
             Engine::TRACE_ALL
         } else if cfg!(feature = "fift_check") {
-            Engine::TRACE_ALL_BUT_CTRLS
+            Engine::TRACE_CODE | Engine::TRACE_GAS
         } else {
             Engine::TRACE_NONE
         };
@@ -444,27 +444,6 @@ impl Engine {
             if self.trace_bit(Engine::TRACE_CTRLS) {
                 log::trace!(target: "tvm", "{}", self.dump_ctrls(true));
             }
-        }
-    }
-
-    pub fn emulator_trace_callback(&self, info: &EngineTraceInfo) {
-        if info.has_cmd() {
-            if self.trace_bit(Engine::TRACE_CODE) {
-                log::info!(target: "executor", "code cell hash: {:X} offset: {}\n",
-                    info.cmd_code.cell().unwrap().repr_hash(), info.cmd_code.pos());
-                log::info!(target: "executor", "{}\n", info.cmd_str);
-            }
-            if self.trace_bit(Engine::TRACE_STACK) {
-                log::info!(target: "executor", " [ {} ] \n", self.get_stack_result_fift());
-            }
-            if self.trace_bit(Engine::TRACE_GAS) {
-                log::info!(target: "executor", "gas - {}\n", info.gas_used);
-            }
-            // log::info!(target: "executor", "code cell hash: {:X} offset: {}\n",
-            //     info.cmd_code.cell().unwrap().repr_hash(), info.cmd_code.pos());
-            // log::info!(target: "executor", "{}\n", info.cmd_str);
-            // log::info!(target: "executor", " [ {} ] \n", self.get_stack_result_fift());
-            // log::info!(target: "executor", "gas - {}\n", info.gas_used);
         }
     }
 

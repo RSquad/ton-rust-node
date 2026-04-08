@@ -279,13 +279,13 @@ pub fn find_overlay_peer(
             }
         }
         let (ip, node) = peers.pop().unwrap();
-        if ip.to_udp() == ctx_test.adnl.ip_address_adnl().to_udp() {
+        if ip.to_udp() == ctx_test.adnl.ip_address().to_udp() {
             continue;
         }
         log::info!(
             target: log_target,
             "---- Try overlay peer {} {}, own address {}",
-            ip, node, ctx_test.adnl.ip_address_adnl()
+            ip, node, ctx_test.adnl.ip_address()
         );
         let peer = ctx_test
             .overlay

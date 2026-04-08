@@ -37,7 +37,7 @@ fn test_use_library_normal_load_cell_from_ref() {
     code_use_lib.set_type(CellType::LibraryReference);
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     test_case_with_ref(
         "
@@ -65,7 +65,7 @@ fn test_use_library_normal_compose_cell() {
     );
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     test_case(
         "
@@ -96,7 +96,7 @@ fn test_use_library_normal_jmpref() {
     code_use_lib.set_type(CellType::LibraryReference);
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     test_case_with_ref(
         "
@@ -118,7 +118,7 @@ fn test_use_library_with_wrong_cell_hash() {
     code_use_lib.set_type(CellType::LibraryReference);
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     test_case_with_ref(
         "
@@ -151,8 +151,8 @@ fn test_use_library_with_cell_type_error() {
     code_use_lib.set_type(CellType::MerkleProof);
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash1.into(), lib_code1.clone()).unwrap();
-    lib.setref(hash2.into(), lib_code2.clone()).unwrap();
+    lib.setref(hash1.into(), &lib_code1).unwrap();
+    lib.setref(hash2.into(), &lib_code2).unwrap();
 
     test_case_with_ref(
         "
@@ -237,7 +237,7 @@ fn test_incorrect_library() {
     assert_ne!(hash, lib_code.repr_hash());
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     test_case_with_ref(
         "
@@ -698,7 +698,7 @@ fn test_compose_exotic_cell_and_load_as_cell() {
     let hash = lib_code.repr_hash();
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     test_case_with_ref(
         "
@@ -727,7 +727,7 @@ fn test_code_as_exotic_cell() {
 
     let lib_code = BuilderData::with_raw(vec![0x72], 8).unwrap().into_cell().unwrap();
     let hash = lib_code.repr_hash();
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     let code = lib_code.as_library_cell();
     // normal case with code as library cell
@@ -739,7 +739,7 @@ fn test_code_as_exotic_cell() {
 
     let lib_code = code;
     let hash = lib_code.repr_hash();
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     let code = lib_code.as_library_cell();
     // code as library cell with recursive library cell
@@ -766,7 +766,7 @@ fn test_code_as_exotic_cell() {
     let hash = lib_code.repr_hash();
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     let code = lib_code.as_library_cell();
 
@@ -780,7 +780,7 @@ fn test_compose_exotic_cell_and_load_quite_as_cell() {
     let hash = lib_code.repr_hash();
 
     let mut lib = HashmapE::with_bit_len(256);
-    lib.setref(hash.into(), lib_code.clone()).unwrap();
+    lib.setref(hash.into(), &lib_code).unwrap();
 
     test_case_with_ref(
         "

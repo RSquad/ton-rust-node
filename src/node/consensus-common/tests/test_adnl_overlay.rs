@@ -370,7 +370,6 @@ fn run_overlay_test(
                 &node1.adnl_id,
                 &node1.public_key.id(),
                 broadcast_payload.clone(),
-                None,
             );
         }
     }
@@ -474,8 +473,6 @@ fn test_adnl_overlay_quic_delivery() -> Result<()> {
         true, // is_tcp_enabled
         true, // is_quic_enabled
     );
-    // Quinn QUIC requires a Tokio runtime context on the calling thread
-    let _runtime_guard = test_network.get_runtime().enter();
     let result = run_overlay_test(test_network.get_nodes().clone(), TRANSPORT_TYPE);
 
     test_network.shutdown();
@@ -779,7 +776,6 @@ fn run_adnl_overlay_performance_test(
                     &node1.adnl_id,
                     &node1.public_key.id(),
                     make_broadcast_payload(),
-                    None,
                 );
                 broadcasts_sent += 1;
                 thread::sleep(SLEEP_TIME);

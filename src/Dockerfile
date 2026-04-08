@@ -19,18 +19,16 @@ ENV GIT_BRANCH=${GIT_BRANCH}
 ENV GIT_COMMIT=${GIT_COMMIT}
 ENV GIT_COMMIT_DATE=${GIT_COMMIT_DATE}
 
-RUN cargo build --release --bin node --bin console
+RUN cargo build --release --bin node
 
-FROM ubuntu:24.04
+FROM debian:stable-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3t64 \
+RUN apt-get update && apt-get install -y \
+    openssl \
     libzstd1 \
-    libgoogle-perftools4t64 \
+    libgoogle-perftools4 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /node/target/release/node /usr/local/bin/
-COPY --from=builder /node/target/release/console /usr/local/bin/
 
 WORKDIR /node

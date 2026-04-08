@@ -1464,7 +1464,7 @@ impl TopBlockDescrSet {
     pub fn insert(&mut self, shard: &ShardIdent, descr: &TopBlockDescr) -> Result<()> {
         let key = shard.full_key_with_tag()?;
         let value = descr.serialize()?;
-        self.collection.0.setref(key, value)?;
+        self.collection.0.setref(key, &value)?;
         Ok(())
     }
     pub fn is_empty(&self) -> bool {

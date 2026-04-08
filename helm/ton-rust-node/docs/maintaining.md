@@ -59,7 +59,6 @@ All documentation lives in the `docs/` directory:
 | File | Content |
 |------|---------|
 | `node-config.md` | `config.json` field reference, JSON examples, archival setup |
-| `archival-node.md` | Archive import tool, epoch-based archival mode, cloning |
 | `logging.md` | log4rs config (appenders, levels, rotation) |
 | `global-config.md` | Global network config overview |
 | `networking.md` | Networking modes (LoadBalancer, NodePort, hostPort, hostNetwork), NetworkPolicy |

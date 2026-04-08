@@ -21,7 +21,7 @@ use crate::{
     shard::{AccountIdPrefixFull, ShardIdent, SHARD_FULL},
     signature::CryptoSignaturePair,
     types::{ChildCell, CurrencyCollection, InRefValue},
-    validators::ValidatorInfo,
+    validators::{ValidatorInfo, ValidatorsStat},
     AccountId, Augmentation, BuilderData, Cell, Deserializable, IBitstring, Result, Serializable,
     SliceData, UInt256,
 };
@@ -395,6 +395,7 @@ pub struct McBlockExtra {
     recover_create_msg: Option<ChildCell<InMsg>>,
     mint_msg: Option<ChildCell<InMsg>>,
     config: Option<ConfigParams>,
+    validators_stat: ValidatorsStat,
 }
 
 impl McBlockExtra {
@@ -477,6 +478,18 @@ impl McBlockExtra {
     }
     pub fn mint_msg_cell(&self) -> Option<Cell> {
         self.mint_msg.as_ref().map(|mr| mr.cell())
+    }
+
+    pub fn validators_stat(&self) -> &ValidatorsStat {
+        &self.validators_stat
+    }
+
+    pub fn validators_stat_mut(&mut self) -> &mut ValidatorsStat {
+        &mut self.validators_stat
+    }
+
+    pub fn set_validators_stat(&mut self, stat: ValidatorsStat) {
+        self.validators_stat = stat;
     }
 }
 
@@ -1034,10 +1047,12 @@ pub struct McStateExtra {
     pub last_key_block: Option<ExtBlkRef>,
     pub block_create_stats: Option<BlockCreateStats>,
     pub global_balance: CurrencyCollection,
+    pub validators_stat: ValidatorsStat,
 }
 
 const MC_STATE_EXTRA_TAG: u16 = 0xcc26;
 const MC_STATE_CREATE_STATS_FLAG: u16 = 0b0001;
+const MC_STATE_VAL_STAT_FLAG: u16 = 0b1000;
 
 impl McStateExtra {
     /// Adds new workchain
@@ -1100,9 +1115,9 @@ impl Deserializable for McStateExtra {
         let cell1 = &mut SliceData::load_cell(cell.checked_drain_reference()?)?;
         let mut flags = 0u16;
         flags.read_from(cell1)?; // 16 + 0
-        if flags > 1 {
+        if flags > 15 {
             fail!(BlockError::InvalidData(format!(
-                "Invalid flags value ({}). Must be <= 1.",
+                "Invalid flags value ({}). Must be <= 7.",
                 flags
             )))
         }
@@ -1115,6 +1130,10 @@ impl Deserializable for McStateExtra {
         } else {
             Some(BlockCreateStats::construct_from(cell1)?) // 1 + 1
         };
+        let flag_val_stat = flags & MC_STATE_VAL_STAT_FLAG != 0;
+        if flag_val_stat {
+            self.validators_stat.read_from(cell1)?;
+        }
         self.global_balance.read_from(cell)?;
         Ok(())
     }
@@ -1131,6 +1150,9 @@ impl Serializable for McStateExtra {
         if self.block_create_stats.is_some() {
             flags |= MC_STATE_CREATE_STATS_FLAG;
         }
+        if !self.validators_stat.is_empty() {
+            flags |= MC_STATE_VAL_STAT_FLAG;
+        }
         flags.write_to(&mut builder1)?;
         self.validator_info.write_to(&mut builder1)?;
         self.prev_blocks.write_to(&mut builder1)?;
@@ -1138,6 +1160,9 @@ impl Serializable for McStateExtra {
         self.last_key_block.write_to(&mut builder1)?;
         if let Some(ref block_create_stats) = self.block_create_stats {
             block_create_stats.write_to(&mut builder1)?;
+        }
+        if !self.validators_stat.is_empty() {
+            self.validators_stat.write_to(&mut builder1)?;
         }
         builder.checked_append_reference(builder1.into_cell()?)?;
 

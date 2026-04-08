@@ -161,18 +161,6 @@ where
         Ok(())
     }
 
-    pub async fn shunt_async(
-        &self,
-        id: &I,
-        operation: impl futures::Future<Output = Result<R>>,
-    ) -> Result<()> {
-        if let Some(op_awaiters) = self.ops_awaiters.get(id) {
-            let r = operation.await?;
-            let _ = op_awaiters.1.tx.send(Some(Ok(r)));
-        }
-        Ok(())
-    }
-
     async fn wait_operation(
         &self,
         id: &I,

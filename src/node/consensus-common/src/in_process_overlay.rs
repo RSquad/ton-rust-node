@@ -251,7 +251,6 @@ impl ConsensusOverlay for OverlayClientImpl {
         sender_id: &PublicKeyHash,
         send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
-        _extra: Option<Vec<u8>>,
     ) {
         log::trace!(
             target: LOG_TARGET,

@@ -243,12 +243,7 @@ impl<'a> NodeTestNetwork<'a> {
                 overlay.set_rldp(rldp.clone()).unwrap();
 
                 let quic = if is_quic_enabled {
-                    let quic = QuicNode::new(
-                        vec![overlay.clone()],
-                        cancellation_token.clone(),
-                        None,
-                        tokio::runtime::Handle::current(),
-                    );
+                    let quic = QuicNode::new(vec![overlay.clone()], cancellation_token.clone());
                     overlay.set_quic(quic.clone()).unwrap();
                     Some(quic)
                 } else {
@@ -501,7 +496,6 @@ impl ConsensusOverlay for ToggleableOverlay {
         sender_id: &PublicKeyHash,
         send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
-        extra: Option<Vec<u8>>,
     ) {
         if !self.enabled.load(Ordering::Relaxed) {
             log::trace!(
@@ -513,7 +507,7 @@ impl ConsensusOverlay for ToggleableOverlay {
             let _ = payload;
             return;
         }
-        self.inner.send_broadcast_fec_ex(sender_id, send_as, payload, extra);
+        self.inner.send_broadcast_fec_ex(sender_id, send_as, payload);
     }
 
     fn get_impl(&self) -> &dyn std::any::Any {

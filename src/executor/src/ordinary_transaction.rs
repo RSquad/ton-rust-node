@@ -178,20 +178,6 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             tr.add_fee_coins(&in_fwd_fee)?;
         }
 
-        if let Some(burning_cfg) = self.config.burning_config() {
-            if is_masterchain
-                && !msg_balance.coins.is_zero()
-                && burning_cfg.blackhole_addr.as_ref() == Some(&account_id)
-            {
-                let burned = std::mem::take(&mut msg_balance.coins);
-                log::debug!(
-                    target: "executor",
-                    "Burning {burned} nanocoins for blackhole account {account_id:x}",
-                );
-                tr.set_blackhole_burned(burned);
-            }
-        }
-
         if description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
                 Ok(credit_ph) => Some(credit_ph),

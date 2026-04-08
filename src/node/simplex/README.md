@@ -1,6 +1,6 @@
 # Simplex Consensus Protocol
 
-**Version**: 0.5.0 (March 20, 2026) | [Changelog](CHANGELOG.md)
+**Version**: 0.5.0 (February 28, 2026) | [Changelog](CHANGELOG.md)
 
 Rust implementation of the Simplex consensus protocol for TON blockchain.
 
@@ -45,32 +45,38 @@ overlay / ADNL (lower level, network)
 
 This crate targets wire-compatibility with the upstream **C++ Simplex** implementation (`origin/testnet@e40d0e36`, Feb 28, 2026).
 
+### Critical interop blockers
+
+- **SIG-1**: Block candidate signature input differs — Rust signs `consensus.candidateParent(candidateId)`, C++ signs `consensus.candidateId` directly. **CRITICAL**
+
 ### Protocol parity gaps (from C++ upstream)
 
-- C++ proactively rebroadcasts FinalCerts (`cfd8850c`) — Rust standstill replay is less aggressive. **HIGH**
+- **FINALCERT-REBROADCAST**: C++ proactively rebroadcasts FinalCerts (`cfd8850c`) — Rust standstill replay is less aggressive. **HIGH**
+- **MC-FORK-PREVENTION**: C++ validator rejects MC candidates that would fork with real blocks (`9aac62b8`) — Rust lacks symmetric check. **CRITICAL**
+- **ADAPTIVE-SKIP-TIMEOUT**: C++ adaptively increases first block timeout after skip vote (`3c0cae03`) — not implemented in Rust.
+
+### Network / transport differences
+
+- **TWOSTEP-1**: Candidate broadcasts: C++ uses twostep FEC (`send_twostep_broadcast_=true`), Rust uses single-step overlay broadcast (not implemented).
+- **QUIC-1**: QUIC transport layer used by C++ for twostep sender; Rust simplex doesn't use QUIC (deferred).
 
 ### Implementation parity gaps
 
-- Committed-parent validation gate — needs state-root caching / apply-block-to-state.
-- Base selection should use "max available base" like C++ `SlotState::add_available_base` (audit needed).
-- C++ has `ImprovedStructureLZ4WithState` (BOC compression algo 2) — Rust only supports algos 0 and 1.
-- C++ has `StoreCellHint` for DB commit optimization during MerkleUpdate apply — Rust lacks equivalent.
-- C++ overlay manager can buffer messages for unknown overlays (disabled by default) — Rust lacks equivalent.
+- **FLOW-1**: Committed-parent validation gate — needs state-root caching / apply-block-to-state.
+- **POOL-BASE-1**: Base selection should use "max available base" like C++ `SlotState::add_available_base` (audit needed).
+- **ALGO-2**: C++ has `ImprovedStructureLZ4WithState` (BOC compression algo 2) — Rust only supports algos 0 and 1.
+- **STORE-HINT-1**: C++ has `StoreCellHint` for DB commit optimization during MerkleUpdate apply — Rust lacks equivalent.
+- **OVERLAY-BUFFER-1**: C++ overlay manager can buffer messages for unknown overlays (disabled by default) — Rust lacks equivalent.
 
 ### Resolved (for reference)
 
-- Candidate signature now signs bare `consensus.candidateId` directly, matching C++ testnet. Regression test: `test_candidate_id_to_sign_is_bare_candidate_id`.
-- MC stale-head rejection implemented in `validator_group.rs` (`should_reject_stale_mc_candidate`), matching C++ `block-validator.cpp` commit `9aac62b8`.
-- Adaptive first-block timeout backoff after skip implemented in `simplex_state.rs` (`apply_adaptive_timeout_backoff`), matching C++ `consensus.cpp`.
-- Twostep FEC broadcast implemented in `consensus-common/adnl_overlay.rs` (`BroadcastTwostepSimple`), with C++-compatible signing.
-- QUIC transport supported via `SessionOptions::use_quic` and `OverlayTransportType::SimplexQuic`. Tested in `test_adnl_overlay_quic_delivery`.
-- Overlay ID computation (node ordering, short ID)
-- `candidateAndCert.notar` encoding (voteSignatureSet)
-- Handle incoming `consensus.simplex.certificate` on vote channel
-- `requestCandidate2` removed — replaced by `get_committed_candidate`
-- Shard `before_split` empty block rule
-- Restart support (DB persistence + startup recovery)
-- Certificate rebroadcast on restart
+- **OVERLAY-1**: Overlay ID computation (node ordering, short ID)
+- **INTEROP-1**: `candidateAndCert.notar` encoding (voteSignatureSet)
+- **INTEROP-2**: Handle incoming `consensus.simplex.certificate` on vote channel
+- **INTEROP-3**: `requestCandidate2` removed — replaced by `get_committed_candidate` (GET-COMMITTED-1)
+- **SPLIT-1**: Shard `before_split` empty block rule
+- **U5.6**: Restart support (DB persistence + startup recovery)
+- **CERT-1**: Certificate rebroadcast on restart
 
 
 ## Architecture
@@ -350,7 +356,7 @@ Single-threaded consensus algorithm (crate-private):
 - ✅ Standstill coordination - calls `receiver.reschedule_standstill()` on finalization, `set_standstill_slots()` on finalization/skip
 - ✅ DB persistence - finalized blocks, candidate infos, notar certs, votes, pool state persisted to RocksDB
 - ✅ Startup recovery - bootstrap load, vote replay, receiver cache restore, recommit to ValidatorGroup
-- ✅ Download committed block via full-node proof for MC gap recovery (replaces requestCandidate2)
+- ✅ GET-COMMITTED-1 - download committed block via full-node proof for MC gap recovery (replaces requestCandidate2)
 - ⚠️ Precollation parent tracking - needs fix for cross-window scenarios
 
 **Key methods:**
@@ -544,6 +550,7 @@ Cryptographic and utility functions:
 | `max_collated_data_size` | `usize` | 4 MB | Max collated data |
 | `collation_retry_timeout` | `Duration` | 1s | Collation retry timeout |
 | `collation_retry_max_attempts` | `u32` | 3 | Max collation retries |
+| `max_precollated_blocks` | `u32` | 10 | Max precollated blocks |
 | `use_callback_thread` | `bool` | true | Use separate callback thread |
 
 ## Integration
@@ -655,7 +662,7 @@ Multi-instance consensus tests with in-process overlay.
 |------|-------------|--------|
 | `test_simplex_consensus_basic` | Basic consensus with 7 nodes, 100 rounds | ✅ |
 | `test_simplex_consensus_with_failures` | Consensus with simulated failures | ✅ |
-| `test_simplex_consensus_finalcert_recovery` | FinalCert recovery via `get_committed_candidate` | ✅ |
+| `test_simplex_consensus_finalcert_recovery` | FinalCert recovery via `get_committed_candidate` (GET-COMMITTED-1) | ✅ |
 | `test_simplex_consensus_shard_with_mc_notifications` | MC finalization forwarding to shards | ✅ |
 | `test_simplex_consensus_adnl_overlay` | ADNL overlay-based consensus | ✅ |
 | `test_simplex_consensus_adnl_net_gremlin` | ADNL net gremlin (packet loss/delay simulation) | ✅ |

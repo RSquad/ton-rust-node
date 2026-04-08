@@ -10,7 +10,7 @@ use std::{collections::HashMap, fs::OpenOptions, path::Path, sync::Arc};
 #[cfg(feature = "telemetry")]
 use storage::StorageTelemetry;
 use storage::{
-    db::rocksdb::{AccessType, RocksDb},
+    db::rocksdb::RocksDb,
     dynamic_boc_rc_db::DynamicBocDb,
     shardstate_db_async::{CellsDbConfig, ShardStateDb},
     StorageAlloc,
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
             "counters".to_string(),
             DynamicBocDb::build_counters_cf_options(&CellsDbConfig::default()),
         );
-        let db = RocksDb::new(DB_PATH, DB_NAME, cfs_opts, AccessType::ReadOnly)?;
+        let db = RocksDb::new(DB_PATH, DB_NAME, cfs_opts, None)?;
         let ss_db = ShardStateDb::new(
             db.clone(),
             "shardstate_db",

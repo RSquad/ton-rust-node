@@ -11,8 +11,8 @@
 use crate::{
     block::{BlockIdExtExtention, BlockStuff},
     internal_db::{
-        BlockHandle, InternalDb, ARCHIVES_GC_BLOCK, DESTROYED_VALIDATOR_SESSIONS,
-        LAST_APPLIED_MC_BLOCK, LAST_ROTATION_MC_BLOCK, PSS_KEEPER_MC_BLOCK, SHARD_CLIENT_MC_BLOCK,
+        BlockHandle, InternalDb, ARCHIVES_GC_BLOCK, LAST_APPLIED_MC_BLOCK, LAST_ROTATION_MC_BLOCK,
+        PSS_KEEPER_MC_BLOCK, SHARD_CLIENT_MC_BLOCK,
     },
     shard_state::ShardStateStuff,
 };
@@ -29,7 +29,7 @@ use std::{
     time::Duration,
 };
 use storage::{
-    cell_db::BROKEN_CELL_BEACON_FILE, shardstate_db_async::SsNotificationCallback,
+    dynamic_boc_rc_db::BROKEN_CELL_BEACON_FILE, shardstate_db_async::SsNotificationCallback,
     traits::Serializable,
 };
 use ton_block::{
@@ -349,9 +349,6 @@ async fn restore(
     if !refill_cells_db {
         log::info!("Fast restore successfully finished");
         return Ok(db);
-    }
-    if db.config.archival_mode.is_some() {
-        fail!("Refilling cells db is not supported in archival mode");
     }
 
     // If there was broken cell or special flag set - check blocks and restore cells db
@@ -676,7 +673,6 @@ async fn calc_min_mc_state_id(
                 min_id = id;
             } else {
                 db.drop_validator_state(LAST_ROTATION_MC_BLOCK)?;
-                db.drop_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)?;
             }
         }
     }

@@ -31,7 +31,6 @@ use crate::{
 use std::{
     any::type_name,
     fmt::{self, Display, Formatter},
-    str::FromStr,
 };
 
 #[cfg(test)]
@@ -642,24 +641,6 @@ impl Display for ShardIdent {
 impl fmt::Debug for ShardIdent {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}, {}", self.workchain_id, self.shard_prefix_as_str_with_tag())
-    }
-}
-
-impl FromStr for ShardIdent {
-    type Err = crate::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        let (workchain_part, shard_part_with_maybe_extra) =
-            s.split_once(':').ok_or_else(|| error!("Can't read shard ident from {}", s))?;
-
-        let workchain_id: i32 = workchain_part
-            .trim()
-            .parse()
-            .map_err(|e| error!("Can't read workchain_id from {}: {}", s, e))?;
-        let prefix = u64::from_str_radix(shard_part_with_maybe_extra.trim(), 16)
-            .map_err(|e| error!("Can't read shard from {}: {}", s, e))?;
-
-        Ok(Self { workchain_id, prefix })
     }
 }
 

@@ -638,7 +638,8 @@ fn test_convert_for_stats() {
     assert_eq!("Disabled", &format!("{:?}", ValidationStatus::from_u8(5)));
     assert_eq!("Disabled", &format!("{:?}", ValidationStatus::from_u8(0)));
     assert_eq!("Waiting", &format!("{:?}", ValidationStatus::from_u8(1)));
-    assert_eq!("Active", &format!("{:?}", ValidationStatus::from_u8(2)));
+    assert_eq!("Countdown", &format!("{:?}", ValidationStatus::from_u8(2)));
+    assert_eq!("Active", &format!("{:?}", ValidationStatus::from_u8(3)));
 
     let shard_id = ShardIdent::with_tagged_prefix(15, 0xABCD_0000_0000_0000u64).unwrap();
     let root_hash =

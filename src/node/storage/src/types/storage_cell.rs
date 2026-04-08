@@ -8,8 +8,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::{cell_db::CellDb, TARGET};
-use smallvec::SmallVec;
+use crate::{dynamic_boc_rc_db::DynamicBocDb, TARGET};
 use std::{
     io::Write,
     sync::{
@@ -18,9 +17,9 @@ use std::{
     },
 };
 use ton_block::{
-    append_tag, calc_d1, cell_type, error, fail, full_len, hashes_count, level, level_mask,
-    refs_count, store_hashes, Cell, CellData, CellImpl, CellType, LevelMask, Result, UInt256,
-    DEPTH_SIZE, MAX_LEVEL, SHA256_SIZE,
+    calc_d1, cell_type, error, fail, full_len, hashes_count, level, level_mask, refs_count,
+    store_hashes, Cell, CellData, CellImpl, CellType, LevelMask, Result, UInt256, DEPTH_SIZE,
+    MAX_LEVEL, SHA256_SIZE,
 };
 
 #[cfg(test)]
@@ -28,9 +27,6 @@ use ton_block::{
 mod tests;
 
 const NOT_INITIALIZED_DEPTH: u16 = u16::MAX;
-
-// Max raw data: d1(1) + d2(1) + hashes(32*3) + depths(2*4) + data(128) + ref_hashes(32*4) + ref_depths(2*4)
-pub const STORED_CELL_MAX_RAW_LEN: usize = 1 + 1 + 32 * 3 + 2 * 4 + 128 + 32 * 4 + 2 * 4;
 
 struct Reference {
     hash: UInt256,
@@ -41,7 +37,7 @@ struct Reference {
 pub struct StoredCell {
     cell_data: CellData,
     references: parking_lot::RwLock<Vec<Reference>>,
-    boc_db: Weak<CellDb>,
+    boc_db: Weak<DynamicBocDb>,
 }
 
 static STORED_CELL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -66,7 +62,11 @@ impl<'a> SliceReader<'a> {
 
 /// Represents Cell for storing in persistent storage
 impl StoredCell {
-    pub fn deserialize(boc_db: &Arc<CellDb>, repr_hash: &UInt256, data: &[u8]) -> Result<Self> {
+    pub fn deserialize(
+        boc_db: &Arc<DynamicBocDb>,
+        repr_hash: &UInt256,
+        data: &[u8],
+    ) -> Result<Self> {
         if data.len() < 2 {
             fail!("Buffer is too small to read description bytes");
         }
@@ -221,35 +221,9 @@ impl StoredCell {
     }
 
     pub fn serialize(cell: &dyn CellImpl) -> Result<Vec<u8>> {
-        Self::serialize_internal(cell, cell.raw_data()?, cell.store_hashes())
-    }
-
-    pub fn serialize_virtual(cell: &dyn CellImpl) -> Result<Vec<u8>> {
-        if cell.is_pruned() && cell.level() == 0 {
-            fail!("Virtual pruned cell can't be serialized");
-        }
-
-        let mut data = SmallVec::from_slice(cell.data());
-        if cell.bit_length() % 8 == 0 {
-            append_tag(&mut data, cell.bit_length());
-        };
-        let data = CellData::with_params(
-            cell.cell_type(),
-            data.as_slice(),
-            cell.level_mask().mask(),
-            cell.references_count() as u8,
-        )?;
-
-        Self::serialize_internal(cell, data.raw_data(), false)
-    }
-
-    fn serialize_internal(
-        cell: &dyn CellImpl,
-        raw_data: &[u8],
-        store_hashes: bool,
-    ) -> Result<Vec<u8>> {
+        let store_hashes = cell.store_hashes();
         let data_size = Self::calc_serialized_size(
-            raw_data.len(),
+            cell.raw_data()?.len(),
             store_hashes,
             cell.level(),
             cell.references_count(),
@@ -257,7 +231,7 @@ impl StoredCell {
         );
 
         let mut data = Vec::with_capacity(data_size);
-        data.extend_from_slice(raw_data);
+        data.extend_from_slice(cell.raw_data()?);
 
         if !store_hashes {
             if cell.cell_type() != CellType::PrunedBranch {
@@ -284,7 +258,7 @@ impl StoredCell {
     pub fn with_cell_data(
         cell_data: CellData,
         refs: &[(UInt256, u16)],
-        boc_db: &Arc<CellDb>,
+        boc_db: &Arc<DynamicBocDb>,
     ) -> Result<Self> {
         if cell_data.references_count() != refs.len() {
             fail!("References count mismatch: {} != {}", cell_data.references_count(), refs.len());
@@ -324,7 +298,7 @@ impl PartialEq for StoredCell {
 pub struct StoringCell {
     cell_data: CellData,
     references: parking_lot::RwLock<Vec<Reference>>,
-    boc_db: Weak<CellDb>,
+    boc_db: Weak<DynamicBocDb>,
 }
 
 impl PartialEq for StoringCell {
@@ -334,7 +308,7 @@ impl PartialEq for StoringCell {
 }
 
 impl StoringCell {
-    pub fn with_cell(cell: &dyn CellImpl, boc_db: &Arc<CellDb>) -> Result<Self> {
+    pub fn with_cell(cell: &dyn CellImpl, boc_db: &Arc<DynamicBocDb>) -> Result<Self> {
         let references_count = cell.references_count();
         let mut references = Vec::with_capacity(references_count);
         for i in 0..references_count {
@@ -462,7 +436,7 @@ define_CellImpl!(StoringCell);
 fn reference(
     index: usize,
     references: &parking_lot::RwLock<Vec<Reference>>,
-    boc_db: &Weak<CellDb>,
+    boc_db: &Weak<DynamicBocDb>,
     repr_hash: &dyn Fn() -> UInt256,
 ) -> Result<Arc<dyn CellImpl>> {
     let hash = {

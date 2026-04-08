@@ -60,6 +60,23 @@ pub(super) const ACCELERATED_CONSENSUS_BLOCK_CANDIDATE_SENDING_RETRY_TIMEOUT_MS:
 pub(super) const ACCELERATED_CONSENSUS_BLOCK_CANDIDATE_SENDING_RETRY_ATTEMPTS: u32 = 3;
 
 // =============================================================================
+// Simplex testing constants - Override network config params during testing
+// =============================================================================
+// These values are used instead of ConfigParam 30 when testing simplex consensus.
+// Reference: p30.mc from testnet config
+pub(super) const SIMPLEX_TARGET_RATE_MS: u64 = 500;
+pub(super) const SIMPLEX_SLOTS_PER_LEADER_WINDOW: u32 = 4;
+pub(super) const SIMPLEX_FIRST_BLOCK_TIMEOUT_MS: u64 = 1000;
+pub(super) const SIMPLEX_MAX_LEADER_WINDOW_DESYNC: u32 = 2;
+
+// Additional simplex timing constants (matching accelerated consensus patterns)
+pub(super) const SIMPLEX_VALIDATION_RETRY_ATTEMPTS: u32 = 8;
+pub(super) const SIMPLEX_VALIDATION_RETRY_TIMEOUT_MS: u64 = 500;
+pub(super) const SIMPLEX_COLLATION_RETRY_TIMEOUT_MS: u64 = 500;
+pub(super) const SIMPLEX_COLLATION_RETRY_MAX_ATTEMPTS: u32 = 3;
+pub(super) const SIMPLEX_STANDSTILL_TIMEOUT_MS: u64 = 10000;
+
+// =============================================================================
 // Common Types from consensus-common (preferred source)
 // =============================================================================
 
@@ -72,9 +89,9 @@ pub use consensus_common::{
     ConsensusOverlayListener, ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListener,
     ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
     ConsensusOverlayPtr, ConsensusReplayListener, ConsensusReplayListenerPtr, LogPlayer,
-    LogPlayerPtr, LogReplayOptions, OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash,
-    RawBuffer, Result, Session, SessionId, SessionListener, SessionListenerPtr, SessionNode,
-    SessionPtr, SessionStats, ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
+    LogPlayerPtr, LogReplayOptions, PrivateKey, PublicKey, PublicKeyHash, RawBuffer, Result,
+    Session, SessionId, SessionListener, SessionListenerPtr, SessionNode, SessionPtr, SessionStats,
+    ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback, ValidatorBlockCandidatePtr, ValidatorWeight,
 };
 
@@ -270,10 +287,6 @@ impl SessionHolder {
 // Implement consensus_common::Session for SessionHolder
 // Delegates to the common Session interface of the inner session
 impl consensus_common::Session for SessionHolder {
-    fn start(&self, initial_block_seqno: u32) {
-        self.inner.as_common_session().start(initial_block_seqno);
-    }
-
     fn stop(&self) {
         self.inner.as_common_session().stop();
     }
@@ -418,6 +431,7 @@ impl ConsensusFactory {
         options: &SimplexSessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
+        initial_block_seqno: u32,
         nodes: Vec<SessionNode>,
         local_key: &PrivateKey,
         db_root: String,
@@ -425,15 +439,18 @@ impl ConsensusFactory {
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
     ) -> consensus_common::Result<SessionHolderPtr> {
+        // Disable callback thread - ValidatorSessionListener has its own
         let mut options = options.clone();
         options.use_callback_thread = false;
 
+        // Construct full DB path
         let db_path = Self::make_simplex_db_path(&db_root, shard, catchain_seqno, session_id);
 
         let simplex_session = Self::create_simplex_session(
             &options,
             session_id,
             shard,
+            initial_block_seqno,
             nodes,
             local_key,
             db_path,
@@ -441,7 +458,44 @@ impl ConsensusFactory {
             listener,
         )?;
 
+        // Wrap in SessionHolder and return as SessionHolderPtr
         Ok(Arc::new(SessionHolder::simplex(simplex_session)))
+    }
+
+    /// Create simplex options with testing constants.
+    ///
+    /// Uses hardcoded testing values instead of network config params.
+    /// Reference values from p30.mc testnet config:
+    /// - target_rate_ms: 500
+    /// - slots_per_leader_window: 4
+    /// - first_block_timeout_ms: 1000
+    /// - max_leader_window_desync: 2
+    pub fn create_simplex_options(
+        max_block_size: usize,
+        max_collated_data_size: usize,
+    ) -> SimplexSessionOptions {
+        use super::consensus::*;
+
+        SimplexSessionOptions {
+            // Core timing from testing constants (p30 reference)
+            target_rate: Duration::from_millis(SIMPLEX_TARGET_RATE_MS),
+            slots_per_leader_window: SIMPLEX_SLOTS_PER_LEADER_WINDOW,
+            first_block_timeout: Duration::from_millis(SIMPLEX_FIRST_BLOCK_TIMEOUT_MS),
+
+            // Retry and timeout settings
+            validation_retry_attempts: SIMPLEX_VALIDATION_RETRY_ATTEMPTS,
+            validation_retry_timeout: Duration::from_millis(SIMPLEX_VALIDATION_RETRY_TIMEOUT_MS),
+            collation_retry_timeout: Duration::from_millis(SIMPLEX_COLLATION_RETRY_TIMEOUT_MS),
+            collation_retry_max_attempts: SIMPLEX_COLLATION_RETRY_MAX_ATTEMPTS,
+            standstill_timeout: Duration::from_millis(SIMPLEX_STANDSTILL_TIMEOUT_MS),
+
+            // Block size limits from catchain config (ConfigParam 29)
+            max_block_size,
+            max_collated_data_size,
+
+            // Other settings use defaults
+            ..Default::default()
+        }
     }
 
     /// Configure catchain-specific options for accelerated consensus
@@ -560,6 +614,7 @@ impl ConsensusFactory {
         options: &SimplexSessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
+        initial_block_seqno: u32,
         nodes: Vec<SessionNode>,
         local_key: &PrivateKey,
         db_path: String,
@@ -570,6 +625,7 @@ impl ConsensusFactory {
             options,
             session_id,
             shard,
+            initial_block_seqno,
             nodes,
             local_key,
             db_path,

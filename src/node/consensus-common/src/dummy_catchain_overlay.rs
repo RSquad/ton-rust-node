@@ -93,7 +93,6 @@ impl ConsensusOverlay for DummyConsensusOverlay {
         sender_id: &PublicKeyHash,
         send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
-        _extra: Option<Vec<u8>>,
     ) {
         log::trace!(
             "DummyConsensusOverlay: send broadcast_fec_ex {:?}/{:?}: {:?}",

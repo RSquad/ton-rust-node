@@ -89,7 +89,7 @@ impl CatchainClient {
             overlay_id,
             runtime: Some(runtime_handle.clone()),
         };
-        network_context.stack.overlay.add_private_overlay(params, local_adnl_key, &peers, false)?;
+        network_context.stack.overlay.add_private_overlay(params, local_adnl_key, &peers)?;
         let consumer = Arc::new(CatchainClientConsumer::new(overlay_id.clone(), catchain_listener));
         network_context.stack.overlay.add_consumer(overlay_id, consumer.clone())?;
 
@@ -467,7 +467,6 @@ impl CatchainOverlay for CatchainClient {
         _sender_id: &PublicKeyHash,
         _send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
-        _extra: Option<Vec<u8>>,
     ) {
         let msg = payload.clone();
         let overlay_id = self.overlay_id.clone();

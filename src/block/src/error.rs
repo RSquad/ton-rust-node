@@ -54,8 +54,6 @@ pub enum BlockError {
     UnexpectedStructVariant(String, String),
     #[error("Mismatched serde options: {0} exp={1} real={2}")]
     MismatchedSerdeOptions(String, usize, usize),
-    #[error("OutAction deserialize error {0}, mode {1}")]
-    OutActionError(#[source] crate::Error, u8),
 }
 
 // Exception codes *****************************************************************

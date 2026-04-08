@@ -17,7 +17,6 @@ use std::{collections::BTreeMap, ops::Not};
 mod tests;
 
 const DICT_PROOF_TAG: u32 = 0x37c1e3fc;
-const CONSENSUS_EXTRA_DATA_TAG: u32 = 0x638eb292;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct StorageStatCellInfo {
@@ -306,42 +305,6 @@ impl Deserializable for AccountStorageDictProof {
             );
         }
         self.proof = cell.checked_drain_reference()?;
-        Ok(())
-    }
-}
-
-/// consensus_extra_data#638eb292 flags:# gen_utime_ms:uint64 = ConsensusExtraData;
-#[derive(Debug, Default, Clone)]
-pub struct ConsensusExtraData {
-    pub flags: u32,
-    pub gen_utime_ms: u64,
-}
-
-impl ConsensusExtraData {
-    pub const TAG: u32 = CONSENSUS_EXTRA_DATA_TAG;
-}
-
-impl Serializable for ConsensusExtraData {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        cell.append_u32(CONSENSUS_EXTRA_DATA_TAG)?;
-        cell.append_u32(self.flags)?;
-        cell.append_u64(self.gen_utime_ms)?;
-        Ok(())
-    }
-}
-
-impl Deserializable for ConsensusExtraData {
-    fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        let tag = cell.get_next_u32()?;
-        if tag != CONSENSUS_EXTRA_DATA_TAG {
-            fail!(
-                "Invalid ConsensusExtraData tag: expected {:#x}, found {:#x}",
-                CONSENSUS_EXTRA_DATA_TAG,
-                tag
-            );
-        }
-        self.flags = cell.get_next_u32()?;
-        self.gen_utime_ms = cell.get_next_u64()?;
         Ok(())
     }
 }

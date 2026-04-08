@@ -468,60 +468,21 @@ pub enum Answer {
     Raw(TaggedByteVec),
 }
 
-/// Cancellation-safety guard over AtomicU32 counter
-struct SyncGuard<'a> {
-    counter: &'a AtomicU32,
-}
-
-impl<'a> SyncGuard<'a> {
-    fn new(counter: &'a AtomicU32) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
-    }
-}
-
-impl Drop for SyncGuard<'_> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// Asynchronous data receiver
 pub(crate) struct AsyncReceiver<T> {
-    id: u64,
     data: lockfree::queue::Queue<Option<T>>,
     subscribers: lockfree::queue::Queue<Arc<tokio::sync::Barrier>>,
     sync: AtomicU32,
     started_receiving: AtomicBool,
-    alive_tasks: AtomicU32,
-    total_spawned: AtomicU64,
-}
-
-impl<T> Drop for AsyncReceiver<T> {
-    fn drop(&mut self) {
-        log::info!(
-            target: TARGET,
-            "AsyncReceiver #{} dropped (alive_tasks={}, total_spawned={})",
-            self.id,
-            self.alive_tasks.load(Ordering::Relaxed),
-            self.total_spawned.load(Ordering::Relaxed),
-        );
-    }
 }
 
 impl<T: Send + 'static> AsyncReceiver<T> {
     pub(crate) fn new() -> Arc<Self> {
-        static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        log::info!(target: TARGET, "AsyncReceiver #{id} created");
         Arc::new(Self {
-            id,
             data: lockfree::queue::Queue::new(),
             subscribers: lockfree::queue::Queue::new(),
             sync: AtomicU32::new(0),
             started_receiving: AtomicBool::new(false),
-            alive_tasks: AtomicU32::new(0),
-            total_spawned: AtomicU64::new(0),
         })
     }
 
@@ -533,10 +494,10 @@ impl<T: Send + 'static> AsyncReceiver<T> {
 
     pub(crate) async fn pop(&self) -> Result<Option<T>> {
         self.started_receiving.store(true, Ordering::Relaxed);
-        // Protect counter by guard
-        let _guard = SyncGuard::new(&self.sync);
+        self.sync.fetch_add(1, Ordering::Relaxed);
         loop {
             if let Some(data) = self.data.pop() {
+                self.sync.fetch_sub(1, Ordering::Relaxed);
                 break Ok(data);
             }
             let subscriber = Arc::new(tokio::sync::Barrier::new(2));
@@ -554,15 +515,6 @@ impl<T: Send + 'static> AsyncReceiver<T> {
         if self.sync.load(Ordering::Relaxed) == 0 {
             return;
         }
-        let alive = self.alive_tasks.fetch_add(1, Ordering::Relaxed) + 1;
-        let total = self.total_spawned.fetch_add(1, Ordering::Relaxed) + 1;
-        if total % 1000 == 0 || alive > 10 {
-            log::warn!(
-                target: TARGET,
-                "AsyncReceiver #{}: alive_tasks={alive}, total_spawned={total}, sync={}",
-                self.id, self.sync.load(Ordering::Relaxed)
-            );
-        }
         let receiver = self.clone();
         tokio::spawn(async move {
             while receiver.sync.load(Ordering::Relaxed) > 0 {
@@ -573,7 +525,6 @@ impl<T: Send + 'static> AsyncReceiver<T> {
                     tokio::task::yield_now().await;
                 }
             }
-            receiver.alive_tasks.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }

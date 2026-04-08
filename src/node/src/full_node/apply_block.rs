@@ -37,7 +37,7 @@ pub async fn apply_block(
     check_prev_blocks(&prev_ids, engine, mc_seq_no, pre_apply, recursion_depth).await?;
 
     if !handle.has_state() {
-        store_state_update(handle, block, &prev_ids, engine).await?;
+        calc_shard_state(handle, block, &prev_ids, engine).await?;
     }
     set_prev_ids(handle, &prev_ids, engine.deref())?;
     if !pre_apply {
@@ -92,87 +92,75 @@ async fn check_prev_blocks(
     Ok(())
 }
 
-// Normal mode - gets prev block(s) state and applies merkle update from block to calculate new state
-// Archival mode - just saves state update from block, without applying it
-pub async fn store_state_update(
+// Gets prev block(s) state and applies merkle update from block to calculate new state
+pub async fn calc_shard_state(
     handle: &Arc<BlockHandle>,
     block: &BlockStuff,
     prev_ids: &(BlockIdExt, Option<BlockIdExt>),
     engine: &Arc<dyn EngineOperations>,
-) -> Result<()> {
+) -> Result<(Arc<ShardStateStuff>, (Arc<ShardStateStuff>, Option<Arc<ShardStateStuff>>))> {
     let block_descr = fmt_block_id_short(block.id());
 
-    log::debug!("({}): store_state_update: block: {}", block_descr, block.id());
+    log::debug!("({}): calc_shard_state: block: {}", block_descr, block.id());
 
-    if engine.is_archival_mode() {
-        log::debug!("({}): store_state_update: store_state_update: {}", block_descr, handle.id());
-        engine.store_state_update(handle, block.block()?.read_state_update()?.new).await?;
+    let (prev_ss_root, prev_ss) = match prev_ids {
+        (prev1, Some(prev2)) => {
+            let ss1 = engine.clone().wait_state(prev1, None, true).await?;
+            let ss2 = engine.clone().wait_state(prev2, None, true).await?;
+            let root = ShardStateStuff::construct_split_root(
+                ss1.root_cell().clone(),
+                ss2.root_cell().clone(),
+            )?;
+            (root, (ss1, Some(ss2)))
+        }
+        (prev, None) => {
+            let ss = engine.clone().wait_state(prev, None, true).await?;
+            (ss.root_cell().clone(), (ss, None))
+        }
+    };
+
+    let merkle_update = block.block()?.read_state_update()?;
+    let block_id = block.id().clone();
+    let engine_cloned = engine.clone();
+
+    let block_descr_clone = block_descr.clone();
+    let ss = tokio::task::spawn_blocking(move || -> Result<Arc<ShardStateStuff>> {
+        let now = std::time::Instant::now();
+        let cf = engine_cloned.db_cells_factory()?;
+        let cl = engine_cloned.db_cells_loader()?;
+        let (ss_root, _metrics) =
+            merkle_update.apply_for_ex(&prev_ss_root, &cf, cl.deref()).map_err(|e| {
+                error!(
+                    "Error applying Merkle update for block {}: {}\
+                    prev_ss_root: {:#.2}\
+                    merkle_update: {}",
+                    block_id, e, prev_ss_root, merkle_update
+                )
+            })?;
+        let elapsed = now.elapsed();
         log::debug!(
-            "({}): store_state_update: store_state_update: {} done",
-            block_descr,
-            handle.id()
+            "({}): TIME: calc_shard_state: applied Merkle update {}ms   {}",
+            block_descr_clone,
+            elapsed.as_millis(),
+            block_id
         );
-    } else {
-        let prev_ss_root = match prev_ids {
-            (prev1, Some(prev2)) => {
-                let ss1 = engine.clone().wait_state(prev1, None, true).await?;
-                let ss2 = engine.clone().wait_state(prev2, None, true).await?;
-                let root = ShardStateStuff::construct_split_root(
-                    ss1.root_cell().clone(),
-                    ss2.root_cell().clone(),
-                )?;
-                root
-            }
-            (prev, None) => {
-                let ss = engine.clone().wait_state(prev, None, true).await?;
-                ss.root_cell().clone()
-            }
-        };
-
-        let merkle_update = block.block()?.read_state_update()?;
-        let block_id = block.id().clone();
-        let engine_cloned = engine.clone();
-
-        let block_descr_clone = block_descr.clone();
-        let ss = tokio::task::spawn_blocking(move || -> Result<Arc<ShardStateStuff>> {
-            let now = std::time::Instant::now();
-            let cf = engine_cloned.db_cells_factory()?;
-            let cl = engine_cloned.db_cells_loader()?;
-            let (ss_root, _metrics) =
-                merkle_update.apply_for_ex(&prev_ss_root, &cf, cl.deref()).map_err(|e| {
-                    error!(
-                        "Error applying Merkle update for block {}: {}\
-                        prev_ss_root: {:#.2}\
-                        merkle_update: {}",
-                        block_id, e, prev_ss_root, merkle_update
-                    )
-                })?;
-            let elapsed = now.elapsed();
-            log::debug!(
-                "({}): TIME: store_state_update: applied Merkle update {}ms   {}",
-                block_descr_clone,
-                elapsed.as_millis(),
-                block_id
-            );
+        #[cfg(feature = "telemetry")]
+        log::debug!(target: "telemetry", "({}): applying Merkle update: \n{}", block_descr_clone, _metrics);
+        metrics::histogram!("ton_node_db_calc_merkle_update_seconds").record(elapsed);
+        ShardStateStuff::from_root_cell(
+            block_id.clone(),
+            ss_root,
             #[cfg(feature = "telemetry")]
-            log::debug!(target: "telemetry", "({}): applying Merkle update: \n{}", block_descr_clone, _metrics);
-            metrics::histogram!("ton_node_db_calc_merkle_update_seconds").record(elapsed);
-            ShardStateStuff::from_root_cell(
-                block_id.clone(),
-                ss_root,
-                #[cfg(feature = "telemetry")]
-                engine_cloned.engine_telemetry(),
-                engine_cloned.engine_allocated(),
-            )
-        })
-        .await??;
+            engine_cloned.engine_telemetry(),
+            engine_cloned.engine_allocated(),
+        )
+    })
+    .await??;
 
-        log::debug!("({}): store_state_update: store_state: {}", block_descr, handle.id());
-        engine.store_state(handle, ss).await?;
-        log::debug!("({}): store_state_update: store_state: {} done", block_descr, handle.id());
-    }
-
-    Ok(())
+    log::debug!("({}): calc_shard_state: store_state: {}", block_descr, handle.id());
+    let ss = engine.store_state(handle, ss).await?;
+    log::debug!("({}): calc_shard_state: store_state: {} done", block_descr, handle.id());
+    Ok((ss, prev_ss))
 }
 
 // set next block ids for prev blocks

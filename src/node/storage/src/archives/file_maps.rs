@@ -14,7 +14,6 @@ use crate::StorageTelemetry;
 use crate::{
     archives::{
         archive_slice::ArchiveSlice,
-        db_provider::{ArchiveDbProvider, SingleDbProvider},
         package_id::{PackageId, PackageType},
         package_index_db::{PackageIndexDb, PackageIndexEntry},
     },
@@ -35,9 +34,6 @@ use std::{
     },
 };
 use ton_block::{error, fail, BlockIdExt, Result, ShardIdent, LT_ALIGN};
-
-pub const FILES_DB_NAME: &str = "files";
-pub const KEY_FILES_DB_NAME: &str = "key_files";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BlockRanges {
@@ -75,6 +71,17 @@ impl Clone for BlockRanges {
     }
 }
 impl BlockRanges {
+    pub fn new(handle: &BlockHandle) -> Self {
+        Self {
+            min_seqno: AtomicU32::new(handle.id().seq_no()),
+            max_seqno: AtomicU32::new(handle.id().seq_no()),
+            min_utime: AtomicU32::new(handle.gen_utime()),
+            max_utime: AtomicU32::new(handle.gen_utime()),
+            min_lt: AtomicU64::new(handle.end_lt()),
+            max_lt: AtomicU64::new(handle.end_lt()),
+        }
+    }
+
     pub fn compare_seqno(&self, seqno: &u32) -> std::cmp::Ordering {
         let min_sn = self.min_seqno.load(Ordering::Relaxed);
         let max_sn = self.max_seqno.load(Ordering::Relaxed);
@@ -143,21 +150,6 @@ impl FileDescription {
     }
 
     pub fn update_block_ranges(&self, handle: &BlockHandle) -> bool {
-        self.update_block_ranges_raw(
-            handle.id().shard(),
-            handle.id().seq_no(),
-            handle.gen_utime(),
-            handle.end_lt(),
-        )
-    }
-
-    pub fn update_block_ranges_raw(
-        &self,
-        shard: &ShardIdent,
-        seq_no: u32,
-        gen_utime: u32,
-        end_lt: u64,
-    ) -> bool {
         macro_rules! update_atomic {
             ($atomic:expr, $new:expr, $cmp_fn:expr) => {{
                 let mut prev = $atomic.load(Ordering::Relaxed);
@@ -189,27 +181,26 @@ impl FileDescription {
         }
 
         let mut updated = false;
-        let _ = add_unbound_object_to_map_with_update(&self.blocks_ranges, shard.clone(), |prev| {
-            if let Some(prev) = prev {
-                updated |= update_min_32(&prev.min_seqno, seq_no);
-                updated |= update_max_32(&prev.max_seqno, seq_no);
-                updated |= update_min_32(&prev.min_utime, gen_utime);
-                updated |= update_max_32(&prev.max_utime, gen_utime);
-                updated |= update_min_64(&prev.min_lt, end_lt - end_lt % LT_ALIGN);
-                updated |= update_max_64(&prev.max_lt, end_lt);
-                Ok(None)
-            } else {
-                updated = true;
-                Ok(Some(BlockRanges {
-                    min_seqno: AtomicU32::new(seq_no),
-                    max_seqno: AtomicU32::new(seq_no),
-                    min_utime: AtomicU32::new(gen_utime),
-                    max_utime: AtomicU32::new(gen_utime),
-                    min_lt: AtomicU64::new(end_lt - end_lt % LT_ALIGN),
-                    max_lt: AtomicU64::new(end_lt),
-                }))
-            }
-        });
+        let _ = add_unbound_object_to_map_with_update(
+            &self.blocks_ranges,
+            handle.id().shard().clone(),
+            |prev| {
+                if let Some(prev) = prev {
+                    let sn = handle.id().seq_no();
+                    updated |= update_min_32(&prev.min_seqno, sn);
+                    updated |= update_max_32(&prev.max_seqno, sn);
+                    let ut = handle.gen_utime();
+                    updated |= update_min_32(&prev.min_utime, ut);
+                    updated |= update_max_32(&prev.max_utime, ut);
+                    let lt = handle.end_lt();
+                    updated |= update_min_64(&prev.min_lt, lt - lt % LT_ALIGN);
+                    updated |= update_max_64(&prev.max_lt, lt);
+                    Ok(None)
+                } else {
+                    Ok(Some(BlockRanges::new(handle)))
+                }
+            },
+        );
 
         updated
     }
@@ -250,15 +241,15 @@ pub struct FileMap {
 
 impl FileMap {
     pub async fn new(
-        index_db: Arc<RocksDb>,
-        db_provider: &Arc<dyn ArchiveDbProvider>,
+        db: Arc<RocksDb>,
+        db_root_path: &Arc<PathBuf>,
         path: impl ToString,
         package_type: PackageType,
         last_unneeded_key_block: u32,
         #[cfg(feature = "telemetry")] telemetry: &Arc<StorageTelemetry>,
         allocated: &Arc<StorageAlloc>,
     ) -> Result<Self> {
-        let storage = PackageIndexDb::with_db(index_db, path, true)?;
+        let storage = PackageIndexDb::with_db(db.clone(), path, true)?;
         let mut index_pairs = Vec::new();
 
         storage.for_each_deserialized(|key, value| {
@@ -267,21 +258,19 @@ impl FileMap {
         })?;
 
         index_pairs.sort_by_key(|pair| pair.0);
-        let last = index_pairs.last().map(|pair| pair.0);
 
         let mut elements = Vec::new();
         for (key, value) in index_pairs {
             let unneeded = key < last_unneeded_key_block;
-            let finalized = value.finalized() && Some(key) != last;
+            let finalized = value.finalized();
             log::info!(
                 target: TARGET,
                 "Opening archive slice {}, finalized {}, unneeded {}",
                 key, finalized, unneeded
             );
-            let (slice_db, slice_root_path) = db_provider.db_for_archive(key).await?;
             let archive_slice = match ArchiveSlice::with_data(
-                slice_db,
-                slice_root_path,
+                db.clone(),
+                db_root_path.clone(),
                 key,
                 package_type,
                 finalized,
@@ -520,18 +509,15 @@ impl FileMaps {
     pub async fn new(
         db: Arc<RocksDb>,
         db_root_path: &Arc<PathBuf>,
-        db_provider: &Arc<dyn ArchiveDbProvider>,
         last_unneeded_key_block: u32,
         #[cfg(feature = "telemetry")] telemetry: &Arc<StorageTelemetry>,
         allocated: &Arc<StorageAlloc>,
     ) -> Result<Self> {
-        let key_db_provider: Arc<dyn ArchiveDbProvider> =
-            Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()));
         Ok(Self {
             files: FileMap::new(
                 db.clone(),
-                db_provider,
-                FILES_DB_NAME,
+                db_root_path,
+                "files",
                 PackageType::Blocks,
                 last_unneeded_key_block,
                 #[cfg(feature = "telemetry")]
@@ -541,15 +527,15 @@ impl FileMaps {
             .await?,
             key_files: FileMap::new(
                 db.clone(),
-                &key_db_provider,
-                KEY_FILES_DB_NAME,
+                db_root_path,
+                "key_files",
                 PackageType::KeyBlocks,
                 0,
                 #[cfg(feature = "telemetry")]
                 telemetry,
                 allocated,
             )
-            .await?,
+            .await?, // temp_files: FileMap::new(db_root_path, path.join("temp_files"), PackageType::Temp).await?,
         })
     }
 

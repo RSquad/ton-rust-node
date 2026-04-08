@@ -16,7 +16,7 @@ use std::{
     io::{ErrorKind, Read},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, Ordering},
         mpsc::{channel, Receiver, Sender, TryRecvError},
         Arc,
     },
@@ -114,8 +114,6 @@ impl<S> Connections<S> {
 pub(crate) struct SendQueue<Q> {
     buffer: lockfree::queue::Queue<Q>,
     sync: AtomicU8,
-    len: AtomicUsize,
-    capacity: usize,
 }
 
 impl<Q> SendQueue<Q> {
@@ -124,15 +122,9 @@ impl<Q> SendQueue<Q> {
     const SYNC_CHECKING: u8 = 2;
 
     pub(crate) fn new() -> Arc<Self> {
-        Self::with_capacity(usize::MAX)
-    }
-
-    pub(crate) fn with_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(SendQueue {
             buffer: lockfree::queue::Queue::new(),
             sync: AtomicU8::new(Self::SYNC_INACTIVE),
-            len: AtomicUsize::new(0),
-            capacity,
         })
     }
 
@@ -155,30 +147,11 @@ impl<Q> SendQueue<Q> {
     }
 
     pub(crate) fn pop(&self) -> Option<Q> {
-        let item = self.buffer.pop();
-        if item.is_some() {
-            self.len.fetch_sub(1, Ordering::Relaxed);
-        }
-        item
+        self.buffer.pop()
     }
 
     pub(crate) fn push(&self, data: Q) {
-        self.len.fetch_add(1, Ordering::Relaxed);
         self.buffer.push(data);
-    }
-
-    /// Push data only if the queue has not reached its capacity.
-    /// Returns `true` if the data was enqueued, `false` if the queue is full.
-    pub(crate) fn try_push(&self, data: Q) -> bool {
-        if self.len.load(Ordering::Relaxed) >= self.capacity {
-            return false;
-        }
-        self.push(data);
-        true
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len.load(Ordering::Relaxed) == 0
     }
 
     fn switch(&self, from: u8, to: u8) -> bool {

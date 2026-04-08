@@ -430,15 +430,14 @@ impl Engine {
     pub const MASK_SERVICE_ARCHIVES_GC: u32 = 0x0800;
     pub const MASK_SERVICE_SS_CACHE_KEEPER: u32 = 0x1000;
 
-    // Sync status (ordered by normal flow: boot → states → finish boot → archives → blocks → synced)
-    pub const SYNC_STATUS_START_BOOT: u32 = 1;
-    pub const SYNC_STATUS_LOAD_STATES: u32 = 2;
-    pub const SYNC_STATUS_FINISH_BOOT: u32 = 3;
-    pub const SYNC_STATUS_SYNC_ARCHIVES: u32 = 4;
-    pub const SYNC_STATUS_SYNC_BLOCKS: u32 = 5;
-    pub const SYNC_STATUS_FINISH_SYNC: u32 = 6;
-    pub const SYNC_STATUS_CHECKING_DB: u32 = 7;
-    pub const SYNC_STATUS_DB_BROKEN: u32 = 8;
+    // Sync status
+    pub const SYNC_STATUS_START_BOOT: u32 = 0x0001;
+    pub const SYNC_STATUS_LOAD_STATES: u32 = 0x0003;
+    pub const SYNC_STATUS_FINISH_BOOT: u32 = 0x0004;
+    pub const SYNC_STATUS_SYNC_BLOCKS: u32 = 0x0005;
+    pub const SYNC_STATUS_FINISH_SYNC: u32 = 0x0006;
+    pub const SYNC_STATUS_CHECKING_DB: u32 = 0x0007;
+    pub const SYNC_STATUS_DB_BROKEN: u32 = 0x0008;
 
     const MASK_STOP: u32 = 0x80000000;
     const TIMEOUT_STOP_MS: u64 = 1000;
@@ -518,11 +517,7 @@ impl Engine {
         });
 
         let archives_life_time_hours = general_config.gc_archives_life_time_hours();
-        let cells_lifetime_sec = if general_config.archival_mode().is_none() {
-            general_config.cells_gc_config().cells_lifetime_sec
-        } else {
-            u64::MAX
-        };
+        let cells_lifetime_sec = general_config.cells_gc_config().cells_lifetime_sec;
         let enable_shard_state_persistent_gc = general_config.enable_shard_state_persistent_gc();
         let skip_saving_persistent_states = general_config.skip_saving_persistent_states();
         let states_cache_mode = general_config.states_cache_mode();
@@ -533,7 +528,6 @@ impl Engine {
             db_directory: general_config.internal_db_path().to_string(),
             cells_gc_interval_sec: general_config.cells_gc_config().gc_interval_sec,
             cells_db_config: cells_db_config.clone(),
-            archival_mode: general_config.archival_mode().cloned(),
         };
         let control_config = general_config.control_server()?;
         let collator_config = general_config.collator_config().clone();
@@ -1459,15 +1453,9 @@ impl Engine {
             shardstates_queue: create_metric("Alloc NODE shardstates queue"),
             cached_cells_counters: create_metric("Alloc NODE cells counters"),
 
-            loaded_cells_from_db: create_metric_per_sec("NODE loaded from db cells/sec"),
-            load_cell_from_db_time_nanos: create_metric_with_total_average(
+            loaded_cells: create_metric_per_sec("NODE loaded from db cells/sec"),
+            load_cell_time_nanos: create_metric_with_total_average(
                 "NODE cell load time from db, nanos",
-            ),
-            load_cell_from_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell load time from cache, nanos",
-            ),
-            store_cell_to_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell store time to cache, nanos",
             ),
             stored_new_cells: create_metric_per_sec("NODE stored new cells & counters/sec"),
             deleted_cells: create_metric_per_sec("NODE deleted cells & counters/sec"),
@@ -1508,9 +1496,6 @@ impl Engine {
             delete_boc_commit_micros: create_metric_with_total_average(
                 "NODE delete boc: commit time, micros",
             ),
-            cell_cache_hits: create_metric_per_sec("NODE cell cache hits/sec"),
-            cell_cache_misses: create_metric_per_sec("NODE cell cache misses/sec"),
-            cell_cache_len: create_metric("NODE cell cache len"),
         });
         let engine_telemetry = Arc::new(EngineTelemetry {
             storage: storage_telemetry,
@@ -1531,10 +1516,8 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.storing_cells.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.cached_cells_counters.clone()),
-            TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells_from_db.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_db_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_cache_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.store_cell_to_cache_time_nanos.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.load_cell_time_nanos.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.stored_new_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.deleted_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_counters.clone()),
@@ -2115,7 +2098,7 @@ async fn boot(
     let (last_applied_mc_block, cold) = match result {
         Ok(block_id) => (block_id.clone(), false),
         Err(err) => {
-            log::warn!("Before cold boot: {err}");
+            log::debug!("before cold boot: {}", err);
             engine.acquire_stop(Engine::MASK_SERVICE_BOOT);
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
@@ -2299,7 +2282,6 @@ pub async fn run(
 
         // Sync by archives
         if sync_by_archives && !engine.check_sync().await? {
-            engine.set_sync_status(Engine::SYNC_STATUS_SYNC_ARCHIVES);
             struct Checker;
             #[async_trait::async_trait]
             impl crate::sync::StopSyncChecker for Checker {
@@ -2425,30 +2407,6 @@ fn telemetry_logger(engine: Arc<Engine>) {
 
             // print telemetry
 
-            {
-                let hits = engine
-                    .engine_telemetry
-                    .storage
-                    .cell_cache_hits
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let misses = engine
-                    .engine_telemetry
-                    .storage
-                    .cell_cache_misses
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let total = hits + misses;
-                let hit_rate = if total > 0 { hits * 100 / total } else { 0 };
-                log::info!(
-                    target: "telemetry",
-                    "Cell cache hit_rate: {}%",
-                    hit_rate
-                );
-            }
-
             engine.telemetry_printer.try_print();
 
             let period = crate::full_node::telemetry::TPS_PERIOD_1;
@@ -2538,8 +2496,8 @@ pub fn init_prometheus_recorder(
     // -- engine
     metrics::describe_gauge!(
         "ton_node_engine_sync_status",
-        "Sync state (0=not_set, 1=boot, 2=load_states, 3=finish_boot, \
-        4=sync_archives, 5=sync_blocks, 6=synced, 7=checking_db, 8=db_broken)"
+        "Sync state (0=not_set, 1=boot, 3=load_states, 4=finish_boot, \
+        5=syncing, 6=synced, 7=checking_db, 8=db_broken)"
     );
     metrics::describe_gauge!(
         "ton_node_engine_timediff_seconds",
@@ -2568,7 +2526,7 @@ pub fn init_prometheus_recorder(
     // -- validator
     metrics::describe_gauge!(
         "ton_node_validator_status",
-        "Validation state (0=Disabled, 1=Waiting, 2=Active)"
+        "Validation state (0=Disabled, 1=Waiting, 2=Countdown, 3=Active)"
     );
     metrics::describe_gauge!(
         "ton_node_validator_in_current_set",

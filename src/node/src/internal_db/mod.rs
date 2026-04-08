@@ -34,28 +34,16 @@ use std::{
 #[cfg(feature = "telemetry")]
 use storage::StorageTelemetry;
 use storage::{
-    archive_shardstate_db::ArchiveShardStateDb,
-    archives::{
-        archive_manager::ArchiveManager,
-        db_provider::{ArchiveDbProvider, EpochDbProvider, SingleDbProvider},
-        epoch::{ArchivalModeConfig, EpochRouter},
-        package_entry_id::PackageEntryId,
-    },
-    block_handle_db::{
-        self, BlockHandle, BlockHandleDb, BlockHandleStorage, NodeStateDb, BLOCK_HANDLE_DB_NAME,
-        VALIDATOR_STATE_DB_NAME,
-    },
-    block_info_db::{
-        BlockInfoDb, NEXT1_BLOCK_DB_NAME, NEXT2_BLOCK_DB_NAME, PREV1_BLOCK_DB_NAME,
-        PREV2_BLOCK_DB_NAME,
-    },
+    archives::{archive_manager::ArchiveManager, package_entry_id::PackageEntryId},
+    block_handle_db::{self, BlockHandle, BlockHandleDb, BlockHandleStorage, NodeStateDb},
+    block_info_db::BlockInfoDb,
     db::{
         filedb::FileDb,
-        rocksdb::{AccessType, RocksDb, CATCHAINS_DB_NAME, NODE_DB_NAME},
+        rocksdb::{AccessType, RocksDb},
     },
     dynamic_boc_rc_db::{AsyncCellsStorageAdapter, DynamicBocDb},
-    shard_top_blocks_db::{ShardTopBlocksDb, SHARD_TOP_BLOCKS_DB_NAME},
-    shardstate_db_async::{AllowStateGcResolver, CellsDbConfig, Job, ShardStateDb},
+    shard_top_blocks_db::ShardTopBlocksDb,
+    shardstate_db_async::{AllowStateGcResolver, CellsDbConfig, ShardStateDb},
     traits::Serializable,
     types::{BlockMeta, PersistentStatePartId, PersistentStatePartKey},
     StorageAlloc, TimeChecker,
@@ -79,17 +67,11 @@ pub const DB_VERSION: &str = "DbVersion";
 pub const DB_VERSION_7: u32 = 7; // with block indexes
 pub const CURRENT_DB_VERSION: u32 = DB_VERSION_7;
 
-pub const SHARDSTATE_DB_NAME: &str = "shardstate_db";
 const CELLS_CF_NAME: &str = "cells_db_v6";
 const CELLSCOUNTERS_CF_NAME: &str = "cells_db_v6_counters";
-const SHARD_STATE_PERSISTENT_DB_NAME: &str = "shard_state_persistent_db";
-pub const ARCHIVE_STATES_DB_NAME: &str = "archive_states";
-pub const ARCHIVE_CELLS_CF_NAME: &str = "archive_cells_db";
-pub const ARCHIVE_SHARDSTATE_CF_NAME: &str = "archive_shardstate_db";
 
 /// Validator state keys
 pub(crate) const LAST_ROTATION_MC_BLOCK: &str = "LastRotationBlockId";
-pub(crate) const DESTROYED_VALIDATOR_SESSIONS: &str = "DestroyedValidatorSessions";
 
 #[derive(Clone, Debug)]
 pub enum DataStatus {
@@ -193,59 +175,6 @@ pub struct InternalDbConfig {
     pub db_directory: String,
     pub cells_gc_interval_sec: u32,
     pub cells_db_config: CellsDbConfig,
-    pub archival_mode: Option<ArchivalModeConfig>,
-}
-
-pub enum StateDb {
-    Dynamic(Arc<ShardStateDb>),
-    Archive(Arc<ArchiveShardStateDb>),
-}
-
-impl StateDb {
-    pub fn get(&self, id: &BlockIdExt) -> Result<Cell> {
-        match self {
-            StateDb::Dynamic(db) => db.get(id),
-            StateDb::Archive(db) => db.get(id),
-        }
-    }
-
-    pub fn get_cell(&self, id: &UInt256) -> Result<Cell> {
-        match self {
-            StateDb::Dynamic(db) => db.get_cell(id),
-            StateDb::Archive(db) => db.get_cell(id),
-        }
-    }
-
-    pub fn cells_factory(&self) -> Result<Arc<dyn CellsFactory>> {
-        match self {
-            StateDb::Dynamic(db) => db.cells_factory(),
-            StateDb::Archive(db) => Ok(db.cells_factory()),
-        }
-    }
-
-    pub fn create_hashed_cell_storage(
-        &self,
-        root: Option<&Cell>,
-        max_inmemory_cells: usize,
-    ) -> Result<Arc<dyn CellsStorage + Send + Sync>> {
-        match self {
-            StateDb::Dynamic(db) => {
-                Ok(Arc::new(db.create_hashed_cell_storage(root, max_inmemory_cells)?))
-            }
-            StateDb::Archive(db) => {
-                Ok(Arc::new(db.create_hashed_cell_storage(root, max_inmemory_cells)?))
-            }
-        }
-    }
-}
-
-impl Clone for StateDb {
-    fn clone(&self) -> Self {
-        match self {
-            StateDb::Dynamic(db) => StateDb::Dynamic(db.clone()),
-            StateDb::Archive(db) => StateDb::Archive(db.clone()),
-        }
-    }
 }
 
 pub struct InternalDb {
@@ -256,7 +185,7 @@ pub struct InternalDb {
     next1_block_db: BlockInfoDb,
     next2_block_db: BlockInfoDb,
     shard_state_persistent_db: Arc<FileDb>,
-    state_db: StateDb,
+    shard_state_dynamic_db: Arc<ShardStateDb>,
     archive_manager: Arc<ArchiveManager>,
     shard_top_blocks_db: ShardTopBlocksDb,
     full_node_state_db: Arc<NodeStateDb>,
@@ -328,39 +257,28 @@ impl InternalDb {
         allocated: Arc<EngineAlloc>,
     ) -> Result<Self> {
         let mut cfs_opts = HashMap::new();
-        if config.archival_mode.is_none() {
-            cfs_opts.insert(
-                CELLS_CF_NAME.to_string(),
-                DynamicBocDb::build_cells_cf_options(&config.cells_db_config),
-            );
-            cfs_opts.insert(
-                CELLSCOUNTERS_CF_NAME.to_string(),
-                DynamicBocDb::build_counters_cf_options(&config.cells_db_config),
-            );
-        }
+        cfs_opts.insert(
+            CELLS_CF_NAME.to_string(),
+            DynamicBocDb::build_cells_cf_options(&config.cells_db_config),
+        );
+        cfs_opts.insert(
+            CELLSCOUNTERS_CF_NAME.to_string(),
+            DynamicBocDb::build_counters_cf_options(&config.cells_db_config),
+        );
         let access_type = access_type.unwrap_or(AccessType::ReadWrite);
         let can_create_db = access_type == AccessType::ReadWrite;
-        let db = RocksDb::new(
-            config.db_directory.as_str(),
-            NODE_DB_NAME,
-            cfs_opts,
-            access_type.clone(),
-        )?;
-        let db_catchain = RocksDb::new(
-            config.db_directory.as_str(),
-            CATCHAINS_DB_NAME,
-            None,
-            access_type.clone(),
-        )?;
+        let db = RocksDb::new(config.db_directory.as_str(), "db", cfs_opts, access_type.clone())?;
+        let db_catchain =
+            RocksDb::new(config.db_directory.as_str(), "catchains", None, access_type)?;
         let block_handle_db =
-            Arc::new(BlockHandleDb::with_db(db.clone(), BLOCK_HANDLE_DB_NAME, can_create_db)?);
+            Arc::new(BlockHandleDb::with_db(db.clone(), "block_handle_db", can_create_db)?);
         let full_node_state_db = Arc::new(NodeStateDb::with_db(
             db.clone(),
             storage::db::rocksdb::NODE_STATE_DB_NAME,
             can_create_db,
         )?);
         let validator_state_db =
-            Arc::new(NodeStateDb::with_db(db_catchain, VALIDATOR_STATE_DB_NAME, can_create_db)?);
+            Arc::new(NodeStateDb::with_db(db_catchain, "validator_state_db", can_create_db)?);
         let block_handle_storage = Arc::new(BlockHandleStorage::with_dbs(
             block_handle_db.clone(),
             full_node_state_db.clone(),
@@ -370,52 +288,19 @@ impl InternalDb {
             allocated.storage.clone(),
         ));
 
-        let state_db = if config.archival_mode.is_some() {
-            let states_db = RocksDb::new(
-                &config.db_directory,
-                ARCHIVE_STATES_DB_NAME,
-                std::collections::HashMap::from([(
-                    ARCHIVE_CELLS_CF_NAME.to_string(),
-                    storage::cell_db::CellDb::build_cf_options(
-                        config.cells_db_config.cells_cache_size_bytes,
-                    ),
-                )]),
-                access_type.clone(),
-            )?;
-            StateDb::Archive(Arc::new(ArchiveShardStateDb::new(
-                states_db,
-                ARCHIVE_SHARDSTATE_CF_NAME,
-                ARCHIVE_CELLS_CF_NAME,
-                &config.db_directory,
-                &config.cells_db_config,
-                #[cfg(feature = "telemetry")]
-                telemetry.storage.clone(),
-                allocated.storage.clone(),
-            )?))
-        } else {
-            StateDb::Dynamic(Self::create_shard_state_dynamic_db(
-                db.clone(),
-                &config,
-                #[cfg(feature = "telemetry")]
-                telemetry.storage.clone(),
-                allocated.storage.clone(),
-            )?)
-        };
+        let shard_state_dynamic_db = Self::create_shard_state_dynamic_db(
+            db.clone(),
+            &config,
+            #[cfg(feature = "telemetry")]
+            telemetry.storage.clone(),
+            allocated.storage.clone(),
+        )?;
         let last_unneeded_key_block_id =
             block_handle_storage.load_full_node_state(LAST_UNNEEDED_KEY_BLOCK)?.unwrap_or_default();
-        let db_root_path = Arc::new(PathBuf::from(&config.db_directory));
-        let db_provider: Arc<dyn ArchiveDbProvider> =
-            if let Some(ref archival_config) = config.archival_mode {
-                let router = Arc::new(EpochRouter::new(archival_config).await?);
-                Arc::new(EpochDbProvider::new(router))
-            } else {
-                Arc::new(SingleDbProvider::new(db.clone(), db_root_path.clone()))
-            };
         let archive_manager = Arc::new(
             ArchiveManager::with_data(
                 db.clone(),
-                db_root_path,
-                db_provider,
+                Arc::new(PathBuf::from(&config.db_directory)),
                 last_unneeded_key_block_id.seq_no(),
                 monitor_min_split,
                 #[cfg(feature = "telemetry")]
@@ -428,18 +313,18 @@ impl InternalDb {
         let db = Self {
             db: db.clone(),
             block_handle_storage,
-            prev1_block_db: BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?,
-            prev2_block_db: BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?,
-            next1_block_db: BlockInfoDb::with_db(db.clone(), NEXT1_BLOCK_DB_NAME, can_create_db)?,
-            next2_block_db: BlockInfoDb::with_db(db.clone(), NEXT2_BLOCK_DB_NAME, can_create_db)?,
+            prev1_block_db: BlockInfoDb::with_db(db.clone(), "prev1_block_db", can_create_db)?,
+            prev2_block_db: BlockInfoDb::with_db(db.clone(), "prev2_block_db", can_create_db)?,
+            next1_block_db: BlockInfoDb::with_db(db.clone(), "next1_block_db", can_create_db)?,
+            next2_block_db: BlockInfoDb::with_db(db.clone(), "next2_block_db", can_create_db)?,
             shard_state_persistent_db: Arc::new(FileDb::with_path(
-                Path::new(config.db_directory.as_str()).join(SHARD_STATE_PERSISTENT_DB_NAME),
+                Path::new(config.db_directory.as_str()).join("shard_state_persistent_db"),
             )),
-            state_db,
+            shard_state_dynamic_db,
             archive_manager,
             shard_top_blocks_db: ShardTopBlocksDb::with_db(
                 db.clone(),
-                SHARD_TOP_BLOCKS_DB_NAME,
+                "shard_top_blocks_db",
                 can_create_db,
             )?,
             full_node_state_db,
@@ -479,7 +364,7 @@ impl InternalDb {
     ) -> Result<Arc<ShardStateDb>> {
         ShardStateDb::new(
             db,
-            SHARDSTATE_DB_NAME,
+            "shardstate_db",
             CELLS_CF_NAME,
             CELLSCOUNTERS_CF_NAME,
             &config.db_directory,
@@ -491,49 +376,36 @@ impl InternalDb {
     }
 
     pub fn clean_shard_state_dynamic_db(&mut self) -> Result<()> {
-        match &self.state_db {
-            StateDb::Dynamic(db) => {
-                if db.is_gc_run() {
-                    fail!(
-                        "It is forbidden to clear shard_state_dynamic_db while cells GC is running"
-                    )
-                }
-
-                if let Err(e) = self.db.drop_table_force(SHARDSTATE_DB_NAME) {
-                    log::warn!("Can't drop table \"shardstate_db\": {}", e);
-                }
-                if let Err(e) = self.db.drop_table_force(CELLS_CF_NAME) {
-                    log::warn!("Can't drop table \"cells_db\": {}", e);
-                }
-                let _ = self.db.drop_table_force("cells_db1");
-                self.full_node_state_db.put(&ASSUME_OLD_FORMAT_CELLS, &[0])?;
-
-                self.state_db = StateDb::Dynamic(Self::create_shard_state_dynamic_db(
-                    self.db.clone(),
-                    &self.config,
-                    #[cfg(feature = "telemetry")]
-                    self.telemetry.storage.clone(),
-                    self.allocated.storage.clone(),
-                )?);
-
-                Ok(())
-            }
-            StateDb::Archive(_) => {
-                fail!("clean_shard_state_dynamic_db is not supported in archival mode")
-            }
+        if self.shard_state_dynamic_db.is_gc_run() {
+            fail!("It is forbidden to clear shard_state_dynamic_db while cells GC is running")
         }
+
+        if let Err(e) = self.db.drop_table_force("shardstate_db") {
+            log::warn!("Can't drop table \"shardstate_db\": {}", e);
+        }
+        if let Err(e) = self.db.drop_table_force(CELLS_CF_NAME) {
+            log::warn!("Can't drop table \"cells_db\": {}", e);
+        }
+        let _ = self.db.drop_table_force("cells_db1"); // depricated table, used in db versions 1 & 2
+        self.full_node_state_db.put(&ASSUME_OLD_FORMAT_CELLS, &[0])?;
+
+        self.shard_state_dynamic_db = Self::create_shard_state_dynamic_db(
+            self.db.clone(),
+            &self.config,
+            #[cfg(feature = "telemetry")]
+            self.telemetry.storage.clone(),
+            self.allocated.storage.clone(),
+        )?;
+
+        Ok(())
     }
 
     pub fn start_states_gc(&self, resolver: Arc<dyn AllowStateGcResolver>) {
-        if let StateDb::Dynamic(db) = &self.state_db {
-            db.clone().start_gc(resolver, self.cells_gc_interval.clone())
-        }
+        self.shard_state_dynamic_db.clone().start_gc(resolver, self.cells_gc_interval.clone())
     }
 
     pub async fn stop_states_db(&self) {
-        if let StateDb::Dynamic(db) = &self.state_db {
-            db.stop().await
-        }
+        self.shard_state_dynamic_db.stop().await
     }
 
     fn store_block_handle(
@@ -806,35 +678,15 @@ impl InternalDb {
         }
         let _lock = handle.saving_state_lock().lock().await;
         if force || !handle.has_saved_state() {
-            match &self.state_db {
-                StateDb::Archive(db) => {
-                    let state = state.clone();
-                    let db = db.clone();
-                    let state_root = state.root_cell().clone();
-                    tokio::task::spawn_blocking(move || {
-                        db.put(state.block_id(), state.root_cell().clone())
-                    })
-                    .await??;
-                    if let Some(callback) = callback_ss {
-                        callback.invoke(Job::PutState(state_root, handle.id().clone()), true).await;
-                    }
-                    if handle.set_state() | handle.set_state_saved() {
-                        self.store_block_handle(handle, callback_handle)?;
-                    }
-                }
-                StateDb::Dynamic(db) => {
-                    let callback = SsCallback::new(
-                        handle.clone(),
-                        self.block_handle_storage.clone(),
-                        callback_ss,
-                    );
-                    let callback =
-                        Some(Arc::new(callback) as Arc<dyn storage::shardstate_db_async::Callback>);
-                    db.put(state.block_id(), state.root_cell().clone(), callback).await?;
-                    if handle.set_state() {
-                        self.store_block_handle(handle, callback_handle)?;
-                    }
-                }
+            let callback =
+                SsCallback::new(handle.clone(), self.block_handle_storage.clone(), callback_ss);
+            let callback =
+                Some(Arc::new(callback) as Arc<dyn storage::shardstate_db_async::Callback>);
+            self.shard_state_dynamic_db
+                .put(state.block_id(), state.root_cell().clone(), callback)
+                .await?;
+            if handle.set_state() {
+                self.store_block_handle(handle, callback_handle)?;
             }
             Ok((state.clone(), true))
         } else {
@@ -849,62 +701,17 @@ impl InternalDb {
         callback_ss: Option<Arc<dyn storage::shardstate_db_async::Callback>>,
     ) -> Result<Cell> {
         let timeout = 30;
+        let callback =
+            SsCallback::new(handle.clone(), self.block_handle_storage.clone(), callback_ss);
+        let callback = Some(Arc::new(callback) as Arc<dyn storage::shardstate_db_async::Callback>);
         let _tc = TimeChecker::new(
             format!("store_shard_state_dynamic_raw_force {}", handle.id()),
             timeout,
         );
         let _lock = handle.saving_state_lock().lock().await;
 
-        match &self.state_db {
-            StateDb::Archive(db) => {
-                let db = db.clone();
-                let id = handle.id().clone();
-                let saved = tokio::task::spawn_blocking(move || db.put(&id, state_root)).await??;
-                if let Some(callback) = callback_ss {
-                    callback.invoke(Job::PutState(saved.clone(), handle.id().clone()), true).await;
-                }
-                if handle.set_state() | handle.set_state_saved() {
-                    self.store_block_handle(handle, None)?;
-                }
-                Ok(saved)
-            }
-            StateDb::Dynamic(db) => {
-                let callback =
-                    SsCallback::new(handle.clone(), self.block_handle_storage.clone(), callback_ss);
-                let callback =
-                    Some(Arc::new(callback) as Arc<dyn storage::shardstate_db_async::Callback>);
-                db.put(handle.id(), state_root.clone(), callback).await?;
-                Ok(state_root)
-            }
-        }
-    }
-
-    pub async fn store_state_update(
-        &self,
-        handle: &Arc<BlockHandle>,
-        state_update: Cell,
-    ) -> Result<()> {
-        let timeout = 30;
-        let _tc = TimeChecker::new(format!("store_state_update {}", handle.id()), timeout);
-
-        let _lock = handle.saving_state_lock().lock().await;
-        if !handle.has_saved_state() {
-            match &self.state_db {
-                StateDb::Archive(db) => {
-                    let db = db.clone();
-                    let id = handle.id().clone();
-                    tokio::task::spawn_blocking(move || db.put_update(&id, state_update)).await??;
-                    if handle.set_state() | handle.set_state_saved() {
-                        self.store_block_handle(handle, None)?;
-                    }
-                }
-                _ => {
-                    fail!("store_state_update is only supported in archival mode")
-                }
-            }
-        }
-
-        Ok(())
+        self.shard_state_dynamic_db.put(handle.id(), state_root.clone(), callback).await?;
+        Ok(state_root)
     }
 
     pub fn load_shard_state_dynamic(&self, id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
@@ -918,7 +725,7 @@ impl InternalDb {
             fail!("ShardState is not saved for {}", id);
         }
 
-        let root_cell = self.state_db.get(handle.id())?;
+        let root_cell = self.shard_state_dynamic_db.get(handle.id())?;
 
         ShardStateStuff::from_root_cell(
             handle.id().clone(),
@@ -931,7 +738,7 @@ impl InternalDb {
 
     pub fn load_cell(&self, id: &UInt256) -> Result<Cell> {
         let _tc = TimeChecker::new(format!("load_cell {}", id), 30);
-        self.state_db.get_cell(id)
+        self.shard_state_dynamic_db.get_cell(id)
     }
 
     pub fn shard_state_persistent_write_obj(
@@ -980,7 +787,7 @@ impl InternalDb {
             log::info!("store_shard_state_persistent {:x}: already saved", root_hash);
         } else {
             let id = handle.id().clone();
-            let state_db = self.state_db.clone();
+            let shard_state_dynamic_db = self.shard_state_dynamic_db.clone();
             let shard_state_persistent_db = self.shard_state_persistent_db.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let root_cell = state.root_cell().clone();
@@ -995,13 +802,13 @@ impl InternalDb {
                 // in memory cells, as we do it while storing part (see store_shard_state_persistent_part).
                 // It means we don't need to pass root cell into the adapter
                 // and can set a zero limit for in-memory cells.
-                let cells_storage = state_db.create_hashed_cell_storage(None, 0)?;
+                let cells_storage = shard_state_dynamic_db.create_hashed_cell_storage(None, 0)?;
                 let writer = BigBocWriter::with_params(
                     [root_cell],
                     MAX_SAFE_DEPTH,
                     BocFlags::all(),
                     abort.deref(),
-                    cells_storage,
+                    Arc::new(cells_storage),
                 )?;
                 let arrange_time = now.elapsed();
                 let cells_count = writer.cells_count();
@@ -1047,7 +854,7 @@ impl InternalDb {
             log::info!("store_shard_state_persistent_part {}: already saved", id);
         } else {
             tokio::task::spawn_blocking({
-                let state_db = self.state_db.clone();
+                let shard_state_dynamic_db = self.shard_state_dynamic_db.clone();
                 let shard_state_persistent_db = self.shard_state_persistent_db.clone();
                 let db_key: PersistentStatePartKey = id.into();
                 let id = id.clone();
@@ -1081,14 +888,14 @@ impl InternalDb {
                         // and remembers their data in memory.
                         // The adapter does not store the cell (don't keep references), only data.
                         // The maximum number of cells to store in memory is limited
-                        let cells_storage =
-                            state_db.create_hashed_cell_storage(Some(&part), MAX_INMEMORY_CELLS)?;
+                        let cells_storage = shard_state_dynamic_db
+                            .create_hashed_cell_storage(Some(&part), MAX_INMEMORY_CELLS)?;
                         let writer = BigBocWriter::with_params(
                             [part],
                             MAX_SAFE_DEPTH,
                             BocFlags::all(),
                             abort.deref(),
-                            cells_storage,
+                            Arc::new(cells_storage),
                         )?;
                         let arrange_time = now.elapsed();
                         let cells_count = writer.cells_count();
@@ -1420,21 +1227,6 @@ impl InternalDb {
         self.block_handle_storage.save_validator_state(key.to_string(), block_id)
     }
 
-    pub fn drop_validator_state_raw(&self, key: &'static str) -> Result<()> {
-        let _tc = TimeChecker::new(format!("drop_validator_state_raw {}", key), 30);
-        self.block_handle_storage.drop_validator_state_raw(key)
-    }
-
-    pub fn load_validator_state_raw(&self, key: &'static str) -> Result<Option<Vec<u8>>> {
-        let _tc = TimeChecker::new(format!("load_validator_state_raw {}", key), 30);
-        self.block_handle_storage.load_validator_state_raw(key)
-    }
-
-    pub fn save_validator_state_raw(&self, key: &'static str, data: &[u8]) -> Result<()> {
-        let _tc = TimeChecker::new(format!("save_validator_state_raw {}", key), 30);
-        self.block_handle_storage.save_validator_state_raw(key, data)
-    }
-
     pub async fn get_archive_id(&self, mc_seq_no: u32, shard: &ShardIdent) -> Option<u64> {
         let _tc = TimeChecker::new(format!("get_archive_id {mc_seq_no} {shard}"), 30);
         self.archive_manager.get_archive_id(mc_seq_no, shard).await
@@ -1645,12 +1437,7 @@ impl InternalDb {
         &self,
         index: Vec<(UInt256, u16)>,
     ) -> Result<AsyncCellsStorageAdapter> {
-        match &self.state_db {
-            StateDb::Dynamic(db) => db.create_fast_cell_storage(index),
-            StateDb::Archive(_) => {
-                fail!("create_fast_cell_storage is not supported in archival mode")
-            }
-        }
+        self.shard_state_dynamic_db.create_fast_cell_storage(index)
     }
 
     pub fn find_full_block_id(&self, root_hash: &UInt256) -> Result<Option<BlockIdExt>> {
@@ -1658,16 +1445,12 @@ impl InternalDb {
     }
 
     pub fn cells_factory(&self) -> Result<Arc<dyn CellsFactory>> {
-        self.state_db.cells_factory()
+        self.shard_state_dynamic_db.cells_factory()
     }
 
     pub fn cells_loader(&self) -> Result<Arc<dyn Fn(&UInt256) -> Result<Cell> + Send + Sync>> {
-        let cs = self.state_db.create_hashed_cell_storage(None, 0)?;
+        let cs = self.shard_state_dynamic_db.create_hashed_cell_storage(None, 0)?;
         Ok(Arc::new(move |hash| cs.load_cell(hash)))
-    }
-
-    pub fn is_archival_mode(&self) -> bool {
-        matches!(self.state_db, StateDb::Archive(_))
     }
 }
 

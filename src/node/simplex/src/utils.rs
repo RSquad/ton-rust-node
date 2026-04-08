@@ -37,7 +37,7 @@
 //!
 
 use crate::{PrivateKey, PublicKey, SessionId, ValidatorWeight};
-use std::{any::Any, backtrace::Backtrace, cmp::max, panic, sync::Once, thread, time::Duration};
+use std::{any::Any, backtrace::Backtrace, panic, sync::Once, thread, time::Duration};
 use ton_api::{
     ton::{
         consensus::{
@@ -476,7 +476,6 @@ pub fn extract_block_info_from_candidate(
     candidate_bytes: &[u8],
     shard: &ShardIdent,
     max_size: usize,
-    proto_version: u32,
 ) -> Result<Option<ExtractedBlockInfo>> {
     // Empty candidate means empty block
     if candidate_bytes.is_empty() {
@@ -510,17 +509,13 @@ pub fn extract_block_info_from_candidate(
                 )
             }
 
-            // C++ simplex always uses mode 2 (CRC32 only) for collated data
-            // re-serialization, regardless of proto_version. The proto_version >= 5
-            // gate in decompress_candidate_data selects mode 2; lower versions select
-            // mode 31.
-            let effective_proto = max(proto_version, 5);
+            // Decompress using validator-session's decompression utility
             let (block_data, collated_data) =
                 consensus_common::compression::decompress_candidate_data(
                     &c.data,
                     false,
                     c.decompressed_size as usize,
-                    effective_proto,
+                    0,
                 )?;
 
             (c.round, c.root_hash.clone(), block_data, collated_data)
@@ -579,10 +574,8 @@ pub fn compute_candidate_id_hash_from_bytes(
     parent: Option<(SlotIndex, &UInt256)>,
     shard: &ShardIdent,
     max_size: usize,
-    proto_version: u32,
 ) -> Result<UInt256> {
-    let block_info =
-        extract_block_info_from_candidate(candidate_bytes, shard, max_size, proto_version)?;
+    let block_info = extract_block_info_from_candidate(candidate_bytes, shard, max_size)?;
 
     let hash = match block_info {
         Some(info) => compute_candidate_id_hash(
@@ -884,7 +877,7 @@ pub fn get_vote_slot(vote: &tl_simplex::UnsignedVote) -> i32 {
 }
 
 /*
-    Block Info Extraction (before_split support)
+    Block Info Extraction (SPLIT-1 Support)
 */
 
 /// Extract before_split flag from block payload

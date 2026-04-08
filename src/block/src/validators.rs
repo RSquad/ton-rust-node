@@ -10,14 +10,14 @@
  */
 use crate::{
     config_params::CatchainConfig,
-    define_HashmapE,
+    define_HashmapE, error,
     error::{BlockError, Result},
     fail, sha512_digest,
     shard::{MASTERCHAIN_ID, SHARD_FULL},
     signature::{CryptoSignature, SigPubKey},
     types::Number16,
     BuilderData, ByteOrderRead, Cell, Crc32, Deserializable, IBitstring, KeyId, Serializable,
-    SliceData, UInt256,
+    SliceData, UInt256, MAX_DATA_BITS,
 };
 use std::{
     borrow::Cow,
@@ -661,6 +661,128 @@ impl ValidatorSetPRNG {
     pub fn next_ranged(&mut self, range: u64) -> u64 {
         let val = self.next_u64();
         ((range as u128 * val as u128) >> 64) as u64
+    }
+}
+
+const VALIDATORS_SHARD_STAT_TAG: u8 = 0x1; // 4 bits
+const VALIDATORS_STAT_EXPECTED_MAX: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct ValidatorsStat {
+    // Single u16 value for each validator.
+    // VALIDATORS_STAT_EXPECTED_MAX values are stored inplace,
+    // if more - SmallVec just reallocates memory using heap.
+    values: smallvec::SmallVec<[u16; VALIDATORS_STAT_EXPECTED_MAX]>,
+}
+
+impl ValidatorsStat {
+    pub fn new(validators_count: u16) -> Self {
+        ValidatorsStat { values: smallvec::smallvec![0; validators_count as usize] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn update<F>(&mut self, validator_index: u16, updater: F) -> Result<()>
+    where
+        F: FnOnce(u16) -> u16,
+    {
+        if self.values.len() <= validator_index as usize {
+            fail!("Invalid validator index: {} (max is {})", validator_index, self.values.len() - 1)
+        }
+        self.values[validator_index as usize] = updater(self.values[validator_index as usize]);
+        Ok(())
+    }
+
+    pub fn get(&self, validator_index: u16) -> Result<u16> {
+        if self.values.is_empty() {
+            fail!("ValidatorsStat is empty")
+        }
+        self.values.get(validator_index as usize).copied().ok_or_else(|| {
+            error!(
+                "Invalid validator index: {} (max is {})",
+                validator_index,
+                self.values.len() - 1
+            )
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+impl Serializable for ValidatorsStat {
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        builder.append_bits(VALIDATORS_SHARD_STAT_TAG as usize, 4)?;
+
+        // Items are wrote one by one into cell. If the cell is full,
+        // the rest of the items are wrote into the child cell, etc.
+
+        let mut remaining_len = self.values.len();
+        if remaining_len == 0 {
+            return Ok(());
+        }
+        let mut stack = vec![builder.clone()];
+        loop {
+            // Calculate how many items can be written to the current builder
+            let builder_fits =
+                stack.last().ok_or_else(|| error!("INTERNAL ERROR: stack is empty"))?.bits_free()
+                    / 16;
+
+            // If the current builder can fit all remaining items - finish
+            if builder_fits >= remaining_len {
+                break;
+            } else {
+                // If not - create one more builder and push it to the stack
+                remaining_len = remaining_len.saturating_sub(builder_fits);
+                stack.push(BuilderData::new());
+            }
+        }
+
+        // Write items to the builders from the last (deeper) cell to the first.
+        let mut start = self.values.len().saturating_sub(remaining_len);
+        while let Some(mut last_builder) = stack.pop() {
+            // Fill a builder
+            let builder_fits = last_builder.bits_free() / 16;
+            for i in start..min(start + builder_fits, self.values.len()) {
+                last_builder.append_u16(self.values[i])?;
+            }
+
+            // Move start to the start of the next builder (minus one cell of items)
+            start = start.saturating_sub(MAX_DATA_BITS / 16);
+
+            if let Some(prev_builder) = stack.last_mut() {
+                prev_builder.checked_append_reference(last_builder.into_cell()?)?;
+            } else {
+                *builder = last_builder;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Deserializable for ValidatorsStat {
+    fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
+        let tag = slice.get_next_int(4)? as u8;
+        if tag != VALIDATORS_SHARD_STAT_TAG {
+            fail!("Invalid tag for ValidatorsShardStat: {}", tag)
+        }
+        self.values.clear();
+        while slice.remaining_bits() > 0 {
+            self.values.push(u16::construct_from(slice)?);
+        }
+        let mut next_cell_opt = slice.checked_drain_reference().ok();
+        while let Some(next_cell) = next_cell_opt {
+            let mut slice = SliceData::load_cell(next_cell)?;
+            while slice.remaining_bits() > 0 {
+                self.values.push(u16::construct_from(&mut slice)?);
+            }
+            next_cell_opt = slice.checked_drain_reference().ok();
+        }
+        Ok(())
     }
 }
 

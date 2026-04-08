@@ -69,10 +69,7 @@ use crate::{
 };
 use consensus_common::{
     check_execution_time,
-    utils::{
-        add_compute_percentage_metric, add_compute_relative_metric, add_compute_result_metric,
-        get_elapsed_time, MetricsDumper,
-    },
+    utils::{get_elapsed_time, MetricsDumper},
 };
 use crossbeam::channel::{bounded, Sender};
 use std::{
@@ -82,7 +79,7 @@ use std::{
     collections::BTreeMap,
     fmt, panic,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     thread,
@@ -92,7 +89,7 @@ use ton_api::ton::consensus::{
     simplex::{Certificate, Vote},
     CandidateData,
 };
-use ton_block::{error, Error, Result, ShardIdent, UInt256};
+use ton_block::{error, Error, Result, ShardIdent};
 
 /*
     Constants
@@ -150,24 +147,6 @@ impl ReceiverListener for ReceiverListenerImpl {
     fn on_certificate(&self, source_idx: u32, certificate: Certificate) {
         self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
             processor.on_certificate(source_idx, certificate);
-        }));
-    }
-
-    /// Handle RequestCandidate cache miss by delegating to SessionProcessor
-    fn on_candidate_query_fallback(
-        &self,
-        slot: crate::block::SlotIndex,
-        block_hash: UInt256,
-        want_notar: bool,
-        response_callback: consensus_common::QueryResponseCallback,
-    ) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.handle_candidate_query_fallback(
-                slot,
-                block_hash,
-                want_notar,
-                response_callback,
-            );
         }));
     }
 }
@@ -344,15 +323,6 @@ pub(crate) struct SessionImpl {
     stop_flag: Arc<AtomicBool>,
     /// Indicates database should be destroyed on stop
     destroy_db_flag: Arc<AtomicBool>,
-    /// Atomic flag: main_loop should begin active FSM processing.
-    /// Set by `start(seqno)`. The overlay is created at `create()` time and
-    /// warms up while main_loop polls this flag, so peers are connected
-    /// before the first_block_timeout clock starts ticking.
-    start_flag: Arc<AtomicBool>,
-    /// Initial block seqno, provided by `start(seqno)`.
-    /// Read by main_loop after start_flag is set, before SessionDescription
-    /// creation.
-    deferred_initial_seqno: Arc<AtomicU32>,
     /// Atomic flag to indicate main processing thread has stopped
     main_processing_thread_stopped: Arc<AtomicBool>,
     /// Atomic flag to indicate callbacks processing thread has stopped
@@ -374,16 +344,6 @@ pub(crate) struct SessionImpl {
 }
 
 impl ConsensusSession for SessionImpl {
-    fn start(&self, initial_block_seqno: u32) {
-        log::info!(
-            "SimplexSession {}: start(seqno={}) called — storing seqno and unblocking main loop",
-            self.session_id.to_hex_string(),
-            initial_block_seqno
-        );
-        self.deferred_initial_seqno.store(initial_block_seqno, Ordering::Release);
-        self.start_flag.store(true, Ordering::Release);
-    }
-
     fn stop(&self) {
         self.stop_async();
         self.stop_impl(false);
@@ -483,21 +443,19 @@ impl SessionImpl {
         should_stop_flag: Arc<AtomicBool>,
         is_stopped_flag: Arc<AtomicBool>,
         destroy_db_flag: Arc<AtomicBool>,
-        start_flag: Arc<AtomicBool>,
-        deferred_initial_seqno: Arc<AtomicU32>,
         panicked_flag: Arc<AtomicBool>,
         task_queue: TaskQueuePtr,
         callbacks_task_queue: CallbackTaskQueuePtr,
         options: SessionOptions,
         session_id: SessionId,
         shard: ShardIdent,
+        initial_block_seqno: u32,
         ids: Vec<SessionNode>,
         local_key: PrivateKey,
         listener: SessionListenerPtr,
         overlay_manager: ConsensusOverlayManagerPtr,
         receiver_listener: ReceiverListenerPtr,
         max_candidate_size: usize,
-        max_candidate_query_answer_size: u64,
         db_path: String,
         session_activity_node: ActivityNodePtr,
         session_creation_time: SystemTime,
@@ -514,7 +472,7 @@ impl SessionImpl {
         // Signal thread start based on wait_for_db_init option:
         // - If false: send Ok(()) now (non-blocking for caller)
         // - If true: wait until full initialization completes
-        let init_signaled = Cell::new(false);
+        let mut init_signaled = false;
         if !options.wait_for_db_init {
             if init_result_sender.send(Ok(())).is_err() {
                 log::warn!(
@@ -524,7 +482,7 @@ impl SessionImpl {
                 is_stopped_flag.store(true, Ordering::Release);
                 return;
             }
-            init_signaled.set(true);
+            init_signaled = true;
         }
 
         // Configure metrics
@@ -543,7 +501,7 @@ impl SessionImpl {
         let fail_startup = |err: Error, ctx: &str| {
             log::error!("Session {} {}: {:?}", session_id.to_hex_string(), ctx, err);
             startup_errors.set(startup_errors.get().saturating_add(1));
-            if !init_signaled.get() {
+            if !init_signaled {
                 let _ = init_result_sender.send(Err(err));
             }
             is_stopped_flag.store(true, Ordering::Release);
@@ -562,7 +520,7 @@ impl SessionImpl {
         // Check if we should stop before loading bootstrap
         if should_stop_flag.load(Ordering::Relaxed) {
             log::info!("Session {} stopping before bootstrap load", session_id.to_hex_string());
-            if !init_signaled.get() {
+            if !init_signaled {
                 let _ =
                     init_result_sender.send(Err(error!("Session stopped before bootstrap load")));
             }
@@ -580,15 +538,12 @@ impl SessionImpl {
             session_id.clone(),
             &shard,
             max_candidate_size,
-            max_candidate_query_answer_size,
-            options.proto_version,
             &ids,
             &local_key,
             overlay_manager.clone(),
             receiver_listener,
             options.standstill_timeout,
             panicked_flag.clone(),
-            options.use_quic,
             health_counters.clone(),
         ) {
             Ok(r) => r,
@@ -607,7 +562,7 @@ impl SessionImpl {
                 // Check if this was a cancellation
                 if should_stop_flag.load(Ordering::Relaxed) {
                     log::info!("Session {} bootstrap load cancelled", session_id.to_hex_string());
-                    if !init_signaled.get() {
+                    if !init_signaled {
                         let _ = init_result_sender
                             .send(Err(error!("Session bootstrap load cancelled")));
                     }
@@ -628,49 +583,6 @@ impl SessionImpl {
             bootstrap.finalized_blocks.len(),
             bootstrap.candidate_infos.len(),
             bootstrap.notar_certs.len(),
-        );
-
-        // Signal init complete before the start gate — the overlay and DB are
-        // fully ready.  The caller (create()) can return and later call
-        // start(seqno) to unblock the FSM.
-        if !init_signaled.get() {
-            if init_result_sender.send(Ok(())).is_err() {
-                log::warn!(
-                    "SimplexSession {} main loop: failed to send init result (receiver dropped)",
-                    session_id.to_hex_string()
-                );
-            }
-            init_signaled.set(true);
-        }
-
-        // Wait for start(seqno) before creating SessionDescription.
-        // The overlay is already registered and warming up peer connections
-        // while we poll here, so by the time start() is called the overlay
-        // should have established connectivity -- preventing premature
-        // first_block_timeout skips that occur when the FSM starts before
-        // any peers are reachable.
-        if !start_flag.load(Ordering::Acquire) {
-            log::info!(
-                "SimplexSession {} waiting for start(seqno) signal (overlay warming up)...",
-                session_id.to_hex_string()
-            );
-            while !start_flag.load(Ordering::Acquire) {
-                if should_stop_flag.load(Ordering::Relaxed) {
-                    log::info!(
-                        "SimplexSession {} stopped while waiting for start()",
-                        session_id.to_hex_string()
-                    );
-                    is_stopped_flag.store(true, Ordering::Release);
-                    return;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-        let initial_block_seqno = deferred_initial_seqno.load(Ordering::Acquire);
-        log::info!(
-            "SimplexSession {} start(seqno={}) received, creating SessionDescription",
-            session_id.to_hex_string(),
-            initial_block_seqno
         );
 
         // Phase 4a: Create session description (immutable session configuration)
@@ -750,6 +662,16 @@ impl SessionImpl {
             }
         }
 
+        // Signal full initialization complete (if wait_for_db_init is true)
+        if !init_signaled {
+            if init_result_sender.send(Ok(())).is_err() {
+                log::warn!(
+                    "SimplexSession {} main loop: failed to send init result after full init (receiver dropped)",
+                    session_id.to_hex_string()
+                );
+            }
+        }
+
         // Create metrics dumper for computed/derivative metrics
         let mut metrics_dumper = Self::create_metrics_dumper();
 
@@ -761,10 +683,6 @@ impl SessionImpl {
         let mut next_metrics_dump_time = processor.get_description().get_time();
         let mut next_profiling_dump_time = next_metrics_dump_time;
         let mut next_health_check_time = next_metrics_dump_time;
-
-        // Arm FSM skip timeouts now that overlay warmup and bootstrap
-        // recovery are complete.  Matches C++ Start event timing.
-        processor.start();
 
         loop {
             {
@@ -942,6 +860,10 @@ impl SessionImpl {
     /// Configures derivative metrics (rate of change), percentage metrics,
     /// and result status metrics similar to validator-session.
     fn create_metrics_dumper() -> MetricsDumper {
+        use consensus_common::utils::{
+            add_compute_percentage_metric, add_compute_relative_metric, add_compute_result_metric,
+        };
+
         let mut metrics_dumper = MetricsDumper::new();
 
         // Derivative metrics for loop counters (rate per second)
@@ -1117,6 +1039,7 @@ impl SessionImpl {
         options: &SessionOptions,
         session_id: &SessionId,
         shard: &ShardIdent,
+        initial_block_seqno: u32,
         ids: Vec<SessionNode>,
         local_key: &PrivateKey,
         db_path: String,
@@ -1124,9 +1047,10 @@ impl SessionImpl {
         listener: SessionListenerPtr,
     ) -> Result<SessionPtr> {
         log::info!(
-            "Creating SimplexSession (session_id is {}, shard={}, nodes_count={}, db_path={})",
+            "Creating SimplexSession (session_id is {}, shard={}, initial_seqno={}, nodes_count={}, db_path={})",
             session_id.to_hex_string(),
             shard,
+            initial_block_seqno,
             ids.len(),
             db_path
         );
@@ -1151,8 +1075,6 @@ impl SessionImpl {
         // Create thread synchronization flags
         let stop_flag = Arc::new(AtomicBool::new(false));
         let destroy_db_flag = Arc::new(AtomicBool::new(false));
-        let start_flag = Arc::new(AtomicBool::new(false));
-        let deferred_initial_seqno = Arc::new(AtomicU32::new(0));
         let main_processing_thread_stopped = Arc::new(AtomicBool::new(false));
         let callbacks_processing_thread_stopped = Arc::new(AtomicBool::new(false));
         let panicked_flag = Arc::new(AtomicBool::new(false));
@@ -1163,18 +1085,13 @@ impl SessionImpl {
             ReceiverListenerImpl::create(main_task_queue.clone(), session_id.clone());
         let receiver_listener_weak: ReceiverListenerPtr = Arc::downgrade(&receiver_listener);
 
-        // Compute max candidate size for receiver (local validation guard, +1KB slack)
+        // Compute max candidate size for receiver
         let max_candidate_size = options.max_block_size + options.max_collated_data_size + 1024;
-        // Network response budget for requestCandidate queries (C++ PR #2195 parity: +1MB)
-        let max_candidate_query_answer_size: u64 =
-            (options.max_block_size + options.max_collated_data_size) as u64 + (1 << 20);
 
         // Create session (receiver is created in main_loop after bootstrap loading)
         let session = SessionImpl {
             stop_flag: stop_flag.clone(),
             destroy_db_flag: destroy_db_flag.clone(),
-            start_flag: start_flag.clone(),
-            deferred_initial_seqno: deferred_initial_seqno.clone(),
             main_processing_thread_stopped: main_processing_thread_stopped.clone(),
             callbacks_processing_thread_stopped: callbacks_processing_thread_stopped.clone(),
             panicked_flag: panicked_flag.clone(),
@@ -1217,21 +1134,19 @@ impl SessionImpl {
                         stop_flag_for_main_loop,
                         main_processing_thread_stopped,
                         destroy_db_flag,
-                        start_flag,
-                        deferred_initial_seqno,
                         panicked_flag_for_main_loop,
                         main_task_queue,
                         callbacks_task_queue,
                         options_clone,
                         session_id_clone,
                         shard_clone,
+                        initial_block_seqno,
                         ids,
                         local_key_clone,
                         listener,
                         overlay_manager,
                         receiver_listener_weak,
                         max_candidate_size,
-                        max_candidate_query_answer_size,
                         db_path,
                         session_activity_node,
                         session_creation_time,

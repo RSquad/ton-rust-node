@@ -74,7 +74,3 @@ loggers:
     level: warn
   ext_messages:
     level: info
-  quic:
-    level: info
-  simplex:
-    level: info

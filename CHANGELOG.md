@@ -6,33 +6,6 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
-## [v0.4.0] - 2026-04-05
-
-Image: `ghcr.io/rsquad/ton-rust-node/node:v0.4.0`
-
-This release brings support for the Simplex consensus protocol and QUIC transport — key protocol upgrades rolling out across the TON network. It also introduces archival node functionality and a range of fixes to fee accounting, storage phase handling, and sync stability.
-
-### Added
-
-- Simplex consensus updates and QUIC integration
-- QUIC transport with separate address support and connection deduplication
-- Archival node functionality with split/merge resilience
-- CellsDB cells cache
-
-### Changed
-
-- Validate query uses capabilities from blockchain config instead of candidate block
-- Enforce mcStateExtra flags <=1, remove ValidatorsStat
-
-### Fixed
-
-- Storage phase: preserve original due_payment for special accounts in partial storage phase
-- Masterchain ValueFlow burned fees and blackhole accounting
-- Fee accumulation: accumulate fees_collected instead of overwriting to preserve shard burn
-- Untouched account change detection
-- Fast sync overlay creation reliability
-- Archive sync stalling on shard split/merge
-
 ## [v0.3.0] - 2026-03-12
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.3.0`

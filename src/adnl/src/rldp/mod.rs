@@ -208,7 +208,6 @@ impl RldpNode {
     const MAX_OUTBOUNDS_PER_PEER: u32 = 3;
     const SIZE_TRANSFER_WAVE: u32 = 10;
     const SPINNER_MS: u64 = 1;
-    const SPINNER_V1_SEND_MS: u64 = 10;
     const TIMEOUT_MAX_MS: u64 = 10000;
     const TIMEOUT_MIN_MS: u64 = 500;
     const TIMEOUT_WARN_MS: u64 = 5000;
@@ -1207,16 +1206,16 @@ impl RldpNode {
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
         #[cfg(feature = "debug")]
+        let mut total_packets = 0;
+        #[cfg(feature = "debug")]
         let mut last_seqno = 0;
-        #[cfg(any(feature = "debug", feature = "telemetry"))]
-        let mut total_packets: u32 = 0;
         loop {
             let mut transfer_wave = transfer.start_next_part()?;
             if transfer_wave == 0 {
                 #[cfg(feature = "debug")]
                 Self::check_timestamp(
                     &context.timestamp,
-                    format!("Send transfer finished, packets {total_packets}").as_str(),
+                    format!("Send transfer finished, packets {}", total_packets).as_str(),
                 );
                 break;
             }
@@ -1225,12 +1224,9 @@ impl RldpNode {
             let mut recv_seqno = 0;
             'part: loop {
                 for _ in 0..transfer_wave {
-                    #[cfg(any(feature = "debug", feature = "telemetry"))]
-                    {
-                        total_packets += 1;
-                    }
                     #[cfg(feature = "debug")]
                     {
+                        total_packets += 1;
                         last_seqno = transfer.state().seqno_send()
                     }
                     let (object, do_next) = transfer.prepare_chunk()?;
@@ -1262,12 +1258,9 @@ impl RldpNode {
                         break 'part;
                     }
                 }
-                tokio::time::timeout(
-                    Duration::from_millis(Self::SPINNER_V1_SEND_MS),
-                    context.pong.recv(),
-                )
-                .await
-                .ok();
+                tokio::time::timeout(Duration::from_millis(Self::SPINNER_MS), context.pong.recv())
+                    .await
+                    .ok();
                 if transfer.state().is_transfer_finished_or_next_part(part)? {
                     #[cfg(feature = "debug")]
                     Self::check_timestamp(
@@ -1294,18 +1287,11 @@ impl RldpNode {
                     peer.stats.v1.update(min_timeout_ms);
                     recv_seqno = new_recv_seqno;
                 } else if peer.stats.v1.try_timeout(start_ms) {
-                    #[cfg(feature = "telemetry")]
-                    log::info!(
-                        target: TARGET,
-                        "RLDPv1 send: packets sent {total_packets} (timeout) in {transfer_str}"
-                    );
                     return Ok(false);
                 }
             }
             peer.stats.v1.update(min_timeout_ms);
         }
-        #[cfg(feature = "telemetry")]
-        log::info!(target: TARGET, "RLDPv1 send: packets sent {total_packets} in {transfer_str}");
         Ok(true)
     }
 
@@ -1319,7 +1305,7 @@ impl RldpNode {
         let SendTransfer::V2(part_transfers) = &mut context.send_transfer else {
             fail!("Unexpected V1 send transfer in V2 send loop")
         };
-        #[cfg(any(feature = "debug", feature = "telemetry"))]
+        #[cfg(feature = "debug")]
         let total_packets = Arc::new(AtomicU32::new(0));
         let progress = Arc::new(AtomicU64::new(0));
         let bbr_part_states = transfer_state.clone();
@@ -1370,7 +1356,7 @@ impl RldpNode {
                     tag: context.tag,
                     #[cfg(feature = "debug")]
                     timestamp: context.timestamp.clone(),
-                    #[cfg(any(feature = "debug", feature = "telemetry"))]
+                    #[cfg(feature = "debug")]
                     total_packets: total_packets.clone(),
                     transfer_str: transfer_str.clone(),
                 };
@@ -1407,13 +1393,6 @@ impl RldpNode {
                 }
             }
         }?;
-        #[cfg(feature = "telemetry")]
-        log::info!(
-            target: TARGET,
-            "RLDPv2 send: packets sent {} ({}) in {transfer_str}",
-            total_packets.load(Ordering::Relaxed),
-            if ok { "ok" } else { "timeout" }
-        );
         match bbr_task.await {
             Err(e) => Err(e.into()),
             Ok(Err(e)) => Err(e),
@@ -1498,7 +1477,7 @@ impl RldpNode {
                     continue;
                 }
             };
-            #[cfg(any(feature = "debug", feature = "telemetry"))]
+            #[cfg(feature = "debug")]
             context.total_packets.fetch_add(1, Ordering::Relaxed);
             let chunk = TaggedByteSlice {
                 object,
