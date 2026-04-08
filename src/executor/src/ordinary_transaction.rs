@@ -262,6 +262,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             in_msg: Some(in_msg.clone()),
             incoming_value: msg_balance.clone(),
             storage_fees_collected,
+            due_payment: account.due_payment().map_or(0, Coins::as_u128),
             config_params,
             prev_blocks_info: params.prev_blocks_info.clone(),
             ..Default::default()

@@ -12,9 +12,9 @@ use crate::blockchain_config::BlockchainConfig;
 use pretty_assertions::assert_eq;
 use std::io::{BufRead, BufReader};
 use ton_block::{
-    read_single_root_boc, Account, AccountStorage, Block, Cell, ConfigParams, CurrencyCollection,
-    Deserializable, Message, MsgAddressInt, Result, Serializable, StateInit, StorageInfo,
-    Transaction, UnixTime,
+    base64_decode, read_single_root_boc, Account, AccountStorage, Block, Cell, ConfigParams,
+    CurrencyCollection, Deserializable, Message, MsgAddressInt, Result, Serializable, ShardAccount,
+    StateInit, StorageInfo, TrComputePhase, Transaction, UnixTime,
 };
 
 mod common;
@@ -92,7 +92,7 @@ fn many_replay_contract_by_files(
             let descr = transaction.read_description()?;
             let compute_ph = descr.compute_phase_ref().expect("no compute phase");
             match compute_ph {
-                ton_block::TrComputePhase::Vm(vm) => {
+                TrComputePhase::Vm(vm) => {
                     let steps = vm.vm_steps;
                     let gas = vm.gas_used;
                     result.push((idx, contents.len(), steps, gas));
@@ -539,6 +539,26 @@ fn test_size_limits_v12() {
     )
 }
 
+#[test]
+fn test_due_payment_in_smc() {
+    replay_transaction_by_files(
+        "real_boc/due_payment_in_smc_account_old.boc",
+        "real_boc/due_payment_in_smc_account_new.boc",
+        "real_boc/due_payment_in_smc_transaction.boc",
+        "real_boc/config12.boc",
+    )
+}
+
+#[test]
+fn test_fwd_fee_payment_in_smc() {
+    replay_transaction_by_files(
+        "real_boc/fwd_fee_payment_in_smc_account_old.boc",
+        "real_boc/fwd_fee_payment_in_smc_account_new.boc",
+        "real_boc/fwd_fee_payment_in_smc_transaction.boc",
+        "real_boc/config12.boc",
+    )
+}
+
 #[ignore = "test for replay transaction by files"]
 #[test]
 fn test_replay_transaction_by_files() {
@@ -594,4 +614,39 @@ fn test_revert_action_phase() {
     answer.set_balance(account.get_balance().unwrap().clone());
     answer.set_last_tr_time(account.last_tr_time().unwrap_or(0));
     assert_eq!(answer, account);
+}
+
+#[ignore]
+#[test]
+fn test_bad_single() {
+    replay_transaction_by_files(
+        "real_boc/bad_account_old.boc",
+        "real_boc/bad_account_new.boc",
+        "real_boc/bad_transaction.boc",
+        "real_boc/config12.boc",
+    )
+}
+
+#[ignore]
+#[test]
+fn test_bad_trans() {
+    let json = "../../emulator/emulator_test.json";
+    let prefix = "real_boc/bad_".to_string();
+    let json = std::fs::read_to_string(json).unwrap();
+    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
+    let acc = json["shard_account_boc"].as_str().unwrap();
+    let tr = json["tx_boc"].as_str().unwrap();
+    let prev = json["prev_blocks_info_boc"].as_str().unwrap();
+    let shard_acc = ShardAccount::construct_from_base64(acc).unwrap();
+    shard_acc.account_cell().write_to_file(prefix.clone() + "account_old.boc");
+    shard_acc.account_cell().write_to_file(prefix.clone() + "account_new.boc");
+    std::fs::write(prefix.clone() + "transaction.boc", base64_decode(tr).unwrap()).unwrap();
+
+    replay_transaction_with_prevs(
+        acc,
+        &(prefix + "account_new.boc"),
+        tr,
+        "real_boc/config12.boc",
+        prev,
+    );
 }

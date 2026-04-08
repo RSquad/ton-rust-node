@@ -3307,7 +3307,7 @@ impl ValidateQuery {
         };
         let (workchain_id, addr) = dst.extract_std_address(true).map_err(|err| {
             error!(
-                "destination of inbound internal message with hash {key:x} \
+                "destination {dst} of inbound internal message with hash {key:x} \
                 is an invalid blockchain address {err}"
             )
         })?;
@@ -3495,9 +3495,15 @@ impl ValidateQuery {
         }
 
         if from_dispatch_queue {
+            let (_, addr) = src.extract_std_address(true).map_err(|err| {
+                error!(
+                    "source {src} of deferred inbound message with hash {key:x} \
+                    is an invalid blockchain address {err}"
+                )
+            })?;
             // Check that the message was removed from DispatchQueue
             let Some(dispatched_msg_env_cell) =
-                base.removed_dispatch_queue_messages(src.address(), created_lt)
+                base.removed_dispatch_queue_messages(&addr, created_lt)
             else {
                 reject_query!(
                     "deferred InMsg with src_addr={addr:x} lt={created_lt} was not removed from \

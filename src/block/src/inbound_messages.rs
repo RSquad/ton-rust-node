@@ -470,10 +470,15 @@ impl Augmentation<ImportFees> for InMsg {
 
                 fees.value_imported.coins = header.fwd_fee;
             }
-            InMsg::DeferredFinal(_) => {
-                fees.fees_collected = header.fwd_fee;
+            InMsg::DeferredFinal(x) => {
+                let env = x.read_envelope_message()?;
+                if env.fwd_fee_remaining() != x.fwd_fee() {
+                    fail!("fwd_fee_remaining not equal to fwd_fee")
+                }
+                fees.fees_collected = *env.fwd_fee_remaining();
 
-                fees.value_imported.coins = header.fwd_fee;
+                fees.value_imported = header.value.clone();
+                fees.value_imported.coins.add(env.fwd_fee_remaining())?;
             }
             InMsg::DeferredTransit(x) => {
                 let env = x.read_in_envelope_message()?;
