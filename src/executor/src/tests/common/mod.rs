@@ -141,7 +141,7 @@ pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
         Simple,
         Emulator,
     }
-    let debug = DebugType::Emulator;
+    let debug = DebugType::None;
     let _ = cross_check::DisableCrossCheck::new();
     let (verbosity, pattern, trace_callback) = match debug {
         DebugType::None => (4, None, None),
@@ -458,6 +458,7 @@ pub fn execute_with_params(
     } else {
         mc_state_proof
     };
+    let block_version = config.global_version();
     let dict_hash_min_cells = config.size_limits_config().acc_state_cells_for_storage_dict;
     let executor: Box<dyn TransactionExecutor> = if in_msg_cell.is_none() {
         let tt = acc.get_tick_tock().unwrap();
@@ -474,7 +475,11 @@ pub fn execute_with_params(
     let acc_before = acc.clone();
     let trans = executor.execute_with_params(in_msg_cell.clone(), acc, params.clone());
     if trans.is_ok() {
-        acc.update_storage_stat(dict_hash_min_cells).unwrap();
+        if block_version < 11 {
+            acc.del_storage_stat();
+        } else {
+            acc.update_storage_stat(dict_hash_min_cells).unwrap();
+        }
     }
     #[cfg(feature = "cross_check")]
     cross_check::cross_check(
@@ -922,22 +927,6 @@ pub fn replay_transaction(
         transaction.read_description().unwrap()
     );
 
-    let block_version = extra.config.global_version();
-    if block_version < 11 {
-        account.del_storage_stat();
-    } else {
-        account
-            .update_storage_stat(
-                mc.read_custom()
-                    .unwrap()
-                    .unwrap()
-                    .config()
-                    .size_limits_config()
-                    .unwrap()
-                    .acc_state_cells_for_storage_dict,
-            )
-            .unwrap();
-    }
     // account.write_to_file(acc_after).unwrap();
     let new_hash = account.serialize().unwrap().repr_hash();
     // let hash_update = ton_block::HashUpdate::with_hashes(old_hash.clone(), new_hash.clone());

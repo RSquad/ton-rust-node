@@ -272,7 +272,7 @@ impl SmartContractInfo {
                 tuple.push(StackItem::boolean(int.bounce));
                 tuple.push(StackItem::boolean(int.bounced));
                 tuple.push(StackItem::slice(int.src.write_to_bitstring().unwrap_or_default()));
-                tuple.push(StackItem::int(0));
+                tuple.push(StackItem::int(int.fwd_fee().as_u128()));
                 tuple.push(StackItem::int(int.created_lt));
                 tuple.push(StackItem::int(int.created_at));
                 tuple.push(StackItem::int(int.value.coins.as_u128()));
