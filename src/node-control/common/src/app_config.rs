@@ -459,7 +459,7 @@ fn default_workchain() -> i32 {
     -1
 }
 
-pub fn default_max_factor() -> f32 {
+fn default_max_factor() -> f32 {
     3.0
 }
 
@@ -778,10 +778,10 @@ mod tests {
     fn test_elections_validate_max_factor_respects_network_cap() {
         let mut c = ElectionsConfig::default();
         c.max_factor = 5.0;
-        assert!(c.validate(Some(default_max_factor())).is_err());
+        assert!(c.validate(None).is_err());
         assert!(c.validate(Some(5.0)).is_ok());
         c.max_factor = 2.0;
-        assert!(c.validate(Some(default_max_factor())).is_ok());
+        assert!(c.validate(None).is_ok());
     }
 
     #[test]
