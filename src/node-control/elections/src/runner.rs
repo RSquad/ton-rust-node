@@ -21,7 +21,10 @@ use common::{
     },
     task_cancellation::CancellationCtx,
     time_format,
-    ton_utils::{display_tons, nanotons_to_dec_string, nanotons_to_tons_f64},
+    ton_utils::{
+        MAX_STAKE_FACTOR_SCALE, display_tons, max_stake_factor_raw_to_multiplier,
+        nanotons_to_dec_string, nanotons_to_tons_f64,
+    },
 };
 use contracts::{
     ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
@@ -391,7 +394,11 @@ impl ElectionRunner {
             elections_info.participants.len()
         );
 
-        self.build_elections_snapshot(election_id, &cfg15, &elections_info);
+        // Config param 17: effective `max_factor` in snapshot; 16/17: participation (e.g. AdaptiveSplit50).
+        let cfg16 = self.fetch_config_param_16().await?;
+        let cfg17 = self.fetch_config_param_17().await?;
+
+        self.build_elections_snapshot(election_id, &cfg15, &elections_info, &cfg17);
 
         if elections_info.finished {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Finished;
@@ -436,9 +443,6 @@ impl ElectionRunner {
                 );
             }
         }
-        // Fetch config params 16/17 - used for AdaptiveSplit50 strategy
-        let cfg16 = self.fetch_config_param_16().await?;
-        let cfg17 = self.fetch_config_param_17().await?;
 
         // walk through the nodes and try to participate in the elections
         let mut nodes = self.nodes.keys().cloned().collect::<Vec<String>>();
@@ -491,8 +495,9 @@ impl ElectionRunner {
         election_id: u64,
         cfg15: &ConfigParam15,
         elections_info: &ElectionsInfo,
+        cfg17: &ConfigParam17,
     ) {
-        self.snapshot_cache.last_max_factor = Some(self.calc_max_factor());
+        self.snapshot_cache.last_max_factor = Some(self.calc_max_factor(cfg17.max_stake_factor));
 
         // It can be a validator wallet or nominator pool address.
         let wallet_addrs: HashSet<Vec<u8>> =
@@ -549,8 +554,15 @@ impl ElectionRunner {
         election_id: u64,
         params: &ConfigParams<'_>,
     ) -> anyhow::Result<()> {
-        let max_factor = ((self.calc_max_factor() * 65536.0) as u32)
-            .clamp(common::ton_utils::MAX_STAKE_FACTOR_SCALE, params.cfg17.max_stake_factor);
+        let configured_raw = self.configured_max_factor_raw();
+        let max_factor = self.calc_max_factor_raw(params.cfg17.max_stake_factor);
+        if max_factor != configured_raw {
+            tracing::warn!(
+                "max_factor clamped: configured={}, used={} (network limit from cfg17)",
+                max_stake_factor_raw_to_multiplier(configured_raw),
+                max_stake_factor_raw_to_multiplier(max_factor),
+            );
+        }
         let stake_ctx = StakeContext {
             past_elections: &self.past_elections,
             our_max_factor: max_factor,
@@ -692,7 +704,7 @@ impl ElectionRunner {
                     max_factor,
                 });
                 node.key_id = key_id;
-                Self::send_stake(node_id, node, stake, params.cfg17.max_stake_factor).await?;
+                Self::send_stake(node_id, node, stake).await?;
                 Ok(())
             }
             Some(entry) => {
@@ -718,8 +730,7 @@ impl ElectionRunner {
                                 nanotons_to_tons_f64(old_stake + stake),
                                 nanotons_to_tons_f64(stake),
                             );
-                            Self::send_stake(node_id, node, stake, params.cfg17.max_stake_factor)
-                                .await?;
+                            Self::send_stake(node_id, node, stake).await?;
                             node.participant.as_mut().map(|p| p.stake += stake);
                         }
                     }
@@ -728,8 +739,7 @@ impl ElectionRunner {
                         if let Some(p) = node.participant.as_mut() {
                             p.stake = stake;
                         }
-                        Self::send_stake(node_id, node, stake, params.cfg17.max_stake_factor)
-                            .await?;
+                        Self::send_stake(node_id, node, stake).await?;
                     }
                 }
                 Ok(())
@@ -737,15 +747,9 @@ impl ElectionRunner {
         }
     }
 
-    async fn send_stake(
-        node_id: &str,
-        node: &mut Node,
-        stake: u64,
-        network_max_stake_factor: u32,
-    ) -> anyhow::Result<()> {
+    async fn send_stake(node_id: &str, node: &mut Node, stake: u64) -> anyhow::Result<()> {
         tracing::info!("node [{}] build stake message", node_id);
-        let payload =
-            Self::build_new_stake_payload(node_id, node, stake, network_max_stake_factor).await?;
+        let payload = Self::build_new_stake_payload(node_id, node, stake).await?;
         // For simplicity we always assume that the node has nominator pool.
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
         let stake_balance = node.stake_balance(fee).await?;
@@ -791,7 +795,6 @@ impl ElectionRunner {
         node_id: &str,
         node: &mut Node,
         stake: u64,
-        network_max_stake_factor: u32,
     ) -> anyhow::Result<Cell> {
         let Some(participant) = &mut node.participant else {
             anyhow::bail!("node [{}] no participant info", node_id);
@@ -808,13 +811,6 @@ impl ElectionRunner {
                 participant.adnl_addr.as_slice()
             )
         );
-        let scale = common::ton_utils::MAX_STAKE_FACTOR_SCALE;
-        if participant.max_factor < scale || participant.max_factor > network_max_stake_factor {
-            anyhow::bail!(
-                "<max-factor> must be between 1.0 and {} (network max_stake_factor from config param 17)",
-                common::ton_utils::max_stake_factor_raw_to_multiplier(network_max_stake_factor)
-            );
-        }
         // todo: move to ElectorWrapper
         // validator-elect-req.fif
         let mut data = 0x654C5074u32.to_be_bytes().to_vec();
@@ -937,8 +933,22 @@ impl ElectionRunner {
         tracing::info!("elections: start={}, end={}", elections_start, elections_end);
     }
 
-    fn calc_max_factor(&self) -> f32 {
-        self.default_max_factor
+    /// Effective stake multiplier after applying configured `default_max_factor` and chain cap
+    /// (`network_max_stake_factor_raw` from masterchain config param 17).
+    fn calc_max_factor(&self, network_max_stake_factor_raw: u32) -> f32 {
+        max_stake_factor_raw_to_multiplier(self.calc_max_factor_raw(network_max_stake_factor_raw))
+    }
+
+    #[inline]
+    fn configured_max_factor_raw(&self) -> u32 {
+        (self.default_max_factor * MAX_STAKE_FACTOR_SCALE) as u32
+    }
+
+    /// Elector `max_factor` fixed-point value: configured multiplier as raw, clamped to
+    /// `[65536, network_max_stake_factor_raw]` (fixed-point scale).
+    fn calc_max_factor_raw(&self, network_max_stake_factor_raw: u32) -> u32 {
+        self.configured_max_factor_raw()
+            .clamp(MAX_STAKE_FACTOR_SCALE as u32, network_max_stake_factor_raw)
     }
 
     /// Calculate stake for a node according to the stake policy.

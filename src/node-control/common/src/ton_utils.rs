@@ -19,12 +19,22 @@ pub fn nanotons_to_tons_f64(nanotons: u64) -> f64 {
 }
 
 /// Elector uses fixed-point `max_stake_factor`: raw value is multiplier × 65536 (e.g. 3× → `3 * 65536`).
-pub const MAX_STAKE_FACTOR_SCALE: u32 = 65536;
+pub const MAX_STAKE_FACTOR_SCALE: f32 = 65536.0;
 
 /// Converts chain `max_stake_factor` (raw) to float multiplier (e.g. `196608` → `3.0`).
 #[inline]
 pub fn max_stake_factor_raw_to_multiplier(raw: u32) -> f32 {
-    raw as f32 / MAX_STAKE_FACTOR_SCALE as f32
+    raw as f32 / MAX_STAKE_FACTOR_SCALE
+}
+
+/// Extracts `max_stake_factor` from a `ConfigParamEnum` (must be param 17) as a float multiplier.
+pub fn extract_max_stake_factor(param: ton_block::ConfigParamEnum) -> anyhow::Result<f32> {
+    match param {
+        ton_block::ConfigParamEnum::ConfigParam17(c) => {
+            Ok(max_stake_factor_raw_to_multiplier(c.max_stake_factor))
+        }
+        _ => anyhow::bail!("expected config param 17 (stakes config)"),
+    }
 }
 
 pub fn display_tons(nanotons: u64) -> String {

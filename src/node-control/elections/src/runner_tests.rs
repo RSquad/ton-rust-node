@@ -1352,6 +1352,8 @@ async fn test_elections_finished_node_not_in_participants() {
     let provider = &mut harness.provider_mock;
     provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
     provider.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
 
     provider.expect_shutdown().returning(|| Ok(()));
 

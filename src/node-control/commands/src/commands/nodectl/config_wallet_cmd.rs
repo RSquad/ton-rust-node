@@ -9,10 +9,10 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, check_ton_api_connection, get_wallet_config,
-        load_config_vault, load_config_vault_rpc_client, make_wallet, save_config,
-        wait_for_seqno_change, wallet_address, wallet_info, warn_missing_secret,
-        warn_ton_api_unavailable,
+        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, check_ton_api_connection,
+        fetch_network_max_factor, get_wallet_config, load_config_vault,
+        load_config_vault_rpc_client, make_wallet, save_config, wait_for_seqno_change,
+        wallet_address, wallet_info, warn_missing_secret, warn_ton_api_unavailable,
     },
 };
 use anyhow::Context;
@@ -441,14 +441,11 @@ impl WalletSendCmd {
 impl WalletStakeCmd {
     pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
-        let network_max = rpc_client
-            .network_max_stake_factor_multiplier()
-            .await
-            .context("read max_stake_factor from chain (config param 17)")?;
-        if !(1.0..=network_max).contains(&self.max_factor) {
+        let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
+        if !(1.0..=network_max_factor).contains(&self.max_factor) {
             anyhow::bail!(
                 "max-factor must be in range [1.0..{}] (network max_stake_factor from config param 17)",
-                network_max
+                network_max_factor
             );
         }
 

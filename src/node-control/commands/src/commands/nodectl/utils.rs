@@ -32,6 +32,11 @@ pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 /// Logical name for the master wallet in CLI, `get_wallet_config`, and `config wallet ls`.
 pub const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
 
+/// `max_stake_factor` from masterchain config param 17 as a float multiplier (e.g. `3.0`).
+pub async fn fetch_network_max_factor(rpc_client: &ClientJsonRpc) -> anyhow::Result<f32> {
+    common::ton_utils::extract_max_stake_factor(rpc_client.get_config_param(17).await?)
+}
+
 pub fn warn_missing_secret(secret_name: &str) {
     println!("\n{} {}", "[WARNING]".yellow().bold(), "Vault secret is missing".yellow(),);
     println!(

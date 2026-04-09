@@ -510,18 +510,14 @@ impl ElectionsConfig {
     ///
     /// - `None`: only checks `max_factor >= 1.0` (e.g. [`AppConfig::load`] without RPC). No upper bound.
     /// - `Some(m)`: `max_factor` must be in `[1.0, m]` where `m` is from config param 17 (service startup).
-    pub fn validate(&self, max_stake_factor_upper_bound: Option<f32>) -> anyhow::Result<()> {
+    pub fn validate(&self, max_factor_upper_bound: Option<f32>) -> anyhow::Result<()> {
         self.validate_timing_fields()?;
-        match max_stake_factor_upper_bound {
-            None => {
-                if self.max_factor < 1.0 {
-                    anyhow::bail!("max_factor must be >= 1.0");
-                }
-            }
-            Some(m) => {
-                if !(1.0..=m).contains(&self.max_factor) {
-                    anyhow::bail!("max_factor must be in range [1.0..{}]", m);
-                }
+        if self.max_factor < 1.0 {
+            anyhow::bail!("max_factor must be >= 1.0");
+        }
+        if let Some(m) = max_factor_upper_bound {
+            if self.max_factor > m {
+                anyhow::bail!("max_factor must be in range [1.0..{}]", m);
             }
         }
         Ok(())

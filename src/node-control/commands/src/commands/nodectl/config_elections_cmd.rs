@@ -8,9 +8,8 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{load_config_vault_rpc_client, save_config},
+    utils::{fetch_network_max_factor, save_config, try_create_rpc_client},
 };
-use anyhow::Context;
 use colored::Colorize;
 use common::{
     app_config::{AppConfig, BindingStatus, ElectionsConfig, StakePolicy},
@@ -226,23 +225,21 @@ impl TickIntervalCmd {
 
 impl MaxFactorCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let (_app, _vault, rpc_client) = load_config_vault_rpc_client(path).await?;
-        let network_max = rpc_client
-            .network_max_stake_factor_multiplier()
-            .await
-            .context("read max_stake_factor from chain (config param 17)")?;
-        if !(1.0..=network_max).contains(&self.value) {
+        let mut config = AppConfig::load(path)?;
+        if config.elections.is_none() {
+            anyhow::bail!("Elections are not configured");
+        }
+
+        let rpc_client = try_create_rpc_client(&config).await?;
+        let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
+        if !(1.0..=network_max_factor).contains(&self.value) {
             anyhow::bail!(
                 "max-factor must be in range [1.0..{}] (network max_stake_factor from config param 17)",
-                network_max
+                network_max_factor
             );
         }
-        let mut config = AppConfig::load(path)?;
-        config
-            .elections
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?
-            .max_factor = self.value;
+
+        config.elections.as_mut().unwrap().max_factor = self.value;
         save_config(&config, path)?;
         println!("{} Max factor set to {}", "OK".green().bold(), self.value);
         Ok(())

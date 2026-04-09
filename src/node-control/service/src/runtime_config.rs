@@ -8,7 +8,7 @@
  */
 use anyhow::Context;
 use common::{
-    app_config::{AppConfig, KeyConfig, PoolConfig, WalletConfig},
+    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
     time_format,
     vault_signer::VaultSigner,
 };
@@ -94,13 +94,7 @@ impl RuntimeConfigStore {
         let vault = Some(SecretVaultBuilder::from_env().await?);
         let rpc_client = Self::load_rpc_client(&app_cfg).await?;
         if let Some(elections) = app_cfg.elections.as_ref() {
-            let network_max = rpc_client
-                .network_max_stake_factor_multiplier()
-                .await
-                .context("read max_stake_factor for elections config validation")?;
-            elections
-                .validate(Some(network_max))
-                .context("elections max_factor vs chain (config param 17)")?;
+            Self::validate_elections_max_factor_vs_chain(&rpc_client, elections).await?;
         }
         let master_wallet =
             Self::load_master_wallet(&app_cfg, rpc_client.clone(), vault.clone()).await?;
@@ -126,13 +120,7 @@ impl RuntimeConfigStore {
         let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
         let rpc_client = Self::load_rpc_client(&new_config).await?;
         if let Some(elections) = new_config.elections.as_ref() {
-            let network_max = rpc_client
-                .network_max_stake_factor_multiplier()
-                .await
-                .context("read max_stake_factor for elections config validation")?;
-            elections
-                .validate(Some(network_max))
-                .context("elections max_factor vs chain (config param 17)")?;
+            Self::validate_elections_max_factor_vs_chain(&rpc_client, elections).await?;
         }
         let master_wallet =
             Self::load_master_wallet(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
@@ -151,6 +139,27 @@ impl RuntimeConfigStore {
         *self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))? = new_state;
         self.updated_at.store(time_format::now(), Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn validate_elections_max_factor_vs_chain(
+        rpc_client: &ClientJsonRpc,
+        elections: &ElectionsConfig,
+    ) -> anyhow::Result<()> {
+        match rpc_client
+            .get_config_param(17)
+            .await
+            .and_then(common::ton_utils::extract_max_stake_factor)
+        {
+            Ok(network_max_factor) => elections.validate(Some(network_max_factor)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "elections max_factor: failed to read config param 17 from chain; \
+                     validating without network upper bound (re-check max_factor when TON HTTP API is reachable)"
+                );
+                elections.validate(None)
+            }
+        }
     }
 
     #[cfg(test)]
