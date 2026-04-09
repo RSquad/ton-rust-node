@@ -41,6 +41,9 @@ const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 /// Gas fee consumed by wallet to send message to nominator pool.
 const WALLET_COMPUTE_FEE: u64 = 100_000_000;
 
+/// Name shown for `master_wallet` in `config wallet ls` and accepted by `get_wallet_config`.
+const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
+
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage wallets in the configuration")]
 pub struct WalletCmd {
@@ -138,7 +141,7 @@ impl WalletCmd {
 
 impl WalletAddCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if self.name == "master_wallet" {
+        if self.name == MASTER_WALLET_RESERVED_NAME {
             anyhow::bail!("'master_wallet' is a reserved name");
         }
 
@@ -196,7 +199,7 @@ impl WalletLsCmd {
         let mut all_wallets: Vec<(&str, &WalletConfig)> =
             config.wallets.iter().map(|(k, v)| (k.as_str(), v)).collect();
         if let Some(mw) = config.master_wallet.as_ref() {
-            all_wallets.push(("master_wallet", mw));
+            all_wallets.push((MASTER_WALLET_RESERVED_NAME, mw));
         }
 
         if all_wallets.is_empty() {
@@ -326,6 +329,10 @@ async fn print_wallets_table(
 
 impl WalletRmCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+        if self.name == MASTER_WALLET_RESERVED_NAME {
+            anyhow::bail!("The master wallet cannot be removed");
+        }
+
         let mut config = AppConfig::load(path)?;
 
         if !config.wallets.contains_key(&self.name) {
