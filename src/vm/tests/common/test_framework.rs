@@ -519,8 +519,10 @@ impl TestCase {
                     .push(StackItem::Slice(message.body().cloned().unwrap_or_default()))
                     .push(StackItem::boolean(!message.is_internal()));
             }
+            let account =
+                args.shard_account.as_ref().map(|sa| sa.read_account()).transpose().unwrap();
             let mut smci = SmartContractInfo::with_params(
-                args.shard_account.as_ref(),
+                account.as_ref(),
                 args.message.clone(),
                 mc_state_root,
             )

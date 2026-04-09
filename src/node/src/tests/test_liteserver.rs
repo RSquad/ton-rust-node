@@ -33,12 +33,13 @@ use ton_api::{
     ton::lite_server::{accountid::AccountId as AccountIdTl, BlockHeader, LookupBlockResult},
 };
 use ton_block::{
-    fail, read_single_root_boc, write_boc, AccountDispatchQueue, BlkPrevInfo, Block, BlockExtra,
-    BlockIdExt, BlockInfo, ChildCell, ConfigParam0, ConfigParamEnum, ConfigParams,
-    CurrencyCollection, DispatchQueue, EnqueuedMsg, ExtBlkRef, GetRepresentationHash,
-    IntermediateAddress, InternalMessageHeader, KeyExtBlkRef, KeyId, McBlockExtra, MerkleUpdate,
-    Message, MsgAddressInt, MsgEnvelope, OldMcBlocksInfo, OutMsgQueue, OutMsgQueueExtra,
-    OutMsgQueueInfo, OutMsgQueueKey, ShardIdent, UInt256, ValueFlow,
+    fail, read_single_root_boc, write_boc, AccountBlock, AccountDispatchQueue, AccountStatus,
+    BlkPrevInfo, Block, BlockExtra, BlockIdExt, BlockInfo, ChildCell, ConfigParam0,
+    ConfigParamEnum, ConfigParams, CurrencyCollection, DispatchQueue, EnqueuedMsg, ExtBlkRef,
+    GetRepresentationHash, HashUpdate, IntermediateAddress, InternalMessageHeader, KeyExtBlkRef,
+    KeyId, McBlockExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope,
+    OldMcBlocksInfo, OutMsgQueue, OutMsgQueueExtra, OutMsgQueueInfo, OutMsgQueueKey,
+    ShardAccountBlocks, ShardIdent, Transaction, Transactions, UInt256, ValueFlow,
 };
 
 //static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -2908,7 +2909,7 @@ fn test_vm_stack_boc_roundtrip_mixed_types() {
         vec![StackItem::cell(empty_cell), StackItem::None],
     ];
     for items in &cases {
-        let boc = serialize_vm_stack_boc(items).unwrap();
+        let boc = write_boc(&serialize_vm_stack(items).unwrap()).unwrap();
         let decoded = deserialize_vm_stack_boc(&boc).unwrap();
         assert_eq!(decoded.len(), items.len(), "length mismatch for {:?}", items);
     }
@@ -2917,7 +2918,7 @@ fn test_vm_stack_boc_roundtrip_mixed_types() {
 #[test]
 fn test_vm_stack_boc_roundtrip_extreme_ints() {
     let items = vec![StackItem::int(i64::MAX), StackItem::int(i64::MIN)];
-    let boc = serialize_vm_stack_boc(&items).unwrap();
+    let boc = write_boc(&serialize_vm_stack(&items).unwrap()).unwrap();
     let decoded = deserialize_vm_stack_boc(&boc).unwrap();
     assert_eq!(decoded.len(), 2);
     match &decoded[0] {
@@ -2931,5 +2932,47 @@ fn test_vm_stack_boc_roundtrip_extreme_ints() {
             assert_eq!(v.as_integer_value(i64::MIN..=i64::MAX).unwrap(), i64::MIN)
         }
         other => panic!("expected int(MIN), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_vm_stack_boc_roundtrip_bigints() {
+    use ton_vm::stack::integer::IntegerData;
+
+    let cases: Vec<StackItem> = vec![
+        // positive 256-bit: 2^200
+        StackItem::integer(
+            IntegerData::from_str_radix(
+                "1606938044258990275541962092341162602522202993782792835301376",
+                10,
+            )
+            .unwrap(),
+        ),
+        // max unsigned 256-bit: 2^256 - 1
+        StackItem::integer(IntegerData::from_unsigned_bytes_be([0xFF; 32])),
+        // negative big: -(2^200)
+        StackItem::integer(
+            IntegerData::from_str_radix(
+                "-1606938044258990275541962092341162602522202993782792835301376",
+                10,
+            )
+            .unwrap(),
+        ),
+        // just outside i64 range: i64::MAX + 1
+        StackItem::integer(IntegerData::from_str_radix("9223372036854775808", 10).unwrap()),
+        // just outside i64 range: i64::MIN - 1
+        StackItem::integer(IntegerData::from_str_radix("-9223372036854775809", 10).unwrap()),
+    ];
+
+    let boc = write_boc(&serialize_vm_stack(&cases).unwrap()).unwrap();
+    let decoded = deserialize_vm_stack_boc(&boc).unwrap();
+    assert_eq!(decoded.len(), cases.len());
+    for (i, (orig, dec)) in cases.iter().zip(decoded.iter()).enumerate() {
+        let orig_int = orig.as_integer().expect("original is integer");
+        let dec_int = dec.as_integer().expect("decoded is integer");
+        assert_eq!(
+            orig_int, dec_int,
+            "bigint mismatch at index {i}: orig={orig_int:?}, decoded={dec_int:?}"
+        );
     }
 }

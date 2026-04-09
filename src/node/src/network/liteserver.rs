@@ -15,6 +15,7 @@ use crate::{
     },
     engine_traits::{EngineOperations, Stoppable},
     error::NodeError,
+    shard_states_keeper::PinnedShardStateGuard,
     types::awaiters_pool::AwaitersPool,
     validating_utils::UNREGISTERED_CHAIN_MAX_LEN,
 };
@@ -78,10 +79,18 @@ use ton_block::{
     MsgAddressInt, Result, Serializable, ShardIdent, ShardStateUnsplit, SliceData, Transaction,
     UInt256, UsageTree, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID,
 };
-use ton_vm::{
-    smart_contract_info::{convert_stack, convert_ton_stack},
-    stack::StackItem,
-};
+use ton_vm::{smart_contract_info::convert_stack, stack::StackItem};
+
+const SEQNO_ANY: u32 = u32::MAX;
+
+const RUN_SMC_METHOD_PROOFS: i32 = 0x1;
+const RUN_SMC_METHOD_STATE_PROOF: i32 = 0x2;
+const RUN_SMC_METHOD_RESULT: i32 = 0x4;
+const RUN_SMC_METHOD_INIT_C7: i32 = 0x8;
+const RUN_SMC_METHOD_LIB_EXTRAS: i32 = 0x10;
+const RUN_SMC_METHOD_FULL_C7: i32 = 0x20;
+const RUN_SMC_METHOD_SUPPORTED: i32 = 0x3f;
+const RUN_SMC_METHOD_ERROR_CODE: i32 = -0x100;
 
 pub type LookupMode = i32;
 
@@ -232,8 +241,10 @@ fn make_shard_descr_proof(
     if got.seq_no != expected_descr.seq_no || got.root_hash != expected_descr.root_hash {
         log::warn!(
             "make_shard_descr_proof: descr mismatch; expected (seqno={}, rh={:x}) got (seqno={}, rh={:x})",
-            expected_descr.seq_no, expected_descr.root_hash,
-            got.seq_no, got.root_hash,
+            expected_descr.seq_no,
+            expected_descr.root_hash,
+            got.seq_no,
+            got.root_hash,
         );
     }
 
@@ -269,6 +280,126 @@ async fn state_header_proof(engine: &Arc<dyn EngineOperations>, id: &BlockIdExt)
     // This proof is so lightweight that we can build it without spawn_blocking
     let proof = create_state_proof(&virt_root)?;
     Ok(proof.serialize()?)
+}
+
+struct ResolvedAccount {
+    id: BlockIdExt,
+    shardblk: BlockIdExt,
+    mc_state: PinnedShardStateGuard,
+    _shard_state: PinnedShardStateGuard,
+    shard_proof: Option<Vec<u8>>,
+    proof: Option<Vec<u8>>,
+    account_cell: Option<Cell>,
+    gen_utime: u32,
+    gen_lt: u64,
+}
+
+async fn resolve_account_state(
+    engine: &Arc<dyn EngineOperations>,
+    block_id: BlockIdExt,
+    account_address: &MsgAddressInt,
+    workchain: i32,
+    need_proofs: bool,
+) -> Result<ResolvedAccount> {
+    let id;
+    let shardblk;
+    let shard_state_guard: PinnedShardStateGuard;
+    let mc_state_guard: PinnedShardStateGuard;
+    let mut shard_proof = None;
+
+    if !block_id.shard_id.is_masterchain() {
+        // Reference block is not from masterchain — it must be fully specified
+        // and exactly this block must contain the account state
+        shardblk = block_id.clone();
+        shard_state_guard = engine.load_and_pin_state(&block_id).await?;
+        let master_ref = shard_state_guard
+            .state()
+            .state()?
+            .master_ref()
+            .ok_or_else(|| error!("shard state has no master_ref"))?;
+        let mc_block_id = BlockIdExt::from_ext_blk(master_ref.master.clone());
+        id = mc_block_id.clone();
+        mc_state_guard = engine.load_and_pin_state(&mc_block_id).await?;
+    } else {
+        id = if block_id.seq_no != SEQNO_ANY {
+            // Reference block is specified
+            block_id.clone()
+        } else {
+            // Reference block is not specified, use last known mc state
+            (*get_last_liteserver_state_block(engine)?).clone()
+        };
+        mc_state_guard = engine.load_and_pin_state(&id).await?;
+
+        if workchain == MASTERCHAIN_ID {
+            // Account is in masterchain — read directly from the reference block state
+            shard_state_guard = mc_state_guard.clone();
+            shardblk = id.clone();
+        } else {
+            // Find the shard containing the account
+            let mut sb_id = None;
+            for top_id in mc_state_guard.state().top_blocks(account_address.workchain_id())? {
+                if top_id.shard().contains_address(account_address)? {
+                    sb_id = Some(top_id);
+                    break;
+                }
+            }
+            shardblk =
+                sb_id.ok_or_else(|| error!("No shard found for address {account_address}"))?;
+            shard_state_guard = engine.load_and_pin_state(&shardblk).await?;
+
+            // Build shard proofs (mc block→state + mc state→shard)
+            if need_proofs {
+                let mc_state_proof_cell = state_header_proof(engine, &id).await?;
+                let shard_id = shardblk.shard_id.clone();
+                let mc_state_root = mc_state_guard.state().root_cell().clone();
+                shard_proof = Some(
+                    tokio::task::spawn_blocking(move || {
+                        let shard_header = create_shard_proof(&mc_state_root, &shard_id)?;
+                        BocWriter::with_roots([mc_state_proof_cell, shard_header.serialize()?])?
+                            .write_to_vec()
+                    })
+                    .await??,
+                );
+            }
+        }
+    }
+
+    let state_proof_cell =
+        if need_proofs { Some(state_header_proof(engine, &shardblk).await?) } else { None };
+
+    // Lookup account in the shard state and build its proof
+    let shard_root = shard_state_guard.state().root_cell().clone();
+    let addr = account_address.clone();
+    tokio::task::spawn_blocking(move || {
+        let usage_tree = UsageTree::with_params(shard_root.clone(), true);
+        let state = ShardStateUnsplit::construct_from_cell(usage_tree.root_cell())?;
+        let shard_account = state.read_accounts()?.account(&addr.address())?;
+        let account_cell = shard_account.map(|acc| acc.account_cell());
+
+        // proof: BOC with 2 roots (shard block→state proof + state→account proof)
+        let proof = state_proof_cell
+            .map(|spc| {
+                let acc_proof = MerkleProof::create_by_usage_tree(&shard_root, &usage_tree)?;
+                BocWriter::with_roots([spc, acc_proof.serialize()?])?.write_to_vec()
+            })
+            .transpose()?;
+
+        let gen_utime = state.gen_time();
+        let gen_lt = state.gen_lt();
+
+        Ok(ResolvedAccount {
+            id,
+            shardblk,
+            mc_state: mc_state_guard,
+            _shard_state: shard_state_guard,
+            shard_proof,
+            proof,
+            account_cell,
+            gen_utime,
+            gen_lt,
+        })
+    })
+    .await?
 }
 
 fn create_state_proof(block_root: &Cell) -> Result<MerkleProof> {
@@ -583,116 +714,36 @@ impl LiteServerQuerySubscriber {
             fail!("Requested account id is not contained in the shard of the reference block");
         }
 
-        // Choose block and state
+        let resolved =
+            resolve_account_state(engine, block_id, &account_address, account_id.workchain, true)
+                .await?;
+        let ResolvedAccount { id, shardblk, shard_proof, proof, account_cell, .. } = resolved;
+        let proof = proof.expect("always built with need_proofs=true");
+        let shard_proof = shard_proof.unwrap_or_default();
 
-        // if block_id is specified - it is
-        // if not - last mc block
-        let id;
-
-        // if block_id is specified - it is
-        // if not - shard (or mc block) account readed from
-        let shardblk;
-
-        // if block_id is specified - empty
-        // if account is in mc - empty
-        // else - boc with 2 roots: mc state proof and shard descr proof
-        let mut shard_proof = vec![];
-
-        // State to read account from and corresponding block
-        let shard_state;
-        let state_proof_cell;
-
-        if !block_id.shard_id.is_masterchain() {
-            // Reference block is not from masterchain - it means the block must be fully specifed
-            // and exactly this block must contain the account state
-            id = block_id.clone();
-            shardblk = block_id.clone();
-            shard_state = engine.load_and_pin_state(&block_id).await?;
-            state_proof_cell = state_header_proof(engine, &block_id).await?;
-        } else {
-            id = if block_id.seq_no != !0 {
-                // Reference block is specified
-                block_id.clone()
-            } else {
-                // Reference block is not specified, use last known shard state
-                (*get_last_liteserver_state_block(engine)?).clone()
-            };
-            let mc_state = engine.load_and_pin_state(&id).await?;
-
-            if account_id.workchain == MASTERCHAIN_ID {
-                // If account is in masterchain - read it directly from reference block's state
-                shard_state = mc_state;
-                shardblk = id.clone();
-                state_proof_cell = state_header_proof(engine, &id).await?;
-            } else {
-                // Find for needed shard
-                let mut sb_id = None;
-                for top_id in mc_state.state().top_blocks(account_address.workchain_id())? {
-                    if top_id.shard().contains_address(&account_address)? {
-                        sb_id = Some(top_id);
-                        break;
+        if !is_slow.load(Ordering::Relaxed) {
+            if let Some(ref ac) = account_cell {
+                let acc = Account::construct_from_cell(ac.clone())?;
+                if let Some(si) = acc.storage_info() {
+                    if si.used().bits() > 30 * 1024 * 8 || si.used().cells() > 300 {
+                        log::info!(
+                            "Account {} is big: storage stat: {} bits, {} cells, processing is postponed",
+                            account_id.id,
+                            si.used().bits(),
+                            si.used().cells(),
+                        );
+                        is_slow.store(true, Ordering::Relaxed);
+                        return Ok(AccountState::default());
                     }
                 }
-                shardblk =
-                    sb_id.ok_or_else(|| error!("No shard found for address {account_address}"))?;
-                shard_state = engine.load_and_pin_state(&shardblk).await?;
-                state_proof_cell = state_header_proof(engine, &shardblk).await?;
-
-                // Build shard proofs
-                let mc_state_proof_cell = state_header_proof(engine, &id).await?;
-                let shard_id = shardblk.shard_id.clone();
-                shard_proof = tokio::task::spawn_blocking(move || {
-                    let shard_header_proof =
-                        create_shard_proof(mc_state.state().root_cell(), &shard_id)?;
-                    BocWriter::with_roots([mc_state_proof_cell, shard_header_proof.serialize()?])?
-                        .write_to_vec()
-                })
-                .await??;
             }
         }
 
-        tokio::task::spawn_blocking(move || {
-            // Lookup account and build its proof
-            let usage_tree = UsageTree::with_params(shard_state.state().root_cell().clone(), true);
-            let uss = ShardStateUnsplit::construct_from_cell(usage_tree.root_cell())?;
-            let shard_account = uss
-                .read_accounts()?
-                .account(&account_address.address())?;
-            let account_cell = shard_account.as_ref().map(|sa| sa.account_cell());
-            let acc_proof =
-                MerkleProof::create_by_usage_tree(shard_state.state().root_cell(), &usage_tree)?;
-            // boc with 2 roots: state proof and account proof
-            // (In account proof - dict value + first ref)
-            let proof = BocWriter::with_roots([state_proof_cell, acc_proof.serialize()?])?
-                .write_to_vec()?;
-
-            if !is_slow.load(Ordering::Relaxed) {
-                if let Some(sa) = shard_account {
-                    if let Some(si) = sa.read_account()?.storage_info() {
-                        if si.used().bits() > 30 * 1024 * 8 || si.used().cells() > 300 {
-                            log::info!(
-                                "Account {} is big: storage stat: {} bits, {} cells, processing is postponed",
-                                account_id.id,
-                                si.used().bits(),
-                                si.used().cells(),
-                            );
-                            is_slow.store(true, Ordering::Relaxed);
-                            return Ok(AccountState::default());
-                        }
-                    }
-                }
-            }
-
-            let mut state = Vec::new();
-            if let Some(ac) = account_cell {
-                let account_cell = usage_tree
-                    .original_cell(&ac.repr_hash())
-                    .ok_or_else(|| error!("account root not found in usage tree"))?;
+        let state = if let Some(account_cell) = account_cell {
+            tokio::task::spawn_blocking(move || {
                 if !prune {
-                    // include full account
-                    state = write_boc(&account_cell)?;
+                    write_boc(&account_cell)
                 } else {
-                    // With balance, but without code, data and libs
                     let usage_tree = UsageTree::with_root(account_cell.clone());
                     let acc = Account::construct_from_cell(usage_tree.root_cell())?;
                     let balance_root = acc
@@ -700,18 +751,20 @@ impl LiteServerQuerySubscriber {
                         .map(|cc| cc.other.root().map(|c| c.repr_hash()))
                         .flatten()
                         .unwrap_or_default();
-                    state = MerkleProof::create_with_subtrees(
+                    MerkleProof::create_with_subtrees(
                         &account_cell,
                         |hash| usage_tree.contains(hash),
                         |hash| hash == &balance_root,
                     )?
-                    .write_to_bytes()?;
+                    .write_to_bytes()
                 }
-            }
+            })
+            .await??
+        } else {
+            Vec::new()
+        };
 
-            Ok(AccountState { id, shardblk, shard_proof, proof, state })
-        })
-        .await?
+        Ok(AccountState { id, shardblk, shard_proof, proof, state })
     }
 
     async fn run_smc_method(
@@ -728,7 +781,7 @@ impl LiteServerQuerySubscriber {
         if params.len() >= 65536 {
             fail!("more than 64k parameter bytes passed");
         }
-        if mode & !0x3f != 0 {
+        if mode & !RUN_SMC_METHOD_SUPPORTED != 0 {
             fail!("unsupported mode in runSmcMethod");
         }
 
@@ -738,119 +791,120 @@ impl LiteServerQuerySubscriber {
             address: account_id.id.clone().into(),
         });
 
-        let id;
-        let shardblk;
-        let shard_state;
-        let mc_state_root;
-        let mut shard_proof_bytes = vec![];
-
-        if !block_id.shard_id.is_masterchain() {
-            id = block_id.clone();
-            shardblk = block_id.clone();
-            shard_state = engine.load_and_pin_state(&block_id).await?;
-            let master_ref = shard_state
-                .state()
-                .state()?
-                .master_ref()
-                .ok_or_else(|| error!("shard state has no master_ref"))?;
-            let mc_block_id = BlockIdExt::from_ext_blk(master_ref.master.clone());
-            let mc_state = engine.load_and_pin_state(&mc_block_id).await?;
-            mc_state_root = mc_state.state().root_cell().clone();
-        } else {
-            id = if block_id.seq_no != !0 {
-                block_id.clone()
-            } else {
-                (*get_last_liteserver_state_block(engine)?).clone()
-            };
-            let mc_state = engine.load_and_pin_state(&id).await?;
-            mc_state_root = mc_state.state().root_cell().clone();
-
-            if account_id.workchain == MASTERCHAIN_ID {
-                shard_state = mc_state;
-                shardblk = id.clone();
-            } else {
-                let mut sb_id = None;
-                for top_id in mc_state.state().top_blocks(account_address.workchain_id())? {
-                    if top_id.shard().contains_address(&account_address)? {
-                        sb_id = Some(top_id);
-                        break;
-                    }
-                }
-                shardblk =
-                    sb_id.ok_or_else(|| error!("No shard found for address {account_address}"))?;
-                shard_state = engine.load_and_pin_state(&shardblk).await?;
-
-                if mode & 1 != 0 {
-                    let mc_state_proof_cell = state_header_proof(engine, &id).await?;
-                    let shard_id = shardblk.shard_id.clone();
-                    let mc_root_for_proof = mc_state_root.clone();
-                    shard_proof_bytes = tokio::task::spawn_blocking(move || {
-                        let shard_header = create_shard_proof(&mc_root_for_proof, &shard_id)?;
-                        BocWriter::with_roots([mc_state_proof_cell, shard_header.serialize()?])?
-                            .write_to_vec()
-                    })
-                    .await??;
-                }
-            }
-        }
-
-        let state_proof_cell =
-            if mode & 1 != 0 { Some(state_header_proof(engine, &shardblk).await?) } else { None };
-
-        let shard_root = shard_state.state().root_cell().clone();
-        let addr = account_address.clone();
-        let (exit_code, result_bytes, proof_bytes) = tokio::task::spawn_blocking(
-            move || -> Result<(i32, Option<Vec<u8>>, Option<Vec<u8>>)> {
-                let usage_tree = UsageTree::with_params(shard_root.clone(), true);
-                let uss = ShardStateUnsplit::construct_from_cell(usage_tree.root_cell())?;
-                let shard_account_opt = uss.read_accounts()?.account(&addr.address())?;
-
-                let proof = if let Some(spc) = state_proof_cell {
-                    let acc_proof = MerkleProof::create_by_usage_tree(&shard_root, &usage_tree)?;
-                    Some(BocWriter::with_roots([spc, acc_proof.serialize()?])?.write_to_vec()?)
-                } else {
-                    None
-                };
-
-                let shard_account = match shard_account_opt {
-                    Some(sa) if sa.read_account()?.get_code().is_some() => sa,
-                    _ => return Ok((-256, None, proof)),
-                };
-
-                let input_stack = deserialize_vm_stack_boc(&params)?;
-                let input_entries = convert_stack(&input_stack)?;
-
-                let run_result = ton_vm::run_smc_method(
-                    &shard_account,
-                    mc_state_root,
-                    method_id as u32,
-                    input_entries,
-                )?;
-
-                let result_bytes = if mode & 4 != 0 {
-                    let result_items = convert_ton_stack(&run_result.stack)?;
-                    Some(serialize_vm_stack_boc(&result_items)?)
-                } else {
-                    None
-                };
-
-                Ok((run_result.exit_code, result_bytes, proof))
-            },
+        let resolved = resolve_account_state(
+            engine,
+            block_id,
+            &account_address,
+            account_id.workchain,
+            mode & RUN_SMC_METHOD_PROOFS != 0,
         )
-        .await??;
+        .await?;
+        let mc_state_root = resolved.mc_state.state().root_cell().clone();
 
-        Ok(RunMethodResult {
+        let lib_extras =
+            if mode & RUN_SMC_METHOD_LIB_EXTRAS != 0 { Some(Vec::new()) } else { None };
+
+        let make_result = move |exit_code, result, state_proof, init_c7| RunMethodResult {
             mode,
-            id: id.into(),
-            shardblk: shardblk.into(),
-            shard_proof: if mode & 1 != 0 { Some(shard_proof_bytes) } else { None },
-            proof: proof_bytes,
-            state_proof: None,
-            init_c7: None,
-            lib_extras: None,
+            id: resolved.id.into(),
+            shardblk: resolved.shardblk.into(),
+            shard_proof: resolved.shard_proof,
+            proof: resolved.proof,
+            state_proof,
+            init_c7,
+            lib_extras,
             exit_code,
-            result: result_bytes,
+            result,
+        };
+
+        let empty_result = if mode & RUN_SMC_METHOD_RESULT != 0 { Some(Vec::new()) } else { None };
+        let empty_init_c7 =
+            if mode & RUN_SMC_METHOD_INIT_C7 != 0 { Some(Vec::new()) } else { None };
+
+        let account_cell = match resolved.account_cell {
+            Some(cell) => cell,
+            None => {
+                let empty_state_proof =
+                    if mode & RUN_SMC_METHOD_STATE_PROOF != 0 { Some(Vec::new()) } else { None };
+                return Ok(make_result(
+                    RUN_SMC_METHOD_ERROR_CODE,
+                    empty_result,
+                    empty_state_proof,
+                    empty_init_c7,
+                ));
+            }
+        };
+
+        tokio::task::spawn_blocking(move || -> Result<RunMethodResult> {
+            let account_usage = if mode & RUN_SMC_METHOD_STATE_PROOF != 0 {
+                Some(UsageTree::with_params(account_cell.clone(), true))
+            } else {
+                None
+            };
+            let account = if let Some(ref usage) = account_usage {
+                Account::construct_from_cell(usage.root_cell())?
+            } else {
+                Account::construct_from_cell(account_cell.clone())?
+            };
+
+            if account.get_code().is_none() {
+                let state_proof = account_usage
+                    .map(|usage| {
+                        MerkleProof::create_by_usage_tree(&account_cell, &usage)?.write_to_bytes()
+                    })
+                    .transpose()?;
+                return Ok(make_result(
+                    RUN_SMC_METHOD_ERROR_CODE,
+                    empty_result,
+                    state_proof,
+                    empty_init_c7,
+                ));
+            }
+
+            let input_stack = deserialize_vm_stack_boc(&params)?;
+            let input_entries = convert_stack(&input_stack)?;
+
+            let run = ton_vm::run_smc_method(
+                &account,
+                mc_state_root.clone(),
+                method_id as u32,
+                input_entries,
+                resolved.gen_utime,
+                resolved.gen_lt,
+            )?;
+
+            // Always serialize stack when state_proof is requested — serialization
+            // visits data cells referenced from the result, capturing them in the usage tree
+            let result = if mode & (RUN_SMC_METHOD_RESULT | RUN_SMC_METHOD_STATE_PROOF) != 0 {
+                let cell = serialize_vm_stack(&run.stack)?;
+                if mode & RUN_SMC_METHOD_RESULT != 0 {
+                    Some(write_boc(&cell)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let state_proof = account_usage
+                .map(|usage| {
+                    MerkleProof::create_by_usage_tree(&account_cell, &usage)?.write_to_bytes()
+                })
+                .transpose()?;
+
+            let init_c7 = if mode & RUN_SMC_METHOD_INIT_C7 != 0 {
+                let mut smc_info = run.smc_info;
+                if mode & RUN_SMC_METHOD_FULL_C7 == 0 {
+                    smc_info.config_params = Default::default();
+                }
+                Some(serialize_vm_stack_value_boc(&smc_info.as_temp_data_item())?)
+            } else {
+                None
+            };
+
+            Ok(make_result(run.exit_code, result, state_proof, init_c7))
         })
+        .await?
     }
 
     async fn get_account_state_coalesced(
@@ -865,7 +919,7 @@ impl LiteServerQuerySubscriber {
         // 2. Parallel duplicate requests share a single computation via coalescing.
 
         // Resolve "latest" block_id to actual id for a stable cache key.
-        let resolved_root_hash = if block_id.seq_no == u32::MAX {
+        let resolved_root_hash = if block_id.seq_no == SEQNO_ANY {
             get_last_liteserver_state_block(&context.engine)?.root_hash.clone()
         } else {
             block_id.root_hash.clone()
@@ -1153,6 +1207,8 @@ impl LiteServerQuerySubscriber {
                 cfg.root().ok_or_else(|| error!("No config root in state {id}"))?.repr_hash(),
             );
         } else {
+            param_list.sort_unstable();
+            param_list.dedup();
             for &pid in &param_list {
                 let key_bits: SliceData = pid.write_to_bitstring()?;
                 if let Some(leaf) = cfg.config_params.get(key_bits)? {
@@ -1546,10 +1602,10 @@ impl LiteServerQuerySubscriber {
         let handle = engine
             .load_block_handle(&block_id)?
             .ok_or_else(|| error!("no handle for {}", block_id))?;
-        let bp = engine.load_block_proof(&handle, !block_id.is_masterchain()).await?;
+        let raw = engine.load_block_raw(&handle).await?;
         tokio::task::spawn_blocking(move || {
-            let (_blk_cell, virt_root) = bp.virtualize_block()?;
-            let usage = UsageTree::with_params(virt_root.clone(), true);
+            let root = read_single_root_boc(&raw)?;
+            let usage = UsageTree::with_params(root.clone(), true);
             let blk = Block::construct_from_cell(usage.root_cell())?;
 
             let info = blk.read_info()?;
@@ -1576,8 +1632,7 @@ impl LiteServerQuerySubscriber {
             let tx_cell = slice.reference(0)?;
             let tx_boc = write_boc(&tx_cell)?;
 
-            let proof_bytes =
-                MerkleProof::create_by_usage_tree(&virt_root, &usage)?.write_to_bytes()?;
+            let proof_bytes = MerkleProof::create_by_usage_tree(&root, &usage)?.write_to_bytes()?;
 
             Ok(TransactionInfo { id: block_id, proof: proof_bytes, transaction: tx_boc })
         })
@@ -2972,12 +3027,12 @@ fn deserialize_vm_stack_boc(boc: &[u8]) -> Result<Vec<StackItem>> {
     Ok(items)
 }
 
-fn serialize_vm_stack_boc(items: &[StackItem]) -> Result<Vec<u8>> {
+fn serialize_vm_stack(items: &[StackItem]) -> Result<Cell> {
     let n = items.len();
     let mut cb = BuilderData::new();
     cb.append_bits(n, 24)?;
     if n == 0 {
-        return write_boc(&cb.into_cell()?);
+        return cb.into_cell();
     }
     // vm_stk_nil = empty cell
     let mut rest = BuilderData::new().into_cell()?;
@@ -2989,6 +3044,12 @@ fn serialize_vm_stack_boc(items: &[StackItem]) -> Result<Vec<u8>> {
     }
     cb.checked_append_reference(rest)?;
     write_vm_stack_value(&items[n - 1], &mut cb)?;
+    cb.into_cell()
+}
+
+fn serialize_vm_stack_value_boc(item: &StackItem) -> Result<Vec<u8>> {
+    let mut cb = BuilderData::new();
+    write_vm_stack_value(item, &mut cb)?;
     write_boc(&cb.into_cell()?)
 }
 
