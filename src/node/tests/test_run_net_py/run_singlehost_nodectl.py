@@ -342,7 +342,9 @@ class Bootstrap:
         self.paths.nodectl_config.unlink(missing_ok=True)
         self.paths.vault_file.unlink(missing_ok=True)
 
+        self.log.info("  config generate...")
         self._nctl("config", "generate", "--output", str(self.paths.nodectl_config), "--force")
+        self.log.info("  config ton-http-api set...")
         self._nctl("config", "ton-http-api", "set", "--url", self.cfg.http_api_url)
 
         # Patch global tick_interval — no CLI command exists for this field
@@ -352,6 +354,7 @@ class Bootstrap:
         self.log.info("  global tick_interval → 20")
 
         # Create the key used by nodes 3+ (nodes 1-2 get per-node keys in phase 5)
+        self.log.info("  key add control-client-secret...")
         self._nctl("key", "add", "-n", "control-client-secret", "-e")
 
         # Extract its public key from the `key ls` tabular output
@@ -541,7 +544,7 @@ class Bootstrap:
             print(self._log_tail(120), file=sys.stderr)
             raise BootstrapError("nodectl service failed to start")
         self.log.info(f"  nodectl service running (pid {self._proc.pid})")
-        self.log.info(f"  log: {log_path}")
+        self.log.info(f"  log: {self._nodectl_log}")
 
     # ── Phase 8: Wait for wallets/pools, top them up ──────────────────────────
 
@@ -797,6 +800,10 @@ def main() -> None:
         bootstrap.run()
     except BootstrapError:
         exit_code = 1   # error already logged inside _fail()
+    except Exception:
+        import traceback
+        log.error(f"Unexpected error:\n{traceback.format_exc()}")
+        exit_code = 1
     finally:
         bootstrap.shutdown(force=(exit_code != 0))
         log.close()
