@@ -49,23 +49,16 @@ $(SINGLEHOST_DIR)/.venv/pyvenv.cfg: $(SINGLEHOST_DIR)/requirements.txt
 
 singlehost-venv: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
 
-singlehost: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
+test-e2e: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
 	cd $(SINGLEHOST_DIR) && \
 	  NOBUILD=$(NOBUILD) \
 	  NODE_CNT=$(NODE_CNT) \
 	  PARTICIPANTS_WAIT_SECONDS=$(PARTICIPANTS_WAIT) \
 	  .venv/bin/python3 run_singlehost_nodectl.py
 
-singlehost-sh: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
-	cd $(SINGLEHOST_DIR) && \
-	  NOBUILD=$(NOBUILD) \
-	  NODE_CNT=$(NODE_CNT) \
-	  PARTICIPANTS_WAIT_SECONDS=$(PARTICIPANTS_WAIT) \
-	  bash run_singlehost_nodectl.sh
-
-stop-singlehost:
+stop-e2e:
 	cd $(SINGLEHOST_DIR) && \
 	  .venv/bin/python3 test_run_net.py --stop
 	  pkill -9 nodectl
 
-.PHONY: singlehost singlehost-sh singlehost-venv
+.PHONY: test-e2e stop-e2e singlehost-venv
