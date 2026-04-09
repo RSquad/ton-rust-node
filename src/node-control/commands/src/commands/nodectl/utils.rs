@@ -139,11 +139,8 @@ pub fn get_wallet_config<'a>(
     wallets: &'a HashMap<String, WalletConfig>,
     master_wallet: Option<&'a WalletConfig>,
 ) -> anyhow::Result<&'a WalletConfig> {
-    let config = if name == MASTER_WALLET_RESERVED_NAME {
-        master_wallet
-    } else {
-        wallets.get(name)
-    };
+    let config =
+        if name == MASTER_WALLET_RESERVED_NAME { master_wallet } else { wallets.get(name) };
     config.ok_or_else(|| anyhow::anyhow!("Wallet not found '{}'", name))
 }
 
