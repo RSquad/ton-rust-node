@@ -559,6 +559,18 @@ fn test_fwd_fee_payment_in_smc() {
     )
 }
 
+#[test]
+fn test_raw_reserve_with_flag4() {
+    replay_transaction_full(
+        "real_boc/raw_reserve_with_flag4_account_old.boc",
+        "real_boc/raw_reserve_with_flag4_account_new.boc",
+        "real_boc/raw_reserve_with_flag4_transaction.boc",
+        "real_boc/config12.boc",
+        "",
+        "real_boc/raw_reserve_with_flag4_libs.boc",
+    )
+}
+
 #[ignore = "test for replay transaction by files"]
 #[test]
 fn test_replay_transaction_by_files() {
@@ -632,6 +644,8 @@ fn test_bad_single() {
 fn test_bad_trans() {
     let json = "../../emulator/emulator_test.json";
     let prefix = "real_boc/bad_".to_string();
+    let libs = std::path::PathBuf::from(json).parent().unwrap().join("libs.boc");
+    let libs = libs.to_string_lossy();
     let json = std::fs::read_to_string(json).unwrap();
     let json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
     let acc = json["shard_account_boc"].as_str().unwrap();
@@ -642,11 +656,12 @@ fn test_bad_trans() {
     shard_acc.account_cell().write_to_file(prefix.clone() + "account_new.boc");
     std::fs::write(prefix.clone() + "transaction.boc", base64_decode(tr).unwrap()).unwrap();
 
-    replay_transaction_with_prevs(
+    replay_transaction_full(
         acc,
         &(prefix + "account_new.boc"),
         tr,
         "real_boc/config12.boc",
         prev,
+        &libs,
     );
 }

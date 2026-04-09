@@ -53,7 +53,7 @@ pub static RECEIVER_ACCOUNT: AccountId = AccountId::with_uint256([0x22; 128]);
 pub static THIRD_ACCOUNT: AccountId = AccountId::with_uint256([0x33; 128]);
 pub static BLOCKCHAIN_CONFIG: LazyLock<BlockchainConfig> = LazyLock::new(default_config);
 pub static SIMPLE_MC_STATE: LazyLock<Cell> =
-    LazyLock::new(|| mc_state_proof_cell_with_config(BLOCKCHAIN_CONFIG.raw_config().clone()));
+    LazyLock::new(|| mc_state_proof_cell_with_config(BLOCKCHAIN_CONFIG.raw_config().clone(), None));
 
 pub fn mc_state_cell_with_config(config: ConfigParams) -> ShardStateUnsplit {
     let mc_seqno = 1234567;
@@ -78,8 +78,11 @@ pub fn make_proof_cell(p: &impl Serializable) -> Cell {
     proof.serialize().unwrap()
 }
 
-pub fn mc_state_proof_cell_with_config(config: ConfigParams) -> Cell {
-    let mc_state = mc_state_cell_with_config(config);
+pub fn mc_state_proof_cell_with_config(config: ConfigParams, libs: Option<Cell>) -> Cell {
+    let mut mc_state = mc_state_cell_with_config(config);
+    if let Some(libs) = libs {
+        *mc_state.libraries_mut() = ton_block::Libraries::with_hashmap(Some(libs));
+    }
     make_proof_cell(&mc_state)
 }
 
@@ -142,7 +145,7 @@ pub fn execute_params(last_tr_lt: u64) -> ExecuteParams {
         Emulator,
     }
     let debug = DebugType::None;
-    let _ = cross_check::DisableCrossCheck::new();
+    // let _ = cross_check::DisableCrossCheck::new();
     let (verbosity, pattern, trace_callback) = match debug {
         DebugType::None => (4, None, None),
         DebugType::Simple => (2048 + 4, Some("{m}"), None),
@@ -978,13 +981,27 @@ pub fn read_config(cfg: &str) -> Result<ConfigParams> {
 }
 
 pub fn replay_transaction_by_files(acc: &str, acc_after: &str, tr: &str, cfg: &str) {
-    replay_transaction_with_prevs(acc, acc_after, tr, cfg, "")
+    replay_transaction_full(acc, acc_after, tr, cfg, "", "")
 }
 
-pub fn replay_transaction_with_prevs(acc: &str, acc_after: &str, tr: &str, cfg: &str, prev: &str) {
+pub fn replay_transaction_full(
+    acc: &str,
+    acc_after: &str,
+    tr: &str,
+    cfg: &str,
+    prev: &str,
+    libs: &str,
+) {
     let config = read_config(cfg).unwrap();
     assert!(config.valid_config_data(false, None).unwrap());
-    let mc_state_proof = mc_state_proof_cell_with_config(config);
+    let libs = if libs.is_empty() {
+        None
+    } else if let Ok(data) = std::fs::read(libs) {
+        Some(read_single_root_boc(data).unwrap())
+    } else {
+        None
+    };
+    let mc_state_proof = mc_state_proof_cell_with_config(config, libs);
     replay_transaction(None, acc, acc_after, tr, prev, mc_state_proof)
 }
 
@@ -1015,7 +1032,7 @@ pub fn try_replay_transaction(
     config: BlockchainConfig,
     params: &ExecuteParams,
 ) -> Result<Transaction> {
-    let mc_state_proof = mc_state_proof_cell_with_config(config.raw_config().clone());
+    let mc_state_proof = mc_state_proof_cell_with_config(config.raw_config().clone(), None);
     let msg_cell = message.map(|msg| msg.serialize().unwrap());
     execute_with_params(mc_state_proof, msg_cell, account, params)
 }

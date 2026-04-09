@@ -3585,6 +3585,14 @@ impl Collator {
             );
             return Ok(());
         }
+        if collator_data.error_attempt >= 2 {
+            log::info!(
+                "{}: attempt #{}: skipping external messages",
+                self.collated_block_descr,
+                collator_data.error_attempt
+            );
+            return Ok(());
+        }
         log::debug!("{}: process_inbound_external_messages", self.collated_block_descr);
         let finish_time_ms = self.get_external_messages_finish_time_micros();
         let mut iter =
