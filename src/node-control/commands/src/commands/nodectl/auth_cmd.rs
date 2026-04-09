@@ -163,8 +163,8 @@ impl AddUserCmd {
                 .context("failed to read password from stdin")?;
             input.trim_end_matches(['\n', '\r']).to_owned()
         } else {
-            let pw =
-                rpassword::prompt_password("Enter password: ").context("failed to read password")?;
+            let pw = rpassword::prompt_password("Enter password: ")
+                .context("failed to read password")?;
             let confirm = rpassword::prompt_password("Confirm password: ")
                 .context("failed to read password confirmation")?;
             if pw != confirm {
