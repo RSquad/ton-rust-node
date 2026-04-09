@@ -9,7 +9,7 @@
 use crate::commands::{
     nodectl::{
         auth_cmd::AuthCmd, config_cmd::ConfigCmd, deploy_cmd::DeployCmd, key_cmd::KeyCmd,
-        service_api_cmd::ApiCmd, service_cmd::ServiceCmd,
+        service_api_cmd::ApiCmd, service_cmd::ServiceCmd, vote_cmd::VoteCmd,
     },
     ton_http_api::get_config_param_cmd::GetConfigParamCmd,
 };
@@ -37,4 +37,7 @@ pub enum Commands {
     // Start as service
     #[command(name = "service")]
     Service(ServiceCmd),
+    // Config proposals voting
+    #[command(name = "vote")]
+    Vote(VoteCmd),
 }
