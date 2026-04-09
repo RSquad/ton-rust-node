@@ -116,6 +116,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             log::debug!(target: "executor", "Account is frozen, hash = {:x}", hash);
         }
         let mut acc_balance = account.balance().cloned().unwrap_or_default();
+        let mut original_acc_balance = acc_balance.clone();
         let is_special = self.config.is_special_account(is_masterchain, &account_id)?;
         let account_address = MsgAddressInt::with_params(wc_id, account_id.clone())?;
 
@@ -228,8 +229,10 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
 
         log::debug!(target: "executor",
             "storage_phase: {}", if description.storage_ph.is_some() {"present"} else {"none"});
-        let mut original_acc_balance = account.balance().cloned().unwrap_or_default();
-        original_acc_balance.sub(tr.total_fees())?;
+        if !original_acc_balance.sub(tr.total_fees())? {
+            original_acc_balance.coins = Default::default();
+            debug_assert!(tr.total_fees().other.is_empty());
+        }
 
         if !description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
