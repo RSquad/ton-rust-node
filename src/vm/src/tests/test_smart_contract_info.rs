@@ -9,7 +9,10 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::*;
-use ton_block::{base64_decode, read_single_root_boc, ton_method_id};
+use ton_block::{
+    base64_decode, read_single_root_boc, ton_method_id, Coins, CurrencyCollection,
+    InternalMessageHeader, Message, MsgAddressInt,
+};
 
 #[test]
 fn test_smart_contract_info_serialization_default() {
@@ -30,6 +33,35 @@ fn test_smart_contract_info() {
         .expect("SMCI list must be a tuple")
         .len();
     assert_eq!(result, 17);
+}
+
+#[test]
+fn test_smart_contract_info_internal_message_info_uses_fwd_fee() {
+    let src: MsgAddressInt =
+        "0:cd9c066feaf8e26f56005510b510eebcf0b36e7527343b1cc9ae9286ee018ba7".parse().unwrap();
+    let dst: MsgAddressInt =
+        "0:448f07b4f2867fcf9aba8944ef9f697782d247e3872ef1cdbb72f5442e32bdd8".parse().unwrap();
+    let mut hdr = InternalMessageHeader::with_addresses_and_bounce(
+        src,
+        dst,
+        CurrencyCollection::with_coins(10_000_000),
+        true,
+    );
+    hdr.fwd_fee = Coins::from(1_408_000u64);
+    hdr.created_lt = 68978789000002;
+    hdr.created_at = 1775439477;
+
+    let sci = SmartContractInfo {
+        in_msg: Some(Message::with_int_header(hdr)),
+        incoming_value: CurrencyCollection::with_coins(10_000_000),
+        ..Default::default()
+    };
+
+    let msg_info = sci.get_message_info();
+    let info = msg_info.as_tuple().unwrap();
+    assert_eq!(info[3].as_integer().unwrap().to_str_radix(10), "1408000");
+    assert_eq!(info[6].as_integer().unwrap().to_str_radix(10), "10000000");
+    assert_eq!(info[7].as_integer().unwrap().to_str_radix(10), "10000000");
 }
 
 #[test]

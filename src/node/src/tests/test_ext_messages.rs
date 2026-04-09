@@ -103,7 +103,7 @@ fn test_create_ext_message() {
 #[test]
 fn test_message_keeper() {
     let m = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
-    let mk = MessageKeeper::new(Arc::new(m));
+    let mk = MessageKeeper::new(Arc::new(m), Default::default());
 
     assert!(mk.check_active(10000));
 
@@ -133,7 +133,7 @@ fn test_message_keeper() {
 #[test]
 fn test_message_keeper_multithread() {
     let m = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
-    let mk = Arc::new(MessageKeeper::new(Arc::new(m)));
+    let mk = Arc::new(MessageKeeper::new(Arc::new(m), Default::default()));
 
     let mut hs = vec![];
     for _ in 0..50 {
@@ -173,11 +173,15 @@ fn test_message_keeper_multithread() {
 }
 
 fn create_external_message(dst_shard: u8, salt: Vec<u8>) -> Arc<Message> {
+    create_external_message_to([dst_shard; 32], salt)
+}
+
+fn create_external_message_to(dst_account: [u8; 32], salt: Vec<u8>) -> Arc<Message> {
     let mut hdr = ExternalInboundMessageHeader::default();
     let length_in_bits = salt.len() * 8;
     let address = SliceData::from_raw(salt, length_in_bits);
     hdr.src = MsgAddressExt::with_extern(address).unwrap();
-    hdr.dst = MsgAddressInt::with_standart(None, 0, [dst_shard; 32].into()).unwrap();
+    hdr.dst = MsgAddressInt::with_standart(None, 0, dst_account.into()).unwrap();
     hdr.import_fee = 10u64.into();
     Arc::new(Message::with_ext_in_header(hdr))
 }
@@ -352,7 +356,10 @@ fn test_external_messages_big_load() {
     let queue_seconds = min(MESSAGE_LIFETIME, 100);
     for i in 0..queue_seconds {
         for j in 0..rate_per_second {
-            let m = create_external_message(0, (i * rate_per_second + j).to_be_bytes().to_vec());
+            let idx = i * rate_per_second + j;
+            let mut dst = [0u8; 32];
+            dst[..4].copy_from_slice(&idx.to_be_bytes());
+            let m = create_external_message_to(dst, idx.to_be_bytes().to_vec());
             let id = m.hash().unwrap();
             mp.new_message(&id, m, now + i).unwrap();
         }
@@ -369,6 +376,9 @@ fn test_external_messages_big_load() {
         (count, n)
     };
     println!("count = {}, time = {:?}", count, n);
-    assert_eq!(0, count);
+    // With newest-first iteration, non-expired messages are found quickly.
+    // The pool contains messages from ~502 to ~601 seconds ago;
+    // those within MESSAGE_LIFETIME (600s) are valid and returned.
+    assert!(count <= 100);
     assert!((n as u64) < limit * 3);
 }

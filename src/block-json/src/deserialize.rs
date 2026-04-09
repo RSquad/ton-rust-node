@@ -703,6 +703,12 @@ impl StateParser {
                 candidate_resolve_rate_limit: p
                     .get_num32("candidate_resolve_rate_limit")
                     .unwrap_or(d.candidate_resolve_rate_limit),
+                min_block_interval_ms: p
+                    .get_num32("min_block_interval_ms")
+                    .unwrap_or(d.min_block_interval_ms),
+                no_empty_blocks_on_error_timeout_ms: p
+                    .get_num32("no_empty_blocks_on_error_timeout_ms")
+                    .unwrap_or(d.no_empty_blocks_on_error_timeout_ms),
             },
         })
     }

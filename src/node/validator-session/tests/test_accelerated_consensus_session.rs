@@ -434,15 +434,6 @@ impl SessionListener for SessionInstance {
             self.source_index
         );
     }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
-    }
 }
 
 impl SessionListener for SessionInstanceListener {
@@ -522,15 +513,6 @@ impl SessionListener for SessionInstanceListener {
                 callback,
             );
         }
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
     }
 }
 

@@ -1097,6 +1097,12 @@ fn serialize_simplex_config(cfg: &SimplexConfig) -> Result<Value> {
     serialize_field(&mut map, "max_leader_window_desync", np.max_leader_window_desync);
     serialize_field(&mut map, "bad_signature_ban_duration_ms", np.bad_signature_ban_duration_ms);
     serialize_field(&mut map, "candidate_resolve_rate_limit", np.candidate_resolve_rate_limit);
+    serialize_field(&mut map, "min_block_interval_ms", np.min_block_interval_ms);
+    serialize_field(
+        &mut map,
+        "no_empty_blocks_on_error_timeout_ms",
+        np.no_empty_blocks_on_error_timeout_ms,
+    );
     Ok(map.into())
 }
 

@@ -59,12 +59,8 @@ impl RaptorqDecoder {
     /// Construct with parameters
     pub fn with_params(params: FecTypeRaptorQ) -> Result<Self> {
         const MAX_SOURCE_SYMBOLS: i32 = 56_403; // K'_max per RFC 6330 §5.1.2
-        if (params.symbol_size <= 0) || (params.symbol_size > u16::MAX as i32) {
-            fail!(
-                "Invalid FEC params: symbol_size must be in 1..={}, got {}",
-                u16::MAX,
-                params.symbol_size
-            );
+        if params.symbol_size <= 0 {
+            fail!("Invalid FEC params: symbol_size must be > 0, got {}", params.symbol_size);
         }
         if params.data_size <= 0 {
             fail!("Invalid FEC params: data_size must be > 0, got {}", params.data_size);
@@ -77,12 +73,15 @@ impl RaptorqDecoder {
         } else {
             // Two-step broadcast case: symbol_size was set by the sender without alignment
             // rounding (alignment=1). Use the same config as the encoder.
+            // symbol_size can exceed u16::MAX for large blocks with few validators
+            // (matches C++ behaviour which uses size_t for symbol_size).
             //
             // With source_blocks=1, raptorq asserts ceil(data_size/symbol_size) <=
             // MAX_SOURCE_SYMBOLS_PER_BLOCK (K'_max = 56403, RFC 6330 §5.1.2).
             // Validate before calling to prevent a panic on malformed network messages.
-            let source_symbols = (params.data_size + params.symbol_size - 1) / params.symbol_size;
-            if source_symbols > MAX_SOURCE_SYMBOLS {
+            let source_symbols = (params.data_size as i64 + params.symbol_size as i64 - 1)
+                / params.symbol_size as i64;
+            if source_symbols > MAX_SOURCE_SYMBOLS as i64 {
                 fail!(
                     "Invalid FEC params: source symbol count {source_symbols} \
                     exceeds raptorq limit {MAX_SOURCE_SYMBOLS} (data_size={}, symbol_size={})",
@@ -92,7 +91,7 @@ impl RaptorqDecoder {
             }
             raptorq::ObjectTransmissionInformation::new(
                 params.data_size as u64,
-                params.symbol_size as u16,
+                params.symbol_size as u32,
                 1,
                 1,
                 1,

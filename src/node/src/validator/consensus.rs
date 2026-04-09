@@ -32,7 +32,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use ton_block::ShardIdent;
+use ton_block::{BlockIdExt, ShardIdent};
 
 // =============================================================================
 // Consensus Timing Constants (for accelerated consensus mode only)
@@ -67,14 +67,14 @@ pub use consensus_common::{
     serialize_tl_bare_object, serialize_tl_boxed_object,
     utils::{get_elapsed_time, get_hash, get_hash_from_block_payload},
     AsyncRequest, AsyncRequestPtr, BlockCandidatePriority, BlockHash, BlockPayloadPtr,
-    BlockSignature, BlockSourceInfo, CollationParentHint, CommittedBlockProof,
-    CommittedBlockProofCallback, ConsensusCommonFactory, ConsensusNode, ConsensusOverlay,
-    ConsensusOverlayListener, ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListener,
-    ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
-    ConsensusOverlayPtr, ConsensusReplayListener, ConsensusReplayListenerPtr, LogPlayer,
-    LogPlayerPtr, LogReplayOptions, OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash,
-    RawBuffer, Result, Session, SessionId, SessionListener, SessionListenerPtr, SessionNode,
-    SessionPtr, SessionStats, ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
+    BlockSignature, BlockSourceInfo, CollationParentHint, ConsensusCommonFactory, ConsensusNode,
+    ConsensusOverlay, ConsensusOverlayListener, ConsensusOverlayListenerPtr,
+    ConsensusOverlayLogReplayListener, ConsensusOverlayLogReplayListenerPtr,
+    ConsensusOverlayManager, ConsensusOverlayManagerPtr, ConsensusOverlayPtr,
+    ConsensusReplayListener, ConsensusReplayListenerPtr, LogPlayer, LogPlayerPtr, LogReplayOptions,
+    OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash, RawBuffer, Result, Session,
+    SessionId, SessionListener, SessionListenerPtr, SessionNode, SessionPtr, SessionStats,
+    ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback, ValidatorBlockCandidatePtr, ValidatorWeight,
 };
 
@@ -151,6 +151,18 @@ impl ConsensusOptions {
         match self {
             ConsensusOptions::Catchain(opts) => opts.accelerated_consensus_enabled,
             ConsensusOptions::Simplex(_) => false,
+        }
+    }
+
+    /// Check if pipeline context updates are enabled.
+    ///
+    /// Pipeline context keeps recently collated block states so that subsequent
+    /// collations can chain on top of them (precollation).  Simplex always needs
+    /// this; for Catchain it mirrors the accelerated-consensus flag.
+    pub fn is_pipeline_context_enabled(&self) -> bool {
+        match self {
+            ConsensusOptions::Catchain(opts) => opts.accelerated_consensus_enabled,
+            ConsensusOptions::Simplex(_) => true,
         }
     }
 }
@@ -248,21 +260,18 @@ impl SessionHolder {
         }
     }
 
-    /// Notify session about masterchain finalization
+    /// Notify session about the current applied top for its shard.
     ///
-    /// For simplex shard sessions, this updates `last_mc_finalized_seqno` which is
-    /// used to decide if an empty block should be generated (finalization recovery).
+    /// For simplex sessions, this updates the session-local applied-top tracking used for
+    /// empty-block recovery and MC validation ordering.
     ///
     /// For catchain sessions, this is a no-op as they don't need MC finalization tracking.
     ///
     /// # Arguments
-    /// * `mc_block_seqno` - The seqno of the finalized masterchain block
-    pub fn notify_mc_finalized(&self, mc_block_seqno: u32) {
+    /// * `applied_top` - Current applied top for this session shard
+    pub fn notify_mc_finalized(&self, applied_top: BlockIdExt) {
         if let SessionInner::Simplex(s) = &self.inner {
-            s.notify_mc_finalized(mc_block_seqno);
-        } else {
-            // Catchain sessions don't need MC finalization notification
-            let _ = mc_block_seqno; // Suppress unused warning
+            s.notify_mc_finalized(applied_top);
         }
     }
 }
@@ -591,7 +600,7 @@ pub enum ConsensusType {
     /// Old catchain-based validator-session (default)
     #[default]
     Catchain,
-    /// New Alpenglow-based simplex consensus
+    /// Simplex consensus
     Simplex,
 }
 

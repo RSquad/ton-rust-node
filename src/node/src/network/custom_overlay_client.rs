@@ -446,7 +446,7 @@ impl CustomOverlayClient {
                         peer
                     );
                     self.overlay_node
-                        .add_private_peers(&local_key, vec![(adnl_addr, quic_addr, key)])?;
+                        .add_private_peers_to_adnl(&local_key, vec![(adnl_addr, quic_addr, key)])?;
                 }
                 Ok(None) => {
                     log::warn!("{}: find address for {} failed", self.id, &peer);

@@ -53,10 +53,10 @@ use ton_block::{
     error, write_boc, Account, AccountId, AccountIdPrefixFull, AccountStorage, BlkMasterInfo,
     Block, BlockIdExt, BlockSignatures, BlockSignaturesVariant, Cell, ConfigParam0, ConfigParam34,
     ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable, HashmapAugType, HashmapType,
-    InMsgDescr, InRefValue, Libraries, McStateExtra, Message, MsgAddressInt, OutMsgDescr,
-    OutMsgQueue, Serializable, ShardAccount, ShardAccountBlocks, ShardIdent, ShardStateUnsplit,
-    SliceData, StateInit, StorageInfo, TickTock, Transaction, UInt15, UInt256, ValidatorBaseInfo,
-    ValidatorDescr, ValidatorSet,
+    InMsgDescr, InRefValue, Libraries, McStateExtra, Message, MsgAddressInt, OldMcBlocksInfo,
+    OutMsgDescr, OutMsgQueue, Serializable, ShardAccount, ShardAccountBlocks, ShardIdent,
+    ShardStateUnsplit, SliceData, StateInit, StorageInfo, TickTock, Transaction, UInt15, UInt256,
+    ValidatorBaseInfo, ValidatorDescr, ValidatorSet,
 };
 use ton_block_json::*;
 
@@ -344,6 +344,8 @@ pub struct GenMasterStateParams<'a> {
     pub master_state_id: Option<BlockIdExt>,
     pub accounts: &'a [&'a Account],
     pub libraries: Libraries,
+    pub prev_blocks: Option<OldMcBlocksInfo>,
+    pub after_key_block: bool,
 }
 
 impl Default for GenMasterStateParams<'_> {
@@ -354,6 +356,8 @@ impl Default for GenMasterStateParams<'_> {
             master_state_id: None,
             accounts: &[],
             libraries: Libraries::default(),
+            prev_blocks: None,
+            after_key_block: false,
         }
     }
 }
@@ -386,6 +390,10 @@ pub fn gen_master_state(
         ms.config.set_config(ConfigParamEnum::ConfigParam34(param)).unwrap();
     }
 
+    if let Some(prev_blocks) = params.prev_blocks {
+        ms.prev_blocks = prev_blocks;
+    }
+    ms.after_key_block = params.after_key_block;
     if let Some(shard_state_id) = params.shard_state_id {
         ms.shards
             .add_workchain(0, 0, shard_state_id.root_hash.clone(), shard_state_id.file_hash.clone())
@@ -803,6 +811,7 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids.clone(),
+            Default::default(),
             block_candidate,
             validator_set.clone(),
             self.clone(),
@@ -844,6 +853,7 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids.clone(),
+            Default::default(),
             block_candidate,
             validator_set.clone(),
             self.clone(),
@@ -954,6 +964,7 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids,
+            Default::default(),
             block_candidate.clone(),
             validator_set,
             self.clone(),

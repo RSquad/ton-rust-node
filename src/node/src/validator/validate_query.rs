@@ -28,6 +28,7 @@ use crate::{
     },
     validator::{
         out_msg_queue::{MsgQueueManager, StatesManager},
+        validator_group::PipelineContext,
         validator_utils::calc_subset_for_masterchain,
         BlockCandidate, McData,
     },
@@ -39,6 +40,7 @@ use std::fs;
 use std::{
     collections::HashMap,
     mem,
+    ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
@@ -276,6 +278,10 @@ pub struct ValidateQuery {
 
     engine: Arc<dyn EngineOperations>,
 
+    /// In-memory pipeline of recently collated states (accelerated consensus / Simplex).
+    /// Used to find prev states that haven't been persisted to DB yet.
+    pipeline_context: PipelineContext,
+
     next_block_descr: Arc<String>,
 }
 
@@ -295,6 +301,7 @@ impl ValidateQuery {
         shard: ShardIdent,
         min_mc_seqno: u32,
         prev_blocks_ids: Vec<BlockIdExt>,
+        pipeline_context: PipelineContext,
         block_candidate: BlockCandidate,
         validator_set: ValidatorSet,
         engine: Arc<dyn EngineOperations>,
@@ -320,6 +327,7 @@ impl ValidateQuery {
             create_stats_enabled: Default::default(),
             block_create_total: Default::default(),
             block_create_count: Default::default(),
+            pipeline_context,
             next_block_descr,
         }
     }
@@ -451,6 +459,8 @@ impl ValidateQuery {
                     self.engine.engine_telemetry(),
                     self.engine.engine_allocated(),
                 )?
+            } else if let Some(state) = self.pipeline_context.try_get_state(block_id) {
+                state
             } else {
                 self.engine.clone().wait_state(block_id, Some(1_000), true).await?
             };
@@ -926,7 +936,11 @@ impl ValidateQuery {
      *
      */
 
-    fn compute_next_state(&mut self, base: &mut ValidateBase, mc_data: &McData) -> Result<()> {
+    async fn compute_next_state(
+        &mut self,
+        base: &mut ValidateBase,
+        mc_data: &McData,
+    ) -> Result<()> {
         let prev_state = base.prev_states[0].clone();
         base.prev_state = Some(prev_state.clone());
         let prev_state_root = if base.after_merge && base.prev_states.len() == 2 {
@@ -941,9 +955,33 @@ impl ValidateQuery {
             base.prev_states[0].root_cell().clone()
         };
         log::debug!(target: "validate_query", "({}): computing next state", self.next_block_descr);
-        let next_state_root = base.state_update.apply_for(&prev_state_root).map_err(|err| {
-            error!("cannot apply Merkle update from block to compute new state : {}", err)
-        })?;
+        let engine = self.engine.clone();
+        let state_update = base.state_update.clone();
+        let next_block_descr = self.next_block_descr.clone();
+        let is_fake = base.is_fake;
+        let (next_state_root, _) = tokio::task::spawn_blocking(move || {
+            let fast_result = if is_fake {
+                Err(error!("not supported in test env"))
+            } else {
+                engine.db_cells_factory()
+                    .and_then(|cf| engine.db_cells_loader().map(|cl| (cf, cl)))
+                    .and_then(|(cf, cl)| {
+                        state_update.apply_for_ex(&prev_state_root, &cf, cl.deref())
+                    })
+            };
+            match fast_result {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    log::debug!(
+                        "({}): Failed the fast attempt of Merkle update applying: {}. Trying classic approach...",
+                        next_block_descr, e
+                    );
+                    state_update.apply_for(&prev_state_root).map_err(|err| {
+                        error!("cannot apply Merkle update from block to compute new state : {}", err)
+                    })
+                }
+            }
+        }).await??;
         log::debug!(target: "validate_query", "({}): next state computed", self.next_block_descr);
         let next_state = ShardStateStuff::from_root_cell(
             base.block_id().clone(),
@@ -3269,7 +3307,7 @@ impl ValidateQuery {
         };
         let (workchain_id, addr) = dst.extract_std_address(true).map_err(|err| {
             error!(
-                "destination of inbound internal message with hash {key:x} \
+                "destination {dst} of inbound internal message with hash {key:x} \
                 is an invalid blockchain address {err}"
             )
         })?;
@@ -3457,9 +3495,15 @@ impl ValidateQuery {
         }
 
         if from_dispatch_queue {
+            let (_, addr) = src.extract_std_address(true).map_err(|err| {
+                error!(
+                    "source {src} of deferred inbound message with hash {key:x} \
+                    is an invalid blockchain address {err}"
+                )
+            })?;
             // Check that the message was removed from DispatchQueue
             let Some(dispatched_msg_env_cell) =
-                base.removed_dispatch_queue_messages(src.address(), created_lt)
+                base.removed_dispatch_queue_messages(&addr, created_lt)
             else {
                 reject_query!(
                     "deferred InMsg with src_addr={addr:x} lt={created_lt} was not removed from \
@@ -6780,7 +6824,7 @@ impl ValidateQuery {
         let mut base = self.init_base()?;
         let mc_data = self.init_mc_data(&mut base).await?;
         // stage 0
-        self.compute_next_state(&mut base, &mc_data)?;
+        self.compute_next_state(&mut base, &mc_data).await?;
         self.unpack_prev_state(&mut base)?;
         self.unpack_next_state(&mut base, &mc_data)?;
         base.prev_blocks_info = PrevBlocksInfo::Raw(

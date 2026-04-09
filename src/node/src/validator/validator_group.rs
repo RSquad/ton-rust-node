@@ -12,11 +12,11 @@
 
 use super::{
     consensus::{
-        get_hash, BlockHash, BlockPayloadPtr, CollationParentHint, CommittedBlockProof,
-        CommittedBlockProofCallback, ConsensusOptions, ConsensusOverlayManagerPtr, ConsensusType,
-        PrivateKey, PublicKey, PublicKeyHash, Session, SessionHolderPtr, SessionId,
-        SessionListener, SessionListenerPtr, SessionNode, ValidatorBlockCandidate,
-        ValidatorBlockCandidateCallback, ValidatorBlockCandidateDecisionCallback,
+        get_hash, BlockHash, BlockPayloadPtr, CollationParentHint, ConsensusOptions,
+        ConsensusOverlayManagerPtr, ConsensusType, PrivateKey, PublicKey, PublicKeyHash, Session,
+        SessionHolderPtr, SessionId, SessionListener, SessionListenerPtr, SessionNode,
+        ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
+        ValidatorBlockCandidateDecisionCallback,
     },
     fabric::*,
     validator_utils::{GeneralSessionInfo, PrevBlockHistory},
@@ -127,6 +127,16 @@ fn should_reject_stale_mc_candidate(
     match last_accepted_seqno {
         Some(accepted) => candidate_parent_seqno < accepted,
         None => false,
+    }
+}
+
+fn sync_last_accepted_mc_seqno_from_applied_top(
+    group_impl: &mut ValidatorGroupImpl,
+    applied_top: &BlockIdExt,
+) {
+    if group_impl.shard.is_masterchain() {
+        let prev = group_impl.last_accepted_mc_seqno.unwrap_or(0);
+        group_impl.last_accepted_mc_seqno = Some(prev.max(applied_top.seq_no));
     }
 }
 
@@ -251,6 +261,7 @@ pub struct ValidatorGroupImpl {
     expected_collation_round: u32,
     is_collator: bool,
     is_accelerated_consensus_enabled: bool,
+    is_pipeline_context_enabled: bool,
 
     shard: ShardIdent,
     session_id: SessionId,
@@ -506,6 +517,7 @@ impl ValidatorGroupImpl {
         cc_seqno: u32,
         session_id: SessionId,
         is_accelerated_consensus_enabled: bool,
+        is_pipeline_context_enabled: bool,
         consensus_type: ConsensusType,
     ) -> ValidatorGroupImpl {
         log::info!(target: "validator",
@@ -516,6 +528,7 @@ impl ValidatorGroupImpl {
         ValidatorGroupImpl {
             local_id: local_id.clone(),
             is_accelerated_consensus_enabled,
+            is_pipeline_context_enabled,
             min_masterchain_block_id: None,
             cc_seqno,
             min_ts: SystemTime::now(),
@@ -646,6 +659,7 @@ pub struct ValidatorGroup {
     allow_unsafe_self_blocks_resync: bool,
 
     group_impl: Arc<MutexWrapper<ValidatorGroupImpl>>,
+    action_queue: tokio::sync::mpsc::UnboundedSender<ValidationAction>,
     callback: Arc<dyn SessionListener + Send + Sync>,
     receiver: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ValidationAction>>>>,
 
@@ -670,6 +684,7 @@ impl ValidatorGroup {
     ) -> Self {
         let consensus_type = consensus_options.consensus_type();
         let is_accelerated = consensus_options.is_accelerated_consensus_enabled();
+        let is_pipeline_context_enabled = consensus_options.is_pipeline_context_enabled();
 
         let group_impl = ValidatorGroupImpl::new(
             local_key.id(),
@@ -677,6 +692,7 @@ impl ValidatorGroup {
             general_session_info.catchain_seqno,
             session_id.clone(),
             is_accelerated,
+            is_pipeline_context_enabled,
             consensus_type,
         );
         let id = format!("Val. group {} {:x}", general_session_info.shard, session_id);
@@ -684,6 +700,7 @@ impl ValidatorGroup {
             session_id.clone(),
             general_session_info.shard.clone(),
         );
+        let action_queue = listener.queue_sender();
 
         log::trace!(target: "validator", "Creating validator group: {}, consensus_type: {}", id, consensus_type);
         ValidatorGroup {
@@ -698,6 +715,7 @@ impl ValidatorGroup {
             engine,
             allow_unsafe_self_blocks_resync,
             group_impl: Arc::new(MutexWrapper::new(group_impl, id)),
+            action_queue,
             callback: Arc::new(listener),
             receiver: Arc::new(Mutex::new(Some(receiver))),
             last_validation_time: Arc::new(AtomicU64::new(0)),
@@ -746,27 +764,34 @@ impl ValidatorGroup {
             .await
     }
 
-    /// Notify this session about masterchain finalization.
+    /// Enqueue an applied-top update into this group's ordered action queue.
     ///
-    /// For simplex shard sessions, this updates the MC finalization tracking which is
-    /// used for empty block generation (finalization recovery).
+    /// For simplex sessions, the queued action eventually updates the session processor:
+    /// - shard sessions use it for empty-block recovery against MC-registered tops
+    /// - masterchain sessions use it to mirror the applied MC head
     ///
-    /// This should be called by ValidatorManager when a masterchain block is finalized,
-    /// for all shard validator groups.
+    /// The manager should not await this on the hot path; queue processing preserves
+    /// per-group sequencing with other validator-group actions.
     ///
     /// # Arguments
-    /// * `mc_block_seqno` - The seqno of the finalized masterchain block
-    pub async fn notify_mc_finalized(&self, mc_block_seqno: u32) {
-        // Only shard sessions need MC finalization notification
-        if self.shard().is_masterchain() {
-            return;
+    /// * `applied_top` - Current applied top for this group shard
+    pub fn notify_mc_finalized(&self, applied_top: BlockIdExt) {
+        if let Err(error) = self.action_queue.send(ValidationAction::OnAppliedTop { applied_top }) {
+            log::warn!(
+                target: "validator",
+                "Failed to enqueue applied-top notification for {}: {}",
+                self.shard,
+                error
+            );
         }
+    }
 
-        //TODO: lock optimization is required
+    pub async fn on_applied_top(&self, applied_top: BlockIdExt) {
         self.group_impl
             .execute_sync(|group_impl| {
+                sync_last_accepted_mc_seqno_from_applied_top(group_impl, &applied_top);
                 if let Some(ref session) = group_impl.session {
-                    session.notify_mc_finalized(mc_block_seqno);
+                    session.notify_mc_finalized(applied_top);
                 }
             })
             .await;
@@ -997,6 +1022,7 @@ impl ValidatorGroup {
                 )
             })
             .await;
+        let min_ts = min_ts.max(request.get_creation_time());
 
         if !is_collator && self.is_accelerated_consensus_enabled {
             log::info!(
@@ -1039,7 +1065,7 @@ impl ValidatorGroup {
                 // - last_committed_seqno: from `prev_block_ids` (finalized/committed head)
                 // - last_collated_seqno: from `pipeline_context` (accelerated consensus), if any
                 //
-                // With notarized-parent collation (require_finalized_parent=false), the parent
+                // With notarized-parent collation, the parent
                 // can be *ahead* of last_committed_seqno (notarized but not yet finalized).
                 // This is expected and allowed. The guard only rejects parents that are *behind*
                 // our current collation head (going backward).
@@ -1233,7 +1259,7 @@ impl ValidatorGroup {
                                 group_impl.expected_collation_round = round + 1;
                             }
 
-                            if group_impl.is_accelerated_consensus_enabled {
+                            if group_impl.is_pipeline_context_enabled {
                                 group_impl.pipeline_context.add(
                                     new_state,
                                     new_block,
@@ -1335,6 +1361,7 @@ impl ValidatorGroup {
         let (
             expected_current_round,
             prev_block_ids,
+            pipeline_context,
             mc_block_id_opt,
             min_ts,
             last_accepted_mc_seqno,
@@ -1343,6 +1370,7 @@ impl ValidatorGroup {
                 (
                     group_impl.expected_current_round,
                     group_impl.prev_block_ids.clone(),
+                    group_impl.pipeline_context.clone(), //TODO: optimize
                     group_impl.min_masterchain_block_id.clone(),
                     group_impl.min_ts,
                     group_impl.last_accepted_mc_seqno,
@@ -1435,6 +1463,7 @@ impl ValidatorGroup {
                     let validation_completion_time = run_validate_query_any_candidate(
                         candidate.clone(),
                         engine.clone(),
+                        pipeline_context,
                         is_simplex,
                     )
                     .await?;
@@ -1653,6 +1682,15 @@ impl ValidatorGroup {
         signatures: BlockSignaturesVariant,
         approve_sig_set: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
+        let is_simplex_group = self
+            .group_impl
+            .execute_sync(|group_impl| group_impl.consensus_type == ConsensusType::Simplex)
+            .await;
+        assert!(
+            !is_simplex_group,
+            "ValidatorGroup::on_block_committed must not be called for simplex sessions"
+        );
+
         let next_block_descr = self.get_next_block_descr(Some(&root_hash)).await;
 
         let data_vec = data.data().to_vec();
@@ -1747,12 +1785,9 @@ impl ValidatorGroup {
                     err => err, // TODO: retry block commit
                 };
 
-                let committed_seqno = next_block_id.seq_no;
-                group_impl.prev_block_ids.update_prev(vec![next_block_id]);
-
-                if group_impl.shard.is_masterchain() {
-                    let prev = group_impl.last_accepted_mc_seqno.unwrap_or(0);
-                    group_impl.last_accepted_mc_seqno = Some(prev.max(committed_seqno));
+                if full_result.is_ok() {
+                    sync_last_accepted_mc_seqno_from_applied_top(group_impl, &next_block_id);
+                    group_impl.prev_block_ids.update_prev(vec![next_block_id]);
                 }
 
                 (full_result, group_impl.prev_block_ids.display_prevs())
@@ -1779,6 +1814,184 @@ impl ValidatorGroup {
                 new_prevs
             ),
         }
+    }
+
+    /// Out-of-order finalized block delivery.
+    ///
+    /// Called immediately when a finalization certificate is observed,
+    /// regardless of whether predecessors have been committed.
+    /// `block_id` carries the full identity (shard, seqno, root_hash, file_hash)
+    /// so we don't rely on sequential `prev_block_ids` tracking.
+    ///
+    /// The engine's `apply_block` is dependency-driven and will recursively
+    /// fetch predecessors, so out-of-order acceptance is safe at that layer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
+        round: u32,
+        source: PublicKey,
+        _root_hash: BlockHash,
+        _file_hash: BlockHash,
+        data: BlockPayloadPtr,
+        signatures: BlockSignaturesVariant,
+        approve_sig_set: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+    ) {
+        let is_simplex_group = self
+            .group_impl
+            .execute_sync(|group_impl| group_impl.consensus_type == ConsensusType::Simplex)
+            .await;
+        if !is_simplex_group {
+            log::error!(
+                target: "validator",
+                "ValidatorGroup::on_block_finalized: unexpected callback for non-simplex session; \
+                ignoring (block_id={block_id}, source={}, round={round})",
+                source.id()
+            );
+            return;
+        }
+
+        // Important: do not block ValidationAction queue on out-of-order acceptance.
+        // This path can involve downloads/apply and must run in detached task.
+        let engine = self.engine.clone();
+        let validator_set = self.validator_set.clone();
+        let group_impl = self.group_impl.clone();
+        let local_key = self.local_key.clone();
+        let source_id = source.id().clone();
+        let data_vec = data.data().to_vec();
+        let data_opt = if data_vec.is_empty() { None } else { Some(data_vec) };
+        let we_generated = source.id() == local_key.id();
+        metrics::counter!("ton_node_validator_finalized_received_total", "consensus" => "simplex")
+            .increment(1);
+
+        // Activate session on first finalized-block receipt because simplex is
+        // finalized-driven and does not use on_block_committed callbacks.
+        self.group_impl
+            .execute_sync(|group_impl| {
+                if group_impl.status == ValidatorGroupStatus::Sync {
+                    group_impl.status = ValidatorGroupStatus::Active;
+                    let cl = if group_impl.consensus_type == ConsensusType::Simplex {
+                        "simplex"
+                    } else {
+                        "catchain"
+                    };
+                    metrics::counter!(
+                        "ton_node_validator_session_activated_total",
+                        "consensus" => cl
+                    )
+                    .increment(1);
+                    log::info!(
+                        target: "validator",
+                        "SESSION_LIFECYCLE: transition shard={} cc_seqno={} \
+                         session_id={:x} sync -> active \
+                         (first finalized block received)",
+                        group_impl.shard,
+                        group_impl.cc_seqno,
+                        group_impl.session_id
+                    );
+                }
+            })
+            .await;
+
+        log::info!(
+            target: "validator",
+            "ValidatorGroup::on_block_finalized: scheduling async accept for \
+            block_id={block_id} source={source_id} round={round}"
+        );
+
+        tokio::spawn(async move {
+            let (accept_data, prevs) =
+                match Self::resolve_prev_for_finalized_block(engine.clone(), &block_id, data_opt)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!(
+                            target: "validator",
+                            "ValidatorGroup::on_block_finalized:
+                            failed to resolve prev for {block_id}: {e}"
+                        );
+                        return;
+                    }
+                };
+
+            let result = run_accept_block_query(
+                block_id.clone(),
+                accept_data,
+                prevs,
+                validator_set,
+                signatures,
+                approve_sig_set,
+                we_generated,
+                engine,
+            )
+            .await;
+
+            match result {
+                Ok(()) => {
+                    log::info!(
+                        target: "validator",
+                        "ValidatorGroup::on_block_finalized: \
+                        accepted block_id={block_id} source={source_id} round={round}"
+                    );
+
+                    group_impl
+                        .execute_sync(|group_impl| {
+                            sync_last_accepted_mc_seqno_from_applied_top(group_impl, &block_id);
+                        })
+                        .await;
+                }
+                Err(err) => {
+                    log::error!(
+                        target: "validator",
+                        "ValidatorGroup::on_block_finalized: accept failed for \
+                        block_id={block_id} source={source_id} round={round}: {err}"
+                    );
+                }
+            }
+        });
+    }
+
+    fn extract_prev_ids_from_block_data(
+        block_id: &BlockIdExt,
+        data: Vec<u8>,
+    ) -> Result<Vec<BlockIdExt>> {
+        let block = crate::block::BlockStuff::deserialize_block(block_id.clone(), Arc::new(data))?;
+        Self::extract_prev_ids_from_block(&block)
+    }
+
+    fn extract_prev_ids_from_block(block: &crate::block::BlockStuff) -> Result<Vec<BlockIdExt>> {
+        let (prev1, prev2) = block.construct_prev_id()?;
+        let mut prev = Vec::with_capacity(if prev2.is_some() { 2 } else { 1 });
+        prev.push(prev1);
+        if let Some(prev2) = prev2 {
+            prev.push(prev2);
+        }
+        Ok(prev)
+    }
+
+    async fn resolve_prev_for_finalized_block(
+        engine: Arc<dyn EngineOperations>,
+        block_id: &BlockIdExt,
+        data_opt: Option<Vec<u8>>,
+    ) -> Result<(Option<Vec<u8>>, Vec<BlockIdExt>)> {
+        if let Some(data) = data_opt {
+            match Self::extract_prev_ids_from_block_data(block_id, data.clone()) {
+                Ok(prev) => return Ok((Some(data), prev)),
+                Err(e) => {
+                    log::warn!(
+                        target: "validator",
+                        "ValidatorGroup::resolve_prev_for_finalized_block: \
+                        failed to parse payload for {block_id}: {e}. Falling back to download_block"
+                    );
+                }
+            }
+        }
+
+        let (downloaded_block, _proof) = engine.download_block(block_id, Some(10)).await?;
+        let prev = Self::extract_prev_ids_from_block(&downloaded_block)?;
+        let downloaded_data = downloaded_block.data().to_vec();
+        Ok((Some(downloaded_data), prev))
     }
 
     pub async fn on_block_skipped(&self, round: u32) {
@@ -1828,60 +2041,6 @@ impl ValidatorGroup {
         );
         callback(result);
     }
-
-    /// Download committed block proof from full-node.
-    ///
-    /// Spawns an async task (non-blocking) that downloads the block proof via
-    /// EngineOperations, extracts BlockSignaturesVariant, and invokes the callback.
-    /// The spawned task does NOT hold up the ValidationAction queue.
-    pub async fn on_get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: CommittedBlockProofCallback,
-    ) {
-        log::info!(
-            target: "validator",
-            "ValidatorGroup::on_get_committed_candidate: block_id={}, {}",
-            block_id, self.info().await
-        );
-
-        let engine = self.engine.clone();
-        let block_id_clone = block_id.clone();
-        tokio::spawn(async move {
-            let result = Self::fetch_committed_block_proof(engine.as_ref(), &block_id_clone).await;
-            let result_txt = match &result {
-                Ok(_) => "Ok".to_string(),
-                Err(e) => format!("Err: {}", e),
-            };
-            log::info!(
-                target: "validator",
-                "ValidatorGroup::on_get_committed_candidate: result={} for {}",
-                result_txt, block_id_clone,
-            );
-            callback(result);
-        });
-    }
-
-    async fn fetch_committed_block_proof(
-        engine: &dyn crate::engine_traits::EngineOperations,
-        block_id: &BlockIdExt,
-    ) -> Result<CommittedBlockProof> {
-        let is_link = !block_id.shard().is_masterchain();
-        let proof = engine.download_block_proof(block_id, is_link, false).await?;
-
-        let signatures = proof.drain_signatures()?;
-
-        if block_id.shard().is_masterchain() {
-            match &signatures {
-                BlockSignaturesVariant::Simplex(s) if s.is_final => { /* ok */ }
-                _ => {
-                    fail!("Expected Simplex(is_final=true) for MC block {}", block_id);
-                }
-            }
-        }
-
-        Ok(CommittedBlockProof { block_id: block_id.clone(), signatures })
-    }
 }
 
 impl Drop for ValidatorGroup {
@@ -1903,6 +2062,7 @@ mod tests {
             ShardIdent::masterchain(),
             1,
             UInt256::default(),
+            false,
             false,
             ConsensusType::Catchain,
         )
@@ -1930,6 +2090,38 @@ mod tests {
         assert!(should_reject_stale_mc_candidate(Some(10), 9));
         assert!(should_reject_stale_mc_candidate(Some(10), 0));
         assert!(should_reject_stale_mc_candidate(Some(100), 50));
+    }
+
+    #[test]
+    fn test_sync_last_accepted_mc_seqno_from_applied_top_is_monotonic() {
+        let mut group = make_group_impl_for_start_tests();
+
+        let top10 = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            10,
+            UInt256::from([0x11; 32]),
+            UInt256::from([0x12; 32]),
+        );
+        sync_last_accepted_mc_seqno_from_applied_top(&mut group, &top10);
+        assert_eq!(group.last_accepted_mc_seqno, Some(10));
+
+        let top7 = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            7,
+            UInt256::from([0x21; 32]),
+            UInt256::from([0x22; 32]),
+        );
+        sync_last_accepted_mc_seqno_from_applied_top(&mut group, &top7);
+        assert_eq!(group.last_accepted_mc_seqno, Some(10));
+
+        let top11 = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            11,
+            UInt256::from([0x31; 32]),
+            UInt256::from([0x32; 32]),
+        );
+        sync_last_accepted_mc_seqno_from_applied_top(&mut group, &top11);
+        assert_eq!(group.last_accepted_mc_seqno, Some(11));
     }
 
     #[test]

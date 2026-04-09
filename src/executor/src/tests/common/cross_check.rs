@@ -87,7 +87,7 @@ pub(crate) fn cross_check(
     // assert!(extra.config.global_version() >= ton_block::SUPPORTED_VERSION, "global_version {} must be >= {}",
     //     config.global_version(), ton_block::SUPPORTED_VERSION);
     #[cfg(windows)]
-    let lib_name = "../../ton/build/crypto/Release/vm_run_shared.dll";
+    let lib_name = "../../../ton/build/crypto/vm_run_shared.dll";
     #[cfg(target_os = "linux")]
     let lib_name = "../../ton-node-cpp/build/crypto/libvm_run_shared.so";
     #[cfg(target_os = "macos")]

@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    utils::MetricsHandle, BlockPayloadPtr, ConsensusNode, ConsensusOverlay,
+    utils::MetricsHandle, BlockPayloadPtr, ConsensusCommonFactory, ConsensusNode, ConsensusOverlay,
     ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager,
     ConsensusOverlayManagerPtr, ConsensusOverlayPtr, OverlayTransportType, PrivateKey,
     PublicKeyHash, QueryResponseCallback, Result,
@@ -24,6 +24,7 @@ use std::{
     any::Any,
     collections::HashMap,
     future::Future,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -36,7 +37,10 @@ use ton_api::{
     deserialize_boxed, serialize_bare, serialize_boxed, serialize_boxed_append,
     ton::{
         catchain::BroadcastWrapper,
-        consensus::simplex::{Certificate as SimplexCertificate, Vote as SimplexVote},
+        consensus::{
+            simplex::{Certificate as SimplexCertificate, Vote as SimplexVote},
+            RequestError as ConsensusRequestError,
+        },
         overlay::{
             broadcast::BroadcastTwostepSimple, broadcast_twostep::id::Id as BroadcastTwostepId,
             broadcast_twostep_simple::tosign::ToSign as BroadcastTwostepSimpleToSign,
@@ -48,6 +52,26 @@ use ton_api::{
 use ton_block::{error, fail, sha256_digest, KeyId, KeyOption, UInt256};
 
 const LOG_TARGET: &str = "consensus_adnl_overlay";
+
+fn describe_query_response_error(error: &ConsensusRequestError) -> &'static str {
+    match error {
+        ConsensusRequestError::Consensus_RequestError => "consensus.requestError",
+    }
+}
+
+fn extract_query_response_error(data: &[u8]) -> Option<String> {
+    let message = deserialize_boxed(data).ok()?;
+    let error = message.downcast::<ConsensusRequestError>().ok()?;
+    Some(describe_query_response_error(&error).to_string())
+}
+
+fn normalize_query_response_payload(data: Vec<u8>) -> Result<BlockPayloadPtr> {
+    if let Some(error_name) = extract_query_response_error(data.as_slice()) {
+        return Err(error!("Peer returned {}", error_name));
+    }
+
+    Ok(ConsensusCommonFactory::create_block_payload(data))
+}
 
 /// Stream tags for task processor routing in ADNL overlay
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -591,7 +615,7 @@ impl Peer {
                         }
 
                         // Add new address
-                        let add_result = self.overlay_node.add_private_peers(
+                        let add_result = self.overlay_node.add_private_peers_to_adnl(
                             &self.src_adnl_addr,
                             vec![(adnl_addr, quic_addr, key)],
                         );
@@ -899,11 +923,9 @@ impl AdnlOverlay {
 
         log::debug!(
             target: LOG_TARGET,
-            "Creating new AdnlOverlay: overlay_id={}, local_id={}, nodes_count={}, transport={:?}",
-            overlay_id,
-            local_id,
-            nodes.len(),
-            transport_type,
+            "Creating new AdnlOverlay: overlay_id={overlay_id}, local_id={local_id}, \
+            nodes_count={}, transport={transport_type:?}",
+            nodes.len()
         );
 
         // Find local ADNL key from nodes by matching local_id
@@ -916,8 +938,7 @@ impl AdnlOverlay {
                 local_adnl_key = Some(stack.adnl.key_by_id(&node.adnl_id)?);
                 log::trace!(
                     target: LOG_TARGET,
-                    "Found local ADNL key: local_id={}, adnl_id={}",
-                    local_id,
+                    "Found local ADNL key: local_id={local_id}, adnl_id={}",
                     node.adnl_id
                 );
                 continue; // Skip adding local node to peers
@@ -949,10 +970,7 @@ impl AdnlOverlay {
                             adnl::QuicNode::OFFSET_PORT
                         )
                     })?;
-                let bind_addr = std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    quic_port,
-                );
+                let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), quic_port);
                 quic.add_key(&key_bytes, local_adnl_key.id(), bind_addr)?;
                 log::info!(
                     target: LOG_TARGET,
@@ -1577,9 +1595,7 @@ impl ConsensusOverlay for AdnlOverlay {
 
                 let result = result.ok_or_else(|| error!("answer is None!"))?;
                 let data = serialize_boxed(&result)?;
-                let data = crate::ConsensusCommonFactory::create_block_payload(data);
-
-                Ok(data)
+                normalize_query_response_payload(data)
             }
             .await;
 
@@ -1595,7 +1611,10 @@ impl ConsensusOverlay for AdnlOverlay {
         });
     }
 
-    /// Send query via RLDP for large messages
+    /// Send query via RLDP for large messages.
+    /// On QUIC-enabled overlays (simplex+quic) the query is routed through QUIC
+    /// bi-directional streams instead, since QUIC handles flow control natively
+    /// and doesn't need `max_answer_size`.
     fn send_query_via_rldp(
         &self,
         dst_adnl_id: PublicKeyHash,
@@ -1610,6 +1629,7 @@ impl ConsensusOverlay for AdnlOverlay {
         let overlay_node = self.stack.overlay.clone();
         let stop_requested = self.stop_requested.clone();
         let runtime_handle = self.runtime_handle.clone();
+        let is_quic = self.is_quic_available;
 
         if stop_requested.load(Ordering::Relaxed) {
             log::warn!(target: LOG_TARGET, "AdnlOverlay: Overlay {} was stopped!", &overlay_id);
@@ -1622,28 +1642,40 @@ impl ConsensusOverlay for AdnlOverlay {
                 return;
             }
 
-            // Execute RLDP query
             let result = async {
                 let query_body = deserialize_boxed(query.data())?;
-                let mut query_data = overlay_node.get_query_prefix(&overlay_id)?;
-                serialize_boxed_append(&mut query_data, &query_body)?;
 
-                let (data, _) = overlay_node
-                    .query_via_rldp(
-                        &dst_adnl_id,
-                        &TaggedByteSlice {
-                            object: &query_data[..],
-                            #[cfg(feature = "telemetry")]
-                            tag: query_body.bare_object().constructor(),
-                        },
-                        &overlay_id,
-                        Some(max_answer_size),
-                        v2,
-                        None,
-                    )
-                    .await?;
-                let data = data.ok_or_else(|| error!("answer is None!"))?;
-                Ok(crate::ConsensusCommonFactory::create_block_payload(data))
+                if is_quic {
+                    // QUIC path: use bi-directional stream query (no max_answer_size needed)
+                    let tagged: TaggedTlObject = query_body.into();
+                    let result = overlay_node
+                        .query_via_quic(&dst_adnl_id, &tagged, &overlay_id, None)
+                        .await?;
+                    let result = result.ok_or_else(|| error!("QUIC query answer is None!"))?;
+                    let data = serialize_boxed(&result)?;
+                    normalize_query_response_payload(data)
+                } else {
+                    // RLDP path: traditional large-message query
+                    let mut query_data = overlay_node.get_query_prefix(&overlay_id)?;
+                    serialize_boxed_append(&mut query_data, &query_body)?;
+
+                    let (data, _) = overlay_node
+                        .query_via_rldp(
+                            &dst_adnl_id,
+                            &TaggedByteSlice {
+                                object: &query_data[..],
+                                #[cfg(feature = "telemetry")]
+                                tag: query_body.bare_object().constructor(),
+                            },
+                            &overlay_id,
+                            Some(max_answer_size),
+                            v2,
+                            None,
+                        )
+                        .await?;
+                    let data = data.ok_or_else(|| error!("answer is None!"))?;
+                    normalize_query_response_payload(data)
+                }
             }
             .await;
 
@@ -1957,3 +1989,7 @@ impl ConsensusOverlayManager for AdnlOverlayManager {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/test_adnl_overlay.rs"]
+mod tests;

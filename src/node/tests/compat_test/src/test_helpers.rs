@@ -18,7 +18,8 @@ use adnl::{
         TaggedTlObject,
     },
     node::{AdnlNode, AdnlNodeConfig, AdnlSendMethod, IpAddress},
-    OverlayNode, OverlayNodeInfo, OverlayParams, OverlayShortId, QuicNode, RldpNode,
+    OverlayNode, OverlayNodeInfo, OverlayParams, OverlayShortId, QuicNode, QuicRateLimitConfig,
+    RldpNode,
 };
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -532,6 +533,7 @@ impl RustQuicTestNode {
                 cancellation_token.clone(),
                 None,
                 rt.handle().clone(),
+                Some(QuicRateLimitConfig::disabled()),
             );
             let bind_addr = SocketAddr::new(
                 Ipv4Addr::from(adnl.ip_address_adnl().ip()).into(),

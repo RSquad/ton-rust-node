@@ -117,6 +117,7 @@ const LS_VERSION: i32 = 0x101;
 const LS_CAPABILITIES: i64 = 7;
 const SKIP_EXTERNALS_QUEUE_SIZE: i32 = 1000;
 
+const CFG_NEED_PREV_BLOCKS: i32 = 0x80;
 const CFG_FROM_PREV_KEY_BLOCK: i32 = 0x8000; // read the config from the previous key block
 const CFG_VISIT_PARAMS: i32 = 0x10000; // enable the listed parameters (list)
 const CFG_VISIT_ROOT: i32 = 0x20000; // enable the config root (all at once)
@@ -944,63 +945,6 @@ impl LiteServerQuerySubscriber {
         }
     }
 
-    async fn get_all_config_params(
-        engine: &Arc<dyn EngineOperations>,
-        mode: i32,
-        id: BlockIdExt,
-    ) -> Result<ConfigInfo> {
-        if !id.is_masterchain() {
-            fail!("get_all_config_params: {} is not masterchain", id);
-        }
-
-        let id = Self::resolve_config_block_id(engine, mode, &id).await?;
-        let state_proof = Self::state_proof_for_config(engine, &id).await?;
-        let state = engine.load_state(&id).await?;
-        let state_root = state.root_cell().clone();
-        let state_usage = UsageTree::with_params(state_root.clone(), true);
-
-        let ss = ShardStateUnsplit::construct_from_cell(state_usage.root_cell())?;
-        let custom = ss
-            .read_custom()
-            .map_err(|e| error!("read_custom({id}) failed: {e}"))?
-            .ok_or_else(|| error!("No custom in masterchain state {id}"))?;
-
-        let mc_ident = ShardIdent::with_workchain_id(MASTERCHAIN_ID)?;
-        let _ = custom.shard_seq_no(&mc_ident)?;
-        let _ = custom.validator_info;
-        let _ = custom.after_key_block;
-        if let Some(ref lb) = custom.last_key_block {
-            let _ = (&lb.seq_no, &lb.root_hash, &lb.file_hash);
-        }
-
-        visit_prev_blocks_info(&custom, &ss)?;
-        let stats_hash = custom
-            .block_create_stats
-            .as_ref()
-            .map(|s| s.counters.root().map(|c| c.repr_hash()))
-            .flatten()
-            .unwrap_or_default();
-
-        let cfg_root_hash = custom
-            .config()
-            .root()
-            .cloned()
-            .ok_or_else(|| error!("No config root in state {id}"))?
-            .repr_hash();
-
-        let config_proof = tokio::task::spawn_blocking(move || {
-            MerkleProof::create_with_subtrees(
-                &state_root,
-                |h| state_usage.contains(h),
-                |h| h == &cfg_root_hash || h == &stats_hash,
-            )?
-            .write_to_bytes()
-        })
-        .await??;
-
-        Ok(ConfigInfo { mode: (mode & CFG_MODE_MASK_RET), id, state_proof, config_proof })
-    }
-
     async fn get_all_shards_info(
         engine: &Arc<dyn EngineOperations>,
         block_id: BlockIdExt,
@@ -1149,7 +1093,7 @@ impl LiteServerQuerySubscriber {
         engine: &Arc<dyn EngineOperations>,
         mode: i32,
         id: BlockIdExt,
-        param_list: Vec<i32>,
+        mut param_list: Vec<i32>,
     ) -> Result<ConfigInfo> {
         if !id.is_masterchain() {
             fail!("id must be a full masterchain block");
@@ -1158,28 +1102,59 @@ impl LiteServerQuerySubscriber {
             fail!("empty param_list: pass ids or call GetConfigAll");
         }
 
-        let id = Self::resolve_config_block_id(engine, mode, &id).await?;
-        let state_proof = Self::state_proof_for_config(engine, &id).await?;
-
-        let state = engine.load_state(&id).await?;
-        let state_usage = UsageTree::with_params(state.root_cell().clone(), true);
-        let ss: ShardStateUnsplit =
-            ShardStateUnsplit::construct_from_cell(state_usage.root_cell())?;
-        let custom = ss
-            .read_custom()
-            .map_err(|e| error!("read_custom({id}) failed: {e}"))?
-            .ok_or_else(|| error!("No custom in masterchain state {id}"))?;
-
-        let cfg = custom.config();
+        let from_key_block = (mode & CFG_FROM_PREV_KEY_BLOCK) != 0;
         let mut subtrees = HashSet::new();
+
+        let (id, state_proof, cfg, usage) = if from_key_block {
+            let key_block_id = Self::get_prev_key_block(engine, &id).await?;
+            let block_handle = engine
+                .load_block_handle(&key_block_id)?
+                .ok_or_else(|| error!("no handle for {}", key_block_id))?;
+            let block_data = engine.load_block_raw(&block_handle).await?;
+            let block_root = read_single_root_boc(&block_data)?;
+            let usage = UsageTree::with_params(block_root.clone(), true);
+            let block = Block::construct_from_cell(usage.root_cell())?;
+            let extra = block
+                .read_extra()?
+                .read_custom()?
+                .ok_or_else(|| error!("no custom in key block {}", key_block_id))?;
+            let cfg = extra
+                .config()
+                .cloned()
+                .ok_or_else(|| error!("no config in key block {}", key_block_id))?;
+            (key_block_id, Vec::new(), cfg, usage)
+        } else {
+            let state_proof = Self::state_proof_for_config(engine, &id).await?;
+            let state = engine.load_state(&id).await?;
+            let usage = UsageTree::with_params(state.root_cell().clone(), true);
+            let ss: ShardStateUnsplit = ShardStateUnsplit::construct_from_cell(usage.root_cell())?;
+            let custom = ss
+                .read_custom()
+                .map_err(|e| error!("read_custom({id}) failed: {e}"))?
+                .ok_or_else(|| error!("No custom in masterchain state {id}"))?;
+            if mode & CFG_NEED_PREV_BLOCKS != 0 {
+                visit_prev_blocks_info(&custom, &ss)?;
+                param_list.push(8);
+            }
+            if (mode & CFG_VISIT_ROOT) != 0 {
+                let stats_hash = custom
+                    .block_create_stats
+                    .as_ref()
+                    .map(|s| s.counters.root().map(|c| c.repr_hash()))
+                    .flatten()
+                    .unwrap_or_default();
+                subtrees.insert(stats_hash);
+            }
+            (id, state_proof, custom.config, usage)
+        };
+
         if (mode & CFG_VISIT_ROOT) != 0 {
             subtrees.insert(
                 cfg.root().ok_or_else(|| error!("No config root in state {id}"))?.repr_hash(),
             );
         } else {
             for &pid in &param_list {
-                let key_u32 = pid as u32;
-                let key_bits: SliceData = key_u32.write_to_bitstring()?;
+                let key_bits: SliceData = pid.write_to_bitstring()?;
                 if let Some(leaf) = cfg.config_params.get(key_bits)? {
                     subtrees.insert(leaf.cell()?.repr_hash());
                 }
@@ -1188,8 +1163,8 @@ impl LiteServerQuerySubscriber {
 
         let config_proof = tokio::task::spawn_blocking(move || {
             let proof = MerkleProof::create_with_subtrees(
-                &state.root_cell(),
-                |h| state_usage.contains(h),
+                &usage.original_root(),
+                |h| usage.contains(h),
                 |h| subtrees.contains(h),
             )?;
             proof.write_to_bytes()
@@ -2452,34 +2427,32 @@ impl LiteServerQuerySubscriber {
         }
     }
 
-    /// Resolves the block ID to use for config retrieval.
-    /// If CFG_FROM_PREV_KEY_BLOCK is set, returns the previous key block ID,
-    /// falling back to zerostate if no previous key block exists
-    async fn resolve_config_block_id(
+    /// Returns the previous key block for the given block ID
+    async fn get_prev_key_block(
         engine: &Arc<dyn EngineOperations>,
-        mode: i32,
         id: &BlockIdExt,
     ) -> Result<BlockIdExt> {
-        if (mode & CFG_FROM_PREV_KEY_BLOCK) == 0 {
-            return Ok(id.clone());
+        let last_block_id = get_last_liteserver_state_block(engine)?;
+        if id.seq_no > last_block_id.seq_no {
+            fail!(
+                "Requested block seq_no {} is greater than last known block seq_no {}",
+                id.seq_no,
+                last_block_id.seq_no
+            );
         }
-        if !id.is_masterchain() {
-            fail!("resolve_config_block_id: {} is not masterchain", id);
-        }
-
-        let state = engine.load_state(id).await?;
+        let state = engine.load_state(&last_block_id).await?;
         let extra = state.shard_state_extra()?;
+        if id != last_block_id.as_ref() {
+            extra.prev_blocks.check_block(id)?;
+        } else if state.shard_state_extra()?.after_key_block {
+            return Ok(last_block_id.as_ref().clone());
+        }
 
-        let req_seqno =
-            if extra.after_key_block { id.seq_no().saturating_sub(1) } else { id.seq_no() };
-
-        if let Some(prev_key) = extra.prev_blocks.get_prev_key_block(req_seqno)? {
+        if let Some(prev_key) = extra.prev_blocks.get_prev_key_block(id.seq_no)? {
             return Ok(prev_key.master_block_id().1);
+        } else {
+            fail!("No previous key block found for seq_no {}", id.seq_no);
         }
-        if let Some(zero) = extra.prev_blocks.get(&0)? {
-            return Ok(zero.master_block_id().1);
-        }
-        Ok(engine.zerostate_id()?.clone())
     }
 
     async fn state_proof_for_config(
@@ -2586,10 +2559,11 @@ impl LiteServerQuerySubscriber {
             GetBlockProof =>
                 |q| Self::get_block_proof(engine, q.mode, q.known_block, q.target_block),
             GetConfigAll =>
-                |q| Self::get_all_config_params(
+                |q| Self::get_config_params(
                     engine,
                     (q.mode & CFG_MODE_MASK_RET) | CFG_VISIT_ROOT,
-                    q.id
+                    q.id,
+                    Vec::new(),
                 ),
             GetConfigParams =>
                 |q| Self::get_config_params(

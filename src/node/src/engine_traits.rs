@@ -96,29 +96,20 @@ pub struct ValidatorKeyBinding {
 /// # C++ counterpart
 ///
 /// C++ uses `get_validator()` (`manager.cpp`) which returns a `PublicKeyHash`
-/// (zero = not a validator). There is no explicit `network_ready` concept in C++ because
-/// ADNL identity is always resolvable (falling back to the validator public key hash when
-/// `addr` is zero, see `create_validator_group()` in `manager.cpp`). The `network_ready` flag is a
-/// Rust-specific extension that decouples validator membership from ADNL/overlay readiness.
-/// Rust still records validator membership immediately, while overlay activation is retried
-/// until the network layer finishes loading the ADNL key.
+/// (zero = not a validator). Membership is determined by pubkey-in-set only;
+/// ADNL/overlay readiness is handled in transport/context paths, not in the
+/// membership outcome itself.
 ///
 /// # Variants
 ///
-/// - `Selected { key, matching_keys, network_ready }` -- local node's public key is in the
+/// - `Selected { key, matching_keys }` -- local node's public key is in the
 ///   validator set. `key` is the first selected local key used for network setup, while
 ///   `matching_keys` preserves all local matches in C++ `temp_keys_` order so shard subsets
-///   can still choose the right local validator key. `network_ready` is `true` when the
-///   corresponding ADNL key and overlay infrastructure are operational; `false` when the
-///   pubkey matched but ADNL setup is still pending.
+///   can still choose the right local validator key.
 /// - `NotValidator` -- no local key matches the validator set.
 #[derive(Debug)]
 pub enum ValidatorListOutcome {
-    Selected {
-        key: Arc<dyn KeyOption>,
-        matching_keys: Vec<Arc<dyn KeyOption>>,
-        network_ready: bool,
-    },
+    Selected { key: Arc<dyn KeyOption>, matching_keys: Vec<Arc<dyn KeyOption>> },
     NotValidator,
 }
 
@@ -129,6 +120,8 @@ pub trait PrivateOverlayOperations: Sync + Send {
         validator_list_id: UInt256,
         validators: &[CatchainNode],
     ) -> Result<ValidatorListOutcome>;
+
+    fn has_validator_list_context(&self, validator_list_id: &UInt256) -> bool;
 
     fn activate_validator_list(&self, validator_list_id: UInt256) -> Result<()>;
 

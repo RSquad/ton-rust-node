@@ -1050,6 +1050,8 @@ fn test_simplex_config_v2_round_trip() {
             first_block_timeout_ms: 1000,
             max_leader_window_desync: 250,
             candidate_resolve_rate_limit: 10,
+            min_block_interval_ms: 333,
+            no_empty_blocks_on_error_timeout_ms: 22_000,
             ..Default::default()
         },
         ..Default::default()
