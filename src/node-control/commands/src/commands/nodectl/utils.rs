@@ -11,6 +11,7 @@ use colored::Colorize;
 use common::{
     app_config::{AppConfig, WalletConfig},
     task_cancellation::CancellationCtx,
+    ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
 use contracts::{WalletContract, contract_provider};
@@ -34,7 +35,7 @@ pub const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
 
 /// `max_stake_factor` from masterchain config param 17 as a float multiplier (e.g. `3.0`).
 pub async fn fetch_network_max_factor(rpc_client: &ClientJsonRpc) -> anyhow::Result<f32> {
-    common::ton_utils::extract_max_stake_factor(rpc_client.get_config_param(17).await?)
+    extract_max_factor(rpc_client.get_config_param(17).await?)
 }
 
 pub fn warn_missing_secret(secret_name: &str) {

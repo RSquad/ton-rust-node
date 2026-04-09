@@ -6,6 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use ton_block::ConfigParamEnum;
+
 pub fn nanotons_to_dec_string(value: u64) -> String {
     value.to_string()
 }
@@ -27,10 +29,10 @@ pub fn max_stake_factor_raw_to_multiplier(raw: u32) -> f32 {
     raw as f32 / MAX_STAKE_FACTOR_SCALE
 }
 
-/// Extracts `max_stake_factor` from a `ConfigParamEnum` (must be param 17) as a float multiplier.
-pub fn extract_max_stake_factor(param: ton_block::ConfigParamEnum) -> anyhow::Result<f32> {
+/// Extracts the network `max_factor` from a `ConfigParamEnum` (must be param 17; field `max_stake_factor`) as a float multiplier.
+pub fn extract_max_factor(param: ConfigParamEnum) -> anyhow::Result<f32> {
     match param {
-        ton_block::ConfigParamEnum::ConfigParam17(c) => {
+        ConfigParamEnum::ConfigParam17(c) => {
             Ok(max_stake_factor_raw_to_multiplier(c.max_stake_factor))
         }
         _ => anyhow::bail!("expected config param 17 (stakes config)"),

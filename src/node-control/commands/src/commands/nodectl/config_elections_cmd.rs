@@ -226,9 +226,7 @@ impl TickIntervalCmd {
 impl MaxFactorCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
         let mut config = AppConfig::load(path)?;
-        if config.elections.is_none() {
-            anyhow::bail!("Elections are not configured");
-        }
+        config.elections.as_ref().ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?;
 
         let rpc_client = try_create_rpc_client(&config).await?;
         let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
@@ -239,7 +237,11 @@ impl MaxFactorCmd {
             );
         }
 
-        config.elections.as_mut().unwrap().max_factor = self.value;
+        config
+            .elections
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?
+            .max_factor = self.value;
         save_config(&config, path)?;
         println!("{} Max factor set to {}", "OK".green().bold(), self.value);
         Ok(())

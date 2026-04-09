@@ -10,6 +10,7 @@ use anyhow::Context;
 use common::{
     app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
     time_format,
+    ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
 use contracts::{
@@ -145,11 +146,7 @@ impl RuntimeConfigStore {
         rpc_client: &ClientJsonRpc,
         elections: &ElectionsConfig,
     ) -> anyhow::Result<()> {
-        match rpc_client
-            .get_config_param(17)
-            .await
-            .and_then(common::ton_utils::extract_max_stake_factor)
-        {
+        match rpc_client.get_config_param(17).await.and_then(extract_max_factor) {
             Ok(network_max_factor) => elections.validate(Some(network_max_factor)),
             Err(e) => {
                 tracing::warn!(
