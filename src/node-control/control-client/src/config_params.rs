@@ -8,7 +8,10 @@
  */
 use anyhow::Context;
 use std::str::FromStr;
-use ton_block::{ConfigParam15, SigPubKey, UInt256, ValidatorDescr, ValidatorSet};
+use ton_block::{
+    Coins, ConfigParam15, ConfigParam16, ConfigParam17, SigPubKey, UInt256, ValidatorDescr,
+    ValidatorSet,
+};
 
 pub fn parse_config_param_15(bytes: &[u8]) -> anyhow::Result<ConfigParam15> {
     let param: serde_json::Value =
@@ -103,4 +106,63 @@ fn parse_validator_set(bytes: &[u8], key: &str) -> anyhow::Result<ValidatorSet> 
         list.push(descr);
     }
     ValidatorSet::new(utime_since, utime_until, main, list)
+}
+
+pub fn parse_config_param_16(bytes: &[u8]) -> anyhow::Result<ConfigParam16> {
+    let param: serde_json::Value =
+        serde_json::from_slice(bytes).context("config param 16 is not valid JSON")?;
+    let p16 = param
+        .get("p16")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("p16 not found in JSON"))?;
+
+    let max_validators =
+        p16.get("max_validators")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("max_validators not found"))? as u16;
+    let max_main_validators =
+        p16.get("max_main_validators")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("max_main_validators not found"))? as u16;
+    let min_validators =
+        p16.get("min_validators")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("min_validators not found"))? as u16;
+
+    Ok(ConfigParam16 {
+        max_validators: max_validators.into(),
+        max_main_validators: max_main_validators.into(),
+        min_validators: min_validators.into(),
+    })
+}
+
+pub fn parse_config_param_17(bytes: &[u8]) -> anyhow::Result<ConfigParam17> {
+    let param: serde_json::Value =
+        serde_json::from_slice(bytes).context("config param 17 is not valid JSON")?;
+    let p17 = param
+        .get("p17")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("p17 not found in JSON"))?;
+
+    let parse_coins = |key: &str| -> anyhow::Result<Coins> {
+        let val = p17.get(key).ok_or_else(|| anyhow::anyhow!("{} not found", key))?;
+        // It can be a string (decimal) or a number
+        if let Some(s) = val.as_str() {
+            Ok(Coins::from(u64::from_str_radix(s, 10).context(format!("parse {} as u64", key))?))
+        } else if let Some(n) = val.as_u64() {
+            Ok(Coins::from(n))
+        } else {
+            anyhow::bail!("{} is not a valid coins value", key)
+        }
+    };
+
+    let min_stake = parse_coins("min_stake_dec")?;
+    let max_stake = parse_coins("max_stake_dec")?;
+    let min_total_stake = parse_coins("min_total_stake_dec")?;
+    let max_stake_factor =
+        p17.get("max_stake_factor")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("max_stake_factor not found"))? as u32;
+
+    Ok(ConfigParam17 { min_stake, max_stake, min_total_stake, max_stake_factor })
 }

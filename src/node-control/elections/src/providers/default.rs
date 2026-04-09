@@ -16,10 +16,16 @@ use control_client::{
         AddAdnlAddressRq, AddValidatorAdnlAddrRq, AddValidatorPermKeyRq, AddValidatorTempKeyRq,
         ClientAPI, SignRq,
     },
-    config_params::{parse_config_param_15, parse_config_param_34, parse_config_param_36},
+    config_params::{
+        parse_config_param_15, parse_config_param_16, parse_config_param_17, parse_config_param_34,
+        parse_config_param_36,
+    },
 };
 use std::collections::HashMap;
-use ton_block::{ConfigParam15, ValidatorSet};
+use ton_block::{
+    ConfigParam15, ValidatorSet,
+    config_params::{ConfigParam16, ConfigParam17},
+};
 
 pub struct DefaultElectionsProvider {
     client: ControlClientAdnl,
@@ -128,6 +134,14 @@ impl ElectionsProvider for DefaultElectionsProvider {
     async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet> {
         let bytes = self.client.get_config_param(34).await?;
         parse_config_param_34(&bytes)
+    }
+    async fn config_param_16(&mut self) -> anyhow::Result<ConfigParam16> {
+        let bytes = self.client.get_config_param(16).await?;
+        parse_config_param_16(&bytes)
+    }
+    async fn config_param_17(&mut self) -> anyhow::Result<ConfigParam17> {
+        let bytes = self.client.get_config_param(17).await?;
+        parse_config_param_17(&bytes)
     }
     async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>> {
         match self.client.get_config_param(36).await {
