@@ -177,6 +177,7 @@ impl NodeNetwork {
                 cancellation_token.clone(),
                 None,
                 tokio::runtime::Handle::current(),
+                None,
             );
             overlay.set_quic(quic.clone())?;
             Some(quic)

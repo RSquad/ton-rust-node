@@ -6,6 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+mod rate_limiter;
+mod stat;
+
 use crate::{
     common::{
         add_unbound_object_to_map, add_unbound_object_to_map_with_update, spawn_cancelable,
@@ -14,6 +17,9 @@ use crate::{
     node::AdnlNode,
     transport::{Connections, SendQueue},
 };
+pub use rate_limiter::QuicRateLimitConfig;
+use rate_limiter::{ConnectionRateLimiters, RateLimiter};
+use stat::{extract_inner_tag, tl_tag_name, ConnSnapshot, MsgKind, MsgStats, TransportErrors};
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Formatter, Write},
@@ -25,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 use ton_api::{
-    deserialize_boxed, deserialize_boxed_with_suffix, serialize_boxed,
+    deserialize_boxed, serialize_boxed,
     ton::quic::{
         answer::Answer as QuicAnswer,
         request::{Message as QuicMessage, Query as QuicQuery},
@@ -494,6 +500,8 @@ pub struct QuicNode {
     key_cmd_tx: tokio::sync::mpsc::UnboundedSender<KeyCommand>,
     /// Aggregate error counters (reset each stats dump interval).
     transport_errors: Arc<TransportErrors>,
+    /// Rate limiting configuration for inbound QUIC connections.
+    rate_limit_config: QuicRateLimitConfig,
 }
 
 impl QuicNode {
@@ -552,6 +560,7 @@ impl QuicNode {
         cancellation_token: tokio_util::sync::CancellationToken,
         max_streams_per_connection: Option<usize>,
         runtime_handle: tokio::runtime::Handle,
+        rate_limit_config: Option<QuicRateLimitConfig>,
     ) -> Arc<Self> {
         let max_streams_per_connection =
             max_streams_per_connection.unwrap_or(Self::DEFAULT_MAX_STREAMS_PER_CONNECTION);
@@ -573,6 +582,7 @@ impl QuicNode {
             msg_stats: MsgStats::new(),
             key_cmd_tx,
             transport_errors: TransportErrors::new(),
+            rate_limit_config: rate_limit_config.unwrap_or_default(),
         });
         // Spawn background task that processes key commands inside the Tokio runtime.
         let weak = Arc::downgrade(&transport);
@@ -1184,6 +1194,15 @@ impl QuicNode {
         let per_key_configs = Arc::new(Mutex::new(HashMap::new()));
         let reconnect_tracker = Arc::new(Mutex::new(HashMap::new()));
 
+        let rl_config = self.rate_limit_config.clone();
+        let conn_rate_limiters =
+            ConnectionRateLimiters::new(rl_config.per_ip_capacity, rl_config.per_ip_period);
+        let global_rate_limiter = if rl_config.global_capacity > 0 {
+            Some(RateLimiter::new(rl_config.global_capacity, rl_config.global_period))
+        } else {
+            None
+        };
+
         Self::spawn_accept_loop(
             endpoint.clone(),
             local_key_names.clone(),
@@ -1196,6 +1215,10 @@ impl QuicNode {
             self.msg_stats.clone(),
             per_key_configs.clone(),
             reconnect_tracker.clone(),
+            rl_config,
+            conn_rate_limiters,
+            global_rate_limiter,
+            self.transport_errors.clone(),
         );
 
         let state = Arc::new(EndpointState {
@@ -1341,32 +1364,17 @@ impl QuicNode {
             local {local_key_id} peer {peer_key_id}"
         );
 
+        // Replace any existing inbound connection for this peer path and close the
+        // old one immediately (matches C++ QuicSender::on_connected_inner behaviour).
         let inbound_key = QuicInboundKey(local_key_id.clone(), peer_key_id.clone());
-        let had_existing = {
-            let mut found_existing = false;
-            let result =
-                add_unbound_object_to_map_with_update(&inbound, inbound_key.clone(), |existing| {
-                    if existing.is_some() {
-                        found_existing = true;
-                        // Keep existing entry; resolver task will handle replacement
-                        Ok(None)
-                    } else {
-                        Ok(Some(conn.clone()))
-                    }
-                });
-            if let Err(e) = result {
-                log::warn!(target: TARGET, "Store QUIC inbound for {addr}: {e}");
-                return;
-            }
-            found_existing
-        };
-        if had_existing {
-            tokio::spawn(Self::resolve_duplicate_connection(
-                inbound.clone(),
-                conn.clone(),
-                inbound_key.clone(),
-                addr,
-            ));
+        let old_conn = inbound.remove(&inbound_key).map(|g| g.val().clone());
+        let _ = add_unbound_object_to_map(&inbound, inbound_key.clone(), || Ok(conn.clone()));
+        if let Some(old) = old_conn {
+            log::info!(
+                target: TARGET,
+                "Replacing duplicate inbound from {addr} key {peer_key_id}, closing old"
+            );
+            old.close(0u32.into(), b"duplicate replaced");
         }
 
         let peers = AdnlPeers::with_keys(local_key_id, peer_key_id);
@@ -1742,50 +1750,6 @@ impl QuicNode {
         }
     }
 
-    async fn resolve_duplicate_connection(
-        inbound: Arc<QuicInboundMap>,
-        new_conn: quinn::Connection,
-        key: QuicInboundKey,
-        addr: SocketAddr,
-    ) {
-        use rand::Rng;
-        let delay_ms = rand::thread_rng().gen_range(500..=2500);
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-        let peer_key = &key.1;
-        let old_alive =
-            inbound.get(&key).map(|e| e.val().close_reason().is_none()).unwrap_or(false);
-        let new_alive = new_conn.close_reason().is_none();
-
-        if old_alive && new_alive {
-            // Don't close the old connection — it may be the remote peer's active
-            // outbound. Just replace it in the tracking map; the old connection's
-            // accept loops will continue until idle timeout.
-            if let Some(_old) = inbound.remove(&key) {
-                log::info!(
-                    target: TARGET,
-                    "Replacing old duplicate inbound from {addr} key {peer_key} \
-                   (both alive after {delay_ms}ms)"
-                );
-            }
-            let nc = new_conn.clone();
-            let _ = add_unbound_object_to_map_with_update(&inbound, key, |_| Ok(Some(nc.clone())));
-        } else if new_alive {
-            inbound.remove(&key);
-            log::debug!(
-                target: TARGET,
-                "Old inbound from {addr} key {peer_key} already closed, keeping new"
-            );
-            let nc = new_conn.clone();
-            let _ = add_unbound_object_to_map_with_update(&inbound, key, |_| Ok(Some(nc.clone())));
-        } else {
-            log::debug!(
-                target: TARGET,
-                "New inbound from {addr} key {peer_key} already closed, keeping old"
-            );
-        }
-    }
-
     /// Drain the send queue and exit. Spawned when `message()` has no live
     /// connection and must enqueue data for later delivery. The task establishes
     /// the connection, sends all queued messages, and terminates.
@@ -2116,7 +2080,18 @@ impl QuicNode {
         msg_stats: Arc<MsgStats>,
         per_key_configs: Arc<Mutex<HashMap<String, Arc<quinn::ServerConfig>>>>,
         reconnect_tracker: Arc<Mutex<HashMap<IpAddr, ReconnectTracker>>>,
+        rl_config: QuicRateLimitConfig,
+        mut conn_rate_limiters: ConnectionRateLimiters,
+        mut global_rate_limiter: Option<RateLimiter>,
+        transport_errors: Arc<TransportErrors>,
     ) {
+        log::info!(
+            target: TARGET,
+            "QUIC accept loop on {bind_addr}: Retry={} per_ip_capacity={} global_capacity={}",
+            if rl_config.stateless_retry { "on" } else { "off" },
+            rl_config.per_ip_capacity,
+            rl_config.global_capacity,
+        );
         tokio::spawn(async move {
             loop {
                 log::trace!(target: TARGET, "Loop QUIC server on {bind_addr}");
@@ -2129,6 +2104,16 @@ impl QuicNode {
                         let Some(incoming) = incoming else {
                             log::info!(target: TARGET, "QUIC endpoint on {bind_addr} closed");
                             break;
+                        };
+                        let Some(incoming) = rate_limit(
+                            incoming,
+                            &rl_config,
+                            &mut conn_rate_limiters,
+                            &mut global_rate_limiter,
+                            &transport_errors,
+                            bind_addr,
+                        ) else {
+                            continue;
                         };
                         let addr = incoming.remote_address();
                         log::debug!(target: TARGET, "Accept in QUIC server on {bind_addr} from {addr}");
@@ -2436,12 +2421,20 @@ impl QuicNode {
                     .ok();
                 }
 
-                let (sf, qt, cf, qf, dr) = transport.transport_errors.take();
+                let (sf, qt, cf, qf, dr, rl_ip, rl_gl, retry) = transport.transport_errors.take();
                 Write::write_fmt(
                     &mut dump,
                     format_args!(
                         "  errors: send_failed={sf} query_timeout={qt} \
                     connect_failed={cf} queue_full={qf} dead_conn_removed={dr}\n",
+                    ),
+                )
+                .ok();
+                Write::write_fmt(
+                    &mut dump,
+                    format_args!(
+                        "  rate_limit: per_ip_rejected={rl_ip} global_rejected={rl_gl} \
+                    retry_sent={retry}\n",
                     ),
                 )
                 .ok();
@@ -2456,419 +2449,50 @@ impl QuicNode {
     }
 }
 
-/// Extract the "inner" TL constructor tag from message data.
+/// Apply rate-limiting checks to an incoming QUIC connection.
 ///
-/// QUIC message payloads are typically wrapped in an overlay prefix
-/// (`overlay.message` or `overlay.query`). The outer tag is not useful
-/// for diagnostics. This function skips past the overlay wrapper and
-/// returns the constructor tag of the actual inner payload.
-///
-/// `overlay.message` and `overlay.query` have a fixed layout:
-///   constructor(4 bytes) + int256(32 bytes) = 36 bytes prefix.
-/// `WithExtra` variants have a variable-length extra field, so we
-/// fall back to `deserialize_boxed_with_suffix` for those.
-fn extract_inner_tag(data: &[u8]) -> u32 {
-    if data.len() < 4 {
-        return 0;
-    }
-    let outer = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    // overlay.message / overlay.query: fixed 36-byte prefix (constructor + int256)
-    const FIXED_PREFIX: usize = 4 + 32;
-    match outer {
-        0x75252420 | 0xccfd8443 => {
-            // overlay.message, overlay.query
-            if data.len() >= FIXED_PREFIX + 4 {
-                let s = &data[FIXED_PREFIX..];
-                return u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-            }
-            outer
+/// Returns `Some(incoming)` if the connection is allowed to proceed,
+/// or `None` if it was rejected (retry sent, refused, or ignored).
+fn rate_limit(
+    incoming: quinn::Incoming,
+    config: &QuicRateLimitConfig,
+    conn_rate_limiters: &mut ConnectionRateLimiters,
+    global_rate_limiter: &mut Option<RateLimiter>,
+    transport_errors: &TransportErrors,
+    bind_addr: SocketAddr,
+) -> Option<quinn::Incoming> {
+    let addr = incoming.remote_address();
+
+    // Layer 1: Stateless Retry — force address validation
+    if config.stateless_retry && !incoming.remote_address_validated() && incoming.may_retry() {
+        log::trace!(target: TARGET, "Sending QUIC Retry to unvalidated {addr} on {bind_addr}");
+        transport_errors.retry_sent.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = incoming.retry() {
+            log::warn!(target: TARGET, "QUIC retry failed for {addr}: {e}");
         }
-        0xa232233d | 0x94ffc3e9 => {
-            // overlay.messageWithExtra, overlay.queryWithExtra
-            if let Ok((_obj, suffix_offset)) = deserialize_boxed_with_suffix(data) {
-                if suffix_offset + 4 <= data.len() {
-                    let s = &data[suffix_offset..];
-                    return u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                }
-            }
-            outer
-        }
-        _ => outer,
-    }
-}
-
-/// Map well-known TL constructor tags to short human-readable names for log output.
-fn tl_tag_name(tag: u32) -> &'static str {
-    match tag {
-        0x75252420 => "overlay.message",
-        0xa232233d => "overlay.messageWithExtra",
-        0xccfd8443 => "overlay.query",
-        0x94ffc3e9 => "overlay.queryWithExtra",
-        0xb15a2b6b => "overlay.broadcast",
-        0xbad7c36a => "overlay.broadcastFec",
-        0xf1881342 => "overlay.broadcastFecShort",
-        0x46efae62 => "overlay.broadcastStream",
-        0xf99fd63d => "overlay.broadcastTwostepFec",
-        0x80b859b0 => "overlay.broadcastTwostepSimple",
-        0x33534e24 => "overlay.unicast",
-        0xd55c14ec => "overlay.fec.received",
-        0x09d76914 => "overlay.fec.completed",
-        0x48ee64ab => "overlay.getRandomPeers",
-        0xa58e7ecc => "overlay.getRandomPeersV2",
-        0x690cb481 => "overlay.ping",
-        0x236758c4 => "catchain.blockUpdate",
-        0x9283ce37 => "validatorSession.blockUpdate",
-        0xbe7b573a => "consensus.simplex.certificate",
-        0xc37ef4f3 => "consensus.simplex.vote",
-        0x543fba6c => "consensus.simplex.requestCandidate",
-        _ => "unknown",
-    }
-}
-
-/// Aggregate error counters for the QUIC transport layer (lock-free, reset on each stats dump).
-struct TransportErrors {
-    /// send_via_stream / send_via_stream_nowait failures (stream open, write, finish errors)
-    send_failed: AtomicU64,
-    /// query timeouts (deadline exceeded waiting for response)
-    query_timeout: AtomicU64,
-    /// connection establishment failures (connect / handshake errors)
-    connect_failed: AtomicU64,
-    /// messages dropped because the per-peer send queue was full
-    queue_full: AtomicU64,
-    /// dead connections removed (by checker or on send failure)
-    dead_conn_removed: AtomicU64,
-}
-
-impl TransportErrors {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            send_failed: AtomicU64::new(0),
-            query_timeout: AtomicU64::new(0),
-            connect_failed: AtomicU64::new(0),
-            queue_full: AtomicU64::new(0),
-            dead_conn_removed: AtomicU64::new(0),
-        })
+        return None;
     }
 
-    /// Take current values and reset to zero; returns (send_failed, query_timeout,
-    /// connect_failed, queue_full, dead_conn_removed).
-    fn take(&self) -> (u64, u64, u64, u64, u64) {
-        (
-            self.send_failed.swap(0, Ordering::Relaxed),
-            self.query_timeout.swap(0, Ordering::Relaxed),
-            self.connect_failed.swap(0, Ordering::Relaxed),
-            self.queue_full.swap(0, Ordering::Relaxed),
-            self.dead_conn_removed.swap(0, Ordering::Relaxed),
-        )
+    // Layer 2: Per-IP rate limit
+    if !conn_rate_limiters.take_new_connection(addr.ip()) {
+        log::debug!(target: TARGET, "Per-IP rate limit for {} on {bind_addr}", addr.ip());
+        transport_errors.rate_limited_per_ip.fetch_add(1, Ordering::Relaxed);
+        incoming.refuse();
+        return None;
     }
-}
 
-/// Snapshot of cumulative counters from a single connection, used to compute deltas.
-#[derive(Clone, Copy)]
-struct ConnSnapshot {
-    tx_bytes: u64,
-    tx_dgrams: u64,
-    rx_bytes: u64,
-    rx_dgrams: u64,
-    lost_pkts: u64,
-    /// When this connection was first observed by the stats dumper.
-    connected_since: Instant,
-}
+    // Periodic cleanup of stale per-IP entries
+    conn_rate_limiters.cleanup();
 
-impl ConnSnapshot {
-    fn new(s: &quinn::ConnectionStats, connected_since: Instant) -> Self {
-        Self {
-            tx_bytes: s.udp_tx.bytes,
-            tx_dgrams: s.udp_tx.datagrams,
-            rx_bytes: s.udp_rx.bytes,
-            rx_dgrams: s.udp_rx.datagrams,
-            lost_pkts: s.path.lost_packets,
-            connected_since,
+    // Layer 3: Global rate limit
+    if let Some(ref mut gl) = global_rate_limiter {
+        if !gl.take() {
+            log::debug!(target: TARGET, "Global rate limit on {bind_addr}, refusing {addr}");
+            transport_errors.rate_limited_global.fetch_add(1, Ordering::Relaxed);
+            incoming.refuse();
+            return None;
         }
     }
 
-    fn delta(&self, prev: &Self) -> Self {
-        Self {
-            tx_bytes: self.tx_bytes.saturating_sub(prev.tx_bytes),
-            tx_dgrams: self.tx_dgrams.saturating_sub(prev.tx_dgrams),
-            rx_bytes: self.rx_bytes.saturating_sub(prev.rx_bytes),
-            rx_dgrams: self.rx_dgrams.saturating_sub(prev.rx_dgrams),
-            lost_pkts: self.lost_pkts.saturating_sub(prev.lost_pkts),
-            connected_since: self.connected_since,
-        }
-    }
-
-    fn uptime_str(&self) -> String {
-        let secs = self.connected_since.elapsed().as_secs();
-        if secs < 60 {
-            format!("{secs}s")
-        } else if secs < 3600 {
-            format!("{}m{}s", secs / 60, secs % 60)
-        } else if secs < 36 * 3600 {
-            format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-        } else {
-            let days = secs / 86400;
-            let hours = (secs % 86400) / 3600;
-            let mins = (secs % 3600) / 60;
-            format!("{days}d{hours}h{mins}m")
-        }
-    }
-}
-
-/// Per-TL-tag message counters (lock-free atomics, collected per dump interval).
-struct MsgTagCounters {
-    count: AtomicU64,
-    bytes: AtomicU64,
-}
-
-impl MsgTagCounters {
-    fn new() -> Self {
-        Self { count: AtomicU64::new(0), bytes: AtomicU64::new(0) }
-    }
-
-    fn record(&self, size: usize) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(size as u64, Ordering::Relaxed);
-    }
-
-    /// Take current values and reset to zero.
-    fn take(&self) -> (u64, u64) {
-        (self.count.swap(0, Ordering::Relaxed), self.bytes.swap(0, Ordering::Relaxed))
-    }
-}
-
-/// Classification of a QUIC message for telemetry.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum MsgKind {
-    Message,
-    Query,
-    Answer,
-    NoAnswer,
-}
-
-impl MsgKind {
-    fn label(&self) -> &'static str {
-        match self {
-            MsgKind::Message => "msg   ",
-            MsgKind::Query => "query ",
-            MsgKind::Answer => "ans   ",
-            MsgKind::NoAnswer => "no_ans",
-        }
-    }
-}
-
-/// Per-peer, per-TL-tag message statistics key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct MsgStatsKey {
-    addr: SocketAddr,
-    tag: u32,
-    is_outbound: bool,
-    kind: MsgKind,
-}
-
-/// Tracks per-peer, per-message-kind statistics for QUIC traffic.
-struct MsgStats {
-    counters: lockfree::map::Map<MsgStatsKey, MsgTagCounters>,
-}
-
-impl MsgStats {
-    fn new() -> Arc<Self> {
-        Arc::new(Self { counters: lockfree::map::Map::new() })
-    }
-
-    fn record(&self, tag: u32, size: usize, addr: SocketAddr, is_outbound: bool, kind: MsgKind) {
-        let key = MsgStatsKey { addr, tag, is_outbound, kind };
-        if let Some(entry) = self.counters.get(&key) {
-            entry.val().record(size);
-            return;
-        }
-        let _ = add_unbound_object_to_map(&self.counters, key, || Ok(MsgTagCounters::new()));
-        if let Some(entry) = self.counters.get(&key) {
-            entry.val().record(size);
-        }
-    }
-
-    /// Drain all counters and return entries sorted by peer then bytes desc.
-    /// Entries with zero activity since the last drain are removed
-    fn drain(&self) -> Vec<(MsgStatsKey, u64, u64)> {
-        let mut result = Vec::new();
-        let mut stale = Vec::new();
-        for entry in self.counters.iter() {
-            let (count, bytes) = entry.val().take();
-            if count > 0 {
-                result.push((*entry.key(), count, bytes));
-            } else {
-                stale.push(*entry.key());
-            }
-        }
-        for key in stale {
-            self.counters.remove(&key);
-        }
-        result.sort_by(|a, b| a.0.addr.cmp(&b.0.addr).then(b.2.cmp(&a.2)));
-        result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- extract_inner_tag ---
-
-    /// Helper: build an overlay.message (0x75252420) wrapping the given inner tag.
-    fn make_overlay_message(inner_tag: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0x75252420u32.to_le_bytes()); // outer tag
-        buf.extend_from_slice(&[0u8; 32]); // overlay int256
-        buf.extend_from_slice(&inner_tag.to_le_bytes()); // inner payload tag
-        buf
-    }
-
-    /// Helper: build an overlay.query (0xccfd8443) wrapping the given inner tag.
-    fn make_overlay_query(inner_tag: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&0xccfd8443u32.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 32]);
-        buf.extend_from_slice(&inner_tag.to_le_bytes());
-        buf
-    }
-
-    #[test]
-    fn test_extract_inner_tag_empty() {
-        assert_eq!(extract_inner_tag(&[]), 0);
-        assert_eq!(extract_inner_tag(&[1, 2, 3]), 0);
-    }
-
-    #[test]
-    fn test_extract_inner_tag_unknown_outer() {
-        let data = 0xDEADBEEFu32.to_le_bytes();
-        assert_eq!(extract_inner_tag(&data), 0xDEADBEEF);
-    }
-
-    #[test]
-    fn test_extract_inner_tag_overlay_message() {
-        let data = make_overlay_message(0x236758c4); // catchain.blockUpdate
-        assert_eq!(extract_inner_tag(&data), 0x236758c4);
-    }
-
-    #[test]
-    fn test_extract_inner_tag_overlay_query() {
-        let data = make_overlay_query(0x48ee64ab); // overlay.getRandomPeers
-        assert_eq!(extract_inner_tag(&data), 0x48ee64ab);
-    }
-
-    #[test]
-    fn test_extract_inner_tag_overlay_message_too_short() {
-        // outer tag + partial overlay id (not enough for inner tag)
-        let mut data = Vec::new();
-        data.extend_from_slice(&0x75252420u32.to_le_bytes());
-        data.extend_from_slice(&[0u8; 30]); // only 30 bytes, need 32 + 4
-        assert_eq!(extract_inner_tag(&data), 0x75252420); // falls back to outer
-    }
-
-    // --- MsgStats ---
-
-    fn test_addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
-    }
-
-    #[test]
-    fn test_msg_stats_record_and_drain() {
-        let stats = MsgStats::new();
-        let addr = test_addr(1000);
-
-        stats.record(0xAA, 100, addr, true, MsgKind::Message);
-        stats.record(0xAA, 200, addr, true, MsgKind::Message);
-        stats.record(0xBB, 50, addr, true, MsgKind::Query);
-
-        let entries = stats.drain();
-        assert_eq!(entries.len(), 2);
-
-        // Sorted by addr (same), then bytes desc: AA(300) before BB(50)
-        assert_eq!(entries[0].0.tag, 0xAA);
-        assert_eq!(entries[0].1, 2); // count
-        assert_eq!(entries[0].2, 300); // bytes
-
-        assert_eq!(entries[1].0.tag, 0xBB);
-        assert_eq!(entries[1].1, 1);
-        assert_eq!(entries[1].2, 50);
-    }
-
-    #[test]
-    fn test_msg_stats_drain_sorts_by_addr_then_bytes() {
-        let stats = MsgStats::new();
-        let addr_a = test_addr(1000);
-        let addr_b = test_addr(2000);
-
-        stats.record(0xAA, 10, addr_b, true, MsgKind::Message);
-        stats.record(0xBB, 500, addr_a, true, MsgKind::Message);
-        stats.record(0xCC, 100, addr_a, true, MsgKind::Message);
-
-        let entries = stats.drain();
-        assert_eq!(entries.len(), 3);
-
-        // addr_a (port 1000) first, sorted by bytes desc
-        assert_eq!(entries[0].0.addr, addr_a);
-        assert_eq!(entries[0].0.tag, 0xBB); // 500 bytes
-        assert_eq!(entries[1].0.addr, addr_a);
-        assert_eq!(entries[1].0.tag, 0xCC); // 100 bytes
-
-        // addr_b (port 2000) last
-        assert_eq!(entries[2].0.addr, addr_b);
-        assert_eq!(entries[2].0.tag, 0xAA);
-    }
-
-    #[test]
-    fn test_msg_stats_drain_resets_counters() {
-        let stats = MsgStats::new();
-        let addr = test_addr(1000);
-
-        stats.record(0xAA, 100, addr, true, MsgKind::Message);
-        let entries = stats.drain();
-        assert_eq!(entries.len(), 1);
-
-        // Second drain: no new activity, should return empty
-        let entries = stats.drain();
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn test_msg_stats_drain_evicts_stale_keys() {
-        let stats = MsgStats::new();
-        let addr = test_addr(1000);
-
-        stats.record(0xAA, 100, addr, true, MsgKind::Message);
-        stats.record(0xBB, 50, addr, false, MsgKind::Message);
-
-        // First drain: both active, counters reset
-        let _ = stats.drain();
-
-        // Only record on 0xAA
-        stats.record(0xAA, 200, addr, true, MsgKind::Message);
-
-        // Second drain: 0xBB was idle → evicted
-        let _ = stats.drain();
-
-        // Record on 0xBB again — must re-insert (was evicted)
-        stats.record(0xBB, 30, addr, false, MsgKind::Message);
-        let entries = stats.drain();
-
-        // 0xAA was idle since last drain (evicted), only 0xBB with activity is returned
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0.tag, 0xBB);
-        assert_eq!(entries[0].2, 30);
-    }
-
-    #[test]
-    fn test_msg_stats_distinguishes_direction_and_kind() {
-        let stats = MsgStats::new();
-        let addr = test_addr(1000);
-
-        stats.record(0xAA, 100, addr, true, MsgKind::Message); // outbound msg
-        stats.record(0xAA, 200, addr, false, MsgKind::Message); // inbound msg
-        stats.record(0xAA, 300, addr, true, MsgKind::Query); // outbound query
-
-        let entries = stats.drain();
-        assert_eq!(entries.len(), 3);
-    }
+    Some(incoming)
 }

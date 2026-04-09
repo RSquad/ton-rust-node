@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use simplex::*;
 use spin::mutex::SpinMutex;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs::{self, File},
     io::{self, Cursor, LineWriter, Write},
     path::Path,
@@ -371,10 +371,6 @@ struct SessionInstance {
     finalized_seqnos: Arc<Mutex<HashSet<u32>>>,
     /// Session errors count
     session_errors_count: Arc<AtomicU32>,
-    /// Approved candidates storage for get_approved_candidate() during restart recovery.
-    /// Keyed by root_hash to match lookup semantics.
-    approved_candidates:
-        Arc<Mutex<HashMap<UInt256, Arc<consensus_common::ValidatorBlockCandidate>>>>,
     /// Shared finalized block roots for harness-level introspection.
     finalized_blocks: FinalizedBlocksMap,
     _session: SessionPtr,
@@ -384,10 +380,6 @@ struct SessionInstance {
 /// Listener wrapper that delegates to SessionInstance
 struct SessionInstanceListener {
     instance: SpinMutex<Weak<SpinMutex<SessionInstance>>>,
-    /// Approved candidates storage - shared with SessionInstance but available immediately
-    /// before session creation to support get_approved_candidate() during startup recovery.
-    approved_candidates:
-        Arc<Mutex<HashMap<UInt256, Arc<consensus_common::ValidatorBlockCandidate>>>>,
     /// Maximum finalized seqno - shared with SessionInstance, available immediately.
     max_finalized_seqno: Arc<AtomicU32>,
     /// Finalized seqnos set - shared with SessionInstance, available immediately.
@@ -498,34 +490,6 @@ impl SessionListener for SessionInstance {
                 source_info.source.id()
             )));
             return;
-        }
-
-        // Store approved candidate for get_approved_candidate() during restart recovery.
-        // This allows us to respond to requestCandidate queries after restart.
-        {
-            let collated_data_bytes = _collated_data.data().to_vec();
-            let data_bytes = data.data().to_vec();
-            let file_hash = UInt256::from_slice(&sha256_digest(&data_bytes));
-            let collated_file_hash = UInt256::from_slice(&sha256_digest(&collated_data_bytes));
-
-            let candidate = Arc::new(consensus_common::ValidatorBlockCandidate {
-                public_key: source_info.source.clone(),
-                id: BlockIdExt::with_params(
-                    ShardIdent::masterchain(),
-                    collated_data.seqno, // Use seqno for lookup consistency
-                    root_hash.clone(),
-                    file_hash,
-                ),
-                collated_file_hash,
-                data: consensus_common::ConsensusCommonFactory::create_block_payload(data_bytes),
-                collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
-                    collated_data_bytes,
-                ),
-            });
-
-            if let Ok(mut map) = self.approved_candidates.lock() {
-                map.insert(root_hash, candidate);
-            }
         }
 
         callback(Ok(SystemTime::now()))
@@ -708,62 +672,18 @@ impl SessionListener for SessionInstance {
 
     fn get_approved_candidate(
         &self,
-        source: PublicKey,
+        _source: PublicKey,
         root_hash: BlockHash,
-        file_hash: BlockHash,
-        collated_data_hash: BlockHash,
-        callback: ValidatorBlockCandidateCallback,
+        _file_hash: BlockHash,
+        _collated_data_hash: BlockHash,
+        _callback: ValidatorBlockCandidateCallback,
     ) {
-        log::info!(
-            "SessionListener::get_approved_candidate: \
-            request for block hash {:?} from source {:?} (self source #{})",
-            root_hash.to_hex_string(),
-            source.id(),
-            self.source_index
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex consensus test \
+             (source #{}, root_hash={}); active simplex flow must not use this callback",
+            self.source_index,
+            root_hash.to_hex_string()
         );
-
-        // Lookup candidate by root_hash
-        let candidate =
-            self.approved_candidates.lock().ok().and_then(|map| map.get(&root_hash).cloned());
-
-        match candidate {
-            Some(c) => {
-                log::debug!(
-                    "SessionListener::get_approved_candidate: found candidate for root_hash={} (source #{})",
-                    root_hash.to_hex_string(),
-                    self.source_index
-                );
-                // Sanity: file_hash and collated_data_hash should match
-                if c.id.file_hash != file_hash {
-                    log::warn!(
-                        "get_approved_candidate: file_hash mismatch: stored={} requested={} (source #{})",
-                        c.id.file_hash.to_hex_string(),
-                        file_hash.to_hex_string(),
-                        self.source_index
-                    );
-                }
-                if c.collated_file_hash != collated_data_hash {
-                    log::warn!(
-                        "get_approved_candidate: collated_data_hash mismatch: stored={} requested={} (source #{})",
-                        c.collated_file_hash.to_hex_string(),
-                        collated_data_hash.to_hex_string(),
-                        self.source_index
-                    );
-                }
-                callback(Ok(c));
-            }
-            None => {
-                log::warn!(
-                    "SessionListener::get_approved_candidate: candidate not found for root_hash={} (source #{})",
-                    root_hash.to_hex_string(),
-                    self.source_index
-                );
-                callback(Err(error!(
-                    "approved candidate not found for root_hash={}",
-                    root_hash.to_hex_string()
-                )));
-            }
-        }
     }
 }
 
@@ -898,39 +818,13 @@ impl SessionListener for SessionInstanceListener {
         root_hash: BlockHash,
         _file_hash: BlockHash,
         _collated_data_hash: BlockHash,
-        callback: ValidatorBlockCandidateCallback,
+        _callback: ValidatorBlockCandidateCallback,
     ) {
-        // Access approved_candidates directly - available even before SessionInstance is wired.
-        // This fixes Issue 2 from RESTART-GREMLIN-1: startup recovery calls get_approved_candidate
-        // during create_session, before listener.instance is set.
-        let candidates_count = self.approved_candidates.lock().ok().map(|m| m.len()).unwrap_or(0);
-        log::info!(
-            "[restart-gremlin] get_approved_candidate: root_hash={} candidates_stored={}",
-            &root_hash.to_hex_string()[..8],
-            candidates_count
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex consensus listener \
+             (root_hash={}); active simplex flow must not use this callback",
+            root_hash.to_hex_string()
         );
-
-        // Lookup candidate by root_hash
-        let candidate =
-            self.approved_candidates.lock().ok().and_then(|m| m.get(&root_hash).cloned());
-
-        if let Some(cand) = candidate {
-            log::info!(
-                "[restart-gremlin] get_approved_candidate: FOUND block {} (seq_no={})",
-                &root_hash.to_hex_string()[..8],
-                cand.id.seq_no()
-            );
-            callback(Ok(cand));
-        } else {
-            log::warn!(
-                "[restart-gremlin] get_approved_candidate: NOT FOUND block {}",
-                &root_hash.to_hex_string()[..8]
-            );
-            callback(Err(error!(
-                "Approved candidate not found for root_hash={}",
-                root_hash.to_hex_string()
-            )));
-        }
     }
 }
 
@@ -1177,19 +1071,11 @@ where
         let local_key = nodes[i].public_key.clone();
         let initial_block_seqno = 1u32; // First block seqno=1 (seqno 0 is zerostate)
 
-        // Create approved_candidates storage BEFORE session creation.
-        // This fixes Issue 2 from RESTART-GREMLIN-1: get_approved_candidate() is called
-        // during create_session (startup recovery), before SessionInstance is wired.
-        let approved_candidates: Arc<
-            Mutex<HashMap<UInt256, Arc<consensus_common::ValidatorBlockCandidate>>>,
-        > = Arc::new(Mutex::new(HashMap::new()));
-
         let max_finalized_seqno = Arc::new(AtomicU32::new(initial_block_seqno));
         let finalized_seqnos: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let listener = Arc::new(SessionInstanceListener {
             instance: SpinMutex::new(Weak::new()),
-            approved_candidates: approved_candidates.clone(),
             max_finalized_seqno: max_finalized_seqno.clone(),
             finalized_seqnos: finalized_seqnos.clone(),
         });
@@ -1225,7 +1111,6 @@ where
             max_finalized_seqno: max_finalized_seqno.clone(),
             finalized_seqnos: finalized_seqnos.clone(),
             session_errors_count: Arc::new(AtomicU32::new(0)),
-            approved_candidates: approved_candidates.clone(),
             finalized_blocks: finalized_blocks.clone(),
             source_index: i as u32,
             _session: session,
@@ -1389,7 +1274,7 @@ where
         });
 
     'main_loop: loop {
-        // PANIC-1: fail fast if any session thread panicked.
+        // Fail fast if any session thread panicked.
         // Otherwise the test may stall waiting for progress that will never happen.
         for (idx, inst) in instances.iter().enumerate() {
             let inst = inst.lock();
@@ -1506,30 +1391,14 @@ where
 
                         let ctx = &session_contexts[node_idx];
 
-                        // CRITICAL: Preserve the OLD approved_candidates from the stopped instance.
-                        // The new session's startup recovery will call get_approved_candidate()
-                        // to restore candidates from persistent storage. These candidates were
-                        // stored by the old session's on_generate_slot and on_candidate calls.
-                        let (
-                            old_approved_candidates,
-                            prev_next_seqno,
-                            prev_commits,
-                            finalized_seqnos,
-                        ) = {
+                        let (prev_next_seqno, prev_commits, finalized_seqnos) = {
                             let inst = instances[node_idx].lock();
                             (
-                                inst.approved_candidates.clone(),
                                 inst.max_finalized_seqno.load(Ordering::SeqCst),
                                 inst.on_block_finalized_count.load(Ordering::SeqCst),
                                 inst.finalized_seqnos.clone(),
                             )
                         };
-                        let candidates_count =
-                            old_approved_candidates.lock().map(|m| m.len()).unwrap_or(0);
-                        log::info!(
-                            "[restart-gremlin] Preserving {} approved candidates from old instance for recovery",
-                            candidates_count
-                        );
 
                         // Create seqno counters BEFORE listener - they will be updated by
                         // on_block_finalized during recovery, before SessionInstance is wired.
@@ -1541,7 +1410,6 @@ where
 
                         let new_listener = Arc::new(SessionInstanceListener {
                             instance: SpinMutex::new(Weak::new()),
-                            approved_candidates: old_approved_candidates.clone(),
                             max_finalized_seqno: max_finalized_seqno.clone(),
                             finalized_seqnos: finalized_seqnos.clone(),
                         });
@@ -1595,7 +1463,6 @@ where
                                     max_finalized_seqno: max_finalized_seqno.clone(),
                                     finalized_seqnos: finalized_seqnos.clone(),
                                     session_errors_count: Arc::new(AtomicU32::new(0)),
-                                    approved_candidates: old_approved_candidates.clone(),
                                     finalized_blocks: finalized_blocks.clone(),
                                     source_index: node_idx as u32,
                                     _session: session,
@@ -1630,8 +1497,6 @@ where
                                         .clone_from(&new_inst.finalized_seqnos);
                                     old_inst.session_errors_count =
                                         new_inst.session_errors_count.clone();
-                                    old_inst.approved_candidates =
-                                        new_inst.approved_candidates.clone();
                                     old_inst.finalized_blocks = new_inst.finalized_blocks.clone();
                                     old_inst._session = new_inst._session.clone();
                                     old_inst._listener = new_inst._listener.clone();
@@ -2488,15 +2353,11 @@ fn test_simplex_start_gate() {
     for i in 0..node_count {
         let local_key = nodes[i].public_key.clone();
         let db_path = format!("{}_node{}", db_path_base, i);
-        let approved_candidates: Arc<
-            Mutex<HashMap<UInt256, Arc<consensus_common::ValidatorBlockCandidate>>>,
-        > = Arc::new(Mutex::new(HashMap::new()));
         let max_finalized_seqno = Arc::new(AtomicU32::new(initial_block_seqno));
         let finalized_seqnos: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let listener = Arc::new(SessionInstanceListener {
             instance: SpinMutex::new(Weak::new()),
-            approved_candidates: approved_candidates.clone(),
             max_finalized_seqno: max_finalized_seqno.clone(),
             finalized_seqnos: finalized_seqnos.clone(),
         });
@@ -2528,7 +2389,6 @@ fn test_simplex_start_gate() {
             max_finalized_seqno,
             finalized_seqnos,
             session_errors_count: Arc::new(AtomicU32::new(0)),
-            approved_candidates,
             finalized_blocks: finalized_blocks.clone(),
             _session: session.clone(),
             _listener: listener.clone(),

@@ -600,7 +600,7 @@ pub enum ConsensusType {
     /// Old catchain-based validator-session (default)
     #[default]
     Catchain,
-    /// New Alpenglow-based simplex consensus
+    /// Simplex consensus
     Simplex,
 }
 

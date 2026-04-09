@@ -285,7 +285,7 @@ pub async fn run_accept_block_query(
 
 pub async fn run_collate_query(
     shard: ShardIdent,
-    _min_ts: SystemTime,
+    min_ts: SystemTime,
     min_mc_seqno: u32,
     prev: &PrevBlockHistory,
     pipeline_context: PipelineContext,
@@ -308,7 +308,14 @@ pub async fn run_collate_query(
         UInt256::from(collator_id.pub_key()?),
         engine.clone(),
         None,
-        CollatorSettings { is_simplex, ..Default::default() },
+        CollatorSettings {
+            is_simplex,
+            min_gen_utime_ms: Some(
+                min_ts.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis()
+                    as u64,
+            ),
+            ..Default::default()
+        },
     )?;
     let collate_result = collator.collate().await;
 

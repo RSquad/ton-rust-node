@@ -211,12 +211,17 @@ impl SessionListener for ValidationTestListener {
     fn get_approved_candidate(
         &self,
         _source: PublicKey,
-        _root_hash: BlockHash,
+        root_hash: BlockHash,
         _file_hash: BlockHash,
         _collated_data_hash: BlockHash,
         _callback: ValidatorBlockCandidateCallback,
     ) {
-        // Not used in this test
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex validation test \
+             (node_idx={}, root_hash={}); active simplex flow must not use this callback",
+            self.node_idx,
+            root_hash.to_hex_string()
+        );
     }
 }
 

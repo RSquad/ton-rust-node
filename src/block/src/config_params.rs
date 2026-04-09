@@ -3806,6 +3806,8 @@ pub struct NoncriticalParams {
     pub max_leader_window_desync: u32,                  // idx 10, uint32
     pub bad_signature_ban_duration_ms: u32,             // idx 11, duration
     pub candidate_resolve_rate_limit: u32,              // idx 12, uint32
+    pub min_block_interval_ms: u32,                     // idx 13, duration
+    pub no_empty_blocks_on_error_timeout_ms: u32,       // idx 14, duration
 }
 
 impl Default for NoncriticalParams {
@@ -3824,6 +3826,8 @@ impl Default for NoncriticalParams {
             max_leader_window_desync: 250,
             bad_signature_ban_duration_ms: 5_000,
             candidate_resolve_rate_limit: 10,
+            min_block_interval_ms: 0,
+            no_empty_blocks_on_error_timeout_ms: 15_000,
         }
     }
 }
@@ -3845,6 +3849,8 @@ impl NoncriticalParams {
             10 => self.max_leader_window_desync = value,
             11 => self.bad_signature_ban_duration_ms = value,
             12 => self.candidate_resolve_rate_limit = value,
+            13 => self.min_block_interval_ms = value,
+            14 => self.no_empty_blocks_on_error_timeout_ms = value,
             _ => {}
         }
     }
@@ -3874,6 +3880,8 @@ impl NoncriticalParams {
             (10, self.max_leader_window_desync),
             (11, self.bad_signature_ban_duration_ms),
             (12, self.candidate_resolve_rate_limit),
+            (13, self.min_block_interval_ms),
+            (14, self.no_empty_blocks_on_error_timeout_ms),
         ])
     }
 }
@@ -3902,8 +3910,8 @@ impl Default for SimplexConfig {
     }
 }
 
-/// Maximum noncritical param key defined in the C++ reference (candidate_resolve_rate_limit).
-const NONCRITICAL_PARAMS_MAX_KEY: u8 = 12;
+/// Maximum noncritical param key defined in the C++ reference.
+const NONCRITICAL_PARAMS_MAX_KEY: u8 = 14;
 
 /// Always serializes as simplex_config_v2#22 (the current on-chain format).
 impl Serializable for SimplexConfig {

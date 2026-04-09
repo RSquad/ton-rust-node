@@ -2187,11 +2187,14 @@ impl Collator {
         let prev = max(mc_data.state().state()?.gen_time(), prev_now);
         log::trace!("{}: init_utime prev_time: {}", self.collated_block_descr, prev);
         let allow_same_timestamp = self.allow_same_timestamp(mc_data);
+        let now_ms = self.collator_settings.min_gen_utime_ms.map_or_else(
+            || self.engine.now_ms(),
+            |min_now_ms| self.engine.now_ms().max(min_now_ms),
+        );
         // Compute gen_utime_ms first, then derive gen_utime from it (like C++).
         // This guarantees gen_utime_ms / 1000 == gen_utime, avoiding second-boundary
         // mismatches in ConsensusExtraData validation.
-        let (gen_utime, gen_utime_ms) =
-            Self::calc_utime(prev, self.engine.now_ms(), allow_same_timestamp);
+        let (gen_utime, gen_utime_ms) = Self::calc_utime(prev, now_ms, allow_same_timestamp);
         Ok((gen_utime, gen_utime_ms))
     }
 
