@@ -125,13 +125,13 @@ impl VoteLsCmd {
                 println!(
                     "\n  {:<3} {:<66} {:<7} {:<9} {:<14} {:<7} {:<7} {}",
                     "".bold(),
-                    "Hash".bold(),
-                    "Param".bold(),
-                    "Critical".bold(),
-                    "Expires".bold(),
-                    "Voters".bold(),
-                    "Rounds".bold(),
-                    "W/L".bold(),
+                    "Hash".cyan().bold(),
+                    "Param".cyan().bold(),
+                    "Critical".cyan().bold(),
+                    "Expires".cyan().bold(),
+                    "Voters".cyan().bold(),
+                    "Rounds".cyan().bold(),
+                    "W/L".cyan().bold(),
                 );
                 println!("  {}", "\u{2500}".repeat(126).dimmed());
                 for row in &rows {
@@ -229,31 +229,32 @@ impl VoteInspectCmd {
                 println!("{}", serde_json::to_string_pretty(&detail)?);
             }
             OutputFormat::Table => {
-                println!("\n{}", "Proposal Details".bold());
+                println!("\n{}", "Proposal Details".cyan().bold());
                 println!("{}", "\u{2500}".repeat(80).dimmed());
-                println!("  {:<20} {}", "Hash:".bold(), detail.hash);
-                println!("  {:<20} p{}", "Param ID:".bold(), detail.param_id);
+                println!("  {:<20} {}", "Hash:".cyan().bold(), detail.hash);
+                println!("  {:<20} p{}", "Param ID:".cyan().bold(), detail.param_id);
                 println!(
                     "  {:<20} {}",
-                    "Critical:".bold(),
+                    "Critical:".cyan().bold(),
                     if detail.is_critical { "yes" } else { "no" }
                 );
-                println!("  {:<20} {} ({})", "Expires:".bold(), detail.expires, detail.expires_in);
-                println!("  {:<20} {}", "Rounds remaining:".bold(), detail.rounds_remaining);
-                println!("  {:<20} {}", "Wins:".bold(), detail.wins);
-                println!("  {:<20} {}", "Losses:".bold(), detail.losses);
-                println!("  {:<20} {}", "Weight remaining:".bold(), detail.weight_remaining);
                 println!(
-                    "  {:<20} {}...",
-                    "Vset ID:".bold(),
-                    &detail.vset_id[..detail.vset_id.len().min(16)]
+                    "  {:<20} {} ({})",
+                    "Expires:".cyan().bold(),
+                    detail.expires,
+                    detail.expires_in
                 );
-                println!("  {:<20} {:?}", "Voters:".bold(), detail.voters);
+                println!("  {:<20} {}", "Rounds remaining:".cyan().bold(), detail.rounds_remaining);
+                println!("  {:<20} {}", "Wins:".cyan().bold(), detail.wins);
+                println!("  {:<20} {}", "Losses:".cyan().bold(), detail.losses);
+                println!("  {:<20} {}", "Weight remaining:".cyan().bold(), detail.weight_remaining);
+                println!("  {:<20} {}", "Vset ID:".cyan().bold(), &detail.vset_id);
+                println!("  {:<20} {:?}", "Voters:".cyan().bold(), detail.voters);
                 if let Some(ref boc) = detail.param_cell_boc {
-                    println!("  {:<20} {}", "Param cell (b64):".bold(), boc);
+                    println!("  {:<20} {}", "Param cell (b64):".cyan().bold(), boc);
                 }
                 if let Some(ref h) = detail.param_hash {
-                    println!("  {:<20} {}", "Param hash:".bold(), h);
+                    println!("  {:<20} {}", "Param hash:".cyan().bold(), h);
                 }
                 println!();
             }
