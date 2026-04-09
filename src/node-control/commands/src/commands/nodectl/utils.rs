@@ -29,6 +29,9 @@ const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2)
 pub const SEND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
+/// Logical name for the master wallet in CLI, `get_wallet_config`, and `config wallet ls`.
+pub const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
+
 pub fn warn_missing_secret(secret_name: &str) {
     println!("\n{} {}", "[WARNING]".yellow().bold(), "Vault secret is missing".yellow(),);
     println!(
@@ -136,7 +139,8 @@ pub fn get_wallet_config<'a>(
     wallets: &'a HashMap<String, WalletConfig>,
     master_wallet: Option<&'a WalletConfig>,
 ) -> anyhow::Result<&'a WalletConfig> {
-    let config = if name == "master_wallet" { master_wallet } else { wallets.get(name) };
+    let config =
+        if name == MASTER_WALLET_RESERVED_NAME { master_wallet } else { wallets.get(name) };
     config.ok_or_else(|| anyhow::anyhow!("Wallet not found '{}'", name))
 }
 

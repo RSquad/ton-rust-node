@@ -175,6 +175,8 @@ pub struct StakePolicyCmd {
     split50: bool,
     #[arg(long = "minimum")]
     minimum: bool,
+    #[arg(long = "adaptive-split50")]
+    adaptive_split50: bool,
     #[arg(
         short = 'n',
         long = "node",
@@ -366,6 +368,9 @@ impl StakePolicyCmd {
         }
         if self.minimum {
             return Some(StakePolicy::Minimum);
+        }
+        if self.adaptive_split50 {
+            return Some(StakePolicy::AdaptiveSplit50);
         }
         None
     }
