@@ -966,6 +966,18 @@ impl ExecutionManager {
                     })
                     .await?;
 
+                if cancel_ext.load(Ordering::Relaxed) {
+                    log::debug!(
+                        "{}: account {:x} ext message cancelled by cutoff timeout",
+                        collated_block_descr,
+                        shard_acc.account_id()
+                    );
+                    let transaction_res =
+                        Err(error!("cancelled by cutoff timeout after execution"));
+                    wait_tr.respond(Some((new_msg, msg_metadata, transaction_res)));
+                    continue;
+                }
+
                 if let Ok(transaction) = transaction_res.as_mut() {
                     let res = shard_acc.add_transaction(transaction, account);
                     if let Err(err) = res {
@@ -3788,6 +3800,7 @@ impl Collator {
                     self.collated_block_descr
                 );
                 exec_manager.cancel_ext.store(true, Ordering::Relaxed);
+                break;
             }
             exec_manager.wait_transaction(collator_data).await?;
         }

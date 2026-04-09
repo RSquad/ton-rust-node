@@ -11,7 +11,7 @@
 use super::*;
 use ton_block::{
     base64_decode, read_single_root_boc, ton_method_id, Coins, CurrencyCollection,
-    InternalMessageHeader, Message, MsgAddressInt,
+    InternalMessageHeader, Message, MsgAddressInt, ShardAccount,
 };
 
 #[test]
@@ -73,8 +73,17 @@ fn test_run_get_method_seqno_with_config() {
 
     let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone()).unwrap();
     let shard_account = mc_state.read_accounts().unwrap().get(&[0x55; 32].into()).unwrap().unwrap();
-    let result =
-        run_smc_method(&shard_account, mc_state_cell.clone(), method_id, Vec::new()).unwrap();
+    let result = run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell.clone(),
+        method_id,
+        Vec::new(),
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap();
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.gas_used, 869);
     assert_eq!(result.stack.len(), 1);
@@ -94,8 +103,17 @@ fn test_run_get_method_seqno_with_elector() {
     // let account = base64_decode(account).unwrap();
     // let account = ton_block::Account::construct_from_bytes(&account).unwrap();
     // let shard_account = ShardAccount::with_params(&account, Default::default(), 0).unwrap();
-    let result =
-        run_smc_method(&shard_account, mc_state_cell.clone(), method_id, Vec::new()).unwrap();
+    let result = run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell.clone(),
+        method_id,
+        Vec::new(),
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap();
     assert_eq!(result.exit_code, 11);
     assert_eq!(result.gas_used, 770);
     assert_eq!(result.stack.len(), 1);
@@ -207,8 +225,19 @@ fn run_elector_method(
 ) -> ton_api::ton::smc::runresult::RunResult {
     let shard_account = load_elector_shard_account();
     let mc_state_cell = load_mc_state_cell();
+    let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone()).unwrap();
     let method_id = ton_method_id(method);
-    run_smc_method(&shard_account, mc_state_cell, method_id, stack).unwrap()
+    run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell,
+        method_id,
+        stack,
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap()
 }
 
 fn stack_number(value: i64) -> ton_api::ton::tvm::StackEntry {
@@ -239,8 +268,19 @@ fn run_external_elector_method(
 ) -> ton_api::ton::smc::runresult::RunResult {
     let shard_account = load_external_elector_shard_account();
     let mc_state_cell = load_mc_state_cell();
+    let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone()).unwrap();
     let method_id = ton_method_id(method);
-    run_smc_method(&shard_account, mc_state_cell, method_id, stack).unwrap()
+    run_smc_method(
+        &shard_account.read_account().unwrap(),
+        mc_state_cell,
+        method_id,
+        stack,
+        mc_state.gen_time(),
+        mc_state.gen_lt(),
+    )
+    .unwrap()
+    .into_run_result()
+    .unwrap()
 }
 
 fn first_external_participant_pubkey_and_wallet() -> (String, String) {
