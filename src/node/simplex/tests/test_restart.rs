@@ -12,8 +12,8 @@
 //! same database path, and that post-restart behavior preserves key invariants:
 //!
 //! - **Round monotonicity**: round numbers do not reset after restart
-//! - **Candidate fetch on restart**: restart recovery can retrieve approved candidates
-//!   via `SessionListener::get_approved_candidate` (used for candidate cache restoration)
+//! - **Restart-state parity**: restart recovery restores simplex state without
+//!   relying on the legacy `SessionListener::get_approved_candidate` callback
 //! - **No session errors**: `SessionStats.errors_count` remains 0
 //!
 //! NOTE: These tests intentionally avoid crate-private symbols. Deeper byte-level
@@ -35,7 +35,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
+    sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
     Ed25519KeyOption, ShardIdent, UInt256,
 };
 
@@ -61,10 +61,6 @@ const PHASE_TIMEOUT: Duration = Duration::from_secs(240);
 struct RestartSingleSessionListener {
     public_key: PublicKey,
 
-    // Candidate storage (simulates validator persistent storage for this test process)
-    // Keyed by root_hash which is used by get_approved_candidate().
-    candidates: Mutex<HashMap<UInt256, Arc<ValidatorBlockCandidate>>>,
-
     // Progress tracking (slot-based, not round-based for SIMPLEX_ROUNDLESS mode)
     last_slot_seen: AtomicU32,
     last_finalized_slot: AtomicU32,
@@ -84,9 +80,6 @@ struct RestartSingleSessionListener {
     /// Invariant: each seqno is finalized exactly once with the same block identity.
     finalized_seqnos: Mutex<HashMap<u32, BlockIdExt>>,
 
-    // Recovery verification
-    approved_candidate_requests: AtomicU32,
-
     // Error tracking from SessionStats
     max_errors_count: AtomicU32,
 }
@@ -95,7 +88,6 @@ impl RestartSingleSessionListener {
     fn new(public_key: PublicKey, initial_block_seqno: u32) -> Self {
         Self {
             public_key,
-            candidates: Mutex::new(HashMap::new()),
             last_slot_seen: AtomicU32::new(0),
             last_finalized_slot: AtomicU32::new(0),
             finalized_blocks_count: AtomicU32::new(0),
@@ -104,7 +96,6 @@ impl RestartSingleSessionListener {
             first_slot_after_restart: AtomicU32::new(u32::MAX),
             max_finalized_seqno: AtomicU32::new(initial_block_seqno),
             finalized_seqnos: Mutex::new(HashMap::new()),
-            approved_candidate_requests: AtomicU32::new(0),
             max_errors_count: AtomicU32::new(0),
         }
     }
@@ -144,17 +135,8 @@ impl RestartSingleSessionListener {
         self.collation_count.load(Ordering::SeqCst)
     }
 
-    fn approved_candidate_requests(&self) -> u32 {
-        self.approved_candidate_requests.load(Ordering::SeqCst)
-    }
-
     fn max_errors_count(&self) -> u32 {
         self.max_errors_count.load(Ordering::SeqCst)
-    }
-
-    #[allow(dead_code)]
-    fn candidate_store_len(&self) -> usize {
-        self.candidates.lock().map(|m| m.len()).unwrap_or(0)
     }
 }
 
@@ -240,11 +222,6 @@ impl SessionListener for RestartSingleSessionListener {
             ),
         });
 
-        // Store candidate by root_hash for get_approved_candidate() during restart recovery
-        if let Ok(mut map) = self.candidates.lock() {
-            map.insert(root_hash, candidate.clone());
-        }
-
         callback(Ok(candidate));
     }
 
@@ -311,28 +288,15 @@ impl SessionListener for RestartSingleSessionListener {
         &self,
         _source: PublicKey,
         root_hash: BlockHash,
-        file_hash: BlockHash,
-        collated_data_hash: BlockHash,
-        callback: ValidatorBlockCandidateCallback,
+        _file_hash: BlockHash,
+        _collated_data_hash: BlockHash,
+        _callback: ValidatorBlockCandidateCallback,
     ) {
-        self.approved_candidate_requests.fetch_add(1, Ordering::SeqCst);
-
-        // Lookup candidate by root_hash
-        let candidate = self.candidates.lock().ok().and_then(|map| map.get(&root_hash).cloned());
-
-        match candidate {
-            Some(c) => {
-                // Sanity: hashes must match request
-                assert_eq!(c.id.root_hash, root_hash);
-                assert_eq!(c.id.file_hash, file_hash);
-                assert_eq!(c.collated_file_hash, collated_data_hash);
-                callback(Ok(c));
-            }
-            None => callback(Err(error!(
-                "approved candidate not found for root_hash={}",
-                root_hash.to_hex_string()
-            ))),
-        }
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex restart test \
+             (root_hash={}); active restart flow must not use this callback",
+            root_hash.to_hex_string()
+        );
     }
 }
 
@@ -493,7 +457,7 @@ fn run_single_node_restart_test(test_name: &str) {
     let start = Instant::now();
     while start.elapsed() < PHASE_TIMEOUT {
         if session_1.is_panicked() {
-            log::error!("PANIC-1: session panicked during phase 1 (restart test '{}')", test_name);
+            log::error!("session panicked during phase 1 (restart test '{}')", test_name);
             panic!("session panicked during phase 1");
         }
         // Wait for N finalized callbacks before restart.
@@ -551,7 +515,7 @@ fn run_single_node_restart_test(test_name: &str) {
     let start = Instant::now();
     while start.elapsed() < PHASE_TIMEOUT {
         if session_2.is_panicked() {
-            log::error!("PANIC-1: session panicked during phase 2 (restart test '{}')", test_name);
+            log::error!("session panicked during phase 2 (restart test '{}')", test_name);
             panic!("session panicked during phase 2");
         }
         if listener.first_slot_after_restart().is_some() {
@@ -583,7 +547,7 @@ fn run_single_node_restart_test(test_name: &str) {
     let start = Instant::now();
     while start.elapsed() < PHASE_TIMEOUT {
         if session_2.is_panicked() {
-            log::error!("PANIC-1: session panicked during phase 2 (restart test '{}')", test_name);
+            log::error!("session panicked during phase 2 (restart test '{}')", test_name);
             panic!("session panicked during phase 2");
         }
         if listener.collation_count() >= collation_before + 2 {
@@ -621,9 +585,8 @@ fn run_single_node_restart_test(test_name: &str) {
         "Restart test '{test_name}' complete: \
         last_finalized_slot_before={last_finalized_slot_before}, \
         first_collation_after_restart={first_after}, collations_before={collation_before}, \
-        collations_after={}, approved_candidate_requests={}",
-        listener.collation_count(),
-        listener.approved_candidate_requests()
+        collations_after={}",
+        listener.collation_count()
     );
 }
 

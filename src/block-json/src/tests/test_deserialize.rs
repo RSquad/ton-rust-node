@@ -44,14 +44,18 @@ fn test_parse_zerostate_p30_use_quic_survives_into_v2_boc() {
                 "slots_per_leader_window": 8,
                 "target_rate_ms": 200,
                 "first_block_timeout_ms": 500,
-                "max_leader_window_desync": 2
+                "max_leader_window_desync": 2,
+                "min_block_interval_ms": 333,
+                "no_empty_blocks_on_error_timeout_ms": 22000
             },
             "shard": {
                 "use_quic": 1,
                 "slots_per_leader_window": 16,
                 "target_rate_ms": 200,
                 "first_block_timeout_ms": 500,
-                "max_leader_window_desync": 2
+                "max_leader_window_desync": 2,
+                "min_block_interval_ms": 444,
+                "no_empty_blocks_on_error_timeout_ms": 23000
             }
         }),
     );
@@ -70,6 +74,8 @@ fn test_parse_zerostate_p30_use_quic_survives_into_v2_boc() {
     assert_eq!(mc.noncritical_params.target_rate_ms, 200);
     assert_eq!(mc.noncritical_params.first_block_timeout_ms, 500);
     assert_eq!(mc.noncritical_params.max_leader_window_desync, 2);
+    assert_eq!(mc.noncritical_params.min_block_interval_ms, 333);
+    assert_eq!(mc.noncritical_params.no_empty_blocks_on_error_timeout_ms, 22_000);
 
     let shard = parsed_p30.shard.as_ref().expect("expected shard simplex config");
     assert!(shard.use_quic);
@@ -77,6 +83,8 @@ fn test_parse_zerostate_p30_use_quic_survives_into_v2_boc() {
     assert_eq!(shard.noncritical_params.target_rate_ms, 200);
     assert_eq!(shard.noncritical_params.first_block_timeout_ms, 500);
     assert_eq!(shard.noncritical_params.max_leader_window_desync, 2);
+    assert_eq!(shard.noncritical_params.min_block_interval_ms, 444);
+    assert_eq!(shard.noncritical_params.no_empty_blocks_on_error_timeout_ms, 23_000);
 
     let key = 30u32.write_to_bitstring().unwrap();
     let p30_slice = config.config_params.get(key).unwrap().expect("expected raw p30 cell");
@@ -367,6 +375,8 @@ fn get_config_param30() -> NewConsensusConfigAll {
                 target_rate_ms: 300,
                 first_block_timeout_ms: 1000,
                 max_leader_window_desync: 100,
+                min_block_interval_ms: 111,
+                no_empty_blocks_on_error_timeout_ms: 21_000,
                 ..Default::default()
             },
             ..Default::default()
@@ -377,6 +387,8 @@ fn get_config_param30() -> NewConsensusConfigAll {
                 target_rate_ms: 200,
                 first_block_timeout_ms: 500,
                 max_leader_window_desync: 50,
+                min_block_interval_ms: 222,
+                no_empty_blocks_on_error_timeout_ms: 22_000,
                 ..Default::default()
             },
             ..Default::default()

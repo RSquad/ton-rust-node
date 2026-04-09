@@ -8,15 +8,16 @@
  */
 //! # Simplex Consensus Protocol
 //!
-//! This crate implements the Simplex consensus protocol for TON blockchain,
-//! based on the Solana Alpenglow White Paper with modifications for TON.
+//! This crate implements the Simplex consensus protocol for TON blockchain.
 //!
-//! ## Key Differences from Original Alpenglow
+//! ## Key Protocol Properties
 //!
 //! - **Conservative path only** (no fast finality/optimistic path)
 //! - **Fault tolerance**: <1/3 Byzantine nodes (not 20% as in original)
 //! - **Certificate threshold**: 2/3 stake weight
 //! - **No erasure coding**: Simple broadcast instead of Rotor shreds
+//! - **Spec mapping**: protocol rules tracked in [ton-blockchain/simplex-docs](https://github.com/ton-blockchain/simplex-docs)
+//! - **Finalized-driven semantics**: `on_block_finalized()` is the delivery path; `on_block_committed()` stays legacy-only
 //!
 //! ## Quick Start
 //!
@@ -37,7 +38,6 @@
 //!     validator_nodes,
 //!     &local_private_key,
 //!     db_path,
-//!     db_suffix,
 //!     overlay_manager,
 //!     session_listener,  // Weak<dyn SessionListener>
 //! )?;
@@ -377,6 +377,10 @@ pub struct SessionOptions {
     /// Default: 1 second
     pub target_rate: Duration,
 
+    /// Minimum interval between a parent block's exact generation time and
+    /// validation / generation of the next non-empty block.
+    pub min_block_interval: Duration,
+
     /// Timeout for first block in window
     /// Default: 3 seconds
     pub first_block_timeout: Duration,
@@ -441,15 +445,10 @@ pub struct SessionOptions {
     pub health_stall_warning_secs: u64,
     pub health_stall_error_secs: u64,
 
-    /// Parent resolution aging thresholds (seconds).
-    /// Default: 30s (warn), 120s (error)
-    pub health_parent_aging_warning_secs: u64,
-    pub health_parent_aging_error_secs: u64,
-
     // -- Noncritical params (from simplex_config_v2 HashmapE) --
     //
-    // These fields are deserialized from on-chain config and passed through, but not yet
-    // consumed by the Rust session logic.
+    // Most of these fields are deserialized from on-chain config and passed through.
+    // `min_block_interval` is consumed directly by the Rust session timing logic.
 
     // TODO: replace `timeout_increase_factor` / `max_backoff_delay` with these two fields.
     //   C++ consensus.cpp applies multiplier+cap on window skip (exponential backoff of
@@ -480,16 +479,9 @@ pub struct SessionOptions {
     //   1-second sliding window with this limit per peer for requestCandidate.
     pub candidate_resolve_rate_limit: u32,
 
-    /// When true, collation for non-first slots in a leader window waits until
-    /// the parent slot is notarized (or finalized) before producing the next
-    /// candidate. This avoids broadcasting blocks that validators cannot yet
-    /// accept because C++ `WaitForParent` defers until the parent is notarized.
-    ///
-    /// When false, in-window candidate chaining uses the locally generated
-    /// parent immediately (optimistic pipelining).
-    ///
-    /// Default: true
-    pub require_notarized_parent_for_collation: bool,
+    // TODO: wire into empty-block error backoff. C++ block-producer.cpp suppresses
+    // empty blocks for this period after a failed normal collation.
+    pub no_empty_blocks_on_error_timeout: Duration,
 }
 
 impl Default for SessionOptions {
@@ -500,6 +492,7 @@ impl Default for SessionOptions {
             max_backoff_delay: Duration::from_secs(100),
             slots_per_leader_window: 1,
             target_rate: Duration::from_secs(1),
+            min_block_interval: Duration::from_secs(0),
             first_block_timeout: Duration::from_secs(3),
             max_block_size: 4 << 20,         // 4 MB
             max_collated_data_size: 4 << 20, // 4 MB
@@ -515,8 +508,6 @@ impl Default for SessionOptions {
             health_alert_cooldown: Duration::from_secs(30),
             health_stall_warning_secs: 15,
             health_stall_error_secs: 60,
-            health_parent_aging_warning_secs: 30,
-            health_parent_aging_error_secs: 120,
             first_block_timeout_multiplier: 1.2,
             first_block_timeout_cap: Duration::from_secs(100),
             candidate_resolve_timeout: Duration::from_secs(1),
@@ -527,7 +518,7 @@ impl Default for SessionOptions {
             max_leader_window_desync: 250,
             bad_signature_ban_duration: Duration::from_secs(5),
             candidate_resolve_rate_limit: 10,
-            require_notarized_parent_for_collation: true,
+            no_empty_blocks_on_error_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -580,14 +571,6 @@ impl SessionOptions {
 
         if self.health_stall_error_secs < self.health_stall_warning_secs {
             fail!("health_stall_error_secs must be >= health_stall_warning_secs")
-        }
-
-        if self.health_parent_aging_warning_secs == 0 {
-            fail!("health_parent_aging_warning_secs must be > 0")
-        }
-
-        if self.health_parent_aging_error_secs < self.health_parent_aging_warning_secs {
-            fail!("health_parent_aging_error_secs must be >= health_parent_aging_warning_secs")
         }
 
         // Noncritical params from on-chain config

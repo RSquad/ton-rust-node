@@ -1022,6 +1022,7 @@ impl ValidatorGroup {
                 )
             })
             .await;
+        let min_ts = min_ts.max(request.get_creation_time());
 
         if !is_collator && self.is_accelerated_consensus_enabled {
             log::info!(
@@ -1064,7 +1065,7 @@ impl ValidatorGroup {
                 // - last_committed_seqno: from `prev_block_ids` (finalized/committed head)
                 // - last_collated_seqno: from `pipeline_context` (accelerated consensus), if any
                 //
-                // With notarized-parent collation (require_finalized_parent=false), the parent
+                // With notarized-parent collation, the parent
                 // can be *ahead* of last_committed_seqno (notarized but not yet finalized).
                 // This is expected and allowed. The guard only rejects parents that are *behind*
                 // our current collation head (going backward).

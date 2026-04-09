@@ -35,7 +35,7 @@
 //! - [`SessionStartupRecoveryListener`]: Object-safe trait for recovery operations
 //! - [`SessionStartupRecoveryProcessor`]: Coordinator that loads bootstrap and drives recovery
 //!
-//! See [`RESTART-RECOMMIT-PLAN.md`] for detailed design documentation.
+//! See the startup recovery section in crate-level docs for design details.
 
 use crate::{
     block::{RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
@@ -183,18 +183,18 @@ pub(crate) trait SessionStartupRecoveryListener {
     /// * `block_hash` - The hash of the finalized block
     fn recovery_seed_finalized_block(&mut self, slot: SlotIndex, block_hash: CandidateHash);
 
-    /// Seed ALL finalized blocks into received_candidates for parent resolution.
+    /// Seed ALL finalized blocks into `received_candidates` for restart-side parent/tip lookups.
     ///
     /// After restart, `received_candidates` is empty, but collation/validation require
     /// parent `BlockIdExt` to be resolvable. This seeds all finalized blocks so their
-    /// Block idExt can be looked up during parent resolution.
+    /// `BlockIdExt` can be looked up after restart without waiting for new bodies.
     ///
     /// # Arguments
     ///
     /// * `finalized_blocks` - All finalized blocks from bootstrap
     fn recovery_seed_received_candidates(&mut self, finalized_blocks: &[FinalizedBlockRecord]);
 
-    /// Seed a candidate into `received_candidates` for parent resolution.
+    /// Seed a candidate into `received_candidates` for restart-side parent/tip lookups.
     ///
     /// After restart, collation uses the FSM progress cursor (`first_non_progressed_slot`)
     /// and can require a notarized (but not finalized) parent candidate's `BlockIdExt`.
@@ -551,13 +551,13 @@ impl SessionStartupRecoveryProcessor {
         );
         self.restore_notar_cert_cache(listener, &receiver_boot.notar_certs)?;
 
-        // Step 9b: Seed notarized candidates into received_candidates for parent resolution
+        // Step 9b: Seed notarized candidates into `received_candidates` for post-restart lookups.
         //
         // This ensures post-restart collation can resolve `BlockIdExt` for notarized parents
         // without relying on `requestCandidate` (which may be impossible in single-node tests).
         log::debug!(
             target: LOG_TARGET,
-            "Session {}: step 9b/12 - seeding {} candidate infos into received_candidates for parent resolution",
+            "Session {}: step 9b/12 - seeding {} candidate infos into received_candidates for post-restart parent/tip lookups",
             self.session_id.to_hex_string(),
             self.candidate_info_map.len()
         );
@@ -620,7 +620,7 @@ impl SessionStartupRecoveryProcessor {
         Ok(())
     }
 
-    /// Seed notarized candidates into `received_candidates` for parent resolution.
+    /// Seed notarized candidates into `received_candidates` for post-restart parent/tip lookups.
     ///
     /// Uses `candidate_info_map` to reconstruct minimal metadata (BlockIdExt + parent id + hash data bytes)
     /// for candidates that have a stored NotarCert record.
@@ -938,13 +938,13 @@ impl SessionStartupRecoveryProcessor {
     /// `BlockFinalized(last_known_finalized_block, true)` after loading.
     ///
     /// This notification seeds ALL finalized blocks into `received_candidates`
-    /// for parent resolution, then notifies about the last finalized block.
+    /// for restart-side parent/tip lookups, then notifies about the last finalized block.
     fn notify_last_finalized_block(
         &self,
         listener: &mut dyn SessionStartupRecoveryListener,
         finalized_blocks: &[FinalizedBlockRecord],
     ) {
-        // First, seed ALL finalized blocks into received_candidates for parent resolution
+        // First, seed ALL finalized blocks into `received_candidates` for restart-side lookups.
         listener.recovery_seed_received_candidates(finalized_blocks);
 
         // Find the last block with is_final=true

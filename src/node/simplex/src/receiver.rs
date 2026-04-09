@@ -223,7 +223,7 @@ pub(crate) struct StandstillTriggerNotification {
     Receiver trait and type aliases
 
     These are crate-internal - not exposed in public API.
-    Moved here from lib.rs for encapsulation (CODE-2).
+    Moved here from lib.rs for encapsulation.
 */
 
 /// Shared health counters between receiver and session processor.
@@ -474,7 +474,13 @@ pub(crate) trait ReceiverListener: Send + Sync {
     /// Periodic activity update from receiver
     /// - active_weight: sum of weights for validators with recent activity
     /// - last_activity: last receive time per validator (None if never received)
-    fn on_activity(&self, active_weight: ValidatorWeight, last_activity: Vec<Option<SystemTime>>);
+    /// - snapshot: full per-source activity snapshot for dump diagnostics
+    fn on_activity(
+        &self,
+        active_weight: ValidatorWeight,
+        last_activity: Vec<Option<SystemTime>>,
+        snapshot: ReceiverActivitySnapshot,
+    );
 
     /// Standstill alarm fired and a fresh replay snapshot was built.
     ///
@@ -490,7 +496,7 @@ pub(crate) trait ReceiverListener: Send + Sync {
     ///
     /// This achieves parity with C++ `CandidateResolver::try_load_candidate_data_from_db()`.
     ///
-    /// Reference: Alpenglow-Implementation-Plan.md Section 7.14a
+    /// Reference: Simplex implementation plan Section 7.14a
     fn on_candidate_query_fallback(
         &self,
         slot: SlotIndex,
@@ -723,7 +729,7 @@ impl ReceiverThreads {
 
                 if let Err(panic_payload) = result {
                     log::error!(
-                        "FATAL PANIC (PANIC-1): caught panic in {}: payload=\"{}\"; forcing receiver stop",
+                        "FATAL PANIC: caught panic in {}: payload=\"{}\"; forcing receiver stop",
                         thread::current().name().unwrap_or("<unnamed>"),
                         crate::utils::panic_payload_to_string(panic_payload.as_ref())
                     );
@@ -839,6 +845,26 @@ struct SourceStats {
     last_recv_time: Option<SystemTime>,
     /// Last send time
     last_send_time: Option<SystemTime>,
+    // Typed vote counters
+    votes_in_notarize: u64,
+    votes_in_finalize: u64,
+    votes_in_skip: u64,
+    // Typed cert counters
+    certs_in_notar: u64,
+    certs_in_final: u64,
+    certs_in_skip: u64,
+    // Candidate counters
+    candidates_received: u64,
+    candidate_requests_sent: u64,
+    candidate_requests_received: u64,
+    // Typed last-receive timestamps
+    last_vote_recv_time: Option<SystemTime>,
+    last_notar_cert_recv_time: Option<SystemTime>,
+    last_final_cert_recv_time: Option<SystemTime>,
+    last_candidate_recv_time: Option<SystemTime>,
+    // Duplicate counters
+    duplicate_votes: u64,
+    duplicate_broadcasts: u64,
 }
 
 impl SourceStats {
@@ -859,8 +885,62 @@ impl SourceStats {
             out_broadcasts: 0,
             last_recv_time: None,
             last_send_time: None,
+            votes_in_notarize: 0,
+            votes_in_finalize: 0,
+            votes_in_skip: 0,
+            certs_in_notar: 0,
+            certs_in_final: 0,
+            certs_in_skip: 0,
+            candidates_received: 0,
+            candidate_requests_sent: 0,
+            candidate_requests_received: 0,
+            last_vote_recv_time: None,
+            last_notar_cert_recv_time: None,
+            last_final_cert_recv_time: None,
+            last_candidate_recv_time: None,
+            duplicate_votes: 0,
+            duplicate_broadcasts: 0,
         }
     }
+}
+
+/// Snapshot of per-source activity for the session dump.
+///
+/// Passed from receiver thread to session processor via `on_activity()`.
+#[derive(Clone, Debug)]
+pub(crate) struct SourceActivitySnapshot {
+    pub source_idx: u32,
+    pub weight: ValidatorWeight,
+    pub adnl_id_base64: String,
+    pub in_messages: u64,
+    pub out_messages: u64,
+    pub in_broadcasts: u64,
+    pub out_broadcasts: u64,
+    pub last_recv_time: Option<SystemTime>,
+    pub last_send_time: Option<SystemTime>,
+    pub votes_in_notarize: u64,
+    pub votes_in_finalize: u64,
+    pub votes_in_skip: u64,
+    pub certs_in_notar: u64,
+    pub certs_in_final: u64,
+    pub certs_in_skip: u64,
+    pub candidates_received: u64,
+    pub candidate_requests_sent: u64,
+    pub candidate_requests_received: u64,
+    pub last_vote_recv_time: Option<SystemTime>,
+    pub last_notar_cert_recv_time: Option<SystemTime>,
+    pub last_final_cert_recv_time: Option<SystemTime>,
+    pub last_candidate_recv_time: Option<SystemTime>,
+    pub duplicate_votes: u64,
+    pub duplicate_broadcasts: u64,
+}
+
+/// Aggregate snapshot of receiver activity for session dump.
+#[derive(Clone, Debug)]
+pub(crate) struct ReceiverActivitySnapshot {
+    pub active_weight: ValidatorWeight,
+    pub last_activity: Vec<Option<SystemTime>>,
+    pub sources: Vec<SourceActivitySnapshot>,
 }
 
 /*
@@ -1084,9 +1164,22 @@ impl ReceiverImpl {
                 source_idx,
                 slot
             );
+            if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+                stats.duplicate_votes += 1;
+            }
             return;
         }
         slot_dedup.insert(dedup_key, true);
+
+        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+            let now = SystemTime::now();
+            stats.last_vote_recv_time = Some(now);
+            match vote.vote() {
+                UnsignedVote::Consensus_Simplex_NotarizeVote(_) => stats.votes_in_notarize += 1,
+                UnsignedVote::Consensus_Simplex_FinalizeVote(_) => stats.votes_in_finalize += 1,
+                UnsignedVote::Consensus_Simplex_SkipVote(_) => stats.votes_in_skip += 1,
+            }
+        }
 
         // Forward to listener with raw bytes for misbehavior proof storage
         if let Some(listener) = self.listener.upgrade() {
@@ -1159,6 +1252,24 @@ impl ReceiverImpl {
                 kind
             );
             return;
+        }
+
+        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+            let now = SystemTime::now();
+            match kind {
+                "notarize" => {
+                    stats.certs_in_notar += 1;
+                    stats.last_notar_cert_recv_time = Some(now);
+                }
+                "finalize" => {
+                    stats.certs_in_final += 1;
+                    stats.last_final_cert_recv_time = Some(now);
+                }
+                "skip" => {
+                    stats.certs_in_skip += 1;
+                }
+                _ => {}
+            }
         }
 
         // Forward to listener for verification and application
@@ -1350,6 +1461,11 @@ impl ReceiverImpl {
         // Cache candidate for query responses (candidate resolver)
         // Reference: C++ CandidateResolver caches candidates on CandidateReceived event
         self.resolver_cache.cache_candidate(slot_idx, candidate_hash.clone(), candidate_bytes);
+
+        if let Some(stats) = self.sources.get_mut(source_idx as usize) {
+            stats.candidates_received += 1;
+            stats.last_candidate_recv_time = Some(SystemTime::now());
+        }
 
         // Forward to listener (no deduplication for blocks - SessionProcessor handles it)
         // None notar_cert for broadcasts - certificate comes separately or via query
@@ -2856,6 +2972,44 @@ impl ReceiverImpl {
             .collect()
     }
 
+    fn build_activity_snapshot(
+        &self,
+        active_weight: ValidatorWeight,
+        last_activity: Vec<Option<SystemTime>>,
+    ) -> ReceiverActivitySnapshot {
+        let sources = self
+            .sources
+            .iter()
+            .map(|s| SourceActivitySnapshot {
+                source_idx: s.source_idx,
+                weight: s.weight,
+                adnl_id_base64: key_to_base64(&s.adnl_id),
+                in_messages: s.in_messages,
+                out_messages: s.out_messages,
+                in_broadcasts: s.in_broadcasts,
+                out_broadcasts: s.out_broadcasts,
+                last_recv_time: s.last_recv_time,
+                last_send_time: s.last_send_time,
+                votes_in_notarize: s.votes_in_notarize,
+                votes_in_finalize: s.votes_in_finalize,
+                votes_in_skip: s.votes_in_skip,
+                certs_in_notar: s.certs_in_notar,
+                certs_in_final: s.certs_in_final,
+                certs_in_skip: s.certs_in_skip,
+                candidates_received: s.candidates_received,
+                candidate_requests_sent: s.candidate_requests_sent,
+                candidate_requests_received: s.candidate_requests_received,
+                last_vote_recv_time: s.last_vote_recv_time,
+                last_notar_cert_recv_time: s.last_notar_cert_recv_time,
+                last_final_cert_recv_time: s.last_final_cert_recv_time,
+                last_candidate_recv_time: s.last_candidate_recv_time,
+                duplicate_votes: s.duplicate_votes,
+                duplicate_broadcasts: s.duplicate_broadcasts,
+            })
+            .collect();
+        ReceiverActivitySnapshot { active_weight, last_activity, sources }
+    }
+
     /// Debug dump of receiver state
     fn debug_dump(&self) {
         if !log::log_enabled!(log::Level::Debug) {
@@ -4114,8 +4268,12 @@ impl ReceiverWrapper {
                         let active_weight =
                             receiver_impl.calculate_active_weight(ACTIVITY_THRESHOLD);
                         let last_activity = receiver_impl.get_last_activity();
+                        let snapshot = receiver_impl.build_activity_snapshot(
+                            active_weight,
+                            last_activity.clone(),
+                        );
                         if let Some(listener) = receiver_impl.listener.upgrade() {
-                            listener.on_activity(active_weight, last_activity);
+                            listener.on_activity(active_weight, last_activity, snapshot);
                         }
                         next_active_weight_time =
                             SystemTime::now() + ACTIVE_WEIGHT_RECOMPUTE_PERIOD;
@@ -4178,7 +4336,7 @@ impl ReceiverWrapper {
     /// Compute overlay ID matching C++ consensus.overlayId
     ///
     /// CRITICAL: Must match C++ implementation exactly.
-    /// See: docs/ton-node-cpp-alpenglow/validator/consensus/private-overlay.cpp
+    /// See: ton-node-cpp/validator/consensus/private-overlay.cpp
     fn compute_overlay_id(
         session_id: &SessionId,
         nodes: &[SessionNode],

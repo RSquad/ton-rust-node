@@ -695,7 +695,7 @@ fn test_simplex_empty_block_lag_threshold_matches_cpp_policy() {
 }
 
 #[test]
-fn test_runtime_simplex_options_use_temporary_strict_collation_mode() {
+fn test_runtime_simplex_options_keep_cpp_empty_block_policy() {
     let catchain_options = CatchainSessionOptions {
         proto_version: 4,
         max_block_size: 1024,
@@ -708,26 +708,12 @@ fn test_runtime_simplex_options_use_temporary_strict_collation_mode() {
         &SimplexConfig::default(),
         &catchain_options,
     );
-    assert!(
-        mc_opts.require_notarized_parent_for_collation,
-        "runtime manager-built simplex sessions must currently stay in strict mode"
-    );
     assert_eq!(mc_opts.empty_block_mc_lag_threshold, None);
 
     let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
     let shard_opts =
         build_runtime_simplex_session_options(&shard, &SimplexConfig::default(), &catchain_options);
-    assert!(
-        shard_opts.require_notarized_parent_for_collation,
-        "runtime shard sessions must currently stay in strict mode"
-    );
     assert_eq!(shard_opts.empty_block_mc_lag_threshold, Some(8));
-
-    let default_opts = simplex::SessionOptions::default();
-    assert!(
-        default_opts.require_notarized_parent_for_collation,
-        "default session options must remain in strict mode for tests/manual sessions"
-    );
 }
 
 #[test]
@@ -749,5 +735,57 @@ fn test_mc_registered_top_for_shard_returns_session_specific_block_id() {
     assert!(
         mc_registered_top_for_shard(&mc_state_extra, &unknown_shard).unwrap().is_none(),
         "unknown shard must not produce MC-registered top block id"
+    );
+}
+
+#[test]
+fn test_classify_no_current_session_health_skips_when_not_applicable() {
+    assert_eq!(
+        classify_no_current_session_health(false, ValidationStatus::Active, 0, 0, 0),
+        None,
+        "outside the current validator set there is no no-current-session health state"
+    );
+    assert_eq!(
+        classify_no_current_session_health(true, ValidationStatus::Waiting, 0, 0, 0),
+        None,
+        "validation must be enabled before classifying a no-current-session state"
+    );
+    assert_eq!(
+        classify_no_current_session_health(true, ValidationStatus::Active, 1, 0, 0),
+        None,
+        "an existing current session suppresses the no-current-session classification"
+    );
+}
+
+#[test]
+fn test_classify_no_current_session_health_detects_benign_subset_gap() {
+    let reason = classify_no_current_session_health(true, ValidationStatus::Active, 0, 0, 0)
+        .expect("expected a no-current-session reason");
+
+    assert_eq!(reason, NoCurrentSessionHealthReason::NoCurrentSubsetOwned);
+    assert!(
+        !reason.should_warn(),
+        "not being selected into a current subset must stay non-actionable"
+    );
+}
+
+#[test]
+fn test_classify_no_current_session_health_detects_future_only_gap() {
+    let reason = classify_no_current_session_health(true, ValidationStatus::Active, 0, 0, 2)
+        .expect("expected a no-current-session reason");
+
+    assert_eq!(reason, NoCurrentSessionHealthReason::FutureSubsetOnly);
+    assert!(!reason.should_warn(), "future-only ownership must not emit the actionable warning");
+}
+
+#[test]
+fn test_classify_no_current_session_health_warns_for_owned_current_subset() {
+    let reason = classify_no_current_session_health(true, ValidationStatus::Active, 0, 1, 1)
+        .expect("expected a no-current-session reason");
+
+    assert_eq!(reason, NoCurrentSessionHealthReason::MissingOwnedCurrentSubsetSession);
+    assert!(
+        reason.should_warn(),
+        "owning a current subset without a current session must remain actionable"
     );
 }

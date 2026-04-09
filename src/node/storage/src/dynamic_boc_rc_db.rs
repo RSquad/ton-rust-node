@@ -352,6 +352,9 @@ impl DynamicBocDb {
                 transaction.delete_cf(&cells_cf, id.as_slice());
                 // if there is no counter with the key, then it will be just ignored
                 transaction.delete_cf(&counters_cf, id.as_slice());
+                // Remove from cell_cache so that save_boc won't treat this cell
+                // as still persisted in DB (is::<StoredCell> + cache hit).
+                self.cell_db.remove_from_cache(id);
                 deleted += 1;
             } else {
                 transaction.put_cf(&counters_cf, id.as_slice(), counter.to_le_bytes());
@@ -432,7 +435,7 @@ impl DynamicBocDb {
 
         let cell_id = cell.repr_hash();
 
-        if cell.is::<StoredCell>() {
+        if cell.is::<StoredCell>() && self.cell_db.is_in_cache(&cell_id) {
             return Ok((false, None));
         }
 

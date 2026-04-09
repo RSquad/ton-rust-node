@@ -62,6 +62,8 @@ pub struct CollatorSettings {
     pub lt_compatible: bool,
     // true when running under simplex consensus (passed from ValidatorGroup)
     pub is_simplex: bool,
+    // when set, collator must not choose gen_utime_ms earlier than this value
+    pub min_gen_utime_ms: Option<u64>,
 }
 
 impl CollatorSettings {

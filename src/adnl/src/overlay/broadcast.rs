@@ -1758,7 +1758,19 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
         ctx: &mut BroadcastRecvContext,
         bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
-        <Self as FecProtocol<BroadcastTwostepFec>>::process_broadcast(bcast, ctx, bcast_id).await
+        let (info, mut resend) =
+            <Self as FecProtocol<BroadcastTwostepFec>>::process_broadcast(bcast, ctx, bcast_id)
+                .await?;
+        if resend {
+            let Some(bcast) = ctx.overlay.owned_broadcasts.get(bcast_id) else {
+                return Ok((info, false));
+            };
+            let Some(transfer) = Self::unwrap_transfer(bcast.val()) else {
+                return Ok((info, false));
+            };
+            resend = ctx.peers.other() == &transfer.src_key_id;
+        }
+        Ok((info, resend))
     }
 
     // Send side

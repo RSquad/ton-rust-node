@@ -142,9 +142,14 @@ impl ReceiverListener for ReceiverListenerImpl {
     }
 
     /// Handle activity updates from the receiver
-    fn on_activity(&self, active_weight: ValidatorWeight, last_activity: Vec<Option<SystemTime>>) {
+    fn on_activity(
+        &self,
+        active_weight: ValidatorWeight,
+        last_activity: Vec<Option<SystemTime>>,
+        snapshot: crate::receiver::ReceiverActivitySnapshot,
+    ) {
         self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.on_activity(active_weight, last_activity);
+            processor.on_activity(active_weight, last_activity, snapshot);
         }));
     }
 

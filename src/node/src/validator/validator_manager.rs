@@ -50,10 +50,6 @@ const MC_ACCELERATED_CONSENSUS_ENABLED: bool = true;
 #[cfg(not(feature = "xp25"))]
 const MC_ACCELERATED_CONSENSUS_ENABLED: bool = false;
 
-// TODO(simplex-mc-parity): flip this back to `false` once runtime collation is ready to
-// use the C++-compatible optimistic whole-window pipelining mode in production.
-const SIMPLEX_RUNTIME_REQUIRE_NOTARIZED_PARENT_FOR_COLLATION: bool = true;
-
 fn format_shard_short(shard: &ShardIdent) -> String {
     if shard.is_masterchain() {
         "MC".to_string()
@@ -122,6 +118,7 @@ fn build_runtime_simplex_session_options(
         proto_version: catchain_options.proto_version as u32,
         slots_per_leader_window: cfg.slots_per_leader_window,
         target_rate: Duration::from_millis(np.target_rate_ms as u64),
+        min_block_interval: Duration::from_millis(np.min_block_interval_ms as u64),
         first_block_timeout: Duration::from_millis(np.first_block_timeout_ms as u64),
         first_block_timeout_multiplier: f32::from_bits(np.first_block_timeout_multiplier_bits)
             as f64,
@@ -139,13 +136,13 @@ fn build_runtime_simplex_session_options(
         max_leader_window_desync: np.max_leader_window_desync,
         bad_signature_ban_duration: Duration::from_millis(np.bad_signature_ban_duration_ms as u64),
         candidate_resolve_rate_limit: np.candidate_resolve_rate_limit,
-        // TODO(simplex-mc-parity): temporary strict runtime mode until optimistic
-        // whole-window pipelining is enabled for production sessions.
-        require_notarized_parent_for_collation:
-            SIMPLEX_RUNTIME_REQUIRE_NOTARIZED_PARENT_FOR_COLLATION,
         max_block_size: catchain_options.max_block_size as usize,
         max_collated_data_size: catchain_options.max_collated_data_size as usize,
+        use_callback_thread: false,
         use_quic: cfg.use_quic,
+        no_empty_blocks_on_error_timeout: Duration::from_millis(
+            np.no_empty_blocks_on_error_timeout_ms as u64,
+        ),
         // C++ parity: shard sessions use lag threshold 8 for empty-block recovery.
         // MC sessions use internal consensus-finalized tracking and keep this unset.
         empty_block_mc_lag_threshold: simplex_empty_block_lag_threshold(shard),
@@ -616,6 +613,47 @@ impl ValidationStatus {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum NoCurrentSessionHealthReason {
+    MissingOwnedCurrentSubsetSession,
+    FutureSubsetOnly,
+    NoCurrentSubsetOwned,
+}
+
+impl NoCurrentSessionHealthReason {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::MissingOwnedCurrentSubsetSession => "owned_current_subset_missing_session",
+            Self::FutureSubsetOnly => "future_subset_only",
+            Self::NoCurrentSubsetOwned => "no_current_subset_owned",
+        }
+    }
+
+    fn should_warn(&self) -> bool {
+        matches!(self, Self::MissingOwnedCurrentSubsetSession)
+    }
+}
+
+fn classify_no_current_session_health(
+    in_current_set: bool,
+    validation_status: ValidationStatus,
+    current_sessions_len: usize,
+    owned_current_shards: usize,
+    owned_future_shards: usize,
+) -> Option<NoCurrentSessionHealthReason> {
+    if !in_current_set || !validation_status.allows_validate() || current_sessions_len > 0 {
+        return None;
+    }
+
+    if owned_current_shards > 0 {
+        Some(NoCurrentSessionHealthReason::MissingOwnedCurrentSubsetSession)
+    } else if owned_future_shards > 0 {
+        Some(NoCurrentSessionHealthReason::FutureSubsetOnly)
+    } else {
+        Some(NoCurrentSessionHealthReason::NoCurrentSubsetOwned)
+    }
+}
+
 /// Local node's participation record for a single validator list.
 ///
 /// Stores local validator keys in the same local-key order that C++ uses for `temp_keys_`,
@@ -698,6 +736,12 @@ struct ValidatorManagerImpl {
     current_sessions: HashMap<UInt256, Arc<ValidatorGroup>>,
     /// Sessions for the next (future) validator set with pre-created engines.
     future_sessions: HashMap<UInt256, Arc<ValidatorGroup>>,
+    /// Number of current subsets selected for the local node on the last successful
+    /// `update_shards()` pass.
+    owned_current_shards: usize,
+    /// Number of future subsets selected for the local node on the last successful
+    /// `update_shards()` pass.
+    owned_future_shards: usize,
     validator_list_status: ValidatorListStatus,
     config: ValidatorManagerConfig,
     /// Session IDs that have been destroyed and must not be recreated until the next
@@ -724,6 +768,8 @@ impl ValidatorManagerImpl {
             rt: rt.clone(),
             current_sessions: HashMap::default(),
             future_sessions: HashMap::default(),
+            owned_current_shards: 0,
+            owned_future_shards: 0,
             validator_list_status: ValidatorListStatus::default(),
             config,
             destroyed_sessions: HashSet::new(),
@@ -1356,6 +1402,8 @@ impl ValidatorManagerImpl {
 
         self.engine.set_validation_status(ValidationStatus::Disabled);
         self.sync_complete = false;
+        self.owned_current_shards = 0;
+        self.owned_future_shards = 0;
 
         let existing_validator_sessions: HashSet<UInt256> =
             self.current_sessions.keys().chain(self.future_sessions.keys()).cloned().collect();
@@ -1520,6 +1568,16 @@ impl ValidatorManagerImpl {
                 accelerated_consensus_enabled,
             );
 
+            let local_id_option = self.find_us(&subset.validators);
+
+            if local_id_option.is_some() {
+                // Track owned current subsets independently of whether this specific session
+                // is temporarily suppressed by the destroyed-session blacklist.
+                // Otherwise health classification can mislabel a missing owned current session
+                // as benign `NoCurrentSubsetOwned`.
+                our_current_shards.insert(ident.clone(), vsubset.clone());
+            }
+
             // C++ parity: skip sessions in the destroyed set
             if self.destroyed_sessions.contains(&session_id) {
                 log::trace!(
@@ -1529,11 +1587,7 @@ impl ValidatorManagerImpl {
                 continue;
             }
 
-            let local_id_option = self.find_us(&subset.validators);
-
             if let Some(local_id) = &local_id_option {
-                our_current_shards.insert(ident.clone(), vsubset.clone());
-
                 log::debug!(
                     target: "validator_manager",
                     "subset for session: shard {}, cc_seqno {}, keyblock_seqno {}, \
@@ -1943,12 +1997,14 @@ impl ValidatorManagerImpl {
         log::trace!(target: "validator_manager", "Missing sessions started. Current shards:");
 
         // Iterate over future shards and create all future sessions
+        let mut owned_future_shards = 0usize;
         for (ident, (wc, next_cc_seqno, next_val_list_id)) in our_future_shards.iter() {
             if ident.is_masterchain() {
                 mc_validators.append(&mut wc.validators.clone());
             }
 
             if let Some(local_id) = self.find_us_for_list(&wc.validators, next_val_list_id) {
+                owned_future_shards += 1;
                 let max_vertical_seqno = self.engine.hardforks().len() as u32;
                 let new_session_info = Arc::new(GeneralSessionInfo {
                     shard: ident.clone(),
@@ -2043,6 +2099,9 @@ impl ValidatorManagerImpl {
                 }
             }
         }
+
+        self.owned_current_shards = our_current_shards.len();
+        self.owned_future_shards = owned_future_shards;
 
         // Stale-future culling: remove future entries whose shard already has a current
         // group with equal or higher cc_seqno, or whose shard is an ancestor/descendant
@@ -2188,11 +2247,24 @@ impl ValidatorManagerImpl {
             log::warn!(target: "validator_manager",
                 "HEALTH_CHECK: {} session(s) stalled (validation queue inactive)", stalled_count);
         }
-        if in_current_set && self.current_sessions.is_empty() && validation_status.allows_validate()
-        {
-            log::warn!(target: "validator_manager",
-                "HEALTH_CHECK: node is in current validator set but has no current sessions \
-                 (validation_status={:?})", validation_status);
+        if let Some(reason) = classify_no_current_session_health(
+            in_current_set,
+            validation_status,
+            self.current_sessions.len(),
+            self.owned_current_shards,
+            self.owned_future_shards,
+        ) {
+            if reason.should_warn() {
+                log::warn!(target: "validator_manager",
+                    "HEALTH_CHECK: node is in current validator set but has no current sessions \
+                     (reason={}, owned_current_shards={}, owned_future_shards={}, \
+                     future_sessions={}, validation_status={:?})",
+                    reason.label(),
+                    self.owned_current_shards,
+                    self.owned_future_shards,
+                    self.future_sessions.len(),
+                    validation_status);
+            }
         }
         if validation_status.allows_validate() {
             let sync_count = state_counts.get("sync").copied().unwrap_or(0);
@@ -2283,12 +2355,15 @@ impl ValidatorManagerImpl {
             "=== VALIDATOR MANAGER METRICS (once/min) ===\n\
              \x20 validation_status={:?}  sync_complete={}\n\
              \x20 in_current_set={}  in_next_set={}\n\
+             \x20 owned_subsets: current={} future={}\n\
              \x20 sessions: current={} future={} total={} (simplex={} catchain={})\n\
              \x20 by_state: [{}]  stalled={}",
             validation_status,
             self.sync_complete,
             in_current_set,
             in_next_set,
+            self.owned_current_shards,
+            self.owned_future_shards,
             self.current_sessions.len(),
             self.future_sessions.len(),
             self.current_sessions.len() + self.future_sessions.len(),
@@ -2297,6 +2372,24 @@ impl ValidatorManagerImpl {
             state_str,
             stalled_count,
         ));
+
+        if let Some(reason) = classify_no_current_session_health(
+            in_current_set,
+            validation_status,
+            self.current_sessions.len(),
+            self.owned_current_shards,
+            self.owned_future_shards,
+        ) {
+            lines.push(format!(
+                "  NO CURRENT SESSIONS: reason={} owned_current_shards={} \
+                 owned_future_shards={} current_sessions={} future_sessions={}",
+                reason.label(),
+                self.owned_current_shards,
+                self.owned_future_shards,
+                self.current_sessions.len(),
+                self.future_sessions.len(),
+            ));
+        }
 
         // ── Validator keys ──
         lines.push(String::from("  VALIDATOR KEYS:"));

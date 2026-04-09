@@ -11,9 +11,9 @@
 //! Tests receiver communication with multiple instances using in-process overlay.
 //! Similar structure to `test_consensus.rs` and `catchain/tests/test_catchain_network.rs`
 //!
-//! Note: This test was moved from `tests/test_receiver.rs` to internal tests
-//! as part of CODE-2 (receiver privatization). The test now uses `crate::`
-//! imports to access internal types like `Receiver`, `ReceiverListener`, etc.
+//! Note: This test was moved from `tests/test_receiver.rs` to internal tests.
+//! It now uses `crate::` imports to access internal types like `Receiver`,
+//! `ReceiverListener`, etc.
 
 use crate::{
     receiver::{Receiver, ReceiverListener, ReceiverListenerPtr},
@@ -177,7 +177,12 @@ impl ReceiverListener for TestReceiverListener {
         );
     }
 
-    fn on_activity(&self, active_weight: ValidatorWeight, _last_activity: Vec<Option<SystemTime>>) {
+    fn on_activity(
+        &self,
+        active_weight: ValidatorWeight,
+        _last_activity: Vec<Option<SystemTime>>,
+        _snapshot: crate::receiver::ReceiverActivitySnapshot,
+    ) {
         self.stats.active_weight_updates.fetch_add(1, Ordering::Relaxed);
         self.stats.last_active_weight.store(active_weight, Ordering::Relaxed);
         log::trace!(
@@ -1088,8 +1093,6 @@ fn certificate_slot(cert: &CertificateBoxed) -> u32 {
         crate::simplex_state::Vote::Notarize(v) => v.slot.value(),
         crate::simplex_state::Vote::Finalize(v) => v.slot.value(),
         crate::simplex_state::Vote::Skip(v) => v.slot.value(),
-        crate::simplex_state::Vote::NotarizeFallback(v) => v.slot.value(),
-        crate::simplex_state::Vote::SkipFallback(v) => v.slot.value(),
     }
 }
 
