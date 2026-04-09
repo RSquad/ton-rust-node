@@ -6,17 +6,20 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::{
-    output_format::OutputFormat,
-    utils::{load_config_vault_rpc_client, save_config},
-};
+use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
 use anyhow::Context;
 use base64::Engine;
 use colored::Colorize;
 use common::app_config::{AppConfig, VotingConfig};
 use contracts::{ConfigContractImpl, ConfigContractWrapper, ConfigProposal, contract_provider};
-use std::{io::Write, path::Path};
+use std::{
+    io::{IsTerminal, Write},
+    path::Path,
+    sync::Arc,
+    time::SystemTime,
+};
 use ton_block::write_boc;
+use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Config proposals voting")]
@@ -72,6 +75,7 @@ struct ProposalRow {
     param_id: i32,
     is_critical: bool,
     expires: u32,
+    expires_in: String,
     voters_count: usize,
     weight_remaining: i64,
     rounds_remaining: u8,
@@ -88,6 +92,7 @@ fn proposal_to_row(p: &ConfigProposal, tracked_hashes: &[String]) -> ProposalRow
         param_id: p.param.id,
         is_critical: p.is_critical,
         expires: p.expires,
+        expires_in: format_expires(p.expires),
         voters_count: p.voters.len(),
         weight_remaining: p.weight_remaining,
         rounds_remaining: p.rounds_remaining,
@@ -98,8 +103,7 @@ fn proposal_to_row(p: &ConfigProposal, tracked_hashes: &[String]) -> ProposalRow
 
 impl VoteLsCmd {
     async fn run(&self, config_path: &str) -> anyhow::Result<()> {
-        let (config, _vault, rpc_client) =
-            load_config_vault_rpc_client(Path::new(config_path)).await?;
+        let (config, rpc_client) = load_config_rpc(config_path)?;
         let config_contract = ConfigContractImpl::new(contract_provider!(rpc_client));
 
         let proposals = config_contract.list_proposals().await.context("list_proposals")?;
@@ -109,7 +113,7 @@ impl VoteLsCmd {
             return Ok(());
         }
 
-        let tracked = config.voting.as_ref().map(|v| v.proposals.clone()).unwrap_or_default();
+        let tracked = tracked_proposals(&config);
         let rows: Vec<ProposalRow> =
             proposals.iter().map(|p| proposal_to_row(p, &tracked)).collect();
 
@@ -119,7 +123,7 @@ impl VoteLsCmd {
             }
             OutputFormat::Table => {
                 println!(
-                    "\n  {:<3} {:<66} {:<7} {:<9} {:<12} {:<7} {:<7} {}",
+                    "\n  {:<3} {:<66} {:<7} {:<9} {:<14} {:<7} {:<7} {}",
                     "".bold(),
                     "Hash".bold(),
                     "Param".bold(),
@@ -129,23 +133,23 @@ impl VoteLsCmd {
                     "Rounds".bold(),
                     "W/L".bold(),
                 );
-                println!("  {}", "\u{2500}".repeat(124).dimmed());
+                println!("  {}", "\u{2500}".repeat(126).dimmed());
                 for row in &rows {
                     let marker = if row.tracked { "*" } else { " " };
                     println!(
-                        "  {:<3} {:<66} p{:<6} {:<9} {:<12} {:<7} {:<7} {}/{}",
+                        "  {:<3} {:<66} p{:<6} {:<9} {:<14} {:<7} {:<7} {}/{}",
                         marker.green().bold(),
                         row.hash,
                         row.param_id,
                         if row.is_critical { "yes" } else { "no" },
-                        row.expires,
+                        row.expires_in,
                         row.voters_count,
                         row.rounds_remaining,
                         row.wins,
                         row.losses,
                     );
                 }
-                if tracked.iter().any(|h| rows.iter().any(|r| r.hash == *h)) {
+                if rows.iter().any(|r| r.tracked) {
                     println!("\n  {} tracked by voting task", "*".green().bold());
                 }
                 println!();
@@ -175,6 +179,7 @@ struct ProposalDetail {
     param_cell_boc: Option<String>,
     is_critical: bool,
     expires: u32,
+    expires_in: String,
     voters: Vec<u16>,
     weight_remaining: i64,
     vset_id: String,
@@ -194,6 +199,7 @@ impl From<&ConfigProposal> for ProposalDetail {
             }),
             is_critical: p.is_critical,
             expires: p.expires,
+            expires_in: format_expires(p.expires),
             voters: p.voters.clone(),
             weight_remaining: p.weight_remaining,
             vset_id: hex::encode(p.vset_id),
@@ -207,8 +213,7 @@ impl From<&ConfigProposal> for ProposalDetail {
 impl VoteInspectCmd {
     async fn run(&self, config_path: &str) -> anyhow::Result<()> {
         let phash = parse_proposal_hash(&self.hash)?;
-        let (_config, _vault, rpc_client) =
-            load_config_vault_rpc_client(Path::new(config_path)).await?;
+        let (_config, rpc_client) = load_config_rpc(config_path)?;
         let config_contract = ConfigContractImpl::new(contract_provider!(rpc_client));
 
         let proposal = config_contract
@@ -233,12 +238,16 @@ impl VoteInspectCmd {
                     "Critical:".bold(),
                     if detail.is_critical { "yes" } else { "no" }
                 );
-                println!("  {:<20} {}", "Expires:".bold(), detail.expires);
+                println!("  {:<20} {} ({})", "Expires:".bold(), detail.expires, detail.expires_in);
                 println!("  {:<20} {}", "Rounds remaining:".bold(), detail.rounds_remaining);
                 println!("  {:<20} {}", "Wins:".bold(), detail.wins);
                 println!("  {:<20} {}", "Losses:".bold(), detail.losses);
                 println!("  {:<20} {}", "Weight remaining:".bold(), detail.weight_remaining);
-                println!("  {:<20} {}", "Vset ID:".bold(), &detail.vset_id[..16]);
+                println!(
+                    "  {:<20} {}...",
+                    "Vset ID:".bold(),
+                    &detail.vset_id[..detail.vset_id.len().min(16)]
+                );
                 println!("  {:<20} {:?}", "Voters:".bold(), detail.voters);
                 if let Some(ref boc) = detail.param_cell_boc {
                     println!("  {:<20} {}", "Param cell (b64):".bold(), boc);
@@ -266,7 +275,7 @@ struct VoteAddCmd {
 impl VoteAddCmd {
     async fn run(&self, config_path: &str) -> anyhow::Result<()> {
         let path = Path::new(config_path);
-        let (mut config, _vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+        let (mut config, rpc_client) = load_config_rpc(config_path)?;
         let config_contract = ConfigContractImpl::new(contract_provider!(rpc_client));
 
         let proposals = config_contract.list_proposals().await.context("list_proposals")?;
@@ -274,18 +283,20 @@ impl VoteAddCmd {
             anyhow::bail!("no active proposals on-chain");
         }
 
-        let tracked = config.voting.as_ref().map(|v| v.proposals.clone()).unwrap_or_default();
+        let tracked = tracked_proposals(&config);
 
         let selected_hash = match &self.hash {
             Some(h) => {
-                // Validate the hash exists on-chain
                 let phash = parse_proposal_hash(h)?;
                 if !proposals.iter().any(|p| p.hash == phash) {
                     anyhow::bail!("proposal {} not found on-chain", h);
                 }
-                h.clone()
+                hex::encode(phash)
             }
-            None => select_proposal(&proposals, &tracked)?,
+            None => {
+                require_interactive()?;
+                select_proposal(&proposals, &tracked)?
+            }
         };
 
         if tracked.contains(&selected_hash) {
@@ -315,7 +326,7 @@ impl VoteRmCmd {
         let path = Path::new(config_path);
         let mut config = AppConfig::load(path)?;
 
-        let tracked = config.voting.as_ref().map(|v| v.proposals.clone()).unwrap_or_default();
+        let tracked = tracked_proposals(&config);
 
         if tracked.is_empty() {
             println!("No proposals in voting config");
@@ -324,12 +335,16 @@ impl VoteRmCmd {
 
         let selected_hash = match &self.hash {
             Some(h) => {
-                if !tracked.contains(h) {
+                let normalized = h.to_lowercase();
+                if !tracked.contains(&normalized) {
                     anyhow::bail!("proposal {} is not in voting config", h);
                 }
-                h.clone()
+                normalized
             }
-            None => select_tracked_proposal(&tracked)?,
+            None => {
+                require_interactive()?;
+                select_tracked_proposal(&tracked)?
+            }
         };
 
         let voting = config.voting.as_mut().unwrap();
@@ -343,6 +358,22 @@ impl VoteRmCmd {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+fn load_config_rpc(config_path: &str) -> anyhow::Result<(AppConfig, Arc<ClientJsonRpc>)> {
+    let config = AppConfig::load(Path::new(config_path))?;
+    let rpc_client = Arc::new(
+        ClientJsonRpc::connect_many(
+            config.ton_http_api.resolved_endpoints(),
+            config.ton_http_api.api_key.clone(),
+        )
+        .context("ClientJsonRpc")?,
+    );
+    Ok((config, rpc_client))
+}
+
+fn tracked_proposals(config: &AppConfig) -> Vec<String> {
+    config.voting.as_ref().map(|v| v.proposals.clone()).unwrap_or_default()
+}
+
 fn parse_proposal_hash(s: &str) -> anyhow::Result<[u8; 32]> {
     let bytes = hex::decode(s).context("invalid hex")?;
     if bytes.len() != 32 {
@@ -353,19 +384,45 @@ fn parse_proposal_hash(s: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
+fn format_expires(expires: u32) -> String {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+        as u32;
+    if expires <= now {
+        return "expired".to_string();
+    }
+    let diff = expires - now;
+    let days = diff / 86400;
+    let hours = (diff % 86400) / 3600;
+    let mins = (diff % 3600) / 60;
+    if days > 0 {
+        format!("in {}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("in {}h {}m", hours, mins)
+    } else {
+        format!("in {}m", mins)
+    }
+}
+
+fn require_interactive() -> anyhow::Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("--hash is required in non-interactive mode");
+    }
+    Ok(())
+}
+
 fn select_proposal(proposals: &[ConfigProposal], tracked: &[String]) -> anyhow::Result<String> {
     println!("\n  Active proposals:\n");
     for (i, p) in proposals.iter().enumerate() {
         let hash = hex::encode(p.hash);
         let marker = if tracked.contains(&hash) { "*" } else { " " };
         println!(
-            "  {}{} [{}] p{} critical={} expires={} voters={}",
+            "  {}{} [{}] p{} critical={} {} voters={}",
             marker.green().bold(),
             format!("  {}", i + 1).bold(),
             &hash[..16],
             p.param.id,
             if p.is_critical { "yes" } else { "no" },
-            p.expires,
+            format_expires(p.expires),
             p.voters.len(),
         );
     }
@@ -394,7 +451,7 @@ fn prompt_selection(count: usize) -> anyhow::Result<usize> {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     let n: usize = input.trim().parse().context("invalid number")?;
-    if n < 1 || n > count {
+    if n == 0 || n > count {
         anyhow::bail!("selection out of range");
     }
     Ok(n - 1)
