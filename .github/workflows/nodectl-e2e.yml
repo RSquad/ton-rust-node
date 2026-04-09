@@ -21,8 +21,7 @@ env:
 
 jobs:
   e2e:
-    runs-on:
-      group: ton-large
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     if: >
       (
