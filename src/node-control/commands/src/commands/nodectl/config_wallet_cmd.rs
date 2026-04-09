@@ -9,9 +9,10 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        SEND_TIMEOUT, check_ton_api_connection, get_wallet_config, load_config_vault,
-        load_config_vault_rpc_client, make_wallet, save_config, wait_for_seqno_change,
-        wallet_address, wallet_info, warn_missing_secret, warn_ton_api_unavailable,
+        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, check_ton_api_connection, get_wallet_config,
+        load_config_vault, load_config_vault_rpc_client, make_wallet, save_config,
+        wait_for_seqno_change, wallet_address, wallet_info, warn_missing_secret,
+        warn_ton_api_unavailable,
     },
 };
 use anyhow::Context;
@@ -40,9 +41,6 @@ const ELECTOR_STAKE_FEE: u64 = 1_000_000_000;
 const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 /// Gas fee consumed by wallet to send message to nominator pool.
 const WALLET_COMPUTE_FEE: u64 = 100_000_000;
-
-/// Name shown for `master_wallet` in `config wallet ls` and accepted by `get_wallet_config`.
-const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage wallets in the configuration")]
