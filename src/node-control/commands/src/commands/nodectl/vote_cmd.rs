@@ -13,7 +13,7 @@ use colored::Colorize;
 use common::app_config::{AppConfig, VotingConfig};
 use contracts::{ConfigContractImpl, ConfigContractWrapper, ConfigProposal, contract_provider};
 use std::{
-    io::{IsTerminal, Write},
+    io::{IsTerminal, Write, stdin, stdout},
     path::Path,
     sync::Arc,
     time::SystemTime,
@@ -405,7 +405,7 @@ fn format_expires(expires: u32) -> String {
 }
 
 fn require_interactive() -> anyhow::Result<()> {
-    if !std::io::stdin().is_terminal() {
+    if !stdin().is_terminal() {
         anyhow::bail!("--hash is required in non-interactive mode");
     }
     Ok(())
@@ -447,10 +447,10 @@ fn select_tracked_proposal(tracked: &[String]) -> anyhow::Result<String> {
 
 fn prompt_selection(count: usize) -> anyhow::Result<usize> {
     print!("\n  Select [1-{}]: ", count);
-    std::io::stdout().flush()?;
+    stdout().flush()?;
 
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    stdin().read_line(&mut input)?;
     let n: usize = input.trim().parse().context("invalid number")?;
     if n == 0 || n > count {
         anyhow::bail!("selection out of range");
