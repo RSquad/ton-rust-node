@@ -543,10 +543,24 @@ impl ElectionsConfig {
         self.policy_overrides.get(node_id).unwrap_or(&self.policy)
     }
 
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if !(1.0..=3.0).contains(&self.max_factor) {
-            anyhow::bail!("max_factor must be in range [1.0..3.0]");
+    /// Validates elections settings.
+    ///
+    /// - `None`: only checks `max_factor >= 1.0` (e.g. [`AppConfig::load`] without RPC). No upper bound.
+    /// - `Some(m)`: `max_factor` must be in `[1.0, m]` where `m` is from config param 17 (service startup).
+    pub fn validate(&self, max_factor_upper_bound: Option<f32>) -> anyhow::Result<()> {
+        self.validate_timing_fields()?;
+        if self.max_factor < 1.0 {
+            anyhow::bail!("max_factor must be >= 1.0");
         }
+        if let Some(m) = max_factor_upper_bound {
+            if self.max_factor > m {
+                anyhow::bail!("max_factor must be in range [1.0..{}]", m);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_timing_fields(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.sleep_period_pct) {
             anyhow::bail!("sleep_period_pct must be in range [0.0..1.0]");
         }
@@ -751,7 +765,7 @@ impl AppConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        self.elections.as_ref().map(|e| e.validate()).transpose()?;
+        self.elections.as_ref().map(|e| e.validate(None)).transpose()?;
         Ok(())
     }
 }
@@ -791,6 +805,25 @@ mod tests {
         let policy = StakePolicy::Minimum;
         let stake = policy.calculate_stake(10, 100).unwrap();
         assert_eq!(stake, 10);
+    }
+
+    #[test]
+    fn test_elections_validate_max_factor_respects_network_cap() {
+        let mut c = ElectionsConfig::default();
+        c.max_factor = 5.0;
+        assert!(c.validate(Some(default_max_factor())).is_err());
+        assert!(c.validate(Some(5.0)).is_ok());
+        c.max_factor = 2.0;
+        assert!(c.validate(Some(default_max_factor())).is_ok());
+    }
+
+    #[test]
+    fn test_elections_validate_none_allows_max_factor_above_default_cap() {
+        let mut c = ElectionsConfig::default();
+        c.max_factor = 25.0;
+        assert!(c.validate(None).is_ok());
+        assert!(c.validate(Some(3.0)).is_err());
+        assert!(c.validate(Some(30.0)).is_ok());
     }
 
     #[test]

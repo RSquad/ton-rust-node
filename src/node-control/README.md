@@ -518,7 +518,7 @@ nodectl config elections tick-interval 60
 
 ##### `config elections max-factor`
 
-Set the maximum factor for elections. Must be in the range [1.0..3.0].
+Set the maximum stake factor for elections. The value must be between **1.0** and the network’s **maximum stake factor** from masterchain **config param 17** (`max_stake_factor`). nodectl does not use a hardcoded upper bound (e.g. 3.0): the CLI reads the current limit from the chain when validating and saving.
 
 | Argument | Description |
 |----------|-------------|
@@ -1414,7 +1414,7 @@ Automatic elections task configuration:
   - `"minimum"` — use minimum required stake
   - `{ "fixed": <amount> }` — fixed stake amount in nanoTON
 - `policy_overrides` — per-node stake policy overrides (node name -> policy). When a node has an entry here, it takes precedence over the default `policy`. Example: `{ "node0": { "fixed": 500000000000 } }`
-- `max_factor` — max factor for elections (default: 3.0, must be in range [1.0..3.0])
+- `max_factor` — maximum stake factor (default `3.0` in generated configs). Valid values lie in `[1.0, network_max_factor]`, where **`network_max_factor` comes from masterchain config param 17** (`max_stake_factor`); the CLI and stake command validate against the live network when TON HTTP API is available
 - `tick_interval` — interval between election checks in seconds (default: `40`)
 
 #### `voting` (optional)
@@ -1731,7 +1731,7 @@ nodectl config wallet stake -b <BINDING> -a <AMOUNT> [-m <MAX_FACTOR>]
 |------|------|----------|---------|-------------|
 | `-b` | `--binding` | Yes | — | Binding name (node-wallet-pool triple) |
 | `-a` | `--amount` | Yes | — | Stake amount in TON |
-| `-m` | `--max-factor` | No | `3.0` | Max factor (`1.0`–`3.0`) |
+| `-m` | `--max-factor` | No | `3.0` | Max factor: from `1.0` up to the network limit (**config param 17**), validated against the chain |
 
 Example:
 
