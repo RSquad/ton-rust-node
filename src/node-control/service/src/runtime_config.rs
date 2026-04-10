@@ -151,8 +151,7 @@ impl RuntimeConfigStore {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "elections max_factor: failed to read config param 17 from chain; \
-                     validating without network upper bound (re-check max_factor when TON HTTP API is reachable)"
+                    "cannot validate max_factor: failed to get config param 17; max_factor may be clamped"
                 );
                 elections.validate(None)
             }
