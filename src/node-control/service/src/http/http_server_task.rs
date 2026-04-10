@@ -6,7 +6,16 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::login_rate_limiter::{LoginRateLimiter, login_limiter_key};
+use super::{
+    config_handlers::{
+        v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
+        v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_wallets_handler,
+        BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
+        ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
+        NodeDto, NodesResponse, PoolDto, PoolsResponse, WalletDto, WalletsResponse,
+    },
+    login_rate_limiter::{LoginRateLimiter, login_limiter_key},
+};
 use crate::{
     auth::{
         Claims,
@@ -135,7 +144,20 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
     // request and passes through when `http.auth` is not configured.
     let authenticated = axum::Router::new()
         .route("/v1/elections", axum::routing::get(v1_elections_handler))
+        .route(
+            "/v1/elections/settings",
+            axum::routing::get(v1_elections_settings_handler),
+        )
         .route("/v1/validators", axum::routing::get(v1_validators_handler))
+        .route("/v1/nodes", axum::routing::get(v1_nodes_handler))
+        .route("/v1/wallets", axum::routing::get(v1_wallets_handler))
+        .route("/v1/pools", axum::routing::get(v1_pools_handler))
+        .route("/v1/bindings", axum::routing::get(v1_bindings_handler))
+        .route("/v1/log", axum::routing::get(v1_log_handler))
+        .route(
+            "/v1/master-wallet",
+            axum::routing::get(v1_master_wallet_handler),
+        )
         .route("/auth/me", axum::routing::get(me_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -182,7 +204,7 @@ pub struct AppError {
 }
 
 impl AppError {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_REQUEST,
             body: ApiErrorBody { code: 400, message: message.into() },
@@ -852,6 +874,14 @@ impl utoipa::Modify for BearerAuthAddon {
         v1_validators_handler,
         v1_stake_strategy_handler,
         v1_task_elections_handler,
+        // It' won't compile without full names
+        super::config_handlers::v1_nodes_handler,
+        super::config_handlers::v1_wallets_handler,
+        super::config_handlers::v1_pools_handler,
+        super::config_handlers::v1_bindings_handler,
+        super::config_handlers::v1_elections_settings_handler,
+        super::config_handlers::v1_log_handler,
+        super::config_handlers::v1_master_wallet_handler,
         login_handler,
         me_handler,
         list_users_handler
@@ -865,6 +895,8 @@ impl utoipa::Modify for BearerAuthAddon {
         ValidatorsResponse,
         common::app_config::StakePolicy,
         common::app_config::BindingStatus,
+        common::app_config::LogRotation,
+        common::app_config::LogOutput,
         StakePolicyRequest,
         StakePolicyApplied,
         StakePolicyResponse,
@@ -875,6 +907,21 @@ impl utoipa::Modify for BearerAuthAddon {
         ElectionsTaskControlResponse,
         ElectionsExcludeResult,
         ElectionsExcludeResponse,
+        NodeDto,
+        NodesResponse,
+        WalletDto,
+        WalletsResponse,
+        PoolDto,
+        PoolsResponse,
+        BindingDto,
+        BindingsResponse,
+        BindingElectionStatusDto,
+        ElectionsSettingsDto,
+        ElectionsSettingsResponse,
+        LogDto,
+        LogResponse,
+        MasterWalletDto,
+        MasterWalletResponse,
         LoginRequest,
         LoginResponse,
         MeResponse,

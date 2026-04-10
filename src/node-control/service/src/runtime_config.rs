@@ -205,6 +205,34 @@ impl RuntimeConfigStore {
         self.updated_at.load(Ordering::Relaxed)
     }
 
+    /// Resolves ADNL client configs for all configured nodes concurrently.
+    pub async fn node_adnl_configs(&self) -> HashMap<String, adnl::client::AdnlClientConfig> {
+        let config = self.get();
+        let vault = self.vault();
+
+        let mut set = tokio::task::JoinSet::new();
+        let mut sorted_nodes: Vec<_> =
+            config.nodes.iter().map(|(name, cfg)| (name.clone(), cfg.clone())).collect();
+        sorted_nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (node_id, cfg) in sorted_nodes {
+            let vault = vault.clone();
+            set.spawn(async move { (node_id, cfg.to_node_adnl_config(vault).await) });
+        }
+
+        set.join_all()
+            .await
+            .into_iter()
+            .filter_map(|(node_id, result)| match result {
+                Ok(config) => Some((node_id, config)),
+                Err(e) => {
+                    tracing::error!("node [{}] has wrong ADNL config: {}", node_id, e);
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Updates the config by cloning the current state, applying the mutation
     /// to its config, and atomically swapping in the new snapshot.
     pub fn update_with<F>(&self, f: F) -> anyhow::Result<()>
@@ -419,7 +447,7 @@ impl RuntimeConfig for RuntimeConfigStore {
     }
 }
 
-async fn open_wallet(
+pub(crate) async fn open_wallet(
     wallet_config: &WalletConfig,
     rpc_client: Arc<ClientJsonRpc>,
     vault: Option<Arc<SecretVault>>,
