@@ -50,7 +50,7 @@ impl ShardAccountStuff {
             } else {
                 let now = std::time::Instant::now();
                 let result = account.init_storage_stat(dict_hash_min_cells)?;
-                log::debug!("TIME init_storage_stat {:?}", now.elapsed());
+                log::debug!("TIME account {:x} init_storage_stat {:?}", account_id, now.elapsed());
                 result
             }
         } else {
