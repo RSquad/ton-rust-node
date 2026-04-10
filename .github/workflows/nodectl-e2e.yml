@@ -1,0 +1,75 @@
+name: nodectl-e2e
+
+on:
+  # Auto trigger: PR approved targeting release/nodectl/*
+  pull_request_review:
+    types: [submitted]
+
+  # Manual trigger: label "run-e2e" on PR targeting release/nodectl/*
+  pull_request:
+    types: [labeled]
+    branches:
+      - 'release/nodectl/**'
+
+  # Manual dispatch
+  workflow_dispatch:
+
+concurrency:
+  group: nodectl-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >
+      (
+        github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved' &&
+        startsWith(github.event.pull_request.base.ref, 'release/nodectl/')
+      ) ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.label.name == 'run-e2e'
+      ) ||
+      github.event_name == 'workflow_dispatch'
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang libssl-dev libzstd-dev \
+            libgoogle-perftools-dev build-essential xxd jq python3 python3-yaml
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src -> target
+          shared-key: nodectl-e2e
+
+      - name: Install bun deps
+        run: bun install
+        working-directory: src/node/tests/test_load_net
+
+      - name: Run nodectl e2e test
+        env:
+          MASTER_WALLET_KEY: ${{ secrets.MASTER_WALLET_KEY }}
+        run: bash node/tests/test_run_net_py/test_nodectl_ci.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodectl-e2e-logs
+          path: |
+            src/node/tests/test_run_net_py/tmp/nodectl-service.log
+            src/node/tests/test_run_net_py/tmp/singlehost-bootstrap.log
