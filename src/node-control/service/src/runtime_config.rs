@@ -95,7 +95,7 @@ impl RuntimeConfigStore {
         let vault = Some(SecretVaultBuilder::from_env().await?);
         let rpc_client = Self::load_rpc_client(&app_cfg).await?;
         if let Some(elections) = app_cfg.elections.as_ref() {
-            Self::validate_elections_max_factor_vs_chain(&rpc_client, elections).await?;
+            Self::validate_max_factor(&rpc_client, elections).await?;
         }
         let master_wallet =
             Self::load_master_wallet(&app_cfg, rpc_client.clone(), vault.clone()).await?;
@@ -121,7 +121,7 @@ impl RuntimeConfigStore {
         let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
         let rpc_client = Self::load_rpc_client(&new_config).await?;
         if let Some(elections) = new_config.elections.as_ref() {
-            Self::validate_elections_max_factor_vs_chain(&rpc_client, elections).await?;
+            Self::validate_max_factor(&rpc_client, elections).await?;
         }
         let master_wallet =
             Self::load_master_wallet(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
@@ -142,7 +142,7 @@ impl RuntimeConfigStore {
         Ok(())
     }
 
-    async fn validate_elections_max_factor_vs_chain(
+    async fn validate_max_factor(
         rpc_client: &ClientJsonRpc,
         elections: &ElectionsConfig,
     ) -> anyhow::Result<()> {
