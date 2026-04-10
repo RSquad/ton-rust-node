@@ -39,7 +39,7 @@ impl NominatorWrapperImpl {
         workchain: i32,
     ) -> anyhow::Result<Self> {
         let (nominator_addr, state_init) =
-            Self::calculate_address_with_state_init(workchain, owner_address, validator_address)?;
+            Self::calculate_address_and_state(workchain, owner_address, validator_address)?;
         Ok(Self { provider, nominator_addr, state_init: Some(state_init) })
     }
 
@@ -48,12 +48,12 @@ impl NominatorWrapperImpl {
         owner_address: &MsgAddressInt,
         validator_address: &MsgAddressInt,
     ) -> anyhow::Result<MsgAddressInt> {
-        Self::calculate_address_with_state_init(wc, owner_address, validator_address)
+        Self::calculate_address_and_state(wc, owner_address, validator_address)
             .map(|(addr, _)| addr)
     }
 
-    /// Calculate both the pool address and `StateInit` in a single pass.
-    pub fn calculate_address_with_state_init(
+    /// Calculate the pool address and `StateInit` in a single pass.
+    pub fn calculate_address_and_state(
         wc: i32,
         owner_address: &MsgAddressInt,
         validator_address: &MsgAddressInt,

@@ -10,9 +10,11 @@
 mod messages;
 /// Single nominator contract implementation
 mod single_nominator;
+mod ton_core_nominator_pair;
 /// Trait for single nominator contract
 mod wrapper;
 
 pub use messages::*;
 pub use single_nominator::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl};
+pub use ton_core_nominator_pair::TonCoreNominatorPair;
 pub use wrapper::*;

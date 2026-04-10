@@ -14,7 +14,7 @@ use common::{
     time_format,
 };
 use contracts::{
-    ElectionsInfo, ElectorWrapper, NodePools, NominatorWrapper, Participant, TonWallet,
+    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonCoreNominatorPair, TonWallet,
     elector::{FrozenParticipant, PastElections},
     nominator::{NominatorRoles, PoolData, opcodes},
 };
@@ -196,6 +196,8 @@ mock! {
         async fn get_roles(&self) -> anyhow::Result<NominatorRoles>;
         async fn get_pool_data(&self) -> anyhow::Result<PoolData>;
         fn state_init(&self) -> Option<ton_block::StateInit>;
+        async fn resolve_staking_address(&self) -> anyhow::Result<MsgAddressInt>;
+        fn is_toncore_nominator_pair(&self) -> bool;
     }
 }
 
@@ -347,7 +349,7 @@ struct TestHarness {
     provider_mock: MockElectionsProviderImpl,
     wallet_mock: MockTonWalletImpl,
     pool_mock: Option<MockNominatorWrapperImpl>,
-    router_mocks: Option<(MockNominatorWrapperImpl, MockNominatorWrapperImpl)>,
+    toncore_nominator_mocks: Option<(MockNominatorWrapperImpl, MockNominatorWrapperImpl)>,
     elections_config: ElectionsConfig,
     bindings: HashMap<String, NodeBinding>,
 }
@@ -359,7 +361,7 @@ impl TestHarness {
             provider_mock: MockElectionsProviderImpl::new(),
             wallet_mock: MockTonWalletImpl::new(),
             pool_mock: None,
-            router_mocks: None,
+            toncore_nominator_mocks: None,
             elections_config: ElectionsConfig {
                 policy: StakePolicy::Split50,
                 policy_overrides: HashMap::new(),
@@ -377,8 +379,8 @@ impl TestHarness {
         self
     }
 
-    fn with_router(mut self) -> Self {
-        self.router_mocks =
+    fn with_toncore_nominator_pair(mut self) -> Self {
+        self.toncore_nominator_mocks =
             Some((MockNominatorWrapperImpl::new(), MockNominatorWrapperImpl::new()));
         self
     }
@@ -393,11 +395,13 @@ impl TestHarness {
         let mut providers: HashMap<String, Box<dyn ElectionsProvider>> = HashMap::new();
         providers.insert(node_id.to_string(), Box::new(self.provider_mock));
 
-        let mut pools: HashMap<String, NodePools> = HashMap::new();
+        let mut pools: HashMap<String, Arc<dyn NominatorWrapper>> = HashMap::new();
         if let Some(pool) = self.pool_mock {
-            pools.insert(node_id.to_string(), NodePools::Single(Arc::new(pool)));
-        } else if let Some((p0, p1)) = self.router_mocks {
-            pools.insert(node_id.to_string(), NodePools::Router([Arc::new(p0), Arc::new(p1)]));
+            pools.insert(node_id.to_string(), Arc::new(pool));
+        } else if let Some((p0, p1)) = self.toncore_nominator_mocks {
+            let p0: Arc<dyn NominatorWrapper> = Arc::new(p0);
+            let p1: Arc<dyn NominatorWrapper> = Arc::new(p1);
+            pools.insert(node_id.to_string(), Arc::new(TonCoreNominatorPair::new([p0, p1])));
         }
 
         let elector: Arc<dyn ElectorWrapper> = Arc::new(self.elector_mock);
@@ -538,13 +542,19 @@ fn setup_default_provider_without_account(
 
 fn setup_pool(pool: &mut MockNominatorWrapperImpl) {
     pool.expect_address().returning(|| pool_address());
+    pool.expect_resolve_staking_address().returning(|| Ok(pool_address()));
+    pool.expect_is_toncore_nominator_pair().returning(|| false);
 }
 
 fn pool_data_with_state(state: i32) -> PoolData {
     PoolData { state, ..Default::default() }
 }
 
-fn setup_router_pool(pool: &mut MockNominatorWrapperImpl, addr: MsgAddressInt, state: i32) {
+fn setup_toncore_nominator_slot(
+    pool: &mut MockNominatorWrapperImpl,
+    addr: MsgAddressInt,
+    state: i32,
+) {
     pool.expect_address().returning(move || addr.clone());
     pool.expect_get_pool_data().returning(move || Ok(pool_data_with_state(state)));
 }
@@ -1690,7 +1700,7 @@ async fn test_node_without_wallet_skipped() {
     providers.insert("node-1".to_string(), Box::new(provider1));
 
     let wallets: HashMap<String, Arc<dyn TonWallet>> = HashMap::new(); // empty!
-    let pools: HashMap<String, NodePools> = HashMap::new();
+    let pools: HashMap<String, Arc<dyn NominatorWrapper>> = HashMap::new();
 
     let runner = ElectionRunner::new(
         &elections_config,
@@ -2610,21 +2620,21 @@ async fn test_participation_status_lifecycle() {
 }
 
 // =====================================================
-// Router-specific tests
+// TONCore nominator (two pools) tests
 // =====================================================
 
 #[tokio::test]
-async fn test_router_selects_free_pool() {
+async fn test_toncore_nominator_selects_free_pool() {
     let node_id = "node-1";
-    let mut harness = TestHarness::new().with_router();
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
     setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
     setup_wallet(&mut harness.wallet_mock);
 
-    let (p0, p1) = harness.router_mocks.as_mut().unwrap();
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
     // pool[0] busy (state=2), pool[1] free (state=0)
-    setup_router_pool(p0, pool_address(), 2);
-    setup_router_pool(p1, pool_address_1(), 0);
+    setup_toncore_nominator_slot(p0, pool_address(), 2);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
 
     // Provider returns pool[1] balance when asked for that address
     let pool1_hex = hex::encode(POOL_ADDR_1);
@@ -2638,7 +2648,7 @@ async fn test_router_selects_free_pool() {
 
     setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
 
-    // Router + split50: stake entire liquid balance of the active (free) pool.
+    // TONCore nominator pair + split50: stake entire liquid balance of the active (free) pool.
     let expected_stake = POOL_BALANCE - MIN_NANOTON_FOR_STORAGE;
     harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
 
@@ -2655,16 +2665,16 @@ async fn test_router_selects_free_pool() {
 }
 
 #[tokio::test]
-async fn test_router_both_pools_busy_skips_elections() {
+async fn test_toncore_nominator_both_pools_busy_skips_elections() {
     let node_id = "node-1";
-    let mut harness = TestHarness::new().with_router();
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
     setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
     setup_wallet(&mut harness.wallet_mock);
 
-    let (p0, p1) = harness.router_mocks.as_mut().unwrap();
-    setup_router_pool(p0, pool_address(), 2);
-    setup_router_pool(p1, pool_address_1(), 2);
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot(p0, pool_address(), 2);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
 
     harness
         .provider_mock
@@ -2685,9 +2695,9 @@ async fn test_router_both_pools_busy_skips_elections() {
 }
 
 #[tokio::test]
-async fn test_router_recover_stake_both_pools() {
+async fn test_toncore_nominator_recover_stake_both_pools() {
     let node_id = "node-1";
-    let mut harness = TestHarness::new().with_router();
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
     let returned_per_pool = 50_000_000_000_000u64;
 
@@ -2715,9 +2725,9 @@ async fn test_router_recover_stake_both_pools() {
     setup_wallet(&mut harness.wallet_mock);
     harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
 
-    let (p0, p1) = harness.router_mocks.as_mut().unwrap();
-    setup_router_pool(p0, pool_address(), 0);
-    setup_router_pool(p1, pool_address_1(), 0);
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot(p0, pool_address(), 0);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
 
     harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
     harness.provider_mock.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
@@ -2742,9 +2752,9 @@ async fn test_router_recover_stake_both_pools() {
 }
 
 #[tokio::test]
-async fn test_router_elections_finished_matches_any_pool() {
+async fn test_toncore_nominator_elections_finished_matches_any_pool() {
     let node_id = "node-1";
-    let mut harness = TestHarness::new().with_router();
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
     // Elections are finished with a participant from pool[1]
     harness.elector_mock.expect_address().returning(|| elector_address());
@@ -2774,19 +2784,13 @@ async fn test_router_elections_finished_matches_any_pool() {
 
     setup_wallet(&mut harness.wallet_mock);
 
-    let (p0, p1) = harness.router_mocks.as_mut().unwrap();
-    setup_router_pool(p0, pool_address(), 0);
-    setup_router_pool(p1, pool_address_1(), 0);
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot(p0, pool_address(), 0);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
 
     harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
-    harness.provider_mock.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
-    harness.provider_mock.expect_get_next_vset().returning(|| Ok(None));
-    harness.provider_mock.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
-    harness
-        .provider_mock
-        .expect_account()
-        .returning(move |_address| Ok(fake_account(WALLET_BALANCE)));
-    harness.provider_mock.expect_shutdown().returning(|| Ok(()));
+    harness.provider_mock.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    harness.provider_mock.expect_config_param_17().returning(|| Ok(default_cfg17()));
 
     let mut runner = harness.build(node_id);
     let result = runner.run().await;
@@ -2794,6 +2798,6 @@ async fn test_router_elections_finished_matches_any_pool() {
 
     let node = runner.nodes.get(node_id).unwrap();
     // Stake from pool[1] should be matched even though primary is pool[0]
-    assert!(node.stake_accepted, "stake_accepted should be true for Router pool[1]");
+    assert!(node.stake_accepted, "stake_accepted should be true for TONCore nominator slot 1");
     assert_eq!(node.accepted_stake_amount, Some(50_000_000_000_000));
 }

@@ -7,7 +7,8 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::commands::nodectl::utils::{
-    DEPLOY_TIMEOUT, load_config_vault_rpc_client, make_wallet, wait_for_deploy, wallet_info,
+    DEPLOY_TIMEOUT, load_config_vault_rpc_client, make_wallet, toncore_pool_slot_from_cli_flags,
+    wait_for_deploy, wallet_info,
 };
 use colored::Colorize;
 use common::{
@@ -17,7 +18,7 @@ use common::{
     ton_utils::{nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
 use contracts::{
-    NominatorWrapperImpl, TonWallet, resolve_toncore_pool, resolve_toncore_router,
+    NominatorWrapperImpl, TonWallet, resolve_toncore_nominator_pools, resolve_toncore_pool,
     ton_core_nominator::messages as pool_messages,
 };
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
@@ -75,19 +76,30 @@ struct DeployPoolCmd {
     #[arg(long = "verbose", help = "Print progress", required = false)]
     verbose: bool,
     #[arg(
+        short = 'b',
+        long = "binding",
+        help = "Binding name (resolves validator wallet and pool from config)"
+    )]
+    binding: String,
+    #[arg(long = "amount", help = "Amount of TON to transfer for deployment")]
+    amount: f64,
+    #[arg(
         long = "owner",
-        help = "SNP: pool owner address (required unless deploying a `kind: core` pool)"
+        help = "SNP: pool owner address (required for Single Nominator Pool deploy)"
     )]
     owner: Option<MsgAddressInt>,
     #[arg(
-        long = "pool",
-        help = "Pool name in config (defaults to the `pool` field of this node's binding)"
+        long = "pool-even",
+        conflicts_with = "pool_odd",
+        help = "TONCore nominator: deploy the pool for even validation rounds (default if neither flag is set)"
     )]
-    pool: Option<String>,
-    #[arg(long = "amount", help = "Amount of TONs to transfer")]
-    amount: f64,
-    #[arg(long = "node", help = "Node ID")]
-    node: String,
+    pool_even: bool,
+    #[arg(
+        long = "pool-odd",
+        conflicts_with = "pool_even",
+        help = "TONCore nominator: deploy the pool for odd validation rounds"
+    )]
+    pool_odd: bool,
 }
 
 impl DeployCmd {
@@ -302,8 +314,34 @@ impl DeployPoolCmd {
 
         let (config, vault, rpc_client) =
             load_config_vault_rpc_client(Path::new(&self.config)).await.map_err(set_err)?;
-        let wallet_name =
-            config.bindings.get(&self.node).map(|b| b.wallet.as_str()).unwrap_or(&self.node);
+
+        let binding_cfg = config
+            .bindings
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' not found", self.binding))
+            .map_err(set_err)?;
+
+        let pool_name = binding_cfg
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' has no pool configured", self.binding))
+            .map_err(set_err)?;
+
+        let pool_cfg = config
+            .pools
+            .get(pool_name)
+            .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))
+            .map_err(set_err)?;
+
+        if !matches!(pool_cfg, PoolConfig::TONCore { dual_pools: true, .. })
+            && (self.pool_even || self.pool_odd)
+        {
+            return Err(set_err(anyhow::anyhow!(
+                "--pool-even and --pool-odd apply only to TONCore nominator (`dual_pools: true`)"
+            )));
+        }
+
+        let wallet_name = binding_cfg.wallet.as_str();
         let wallet_cfg = config
             .wallets
             .get(wallet_name)
@@ -320,65 +358,71 @@ impl DeployPoolCmd {
             anyhow::bail!("Task cancelled");
         }
 
-        let pool_cfg_opt = self
-            .pool
-            .as_ref()
-            .or_else(|| config.bindings.get(&self.node).and_then(|b| b.pool.as_ref()))
-            .and_then(|name| config.pools.get(name));
-
-        let deploy_targets: Vec<(MsgAddressInt, ton_block::StateInit)> = match pool_cfg_opt {
-            Some(PoolConfig::TONCore {
+        let mut deploy_targets: Vec<(MsgAddressInt, ton_block::StateInit)> = match pool_cfg {
+            PoolConfig::TONCore {
+                dual_pools: false,
                 validator_share,
                 address,
                 max_nominators,
                 min_validator_stake,
                 min_nominator_stake,
-            }) => {
+                ..
+            } => {
                 let resolved = resolve_toncore_pool(
                     &wallet_address,
                     *validator_share,
                     address.as_deref(),
-                    max_nominators.as_ref().copied(),
-                    min_validator_stake.as_ref().copied(),
-                    min_nominator_stake.as_ref().copied(),
+                    Some(*max_nominators),
+                    Some(*min_validator_stake),
+                    Some(*min_nominator_stake),
                 )
                 .map_err(set_err)?;
                 vec![(resolved.address, resolved.state_init)]
             }
-            Some(PoolConfig::TONCoreRouter {
+            PoolConfig::TONCore {
+                dual_pools: true,
                 validator_share,
                 addresses,
                 max_nominators,
                 min_validator_stake,
                 min_nominator_stake,
-            }) => {
-                let resolved = resolve_toncore_router(
+                ..
+            } => {
+                let resolved = resolve_toncore_nominator_pools(
                     &wallet_address,
                     *validator_share,
-                    addresses.as_ref(),
-                    max_nominators.as_ref().copied(),
-                    min_validator_stake.as_ref().copied(),
-                    min_nominator_stake.as_ref().copied(),
+                    addresses.as_ref().map(|v| v.as_slice()),
+                    Some(*max_nominators),
+                    Some(*min_validator_stake),
+                    Some(*min_nominator_stake),
                 )
                 .map_err(set_err)?;
                 resolved.into_iter().map(|r| (r.address, r.state_init)).collect()
             }
-            Some(PoolConfig::SNP { .. }) | None => {
+            PoolConfig::SNP { .. } => {
                 let owner = self.owner.as_ref().ok_or_else(|| {
                     set_err(anyhow::anyhow!(
-                        "SNP deploy requires --owner (set `pool` to a `kind: core` entry for TON Nominator Pool deploy)"
+                        "SNP deploy requires --owner (use TONCore pool for deploy without --owner)"
                     ))
                 })?;
                 let (pool_address, state_init) =
-                    NominatorWrapperImpl::calculate_address_with_state_init(
-                        -1,
-                        owner,
-                        &wallet_address,
-                    )
-                    .map_err(set_err)?;
+                    NominatorWrapperImpl::calculate_address_and_state(-1, owner, &wallet_address)
+                        .map_err(set_err)?;
                 vec![(pool_address, state_init)]
             }
         };
+
+        if matches!(pool_cfg, PoolConfig::TONCore { dual_pools: true, .. }) {
+            let slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
+            let one = deploy_targets
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("TONCore nominator deploy: invalid pool slot {}", slot)
+                })
+                .map_err(set_err)?;
+            deploy_targets = vec![one];
+        }
 
         if wallet_info.account_state != AccountState::Active {
             res.borrow_mut().error =
@@ -388,14 +432,12 @@ impl DeployPoolCmd {
 
         let amount_to_send_nano = tons_f64_to_nanotons(self.amount);
 
-        let deploy_body = match pool_cfg_opt {
-            Some(PoolConfig::TONCore { .. }) | Some(PoolConfig::TONCoreRouter { .. }) => {
-                pool_messages::deposit_validator(0).map_err(set_err)?
-            }
+        let deploy_body = match pool_cfg {
+            PoolConfig::TONCore { .. } => pool_messages::deposit_validator(0).map_err(set_err)?,
             _ => Cell::default(),
         };
 
-        let wallet = make_wallet(rpc_client.clone(), wallet_cfg, secret, &self.node)
+        let wallet = make_wallet(rpc_client.clone(), wallet_cfg, secret, &self.binding)
             .await
             .map_err(set_err)?;
         let mut seqno = wallet_info.seqno;

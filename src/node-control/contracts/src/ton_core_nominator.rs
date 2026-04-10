@@ -6,12 +6,12 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-/// Internal messages for nominator pool contract
-pub mod messages;
+/// TON Core pool message builders (same as [`crate::nominator::ton_core_pool`]).
+pub use crate::nominator::ton_core_pool as messages;
 /// Nominator pool contract implementation (wrapper, deploy state init, RPC).
-mod ton_core_nominator;
+mod wrapper;
 
-pub use ton_core_nominator::{
+pub use wrapper::{
     NominatorPoolWrapperImpl, ResolvedTonCorePool, resolve_deploy_pool_params,
-    resolve_toncore_pool, resolve_toncore_router,
+    resolve_toncore_nominator_pools, resolve_toncore_pool,
 };

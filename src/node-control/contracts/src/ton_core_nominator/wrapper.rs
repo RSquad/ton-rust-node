@@ -11,6 +11,10 @@ use crate::{
     nominator::{NominatorRoles, NominatorWrapper, PoolConfig, PoolData},
 };
 use anyhow::Context;
+use common::app_config::{
+    DEFAULT_TONCORE_MAX_NOMINATORS, DEFAULT_TONCORE_MIN_NOMINATOR_STAKE_NANOTONS,
+    DEFAULT_TONCORE_MIN_VALIDATOR_STAKE_NANOTONS,
+};
 use std::sync::Arc;
 use ton_block::{
     BuilderData, Coins, IBitstring, MsgAddressInt, Serializable, StateInit, read_single_root_boc,
@@ -26,12 +30,8 @@ const CODE: &str = "b5ee9c7201023a010009c2000114ff00f4a413f4bcf2c80b010201620203
 /// Pool is always deployed in the masterchain.
 pub const POOL_WORKCHAIN: i32 = -1;
 
-/// Deploy-time parameters for `build_state_init` when the app config omits them.
-pub const DEFAULT_DEPLOY_MAX_NOMINATORS: u16 = 40;
-pub const DEFAULT_DEPLOY_MIN_VALIDATOR_STAKE_NANOTONS: u64 = 100_000_000_000_000;
-pub const DEFAULT_DEPLOY_MIN_NOMINATOR_STAKE_NANOTONS: u64 = 10_000_000_000_000;
-
-/// Resolve deploy parameters for address derivation and `StateInit` (defaults from this module).
+/// Resolve deploy parameters for address derivation and `StateInit`
+/// (defaults from [`common::app_config`]).
 #[must_use]
 pub fn resolve_deploy_pool_params(
     max_nominators: Option<u16>,
@@ -39,10 +39,84 @@ pub fn resolve_deploy_pool_params(
     min_nominator_stake: Option<u64>,
 ) -> (u16, u64, u64) {
     (
-        max_nominators.unwrap_or(DEFAULT_DEPLOY_MAX_NOMINATORS),
-        min_validator_stake.unwrap_or(DEFAULT_DEPLOY_MIN_VALIDATOR_STAKE_NANOTONS),
-        min_nominator_stake.unwrap_or(DEFAULT_DEPLOY_MIN_NOMINATOR_STAKE_NANOTONS),
+        max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
+        min_validator_stake.unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE_NANOTONS),
+        min_nominator_stake.unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE_NANOTONS),
     )
+}
+
+fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Result<MsgAddressInt> {
+    let cell = state_init.write_to_new_cell()?.into_cell()?;
+    MsgAddressInt::with_params(POOL_WORKCHAIN, cell.hash(0))
+}
+
+/// Build the `StateInit` for deploying a new TONCore nominator pool.
+///
+/// Data layout follows `save_data` / `load_data` in pool.fc:
+/// ```text
+/// state:8 nominators_count:16 stake_amount_sent:coins validator_amount:coins
+/// config:^Cell nominators:dict withdraw_requests:dict
+/// stake_at:32 saved_validator_set_hash:256 validator_set_changes_count:8
+/// validator_set_change_time:32 stake_held_for:32 config_proposal_votings:dict
+/// ```
+pub fn build_toncore_pool_state_init(
+    validator_address: &MsgAddressInt,
+    validator_reward_share: u16,
+    max_nominators_count: u16,
+    min_validator_stake: u64,
+    min_nominator_stake: u64,
+) -> anyhow::Result<StateInit> {
+    // --- config ref cell ---
+    // pack_config(validator_address, validator_reward_share,
+    //             max_nominators_count, min_validator_stake, min_nominator_stake)
+    let mut config = BuilderData::new();
+    let validator_hash = validator_address.address().get_bytestring(0);
+    anyhow::ensure!(validator_hash.len() == 32, "validator address must be 256 bits");
+    config.append_raw(&validator_hash, 256)?;
+    config.append_raw(&validator_reward_share.to_be_bytes(), 16)?;
+    config.append_raw(&max_nominators_count.to_be_bytes(), 16)?;
+    Coins::new(min_validator_stake).write_to(&mut config)?;
+    Coins::new(min_nominator_stake).write_to(&mut config)?;
+    let config_cell = config.into_cell()?;
+
+    // --- data cell ---
+    let mut data = BuilderData::new();
+    data.append_u8(0)?; // state = 0
+    data.append_raw(&0u16.to_be_bytes(), 16)?; // nominators_count = 0
+    Coins::new(0u64).write_to(&mut data)?; // stake_amount_sent = 0
+    Coins::new(0u64).write_to(&mut data)?; // validator_amount = 0
+    data.checked_append_reference(config_cell)?; // config ref
+    data.append_bit_zero()?; // nominators = empty dict
+    data.append_bit_zero()?; // withdraw_requests = empty dict
+    data.append_u32(0)?; // stake_at
+    data.append_raw(&[0u8; 32], 256)?; // saved_validator_set_hash
+    data.append_u8(0)?; // validator_set_changes_count
+    data.append_u32(0)?; // validator_set_change_time
+    data.append_u32(0)?; // stake_held_for
+    data.append_bit_zero()?; // config_proposal_votings = empty dict
+
+    let code =
+        read_single_root_boc(hex::decode(CODE).expect("nominator pool code hex is invalid"))?;
+    Ok(StateInit::with_code_and_data(code, data.into_cell()?))
+}
+
+/// Derive masterchain pool address and `StateInit` from deployment parameters.
+pub fn toncore_pool_address_and_state(
+    validator_address: &MsgAddressInt,
+    validator_reward_share: u16,
+    max_nominators_count: u16,
+    min_validator_stake: u64,
+    min_nominator_stake: u64,
+) -> anyhow::Result<(MsgAddressInt, StateInit)> {
+    let state_init = build_toncore_pool_state_init(
+        validator_address,
+        validator_reward_share,
+        max_nominators_count,
+        min_validator_stake,
+        min_nominator_stake,
+    )?;
+    let addr = toncore_pool_address_from_state_init(&state_init)?;
+    Ok((addr, state_init))
 }
 
 /// Resolved pool address and `StateInit` for a TONCore config.
@@ -70,13 +144,8 @@ pub fn resolve_toncore_pool(
     let (max_n, min_v, min_n) =
         resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
 
-    let (address, state_init) = NominatorPoolWrapperImpl::calculate_address_with_state_init(
-        validator_addr,
-        validator_share,
-        max_n,
-        min_v,
-        min_n,
-    )?;
+    let (address, state_init) =
+        toncore_pool_address_and_state(validator_addr, validator_share, max_n, min_v, min_n)?;
     if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
@@ -97,14 +166,14 @@ pub fn resolve_toncore_pool(
     })
 }
 
-/// Resolve two TONCore pool addresses for the router configuration.
+/// Resolve two TONCore nominator pool addresses (`dual_pools: true` in config).
 ///
 /// `pool[0]` uses `min_validator_stake`, `pool[1]` uses `min_validator_stake + 1`.
-/// If explicit addresses are provided, they are validated against the derived ones.
-pub fn resolve_toncore_router(
+/// `addresses`, when set, is a slice of 1 or 2 optional strings (missing index = derive that slot).
+pub fn resolve_toncore_nominator_pools(
     validator_addr: &MsgAddressInt,
     validator_share: u16,
-    addresses: Option<&[Option<String>; 2]>,
+    addresses: Option<&[Option<String>]>,
     max_nominators: Option<u16>,
     min_validator_stake: Option<u64>,
     min_nominator_stake: Option<u64>,
@@ -112,23 +181,20 @@ pub fn resolve_toncore_router(
     let (max_n, min_v, min_n) =
         resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
 
-    let explicit = |idx: usize| -> Option<&str> { addresses.and_then(|a| a[idx].as_deref()) };
+    let explicit = |idx: usize| -> Option<&str> {
+        addresses.and_then(|a| a.get(idx)).and_then(|x| x.as_deref())
+    };
 
     let pool0 = {
-        let (address, state_init) = NominatorPoolWrapperImpl::calculate_address_with_state_init(
-            validator_addr,
-            validator_share,
-            max_n,
-            min_v,
-            min_n,
-        )?;
+        let (address, state_init) =
+            toncore_pool_address_and_state(validator_addr, validator_share, max_n, min_v, min_n)?;
         if let Some(addr) = explicit(0) {
             let parsed = addr
                 .parse::<MsgAddressInt>()
-                .context(format!("invalid TONCoreRouter addresses[0]: {addr}"))?;
+                .context(format!("invalid TONCore nominator addresses[0]: {addr}"))?;
             anyhow::ensure!(
                 parsed == address,
-                "TONCoreRouter addresses[0] ({parsed}) does not match derived address ({address})"
+                "TONCore nominator addresses[0] ({parsed}) does not match derived address ({address})"
             );
         }
         ResolvedTonCorePool {
@@ -143,20 +209,15 @@ pub fn resolve_toncore_router(
 
     let min_v_1 = min_v.saturating_add(1);
     let pool1 = {
-        let (address, state_init) = NominatorPoolWrapperImpl::calculate_address_with_state_init(
-            validator_addr,
-            validator_share,
-            max_n,
-            min_v_1,
-            min_n,
-        )?;
+        let (address, state_init) =
+            toncore_pool_address_and_state(validator_addr, validator_share, max_n, min_v_1, min_n)?;
         if let Some(addr) = explicit(1) {
             let parsed = addr
                 .parse::<MsgAddressInt>()
-                .context(format!("invalid TONCoreRouter addresses[1]: {addr}"))?;
+                .context(format!("invalid TONCore nominator addresses[1]: {addr}"))?;
             anyhow::ensure!(
                 parsed == address,
-                "TONCoreRouter addresses[1] ({parsed}) does not match derived address ({address})"
+                "TONCore nominator addresses[1] ({parsed}) does not match derived address ({address})"
             );
         }
         ResolvedTonCorePool {
@@ -215,7 +276,7 @@ impl NominatorPoolWrapperImpl {
         min_validator_stake: u64,
         min_nominator_stake: u64,
     ) -> anyhow::Result<Self> {
-        let (pool_addr, state_init) = Self::calculate_address_with_state_init(
+        let (pool_addr, state_init) = toncore_pool_address_and_state(
             validator_address,
             validator_reward_share,
             max_nominators_count,
@@ -233,7 +294,7 @@ impl NominatorPoolWrapperImpl {
         min_validator_stake: u64,
         min_nominator_stake: u64,
     ) -> anyhow::Result<MsgAddressInt> {
-        Self::calculate_address_with_state_init(
+        toncore_pool_address_and_state(
             validator_address,
             validator_reward_share,
             max_nominators_count,
@@ -243,39 +304,24 @@ impl NominatorPoolWrapperImpl {
         .map(|(addr, _)| addr)
     }
 
-    /// Calculate both the pool address and `StateInit` in a single pass.
-    pub fn calculate_address_with_state_init(
+    /// Calculate the pool address and `StateInit` in a single pass.
+    pub fn calculate_address_and_state(
         validator_address: &MsgAddressInt,
         validator_reward_share: u16,
         max_nominators_count: u16,
         min_validator_stake: u64,
         min_nominator_stake: u64,
     ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
-        let state_init = Self::build_state_init(
+        toncore_pool_address_and_state(
             validator_address,
             validator_reward_share,
             max_nominators_count,
             min_validator_stake,
             min_nominator_stake,
-        )?;
-        let addr = Self::address_from_state_init(&state_init)?;
-        Ok((addr, state_init))
-    }
-
-    fn address_from_state_init(state_init: &StateInit) -> anyhow::Result<MsgAddressInt> {
-        let cell = state_init.write_to_new_cell()?.into_cell()?;
-        MsgAddressInt::with_params(POOL_WORKCHAIN, cell.hash(0))
+        )
     }
 
     /// Build the `StateInit` for deploying a new nominator pool.
-    ///
-    /// Data layout follows `save_data` / `load_data` in pool.fc:
-    /// ```text
-    /// state:8 nominators_count:16 stake_amount_sent:coins validator_amount:coins
-    /// config:^Cell nominators:dict withdraw_requests:dict
-    /// stake_at:32 saved_validator_set_hash:256 validator_set_changes_count:8
-    /// validator_set_change_time:32 stake_held_for:32 config_proposal_votings:dict
-    /// ```
     pub fn build_state_init(
         validator_address: &MsgAddressInt,
         validator_reward_share: u16,
@@ -283,38 +329,13 @@ impl NominatorPoolWrapperImpl {
         min_validator_stake: u64,
         min_nominator_stake: u64,
     ) -> anyhow::Result<StateInit> {
-        // --- config ref cell ---
-        // pack_config(validator_address, validator_reward_share,
-        //             max_nominators_count, min_validator_stake, min_nominator_stake)
-        let mut config = BuilderData::new();
-        let validator_hash = validator_address.address().get_bytestring(0);
-        anyhow::ensure!(validator_hash.len() == 32, "validator address must be 256 bits");
-        config.append_raw(&validator_hash, 256)?;
-        config.append_raw(&validator_reward_share.to_be_bytes(), 16)?;
-        config.append_raw(&max_nominators_count.to_be_bytes(), 16)?;
-        Coins::new(min_validator_stake).write_to(&mut config)?;
-        Coins::new(min_nominator_stake).write_to(&mut config)?;
-        let config_cell = config.into_cell()?;
-
-        // --- data cell ---
-        let mut data = BuilderData::new();
-        data.append_u8(0)?; // state = 0
-        data.append_raw(&0u16.to_be_bytes(), 16)?; // nominators_count = 0
-        Coins::new(0u64).write_to(&mut data)?; // stake_amount_sent = 0
-        Coins::new(0u64).write_to(&mut data)?; // validator_amount = 0
-        data.checked_append_reference(config_cell)?; // config ref
-        data.append_bit_zero()?; // nominators = empty dict
-        data.append_bit_zero()?; // withdraw_requests = empty dict
-        data.append_u32(0)?; // stake_at
-        data.append_raw(&[0u8; 32], 256)?; // saved_validator_set_hash
-        data.append_u8(0)?; // validator_set_changes_count
-        data.append_u32(0)?; // validator_set_change_time
-        data.append_u32(0)?; // stake_held_for
-        data.append_bit_zero()?; // config_proposal_votings = empty dict
-
-        let code =
-            read_single_root_boc(hex::decode(CODE).expect("nominator pool code hex is invalid"))?;
-        Ok(StateInit::with_code_and_data(code, data.into_cell()?))
+        build_toncore_pool_state_init(
+            validator_address,
+            validator_reward_share,
+            max_nominators_count,
+            min_validator_stake,
+            min_nominator_stake,
+        )
     }
 }
 

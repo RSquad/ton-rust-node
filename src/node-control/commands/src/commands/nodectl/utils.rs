@@ -38,6 +38,15 @@ pub async fn fetch_network_max_factor(rpc_client: &ClientJsonRpc) -> anyhow::Res
     extract_max_factor(rpc_client.get_config_param(17).await?)
 }
 
+/// TONCore nominator (two pools): slot index from `--pool-even` / `--pool-odd` (`0` = even round, `1` = odd).
+#[inline]
+pub fn toncore_pool_slot_from_cli_flags(pool_even: bool, pool_odd: bool) -> usize {
+    match (pool_even, pool_odd) {
+        (_, true) => 1,
+        (true, false) | (false, false) => 0,
+    }
+}
+
 pub fn warn_missing_secret(secret_name: &str) {
     println!("\n{} {}", "[WARNING]".yellow().bold(), "Vault secret is missing".yellow(),);
     println!(

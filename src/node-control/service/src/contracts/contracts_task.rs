@@ -10,7 +10,7 @@ use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
 use contracts::{
-    NodePools, NominatorWrapper, TonWallet, contract_provider,
+    NominatorWrapper, TonWallet, contract_provider, nominator_constituents,
     ton_core_nominator::messages as tc_messages,
 };
 use std::{
@@ -51,7 +51,7 @@ pub(crate) async fn run(
 
 struct ContractsMonitor {
     master_wallet: Arc<dyn TonWallet>,
-    pools: Arc<HashMap<String, NodePools>>,
+    pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     rpc_client: Arc<ClientJsonRpc>,
     _store: Arc<SnapshotStore>,
@@ -264,9 +264,9 @@ impl ContractsMonitor {
     /// Returns `false` if master balance is insufficient (caller should sleep).
     async fn ensure_pools_deployed(&self, seqno: &mut i64) -> anyhow::Result<bool> {
         let mut all_deployed = true;
-        for (node_id, node_pools) in self.pools.iter() {
-            for pool in node_pools.all() {
-                match self.deploy_pool(node_id, pool.clone(), *seqno).await {
+        for (node_id, pool_binding) in self.pools.iter() {
+            for pool in nominator_constituents(pool_binding.clone()) {
+                match self.deploy_pool(node_id, pool, *seqno).await {
                     Ok(true) => (),
                     Ok(false) => {
                         all_deployed = false;
@@ -416,7 +416,7 @@ impl ContractsMonitor {
         Ok(all_topped_up)
     }
 
-    /// Step 5: Send `update_validator_set` (opcode 6) to TonCore pool controllers
+    /// Step 5: Send `update_validator_set` (opcode 6) to TonCore pools
     /// that are in staking state (state == 2) but haven't detected enough validator
     /// set changes for recovery.
     ///
@@ -432,8 +432,8 @@ impl ContractsMonitor {
             "ensure_pool_validator_sets_updated: checking {} nodes",
             self.pools.len()
         );
-        for (node_id, node_pools) in self.pools.iter() {
-            for pool in node_pools.all() {
+        for (node_id, pool_binding) in self.pools.iter() {
+            for pool in nominator_constituents(pool_binding.clone()) {
                 let pool_data = match pool.get_pool_data().await {
                     Ok(d) => d,
                     Err(e) => {
@@ -492,7 +492,7 @@ mod tests {
     use super::ContractsMonitor;
     use axum::{Json, Router, extract::State, routing::post};
     use common::snapshot::SnapshotStore;
-    use contracts::{NodePools, SmartContract, TonWallet};
+    use contracts::{NominatorWrapper, SmartContract, TonWallet};
     use std::{
         collections::HashMap,
         sync::{
@@ -667,7 +667,7 @@ mod tests {
         let rpc_client = Arc::new(ClientJsonRpc::connect(rpc_url, None).unwrap());
         ContractsMonitor {
             master_wallet,
-            pools: Arc::<HashMap<String, NodePools>>::default(),
+            pools: Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),
             wallets,
             rpc_client,
             _store: Arc::new(SnapshotStore::new()),

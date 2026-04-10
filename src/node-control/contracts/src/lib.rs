@@ -19,11 +19,14 @@ pub use config_contract::{
     ConfigContractImpl, ConfigContractWrapper, ConfigProposal, ProposedParam,
 };
 pub use elector::{ElectionsInfo, ElectorWrapper, ElectorWrapperImpl, Participant};
-pub use nominator::{NOMINATOR_POOL_WORKCHAIN, NodePools, NominatorWrapper, NominatorWrapperImpl};
+pub use nominator::{
+    NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, NominatorWrapperImpl, TonCoreNominatorPair,
+    nominator_constituents,
+};
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;
 pub use ton_core_nominator::{
     NominatorPoolWrapperImpl, ResolvedTonCorePool, resolve_deploy_pool_params,
-    resolve_toncore_pool, resolve_toncore_router,
+    resolve_toncore_nominator_pools, resolve_toncore_pool,
 };
 pub use wallet::{TonWallet, WalletContract};

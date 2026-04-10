@@ -10,12 +10,12 @@ use crate::SmartContract;
 use std::sync::Arc;
 use ton_block::{MsgAddressInt, StateInit};
 
-/// Trait for interacting with single-nominator smart contract
+/// Trait for interacting with single-nominator or TONCore nominator pool contracts.
 ///
 /// Based on https://github.com/ton-blockchain/single-nominator
 ///
-/// The single-nominator contract provides secure validation for TON blockchain
-/// by separating the owner role (cold wallet) from the validator role (hot wallet).
+/// TONCore nominator with two pools uses [`crate::nominator::TonCoreNominatorPair`], which
+/// implements this trait and picks the first pool with `get_pool_data().state == 0` for staking.
 #[async_trait::async_trait]
 pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Get the owner and validator addresses stored in the contract
@@ -25,6 +25,32 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Return the state_init used for deploying this contract (if available).
     fn state_init(&self) -> Option<StateInit> {
         None
+    }
+
+    /// TONCore nominator (two pools): the two on-chain pool contracts. Default `None`.
+    fn as_toncore_nominator_slots(
+        &self,
+    ) -> Option<(Arc<dyn NominatorWrapper>, Arc<dyn NominatorWrapper>)> {
+        None
+    }
+
+    /// Pool (or elector-facing) address to use for the current stake operation.
+    async fn resolve_staking_address(&self) -> anyhow::Result<MsgAddressInt> {
+        Ok(self.address())
+    }
+
+    /// `true` only for TONCore nominator with two pools ([`crate::nominator::TonCoreNominatorPair`]).
+    fn is_toncore_nominator_pair(&self) -> bool {
+        false
+    }
+}
+
+/// Physical pool contracts for this node binding (one, or two for TONCore nominator pair).
+#[must_use]
+pub fn nominator_constituents(pool: Arc<dyn NominatorWrapper>) -> Vec<Arc<dyn NominatorWrapper>> {
+    match pool.as_toncore_nominator_slots() {
+        Some((a, b)) => vec![a, b],
+        None => vec![pool],
     }
 }
 
@@ -69,49 +95,4 @@ pub struct PoolData {
     pub validator_set_change_time: u64,
     /// Stake held for duration
     pub stake_held_for: u64,
-}
-
-/// Pool binding for a single node: either one pool or two with routing.
-#[derive(Clone)]
-pub enum NodePools {
-    /// SNP or TONCore — a single nominator pool.
-    Single(Arc<dyn NominatorWrapper>),
-    /// TONCoreRouter — two pools; the runner picks the free one via `get_pool_data().state`.
-    Router([Arc<dyn NominatorWrapper>; 2]),
-}
-
-impl NodePools {
-    /// Primary pool (pool[0]). Used for address display and as the default staking address.
-    pub fn primary(&self) -> &Arc<dyn NominatorWrapper> {
-        match self {
-            NodePools::Single(p) => p,
-            NodePools::Router([p, _]) => p,
-        }
-    }
-
-    /// All pools (1 for Single, 2 for Router).
-    pub fn all(&self) -> Vec<&Arc<dyn NominatorWrapper>> {
-        match self {
-            NodePools::Single(p) => vec![p],
-            NodePools::Router([a, b]) => vec![a, b],
-        }
-    }
-
-    /// Select the pool that is ready for validation (`state == 0`).
-    /// For `Single` — always returns the only pool.
-    /// For `Router` — queries `get_pool_data()` on each pool, returns the first with `state == 0`.
-    pub async fn select_free(&self) -> anyhow::Result<&Arc<dyn NominatorWrapper>> {
-        match self {
-            NodePools::Single(p) => Ok(p),
-            NodePools::Router(pools) => {
-                for pool in pools {
-                    let data = pool.get_pool_data().await?;
-                    if data.state == 0 {
-                        return Ok(pool);
-                    }
-                }
-                anyhow::bail!("all router pools are busy (state != 0)")
-            }
-        }
-    }
 }
