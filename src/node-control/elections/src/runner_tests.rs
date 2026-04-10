@@ -1352,6 +1352,8 @@ async fn test_elections_finished_node_not_in_participants() {
     let provider = &mut harness.provider_mock;
     provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
     provider.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
 
     provider.expect_shutdown().returning(|| Ok(()));
 
@@ -2382,7 +2384,7 @@ fn test_elections_config_validate_sleep_gt_waiting() {
         waiting_period_pct: 0.3, // sleep > waiting → invalid
         ..ElectionsConfig::default()
     };
-    assert!(config.validate().is_err());
+    assert!(config.validate(None).is_err());
 }
 
 #[test]
@@ -2391,7 +2393,7 @@ fn test_elections_config_validate_sleep_out_of_range() {
         sleep_period_pct: 1.5, // > 1.0 → invalid
         ..ElectionsConfig::default()
     };
-    assert!(config.validate().is_err());
+    assert!(config.validate(None).is_err());
 }
 
 #[test]
@@ -2401,7 +2403,7 @@ fn test_elections_config_validate_valid() {
         waiting_period_pct: 0.5,
         ..ElectionsConfig::default()
     };
-    assert!(config.validate().is_ok());
+    assert!(config.validate(None).is_ok());
 }
 
 #[test]
@@ -2410,6 +2412,43 @@ fn test_elections_config_defaults() {
     assert_eq!(config.sleep_period_pct, 0.2);
     assert_eq!(config.waiting_period_pct, 0.4);
 }
+
+#[test]
+fn test_calc_max_factor_clamps_to_network_cap() {
+    let mut harness = TestHarness::new();
+    setup_elector_no_elections(&mut harness.elector_mock);
+    harness.elections_config.max_factor = 5.0;
+    let runner = harness.build("node-1");
+    let network_raw = 3 * 65536u32; // chain allows 3×
+    let (raw, mult) = runner.calc_max_factor(network_raw);
+    assert_eq!(raw, network_raw, "configured 5× must clamp to network 3× (raw)");
+    assert!((mult - 3.0).abs() < 1e-3);
+}
+
+#[test]
+fn test_calc_max_factor_no_clamp_when_below_cap() {
+    let mut harness = TestHarness::new();
+    setup_elector_no_elections(&mut harness.elector_mock);
+    harness.elections_config.max_factor = 2.0;
+    let runner = harness.build("node-1");
+    let network_raw = 3 * 65536u32;
+    let (raw, mult) = runner.calc_max_factor(network_raw);
+    assert_eq!(raw, 2 * 65536, "2× should pass through when network cap is 3×");
+    assert!((mult - 2.0).abs() < 1e-3);
+}
+
+#[test]
+fn test_calc_max_factor_clamps_to_minimum_1x() {
+    let mut harness = TestHarness::new();
+    setup_elector_no_elections(&mut harness.elector_mock);
+    harness.elections_config.max_factor = 0.5;
+    let runner = harness.build("node-1");
+    let network_raw = 3 * 65536u32;
+    let (raw, mult) = runner.calc_max_factor(network_raw);
+    assert_eq!(raw, 65536, "below 1× fixed-point must clamp to 65536");
+    assert!((mult - 1.0).abs() < 1e-3);
+}
+
 // Participation status transitions across election lifecycle
 // Simulates: Idle → Participating → Submitted → Accepted → Elected → Validating
 // Also verifies that stale election flags don't leak after elections close.
