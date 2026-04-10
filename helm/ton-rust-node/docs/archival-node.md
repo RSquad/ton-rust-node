@@ -41,7 +41,7 @@ Archives can be obtained using TON storage clients (we used [this](https://githu
 You also need:
 
 - Masterchain zerostate `.boc` file. TON mainnet zerostate [here](https://github.com/RSquad/ton-rust-node/blob/master/src/node/src/tests/static/5E994FCF4D425C0A6CE6A792594B7173205F740A39CD56F537DEFD28B48A0F6E.boc)
-- Workchain zerostate(s) `.boc` file(s) (one per workchain). TON mainnet 0 workchain zeerostate [here](https://github.com/RSquad/ton-rust-node/blob/master/src/node/src/tests/static/EE0BEDFE4B32761FB35E9E1D8818EA720CAD1A0E7B4D2ED673C488E72E910342.boc)
+- Workchain zerostate(s) `.boc` file(s) (one per workchain). TON mainnet 0 workchain zerostate [here](https://github.com/RSquad/ton-rust-node/blob/master/src/node/src/tests/static/EE0BEDFE4B32761FB35E9E1D8818EA720CAD1A0E7B4D2ED673C488E72E910342.boc)
 - Global config JSON (contains zerostate hashes and hard fork list). TON mainnet global config [here](https://ton-blockchain.github.io/global.config.json)
 
 ## Archive import
