@@ -875,6 +875,7 @@ dependencies = [
  "contracts",
  "control-client",
  "elections",
+ "hex",
  "reqwest",
  "rpassword",
  "scopeguard",

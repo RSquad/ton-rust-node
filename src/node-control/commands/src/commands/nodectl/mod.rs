@@ -22,3 +22,4 @@ pub(crate) mod output_format;
 pub(crate) mod service_api_cmd;
 pub(crate) mod service_cmd;
 mod utils;
+pub(crate) mod vote_cmd;
