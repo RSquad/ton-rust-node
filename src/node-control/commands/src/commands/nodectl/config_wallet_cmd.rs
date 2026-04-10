@@ -19,7 +19,7 @@ use anyhow::Context;
 use colored::Colorize;
 use common::{
     TonWalletVersion,
-    app_config::{AppConfig, KeyConfig, PoolConfig, WalletConfig},
+    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
     task_cancellation::CancellationCtx,
     time_format,
     ton_utils::{display_tons, tons_f64_to_nanotons},
@@ -442,12 +442,8 @@ impl WalletStakeCmd {
     pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
         let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
-        if !(1.0..=network_max_factor).contains(&self.max_factor) {
-            anyhow::bail!(
-                "max-factor must be in range [1.0..{}] (network max_stake_factor from config param 17)",
-                network_max_factor
-            );
-        }
+        ElectionsConfig { max_factor: self.max_factor, ..Default::default() }
+            .validate(Some(network_max_factor))?;
 
         // Resolve binding → wallet, pool, node
         let binding = config

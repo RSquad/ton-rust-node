@@ -497,8 +497,7 @@ impl ElectionRunner {
         elections_info: &ElectionsInfo,
         cfg17: &ConfigParam17,
     ) {
-        self.snapshot_cache.last_max_factor =
-            Some(self.calc_max_factor(cfg17.max_stake_factor, false).1);
+        self.snapshot_cache.last_max_factor = Some(self.calc_max_factor(cfg17.max_stake_factor).1);
 
         // It can be a validator wallet or nominator pool address.
         let wallet_addrs: HashSet<Vec<u8>> =
@@ -555,7 +554,15 @@ impl ElectionRunner {
         election_id: u64,
         params: &ConfigParams<'_>,
     ) -> anyhow::Result<()> {
-        let (max_factor, _) = self.calc_max_factor(params.cfg17.max_stake_factor, true);
+        let configured_raw = self.configured_max_factor_raw();
+        let (max_factor, _) = self.calc_max_factor(params.cfg17.max_stake_factor);
+        if max_factor != configured_raw {
+            tracing::warn!(
+                "max_factor clamped: configured={}, used={} (network limit from cfg17)",
+                max_stake_factor_raw_to_multiplier(configured_raw),
+                max_stake_factor_raw_to_multiplier(max_factor),
+            );
+        }
         let stake_ctx = StakeContext {
             past_elections: &self.past_elections,
             our_max_factor: max_factor,
@@ -926,27 +933,19 @@ impl ElectionRunner {
         tracing::info!("elections: start={}, end={}", elections_start, elections_end);
     }
 
+    #[inline]
+    fn configured_max_factor_raw(&self) -> u32 {
+        (self.default_max_factor * MAX_STAKE_FACTOR_SCALE) as u32
+    }
+
     /// Resolves elector `max_factor`: fixed-point `raw` for the Elector and `multiplier` for logs/UI.
     ///
     /// Applies configured `default_max_factor` and clamps to the chain cap
     /// (`network_max_stake_factor_raw` from masterchain config param 17), in fixed-point
     /// `[65536, network_max_stake_factor_raw]` (see [`MAX_STAKE_FACTOR_SCALE`]).
-    ///
-    /// When `warn_if_clamped` is true and the configured value was clamped, logs a warning.
-    fn calc_max_factor(
-        &self,
-        network_max_stake_factor_raw: u32,
-        warn_if_clamped: bool,
-    ) -> (u32, f32) {
-        let configured_raw = (self.default_max_factor * MAX_STAKE_FACTOR_SCALE) as u32;
+    fn calc_max_factor(&self, network_max_stake_factor_raw: u32) -> (u32, f32) {
+        let configured_raw = self.configured_max_factor_raw();
         let raw = configured_raw.clamp(MAX_STAKE_FACTOR_SCALE as u32, network_max_stake_factor_raw);
-        if warn_if_clamped && raw != configured_raw {
-            tracing::warn!(
-                "max_factor clamped: configured={}, used={} (network limit from cfg17)",
-                max_stake_factor_raw_to_multiplier(configured_raw),
-                max_stake_factor_raw_to_multiplier(raw),
-            );
-        }
         (raw, max_stake_factor_raw_to_multiplier(raw))
     }
 

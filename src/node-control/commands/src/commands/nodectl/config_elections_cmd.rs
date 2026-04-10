@@ -230,18 +230,12 @@ impl MaxFactorCmd {
 
         let rpc_client = try_create_rpc_client(&config).await?;
         let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
-        if !(1.0..=network_max_factor).contains(&self.value) {
-            anyhow::bail!(
-                "max-factor must be in range [1.0..{}] (network max_stake_factor from config param 17)",
-                network_max_factor
-            );
-        }
-
-        config
+        let elections = config
             .elections
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?
-            .max_factor = self.value;
+            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?;
+        elections.max_factor = self.value;
+        elections.validate(Some(network_max_factor))?;
         save_config(&config, path)?;
         println!("{} Max factor set to {}", "OK".green().bold(), self.value);
         Ok(())
