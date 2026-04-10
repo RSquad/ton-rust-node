@@ -8,14 +8,17 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use crate::block::BlockStuff;
 use adnl::common::add_unbound_object_to_map_with_update;
 use lockfree::map::Map;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
     Arc,
 };
+use tokio::sync::mpsc;
 use ton_block::{
-    fail, read_boc, types::UInt256, Deserializable, Message, Result, ShardIdent, UnixTime,
+    fail, read_boc, types::UInt256, Deserializable, HashmapAugType, InMsg, Message, Result,
+    ShardIdent, UnixTime,
 };
 
 #[cfg(test)]
@@ -39,14 +42,22 @@ struct MessageKeeper {
     // generation: u8,          0x0_ff_00000000
     // reactivate_at: u32,      0x0_00_ffffffff
     atomic_storage: Arc<AtomicU64>,
+
+    hash_norm: UInt256,
 }
 
 impl MessageKeeper {
-    fn new(message: Arc<Message>, addr_key: (i32, UInt256)) -> Self {
+    fn new(message: Arc<Message>, addr_key: (i32, UInt256)) -> Result<Self> {
         let mut atomic_storage = 0;
         Self::set_active(&mut atomic_storage, true);
+        let hash_norm = message.normalized_hash()?;
 
-        Self { addr_key, message, atomic_storage: Arc::new(AtomicU64::new(atomic_storage)) }
+        Ok(Self {
+            addr_key,
+            message,
+            atomic_storage: Arc::new(AtomicU64::new(atomic_storage)),
+            hash_norm,
+        })
     }
 
     fn message(&self) -> &Arc<Message> {
@@ -146,6 +157,8 @@ pub struct MessagesPool {
     messages: Map<UInt256, MessageKeeper>,
     // map by timestamp, inside map by seqno for hash of message, workchain_id and prefix of dst address
     order: Map<u32, Arc<OrderMap>>,
+    // map by normalized hash to set of raw hashes (for variant-aware cleanup)
+    norm_messages: Map<UInt256, Arc<Map<UInt256, ()>>>,
     // minimal timestamp
     min_timestamp: AtomicU32,
 
@@ -156,21 +169,114 @@ pub struct MessagesPool {
     total_messages: AtomicU32,
     #[cfg(test)]
     total_in_order: AtomicU32,
+
+    // sender for applied-block cleanup worker
+    applied_blocks_tx: mpsc::UnboundedSender<Arc<BlockStuff>>,
 }
 
 impl MessagesPool {
-    pub fn new(now: u32, maximum_queue_length: Option<u32>) -> Self {
+    pub fn new(
+        now: u32,
+        maximum_queue_length: Option<u32>,
+    ) -> (Self, mpsc::UnboundedReceiver<Arc<BlockStuff>>) {
         metrics::gauge!("ton_node_ext_messages_queue_size").set(0f64);
+        let (applied_blocks_tx, applied_blocks_rx) = mpsc::unbounded_channel();
 
-        Self {
+        let pool = Self {
             per_address: Map::new(),
             messages: Map::with_hasher(Default::default()),
             order: Map::with_hasher(Default::default()),
+            norm_messages: Map::with_hasher(Default::default()),
             min_timestamp: AtomicU32::new(now),
             maximum_queue_length,
             total_messages: AtomicU32::new(0),
             #[cfg(test)]
             total_in_order: AtomicU32::new(0),
+            applied_blocks_tx,
+        };
+        (pool, applied_blocks_rx)
+    }
+
+    pub fn push_applied_block(&self, block: Arc<BlockStuff>) {
+        if let Err(e) = self.applied_blocks_tx.send(block) {
+            log::warn!(
+                target: EXT_MESSAGES_TRACE_TARGET,
+                "Failed to send applied block to cleanup worker: {e}"
+            );
+        }
+    }
+
+    pub fn start_applied_blocks_worker(
+        self: Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<Arc<BlockStuff>>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(block) = rx.recv().await {
+                if let Err(e) = self.process_applied_block(&block) {
+                    log::error!(
+                        target: EXT_MESSAGES_TRACE_TARGET,
+                        "Failed to process applied block {}: {e}",
+                        block.id()
+                    );
+                }
+            }
+            log::info!(target: EXT_MESSAGES_TRACE_TARGET, "Applied blocks cleanup worker stopped");
+        });
+    }
+
+    fn process_applied_block(&self, block: &BlockStuff) -> Result<()> {
+        let extra = block.block()?.read_extra()?;
+        let in_msg_descr = extra.read_in_msg_descr()?;
+        let mut hash_norms = Vec::new();
+        in_msg_descr.iterate_with_keys(|_key: UInt256, in_msg: InMsg| {
+            if let InMsg::External(ext) = in_msg {
+                match ext.read_message() {
+                    Ok(message) => match message.normalized_hash() {
+                        Ok(hash_norm) => hash_norms.push(hash_norm),
+                        Err(e) => log::warn!(
+                            target: EXT_MESSAGES_TRACE_TARGET,
+                            "process_applied_block {}: failed to compute hash_norm: {e}",
+                            block.id()
+                        ),
+                    },
+                    Err(e) => log::warn!(
+                        target: EXT_MESSAGES_TRACE_TARGET,
+                        "process_applied_block {}: failed to read ext message: {e}",
+                        block.id()
+                    ),
+                }
+            }
+            Ok(true)
+        })?;
+        if !hash_norms.is_empty() {
+            log::debug!(
+                target: EXT_MESSAGES_TRACE_TARGET,
+                "process_applied_block {}: erasing {} norm hash(es) from pool",
+                block.id(),
+                hash_norms.len()
+            );
+            self.erase_by_hash_norm(&hash_norms);
+        }
+        Ok(())
+    }
+
+    fn erase_by_hash_norm(&self, hash_norms: &[UInt256]) {
+        for hash_norm in hash_norms {
+            let bucket = match self.norm_messages.get(hash_norm) {
+                Some(b) => b,
+                None => continue,
+            };
+            let ids_to_remove: Vec<UInt256> =
+                bucket.val().iter().map(|e| e.key().clone()).collect();
+            for raw_id in ids_to_remove {
+                log::debug!(
+                    target: EXT_MESSAGES_TRACE_TARGET,
+                    "erase_by_hash_norm: removing external message {:x}", raw_id
+                );
+                if let Some(guard) = self.messages.remove(&raw_id) {
+                    self.finalize_removal(&raw_id, guard.val());
+                }
+            }
         }
     }
 
@@ -227,7 +333,21 @@ impl MessagesPool {
         log::debug!(target: EXT_MESSAGES_TRACE_TARGET, "adding external message {:x}", id);
         let prefix =
             message.int_dst_account_id().map_or(0, |slice| slice.get_int(64).unwrap_or_default());
-        self.messages.insert(id.clone(), MessageKeeper::new(message, addr_key.clone()));
+        let keeper = MessageKeeper::new(message, addr_key.clone())?;
+        let hash_norm = keeper.hash_norm.clone();
+        self.messages.insert(id.clone(), keeper);
+
+        // Index by normalized hash for variant-aware cleanup
+        add_unbound_object_to_map_with_update(&self.norm_messages, hash_norm, |bucket| {
+            if let Some(bucket) = bucket {
+                bucket.insert(id.clone(), ());
+                Ok(None)
+            } else {
+                let m = Arc::new(Map::with_hasher(Default::default()));
+                m.insert(id.clone(), ());
+                Ok(Some(m))
+            }
+        })?;
 
         // Increment per-address counter
         if let Some(guard) = self.per_address.get(&addr_key) {
@@ -264,7 +384,7 @@ impl MessagesPool {
     pub fn complete_messages(
         &self,
         to_delay: Vec<(UInt256, String)>,
-        _to_delete: Vec<(UInt256, i32)>,
+        to_delete: Vec<(UInt256, i32)>,
         now: u32,
     ) -> Result<()> {
         for (id, reason) in &to_delay {
@@ -287,11 +407,17 @@ impl MessagesPool {
                     "complete_messages: removing external message {:x} with reason {} because can't postpone",
                     id, reason,
                 );
-                self.decrement_per_address(&guard.val().addr_key);
-                metrics::gauge!("ton_node_ext_messages_queue_size").decrement(1f64);
-                self.total_messages.fetch_sub(1, Ordering::Relaxed);
+                self.finalize_removal(id, guard.val());
             }
         }
+
+        // Remove accepted messages and all their normalized-hash variants from the pool
+        let hash_norms: Vec<UInt256> = to_delete
+            .iter()
+            .filter_map(|(id, _wc)| self.messages.get(id).map(|g| g.val().hash_norm.clone()))
+            .collect();
+        self.erase_by_hash_norm(&hash_norms);
+
         Ok(())
     }
 
@@ -306,6 +432,21 @@ impl MessagesPool {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+    }
+
+    fn remove_from_norm_index(&self, id: &UInt256, hash_norm: &UInt256) {
+        if let Some(bucket) = self.norm_messages.get(hash_norm) {
+            bucket.val().remove(id);
+        }
+    }
+
+    // Completes removal of a message that has already been extracted from `messages`.
+    // Updates norm_messages, per_address counter, queue size gauge, and total count.
+    fn finalize_removal(&self, id: &UInt256, keeper: &MessageKeeper) {
+        self.remove_from_norm_index(id, &keeper.hash_norm);
+        self.decrement_per_address(&keeper.addr_key);
+        metrics::gauge!("ton_node_ext_messages_queue_size").decrement(1f64);
+        self.total_messages.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn decrement_per_address(&self, addr_key: &(i32, UInt256)) {
@@ -334,13 +475,11 @@ impl MessagesPool {
             if let Some(guard) = order.map.remove(&seqno) {
                 if let Some(guard) = self.messages.remove(&guard.val().id) {
                     metrics::counter!("ton_node_ext_messages_expired_total").increment(1);
-                    metrics::gauge!("ton_node_ext_messages_queue_size").decrement(1f64);
                     log::debug!(
                         target: EXT_MESSAGES_TRACE_TARGET,
                         "removing external message {:x} because it is expired", guard.key()
                     );
-                    self.decrement_per_address(&guard.val().addr_key);
-                    self.total_messages.fetch_sub(1, Ordering::Relaxed);
+                    self.finalize_removal(guard.key(), guard.val());
                 }
                 #[cfg(test)]
                 self.total_in_order.fetch_sub(1, Ordering::Relaxed);

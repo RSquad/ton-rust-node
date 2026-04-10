@@ -479,6 +479,9 @@ enum KeyCommand {
         bind_addr: SocketAddr,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    ActivateKey {
+        key_id: Arc<KeyId>,
+    },
 }
 
 pub struct QuicNode {
@@ -609,6 +612,11 @@ impl QuicNode {
                                 };
                                 let _ = reply.send(result);
                             }
+                            KeyCommand::ActivateKey { key_id } => {
+                                if let Some(this) = weak.upgrade() {
+                                    this.activate_key_inner(&key_id);
+                                }
+                            }
                         }
                     }
                     _ = token.cancelled() => break,
@@ -738,9 +746,17 @@ impl QuicNode {
             }
         }
 
-        // Update last-added name for SNI fallback (C++ ngtcp2 doesn't send SNI)
+        // Auto-activate the first key so the server always has an active identity
         if let Ok(mut last) = endpoint_state.last_added_name.lock() {
-            *last = Some(name);
+            if last.is_none() {
+                *last = Some(name);
+                log::info!(
+                    target: TARGET,
+                    "Registered and auto-activated QUIC identity {} on port {}",
+                    key_id, bind_addr.port()
+                );
+                return Ok(());
+            }
         }
 
         log::info!(
@@ -812,6 +828,34 @@ impl QuicNode {
         );
 
         Ok(())
+    }
+
+    /// Activate a previously added key as the current SNI fallback identity.
+    /// Called when the validator set containing this key becomes active.
+    pub fn activate_key(&self, key_id: &Arc<KeyId>) {
+        let _ = self.key_cmd_tx.send(KeyCommand::ActivateKey { key_id: key_id.clone() });
+    }
+
+    fn activate_key_inner(&self, key_id: &Arc<KeyId>) {
+        let Some(local_key) = self.local_keys.get(key_id) else {
+            log::warn!(target: TARGET, "activate_key: unknown key {key_id}");
+            return;
+        };
+        let port = local_key.val().bound_port;
+        let Ok(endpoints) = self.endpoints.lock() else {
+            log::error!(target: TARGET, "activate_key: endpoints lock poisoned");
+            return;
+        };
+        let Some(endpoint_state) = endpoints.get(&port) else {
+            log::warn!(target: TARGET, "activate_key: no endpoint on port {port} for key {key_id}");
+            return;
+        };
+        let name = Self::key_id_to_server_name(key_id);
+        // Update last-added name for SNI fallback (C++ ngtcp2 doesn't send SNI)
+        if let Ok(mut last) = endpoint_state.last_added_name.lock() {
+            *last = Some(name);
+        }
+        log::info!(target: TARGET, "Activated QUIC identity {} on port {}", key_id, port);
     }
 
     pub fn add_peer_key(&self, key_id: Arc<KeyId>, addr: SocketAddr) -> Result<()> {

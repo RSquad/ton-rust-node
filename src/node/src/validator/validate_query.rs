@@ -6950,7 +6950,7 @@ impl ValidateQuery {
 
     pub async fn try_validate(mut self) -> Result<Option<Arc<ShardStateStuff>>> {
         let block_id = self.block_candidate.block_id.clone();
-        log::trace!("({}): VALIDATE {}", self.next_block_descr, block_id);
+        log::info!("({}): VALIDATE {}", self.next_block_descr, block_id);
         let now = Instant::now();
 
         let result = self.validate().await;
