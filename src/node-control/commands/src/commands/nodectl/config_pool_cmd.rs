@@ -38,7 +38,7 @@ enum PoolAddKind {
     /// Single Nominator Pool (`kind: "snp"` in config)
     #[default]
     Snp,
-    /// TONCore nominator: saved as `kind: "core"` with `dual_pools: true` (two pools; see README)
+    /// TONCore nominator (`kind: "core"`): dual pools by default; `--single-pool` for one pool
     Core,
 }
 
@@ -73,19 +73,24 @@ pub struct PoolAddCmd {
     #[arg(
         short = 'a',
         long = "address",
-        help = "SNP: deployed pool contract address. For --kind core: saves one address for the even-round pool only (config `addresses[0]`); do not use together with --address-even or --address-odd"
+        help = "SNP: deployed pool address. Core dual: slot 0 (`addresses[0]`). Core `--single-pool`: config `address` (one contract). Mutually exclusive with --address-even/--address-odd except dual+--address"
     )]
     address: Option<String>,
     #[arg(
         long = "address-even",
-        help = "Core: pool address for even validation rounds (optional; derived if omitted)"
+        conflicts_with = "single_pool",
+        help = "Core dual only: even-round pool address (optional; derived if omitted)"
     )]
     address_even: Option<String>,
     #[arg(
         long = "address-odd",
-        help = "Core: pool address for odd validation rounds (optional; derived if omitted)"
+        conflicts_with = "single_pool",
+        help = "Core dual only: odd-round pool address (optional; derived if omitted)"
     )]
     address_odd: Option<String>,
+    /// Core: one TONCore contract (`dual_pools: false`); cannot combine with --address-even / --address-odd
+    #[arg(long = "single-pool", conflicts_with_all = ["address_even", "address_odd"])]
+    single_pool: bool,
     #[arg(
         short = 'o',
         long = "owner",
@@ -196,6 +201,10 @@ impl PoolAddCmd {
             );
         }
 
+        if self.single_pool && !matches!(self.kind, PoolAddKind::Core) {
+            anyhow::bail!("--single-pool is only valid with --kind core");
+        }
+
         let (pool_config, info) = match self.kind {
             PoolAddKind::Snp => {
                 if self.address.is_none() && self.owner.is_none() {
@@ -237,11 +246,12 @@ impl PoolAddCmd {
                     .validator_share
                     .ok_or_else(|| anyhow::anyhow!("For core: --validator-share is required"))?;
 
-                if self.address.is_some()
+                if !self.single_pool
+                    && self.address.is_some()
                     && (self.address_even.is_some() || self.address_odd.is_some())
                 {
                     anyhow::bail!(
-                        "For core: use either --address (slot 0) or --address-even / --address-odd, not both"
+                        "For core dual: use either --address (slot 0) or --address-even / --address-odd, not both"
                     );
                 }
 
@@ -250,25 +260,6 @@ impl PoolAddCmd {
                     .as_deref()
                     .map(|a| normalize_ton_address(a, "address"))
                     .transpose()?;
-
-                let addr_even = self
-                    .address_even
-                    .as_deref()
-                    .map(|a| normalize_ton_address(a, "address-even"))
-                    .transpose()?;
-                let addr_odd = self
-                    .address_odd
-                    .as_deref()
-                    .map(|a| normalize_ton_address(a, "address-odd"))
-                    .transpose()?;
-
-                let addresses = if normalized_address.is_some() {
-                    Some(vec![normalized_address.clone()])
-                } else if addr_even.is_some() || addr_odd.is_some() {
-                    Some(vec![addr_even.clone(), addr_odd.clone()])
-                } else {
-                    None
-                };
 
                 let max_n = self.max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS);
                 let min_validator_stake_nano = self
@@ -279,36 +270,78 @@ impl PoolAddCmd {
                     .min_nominator_stake
                     .map(tons_f64_to_nanotons)
                     .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE_NANOTONS);
-                let (even_disp, odd_disp) = match &addresses {
-                    Some(v) => {
-                        let e = v.first().and_then(|x| x.as_deref()).unwrap_or("<will be derived>");
-                        let o = v.get(1).and_then(|x| x.as_deref()).unwrap_or("<will be derived>");
-                        (e, o)
-                    }
-                    None => ("<will be derived>", "<will be derived>"),
-                };
-                let info = format!(
-                    "kind=core dual_pools (CLI --kind core) validator_share={}, even_round={}, odd_round={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
-                    share,
-                    even_disp,
-                    odd_disp,
-                    max_n,
-                    min_validator_stake_nano,
-                    min_nominator_stake_nano
-                );
 
-                (
-                    PoolConfig::TONCore {
-                        dual_pools: true,
-                        validator_share: share,
-                        address: None,
-                        addresses,
-                        max_nominators: max_n,
-                        min_validator_stake: min_validator_stake_nano,
-                        min_nominator_stake: min_nominator_stake_nano,
-                    },
-                    info,
-                )
+                if self.single_pool {
+                    let addr_disp = normalized_address.as_deref().unwrap_or("<will be derived>");
+                    let info = format!(
+                        "kind=core single_pool (dual_pools=false) validator_share={}, address={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
+                        share, addr_disp, max_n, min_validator_stake_nano, min_nominator_stake_nano
+                    );
+                    (
+                        PoolConfig::TONCore {
+                            dual_pools: false,
+                            validator_share: share,
+                            address: normalized_address.clone(),
+                            addresses: None,
+                            max_nominators: max_n,
+                            min_validator_stake: min_validator_stake_nano,
+                            min_nominator_stake: min_nominator_stake_nano,
+                        },
+                        info,
+                    )
+                } else {
+                    let addr_even = self
+                        .address_even
+                        .as_deref()
+                        .map(|a| normalize_ton_address(a, "address-even"))
+                        .transpose()?;
+                    let addr_odd = self
+                        .address_odd
+                        .as_deref()
+                        .map(|a| normalize_ton_address(a, "address-odd"))
+                        .transpose()?;
+
+                    let addresses = if normalized_address.is_some() {
+                        Some(vec![normalized_address.clone()])
+                    } else if addr_even.is_some() || addr_odd.is_some() {
+                        Some(vec![addr_even.clone(), addr_odd.clone()])
+                    } else {
+                        None
+                    };
+
+                    let (even_disp, odd_disp) = match &addresses {
+                        Some(v) => {
+                            let e =
+                                v.first().and_then(|x| x.as_deref()).unwrap_or("<will be derived>");
+                            let o =
+                                v.get(1).and_then(|x| x.as_deref()).unwrap_or("<will be derived>");
+                            (e, o)
+                        }
+                        None => ("<will be derived>", "<will be derived>"),
+                    };
+                    let info = format!(
+                        "kind=core dual_pools (default) validator_share={}, even_round={}, odd_round={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
+                        share,
+                        even_disp,
+                        odd_disp,
+                        max_n,
+                        min_validator_stake_nano,
+                        min_nominator_stake_nano
+                    );
+
+                    (
+                        PoolConfig::TONCore {
+                            dual_pools: true,
+                            validator_share: share,
+                            address: None,
+                            addresses,
+                            max_nominators: max_n,
+                            min_validator_stake: min_validator_stake_nano,
+                            min_nominator_stake: min_nominator_stake_nano,
+                        },
+                        info,
+                    )
+                }
             }
         };
 
@@ -524,14 +557,18 @@ fn print_pools_json(views: &[PoolView]) -> anyhow::Result<()> {
 fn print_pools_table(views: &[PoolView]) {
     println!("\n{} {} ({})\n", "OK".green().bold(), "Pools:".green(), views.len());
     println!(
-        "  {:<15} {:<6} {:<14} {:<50} {}",
+        "  {:<15} {:<8} {:<14} {:<50} {}",
         "Name".cyan().bold(),
         "Kind".cyan().bold(),
         "Balance".cyan().bold(),
         "Address".cyan().bold(),
-        "Owner".cyan().bold(),
+        "Owner / share".cyan().bold(),
     );
-    println!("  {}", "─".repeat(137).dimmed());
+    println!("  {}", "─".repeat(145).dimmed());
+
+    fn format_validator_share_bp(share: Option<u16>) -> String {
+        share.map(|s| format!("{s} bp")).unwrap_or_else(|| "-".to_string())
+    }
 
     for v in views {
         match v.kind.as_str() {
@@ -544,7 +581,7 @@ fn print_pools_table(views: &[PoolView]) {
                     v.balance.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
 
                 println!(
-                    "  {:<15} {:<6} {:<14} {:<50} {}",
+                    "  {:<15} {:<8} {:<14} {:<50} {}",
                     v.name, "SNP", display_balance, display_addr, display_owner,
                 );
             }
@@ -552,9 +589,10 @@ fn print_pools_table(views: &[PoolView]) {
                 let display_addr = v.address.as_deref().unwrap_or("<not deployed>");
                 let display_balance =
                     v.balance.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
+                let share = format_validator_share_bp(v.validator_share);
                 println!(
-                    "  {:<15} {:<6} {:<14} {:<50} {}",
-                    v.name, "Core", display_balance, display_addr, "-",
+                    "  {:<15} {:<8} {:<14} {:<50} {}",
+                    v.name, "Core", display_balance, display_addr, share,
                 );
             }
             "TONCore" if v.addresses.is_some() => {
@@ -565,7 +603,11 @@ fn print_pools_table(views: &[PoolView]) {
                     .unwrap_or_else(|| "<not deployed>".into());
                 let display_balance =
                     v.balances.as_deref().map(|b| b.join(" | ")).unwrap_or_else(|| "-".into());
-                println!("  {:<15} {:<8} {:<28} {}", v.name, "TONCore", display_balance, addrs,);
+                let share = format_validator_share_bp(v.validator_share);
+                println!(
+                    "  {:<15} {:<8} {:<14} {:<50} {}",
+                    v.name, "TONCore", display_balance, addrs, share,
+                );
             }
             _ => {}
         }

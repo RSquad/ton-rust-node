@@ -54,14 +54,11 @@ const RECOVER_FEE: u64 = 200_000_000;
 const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 /// Gas fee consumed by validator wallet
 const WALLET_COMPUTE_FEE: u64 = 200_000_000;
-/// Reserved minimum balance on the pool (or wallet) to correctly calculate free
-/// funds for staking.
-///
+/// SNP pool and direct wallet staking (~1 TON); see single-nominator contract storage reserve.
+const SNP_MIN_NANOTON_FOR_STORAGE: u64 = 1_000_000_000;
 /// TONCore nominator-pool contract reserves 10 TON (`MIN_TONS_FOR_STORAGE` in pool.fc)
 /// and checks `throw_unless(82, value <= balance - MIN_TONS_FOR_STORAGE())`.
-/// The SNP contract uses only 1 TON, but over-reserving by 9 TON is negligible
-/// compared to typical validator stakes (100k+ TON).
-const MIN_NANOTON_FOR_STORAGE: u64 = 10_000_000_000;
+const TONCORE_MIN_NANOTON_FOR_STORAGE: u64 = 10_000_000_000;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 
@@ -152,20 +149,44 @@ impl Node {
         self.stake_submissions.clear();
     }
 
+    /// Minimum balance left on the staking target (pool contract or wallet) when computing
+    /// spendable stake liquidity.
+    fn min_nanoton_for_stake_target(&self, active_pool_addr: Option<&MsgAddressInt>) -> u64 {
+        match (&self.pools, active_pool_addr) {
+            (None, _) => SNP_MIN_NANOTON_FOR_STORAGE,
+            (Some(pool_binding), Some(addr)) => {
+                for p in nominator_constituents(pool_binding.clone()) {
+                    if p.address() == *addr {
+                        return if p.is_toncore_pool() {
+                            TONCORE_MIN_NANOTON_FOR_STORAGE
+                        } else {
+                            SNP_MIN_NANOTON_FOR_STORAGE
+                        };
+                    }
+                }
+                SNP_MIN_NANOTON_FOR_STORAGE
+            }
+            (Some(_), None) => SNP_MIN_NANOTON_FOR_STORAGE,
+        }
+    }
+
     async fn stake_balance(
         &mut self,
         gas_fee: u64,
         active_pool_addr: Option<&MsgAddressInt>,
     ) -> anyhow::Result<u64> {
+        let reserve = self.min_nanoton_for_stake_target(active_pool_addr);
         match active_pool_addr {
             Some(addr) => self
                 .api
                 .account(&addr.to_string())
                 .await
-                .map(|x| x.balance().saturating_sub(MIN_NANOTON_FOR_STORAGE)),
-            None => self.api.account(&self.wallet.address().to_string()).await.map(|x| {
-                x.balance().saturating_sub(gas_fee).saturating_sub(MIN_NANOTON_FOR_STORAGE)
-            }),
+                .map(|x| x.balance().saturating_sub(reserve)),
+            None => self
+                .api
+                .account(&self.wallet.address().to_string())
+                .await
+                .map(|x| x.balance().saturating_sub(gas_fee).saturating_sub(reserve)),
         }
     }
 

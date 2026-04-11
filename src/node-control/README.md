@@ -282,14 +282,19 @@ Manage nominator pools in the configuration file.
 
 ##### `config pool add`
 
-Add a pool: **`--kind snp`** (Single Nominator Pool) or **`--kind core`** (TONCore nominator). For `--kind core`, the entry is stored as **`kind: "core"`** with **`dual_pools: true`** (two on-chain nominator pool contracts). Addresses are saved as a **1- or 2-element** `addresses` array: `--address` alone → one entry (slot 0); `--address-even` / `--address-odd` → up to two entries; omit all to derive both.
+Add a pool: **`--kind snp`** (Single Nominator Pool) or **`--kind core`** (TONCore nominator).
+
+**`--kind core` (default):** **`dual_pools: true`** — two on-chain contracts. Addresses go in the **`addresses`** array: `--address` alone → slot 0 only; `--address-even` / `--address-odd` → up to two slots; omit all to derive both.
+
+**`--kind core --single-pool`:** **`dual_pools: false`** — one contract. Optional **`--address`** maps to config field **`address`** (not `addresses`).
 
 | Flag | Short form | Description |
 |------|------------|-------------|
 | `--kind <KIND>` | | `snp` (default) or `core` |
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--address <ADDRESS>` | `-a` | SNP: deployed pool address. Core: only the even-round pool (`addresses[0]`); mutually exclusive with `--address-even` / `--address-odd` |
-| `--address-even`, `--address-odd` | | Core only: per-slot addresses (optional) |
+| `--address <ADDRESS>` | `-a` | SNP: deployed pool address. Core dual: slot 0 (`addresses[0]`). Core `--single-pool`: single `address` field |
+| `--address-even`, `--address-odd` | | Core dual only: per-slot addresses (conflicts with `--single-pool`) |
+| `--single-pool` | | Core only: one TONCore pool (`dual_pools: false`); conflicts with `--address-even` / `--address-odd` |
 | `--owner <ADDRESS>` | `-o` | SNP: owner for deployment/verification |
 | `--validator-share` | | Core: basis points (required for core) |
 | `--max-nominators` | | Core: optional (default from contracts) |
@@ -306,9 +311,16 @@ nodectl config pool add \
   --name pool0 \
   --owner "-1:owner_address"
 
-# Core: TONCore nominator — two pools (validator_share required)
+# Core: dual TONCore nominator (default; validator_share required)
 nodectl config pool add \
   --kind core \
+  --name pool0 \
+  --validator-share 5000
+
+# Core: single TONCore pool (dual_pools: false)
+nodectl config pool add \
+  --kind core \
+  --single-pool \
   --name pool0 \
   --validator-share 5000
 ```

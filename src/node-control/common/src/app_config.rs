@@ -343,6 +343,11 @@ fn is_default_toncore_min_nominator_stake(v: &u64) -> bool {
     *v == DEFAULT_TONCORE_MIN_NOMINATOR_STAKE_NANOTONS
 }
 
+#[inline]
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 fn deserialize_toncore_addresses<'de, D>(
     deserializer: D,
 ) -> Result<Option<Vec<Option<String>>>, D::Error>
@@ -425,7 +430,7 @@ enum PoolConfigSer {
         #[serde(flatten)]
         ton: TonCorePoolSerdeFields,
         #[serde(default)]
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[serde(skip_serializing_if = "is_false")]
         dual_pools: bool,
     },
 }

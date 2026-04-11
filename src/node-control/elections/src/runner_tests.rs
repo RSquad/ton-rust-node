@@ -559,6 +559,7 @@ fn setup_toncore_nominator_slot(
 ) {
     pool.expect_address().returning(move || addr.clone());
     pool.expect_get_pool_data().returning(move || Ok(pool_data_with_state(state)));
+    pool.expect_is_toncore_pool().returning(|| true);
 }
 
 // =====================================================
@@ -574,7 +575,8 @@ async fn test_participate_new_key_no_pool() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
     let expected_stake =
-        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - MIN_NANOTON_FOR_STORAGE) / 2;
+        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - SNP_MIN_NANOTON_FOR_STORAGE)
+            / 2;
     // validate the election bid payload
     harness
         .wallet_mock
@@ -615,7 +617,7 @@ async fn test_participate_new_key_with_pool() {
     setup_wallet(&mut harness.wallet_mock);
     setup_pool(harness.pool_mock.as_mut().unwrap());
 
-    let expected_stake = (POOL_BALANCE - MIN_NANOTON_FOR_STORAGE) / 2;
+    let expected_stake = (POOL_BALANCE - SNP_MIN_NANOTON_FOR_STORAGE) / 2;
     // validate the election bid payload
     harness
         .wallet_mock
@@ -1163,7 +1165,7 @@ async fn test_recover_with_past_elections_frozen() {
     let p = node.participant.as_ref().unwrap();
     // With Split50 policy, stake = max(total_balance / 2, min_stake)
     // total_balance = frozen_stake + pool_free_balance + 0
-    // pool_free_balance = WALLET_BALANCE - gas_fee - MIN_NANOTON_FOR_STORAGE
+    // pool_free_balance = WALLET_BALANCE - gas_fee - SNP_MIN_NANOTON_FOR_STORAGE
     assert!(p.stake >= MIN_STAKE, "stake should be at least min_stake");
 }
 
@@ -1554,9 +1556,9 @@ async fn test_split50_stake_calculation() {
 
     // With Split50: stake = max(total_balance / 2, min_stake)
     // total_balance = frozen_stake(0) + pool_free_balance + elections_stake(0)
-    // pool_free_balance = WALLET_BALANCE - gas_fee - MIN_NANOTON_FOR_STORAGE
+    // pool_free_balance = WALLET_BALANCE - gas_fee - SNP_MIN_NANOTON_FOR_STORAGE
     let gas_fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
-    let pool_free_balance = WALLET_BALANCE - gas_fee - MIN_NANOTON_FOR_STORAGE;
+    let pool_free_balance = WALLET_BALANCE - gas_fee - SNP_MIN_NANOTON_FOR_STORAGE;
     let expected = (pool_free_balance / 2).max(MIN_STAKE);
     assert_eq!(
         p.stake, expected,
@@ -2216,7 +2218,7 @@ async fn test_adaptive_topup_three_ticks() {
     let wallet_addr = addr_bytes(&wallet_address());
 
     let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
-    let pool_free_balance = wallet_balance - fee - MIN_NANOTON_FOR_STORAGE;
+    let pool_free_balance = wallet_balance - fee - SNP_MIN_NANOTON_FOR_STORAGE;
     let initial_stake = pool_free_balance / 2; // stake half on tick 1
 
     // --- Helper: build participants with given stakes ---
@@ -2420,7 +2422,7 @@ async fn test_adaptive_topup_three_ticks() {
     // Remaining wallet ≈ 50k, current_stake ≈ 50k in elector.
     // total ≈ 100k, half ≈ 50k < min_eff (~60k) → stake all remaining.
     let remaining_balance = wallet_balance - initial_stake - fee;
-    let pool_free_tick3 = remaining_balance - fee - MIN_NANOTON_FOR_STORAGE;
+    let pool_free_tick3 = remaining_balance - fee - SNP_MIN_NANOTON_FOR_STORAGE;
     assert!(
         tick3_stake > tick2_stake,
         "tick 3: stake should increase via top-up: tick2={}, tick3={}",
@@ -2651,7 +2653,7 @@ async fn test_toncore_nominator_selects_free_pool() {
     setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
 
     // TONCore nominator pair + split50: stake entire liquid balance of the active (free) pool.
-    let expected_stake = POOL_BALANCE - MIN_NANOTON_FOR_STORAGE;
+    let expected_stake = POOL_BALANCE - TONCORE_MIN_NANOTON_FOR_STORAGE;
     harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
 
     let mut runner = harness.build(node_id);
