@@ -432,10 +432,9 @@ impl DeployPoolCmd {
 
         let amount_to_send_nano = tons_f64_to_nanotons(self.amount);
 
-        let deploy_body = match pool_cfg {
-            PoolConfig::TONCore { .. } => pool_messages::deposit_validator(0).map_err(set_err)?,
-            _ => Cell::default(),
-        };
+        // Keep deploy side-effect free. Validator deposits should be performed
+        // explicitly via the dedicated deposit-validator command.
+        let deploy_body = Cell::default();
 
         let wallet = make_wallet(rpc_client.clone(), wallet_cfg, secret, &self.binding)
             .await
