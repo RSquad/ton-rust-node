@@ -62,6 +62,26 @@ fn test_select_local_validator_candidate_matches_pubkey_when_adnl_missing() {
 }
 
 #[test]
+fn test_select_local_validator_candidate_accepts_pubkey_adnl_fallback() {
+    let validator_key = make_test_key();
+    let chain_adnl_key = make_test_key();
+    let validator = make_validator_node(validator_key.clone(), chain_adnl_key);
+    let validator_key_ids = vec![validator_key.id().clone()];
+    // C++ parity fallback: allow validator pubkey short-id to serve as ADNL identity.
+    let validator_adnl_key_ids = vec![validator_key.id().clone()];
+
+    let (local_validator, adnl_missing) = select_local_validator_candidate(
+        std::slice::from_ref(&validator),
+        &validator_key_ids,
+        &validator_adnl_key_ids,
+    );
+
+    let local_validator = local_validator.expect("pubkey membership should select validator");
+    assert_eq!(local_validator.public_key.id(), validator_key.id());
+    assert!(!adnl_missing);
+}
+
+#[test]
 fn test_select_local_validator_candidate_returns_none_without_pubkey_match() {
     let validator_key = make_test_key();
     let adnl_key = make_test_key();

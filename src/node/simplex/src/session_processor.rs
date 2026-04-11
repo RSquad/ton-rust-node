@@ -10,6 +10,7 @@
 //!
 //! Contains the core consensus algorithm in a single-threaded context.
 //! This module is crate-private.
+//! C++ cross-reference: [ton-blockchain/ton](https://github.com/ton-blockchain/ton) (`testnet/validator/consensus/simplex`).
 //!
 //! # Architecture
 //!
@@ -35,7 +36,7 @@
 //! │  ┌─────────────────────────────┐    ┌─────────────────────────────────────┐     │
 //! │  │ check_all() loop:           │    │ Event dispatch:                     │     │
 //! │  │ 1. check_collation()        │    │   BroadcastVote → sign & send       │     │
-//! │  │ 2. check_validation()       │    │   BlockFinalized → notify_commit    │     │
+//! │  │ 2. check_validation()       │    │   BlockFinalized → apply_finalized  │     │
 //! │  │ 3. simplex_state.check_all()│    │   SlotSkipped → cleanup             │     │
 //! │  │ 4. process_simplex_events() │    └─────────────────────────────────────┘     │
 //! │  │ 5. update next awake time   │                                                │
@@ -53,7 +54,7 @@
 //!
 //! # Consensus Loop
 //!
-//! Each slot: `Collate → Broadcast → Validate → Notarize → Vote → Collect → Finalize → Commit`
+//! Each slot: `Collate → Broadcast → Validate → Notarize → Vote → Collect → Finalize → Deliver`
 //!
 //! See `README.md` "Consensus Loop" section for the phase-to-method mapping table.
 //!
@@ -74,18 +75,17 @@ use crate::{
         CandidateInfoRecord, FinalizedBlockRecord, PoolStateRecord, SimplexDbPtr, VoteRecord,
     },
     misbehavior::{MisbehaviorReport, VoteResult},
-    receiver::{ReceiverPtr, StandstillCertificateType},
+    receiver::{ReceiverPtr, StandstillCertificateType, StandstillTriggerNotification},
     session_description::SessionDescription,
     simplex_state::{
         BlockFinalizedEvent, FinalizationReachedEvent, NotarizationReachedEvent, SimplexEvent,
-        SimplexState, SimplexStateOptions, SkipCertificateReachedEvent, SlotSkippedEvent, Vote,
+        SimplexState, SkipCertificateReachedEvent, SlotSkippedEvent, Vote,
     },
-    startup_recovery::{
-        CandidateHash, RestartRoundAction, SessionStartupRecoveryListener, SignatureBytes,
-    },
+    startup_recovery::{CandidateHash, SessionStartupRecoveryListener, SignatureBytes},
     task_queue::{post_callback_closure, CallbackTaskQueuePtr, TaskPtr, TaskQueuePtr},
     utils::{
-        extract_vote_and_signature, sign_vote, threshold_33, threshold_66, verify_vote_signature,
+        extract_consensus_gen_utime_ms, extract_vote_and_signature, sign_vote, threshold_33,
+        threshold_66, verify_vote_signature,
     },
     BlockCandidatePriority, ConsensusOverlayManagerPtr, MetricsHandle, PrivateKey, RawVoteData,
     SessionId, SessionListenerPtr, ValidatorWeight, SIMPLEX_ROUNDLESS,
@@ -95,12 +95,13 @@ use consensus_common::{
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    fmt::{Display, Formatter},
     mem::discriminant,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use ton_api::{
     deserialize_boxed, deserialize_typed, serialize_boxed,
@@ -110,10 +111,8 @@ use ton_api::{
             candidateid::CandidateId,
             candidateparent::CandidateParent,
             simplex::{
-                candidateandcert::CandidateAndCert, vote::Vote as TlVote,
-                votesignature::VoteSignature as TlVoteSignature,
-                votesignatureset::VoteSignatureSet, Certificate, UnsignedVote, Vote as TlVoteBoxed,
-                VoteSignatureSet as VoteSignatureSetBoxed,
+                candidateandcert::CandidateAndCert, vote::Vote as TlVote, Certificate,
+                UnsignedVote, Vote as TlVoteBoxed, VoteSignatureSet as VoteSignatureSetBoxed,
             },
             CandidateData, CandidateHashData, CandidateParent as CandidateParentBoxed,
         },
@@ -122,23 +121,25 @@ use ton_api::{
     IntoBoxed,
 };
 use ton_block::{
-    error, fail, sha256_digest, BlockIdExt, BlockSignaturesPure, BlockSignaturesSimplex,
-    BlockSignaturesVariant, BocFlags, CryptoSignature, CryptoSignaturePair, Deserializable, Error,
-    HashmapType, KeyId, Result, UInt256, ValidatorBaseInfo,
+    base64_encode, error, fail, sha256_digest, BlockIdExt, BlockSignaturesPure,
+    BlockSignaturesSimplex, BlockSignaturesVariant, BocFlags, CryptoSignature, CryptoSignaturePair,
+    Error, Result, UInt256, ValidatorBaseInfo,
 };
 
 /*
     Constants
 */
 
-/// Maximum timeout for next awake time (1 day)
-/// Used as default "far future" value when no specific timeout is scheduled
-const MAX_AWAKE_TIMEOUT: Duration = Duration::from_secs(86400);
+/// Maximum timeout for next awake time.
+///
+/// TODO(simplex-timing): experimental 10ms wake fallback for simnet/testnet validation.
+/// Restore the old "far future" behavior after the wake-discipline fixes are validated.
+const MAX_AWAKE_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Maximum generation time for collation - warn if exceeded
 const MAX_GENERATION_TIME: Duration = Duration::from_millis(1000);
 
-/// Period without commits before triggering debug dump (stalled consensus detection)
+/// Period without finalizations before triggering debug dump (stalled consensus detection)
 /// Matches validator-session ROUND_DEBUG_PERIOD
 const ROUND_DEBUG_PERIOD: Duration = Duration::from_secs(15);
 
@@ -155,35 +156,156 @@ const CANDIDATE_REQUEST_DELAY: Duration = Duration::from_secs(1);
 /// Under network partitions, a single request may time out; we must retry, but not spam.
 const CANDIDATE_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Interval for re-requesting committed block proofs in WaitingForFinalCert.
-const COMMITTED_PROOF_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Maximum parent-chain walk depth when deriving a persisted DB parent.
-///
-/// This is a safety guard against corrupted parent pointers creating long/looping chains.
-const MAX_DB_PARENT_WALK_HOPS: usize = 1024;
-
-/// Maximum parent chain depth for resolution tracking
-/// Protects against excessive recursion in update_resolution_cache_chain
+/// Maximum empty-parent ancestry depth to walk when resolving the expected
+/// normal tip for empty candidates.
 const MAX_CHAIN_DEPTH: u32 = 10000;
 
-/// Warning threshold for deep parent chain recursion
-/// Logs a warning if recursion depth reaches this level
-const DEEP_RECURSION_WARNING_THRESHOLD: u32 = 100;
-
-/// Maximum time to wait for parent resolution before timeout
-/// Candidates waiting longer than this are considered failed
-const MAX_PARENT_WAIT_TIME: Duration = Duration::from_secs(600); // 10 minutes
-
-/// Integration knob: avoid generating NON-EMPTY blocks on non-committed parents.
+/// SessionProcessor always enforces C++ `WaitForParent` readiness before dispatching validation.
 ///
-/// When `true`, shardchain sessions use the masterchain-style empty-block rule
-/// (`last_committed_seqno + 1 < new_seqno`) instead of the C++ shardchain rule
-/// (MC lag threshold). This was needed before optimistic validation was implemented.
+/// Masterchain stale-parent protection remains validator-side, matching the C++ split where
+/// simplex waits for parent/skip readiness and `block-validator.cpp` owns accepted-head checks.
+
+/// Maximum number of recently-finalized blocks to show in validation section dump.
+const RECENT_FINALIZED_DUMP_WINDOW: Duration = Duration::from_secs(10);
+
+/// Observability state for stall diagnostics.
 ///
-/// Now that ValidatorGroup uses candidate-native validation (run_validate_query_any_candidate)
-/// and check_validation() accepts notarized parents, this flag is set to `false` for C++ parity.
-const DISABLE_NON_FINALIZED_PARENTS_FOR_COLLATION: bool = false;
+/// Tracks cursor-change timestamps and consensus milestone times so the dump
+/// can report how long since each frontier moved and when the last cert arrived.
+struct SessionObservability {
+    prev_first_non_finalized: SlotIndex,
+    prev_first_non_progressed: SlotIndex,
+    last_finalized_cursor_change_at: SystemTime,
+    last_progression_change_at: SystemTime,
+    last_notarization_at: Option<SystemTime>,
+    last_notarization_slot: Option<SlotIndex>,
+    last_notar_cert_at: Option<SystemTime>,
+    last_notar_cert_slot: Option<SlotIndex>,
+    last_final_cert_at: Option<SystemTime>,
+    last_final_cert_slot: Option<SlotIndex>,
+    last_mc_applied_block_id: Option<BlockIdExt>,
+}
+
+impl SessionObservability {
+    fn new(now: SystemTime) -> Self {
+        Self {
+            prev_first_non_finalized: SlotIndex(0),
+            prev_first_non_progressed: SlotIndex(0),
+            last_finalized_cursor_change_at: now,
+            last_progression_change_at: now,
+            last_notarization_at: None,
+            last_notarization_slot: None,
+            last_notar_cert_at: None,
+            last_notar_cert_slot: None,
+            last_final_cert_at: None,
+            last_final_cert_slot: None,
+            last_mc_applied_block_id: None,
+        }
+    }
+}
+
+/// Health check finding kind for structured stall diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthFindingKind {
+    ZeroFinalizationSpeed,
+    ProgressGap,
+    LowActivity,
+    StandstillTriggers,
+    CandidateGiveups,
+    SkipVoteDominance,
+    ValidatorIsolated,
+    CertVerifyFailures,
+}
+
+/// Single health check finding with severity and human-readable summary.
+#[derive(Debug, Clone)]
+struct HealthFinding {
+    kind: HealthFindingKind,
+    severity: log::Level,
+    summary: String,
+}
+
+/// Lifecycle phase of a non-finalized slot for stall diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SlotWaitPhase {
+    WaitingForCandidate,
+    WaitingForParentBase,
+    WaitingForNotarization,
+    NotarizedWaitingForFinalization,
+    Skipped,
+    Finalized,
+    TimeoutSkipped,
+}
+
+impl Display for SlotWaitPhase {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WaitingForCandidate => write!(f, "WaitingForCandidate"),
+            Self::WaitingForParentBase => write!(f, "WaitingForParentBase"),
+            Self::WaitingForNotarization => write!(f, "WaitingForNotarization"),
+            Self::NotarizedWaitingForFinalization => write!(f, "NotarizedWaitFinalization"),
+            Self::Skipped => write!(f, "Skipped"),
+            Self::Finalized => write!(f, "Finalized"),
+            Self::TimeoutSkipped => write!(f, "TimeoutSkipped"),
+        }
+    }
+}
+
+/// Per-slot diagnostic for non-finalized slots.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct SlotDiagnostic {
+    pub slot: SlotIndex,
+    pub window_idx: WindowIndex,
+    pub phase: SlotWaitPhase,
+    pub reason: String,
+    pub has_pending_block: bool,
+    pub available_parent: bool,
+    pub voted_notar: bool,
+    pub voted_skip: bool,
+    pub voted_final: bool,
+    pub has_notar_cert: bool,
+    pub has_final_cert: bool,
+    pub has_skip_cert: bool,
+    pub notar_weight_pct: f64,
+    pub final_weight_pct: f64,
+    pub skip_weight_pct: f64,
+    pub notar_or_skip_weight_pct: f64,
+    pub is_timeout_skipped: bool,
+}
+
+/// Window-level summary for dump grouping.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct WindowDiagnostic {
+    pub window_idx: WindowIndex,
+    pub slot_begin: SlotIndex,
+    pub slot_end: SlotIndex,
+    pub leader_idx: ValidatorIndex,
+    pub had_timeouts: bool,
+    pub slots: Vec<SlotDiagnostic>,
+}
+
+/// Candidate funnel totals for validation inventory.
+struct CandidateTotals {
+    received_total: usize,
+    received_unvalidated: usize,
+    validated_not_notarized: usize,
+    notarized_not_finalized: usize,
+    finalized_recent: usize,
+    other_omitted: usize,
+}
+
+impl CandidateTotals {
+    fn pct(&self, value: usize) -> f64 {
+        if self.received_total == 0 {
+            0.0
+        } else {
+            100.0 * value as f64 / self.received_total as f64
+        }
+    }
+}
 
 /// Tracks per-anomaly cooldowns and delta baselines for health alert deduplication.
 /// All timestamps use `SystemTime` (via `self.now()`) for deterministic testing.
@@ -193,13 +315,16 @@ pub(crate) struct HealthAlertState {
     last_cert_fail_warn: SystemTime,
     last_finalization_speed_warn: SystemTime,
     last_finalization_nonzero_at: SystemTime,
-    last_parent_aging_warn: SystemTime,
     last_progress_warn: SystemTime,
+    last_skip_ratio_warn: SystemTime,
     last_standstill_warn: SystemTime,
     last_isolation_warn: SystemTime,
     prev_candidate_giveups: u64,
     prev_cert_verify_fails: u64,
     prev_last_finalized_slot: f64,
+    prev_votes_in_notarize: u64,
+    prev_votes_in_finalize: u64,
+    prev_votes_in_skip: u64,
     prev_standstill_triggers: u64,
     cooldown: Duration,
 }
@@ -214,13 +339,16 @@ impl HealthAlertState {
             last_cert_fail_warn: warn_base,
             last_finalization_speed_warn: warn_base,
             last_finalization_nonzero_at: now,
-            last_parent_aging_warn: warn_base,
             last_progress_warn: warn_base,
+            last_skip_ratio_warn: warn_base,
             last_standstill_warn: warn_base,
             last_isolation_warn: warn_base,
             prev_candidate_giveups: 0,
             prev_cert_verify_fails: 0,
             prev_last_finalized_slot: 0.0,
+            prev_votes_in_notarize: 0,
+            prev_votes_in_finalize: 0,
+            prev_votes_in_skip: 0,
             prev_standstill_triggers: 0,
             cooldown,
         }
@@ -336,6 +464,8 @@ struct LocalChainHead {
     parent_info: crate::block::CandidateParentInfo,
     /// Resolved BlockIdExt of the generated candidate (for seqno derivation and explicit parent hint)
     block_id: BlockIdExt,
+    /// Exact generation time extracted from ConsensusExtraData, if available.
+    gen_utime_ms: Option<u64>,
 }
 
 /*
@@ -384,6 +514,8 @@ struct GeneratedBlockDesc {
     tl_candidate_data: CandidateData,
     /// Signature for FSM Candidate
     signature: Vec<u8>,
+    /// Exact generation time extracted from ConsensusExtraData, if available.
+    gen_utime_ms: Option<u64>,
 }
 
 /*
@@ -403,8 +535,7 @@ struct DelayedAction {
 
 /// Validated block candidate for finalization
 ///
-/// Contains the data needed to call on_block_committed when a block finalizes.
-/// Validated candidate stored after successful validation
+/// Contains validated candidate data stored after successful validation.
 /// Note: Currently stored but not used - we use received_candidates for finalization
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -433,11 +564,11 @@ struct ReceivedCandidate {
     source_idx: ValidatorIndex,
     /// Candidate ID hash (from RawCandidateId.hash)
     /// This is computed from TL candidateHashData, NOT the block's root_hash
-    /// Used for matching parent references in parent resolution
+    /// Used for matching parent references during candidate metadata lookups
     #[allow(dead_code)] // May be used for debugging/diagnostics
     candidate_id_hash: UInt256,
     /// Serialized CandidateHashData TL bytes
-    /// Used for building BlockSignaturesSimplex during commit
+    /// Used for building BlockSignaturesSimplex during finalization delivery
     /// SHA256(candidate_hash_data_bytes) == candidate_id_hash
     candidate_hash_data_bytes: Vec<u8>,
     /// Full block ID (workchain, shard, seqno, root_hash, file_hash)
@@ -454,36 +585,17 @@ struct ReceivedCandidate {
     /// Collated data (extracted from TL)
     #[allow(dead_code)]
     collated_data: crate::BlockPayloadPtr,
+    /// Exact generation time extracted from ConsensusExtraData, if available.
+    gen_utime_ms: Option<u64>,
     /// Time when candidate was received (for latency tracking)
     #[allow(dead_code)]
     receive_time: SystemTime,
     /// True if this is an empty block (inherits parent's BlockIdExt)
     is_empty: bool,
-    /// Parent candidate ID (None for genesis/first in epoch)
-    /// Used for recursive parent resolution
+    /// Parent candidate ID (None for genesis/first in epoch).
+    /// Used for empty-parent tip checks, explicit-parent collation hints, and
+    /// restart-seeded metadata lookups.
     parent_id: Option<crate::block::RawCandidateId>,
-    /// Cached resolution status: true if entire parent chain is available
-    /// Updated by update_resolution_cache_chain when parents arrive
-    is_fully_resolved: bool,
-}
-
-/// Tracks candidates waiting for parent chain resolution
-///
-/// When a candidate is received but its parent is not yet available,
-/// it's queued here until the parent arrives. This enables recursive
-/// parent resolution - if the parent itself has a missing parent,
-/// the chain is resolved depth-first.
-///
-/// Reference: C++ candidate-resolver.cpp ResolveCandidate bus message
-struct PendingParentResolution {
-    /// The raw candidate waiting for parent(s)
-    raw_candidate: RawCandidate,
-    /// Slot of this candidate
-    slot: SlotIndex,
-    /// Source validator index (leader)
-    source_idx: ValidatorIndex,
-    /// Time when candidate was received (for timeout)
-    receive_time: SystemTime,
 }
 
 /// Pending validation entry
@@ -502,29 +614,34 @@ struct PendingValidation {
     source_idx: ValidatorIndex,
 }
 
-/// Block to be committed as part of batch finalization
-///
-/// Collects all data needed to commit a block: slot, hash, and whether it's
-/// the triggered block. Used by `collect_gapless_commit_chain()` to build the commit queue.
-///
-/// Reference: C++ finalize_blocks() walks parent chain and commits each block
-struct BlockToCommit {
-    /// Candidate identity (slot, hash)
-    candidate_id: RawCandidateId,
-    /// Is this the triggered (first) block in the finalization batch?
-    is_triggered_block: bool,
+/// Tracks a locally generated candidate until it validates successfully.
+#[derive(Debug)]
+struct GeneratedCandidateValidationWatch {
+    /// When the local candidate was generated.
+    generated_at: SystemTime,
+    /// Whether it has already entered higher-layer validation.
+    validation_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum McValidationReadiness {
+    Ready,
+    WaitingForAcceptedHead,
 }
 
 /*
     Finalization Journal
 
-    Tracks finalized blocks that have not yet been committed (awaiting bodies / gapless chain).
+    Tracks finalized blocks that cannot be fully materialized yet because the
+    candidate body has not arrived. Once the body is known, we can deliver the
+    finalized callback, persist restart state, and clear local slot runtime.
 */
 
 /// Finalization journal entry
 ///
 /// Records that a FinalCert was observed for (slot, hash), but we haven't
-/// committed it yet (awaiting missing bodies or gapless chain from committed head).
+/// materialized local finalized state yet because the candidate body is still missing.
 #[derive(Clone)]
 struct FinalizedEntry {
     /// The finalization event from SimplexState
@@ -532,42 +649,6 @@ struct FinalizedEntry {
     /// Time when finalization was first observed (for timeout / diagnostics)
     #[allow(dead_code)]
     finalized_at: SystemTime,
-}
-
-/// Result of collecting a gapless commit chain
-enum ChainCollectionResult {
-    /// Chain is ready: all bodies present, NotarCerts available, connects to committed head
-    Ready {
-        /// The parent chain to commit (oldest first, fully-bodied, gapless)
-        chain: Vec<BlockToCommit>,
-    },
-
-    /// The finalized block is already committed (its block_id == last_committed_block_id)
-    AlreadyCommitted,
-
-    /// Masterchain-only: commit is blocked because we are missing a FinalCert for the next expected seqno.
-    ///
-    /// This typically happens when we observe finalization for a later masterchain block (seqno = K),
-    /// but have not yet observed FinalCerts (and thus cannot commit) for intermediate seqnos.
-    ///
-    /// IMPORTANT: Unlike MissingCandidate, this is NOT resolved by requestCandidate(want_notar=true),
-    /// because requestCandidate responses carry only (candidate bytes + notar cert), not FinalCert.
-    WaitingForFinalCert {
-        /// Next seqno we must commit (last_committed_seqno + 1, or initial seqno)
-        expected_seqno: u32,
-        /// Triggered finalized candidate id we are trying to commit
-        finalized_id: RawCandidateId,
-        /// Seqno of that triggered finalized candidate (from received candidate body)
-        finalized_seqno: u32,
-    },
-
-    /// Missing candidate body or NotarCert for a block in the chain
-    /// Caller should request this candidate from peers (want_notar=true gets NotarCert)
-    MissingCandidate {
-        /// Exact (slot, hash) of the missing candidate
-        /// (could be triggered block or any ancestor in the parent chain)
-        missing_id: RawCandidateId,
-    },
 }
 
 /*
@@ -653,7 +734,7 @@ pub(crate) struct SessionProcessor {
     receiver: ReceiverPtr,
     /// Stop flag shared with Session main loop.
     ///
-    /// Used to suppress late callbacks/commits during session shutdown (validator-group compatibility).
+    /// Used to suppress late callbacks/finalizations during session shutdown (validator-group compatibility).
     stop_flag: Arc<AtomicBool>,
     /// Simplex database for persistent storage
     db: SimplexDbPtr,
@@ -707,6 +788,16 @@ pub(crate) struct SessionProcessor {
     /// `on_candidate_received` self-loop, so `resolve_parent_block_id()` can
     /// find the parent immediately for chained precollation.
     generated_parent_cache: HashMap<RawCandidateId, BlockIdExt>,
+    /// Exact generation timestamps for locally generated parents before the
+    /// async self-receive path populates `received_candidates`.
+    generated_parent_gen_utime_ms_cache: HashMap<RawCandidateId, u64>,
+    /// Locally generated candidates that have not yet validated successfully.
+    ///
+    /// Used to surface warnings and metrics when the self-loop or validation
+    /// pipeline drops our own candidate before it reaches a successful
+    /// `candidate_decision_ok_internal()` outcome.
+    generated_candidates_waiting_validation:
+        HashMap<RawCandidateId, GeneratedCandidateValidationWatch>,
 
     /*
         Validation state
@@ -738,6 +829,11 @@ pub(crate) struct SessionProcessor {
     /// Used by `handle_candidate_query_fallback()` when the receiver's `resolver_cache` misses.
     /// This provides C++ parity with `CandidateResolver::try_load_candidate_data_from_db()`.
     candidate_data_cache: HashMap<RawCandidateId, Vec<u8>>,
+    /// Broadcast ingress dedup: slot -> first candidate seen via broadcast path.
+    ///
+    /// Matches the spirit of C++ `PrecheckCandidateBroadcast` slot-level conflict
+    /// guard by rejecting a second conflicting candidate id for the same slot.
+    seen_broadcast_candidates: HashMap<SlotIndex, RawCandidateId>,
 
     /*
         Metrics
@@ -758,14 +854,14 @@ pub(crate) struct SessionProcessor {
     validation_latency_histogram: metrics::Histogram,
     /// Histogram for collation latency (time to generate a block)
     collation_latency_histogram: metrics::Histogram,
+    /// Histogram for how late `check_all()` runs relative to its scheduled wake.
+    check_all_wake_slip_histogram: metrics::Histogram,
     /// Gauge for current active weight from network
     active_weight_gauge: metrics::Gauge,
     /// Result status counter for validation requests
     validates_counter: ResultStatusCounter,
     /// Result status counter for collation requests
     collates_counter: ResultStatusCounter,
-    /// Result status counter for commit requests
-    commits_counter: ResultStatusCounter,
     /// Counter for precollation requests
     precollation_requests_counter: metrics::Counter,
     /// Counter for precollation results
@@ -774,21 +870,20 @@ pub(crate) struct SessionProcessor {
     collates_precollated_counter: ResultStatusCounter,
     /// Result status counter for expired collation time slots
     collates_expire_counter: ResultStatusCounter,
+    /// Counter for all collation entry attempts, including async, retry, precollated,
+    /// and empty-block fast paths.
+    collation_starts_counter: metrics::Counter,
     /// Histogram for broadcast-to-validation complete latency
     broadcast_validation_latency_histogram: metrics::Histogram,
     /// Counter for errors during session (for SessionStats)
     errors_counter: metrics::Counter,
-    /// Counter for batch commit operations
-    batch_commit_counter: metrics::Counter,
-    /// Histogram for batch commit sizes (number of blocks committed at once)
-    batch_commit_size_histogram: metrics::Histogram,
-    /// Gauge for finalized-but-uncommitted journal size (commit lag indicator)
-    finalized_uncommitted_gauge: metrics::Gauge,
+    /// Gauge for finalized blocks still waiting for candidate body arrival
+    finalized_pending_body_gauge: metrics::Gauge,
 
     /*
-        Error tracking for SessionStats
+        Error tracking
     */
-    /// Total errors count during this session (incremented on errors, passed to on_block_committed)
+    /// Total errors count during this session (used for session statistics)
     /// Atomic to allow increment_error(&self) without requiring &mut self
     session_errors_count: AtomicU32,
 
@@ -810,15 +905,15 @@ pub(crate) struct SessionProcessor {
         Debug
         Reference: validator-session/src/session_processor.rs round_debug_at
     */
-    /// Next time for stalled round debug dump (reset on each commit)
-    /// If current time >= round_debug_at, no commits occurred for ROUND_DEBUG_PERIOD
+    /// Next time for stalled round debug dump (reset on each finalization)
+    /// If current time >= round_debug_at, no finalizations occurred for ROUND_DEBUG_PERIOD
     round_debug_at: SystemTime,
-    /// Time of last commit (for accurate stall duration reporting)
-    last_commit_time: SystemTime,
+    /// Time of last finalization (for accurate stall duration reporting)
+    last_finalization_time: SystemTime,
 
     /*
         Slot Sequence Invariants
-        Ensures correct ordering of slots for commits, skips, and generation
+        Ensures correct ordering of slots for finalizations, skips, and generation
     */
     /// Last slot for which generation was requested
     /// Must be monotonically increasing (gaps allowed)
@@ -828,68 +923,62 @@ pub(crate) struct SessionProcessor {
         Block SeqNo Tracking
         Tracks expected blockchain sequence number for next block
     */
-    /// Last committed block seqno - updated in commit_single_block().
-    /// Used for strict commit sequencing and validation checks.
-    last_committed_seqno: Option<u32>,
+    /// Highest finalized non-empty block seqno materialized locally in this session.
+    /// Used for validation shortcuts and local progress tracking.
+    finalized_head_seqno: Option<u32>,
 
-    /// Last committed block slot - updated in commit_single_block()
-    /// Used to retrieve parent BlockIdExt for empty block generation
-    last_committed_slot: Option<SlotIndex>,
-    /// Last committed non-empty block id (parent for empty blocks)
+    /// Slot of the latest locally materialized finalized head.
+    /// Used to retrieve parent `BlockIdExt` for empty block generation.
+    finalized_head_slot: Option<SlotIndex>,
+    /// Last finalized non-empty block id (parent for empty blocks)
     ///
     /// Empty blocks inherit parent's BlockIdExt (C++ behavior), so we must keep the
-    /// last non-empty committed block id available for empty block generation.
-    last_committed_block_id: Option<BlockIdExt>,
+    /// last non-empty finalized block id available for empty block generation.
+    finalized_head_block_id: Option<BlockIdExt>,
 
-    /// Last committed block's before_split flag (for split/merge handling)
+    /// Last finalized head block's before_split flag (for split/merge handling)
     ///
     /// C++ parity: C++ always generates empty blocks when previous block has `before_split=true`.
     /// We track this flag to implement the same behavior in `should_generate_empty_block()`.
     ///
     /// Reference: C++ block-producer.cpp `is_before_split()` + `should_generate_empty_block()`
-    last_committed_before_split: bool,
+    finalized_head_before_split: bool,
 
-    /// Last consensus-finalized seqno - tracks the highest seqno of a block committed
-    /// with FinalCert (is_final=true) in this session.
+    /// Last consensus-finalized seqno tracked from finalized delivery in this session.
     ///
     /// C++ parity: mirrors `last_consensus_finalized_seqno_` in block-producer.cpp, which
     /// advances on FinalizeBlock(is_final=true) and on BlockFinalizedInMasterchain events.
     /// Used for `should_generate_empty_block()` on masterchain.
     ///
-    /// Updated in `commit_single_block()` when use_final_cert is true, and in
-    /// `set_mc_finalized_seqno()` (coupled max with last_mc_finalized_seqno).
+    /// Updated in `maybe_apply_finalized_state()` and in `set_mc_finalized_block()`
+    /// (coupled max with last_mc_finalized_seqno).
     last_consensus_finalized_seqno: Option<u32>,
 
-    /// Blocks that have been committed (finalized): RawCandidateId(slot, hash)
+    /// Blocks whose finalized state has already been materialized locally.
     ///
-    /// Used during batch finalization to track which blocks in a parent chain
-    /// have already been committed, avoiding double-commit.
-    ///
-    /// When a BlockFinalized event triggers batch finalization, we walk the
-    /// parent chain and commit each block. This set tracks which blocks
-    /// have already been committed so we don't commit them again.
+    /// Used to deduplicate repeated finalization events and late body arrivals,
+    /// avoiding duplicate DB writes and repeated finalized bookkeeping.
     ///
     /// Cleaned up in cleanup_old_slots() for slots older than MAX_HISTORY_SLOTS.
     finalized_blocks: HashSet<RawCandidateId>,
 
     /*
-        Finalization Journal
+        Finalized Pending Body
 
-        Tracks finalized blocks (FinalCert observed) that have not yet been committed
-        to ValidatorGroup. Commitment is deferred until:
-        - All bodies in the uncommitted ancestor chain are present, AND
-        - The chain is gapless by seqno (strict invariant)
+        Tracks finalized blocks (FinalCert observed) whose candidate body has not
+        yet been received locally. Materialization is deferred until the
+        corresponding candidate body arrives.
 
-        Two commit triggers:
-        - BlockFinalizedEvent: records in journal + tries commit
-        - on_candidate_received: body arrival + tries commit
+        Two materialization triggers:
+        - BlockFinalizedEvent: records entry + applies immediately when body is present
+        - on_candidate_received: late body arrival triggers deferred finalization
     */
-    /// Journal of finalized-but-not-yet-committed blocks
+    /// Finalized blocks still waiting for candidate body arrival
     ///
     /// Keyed by RawCandidateId = { slot, hash }
     /// Inserted when BlockFinalizedEvent arrives (even if body missing)
-    /// Removed when committed or cleaned up (old slots)
-    finalized_journal_pending_commit: HashMap<RawCandidateId, FinalizedEntry>,
+    /// Removed when body arrives and finalization is applied, or cleaned up (old slots)
+    finalized_pending_body: HashMap<RawCandidateId, FinalizedEntry>,
 
     /*
         Slot outcome emission gating (future wiring)
@@ -909,12 +998,24 @@ pub(crate) struct SessionProcessor {
         Reference: C++ block-producer.cpp should_generate_empty_block()
         ========================================================================
     */
-    /// Last masterchain finalized seqno (for shardchain empty block decisions)
+    /// Last MC-registered top seqno for this shard session (for empty block decisions)
     ///
-    /// Updated via `set_mc_finalized_seqno()` when MC finalization events arrive.
+    /// Updated via `set_mc_finalized_block()` when manager notifications arrive.
+    /// The value is the current applied-top seqno for this session shard.
     /// Used by `should_generate_empty_block()` for shardchain sessions.
-    /// For masterchain sessions, `last_committed_seqno` is used instead.
+    /// Masterchain sessions also receive manager-applied top updates here so startup and
+    /// recovery share the same monotonic applied-top cursor.
     last_mc_finalized_seqno: Option<u32>,
+    /// Seqno fallback for the accepted normal head used by MC validation ordering.
+    ///
+    /// Seeded from `initial_block_seqno - 1`, then advanced by applied-top notifications,
+    /// restart recovery, and finalized non-empty blocks.
+    accepted_normal_head_seqno: u32,
+    /// Exact accepted normal head when known.
+    ///
+    /// This mirrors the C++ `last_accepted_block_` semantics closely enough to reject
+    /// stale same-seqno forks once an exact BlockIdExt has been observed.
+    accepted_normal_head_block_id: Option<BlockIdExt>,
 
     /*
         ========================================================================
@@ -933,28 +1034,6 @@ pub(crate) struct SessionProcessor {
     /// Candidate request throttling: (slot, hash) → next allowed request time.
     requested_candidates: HashMap<RawCandidateId, SystemTime>,
 
-    /// Pending committed block proof requests via get_committed_candidate.
-    /// Throttling map: block_id → next allowed request time.
-    pending_committed_proof_requests: HashMap<BlockIdExt, SystemTime>,
-
-    /*
-        ========================================================================
-        Pending Parent Resolution (Recursive Candidate Resolution)
-
-        Tracks candidates waiting for their parent chain to be resolved.
-        When a candidate is received but its parent is not yet available,
-        it's queued here until the parent arrives.
-
-        Reference: C++ consensus.cpp get_resolved_candidate, bus.h ResolveCandidate
-        ========================================================================
-    */
-    /// Map: parent_id → Vec of candidates waiting for this parent
-    ///
-    /// When a candidate's parent is missing, we queue the candidate here.
-    /// When a parent arrives (in on_candidate_received), we check this map
-    /// and process any waiting candidates.
-    pending_parent_resolutions: HashMap<RawCandidateId, Vec<PendingParentResolution>>,
-
     /*
         ========================================================================
         Misbehavior Tracking
@@ -964,6 +1043,13 @@ pub(crate) struct SessionProcessor {
         Reference: C++ bus.h MisbehaviorReport
         ========================================================================
     */
+    /// Dedup set for finalized delivery.
+    ///
+    /// We emit at most once per finalized candidate id, even if:
+    /// - finalization is observed before candidate body (delayed emit path), or
+    /// - repeated finalization/candidate events arrive from network.
+    finalized_delivery_sent: HashSet<RawCandidateId>,
+
     /// Collected misbehavior reports from this session
     ///
     /// When a vote is detected as misbehavior (e.g., conflicting votes for same slot),
@@ -973,7 +1059,7 @@ pub(crate) struct SessionProcessor {
     /// Counter for detected misbehavior events
     misbehavior_counter: metrics::Counter,
 
-    /// Gauge: last finalized slot index (set on each commit)
+    /// Gauge: last finalized slot index (set on each finalization)
     last_finalized_slot_gauge: metrics::Gauge,
     /// Gauge: first non-finalized slot from FSM (set in check_all)
     first_non_finalized_slot_gauge: metrics::Gauge,
@@ -982,13 +1068,19 @@ pub(crate) struct SessionProcessor {
     /// Counter: total skip events
     skip_total_counter: metrics::Counter,
     /// Vote pipeline counters (in)
+    votes_in_total_counter: metrics::Counter,
     votes_in_notarize_counter: metrics::Counter,
     votes_in_finalize_counter: metrics::Counter,
     votes_in_skip_counter: metrics::Counter,
     /// Vote pipeline counters (out)
+    votes_out_total_counter: metrics::Counter,
     votes_out_notarize_counter: metrics::Counter,
     votes_out_finalize_counter: metrics::Counter,
     votes_out_skip_counter: metrics::Counter,
+    /// Local vote totals for health anomaly delta checks (inbound stream).
+    votes_in_notarize_total: u64,
+    votes_in_finalize_total: u64,
+    votes_in_skip_total: u64,
     /// Certificate counters
     certs_in_counter: metrics::Counter,
     certs_relayed_counter: metrics::Counter,
@@ -999,12 +1091,32 @@ pub(crate) struct SessionProcessor {
     validation_late_callback_counter: metrics::Counter,
     /// Health warnings counter (separate from session_errors_count)
     health_warnings_counter: metrics::Counter,
+    /// Broadcast precheck drops: old slot (< first_non_finalized)
+    candidate_precheck_old_slot_drop_counter: metrics::Counter,
+    /// Broadcast precheck drops: too-far-future slot
+    candidate_precheck_future_slot_drop_counter: metrics::Counter,
+    /// Broadcast precheck drops: sender is not expected slot leader
+    candidate_precheck_unexpected_sender_drop_counter: metrics::Counter,
+    /// Broadcast precheck drops: conflicting second candidate for same slot
+    candidate_precheck_conflicting_slot_drop_counter: metrics::Counter,
+    /// Peer-delivered candidate bodies received via broadcast.
+    /// Excludes the local generated-block self-loop.
+    candidate_received_broadcast_counter: metrics::Counter,
+    /// Peer-delivered candidate bodies received via requestCandidate/query responses.
+    /// Excludes the local generated-block self-loop.
+    candidate_received_query_counter: metrics::Counter,
+    /// Locally generated candidates that failed to validate successfully.
+    generated_candidate_validation_missed_counter: metrics::Counter,
     /// Health alert state for cooldown-based anomaly detection
     pub(crate) health_alert_state: HealthAlertState,
     /// Shared health counters from receiver (standstill triggers, candidate giveups)
     pub(crate) receiver_health_counters: Arc<crate::receiver::ReceiverHealthCounters>,
     /// Local cert verify fail total (for delta-based anomaly detection)
     pub(crate) cert_verify_fails_total: u64,
+    /// Observability state for stall diagnostics (cursor ages, milestone timestamps)
+    observability: SessionObservability,
+    /// Latest receiver activity snapshot (updated periodically via on_activity)
+    last_receiver_snapshot: Option<crate::receiver::ReceiverActivitySnapshot>,
 }
 
 impl SessionProcessor {
@@ -1028,6 +1140,26 @@ impl SessionProcessor {
     #[allow(dead_code)]
     pub(crate) fn advance_time(&self, delta: Duration) {
         self.description.set_time(self.now() + delta);
+    }
+
+    #[inline]
+    fn record_candidate_ingress(&self, sender_idx: ValidatorIndex, is_broadcast_candidate: bool) {
+        // Keep ingress counters focused on peer-delivered traffic: locally generated
+        // blocks loop back through on_candidate_received() but are not network ingress.
+        if sender_idx == self.description.get_self_idx() {
+            return;
+        }
+
+        if is_broadcast_candidate {
+            self.candidate_received_broadcast_counter.increment(1);
+        } else {
+            self.candidate_received_query_counter.increment(1);
+        }
+    }
+
+    #[inline]
+    fn record_collation_start(&self) {
+        self.collation_starts_counter.increment(1);
     }
 
     /// Clear manual time override (return to real-time mode).
@@ -1125,7 +1257,7 @@ impl SessionProcessor {
 
     /*
         ========================================================================
-        INT-2: Per-slot stage tracking accessors (for latency metrics)
+        Per-slot stage tracking accessors (for latency metrics)
 
         These accessors track milestone events within a slot for latency
         measurement: first candidate received, first notarized, first finalized.
@@ -1198,18 +1330,6 @@ impl SessionProcessor {
             .and_then(|rt| rt.validated_candidate_data.as_ref())
     }
 
-    /// Check if any validator has validated candidate data for this slot.
-    fn slot_has_validated_candidate_from(
-        &self,
-        slot: SlotIndex,
-        validator_idx: ValidatorIndex,
-    ) -> bool {
-        self.slot_entry(slot)
-            .and_then(|e| e.runtime.as_ref())
-            .and_then(|rt| rt.validated_candidate_data.as_ref())
-            .map_or(false, |vc| vc.source_idx == validator_idx)
-    }
-
     /// Create new session processor
     ///
     /// The processor is created with empty state. Bootstrap state is applied
@@ -1237,43 +1357,44 @@ impl SessionProcessor {
 
         // INVARIANT: initial_block_seqno must be > 0.
         // Block seqno 0 is reserved for the zerostate (genesis), so the first real block is seqno 1.
-        // This invariant ensures last_committed_seqno initialization (initial_block_seqno - 1) is valid.
+        // This invariant ensures finalized_head_seqno initialization (initial_block_seqno - 1) is valid.
         assert!(
             initial_block_seqno > 0,
             "INVARIANT VIOLATION: initial_block_seqno must be > 0, got {}",
             initial_block_seqno
         );
 
-        // Initialize SimplexState FSM with C++-compatible options.
-        //
-        // We keep `require_finalized_parent=false` (C++ mode) so the FSM can parent on notarized
-        // blocks and avoid deadlock when a slot is notarized but not finalized/skipped yet.
-        //
+        // Initialize SimplexState FSM.
         // SIMPLEX_ROUNDLESS:
         // - We pass `SIMPLEX_ROUNDLESS` in callbacks to bypass round-based invariants.
-        let simplex_state_options = SimplexStateOptions::cpp_compatible();
-
-        let simplex_state = SimplexState::new(&description, simplex_state_options)?;
+        let simplex_state = SimplexState::new(&description)?;
         let initial_standstill_slots = simplex_state.get_tracked_slots_interval();
+        let initial_progress_slot = simplex_state.get_first_non_progressed_slot().value();
 
         // Initialize receiver standstill tracked range to the FSM-tracked interval (C++ parity).
         // Receiver defaults to a broad range, but we can set the precise initial interval immediately
         // because `SimplexState::new()` creates window 0 (so end = slots_per_leader_window).
+        receiver.set_ingress_slot_begin(initial_standstill_slots.0);
+        receiver.set_ingress_progress_slot(initial_progress_slot);
         receiver.set_standstill_slots(initial_standstill_slots.0, initial_standstill_slots.1);
 
         log::info!(
-            "Session {} SIMPLEX MODE: require_finalized_parent=false (C++ parenting enabled). \
-            Optimistic validation: candidate-native path (notarized parents accepted). \
-            DISABLE_NON_FINALIZED_PARENTS_FOR_COLLATION={}.",
+            "Session {} SIMPLEX MODE: C++ parenting enabled (notarized parents accepted). \
+            Candidate-native validation enabled. \
+            WaitForParent gating=strict, MC stale protection=validator-side.",
             session_id.to_hex_string(),
-            DISABLE_NON_FINALIZED_PARENTS_FOR_COLLATION
         );
 
         log::info!(
-            "Session {} SimplexState FSM initialized: slots_per_window={}, \
-            require_finalized_parent=false",
+            "Session {} SimplexState FSM initialized: slots_per_window={}",
             session_id.to_hex_string(),
             description.opts().slots_per_leader_window,
+        );
+        log::warn!(
+            "Session {}: TEMP experimental MAX_AWAKE_TIMEOUT={}ms is enabled; restore the old \
+            far-future fallback after timing validation is complete",
+            session_id.to_hex_string(),
+            MAX_AWAKE_TIMEOUT.as_millis(),
         );
 
         // Initialize metrics
@@ -1284,29 +1405,30 @@ impl SessionProcessor {
             slot_duration_histogram,
             validation_latency_histogram,
             collation_latency_histogram,
+            check_all_wake_slip_histogram,
             active_weight_gauge,
             validates_counter,
             collates_counter,
-            commits_counter,
             precollation_requests_counter,
             precollation_results_counter,
             collates_precollated_counter,
             collates_expire_counter,
+            collation_starts_counter,
             broadcast_validation_latency_histogram,
             first_candidate_received_latency_histogram,
             first_candidate_notarized_latency_histogram,
             first_candidate_finalized_latency_histogram,
             errors_counter,
-            batch_commit_counter,
-            batch_commit_size_histogram,
             misbehavior_counter,
             last_finalized_slot_gauge,
             first_non_finalized_slot_gauge,
             first_non_progressed_slot_gauge,
             skip_total_counter,
+            votes_in_total_counter,
             votes_in_notarize_counter,
             votes_in_finalize_counter,
             votes_in_skip_counter,
+            votes_out_total_counter,
             votes_out_notarize_counter,
             votes_out_finalize_counter,
             votes_out_skip_counter,
@@ -1317,10 +1439,17 @@ impl SessionProcessor {
             validation_reject_counter,
             validation_late_callback_counter,
             health_warnings_counter,
+            candidate_precheck_old_slot_drop_counter,
+            candidate_precheck_future_slot_drop_counter,
+            candidate_precheck_unexpected_sender_drop_counter,
+            candidate_precheck_conflicting_slot_drop_counter,
+            candidate_received_broadcast_counter,
+            candidate_received_query_counter,
+            generated_candidate_validation_missed_counter,
         ) = Self::init_metrics(&metrics_receiver, &description);
 
-        let finalized_uncommitted_gauge =
-            metrics_receiver.sink().register_gauge(&"simplex_finalized_uncommitted_count".into());
+        let finalized_pending_body_gauge =
+            metrics_receiver.sink().register_gauge(&"simplex_finalized_pending_body_count".into());
 
         let now = description.get_time();
         let num_validators = description.get_total_nodes() as usize;
@@ -1356,6 +1485,8 @@ impl SessionProcessor {
             earliest_collation_time: None,
             local_chain_head: None,
             generated_parent_cache: HashMap::new(),
+            generated_parent_gen_utime_ms_cache: HashMap::new(),
+            generated_candidates_waiting_validation: HashMap::new(),
             // Validation state
             pending_validations: HashMap::new(),
             pending_approve: HashSet::new(),
@@ -1366,6 +1497,7 @@ impl SessionProcessor {
             validated_candidates: VecDeque::new(),
             received_candidates: HashMap::new(),
             candidate_data_cache: HashMap::new(),
+            seen_broadcast_candidates: HashMap::new(),
             // Metrics
             metrics_receiver,
             check_all_counter,
@@ -1373,19 +1505,18 @@ impl SessionProcessor {
             slot_duration_histogram,
             validation_latency_histogram,
             collation_latency_histogram,
+            check_all_wake_slip_histogram,
             active_weight_gauge,
             validates_counter,
             collates_counter,
-            commits_counter,
             precollation_requests_counter,
             precollation_results_counter,
             collates_precollated_counter,
             collates_expire_counter,
+            collation_starts_counter,
             broadcast_validation_latency_histogram,
             errors_counter,
-            batch_commit_counter,
-            batch_commit_size_histogram,
-            finalized_uncommitted_gauge,
+            finalized_pending_body_gauge,
             // Error tracking (includes startup errors from before processor was created)
             session_errors_count: AtomicU32::new(initial_errors),
             // Slot stage tracking
@@ -1394,31 +1525,31 @@ impl SessionProcessor {
             first_candidate_finalized_latency_histogram,
             // Debug
             round_debug_at: now + ROUND_DEBUG_PERIOD,
-            last_commit_time: now,
+            last_finalization_time: now,
             // Slot/round tracking
             last_generated_slot: None,
-            // Treat the block *before* `initial_block_seqno` as the committed head at session start.
+            // Treat the block *before* `initial_block_seqno` as the finalized head at session start.
             //
             // This is required for:
             // - empty-block generation gating (non-finalized parent / ValidatorGroup limitation),
-            // - validation gating (expected_seqno = last_committed_seqno + 1),
+            // - validation gating (expected_seqno = finalized_head_seqno + 1),
             // and matches C++ where the block producer tracks the parent seqno from `Start` / `base`.
-            last_committed_seqno: initial_block_seqno.checked_sub(1),
-            last_committed_slot: None,
-            last_committed_block_id: None,
-            last_committed_before_split: false,
+            finalized_head_seqno: initial_block_seqno.checked_sub(1),
+            finalized_head_slot: None,
+            finalized_head_block_id: None,
+            finalized_head_before_split: false,
             last_consensus_finalized_seqno: initial_block_seqno.checked_sub(1),
             // Batch finalization tracking
             finalized_blocks: HashSet::new(),
-            finalized_journal_pending_commit: HashMap::new(),
+            finalized_pending_body: HashMap::new(),
             slots: BTreeMap::new(),
             // Empty block support
-            last_mc_finalized_seqno: None,
+            last_mc_finalized_seqno: initial_block_seqno.checked_sub(1),
+            accepted_normal_head_seqno: initial_block_seqno.saturating_sub(1),
+            accepted_normal_head_block_id: None,
             // Candidate request tracking
             requested_candidates: HashMap::new(),
-            pending_committed_proof_requests: HashMap::new(),
-            // Pending parent resolution
-            pending_parent_resolutions: HashMap::new(),
+            finalized_delivery_sent: HashSet::new(),
             // Misbehavior tracking
             misbehavior_reports: Vec::new(),
             misbehavior_counter,
@@ -1426,12 +1557,17 @@ impl SessionProcessor {
             first_non_finalized_slot_gauge,
             first_non_progressed_slot_gauge,
             skip_total_counter,
+            votes_in_total_counter,
             votes_in_notarize_counter,
             votes_in_finalize_counter,
             votes_in_skip_counter,
+            votes_out_total_counter,
             votes_out_notarize_counter,
             votes_out_finalize_counter,
             votes_out_skip_counter,
+            votes_in_notarize_total: 0,
+            votes_in_finalize_total: 0,
+            votes_in_skip_total: 0,
             certs_in_counter,
             certs_relayed_counter,
             cert_conflict_counter,
@@ -1439,9 +1575,18 @@ impl SessionProcessor {
             validation_reject_counter,
             validation_late_callback_counter,
             health_warnings_counter,
+            candidate_precheck_old_slot_drop_counter,
+            candidate_precheck_future_slot_drop_counter,
+            candidate_precheck_unexpected_sender_drop_counter,
+            candidate_precheck_conflicting_slot_drop_counter,
+            candidate_received_broadcast_counter,
+            candidate_received_query_counter,
+            generated_candidate_validation_missed_counter,
             health_alert_state: HealthAlertState::new(now, health_alert_cooldown),
             receiver_health_counters,
             cert_verify_fails_total: 0,
+            observability: SessionObservability::new(now),
+            last_receiver_snapshot: None,
         };
 
         // Increment errors_counter metric with startup errors (for metrics consistency)
@@ -1483,6 +1628,21 @@ impl SessionProcessor {
         self.description.get_session_creation_time()
     }
 
+    /// Format a duration as "X.Ys ago" or "never".
+    fn fmt_ago(now: SystemTime, t: Option<SystemTime>) -> String {
+        t.and_then(|t| now.duration_since(t).ok())
+            .map(|d| format!("{:.1}s ago", d.as_secs_f64()))
+            .unwrap_or_else(|| "never".to_string())
+    }
+
+    /// Format a duration as "X.Ys" or "never".
+    fn fmt_dur(now: SystemTime, t: SystemTime) -> String {
+        now.duration_since(t)
+            .ok()
+            .map(|d| format!("{:.1}s", d.as_secs_f64()))
+            .unwrap_or_else(|| "?".to_string())
+    }
+
     /*
         Metrics initialization
     */
@@ -1502,29 +1662,30 @@ impl SessionProcessor {
         metrics::Histogram,  // slot_duration_histogram
         metrics::Histogram,  // validation_latency_histogram
         metrics::Histogram,  // collation_latency_histogram
+        metrics::Histogram,  // check_all_wake_slip_histogram
         metrics::Gauge,      // active_weight_gauge
         ResultStatusCounter, // validates_counter
         ResultStatusCounter, // collates_counter
-        ResultStatusCounter, // commits_counter
         metrics::Counter,    // precollation_requests_counter
         metrics::Counter,    // precollation_results_counter
         ResultStatusCounter, // collates_precollated_counter
         ResultStatusCounter, // collates_expire_counter
+        metrics::Counter,    // collation_starts_counter
         metrics::Histogram,  // broadcast_validation_latency_histogram
         metrics::Histogram,  // first_candidate_received_latency_histogram
         metrics::Histogram,  // first_candidate_notarized_latency_histogram
         metrics::Histogram,  // first_candidate_finalized_latency_histogram
         metrics::Counter,    // errors_counter
-        metrics::Counter,    // batch_commit_counter
-        metrics::Histogram,  // batch_commit_size_histogram
         metrics::Counter,    // misbehavior_counter
         metrics::Gauge,      // last_finalized_slot_gauge
         metrics::Gauge,      // first_non_finalized_slot_gauge
         metrics::Gauge,      // first_non_progressed_slot_gauge
         metrics::Counter,    // skip_total_counter
+        metrics::Counter,    // votes_in_total_counter
         metrics::Counter,    // votes_in_notarize_counter
         metrics::Counter,    // votes_in_finalize_counter
         metrics::Counter,    // votes_in_skip_counter
+        metrics::Counter,    // votes_out_total_counter
         metrics::Counter,    // votes_out_notarize_counter
         metrics::Counter,    // votes_out_finalize_counter
         metrics::Counter,    // votes_out_skip_counter
@@ -1535,6 +1696,13 @@ impl SessionProcessor {
         metrics::Counter,    // validation_reject_counter
         metrics::Counter,    // validation_late_callback_counter
         metrics::Counter,    // health_warnings_counter
+        metrics::Counter,    // candidate_precheck_old_slot_drop_counter
+        metrics::Counter,    // candidate_precheck_future_slot_drop_counter
+        metrics::Counter,    // candidate_precheck_unexpected_sender_drop_counter
+        metrics::Counter,    // candidate_precheck_conflicting_slot_drop_counter
+        metrics::Counter,    // candidate_received_broadcast_counter
+        metrics::Counter,    // candidate_received_query_counter
+        metrics::Counter,    // generated_candidate_validation_missed_counter
     ) {
         let sink = metrics_receiver.sink();
 
@@ -1547,6 +1715,8 @@ impl SessionProcessor {
         let validation_latency_histogram =
             sink.register_histogram(&"time:validation_latency".into());
         let collation_latency_histogram = sink.register_histogram(&"time:collation_latency".into());
+        let check_all_wake_slip_histogram =
+            sink.register_histogram(&"time:check_all_wake_slip_ms".into());
         let broadcast_validation_latency_histogram =
             sink.register_histogram(&"time:broadcast_validation_latency".into());
 
@@ -1570,7 +1740,6 @@ impl SessionProcessor {
         // Result status counters
         let validates_counter = ResultStatusCounter::new(metrics_receiver, "simplex_validates");
         let collates_counter = ResultStatusCounter::new(metrics_receiver, "simplex_collates");
-        let commits_counter = ResultStatusCounter::new(metrics_receiver, "simplex_commits");
 
         // Precollation metrics
         let precollation_requests_counter =
@@ -1581,13 +1750,11 @@ impl SessionProcessor {
             ResultStatusCounter::new(metrics_receiver, "simplex_collates_precollated");
         let collates_expire_counter =
             ResultStatusCounter::new(metrics_receiver, "simplex_collates_expire");
+        let collation_starts_counter = sink.register_counter(&"simplex_collation_starts".into());
 
         // Error tracking for ValidatorSessionStats
         let errors_counter = sink.register_counter(&"simplex_errors".into());
 
-        let batch_commit_counter = sink.register_counter(&"simplex_batch_commits".into());
-        let batch_commit_size_histogram =
-            sink.register_histogram(&"simplex_batch_commit_size".into());
         let misbehavior_counter = sink.register_counter(&"simplex_misbehavior".into());
 
         let last_finalized_slot_gauge = sink.register_gauge(&"simplex_last_finalized_slot".into());
@@ -1597,9 +1764,11 @@ impl SessionProcessor {
             sink.register_gauge(&"simplex_first_non_progressed_slot".into());
         let skip_total_counter = sink.register_counter(&"simplex_skip_total".into());
 
+        let votes_in_total_counter = sink.register_counter(&"simplex_votes_in_total".into());
         let votes_in_notarize_counter = sink.register_counter(&"simplex_votes_in_notarize".into());
         let votes_in_finalize_counter = sink.register_counter(&"simplex_votes_in_finalize".into());
         let votes_in_skip_counter = sink.register_counter(&"simplex_votes_in_skip".into());
+        let votes_out_total_counter = sink.register_counter(&"simplex_votes_out_total".into());
         let votes_out_notarize_counter =
             sink.register_counter(&"simplex_votes_out_notarize".into());
         let votes_out_finalize_counter =
@@ -1616,6 +1785,20 @@ impl SessionProcessor {
             sink.register_counter(&"simplex_validation_late_callback".into());
 
         let health_warnings_counter = sink.register_counter(&"simplex_health_warnings".into());
+        let candidate_precheck_old_slot_drop_counter =
+            sink.register_counter(&"simplex_candidate_precheck_drop_old_slot".into());
+        let candidate_precheck_future_slot_drop_counter =
+            sink.register_counter(&"simplex_candidate_precheck_drop_future_slot".into());
+        let candidate_precheck_unexpected_sender_drop_counter =
+            sink.register_counter(&"simplex_candidate_precheck_drop_unexpected_sender".into());
+        let candidate_precheck_conflicting_slot_drop_counter =
+            sink.register_counter(&"simplex_candidate_precheck_drop_conflicting_slot".into());
+        let candidate_received_broadcast_counter =
+            sink.register_counter(&"simplex_candidate_received_broadcast".into());
+        let candidate_received_query_counter =
+            sink.register_counter(&"simplex_candidate_received_query".into());
+        let generated_candidate_validation_missed_counter =
+            sink.register_counter(&"simplex_generated_candidate_validation_missed".into());
 
         (
             check_all_counter,
@@ -1623,29 +1806,30 @@ impl SessionProcessor {
             slot_duration_histogram,
             validation_latency_histogram,
             collation_latency_histogram,
+            check_all_wake_slip_histogram,
             active_weight_gauge,
             validates_counter,
             collates_counter,
-            commits_counter,
             precollation_requests_counter,
             precollation_results_counter,
             collates_precollated_counter,
             collates_expire_counter,
+            collation_starts_counter,
             broadcast_validation_latency_histogram,
             first_candidate_received_latency_histogram,
             first_candidate_notarized_latency_histogram,
             first_candidate_finalized_latency_histogram,
             errors_counter,
-            batch_commit_counter,
-            batch_commit_size_histogram,
             misbehavior_counter,
             last_finalized_slot_gauge,
             first_non_finalized_slot_gauge,
             first_non_progressed_slot_gauge,
             skip_total_counter,
+            votes_in_total_counter,
             votes_in_notarize_counter,
             votes_in_finalize_counter,
             votes_in_skip_counter,
+            votes_out_total_counter,
             votes_out_notarize_counter,
             votes_out_finalize_counter,
             votes_out_skip_counter,
@@ -1656,6 +1840,13 @@ impl SessionProcessor {
             validation_reject_counter,
             validation_late_callback_counter,
             health_warnings_counter,
+            candidate_precheck_old_slot_drop_counter,
+            candidate_precheck_future_slot_drop_counter,
+            candidate_precheck_unexpected_sender_drop_counter,
+            candidate_precheck_conflicting_slot_drop_counter,
+            candidate_received_broadcast_counter,
+            candidate_received_query_counter,
+            generated_candidate_validation_missed_counter,
         )
     }
 
@@ -1676,6 +1867,98 @@ impl SessionProcessor {
         &self.metrics_receiver
     }
 
+    fn track_generated_candidate_for_validation(&mut self, candidate_id: RawCandidateId) {
+        self.generated_candidates_waiting_validation.insert(
+            candidate_id,
+            GeneratedCandidateValidationWatch {
+                generated_at: self.now(),
+                validation_started: false,
+            },
+        );
+    }
+
+    fn mark_generated_candidate_validation_started(&mut self, candidate_id: &RawCandidateId) {
+        if let Some(watch) = self.generated_candidates_waiting_validation.get_mut(candidate_id) {
+            watch.validation_started = true;
+        }
+    }
+
+    fn mark_generated_candidate_validation_succeeded(&mut self, candidate_id: &RawCandidateId) {
+        self.generated_candidates_waiting_validation.remove(candidate_id);
+    }
+
+    fn take_generated_candidate_watch_by_slot(
+        &mut self,
+        slot: SlotIndex,
+    ) -> Option<(RawCandidateId, GeneratedCandidateValidationWatch)> {
+        let candidate_id = self
+            .generated_candidates_waiting_validation
+            .keys()
+            .find(|candidate_id| candidate_id.slot == slot)
+            .cloned()?;
+        let watch = self.generated_candidates_waiting_validation.remove(&candidate_id)?;
+        Some((candidate_id, watch))
+    }
+
+    fn note_generated_candidate_validation_missed(
+        &mut self,
+        candidate_id: &RawCandidateId,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        let Some(watch) = self.generated_candidates_waiting_validation.remove(candidate_id) else {
+            return;
+        };
+
+        self.generated_candidate_validation_missed_counter.increment(1);
+
+        let waited_ms =
+            self.now().duration_since(watch.generated_at).unwrap_or_default().as_millis();
+        log::warn!(
+            "Session {} local_generated_candidate_missed_validation: slot={} hash={} \
+            validation_started={} waited={}ms reason={}",
+            &self.session_id().to_hex_string()[..8],
+            candidate_id.slot,
+            &candidate_id.hash.to_hex_string()[..8],
+            watch.validation_started,
+            waited_ms,
+            reason,
+        );
+    }
+
+    fn note_generated_candidate_validation_missed_for_slot(
+        &mut self,
+        slot: SlotIndex,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        if let Some((candidate_id, watch)) = self.take_generated_candidate_watch_by_slot(slot) {
+            self.generated_candidate_validation_missed_counter.increment(1);
+
+            let waited_ms =
+                self.now().duration_since(watch.generated_at).unwrap_or_default().as_millis();
+            log::warn!(
+                "Session {} local_generated_candidate_missed_validation: slot={} hash={} \
+                validation_started={} waited={}ms reason={}",
+                &self.session_id().to_hex_string()[..8],
+                candidate_id.slot,
+                &candidate_id.hash.to_hex_string()[..8],
+                watch.validation_started,
+                waited_ms,
+                reason,
+            );
+            return;
+        }
+
+        self.generated_candidate_validation_missed_counter.increment(1);
+        log::warn!(
+            "Session {} local_generated_candidate_missed_validation: slot={} reason={}",
+            &self.session_id().to_hex_string()[..8],
+            slot,
+            reason,
+        );
+    }
+
     /*
         Validator index validation
     */
@@ -1687,13 +1970,12 @@ impl SessionProcessor {
     }
 
     /*
-        Error tracking for SessionStats
+        Error tracking
     */
 
     /// Increment the session error counter
     ///
     /// Called when an error occurs during session processing.
-    /// The error count is included in SessionStats passed to on_block_committed.
     /// Uses atomic increment to allow calling with &self (no &mut self required).
     fn increment_error(&self) {
         self.session_errors_count.fetch_add(1, Ordering::Relaxed);
@@ -1959,16 +2241,6 @@ impl SessionProcessor {
         deserialize_typed(bytes)
     }
 
-    /// Build session statistics for on_block_committed callback
-    ///
-    /// Creates a SessionStats struct with current session metrics.
-    /// Called before notify_block_committed to capture session health data.
-    fn build_session_stats(&self) -> consensus_common::SessionStats {
-        consensus_common::SessionStats {
-            errors_count: self.session_errors_count.load(Ordering::Relaxed),
-        }
-    }
-
     /*
         ========================================================================
         Empty Block Support (TON-specific extension for finalization recovery)
@@ -1981,16 +2253,37 @@ impl SessionProcessor {
         ========================================================================
     */
 
-    /// Update the last masterchain finalized seqno (for shardchain decisions)
+    fn advance_accepted_normal_head_seqno(&mut self, seqno: u32) {
+        if seqno > self.accepted_normal_head_seqno {
+            self.accepted_normal_head_seqno = seqno;
+            if self
+                .accepted_normal_head_block_id
+                .as_ref()
+                .is_some_and(|block_id| block_id.seq_no < seqno)
+            {
+                self.accepted_normal_head_block_id = None;
+            }
+        }
+    }
+
+    fn advance_accepted_normal_head_block(&mut self, block_id: BlockIdExt) {
+        self.advance_accepted_normal_head_seqno(block_id.seq_no);
+        match self.accepted_normal_head_block_id.as_ref() {
+            Some(current) if current >= &block_id => {}
+            _ => self.accepted_normal_head_block_id = Some(block_id),
+        }
+    }
+
+    /// Update applied-top tracking from manager notification.
     ///
-    /// This should be called when a masterchain block finalization event is received
-    /// (similar to C++ `ConsensusBus::BlockFinalizedInMasterchain` event).
-    /// The seqno is used in `should_generate_empty_block()` to determine if a
-    /// shardchain should generate an empty block.
+    /// This should be called when manager forwards the current applied top for this
+    /// session shard (C++ `top_block_id()` / `BlockFinalizedInMasterchain` semantics).
+    /// The seqno is used in `should_generate_empty_block()` and the exact block id is
+    /// also used to seed the MC validation accepted-head cursor when known.
     ///
     /// # Arguments
     ///
-    /// * `seqno` - The masterchain block seqno that was finalized
+    /// * `applied_top` - Current applied top for this session shard
     ///
     /// # Reference
     ///
@@ -2001,9 +2294,22 @@ impl SessionProcessor {
     ///     last_consensus_finalized_seqno_ = std::max(last_mc_finalized_seqno_, last_consensus_finalized_seqno_);
     /// }
     /// ```
-    pub fn set_mc_finalized_seqno(&mut self, seqno: u32) {
+    pub fn set_mc_finalized_block(&mut self, applied_top: BlockIdExt) {
+        self.observability.last_mc_applied_block_id = Some(applied_top.clone());
+        let session_shard = self.description.get_shard();
+        if applied_top.shard() != session_shard {
+            log::trace!(
+                "Session {}: ignoring MC finalization update for mismatched shard {} \
+                (session shard {})",
+                &self.session_id().to_hex_string()[..8],
+                applied_top.shard(),
+                session_shard
+            );
+            return;
+        }
+        let seqno = applied_top.seq_no;
         log::trace!(
-            "Session {}: set_mc_finalized_seqno={} (was {:?})",
+            "Session {}: set_applied_top_seqno={} (was {:?})",
             &self.session_id().to_hex_string()[..8],
             seqno,
             self.last_mc_finalized_seqno
@@ -2012,6 +2318,7 @@ impl SessionProcessor {
         // last_mc_finalized_seqno_ = std::max(event->block.seqno(), last_mc_finalized_seqno_);
         let prev_mc = self.last_mc_finalized_seqno.unwrap_or(0);
         self.last_mc_finalized_seqno = Some(seqno.max(prev_mc));
+        self.advance_accepted_normal_head_block(applied_top);
         // C++ parity: BlockFinalizedInMasterchain also couples to last_consensus_finalized_seqno_
         let consensus = self.last_consensus_finalized_seqno.unwrap_or(0);
         let mc = self.last_mc_finalized_seqno.unwrap_or(0);
@@ -2019,11 +2326,12 @@ impl SessionProcessor {
         if new_val > consensus {
             self.last_consensus_finalized_seqno = Some(new_val);
         }
+        self.wake_now();
     }
 
     /// Get the last masterchain finalized seqno
     ///
-    /// Returns `None` if no MC finalization has been reported.
+    /// Returns the last known applied-top seqno for this session shard.
     #[allow(dead_code)]
     pub fn last_mc_finalized_seqno(&self) -> Option<u32> {
         self.last_mc_finalized_seqno
@@ -2031,7 +2339,7 @@ impl SessionProcessor {
 
     /// Determines if an empty block should be generated for finalization recovery
     ///
-    /// Empty blocks are a TON-specific extension (not in Alpenglow White Paper) that
+    /// Empty blocks are a TON-specific extension that
     /// allows the consensus to continue when the blockchain finalization is lagging
     /// behind. Instead of generating a new block with transactions, validators
     /// re-sign the previous block to help it get a FinalizeCertificate.
@@ -2072,7 +2380,7 @@ impl SessionProcessor {
         // C++ parity: ALWAYS generate empty if previous block has before_split flag
         // This is required for shard split/merge operations.
         // Reference: C++ block-producer.cpp is_before_split() check
-        if self.last_committed_before_split {
+        if self.finalized_head_before_split {
             log::debug!(
                 "Session {} should_generate_empty_block: slot={}, seqno={} - generating EMPTY \
                 (prev block has before_split=true, required for split/merge)",
@@ -2083,25 +2391,23 @@ impl SessionProcessor {
             return true;
         }
 
-        if self.description.get_shard().is_masterchain()
-            || DISABLE_NON_FINALIZED_PARENTS_FOR_COLLATION
-        {
+        if self.description.get_shard().is_masterchain() {
             // Masterchain: consensus-finalized seqno must be at most 1 behind new seqno.
             // C++ parity: block-producer.cpp uses `last_consensus_finalized_seqno_` which
             // advances on FinalizeBlock(is_final) and on BlockFinalizedInMasterchain.
             match self.last_consensus_finalized_seqno {
                 Some(finalized) => finalized + 1 < new_seqno,
-                None => false, // No finalization yet, can't be behind
+                None => false,
             }
         } else {
-            // Shardchain: MC finalized can be up to threshold behind
-            // Threshold is configurable via empty_block_mc_lag_threshold option
+            // Shardchain: MC finalized can be up to threshold behind.
+            // C++ parity: block-producer.cpp `last_mc_finalized_seqno_ + 8 < new_seqno`.
             match (
                 self.last_mc_finalized_seqno,
                 self.description.opts().empty_block_mc_lag_threshold,
             ) {
                 (Some(mc_finalized), Some(threshold)) => mc_finalized + threshold < new_seqno,
-                _ => false, // No MC finalization yet or threshold not set
+                _ => false,
             }
         }
     }
@@ -2122,11 +2428,16 @@ impl SessionProcessor {
         }
     }
 
-    /// Reset next awake time to far future
+    /// Reset next awake time to the fallback poll horizon.
     ///
     /// Called at the beginning of check_all() before collecting timeouts from all sources.
     pub fn reset_next_awake_time(&mut self) {
         self.next_awake_time = self.now() + MAX_AWAKE_TIMEOUT;
+    }
+
+    /// Force the main loop to run `check_all()` again immediately.
+    fn wake_now(&mut self) {
+        self.set_next_awake_time(self.now());
     }
 
     /*
@@ -2219,6 +2530,168 @@ impl SessionProcessor {
         );
     }
 
+    /// Collect current health findings without logging or cooldown gating.
+    ///
+    /// Used by both `debug_dump()` (for the stall conclusion) and `run_health_checks()`
+    /// (for cooldown-gated alerts).
+    fn collect_health_findings(&self) -> Vec<HealthFinding> {
+        let now = self.now();
+        let mut findings = Vec::new();
+
+        let first_non_finalized = self.simplex_state.get_first_non_finalized_slot().0;
+        let first_non_progressed = self.simplex_state.get_first_non_progressed_slot().0;
+        let window_size = self.description.opts().slots_per_leader_window;
+        let total_weight = self.description.get_total_weight();
+        let active_weight = self.active_weight;
+
+        // Progress gap
+        if first_non_progressed > first_non_finalized {
+            let gap = first_non_progressed - first_non_finalized;
+            if gap > window_size {
+                let sev = if gap > 2 * window_size { log::Level::Error } else { log::Level::Warn };
+                findings.push(HealthFinding {
+                    kind: HealthFindingKind::ProgressGap,
+                    severity: sev,
+                    summary: format!(
+                        "progress gap={gap} (nf={first_non_finalized} np={first_non_progressed} \
+                        window={window_size})"
+                    ),
+                });
+            }
+        }
+
+        // Zero finalization speed
+        let stall_warn_secs = self.description.opts().health_stall_warning_secs;
+        let stall_duration = now
+            .duration_since(self.health_alert_state.last_finalization_nonzero_at)
+            .unwrap_or_default();
+        if stall_duration >= Duration::from_secs(stall_warn_secs) {
+            let stall_err_secs = self.description.opts().health_stall_error_secs;
+            let sev = if stall_duration >= Duration::from_secs(stall_err_secs) {
+                log::Level::Error
+            } else {
+                log::Level::Warn
+            };
+            findings.push(HealthFinding {
+                kind: HealthFindingKind::ZeroFinalizationSpeed,
+                severity: sev,
+                summary: format!("no local finalization for {:.1}s", stall_duration.as_secs_f64()),
+            });
+        }
+
+        // Low activity
+        let t66 = threshold_66(total_weight);
+        if active_weight < t66 {
+            let t33 = threshold_33(total_weight);
+            let sev = if active_weight < t33 { log::Level::Error } else { log::Level::Warn };
+            let pct = if total_weight > 0 {
+                (active_weight as f64 / total_weight as f64) * 100.0
+            } else {
+                0.0
+            };
+            findings.push(HealthFinding {
+                kind: HealthFindingKind::LowActivity,
+                severity: sev,
+                summary: format!("active_weight={active_weight} ({pct:.0}%) < th66={t66}"),
+            });
+        }
+
+        // Cert verify failures
+        let current_cert_fails = self.cert_verify_fails_total;
+        let prev_cert_fails = self.health_alert_state.prev_cert_verify_fails;
+        if current_cert_fails > prev_cert_fails {
+            findings.push(HealthFinding {
+                kind: HealthFindingKind::CertVerifyFailures,
+                severity: log::Level::Warn,
+                summary: format!(
+                    "cert_verify_fail delta={} total={}",
+                    current_cert_fails - prev_cert_fails,
+                    current_cert_fails
+                ),
+            });
+        }
+
+        // Standstill triggers
+        let current_standstill =
+            self.receiver_health_counters.standstill_triggers.load(Ordering::Relaxed);
+        let prev_standstill = self.health_alert_state.prev_standstill_triggers;
+        if current_standstill > prev_standstill {
+            findings.push(HealthFinding {
+                kind: HealthFindingKind::StandstillTriggers,
+                severity: log::Level::Warn,
+                summary: format!(
+                    "standstill_triggers delta={} total={}",
+                    current_standstill - prev_standstill,
+                    current_standstill
+                ),
+            });
+        }
+
+        // Candidate giveups
+        let current_giveups =
+            self.receiver_health_counters.candidate_giveups.load(Ordering::Relaxed);
+        let prev_giveups = self.health_alert_state.prev_candidate_giveups;
+        if current_giveups > prev_giveups {
+            findings.push(HealthFinding {
+                kind: HealthFindingKind::CandidateGiveups,
+                severity: log::Level::Warn,
+                summary: format!(
+                    "candidate_giveups delta={} total={}",
+                    current_giveups - prev_giveups,
+                    current_giveups
+                ),
+            });
+        }
+
+        // Skip vote dominance
+        let delta_notar = self
+            .votes_in_notarize_total
+            .saturating_sub(self.health_alert_state.prev_votes_in_notarize);
+        let delta_final = self
+            .votes_in_finalize_total
+            .saturating_sub(self.health_alert_state.prev_votes_in_finalize);
+        let delta_skip =
+            self.votes_in_skip_total.saturating_sub(self.health_alert_state.prev_votes_in_skip);
+        let delta_total = delta_notar + delta_final + delta_skip;
+        let skip_ratio_min_delta = (self.description.get_total_nodes() as u64).max(2) / 2;
+        if delta_total >= skip_ratio_min_delta {
+            let progress_votes = delta_notar + delta_final;
+            let skip_to_progress = delta_skip as f64 / (progress_votes.max(1) as f64);
+            if skip_to_progress >= 3.0 {
+                let sev = if skip_to_progress >= 8.0 && progress_votes == 0 {
+                    log::Level::Error
+                } else {
+                    log::Level::Warn
+                };
+                let skip_share = if delta_total > 0 {
+                    100.0 * delta_skip as f64 / delta_total as f64
+                } else {
+                    0.0
+                };
+                findings.push(HealthFinding {
+                    kind: HealthFindingKind::SkipVoteDominance,
+                    severity: sev,
+                    summary: format!(
+                        "skip_share={skip_share:.0}% skip={delta_skip} notar={delta_notar} \
+                        final={delta_final}"
+                    ),
+                });
+            }
+        }
+
+        // Validator isolation
+        let session_age = now.duration_since(self.session_creation_time()).unwrap_or_default();
+        if session_age > Duration::from_secs(60) && active_weight <= 1 && total_weight > 1 {
+            findings.push(HealthFinding {
+                kind: HealthFindingKind::ValidatorIsolated,
+                severity: log::Level::Error,
+                summary: format!("only self active, session_age={:.0}s", session_age.as_secs_f64()),
+            });
+        }
+
+        findings
+    }
+
     /// Public health check dump for periodic monitoring
     ///
     /// Called from session main loop for periodic health checks.
@@ -2237,6 +2710,9 @@ impl SessionProcessor {
         let session_id = self.session_id().to_hex_string();
         let session_prefix = &session_id[..8.min(session_id.len())];
         let cooldown = self.health_alert_state.cooldown;
+        let skip_ratio_min_delta_votes = (self.description.get_total_nodes() as u64).max(2) / 2;
+        const SKIP_RATIO_WARN_THRESHOLD: f64 = 3.0;
+        const SKIP_RATIO_ERROR_THRESHOLD: f64 = 8.0;
 
         // 1. Progress gap: first_non_progressed - first_non_finalized > window size
         let first_non_finalized = self.simplex_state.get_first_non_finalized_slot().0;
@@ -2268,10 +2744,10 @@ impl SessionProcessor {
             }
         }
 
-        // 2. Zero finalization speed: committed slot unchanged for too long
+        // 2. Zero finalization speed: finalized slot unchanged for too long
         let stall_warn_secs = self.description.opts().health_stall_warning_secs;
         let stall_err_secs = self.description.opts().health_stall_error_secs;
-        let current_finalized = self.last_committed_slot.map(|s| s.0 as f64).unwrap_or(0.0);
+        let current_finalized = self.finalized_head_slot.map(|s| s.0 as f64).unwrap_or(0.0);
         if current_finalized != self.health_alert_state.prev_last_finalized_slot {
             self.health_alert_state.last_finalization_nonzero_at = now;
             self.health_alert_state.prev_last_finalized_slot = current_finalized;
@@ -2332,46 +2808,7 @@ impl SessionProcessor {
             }
         }
 
-        // 4. Parent resolution aging: oldest pending resolution exceeds threshold
-        let parent_warn_secs = self.description.opts().health_parent_aging_warning_secs;
-        let parent_err_secs = self.description.opts().health_parent_aging_error_secs;
-        if !self.pending_parent_resolutions.is_empty() {
-            let mut oldest_age = Duration::ZERO;
-            for entries in self.pending_parent_resolutions.values() {
-                for entry in entries {
-                    if let Ok(age) = now.duration_since(entry.receive_time) {
-                        if age > oldest_age {
-                            oldest_age = age;
-                        }
-                    }
-                }
-            }
-            if oldest_age > Duration::from_secs(parent_warn_secs)
-                && now
-                    .duration_since(self.health_alert_state.last_parent_aging_warn)
-                    .unwrap_or_default()
-                    >= cooldown
-            {
-                self.health_alert_state.last_parent_aging_warn = now;
-                self.health_warnings_counter.increment(1);
-                let pending_count = self.pending_parent_resolutions.len();
-                if oldest_age > Duration::from_secs(parent_err_secs) {
-                    log::error!(
-                        "SIMPLEX_HEALTH anomaly=parent_aging session={session_prefix} \
-                        oldest_secs={:.0} pending_count={pending_count}",
-                        oldest_age.as_secs_f64(),
-                    );
-                } else {
-                    log::warn!(
-                        "SIMPLEX_HEALTH anomaly=parent_aging session={session_prefix} \
-                        oldest_secs={:.0} pending_count={pending_count}",
-                        oldest_age.as_secs_f64(),
-                    );
-                }
-            }
-        }
-
-        // 5. Cert verify failures (delta-based)
+        // 4. Cert verify failures (delta-based)
         let current_cert_fails = self.cert_verify_fails_total;
         let prev_cert_fails = self.health_alert_state.prev_cert_verify_fails;
         if current_cert_fails > prev_cert_fails
@@ -2390,7 +2827,7 @@ impl SessionProcessor {
             );
         }
 
-        // 6. Standstill trigger rate (delta-based, from receiver)
+        // 5. Standstill trigger rate (delta-based, from receiver)
         let current_standstill =
             self.receiver_health_counters.standstill_triggers.load(Ordering::Relaxed);
         let prev_standstill = self.health_alert_state.prev_standstill_triggers;
@@ -2410,7 +2847,7 @@ impl SessionProcessor {
             );
         }
 
-        // 7. Candidate request giveups (delta-based, from receiver)
+        // 6. Candidate request giveups (delta-based, from receiver)
         let current_giveups =
             self.receiver_health_counters.candidate_giveups.load(Ordering::Relaxed);
         let prev_giveups = self.health_alert_state.prev_candidate_giveups;
@@ -2430,6 +2867,70 @@ impl SessionProcessor {
                 delta,
                 current_giveups
             );
+        }
+
+        // 7. Skip/notar/final ratio anomaly (delta-based, inbound vote stream).
+        let current_notar = self.votes_in_notarize_total;
+        let current_final = self.votes_in_finalize_total;
+        let current_skip = self.votes_in_skip_total;
+        let delta_notar =
+            current_notar.saturating_sub(self.health_alert_state.prev_votes_in_notarize);
+        let delta_final =
+            current_final.saturating_sub(self.health_alert_state.prev_votes_in_finalize);
+        let delta_skip = current_skip.saturating_sub(self.health_alert_state.prev_votes_in_skip);
+        let delta_total = delta_notar + delta_final + delta_skip;
+
+        self.health_alert_state.prev_votes_in_notarize = current_notar;
+        self.health_alert_state.prev_votes_in_finalize = current_final;
+        self.health_alert_state.prev_votes_in_skip = current_skip;
+
+        if delta_total >= skip_ratio_min_delta_votes
+            && now.duration_since(self.health_alert_state.last_skip_ratio_warn).unwrap_or_default()
+                >= cooldown
+        {
+            let progress_votes = delta_notar + delta_final;
+            // Compare skip traffic against the full progress-vote stream to avoid
+            // false positives when only one denominator is sparse in this window.
+            let skip_to_progress = delta_skip as f64 / (progress_votes.max(1) as f64);
+            let skip_to_notar = if delta_notar > 0 {
+                delta_skip as f64 / (delta_notar as f64)
+            } else {
+                f64::INFINITY
+            };
+            let skip_to_final = if delta_final > 0 {
+                delta_skip as f64 / (delta_final as f64)
+            } else {
+                f64::INFINITY
+            };
+            let skip_share = if delta_total > 0 {
+                100.0 * (delta_skip as f64) / (delta_total as f64)
+            } else {
+                0.0
+            };
+
+            if skip_to_progress >= SKIP_RATIO_WARN_THRESHOLD {
+                self.health_alert_state.last_skip_ratio_warn = now;
+                self.health_warnings_counter.increment(1);
+
+                if skip_to_progress >= SKIP_RATIO_ERROR_THRESHOLD && progress_votes == 0 {
+                    log::error!(
+                        "SIMPLEX_HEALTH anomaly=skip_vote_dominance session={session_prefix} \
+                        delta_skip={delta_skip} delta_notar={delta_notar} delta_final={delta_final} \
+                        skip_share={skip_share:.0}% skip_to_progress={skip_to_progress:.2} \
+                        skip_to_notar={skip_to_notar:.2} \
+                        skip_to_final={skip_to_final:.2}"
+                    );
+                    self.increment_error();
+                } else {
+                    log::warn!(
+                        "SIMPLEX_HEALTH anomaly=skip_vote_dominance session={session_prefix} \
+                        delta_skip={delta_skip} delta_notar={delta_notar} delta_final={delta_final} \
+                        skip_share={skip_share:.0}% skip_to_progress={skip_to_progress:.2} \
+                        skip_to_notar={skip_to_notar:.2} \
+                        skip_to_final={skip_to_final:.2}"
+                    );
+                }
+            }
         }
 
         // 8. Validator isolation: only self is active for extended period
@@ -2460,15 +2961,177 @@ impl SessionProcessor {
         }
     }
 
+    /// Compute candidate funnel totals for validation inventory dump.
+    fn compute_candidate_totals(&self, now: SystemTime) -> CandidateTotals {
+        let received_total = self.received_candidates.len();
+        let mut received_unvalidated = 0usize;
+        let mut validated_not_notarized = 0usize;
+        let mut notarized_not_finalized = 0usize;
+        let mut finalized_recent = 0usize;
+        let mut other_omitted = 0usize;
+
+        for (id, _rc) in &self.received_candidates {
+            let is_finalized = self.finalized_blocks.contains(id);
+            let is_notarized =
+                self.simplex_state.get_notarized_block_hash(&self.description, id.slot).as_ref()
+                    == Some(&id.hash);
+            let is_approved = self.approved.contains_key(id);
+            let is_pending = self.pending_validations.contains_key(id);
+
+            if is_finalized {
+                let is_recent = self.finalized_pending_body.get(id).map_or_else(
+                    || {
+                        // Already materialized: check receive time as proxy
+                        false
+                    },
+                    |entry| {
+                        now.duration_since(entry.finalized_at)
+                            .map(|d| d <= RECENT_FINALIZED_DUMP_WINDOW)
+                            .unwrap_or(false)
+                    },
+                );
+                // Also check if it was recently finalized by checking last_finalization_time proximity
+                let recent_by_time = now
+                    .duration_since(self.last_finalization_time)
+                    .map(|d| d <= RECENT_FINALIZED_DUMP_WINDOW)
+                    .unwrap_or(false);
+                if is_recent || recent_by_time {
+                    finalized_recent += 1;
+                } else {
+                    other_omitted += 1;
+                }
+            } else if is_notarized {
+                notarized_not_finalized += 1;
+            } else if is_approved || (!is_pending && !self.rejected.contains(id)) {
+                validated_not_notarized += 1;
+            } else {
+                received_unvalidated += 1;
+            }
+        }
+
+        CandidateTotals {
+            received_total,
+            received_unvalidated,
+            validated_not_notarized,
+            notarized_not_finalized,
+            finalized_recent,
+            other_omitted,
+        }
+    }
+
+    /// Dump validation inventory with lifecycle-bucketed blocks.
+    fn dump_validation_inventory(&self, r: &mut String, now: SystemTime, totals: &CandidateTotals) {
+        r.push_str("  validation:\n");
+
+        let mut received_rows = Vec::new();
+        let mut validated_rows = Vec::new();
+        let mut notarized_rows = Vec::new();
+        let mut finalized_rows = Vec::new();
+
+        for (id, rc) in &self.received_candidates {
+            let is_finalized = self.finalized_blocks.contains(id);
+            let is_notarized = self.simplex_state.has_notarized_block(id.slot);
+            let is_approved = self.approved.contains_key(id);
+            let is_pending = self.pending_validations.contains_key(id);
+            let is_rejected = self.rejected.contains(id);
+
+            let mut flags = Vec::new();
+            if is_pending {
+                flags.push("pending_validation");
+            }
+            if is_approved {
+                flags.push("approved");
+            }
+            if is_rejected {
+                flags.push("rejected");
+            }
+            if is_notarized {
+                flags.push("notarized");
+            }
+            if is_finalized {
+                flags.push("finalized");
+            }
+            if rc.is_empty {
+                flags.push("empty");
+            }
+            let flags_str = if flags.is_empty() { "-".to_string() } else { flags.join(",") };
+
+            let age = Self::fmt_ago(now, Some(rc.receive_time));
+            let line = format!(
+                "      slot {} src={} candidate={} block=({}) flags=[{}] recv={}\n",
+                rc.slot,
+                rc.source_idx,
+                &id.hash.to_hex_string()[..8],
+                rc.block_id,
+                flags_str,
+                age,
+            );
+
+            if is_finalized {
+                let is_recent = now
+                    .duration_since(self.last_finalization_time)
+                    .map(|d| d <= RECENT_FINALIZED_DUMP_WINDOW)
+                    .unwrap_or(false);
+                if is_recent {
+                    finalized_rows.push(line);
+                }
+                // older finalized: omitted
+            } else if is_notarized {
+                notarized_rows.push(line);
+            } else if is_approved || (!is_pending && !is_rejected) {
+                validated_rows.push(line);
+            } else {
+                received_rows.push(line);
+            }
+        }
+
+        r.push_str(&format!("    received ({:.1}%):\n", totals.pct(totals.received_unvalidated),));
+        for row in &received_rows {
+            r.push_str(row);
+        }
+
+        r.push_str(&format!(
+            "    validated ({:.1}%):\n",
+            totals.pct(totals.validated_not_notarized),
+        ));
+        for row in &validated_rows {
+            r.push_str(row);
+        }
+
+        r.push_str(&format!(
+            "    notarized ({:.1}%):\n",
+            totals.pct(totals.notarized_not_finalized),
+        ));
+        for row in &notarized_rows {
+            r.push_str(row);
+        }
+
+        r.push_str(&format!("    finalized ({:.1}%):\n", totals.pct(totals.finalized_recent),));
+        for row in &finalized_rows {
+            r.push_str(row);
+        }
+
+        r.push_str(&format!(
+            "    other: omitted={} total_received={}\n",
+            totals.other_omitted, totals.received_total,
+        ));
+    }
+
     /// Produce detailed debug dump of session state
     ///
     /// Includes:
-    /// - Session-level info (validators, weights, timing)
-    /// - Collation/validation state
-    /// - SimplexState FSM dump (via SimplexState::debug_dump)
+    /// - Stall conclusion with health findings
+    /// - Session header, shard info, frontiers with cursor ages
+    /// - Consensus milestone timestamps (finalization, notarization, cert times)
+    /// - Heads (finalized, accepted, MC applied)
+    /// - Candidate funnel statistics with percentages
+    /// - Collation state with per-window grouping and leader identity
+    /// - Validation inventory with lifecycle buckets
+    /// - Peer diagnostics with typed vote/cert/candidate stats
+    /// - Standstill diagnostic grid (on stall)
     ///
     /// # Arguments
-    /// * `is_stalled` - If true, consensus is stalled (no commits for ROUND_DEBUG_PERIOD).
+    /// * `is_stalled` - If true, consensus is stalled (no finalizations for ROUND_DEBUG_PERIOD).
     ///   In stall mode, full details are logged to INFO level for immediate visibility.
     ///   In normal mode (health check), brief status goes to INFO, full details to DEBUG.
     ///
@@ -2479,7 +3142,6 @@ impl SessionProcessor {
         let now = self.now();
         let fsm_first_non_finalized_slot = self.simplex_state.get_first_non_finalized_slot();
         let fsm_first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
-        // Use current slot's started_at time
         let slot_duration = now.duration_since(self.slot_started_at(fsm_first_non_progressed_slot));
         let total_weight = self.description.get_total_weight();
         let slot_dur_secs = slot_duration.map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -2487,16 +3149,18 @@ impl SessionProcessor {
             .duration_since(self.session_creation_time())
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
+        let shard = self.description.get_shard();
 
-        // Stalled consensus: log error and increment error counter
         if is_stalled {
-            let time_since_commit =
-                now.duration_since(self.last_commit_time).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            let time_since_finalization = now
+                .duration_since(self.last_finalization_time)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
             log::error!(
-                "Session {} stalled (no commits for {:.1}s, slot_dur={:.1}s, threshold {:.0}s), \
+                "Session {} stalled (no finalizations for {:.1}s, slot_dur={:.1}s, threshold {:.0}s), \
                 slot_nf={}, slot_np={}",
                 &self.session_id().to_hex_string()[..8],
-                time_since_commit,
+                time_since_finalization,
                 slot_dur_secs,
                 ROUND_DEBUG_PERIOD.as_secs_f64(),
                 fsm_first_non_finalized_slot,
@@ -2505,29 +3169,23 @@ impl SessionProcessor {
             self.increment_error();
         }
 
-        // INFO level: Compact health status (always logged when info enabled)
-        // Provides quick health check without enabling debug
+        // INFO level: compact health status line
         if log::log_enabled!(log::Level::Info) {
             let status = if is_stalled { "STALLED" } else { "OK" };
+            let head_seqno =
+                self.finalized_head_seqno.map(|s| s.to_string()).unwrap_or_else(|| "?".to_string());
             log::info!(
-                "Session {} health [{}]: slot_nf={}, slot_np={}, time={:.1}s, slot_dur={:.1}s, \
-                active={}/{} ({:.0}%), pending_val={}, approved={}, finalized={}",
+                "Session {} health [{}]: shard={}:{:016x} slot_nf={} slot_np={} finalized_head_seqno={}",
                 &self.session_id().to_hex_string()[..8],
                 status,
+                shard.workchain_id(),
+                shard.shard_prefix_with_tag(),
                 fsm_first_non_finalized_slot,
                 fsm_first_non_progressed_slot,
-                session_time,
-                slot_dur_secs,
-                self.active_weight,
-                total_weight,
-                100.0 * self.active_weight as f64 / total_weight as f64,
-                self.pending_validations.len(),
-                self.approved.len(),
-                self.finalized_blocks.len(),
+                head_seqno,
             );
         }
 
-        // Full details: logged to DEBUG in normal mode, INFO in stall mode
         let should_dump_full = if is_stalled {
             log::log_enabled!(log::Level::Info)
         } else {
@@ -2538,168 +3196,341 @@ impl SessionProcessor {
             return;
         }
 
-        let mut result = String::new();
+        let health_findings = self.collect_health_findings();
+        let window_diags = self.simplex_state.collect_window_diagnostics(&self.description);
 
-        // Session header
-        result.push_str(&format!("Session {} dump:\n", self.session_id().to_hex_string()));
+        let mut r = String::with_capacity(4096);
+        let status_str = if is_stalled { "STALLED" } else { "OK" };
 
-        // Timing
-        result.push_str(&format!("  - slot_duration: {:.3}s\n", slot_dur_secs));
-        result.push_str(&format!("  - session_time: {:.3}s\n", session_time));
-
-        // Session info (show FSM slot boundaries)
-        result.push_str(&format!(
-            "  - first_non_finalized_slot: {} (fsm)\n  - first_non_progressed_slot: {} (fsm)\n  - validators_count: {}\n  - local_idx: {}\n",
-            fsm_first_non_finalized_slot,
-            fsm_first_non_progressed_slot,
-            self.description.get_total_nodes(),
-            self.description.get_self_idx()
+        // ---- Conclusion (stalled only) ----
+        r.push_str(&format!(
+            "Session {} dump [{}]:\n",
+            self.session_id().to_hex_string(),
+            status_str,
         ));
-
-        // Weights
-        let total_weight = self.description.get_total_weight();
-        result.push_str(&format!(
-            "  - total_weight: {}\n  - threshold_66: {} ({:.2}%)\n  - threshold_33: {} ({:.2}%)\n",
-            total_weight,
-            threshold_66(total_weight),
-            100.0 * threshold_66(total_weight) as f64 / total_weight as f64,
-            threshold_33(total_weight),
-            100.0 * threshold_33(total_weight) as f64 / total_weight as f64
-        ));
-        result.push_str(&format!(
-            "  - active_weight: {} ({:.2}%)\n",
-            self.active_weight,
-            100.0 * self.active_weight as f64 / total_weight as f64
-        ));
-
-        // Inactive validators (similar to validator-session session_processor.rs)
-        let mut inactive_validators = Vec::new();
-        for (idx, last_time) in self.last_activity.iter().enumerate() {
-            if idx == usize::from(self.description.get_self_idx()) {
-                continue;
+        if is_stalled {
+            r.push_str("  conclusion:\n");
+            for f in &health_findings {
+                r.push_str(&format!("    - {:?}: {}\n", f.kind, f.summary));
             }
-            let is_active = if let Some(last_activity) = last_time {
-                if let Ok(elapsed) = now.duration_since(*last_activity) {
-                    elapsed < crate::utils::ACTIVITY_THRESHOLD
-                } else {
-                    false
+            // Frontier-based reason from first non-finalized slot diagnostic
+            if let Some(wd) = window_diags.first() {
+                if let Some(sd) = wd.slots.first() {
+                    r.push_str(&format!(
+                        "    - frontier_reason: slot {} {} ({})\n",
+                        sd.slot, sd.phase, sd.reason
+                    ));
                 }
-            } else {
-                false
-            };
-
-            if !is_active {
-                let last_str = last_time
-                    .and_then(|t| now.duration_since(t).ok())
-                    .map(|d| format!("{:.0}s", d.as_secs_f64()))
-                    .unwrap_or_else(|| "?".to_string());
-                inactive_validators.push(format!("v{:03}/{}", idx, last_str));
+            }
+            if health_findings.is_empty() {
+                r.push_str("    - none\n");
             }
         }
-        if !inactive_validators.is_empty() {
-            result.push_str(&format!("  - inactive: [{}]\n", inactive_validators.join(", ")));
-        }
 
-        // Collation state (per-slot state for current slot)
-        let current_slot = fsm_first_non_progressed_slot;
-        result.push_str(&format!(
-            "  - collation: pending_gen={}, generated={}, sent_gen={}, precollated={}\n",
-            self.slot_is_pending_generate(current_slot),
-            self.slot_is_generated(current_slot),
-            self.slot_is_sent_generated(current_slot),
-            self.precollated_blocks.len()
+        // ---- Shard ----
+        r.push_str(&format!(
+            "  shard={}:{:016x}\n",
+            shard.workchain_id(),
+            shard.shard_prefix_with_tag(),
         ));
 
-        // Validation state (session-level)
-        result.push_str(&format!(
-            "  - validation: pending={}, approved={}, rejected={}, validated_queue={}\n",
+        // ---- Header ----
+        let t66 = threshold_66(total_weight);
+        let t33 = threshold_33(total_weight);
+        let active_pct = if total_weight > 0 {
+            100.0 * self.active_weight as f64 / total_weight as f64
+        } else {
+            0.0
+        };
+        r.push_str("  header:\n");
+        r.push_str(&format!(
+            "    validators={} local={} session_time={:.1}s slot_duration={:.1}s\n",
+            self.description.get_total_nodes(),
+            self.description.get_self_idx(),
+            session_time,
+            slot_dur_secs,
+        ));
+        r.push_str(&format!(
+            "    total_weight={total_weight} th66={t66} th33={t33} active_weight={} ({active_pct:.1}%)\n",
+            self.active_weight,
+        ));
+
+        // ---- Frontiers ----
+        let nf_age = Self::fmt_dur(now, self.observability.last_finalized_cursor_change_at);
+        let np_age = Self::fmt_dur(now, self.observability.last_progression_change_at);
+        r.push_str("  frontiers:\n");
+        r.push_str(&format!(
+            "    first_non_finalized={} (unchanged {})\n",
+            fsm_first_non_finalized_slot, nf_age,
+        ));
+        r.push_str(&format!(
+            "    first_non_progressed={} (unchanged {})\n",
+            fsm_first_non_progressed_slot, np_age,
+        ));
+
+        // Milestone timestamps
+        let fmt_milestone =
+            |label: &str, seqno: Option<u32>, slot: Option<SlotIndex>, ts: Option<SystemTime>| {
+                let seqno_str =
+                    seqno.map(|s| format!("seqno={s}")).unwrap_or_else(|| "seqno=?".to_string());
+                let slot_str = slot.map(|s| format!(" slot={s}")).unwrap_or_default();
+                let age = Self::fmt_ago(now, ts);
+                format!("    {label}: {seqno_str}{slot_str}, {age}\n")
+            };
+        r.push_str(&fmt_milestone(
+            "last_finalization",
+            self.finalized_head_seqno,
+            self.finalized_head_slot,
+            Some(self.last_finalization_time),
+        ));
+        r.push_str(&fmt_milestone(
+            "last_notarization",
+            None,
+            self.observability.last_notarization_slot,
+            self.observability.last_notarization_at,
+        ));
+        r.push_str(&fmt_milestone(
+            "last_final_cert",
+            None,
+            self.observability.last_final_cert_slot,
+            self.observability.last_final_cert_at,
+        ));
+        r.push_str(&fmt_milestone(
+            "last_notar_cert",
+            None,
+            self.observability.last_notar_cert_slot,
+            self.observability.last_notar_cert_at,
+        ));
+
+        // ---- Heads ----
+        r.push_str("  heads:\n");
+        r.push_str(&format!(
+            "    finalized_head_seqno={}\n",
+            self.finalized_head_seqno.map(|s| s.to_string()).unwrap_or_else(|| "?".to_string()),
+        ));
+        if let Some(ref bid) = self.finalized_head_block_id {
+            r.push_str(&format!(
+                "    finalized_head=slot {} id=({})\n",
+                self.finalized_head_slot.map(|s| s.to_string()).unwrap_or_else(|| "?".to_string()),
+                bid,
+            ));
+        }
+        r.push_str(&format!(
+            "    last_consensus_finalized_seqno={}\n",
+            self.last_consensus_finalized_seqno
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+        ));
+        if let Some(ref bid) = self.accepted_normal_head_block_id {
+            r.push_str(&format!(
+                "    accepted_normal_head=seqno {} id=({})\n",
+                self.accepted_normal_head_seqno, bid
+            ));
+        } else {
+            r.push_str(&format!(
+                "    accepted_normal_head=seqno {}\n",
+                self.accepted_normal_head_seqno
+            ));
+        }
+        if let Some(ref bid) = self.observability.last_mc_applied_block_id {
+            r.push_str(&format!("    last_mc_applied=({})\n", bid));
+        }
+        r.push_str(&format!(
+            "    last_mc_finalized_seqno={}\n",
+            self.last_mc_finalized_seqno.map(|s| s.to_string()).unwrap_or_else(|| "?".to_string()),
+        ));
+
+        // ---- Statistics ----
+        let totals = self.compute_candidate_totals(now);
+        r.push_str("  statistics:\n");
+        r.push_str(&format!(
+            "    candidates: received={} validated={} ({:.1}%) notarized={} \
+            ({:.1}%) finalized={} ({:.1}%) other={} ({:.1}%)\n",
+            totals.received_total,
+            totals.received_total - totals.received_unvalidated,
+            totals.pct(totals.received_total - totals.received_unvalidated),
+            totals.notarized_not_finalized + totals.finalized_recent + totals.other_omitted,
+            totals.pct(
+                totals.notarized_not_finalized + totals.finalized_recent + totals.other_omitted
+            ),
+            totals.finalized_recent,
+            totals.pct(totals.finalized_recent),
+            totals.other_omitted,
+            totals.pct(totals.other_omitted),
+        ));
+        if let Some(ref snap) = self.last_receiver_snapshot {
+            let total_in_msgs: u64 = snap.sources.iter().map(|s| s.in_messages).sum();
+            let total_out_msgs: u64 = snap.sources.iter().map(|s| s.out_messages).sum();
+            let total_in_bcasts: u64 = snap.sources.iter().map(|s| s.in_broadcasts).sum();
+            let total_out_bcasts: u64 = snap.sources.iter().map(|s| s.out_broadcasts).sum();
+            let total_dup_votes: u64 = snap.sources.iter().map(|s| s.duplicate_votes).sum();
+            let total_dup_bcasts: u64 = snap.sources.iter().map(|s| s.duplicate_broadcasts).sum();
+            let total_req_sent: u64 = snap.sources.iter().map(|s| s.candidate_requests_sent).sum();
+            let total_req_recv: u64 =
+                snap.sources.iter().map(|s| s.candidate_requests_received).sum();
+            r.push_str(&format!(
+                "    traffic: msgs_in={total_in_msgs} msgs_out={total_out_msgs} \
+                bcasts_in={total_in_bcasts} bcasts_out={total_out_bcasts}\n"
+            ));
+            r.push_str(&format!(
+                "    votes_in: notar={} final={} skip={}\n",
+                self.votes_in_notarize_total,
+                self.votes_in_finalize_total,
+                self.votes_in_skip_total,
+            ));
+            r.push_str(&format!(
+                "    duplicates: votes={total_dup_votes} broadcasts={total_dup_bcasts} \
+                request_candidates_sent={total_req_sent} request_candidates_recv={total_req_recv}\n"
+            ));
+        }
+        r.push_str(&format!(
+            "    pending: validations={} approvals={} rejections={} finalized_pending_body={}\n",
             self.pending_validations.len(),
             self.approved.len(),
             self.rejected.len(),
-            self.validated_candidates.len()
+            self.finalized_pending_body.len(),
         ));
 
-        // Nodes list (with activity info)
-        result.push_str("  - nodes:\n");
-        for i in 0..self.description.get_total_nodes() {
-            let validator_idx = ValidatorIndex::from(i);
-            let public_key_hash = self.description.get_source_public_key_hash(validator_idx);
-            let weight = self.description.get_node_weight(validator_idx);
-            let is_self = self.description.is_self(validator_idx);
-            let is_leader =
-                self.description.is_self_leader(fsm_first_non_finalized_slot) && is_self;
-
-            // Check if there's validated candidate data from this source
-            let has_candidate = self.slot_has_validated_candidate_from(current_slot, validator_idx);
-
-            // Activity info
-            let last_activity_time = self.last_activity.get(i as usize).and_then(|t| *t);
-            let last_activity_delay = last_activity_time.and_then(|t| now.duration_since(t).ok());
-            let is_active =
-                last_activity_delay.map(|d| d < crate::utils::ACTIVITY_THRESHOLD).unwrap_or(false);
-            let last_activity_str = last_activity_delay
-                .map(|d| format!("{:6.2}s", d.as_secs_f64()))
-                .unwrap_or_else(|| "    N/A ".to_string());
-
-            // Status: "self" for local validator, "inactive" for inactive, blank for active
-            let status_str = if is_self {
-                "self    "
-            } else if is_active {
-                "        "
-            } else {
-                "inactive"
-            };
-
-            result.push_str(&format!(
-                "    - {}: {} last_activity={}, weight={}, pubkey_hash={}{}{}\n",
-                validator_idx,
-                status_str,
-                last_activity_str,
-                weight,
-                public_key_hash,
-                if is_leader { " [LEADER]" } else { "" },
-                if has_candidate { " [HAS_CANDIDATE]" } else { "" },
+        // ---- Collation (per-window) ----
+        let current_slot = fsm_first_non_progressed_slot;
+        r.push_str("  collation:\n");
+        r.push_str(&format!(
+            "    current_slot={} pending_gen={} generated={} sent_gen={} precollated={} \
+            generated_waiting_validation={}\n",
+            current_slot,
+            self.slot_is_pending_generate(current_slot),
+            self.slot_is_generated(current_slot),
+            self.slot_is_sent_generated(current_slot),
+            self.precollated_blocks.len(),
+            self.generated_candidates_waiting_validation.len(),
+        ));
+        for wd in &window_diags {
+            let leader_pubkey =
+                base64_encode(self.description.get_source_public_key_hash(wd.leader_idx).data());
+            let leader_adnl =
+                base64_encode(self.description.get_source_adnl_id(wd.leader_idx).data());
+            r.push_str(&format!(
+                "    window {} slots=[{}..{}] leader={} pubkey_b64={} adnl_b64={}\n",
+                wd.window_idx,
+                wd.slot_begin,
+                wd.slot_end,
+                wd.leader_idx,
+                leader_pubkey,
+                leader_adnl,
             ));
-        }
-
-        // Delayed actions
-        if !self.delayed_actions.is_empty() {
-            result.push_str(&format!("  - delayed_actions: {}\n", self.delayed_actions.len()));
-            for (i, action) in self.delayed_actions.iter().enumerate() {
-                let expires_in = action
-                    .expiration_time
-                    .duration_since(now)
-                    .map(|d| format!("{:.3}s", d.as_secs_f64()))
-                    .unwrap_or_else(|_| "expired".to_string());
-                result.push_str(&format!("    - action {}: expires_in={}\n", i, expires_in));
+            for sd in &wd.slots {
+                let mut flags = Vec::new();
+                if sd.voted_notar {
+                    flags.push("Voted");
+                }
+                if sd.voted_skip {
+                    flags.push("VotedSkip");
+                }
+                if sd.voted_final {
+                    flags.push("VotedFinal");
+                }
+                if sd.has_pending_block {
+                    flags.push("Pending");
+                }
+                if sd.is_timeout_skipped {
+                    flags.push("TimeoutSkipped");
+                }
+                let flags_str = if flags.is_empty() { "none".to_string() } else { flags.join("|") };
+                let mut certs = Vec::new();
+                if sd.has_notar_cert {
+                    certs.push("notar");
+                }
+                if sd.has_final_cert {
+                    certs.push("final");
+                }
+                if sd.has_skip_cert {
+                    certs.push("skip");
+                }
+                let certs_str = if certs.is_empty() { "none".to_string() } else { certs.join("|") };
+                r.push_str(&format!(
+                    "      {} phase={} reason={} notar={:.0}% final={:.0}% \
+                    skip={:.0}% flags=[{}] certs=[{}]\n",
+                    sd.slot,
+                    sd.phase,
+                    sd.reason,
+                    sd.notar_weight_pct,
+                    sd.final_weight_pct,
+                    sd.skip_weight_pct,
+                    flags_str,
+                    certs_str,
+                ));
             }
         }
 
-        // SimplexState dump (full format for debug dumps)
-        result.push_str("  - simplex_state:\n");
-        let fsm_dump = self.simplex_state.debug_dump(&self.description, true);
-        // Indent FSM dump
-        for line in fsm_dump.lines() {
-            result.push_str(&format!("    {}\n", line));
+        // ---- Validation inventory ----
+        self.dump_validation_inventory(&mut r, now, &totals);
+
+        // ---- Peers ----
+        if let Some(ref snap) = self.last_receiver_snapshot {
+            r.push_str("  peers:\n");
+            for src in &snap.sources {
+                let is_self = src.source_idx == self.description.get_self_idx().0 as u32;
+                let vi = ValidatorIndex::from(src.source_idx);
+                let weight = self.description.get_node_weight(vi);
+                let weight_pct = if total_weight > 0 {
+                    100.0 * weight as f64 / total_weight as f64
+                } else {
+                    0.0
+                };
+                let pubkey_b64 =
+                    base64_encode(self.description.get_source_public_key_hash(vi).data());
+                let last_act = Self::fmt_ago(now, src.last_recv_time);
+                let last_vote = Self::fmt_ago(now, src.last_vote_recv_time);
+                let last_final_cert = Self::fmt_ago(now, src.last_final_cert_recv_time);
+                let last_notar_cert = Self::fmt_ago(now, src.last_notar_cert_recv_time);
+                let last_cand = Self::fmt_ago(now, src.last_candidate_recv_time);
+                let marker = if is_self { " (self)" } else { "" };
+                r.push_str(&format!(
+                    "    {} adnl_b64={} pubkey_b64={} weight={} ({weight_pct:.1}%) \
+                    last_activity={last_act} last_vote={last_vote} last_final_cert={last_final_cert} \
+                    last_notar_cert={last_notar_cert} last_candidate={last_cand} \
+                    votes[n/f/s]={}/{}/{} certs[n/f/s]={}/{}/{} candidates={} \
+                    req[s/r]={}/{}{marker}\n",
+                    vi,
+                    src.adnl_id_base64,
+                    pubkey_b64,
+                    weight,
+                    src.votes_in_notarize,
+                    src.votes_in_finalize,
+                    src.votes_in_skip,
+                    src.certs_in_notar,
+                    src.certs_in_final,
+                    src.certs_in_skip,
+                    src.candidates_received,
+                    src.candidate_requests_sent,
+                    src.candidate_requests_received,
+                ));
+            }
         }
 
-        // C++ parity: standstill slot-grid dump (only on stall)
-        // Reference: C++ pool.cpp alarm() sb << slot << ": " << per-validator markers
+        // ---- Health findings ----
+        if !health_findings.is_empty() {
+            r.push_str("  health_findings:\n");
+            for f in &health_findings {
+                r.push_str(&format!("    - [{:?}] {:?}: {}\n", f.severity, f.kind, f.summary));
+            }
+        }
+
+        // ---- Standstill diagnostic (C++ parity, stall only) ----
         if is_stalled {
-            let grid = self.simplex_state.standstill_slot_grid_dump(&self.description);
-            if !grid.is_empty() {
-                result.push_str("  - standstill_slot_grid:\n");
-                for line in grid.lines() {
-                    result.push_str(&format!("    {}\n", line));
+            let diagnostic = self.simplex_state.standstill_diagnostic_dump(&self.description);
+            if !diagnostic.is_empty() {
+                r.push_str("  standstill_diagnostic:\n");
+                for line in diagnostic.lines() {
+                    r.push_str(&format!("    {}\n", line));
                 }
             }
         }
 
-        // Log full dump: ERROR for stalled (critical), DEBUG for health check
         if is_stalled {
-            log::error!("{}", result);
+            log::error!("{}", r);
         } else {
-            log::debug!("{}", result);
+            log::debug!("{}", r);
         }
     }
 
@@ -2714,10 +3545,12 @@ impl SessionProcessor {
     /// with unarmed timeouts (`skip_timestamp = None`) so that no skip
     /// cascade fires during the startup delay.
     ///
-    /// Reference: C++ `Start` event -> `advance_present()` ->
-    /// `LeaderWindowObserved` -> `alarm_timestamp()`.
+    /// C++ reference: `start_up()` initialises state and processes
+    /// bootstrap votes; timeouts are armed through the event flow
+    /// (`LeaderWindowObserved` → `alarm_timestamp()`).  In Rust the
+    /// equivalent arming point is this explicit `start()` call.
     pub(crate) fn start(&mut self) {
-        self.simplex_state.set_timeouts(&self.description);
+        self.simplex_state.reset_timeouts_on_start(&self.description);
 
         log::info!(
             "Session {} started: skip timeouts armed",
@@ -2737,16 +3570,23 @@ impl SessionProcessor {
         // Increment metrics counter
         self.check_all_counter.increment(1);
 
+        let now = self.now();
+        let wake_slip = now.duration_since(self.next_awake_time).unwrap_or_default();
+        self.check_all_wake_slip_histogram.record(wake_slip.as_millis() as f64);
+
         // Reset awake time to far future, will be updated by various checks
         self.reset_next_awake_time();
 
         // Stalled consensus detection
-        let now = self.now();
-        // Debug dump if no commits for ROUND_DEBUG_PERIOD (stalled consensus)
+        // Debug dump if no finalizations for ROUND_DEBUG_PERIOD (stalled consensus)
         if now >= self.round_debug_at {
             self.debug_dump(true); // is_stalled=true: full dump to INFO level
             self.round_debug_at = now + ROUND_DEBUG_PERIOD;
         }
+
+        // Release delayed gates before evaluating validation readiness so retries
+        // can re-enter validation in the same `check_all()` pass.
+        self.process_delayed_actions();
 
         // Check validation (process pending validations)
         self.check_validation();
@@ -2763,13 +3603,17 @@ impl SessionProcessor {
         // Process all events produced by FSM
         self.process_simplex_events();
 
-        // Retry finalized chain commits/proof requests even without new inbound events.
-        self.try_commit_finalized_chains();
+        // Keep receiver standstill slots aligned even when the FSM tracked
+        // interval changes outside the finalization / skip hooks.
+        self.sync_standstill_slots_from_state();
 
         // Update awake time from FSM timeout
         if let Some(fsm_timeout) = self.simplex_state.get_next_timeout() {
             self.set_next_awake_time(fsm_timeout);
         }
+
+        // Ensure we wake up for stall detection even when FSM has no pending timeouts
+        self.set_next_awake_time(self.round_debug_at);
 
         // Persist pool state (first_nonannounced_window) when window advances
         self.maybe_store_pool_state();
@@ -2777,16 +3621,18 @@ impl SessionProcessor {
         // Check collation (am I leader? should I generate?)
         self.check_collation();
 
-        // Check pending parent resolution timeouts
-        self.check_pending_parent_timeouts();
-
-        // Process delayed actions first
-        self.process_delayed_actions();
-
-        self.first_non_finalized_slot_gauge
-            .set(self.simplex_state.get_first_non_finalized_slot().0 as f64);
-        self.first_non_progressed_slot_gauge
-            .set(self.simplex_state.get_first_non_progressed_slot().0 as f64);
+        let cur_nf = self.simplex_state.get_first_non_finalized_slot();
+        let cur_np = self.simplex_state.get_first_non_progressed_slot();
+        if cur_nf != self.observability.prev_first_non_finalized {
+            self.observability.last_finalized_cursor_change_at = now;
+            self.observability.prev_first_non_finalized = cur_nf;
+        }
+        if cur_np != self.observability.prev_first_non_progressed {
+            self.observability.last_progression_change_at = now;
+            self.observability.prev_first_non_progressed = cur_np;
+        }
+        self.first_non_finalized_slot_gauge.set(cur_nf.0 as f64);
+        self.first_non_progressed_slot_gauge.set(cur_np.0 as f64);
 
         // Debug state dump
         self.log_consensus_state("check_all");
@@ -2856,6 +3702,47 @@ impl SessionProcessor {
             .or_else(|| self.received_candidates.get(&parent_id).map(|c| c.block_id.clone()))
     }
 
+    fn resolve_parent_gen_utime_ms(
+        &self,
+        parent: &crate::block::CandidateParentInfo,
+    ) -> Option<u64> {
+        let parent_id = RawCandidateId { slot: parent.slot, hash: parent.hash.clone() };
+        self.generated_parent_gen_utime_ms_cache
+            .get(&parent_id)
+            .copied()
+            .or_else(|| self.received_candidates.get(&parent_id).and_then(|c| c.gen_utime_ms))
+            .or_else(|| {
+                self.local_chain_head.as_ref().and_then(|head| {
+                    if head.parent_info.slot == parent.slot && head.parent_info.hash == parent.hash
+                    {
+                        head.gen_utime_ms
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
+    fn compute_collation_start_time(
+        &self,
+        parent: Option<&crate::block::CandidateParentInfo>,
+    ) -> SystemTime {
+        let now = self.now();
+        let Some(parent) = parent else {
+            return now;
+        };
+        let Some(parent_gen_utime_ms) = self.resolve_parent_gen_utime_ms(parent) else {
+            return now;
+        };
+
+        let target_rate = self.description.opts().target_rate;
+        let earliest_from_parent = UNIX_EPOCH
+            .checked_add(Duration::from_millis(parent_gen_utime_ms).saturating_add(target_rate))
+            .unwrap_or(now);
+        let latest_reasonable = now.checked_add(target_rate).unwrap_or(now);
+        earliest_from_parent.max(now).min(latest_reasonable)
+    }
+
     /// Advance `earliest_collation_time` by `target_rate` from now.
     /// Called after every collation start (invoke, retry, precollated hit,
     /// empty-block short-circuit) to pace the next one.
@@ -2922,8 +3809,20 @@ impl SessionProcessor {
             }
         }
 
-        // Don't generate if already generated or pending for this slot
+        // Don't generate if already generated or pending for this slot.
+        // However, if we have a local chain head and no queued precollation for the
+        // next slot in this window, keep the pipeline full by retrying it here.
         if self.slot_is_generated(current_slot) || self.slot_is_pending_generate(current_slot) {
+            if let Some(ref head) = self.local_chain_head {
+                let next_slot = SlotIndex(head.slot.0 + 1);
+                if head.window == current_window
+                    && !self.slot_is_generated(next_slot)
+                    && !self.slot_is_pending_generate(next_slot)
+                    && !self.precollated_blocks.contains_key(&next_slot)
+                {
+                    self.precollate_block(next_slot);
+                }
+            }
             return;
         }
 
@@ -2994,6 +3893,7 @@ impl SessionProcessor {
             );
 
             self.collates_precollated_counter.success();
+            self.record_collation_start();
 
             // Use precollated candidate (precollated blocks are never empty)
             self.generated_block(current_slot, CollationResult::Block(candidate));
@@ -3079,6 +3979,20 @@ impl SessionProcessor {
             }
         }
 
+        let slot_start_time = self.compute_collation_start_time(parent.as_ref());
+        let now = self.now();
+        if slot_start_time > now {
+            log::trace!(
+                "Session {} invoke_collation: deferring slot {} until {:?}",
+                self.session_id().to_hex_string(),
+                slot,
+                slot_start_time
+            );
+            self.slot_set_pending_generate(slot, false);
+            self.set_next_awake_time(slot_start_time);
+            return;
+        }
+
         // Derive `new_seqno` from the locked parent (C++ behavior).
         //
         // Reference: C++ block-producer.cpp:
@@ -3103,11 +4017,11 @@ impl SessionProcessor {
             if let Some(parent_block_id) = resolved_parent_block_id.clone() {
                 log::debug!(
                     "Session {} invoke_collation: generating EMPTY block for slot {}! \
-                    new_seqno={}, last_committed_seqno={:?}, last_mc_finalized_seqno={:?}",
+                    new_seqno={}, finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
                     self.session_id().to_hex_string(),
                     slot,
                     new_seqno,
-                    self.last_committed_seqno,
+                    self.finalized_head_seqno,
                     self.last_mc_finalized_seqno
                 );
 
@@ -3120,7 +4034,7 @@ impl SessionProcessor {
                 //
                 // Without this, empty blocks would fail with:
                 // `generated_block: empty block for slot sX has no parent`.
-                let request = AsyncRequestImpl::new(request_id, true, self.now());
+                let request = AsyncRequestImpl::new(request_id, true, slot_start_time);
                 let precollated_block = PrecollatedBlock {
                     request: request.clone(),
                     candidate: None,
@@ -3129,6 +4043,7 @@ impl SessionProcessor {
                 self.precollated_blocks.insert(slot, precollated_block);
 
                 // Call collation complete with empty block result
+                self.record_collation_start();
                 self.on_collation_complete(
                     slot,
                     request_id,
@@ -3143,10 +4058,10 @@ impl SessionProcessor {
             panic!(
                 "Session {} INVARIANT VIOLATION: should_generate_empty_block({}) returned true \
                 but no parent available. First block in epoch cannot be empty. \
-                last_committed_seqno={:?}, last_mc_finalized_seqno={:?}",
+                finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
                 self.session_id().to_hex_string(),
                 new_seqno,
-                self.last_committed_seqno,
+                self.finalized_head_seqno,
                 self.last_mc_finalized_seqno
             );
         }
@@ -3160,7 +4075,7 @@ impl SessionProcessor {
         let request_id = self.precollated_blocks_next_request_id;
         self.precollated_blocks_next_request_id += 1;
 
-        let request = AsyncRequestImpl::new(request_id, true, self.now());
+        let request = AsyncRequestImpl::new(request_id, true, slot_start_time);
         let precollated_block =
             PrecollatedBlock { request: request.clone(), candidate: None, parent: parent.clone() };
 
@@ -3278,6 +4193,7 @@ impl SessionProcessor {
             });
 
         // Notify listener
+        self.record_collation_start();
         self.collates_counter.total_increment();
         self.notify_generate_slot(slot, source_info, request, parent, callback);
     }
@@ -3324,6 +4240,7 @@ impl SessionProcessor {
                 CollationResult::Empty { .. } => unreachable!(),
             };
 
+            let mut publish_now = false;
             if let Some(precollated_block) = self.precollated_blocks.get_mut(&slot) {
                 if precollated_block.candidate.is_some() {
                     log::error!(
@@ -3348,7 +4265,24 @@ impl SessionProcessor {
                 );
 
                 // Precollate next block
-                self.precollate_block(slot + 1);
+                // C++ parity: if this slot is still in the current leader window,
+                // publish the candidate immediately instead of waiting until it
+                // becomes `first_non_progressed_slot`.
+                let current_window = self.simplex_state.get_current_leader_window_idx();
+                publish_now = self.description.get_window_idx(slot) == current_window;
+
+                if publish_now {
+                    log::trace!(
+                        "Session {} on_collation_complete: publishing in-window future candidate \
+                        for slot {} immediately (C++ parity)",
+                        self.session_id().to_hex_string(),
+                        slot
+                    );
+                }
+
+                if !publish_now {
+                    self.precollate_block(slot + 1);
+                }
             } else {
                 log::warn!(
                     "Session {} on_collation_complete: no precollated entry for slot {} \
@@ -3357,6 +4291,15 @@ impl SessionProcessor {
                     slot,
                     request_id
                 );
+            }
+
+            if publish_now {
+                if let Some(precollated_candidate) =
+                    self.precollated_blocks.get(&slot).and_then(|pb| pb.candidate.clone())
+                {
+                    self.generated_block(slot, CollationResult::Block(precollated_candidate));
+                    self.precollate_block(slot + 1);
+                }
             }
         } else {
             // Slot already passed - collation result came too late (expired)
@@ -3548,7 +4491,20 @@ impl SessionProcessor {
         // Capture parent at collation start (same as invoke_collation)
         let parent = self.simplex_state.get_available_parent(&self.description, slot);
 
-        let request = AsyncRequestImpl::new(request_id, true, self.now());
+        let slot_start_time = self.compute_collation_start_time(parent.as_ref());
+        let now = self.now();
+        if slot_start_time > now {
+            log::trace!(
+                "Session {} invoke_collation_retry: deferring slot {} retry until {:?}",
+                self.session_id().to_hex_string(),
+                slot,
+                slot_start_time
+            );
+            self.set_next_awake_time(slot_start_time);
+            return;
+        }
+
+        let request = AsyncRequestImpl::new(request_id, true, slot_start_time);
         let precollated_block =
             PrecollatedBlock { request: request.clone(), candidate: None, parent: parent.clone() };
 
@@ -3653,6 +4609,7 @@ impl SessionProcessor {
             });
 
         // Notify listener
+        self.record_collation_start();
         self.collates_counter.total_increment();
         self.notify_generate_slot(slot, source_info, request, parent, callback);
     }
@@ -3747,6 +4704,10 @@ impl SessionProcessor {
                 slot_window,
                 current_window
             );
+            self.note_generated_candidate_validation_missed_for_slot(
+                slot,
+                format!("generated_block_stale_window window={slot_window} current_window={current_window}"),
+            );
             self.invalidate_local_chain_head();
             return;
         }
@@ -3754,14 +4715,29 @@ impl SessionProcessor {
         // Use FSM's progress cursor to validate this is for the current slot.
         // Collation follows notarized/skipped progress, not finalization.
         let fsm_first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
-        if slot != fsm_first_non_progressed_slot {
+        if slot < fsm_first_non_progressed_slot {
             log::warn!(
-                "Session {} generated_block: slot {} != fsm first_non_progressed_slot {}",
+                "Session {} generated_block: slot {} < fsm first_non_progressed_slot {}",
                 self.session_id().to_hex_string(),
                 slot,
                 fsm_first_non_progressed_slot
             );
+            self.note_generated_candidate_validation_missed_for_slot(
+                slot,
+                format!(
+                    "generated_block_old_progress_slot first_non_progressed_slot={fsm_first_non_progressed_slot}"
+                ),
+            );
             return;
+        }
+        if slot > fsm_first_non_progressed_slot {
+            log::trace!(
+                "Session {} generated_block: publishing future in-window slot {} \
+                (first_non_progressed_slot={})",
+                self.session_id().to_hex_string(),
+                slot,
+                fsm_first_non_progressed_slot
+            );
         }
 
         log::trace!(
@@ -3819,7 +4795,14 @@ impl SessionProcessor {
         let candidate_parent_info =
             crate::block::CandidateParentInfo { slot, hash: prepared.candidate_hash.clone() };
         let raw_id = RawCandidateId { slot, hash: prepared.candidate_hash.clone() };
-        self.generated_parent_cache.insert(raw_id, prepared.block_id_ext.clone());
+        self.generated_parent_cache.insert(raw_id.clone(), prepared.block_id_ext.clone());
+        if let Some(gen_utime_ms) = prepared.gen_utime_ms {
+            self.generated_parent_gen_utime_ms_cache.insert(
+                RawCandidateId { slot, hash: prepared.candidate_hash.clone() },
+                gen_utime_ms,
+            );
+        }
+        self.track_generated_candidate_for_validation(raw_id.clone());
 
         let slot_window = self.description.get_window_idx(slot);
         self.local_chain_head = Some(LocalChainHead {
@@ -3827,6 +4810,7 @@ impl SessionProcessor {
             slot,
             parent_info: candidate_parent_info,
             block_id: prepared.block_id_ext.clone(),
+            gen_utime_ms: prepared.gen_utime_ms,
         });
 
         log::trace!(
@@ -3881,7 +4865,7 @@ impl SessionProcessor {
             slot
         );
 
-        // Update state (INT-2: per-slot state)
+        // Update per-slot state
         self.slot_set_pending_generate(slot, false);
         self.slot_set_generated(slot, true);
         self.slot_set_sent_generated(slot, true);
@@ -4047,6 +5031,7 @@ impl SessionProcessor {
         let computed_file_hash = consensus_common::utils::get_hash_from_block_payload(data);
         let computed_collated_file_hash =
             consensus_common::utils::get_hash_from_block_payload(collated_data);
+        let gen_utime_ms = extract_consensus_gen_utime_ms(collated_data.data());
 
         let block_id_ext = BlockIdExt {
             shard_id: self.description.get_shard().clone(),
@@ -4073,6 +5058,7 @@ impl SessionProcessor {
             candidate_hash,
             tl_candidate_data,
             signature,
+            gen_utime_ms,
         })
     }
 
@@ -4129,6 +5115,7 @@ impl SessionProcessor {
             candidate_hash,
             tl_candidate_data,
             signature,
+            gen_utime_ms: None,
         })
     }
 
@@ -4331,6 +5318,7 @@ impl SessionProcessor {
         }
         self.local_chain_head = None;
         self.generated_parent_cache.clear();
+        self.generated_parent_gen_utime_ms_cache.clear();
     }
 
     /*
@@ -4417,13 +5405,13 @@ impl SessionProcessor {
             return;
         }
 
-        // Reject far-future slots before signature verification (DoS protection)
-        if self.simplex_state.is_slot_too_far_ahead(tl_slot) {
+        // Mirror C++ vote ingress: reject slots at or beyond `first_too_new_slot`.
+        if self.simplex_state.is_vote_slot_too_far_ahead(tl_slot) {
             log::warn!(
-                "Session {} on_vote: REJECTED - slot {tl_slot} too far ahead (max={}) \
+                "Session {} on_vote: REJECTED - slot {tl_slot} too far ahead (first_too_new={}) \
                 kind={tl_kind} from source_idx={source_idx}",
                 &self.session_id().to_hex_string()[..8],
-                self.simplex_state.max_acceptable_slot(),
+                self.simplex_state.first_too_new_vote_slot(),
             );
             return;
         }
@@ -4473,8 +5461,6 @@ impl SessionProcessor {
             Vote::Notarize(v) => v.slot,
             Vote::Finalize(v) => v.slot,
             Vote::Skip(v) => v.slot,
-            Vote::NotarizeFallback(v) => v.slot,
-            Vote::SkipFallback(v) => v.slot,
         };
 
         log::trace!(
@@ -4487,9 +5473,21 @@ impl SessionProcessor {
         );
 
         match tl_kind {
-            "notarize" => self.votes_in_notarize_counter.increment(1),
-            "finalize" => self.votes_in_finalize_counter.increment(1),
-            "skip" => self.votes_in_skip_counter.increment(1),
+            "notarize" => {
+                self.votes_in_total_counter.increment(1);
+                self.votes_in_notarize_counter.increment(1);
+                self.votes_in_notarize_total = self.votes_in_notarize_total.saturating_add(1);
+            }
+            "finalize" => {
+                self.votes_in_total_counter.increment(1);
+                self.votes_in_finalize_counter.increment(1);
+                self.votes_in_finalize_total = self.votes_in_finalize_total.saturating_add(1);
+            }
+            "skip" => {
+                self.votes_in_total_counter.increment(1);
+                self.votes_in_skip_counter.increment(1);
+                self.votes_in_skip_total = self.votes_in_skip_total.saturating_add(1);
+            }
             _ => {}
         }
 
@@ -4708,17 +5706,6 @@ impl SessionProcessor {
             return;
         }
 
-        // Reject far-future slots before signature verification (DoS protection)
-        if self.simplex_state.is_slot_too_far_ahead(tl_slot) {
-            log::warn!(
-                "Session {} on_certificate: REJECTED - slot {tl_slot} too far ahead \
-                (max={}) kind={tl_kind} from source_idx={source_idx}",
-                &self.session_id().to_hex_string()[..8],
-                self.simplex_state.max_acceptable_slot(),
-            );
-            return;
-        }
-
         // Parse and verify the certificate (C++ strict policy)
         // Certificate::from_tl performs comprehensive validation:
         // - Rejects invalid validator indices
@@ -4843,7 +5830,7 @@ impl SessionProcessor {
                             cert.signatures.len(),
                         );
                         // NOTE: SimplexState emits:
-                        // - BlockFinalized (commit trigger) and
+                        // - BlockFinalized (finalization trigger) and
                         // - FinalizationReached (standstill caching)
                         // when the cert is stored. SessionProcessor handles those in event handlers.
                     }
@@ -4900,14 +5887,6 @@ impl SessionProcessor {
                         );
                     }
                 }
-            }
-            _ => {
-                log::warn!(
-                    "Session {} on_certificate: REJECTED - unexpected vote type: {:?}",
-                    self.session_id().to_hex_string(),
-                    cert.vote
-                );
-                return;
             }
         }
 
@@ -5021,14 +6000,32 @@ impl SessionProcessor {
 
         let sender_idx = ValidatorIndex::new(source_idx);
         let slot = SlotIndex::new(slot);
+        let is_broadcast_candidate = notar_cert.is_none();
+        let is_local_self_candidate =
+            is_broadcast_candidate && sender_idx == self.description.get_self_idx();
+        self.record_candidate_ingress(sender_idx, is_broadcast_candidate);
 
         // Reject far-future slots (DoS protection) — before any signature verification
         if self.simplex_state.is_slot_too_far_ahead(slot) {
+            if is_broadcast_candidate {
+                self.candidate_precheck_future_slot_drop_counter.increment(1);
+            }
+            if is_local_self_candidate {
+                self.note_generated_candidate_validation_missed_for_slot(
+                    slot,
+                    format!(
+                        "candidate_precheck_too_far_ahead max_acceptable_slot={}",
+                        self.simplex_state.max_acceptable_slot()
+                    ),
+                );
+            }
             log::warn!(
-                "Session {} on_candidate_received: REJECTED - slot {} too far ahead (max={})",
+                "Session {} on_candidate_received: REJECTED precheck_drop_reason=too_far_ahead \
+                slot={} max={} origin={}",
                 &self.session_id().to_hex_string()[..8],
                 slot,
                 self.simplex_state.max_acceptable_slot(),
+                if is_broadcast_candidate { "broadcast" } else { "query" },
             );
             return;
         }
@@ -5057,6 +6054,51 @@ impl SessionProcessor {
             return;
         }
 
+        if is_broadcast_candidate && sender_idx != leader_idx {
+            self.candidate_precheck_unexpected_sender_drop_counter.increment(1);
+            log::warn!(
+                "Session {} on_candidate_received: REJECTED \
+                precheck_drop_reason=unexpected_sender \
+                slot={} leader={} sender={} origin=broadcast",
+                &self.session_id().to_hex_string()[..8],
+                slot,
+                leader_idx,
+                sender_idx
+            );
+            return;
+        }
+
+        // Broadcast path must reject stale slots eagerly to avoid stale-body/db churn.
+        let fsm_first_non_finalized_slot = self.simplex_state.get_first_non_finalized_slot();
+        if slot < fsm_first_non_finalized_slot {
+            if is_broadcast_candidate {
+                self.candidate_precheck_old_slot_drop_counter.increment(1);
+                if is_local_self_candidate {
+                    self.note_generated_candidate_validation_missed_for_slot(
+                        slot,
+                        format!(
+                            "candidate_precheck_old_slot first_non_finalized_slot={fsm_first_non_finalized_slot}"
+                        ),
+                    );
+                }
+                log::warn!(
+                    "Session {} on_candidate_received: REJECTED precheck_drop_reason=old_slot \
+                    slot={} first_non_finalized={} origin=broadcast",
+                    &self.session_id().to_hex_string()[..8],
+                    slot,
+                    fsm_first_non_finalized_slot
+                );
+                return;
+            }
+
+            log::trace!(
+                "Session {} on_candidate_received: old slot received {} (current={}) origin=query",
+                self.session_id().to_hex_string(),
+                slot,
+                fsm_first_non_finalized_slot,
+            );
+        }
+
         // Get leader public key for signature verification
         let leader_key = self.description.get_source_public_key(leader_idx).clone();
 
@@ -5076,6 +6118,12 @@ impl SessionProcessor {
         ) {
             Ok(c) => c,
             Err(e) => {
+                if is_local_self_candidate {
+                    self.note_generated_candidate_validation_missed_for_slot(
+                        slot,
+                        format!("candidate_deserialization_failed error={e}"),
+                    );
+                }
                 log::warn!(
                     "Session {} on_candidate_received: failed to deserialize candidate from \
                     sender={}, leader={}, slot={}: {}",
@@ -5103,22 +6151,10 @@ impl SessionProcessor {
             leader_idx
         );
 
-        // 4. Validate slot is reasonable
-        // Use FSM's finalization cursor to reject candidates from old slots.
-        let fsm_first_non_finalized_slot = self.simplex_state.get_first_non_finalized_slot();
-        if slot < fsm_first_non_finalized_slot {
-            log::trace!(
-                "Session {} on_candidate_received: old slot received {} (current={})",
-                self.session_id().to_hex_string(),
-                slot,
-                fsm_first_non_finalized_slot,
-            );
-        }
-
         // 5. Candidates can be received via relay or requestCandidate (query response),
         // so the sender can differ from the slot leader. The signature is verified against
         // the leader's key above, so a mismatch here is not an error.
-        if sender_idx != leader_idx {
+        if sender_idx != leader_idx && !is_broadcast_candidate {
             log::trace!(
                 "Session {} on_candidate_received: received leader candidate via relay/query: \
                 slot={slot} leader={leader_idx} sender={sender_idx}",
@@ -5135,6 +6171,38 @@ impl SessionProcessor {
             slot,
             candidate_id.slot
         );
+
+        if is_broadcast_candidate {
+            match self.seen_broadcast_candidates.get(&slot).cloned() {
+                Some(existing) if existing != candidate_id => {
+                    self.candidate_precheck_conflicting_slot_drop_counter.increment(1);
+                    if is_local_self_candidate {
+                        self.note_generated_candidate_validation_missed(
+                            &candidate_id,
+                            format!(
+                                "candidate_precheck_conflicting_slot first_seen_slot_hash={}:{}",
+                                existing.slot,
+                                &existing.hash.to_hex_string()[..8]
+                            ),
+                        );
+                    }
+                    log::warn!(
+                        "Session {} on_candidate_received: REJECTED \
+                        precheck_drop_reason=conflicting_slot_candidate \
+                        slot={} first_seen={:?} new_candidate={:?} origin=broadcast",
+                        &self.session_id().to_hex_string()[..8],
+                        slot,
+                        existing,
+                        candidate_id
+                    );
+                    return;
+                }
+                Some(_) => {}
+                None => {
+                    self.seen_broadcast_candidates.insert(slot, candidate_id.clone());
+                }
+            }
+        }
 
         // Check if candidate already known.
         // A finalized-boundary stub (seeded by handle_block_finalized with empty data) is NOT
@@ -5161,19 +6229,17 @@ impl SessionProcessor {
             // already have the candidate body (e.g., we missed the certificate broadcast).
             // Do NOT drop notar_cert in this case, otherwise the node can get permanently stuck
             // waiting for NotarCert while repeatedly receiving bodies.
-            let had_any_cert = notar_cert.is_some();
             if let Some(ref cert_bytes) = notar_cert {
                 self.process_received_notar_cert(slot, &id_hash, cert_bytes);
             }
-            if had_any_cert {
-                self.try_commit_finalized_chains();
+            if notar_cert.is_some() {
                 self.check_all();
             }
             return;
         }
 
         // 7. Store candidate in received_candidates for finalization (even if not validated)
-        // This allows us to commit blocks that are finalized before validation completes
+        // This allows us to accept blocks that are finalized before validation completes
         // Reference: validator-session/src/session_processor.rs set_block_candidate
         let receive_time = self.now();
         let block_id = raw_candidate.block.block_id();
@@ -5223,27 +6289,33 @@ impl SessionProcessor {
                     // while the parent slot is from the Simplex FSM. These can legitimately diverge when:
                     // 1. The FSM parent is an older notarized block
                     // 2. The collator's chain has more finalized blocks
-                    // Seqno validation is still performed at commit time in commit_single_block.
+                    // Seqno validation is deferred until finalized state is materialized.
                     log::debug!(
                         "Session {} on_candidate_received: seqno differs from parent-based \
                         expectation for slot={slot}, received seqno={received_seqno}, \
                         expected={expected_seqno} (parent_seqno={parent_seqno}, \
-                        is_empty={is_empty}). Allowing through - will validate at commit.",
+                        is_empty={is_empty}). Allowing through - finalized path will resolve it.",
                         &self.session_id().to_hex_string()[..8],
                     );
                 }
             }
             // If parent not yet received, we can't validate seqno - allow it through
-            // Validation will happen during commit
+            // Validation will happen when finalized state is applied.
         } else {
             // No parent (first block in epoch) - seqno is based on the session's initial_block_seqno
             // which may be > 1 if this is not the first session (e.g., after zerostate, seqno=1, but
             // subsequent sessions continue from their start seqno).
-            // We don't validate first block seqno at receive time - defer to commit time.
+            // We don't validate first block seqno at receive time - defer to finalized application.
 
             // INVARIANT: First block (no parent) cannot be empty
             // Empty blocks inherit parent's BlockIdExt, so they require a parent
             if is_empty {
+                if is_local_self_candidate {
+                    self.note_generated_candidate_validation_missed(
+                        &candidate_id,
+                        "first_block_cannot_be_empty",
+                    );
+                }
                 log::warn!(
                     "Session {} on_candidate_received: INVARIANT VIOLATION - first block (slot={}) \
                     cannot be empty (empty blocks require parent). Rejecting.",
@@ -5253,17 +6325,15 @@ impl SessionProcessor {
                 return;
             }
 
-            // INVARIANT: First block should be slot 0 (or first slot in epoch)
-            // If we receive a block without parent at slot > 0, it's suspicious
+            // Genesis-parent candidates at slot > 0 are normal in Simplex: when early
+            // slots are skipped, subsequent leaders produce blocks with parent_id=None.
             if slot.value() != 0 {
-                log::warn!(
-                    "Session {} on_candidate_received: unexpected no-parent block at slot={} \
-                    (expected slot 0 for first block). Allowing but logging.",
+                log::trace!(
+                    "Session {} on_candidate_received: genesis-parent block at slot={} \
+                    (early slots were skipped)",
                     &self.session_id().to_hex_string()[..8],
                     slot
                 );
-                // Note: We allow this through because in some edge cases (session restart,
-                // fork recovery) the first block might not be at slot 0
             }
 
             log::debug!(
@@ -5275,7 +6345,11 @@ impl SessionProcessor {
         }
 
         // Extract actual block data from RawCandidate (not the TL wrapper)
-        // This is what on_block_committed callback expects
+        // This is what validation/finalization callbacks consume.
+        let gen_utime_ms = raw_candidate
+            .block
+            .as_block()
+            .and_then(|block| extract_consensus_gen_utime_ms(&block.collated_data));
         let (block_data, collated_data) = match raw_candidate.block.as_block() {
             Some(block) => (
                 consensus_common::ConsensusCommonFactory::create_block_payload(block.data.clone()),
@@ -5290,15 +6364,19 @@ impl SessionProcessor {
             ),
         };
 
-        // Compute is_fully_resolved based on parent chain availability
         let parent_id = raw_candidate.parent_id.clone();
-        let is_fully_resolved = self.compute_is_fully_resolved(&parent_id);
 
         // Build CandidateHashData TL bytes for signature verification
         // This is the data that was hashed to produce candidate_id_hash
         let candidate_hash_data_bytes = if is_empty {
             // Empty blocks use candidateHashDataEmpty with CandidateId parent
             let Some(parent) = parent_id.as_ref() else {
+                if is_local_self_candidate {
+                    self.note_generated_candidate_validation_missed(
+                        &candidate_id,
+                        "empty_candidate_missing_parent",
+                    );
+                }
                 log::error!(
                     "Session {} on_candidate_received: empty block must have parent",
                     &self.session_id().to_hex_string()[..8]
@@ -5323,12 +6401,14 @@ impl SessionProcessor {
             )
         };
 
+        let parent_metadata_present =
+            parent_id.as_ref().is_none_or(|parent| self.received_candidates.contains_key(parent));
         log::trace!(
-            "Session {} on_candidate_received: slot={} parent={:?} is_fully_resolved={}",
+            "Session {} on_candidate_received: slot={} parent={:?} parent_metadata_present={}",
             self.session_id().to_hex_string(),
             slot,
             parent_id.as_ref().map(|p| p.slot),
-            is_fully_resolved,
+            parent_metadata_present,
         );
 
         // Clone data needed for DB save before moving into ReceivedCandidate
@@ -5347,10 +6427,10 @@ impl SessionProcessor {
                 file_hash,
                 data: block_data,
                 collated_data,
+                gen_utime_ms,
                 receive_time,
                 is_empty,
                 parent_id: parent_id.clone(),
-                is_fully_resolved,
             },
         );
 
@@ -5366,10 +6446,19 @@ impl SessionProcessor {
         // Remove from requested_candidates if we were waiting for this
         self.requested_candidates.remove(&candidate_id);
 
+        // Delayed finalized delivery:
+        // if FinalCert arrived earlier and body has just appeared, emit now.
+        let pending_finalized_event =
+            self.finalized_pending_body.get(&candidate_id).map(|entry| entry.event.clone());
+        if let Some(event) = pending_finalized_event {
+            self.maybe_emit_out_of_order_finalized(&candidate_id, &event);
+            self.maybe_apply_finalized_state(&candidate_id);
+        }
+
         // DEBUG: Short pattern for quick grep (RECV = candidate received)
         log::debug!(
             "Session {} RECV candidate: slot={slot}, hash={}, seqno={received_seqno}, \
-            from=v{:03}, empty={is_empty}, resolved={is_fully_resolved}",
+            from=v{:03}, empty={is_empty}, parent_metadata_present={parent_metadata_present}",
             &self.session_id().to_hex_string()[..8],
             &id_hash.to_hex_string()[..8],
             leader_idx,
@@ -5377,74 +6466,33 @@ impl SessionProcessor {
         // TRACE: Method name pattern for detailed tracking
         log::trace!(
             "Session {} on_candidate_received: slot={slot}, hash={}, seqno={received_seqno}, \
-            source={leader_idx}, empty={is_empty}, parent={:?}, resolved={is_fully_resolved}",
+            source={leader_idx}, empty={is_empty}, parent={:?}, parent_metadata_present={parent_metadata_present}",
             self.session_id().to_hex_string(),
             id_hash.to_hex_string(),
             parent_id.as_ref().map(|p| format!("{}:{}", p.slot, p.hash.to_hex_string())),
         );
 
         // 8. Process notarization/finalization signature-sets if provided (from query response)
-        // This can be done immediately, regardless of parent resolution status
+        // This can be done immediately, regardless of parent-metadata availability.
         // Clone id_hash before use for certificates
         let id_hash_for_cert = id_hash.clone();
         if let Some(ref cert_bytes) = notar_cert {
             self.process_received_notar_cert(slot, &id_hash_for_cert, cert_bytes);
         }
 
-        // 9. Update resolution cache for dependent candidates
-        self.update_resolution_cache_chain(&candidate_id);
-
-        // 10. Try to resolve any candidates waiting for this one as their parent
-        self.try_resolve_waiting_candidates(&candidate_id);
-
-        // 11. Register candidate based on resolution status
-        if is_fully_resolved {
-            // Candidate is fully resolved - register for validation
-            log::trace!(
-                "Session {} on_candidate_received: registering fully resolved candidate \
-                slot={slot} id={:?}",
-                self.session_id().to_hex_string(),
-                id_hash,
+        // 9. Admit the candidate immediately; check_validation() owns the remaining
+        // WaitForParent gate and, for empties, waits until the expected normal tip can be
+        // reconstructed from locally known parent metadata.
+        if !parent_metadata_present {
+            log::debug!(
+                "Session {} on_candidate_received: slot={} hash={} is missing parent metadata, \
+                but ingress no longer parks candidates behind a simplex-local resolution queue",
+                &self.session_id().to_hex_string()[..8],
+                slot,
+                &id_hash.to_hex_string()[..8],
             );
-
-            // Optimistic validation: candidates with non-committed (notarized-only) parents
-            // are accepted and forwarded to check_validation(), which validates them as soon
-            // as the parent slot is notarized in the FSM. No committed-head gating.
-            if let Some(ref p) = parent_id {
-                let parent_is_committed = self
-                    .last_committed_block_id
-                    .as_ref()
-                    .and_then(|committed| {
-                        self.received_candidates.get(p).map(|r| &r.block_id == committed)
-                    })
-                    .unwrap_or(false);
-
-                if !parent_is_committed {
-                    log::debug!(
-                        "Session {} on_candidate_received: candidate slot={} hash={} has \
-                        non-committed parent (slot={}), will validate optimistically.",
-                        &self.session_id().to_hex_string()[..8],
-                        slot,
-                        &id_hash.to_hex_string()[..8],
-                        p.slot
-                    );
-                }
-            }
-
-            self.register_resolved_candidate(raw_candidate, slot, leader_idx, receive_time);
-        } else {
-            // Candidate's parent chain is not fully resolved - queue for parent resolution
-            log::trace!(
-                "Session {} on_candidate_received: queueing candidate slot={slot} for parent \
-                resolution",
-                self.session_id().to_hex_string(),
-            );
-            self.queue_for_parent_resolution(raw_candidate, slot, leader_idx, receive_time);
         }
-
-        // Try to commit any finalized chains that may have become ready
-        // (body arrival can make finalized blocks commit-ready)
-        self.try_commit_finalized_chains();
+        self.register_candidate_for_validation(raw_candidate, slot, leader_idx, receive_time);
 
         // Immediately process the new candidate (don't wait for next awake)
         self.check_all();
@@ -5523,7 +6571,7 @@ impl SessionProcessor {
                         // and SessionProcessor handles DB persistence + receiver cache updates there.
                         //
                         // For old slots, SimplexState intentionally avoids emitting events,
-                        // but we still persist the cert for restart/recommit support.
+                        // but we still persist the cert for restart recovery.
                         if slot < first_non_finalized_slot {
                             let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
                             if !self.notar_cert_store_results.contains_key(&candidate_id) {
@@ -5570,111 +6618,6 @@ impl SessionProcessor {
         }
     }
 
-    /// Process finalization certificate signature-set received from query response
-    ///
-    /// Deserializes, verifies, and stores the FinalCert in SimplexState.
-    ///
-    /// Expects serialized boxed `voteSignatureSet` (same wire format as `candidateAndCert.notar`).
-    fn process_received_final_cert(
-        &mut self,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-        final_cert_bytes: &[u8],
-    ) {
-        log::trace!(
-            "Session {} process_received_final_cert: slot={} hash={} bytes={}",
-            &self.session_id().to_hex_string()[..8],
-            slot,
-            &block_hash.to_hex_string()[..8],
-            final_cert_bytes.len()
-        );
-
-        // Deserialize VoteSignatureSet
-        let tl_sigs = match deserialize_boxed(final_cert_bytes) {
-            Ok(msg) => match msg.downcast::<VoteSignatureSetBoxed>() {
-                Ok(sigs) => sigs,
-                Err(_) => {
-                    log::warn!(
-                        "Session {} process_received_final_cert: unexpected type, expected \
-                        VoteSignatureSet for slot={slot} hash={}",
-                        &self.session_id().to_hex_string()[..8],
-                        &block_hash.to_hex_string()[..8],
-                    );
-                    return;
-                }
-            },
-            Err(e) => {
-                log::warn!(
-                    "Session {} process_received_final_cert: failed to deserialize \
-                    VoteSignatureSet for slot={slot} hash={}: {e}",
-                    &self.session_id().to_hex_string()[..8],
-                    &block_hash.to_hex_string()[..8],
-                );
-                return;
-            }
-        };
-
-        // Verify and build certificate (matches C++ FinalCert::from_tl signature path)
-        match self.verify_final_cert_from_vote_signature_set(slot, block_hash, &tl_sigs) {
-            Ok(final_cert_ptr) => {
-                log::trace!(
-                    "Session {} process_received_final_cert: verified final cert for slot={slot} \
-                    hash={} with {} sigs",
-                    &self.session_id().to_hex_string()[..8],
-                    &block_hash.to_hex_string()[..8],
-                    final_cert_ptr.signatures.len(),
-                );
-
-                let store_result = self.simplex_state.set_finalize_certificate(
-                    &self.description,
-                    slot,
-                    block_hash,
-                    final_cert_ptr.clone(),
-                );
-
-                if let Err(e) = store_result {
-                    log::warn!(
-                        "Session {} process_received_final_cert: final cert conflict slot={slot} \
-                        hash={}: {e}",
-                        &self.session_id().to_hex_string()[..8],
-                        &block_hash.to_hex_string()[..8],
-                    );
-                    return;
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "Session {} process_received_final_cert: invalid final cert for slot={slot} \
-                    hash={}: {e}",
-                    &self.session_id().to_hex_string()[..8],
-                    &block_hash.to_hex_string()[..8],
-                );
-            }
-        }
-    }
-
-    /// Verify finalization certificate from a `VoteSignatureSet` received via the
-    /// committed-proof recovery flow (`get_committed_candidate`).
-    ///
-    /// Reference: C++ FinalCert::from_tl(voteSignatureSet&&, vote, bus)
-    fn verify_final_cert_from_vote_signature_set(
-        &self,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-        tl_sigs: &VoteSignatureSetBoxed,
-    ) -> Result<crate::certificate::FinalCertPtr> {
-        let vote = crate::simplex_state::FinalizeVote { slot, block_hash: block_hash.clone() };
-
-        let cert = crate::certificate::FinalCert::from_tl_signatures(
-            tl_sigs,
-            vote,
-            &self.description,
-            &self.session_id(),
-        )?;
-
-        Ok(Arc::new(cert))
-    }
-
     /// Verify notarization certificate from VoteSignatureSet (C++ wire format)
     ///
     /// Parse VoteSignatureSet and verify signatures.
@@ -5706,6 +6649,7 @@ impl SessionProcessor {
         &mut self,
         active_weight: ValidatorWeight,
         last_activity: Vec<Option<SystemTime>>,
+        snapshot: crate::receiver::ReceiverActivitySnapshot,
     ) {
         if self.active_weight != active_weight {
             log::debug!(
@@ -5720,49 +6664,57 @@ impl SessionProcessor {
             self.active_weight_gauge.set(active_weight as f64);
         }
         self.last_activity = last_activity;
+        self.last_receiver_snapshot = Some(snapshot);
+    }
+
+    pub fn on_standstill_trigger(&mut self, notification: StandstillTriggerNotification) {
+        log::warn!("{}", self.build_standstill_trigger_log(&notification));
+    }
+
+    fn build_standstill_trigger_log(&self, notification: &StandstillTriggerNotification) -> String {
+        let mut result = format!(
+            "Session {}: Standstill detected, re-broadcasting \
+            {} certs + {} votes (range [{}, {})). Current pool state:\n",
+            &self.session_id().to_hex_string()[..8],
+            notification.cert_count,
+            notification.vote_count,
+            notification.begin,
+            notification.end,
+        );
+        result.push_str(&self.simplex_state.standstill_diagnostic_dump(&self.description));
+        result
+    }
+
+    fn sync_standstill_slots_from_state(&self) {
+        let (begin, end) = self.simplex_state.get_tracked_slots_interval();
+        let progress = self.simplex_state.get_first_non_progressed_slot().value();
+        self.receiver.set_ingress_slot_begin(begin);
+        self.receiver.set_ingress_progress_slot(progress);
+        self.receiver.set_standstill_slots(begin, end);
     }
 
     /*
         ========================================================================
-        Recursive Parent Resolution
+        Empty Parent Tip Metadata
 
         Reference: C++ consensus.cpp get_resolved_candidate, get_resolved_candidate_inner
         Reference: C++ candidate-resolver.cpp resolve_candidate_inner
         Reference: C++ pool.cpp maybe_resolve_request
 
-        When a candidate is received, we check if its parent chain is fully
-        resolved (all parents available in received_candidates). If not, we
-        queue the candidate for parent resolution and request the missing parent.
-        When a parent arrives, we process all waiting candidates recursively.
+        Non-empty candidates enter `pending_validations` immediately after ingress
+        and rely on strict `WaitForParent` plus validator-side state resolution.
+        Simplex only keeps the minimal metadata walk needed to resolve the
+        expected normal tip for empty candidates when parent metadata is not yet
+        present locally.
         ========================================================================
     */
 
-    /// Compute whether a candidate's parent chain is fully resolved
+    /// Find the first missing metadata record needed to resolve an empty
+    /// candidate's expected normal tip.
     ///
-    /// A candidate is fully resolved if:
-    /// - It has no parent (genesis/first in epoch), OR
-    /// - Its parent exists in received_candidates AND parent.is_fully_resolved == true
-    ///
-    /// This function does NOT modify state - it just checks the current status.
-    fn compute_is_fully_resolved(&self, parent_id: &Option<crate::block::RawCandidateId>) -> bool {
-        match parent_id {
-            None => true, // No parent = genesis/first in epoch = fully resolved
-            Some(parent) => {
-                match self.received_candidates.get(parent) {
-                    None => false, // Parent not yet received
-                    Some(parent_received) => parent_received.is_fully_resolved,
-                }
-            }
-        }
-    }
-
-    /// Find the first missing parent in a candidate's parent chain
-    ///
-    /// Walks up the parent chain until finding a parent that is not in received_candidates.
-    /// Returns None if all parents are available (candidate is fully resolved).
-    ///
-    /// Uses MAX_CHAIN_DEPTH to prevent infinite loops on malformed data.
-    fn find_first_missing_parent(
+    /// We only walk through empty ancestors; a non-empty parent already defines
+    /// the normal tip we need for the C++ `event->state->as_normal()` check.
+    fn find_first_missing_parent_metadata(
         &self,
         candidate: &RawCandidate,
     ) -> Option<crate::block::RawCandidateId> {
@@ -5773,254 +6725,75 @@ impl SessionProcessor {
             depth += 1;
             if depth > MAX_CHAIN_DEPTH {
                 log::error!(
-                    "Session {} find_first_missing_parent: exceeded \
+                    "Session {} find_first_missing_parent_metadata: exceeded \
                     MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH} for candidate slot={}",
                     self.session_id().to_hex_string(),
                     candidate.id.slot,
                 );
                 self.increment_error();
-                return None; // Treat as resolved to avoid infinite loops
+                return None;
             }
 
-            match self.received_candidates.get(&parent_id) {
-                None => {
-                    // This parent is missing - return it
-                    log::trace!(
-                        "Session {} find_first_missing_parent: missing parent slot={} hash={} for \
-                        candidate slot={}",
-                        self.session_id().to_hex_string(),
-                        parent_id.slot,
-                        &parent_id.hash.to_hex_string()[..8],
-                        candidate.id.slot,
-                    );
-                    return Some(parent_id);
-                }
-                Some(parent_received) => {
-                    if !parent_received.is_fully_resolved {
-                        // Parent exists but is not fully resolved - find ITS missing parent
-                        current_parent = parent_received.parent_id.clone();
-                    } else {
-                        // Parent is fully resolved - we're done
-                        return None;
-                    }
-                }
+            let Some(parent_received) = self.received_candidates.get(&parent_id) else {
+                log::trace!(
+                    "Session {} find_first_missing_parent_metadata: missing parent slot={} hash={} \
+                    for candidate slot={}",
+                    self.session_id().to_hex_string(),
+                    parent_id.slot,
+                    &parent_id.hash.to_hex_string()[..8],
+                    candidate.id.slot,
+                );
+                return Some(parent_id);
+            };
+
+            if !parent_received.is_empty {
+                return None;
             }
+
+            current_parent = parent_received.parent_id.clone();
         }
 
-        // No missing parent found
         None
     }
 
-    /// Queue a candidate for parent resolution
+    /// Ensure an empty candidate can resolve the expected normal tip before approval.
     ///
-    /// Called when a candidate is received but its parent chain is not fully resolved.
-    /// The candidate is stored in pending_parent_resolutions and a request for the
-    /// missing parent is scheduled.
-    fn queue_for_parent_resolution(
+    /// Unlike the old simplex-local waiting queue, this is an on-demand check in the
+    /// validation path: if metadata is missing, we request the next missing parent and
+    /// keep the candidate in `pending_validations`.
+    fn ensure_empty_parent_tip_ready(
         &mut self,
-        raw_candidate: RawCandidate,
+        raw_candidate: &RawCandidate,
         slot: SlotIndex,
-        source_idx: ValidatorIndex,
-        receive_time: SystemTime,
-    ) {
-        // Find the first missing parent in the chain
-        let missing_parent = match self.find_first_missing_parent(&raw_candidate) {
-            Some(p) => p,
-            None => {
-                // No missing parent - shouldn't happen if caller checked is_fully_resolved
-                log::trace!(
-                    "Session {} queue_for_parent_resolution: no missing parent for slot={slot} \
-                    but was queued",
-                    self.session_id().to_hex_string(),
-                );
-                return;
-            }
-        };
+    ) -> bool {
+        if self.resolve_parent_normal_tip(raw_candidate).is_some() {
+            return true;
+        }
 
-        log::trace!(
-            "Session {} queue_for_parent_resolution: queuing slot={slot} waiting for parent \
-            slot={} hash={}",
-            self.session_id().to_hex_string(),
-            missing_parent.slot,
-            &missing_parent.hash.to_hex_string()[..8],
-        );
-
-        let key = missing_parent.clone();
-        let pending = PendingParentResolution { raw_candidate, slot, source_idx, receive_time };
-
-        self.pending_parent_resolutions.entry(key).or_default().push(pending);
-
-        // Request the missing parent immediately (no delay). Parent-cascade requests are
-        // catch-up traffic: the candidate was already produced long ago and won't arrive
-        // via broadcast, so the 1-second CANDIDATE_REQUEST_DELAY only adds latency.
-        self.request_candidate(missing_parent.slot, missing_parent.hash, Some(Duration::ZERO));
-    }
-
-    /// Update the `is_fully_resolved` cache for a specific candidate and its descendants.
-    ///
-    /// A candidate is keyed by `RawCandidateId` (slot, candidate_id_hash).
-    /// This must be called when:
-    /// - a candidate is inserted into `received_candidates`, OR
-    /// - a parent candidate's resolution status may have changed.
-    fn update_resolution_cache_chain(&mut self, id: &RawCandidateId) {
-        // NOTE: This used to be recursive; on single-host nets we can receive an old missing parent
-        // late (after hundreds of descendants already exist), which produced deep recursion warnings
-        // and risks stack overflow. Keep the semantics but do it iteratively.
-        let session_id_hex = self.session_id().to_hex_string();
-        let mut stack: Vec<(RawCandidateId, u32)> = vec![(id.clone(), 0)];
-        let mut visited: HashSet<RawCandidateId> = HashSet::new();
-        let mut max_depth_seen: u32 = 0;
-
-        while let Some((cur_id, depth)) = stack.pop() {
-            max_depth_seen = max_depth_seen.max(depth);
-
+        if let Some(missing_parent) = self.find_first_missing_parent_metadata(raw_candidate) {
             log::trace!(
-                "Session {} update_resolution_cache_chain: slot={} hash={} depth={}",
-                &session_id_hex,
-                cur_id.slot,
-                &cur_id.hash.to_hex_string()[..8],
-                depth,
-            );
-
-            if depth >= MAX_CHAIN_DEPTH {
-                log::error!(
-                    "Session {} update_resolution_cache_chain: exceeded \
-                    MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH} slot={} hash={}, aborting",
-                    &session_id_hex,
-                    cur_id.slot,
-                    &cur_id.hash.to_hex_string()[..8],
-                );
-                self.increment_error();
-                continue;
-            }
-
-            if !visited.insert(cur_id.clone()) {
-                continue;
-            }
-
-            // Compute resolution status for this exact candidate (identified by RawCandidateId).
-            let is_resolved = match self.received_candidates.get(&cur_id) {
-                Some(candidate) => self.compute_is_fully_resolved(&candidate.parent_id),
-                None => continue,
-            };
-
-            // Update the is_fully_resolved flag if it changed.
-            if let Some(candidate) = self.received_candidates.get_mut(&cur_id) {
-                if candidate.is_fully_resolved != is_resolved {
-                    let old_resolved = candidate.is_fully_resolved;
-                    candidate.is_fully_resolved = is_resolved;
-                    log::trace!(
-                        "Session {} update_resolution_cache_chain: slot={} hash={} \
-                        is_fully_resolved: {old_resolved} -> {is_resolved}",
-                        &session_id_hex,
-                        candidate.slot,
-                        &cur_id.hash.to_hex_string()[..8],
-                    );
-                }
-            }
-
-            // If this candidate is now resolved, update descendants that depend on it.
-            if is_resolved {
-                // Collect dependent candidate keys first to avoid borrow conflicts.
-                let mut dependent_keys: Vec<RawCandidateId> = Vec::new();
-                for (child_id, child) in &self.received_candidates {
-                    if let Some(parent) = &child.parent_id {
-                        if parent == &cur_id {
-                            dependent_keys.push(child_id.clone());
-                        }
-                    }
-                }
-
-                for child_id in dependent_keys {
-                    stack.push((child_id, depth + 1));
-                }
-            }
-        }
-
-        // Still report unusually deep chains (informational), but avoid spamming WARNs.
-        if max_depth_seen >= DEEP_RECURSION_WARNING_THRESHOLD {
-            log::debug!(
-                "Session {} update_resolution_cache_chain: deep dependency chain \
-                depth={max_depth_seen} start_slot={} start_hash={}",
-                &session_id_hex,
-                id.slot,
-                &id.hash.to_hex_string()[..8],
-            );
-        }
-    }
-
-    /// Process all candidates waiting for a specific parent
-    ///
-    /// Called when a parent candidate arrives. Takes all waiting candidates
-    /// from pending_parent_resolutions and processes them.
-    fn try_resolve_waiting_candidates(&mut self, parent_id: &RawCandidateId) {
-        // Take all waiting candidates (removes from map)
-        let waiting = match self.pending_parent_resolutions.remove(parent_id) {
-            Some(v) => v,
-            None => return, // No candidates waiting for this parent
-        };
-
-        log::trace!(
-            "Session {} try_resolve_waiting_candidates: {} candidates waiting for parent s{}:{}",
-            self.session_id().to_hex_string(),
-            waiting.len(),
-            parent_id.slot,
-            &parent_id.hash.to_hex_string()[..8],
-        );
-
-        // Process each waiting candidate
-        for pending in waiting {
-            self.process_candidate_with_resolved_parent(pending);
-        }
-    }
-
-    /// Process a candidate whose parent just arrived
-    ///
-    /// Re-checks resolution status and either registers the candidate
-    /// (if fully resolved) or re-queues it (if still waiting for a grandparent).
-    fn process_candidate_with_resolved_parent(&mut self, pending: PendingParentResolution) {
-        // Update resolution cache for this candidate
-        self.update_resolution_cache_chain(&pending.raw_candidate.id);
-
-        // Check if the candidate is now fully resolved
-        let is_resolved = self.compute_is_fully_resolved(&pending.raw_candidate.parent_id);
-
-        if is_resolved {
-            log::trace!(
-                "Session {} process_candidate_with_resolved_parent: candidate slot={} is now \
-                fully resolved",
+                "Session {} ensure_empty_parent_tip_ready: requesting missing parent metadata \
+                slot={} hash={} for empty candidate slot={}",
                 self.session_id().to_hex_string(),
-                pending.slot,
+                missing_parent.slot,
+                &missing_parent.hash.to_hex_string()[..8],
+                slot,
             );
-            // Register as a resolved candidate
-            self.register_resolved_candidate(
-                pending.raw_candidate,
-                pending.slot,
-                pending.source_idx,
-                pending.receive_time,
-            );
+            self.request_candidate(missing_parent.slot, missing_parent.hash, Some(Duration::ZERO));
         } else {
             log::trace!(
-                "Session {} process_candidate_with_resolved_parent: candidate slot={} still \
-                waiting for grandparent",
+                "Session {} ensure_empty_parent_tip_ready: empty candidate slot={} is still \
+                waiting for the accepted normal head or restart-seeded parent metadata",
                 self.session_id().to_hex_string(),
-                pending.slot,
-            );
-            // Still has missing parents - re-queue
-            self.queue_for_parent_resolution(
-                pending.raw_candidate,
-                pending.slot,
-                pending.source_idx,
-                pending.receive_time,
+                slot,
             );
         }
+
+        false
     }
 
-    /// Register a fully resolved candidate for validation
-    ///
-    /// Called when a candidate's entire parent chain is available.
-    /// Adds the candidate to pending_validations and tracks latency metrics.
-    fn register_resolved_candidate(
+    /// Register a candidate for validation once it has been accepted at ingress.
+    fn register_candidate_for_validation(
         &mut self,
         raw_candidate: RawCandidate,
         slot: SlotIndex,
@@ -6036,27 +6809,15 @@ impl SessionProcessor {
             || self.rejected.contains(&candidate_id)
         {
             log::trace!(
-                "Session {} register_resolved_candidate: candidate already known: {:?}",
+                "Session {} register_candidate_for_validation: candidate already known: {:?}",
                 self.session_id().to_hex_string(),
                 candidate_id,
             );
             return;
         }
 
-        // Check if slot has already progressed (skip old candidates)
-        // Use FSM's progress cursor - anything less is already done
-        let fsm_first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
-        if slot < fsm_first_non_progressed_slot {
-            log::trace!(
-                "Session {} register_resolved_candidate: skipping old slot {slot} (fsm \
-                first_non_progressed_slot is {fsm_first_non_progressed_slot})",
-                self.session_id().to_hex_string(),
-            );
-            return;
-        }
-
         log::trace!(
-            "Session {} register_resolved_candidate: registering candidate slot={} hash={}",
+            "Session {} register_candidate_for_validation: registering candidate slot={} hash={}",
             self.session_id().to_hex_string(),
             slot,
             &candidate_id.hash.to_hex_string()[..8],
@@ -6068,8 +6829,7 @@ impl SessionProcessor {
             PendingValidation { raw_candidate, slot, receive_time, source_idx },
         );
 
-        // Track first candidate received in this slot (for latency metrics)
-        // Only track for fully resolved candidates in the current slot (progress cursor)
+        // Track first candidate received in this slot (for latency metrics).
         let first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
         if !self.slot_first_candidate_received(slot) && slot == first_non_progressed_slot {
             self.slot_set_first_candidate_received(slot, true);
@@ -6081,76 +6841,135 @@ impl SessionProcessor {
         }
     }
 
-    /// Check timeouts for pending parent resolutions
-    ///
-    /// Called from check_all(). Candidates waiting longer than MAX_PARENT_WAIT_TIME
-    /// are logged as errors and removed.
-    fn check_pending_parent_timeouts(&mut self) {
-        let now = self.now();
-        let mut timed_out_keys: Vec<RawCandidateId> = Vec::new();
-        let session_id = self.session_id().to_hex_string();
-
-        for (key, pending_list) in &self.pending_parent_resolutions {
-            for pending in pending_list {
-                if let Ok(elapsed) = now.duration_since(pending.receive_time) {
-                    if elapsed > MAX_PARENT_WAIT_TIME {
-                        log::error!(
-                            "Session {session_id} check_pending_parent_timeouts: candidate \
-                            slot={} timed out waiting for parent ({}s > {}s)",
-                            pending.slot,
-                            elapsed.as_secs(),
-                            MAX_PARENT_WAIT_TIME.as_secs(),
-                        );
-                        timed_out_keys.push(key.clone());
-                        break; // One timeout per key is enough to remove the whole list
-                    }
-                }
-            }
-        }
-
-        // Increment error count for timed out entries
-        let timeout_count = timed_out_keys.len();
-        for _ in 0..timeout_count {
-            self.increment_error();
-        }
-
-        // Remove timed out entries
-        for key in timed_out_keys {
-            self.pending_parent_resolutions.remove(&key);
-        }
-    }
-
     /*
         Validation processing
         Reference: validator-session/src/session_processor.rs try_approve_block, candidate_decision_*
     */
+
+    /// C++ `WaitForParent`-equivalent readiness check.
+    ///
+    /// Validates parent and skip-gap preconditions before the candidate can be sent
+    /// to higher-layer validation.
+    fn is_wait_for_parent_ready(&self, pending: &PendingValidation) -> bool {
+        let slot = pending.slot;
+        let first_non_finalized = self.simplex_state.get_first_non_finalized_slot();
+        let parent_id = pending.raw_candidate.parent_id.as_ref();
+
+        // C++ parity (pool.cpp maybe_resolve_request):
+        // next_slot_after_parent = parent.has_value() ? parent->slot + 1 : 0
+        let next_slot_after_parent = match parent_id {
+            Some(pid) => {
+                if pid.slot >= slot {
+                    return false;
+                }
+                pid.slot + 1
+            }
+            None => SlotIndex::new(0),
+        };
+
+        if slot < first_non_finalized {
+            return false;
+        }
+        if next_slot_after_parent < first_non_finalized {
+            return false;
+        }
+
+        // C++ parity (pool.cpp maybe_resolve_request):
+        // - if parent is at finalized boundary, it must match last finalized block;
+        // - otherwise parent slot must be notarized with the same candidate hash.
+        if next_slot_after_parent == first_non_finalized {
+            match parent_id {
+                None => {
+                    // Genesis parent at genesis boundary: both last_finalized and parent
+                    // are None. C++ invariant: first_nonfinalized==0 <=> !last_finalized.has_value(),
+                    // so when both are None they match and the check passes.
+                    if first_non_finalized.value() != 0 {
+                        return false;
+                    }
+                }
+                Some(pid) => {
+                    let Some((last_finalized_slot, final_cert)) =
+                        self.simplex_state.get_last_finalize_certificate()
+                    else {
+                        return false;
+                    };
+                    if last_finalized_slot != pid.slot || final_cert.vote.block_hash != pid.hash {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            // next_slot_after_parent > first_non_finalized, so parent must exist and be notarized.
+            // Genesis parent has next_slot_after_parent=0 which can't exceed first_non_finalized.
+            let Some(pid) = parent_id else {
+                return false;
+            };
+            let Some(notarized_hash) =
+                self.simplex_state.get_notarized_block_hash(&self.description, pid.slot)
+            else {
+                return false;
+            };
+            if notarized_hash != pid.hash {
+                return false;
+            }
+        }
+
+        if next_slot_after_parent == slot {
+            return true;
+        }
+
+        // All intermediate slots must have Skip certificates.
+        let mut gap_slot = next_slot_after_parent;
+        while gap_slot < slot {
+            if !self.simplex_state.has_skip_certificate_for_slot(&self.description, gap_slot) {
+                return false;
+            }
+            gap_slot += 1;
+        }
+
+        true
+    }
 
     /// Check pending validations and send to higher layer for validation
     ///
     /// Called from check_all(). Iterates all pending_validations and forwards
     /// each eligible candidate to the SessionListener via on_candidate().
     ///
-    /// Validates pending candidates whose parent slot has been notarized (or finalized)
-    /// in the FSM. Genesis candidates (no parent) are always eligible. This enables
-    /// optimistic validation on notarized-only parents (C++ parity).
+    /// Validates pending candidates whose parent chain is `WaitForParent`-ready in the FSM:
+    /// parent readiness + gap skip coverage (C++ parity).
     fn check_validation(&mut self) {
         check_execution_time!(10_000);
         instrument!();
+        let now = self.now();
 
         // Collect candidates to validate.
         // A candidate is eligible when:
-        // 1. It is fully resolved (parent chain data available — enforced by register_resolved_candidate).
-        // 2. Its parent slot is notarized (or finalized) in the FSM, OR it is a genesis candidate.
-        // 3. It is not already being validated, approved, or rejected.
+        // 1. It has been admitted into pending_validations.
+        // 2. Parent chain is C++ WaitForParent-ready (notar/final parent + gap skip coverage).
+        // 3. Empty candidates can resolve the expected `event->state->as_normal()` tip from
+        //    locally known metadata (requesting the next missing parent on demand if needed).
+        // 4. MC stale-parent protection is handled in validator-side candidate-native validation.
+        // 5. It is not already being validated, approved, or rejected.
         let mut to_validate: Vec<(RawCandidateId, SlotIndex, ValidatorIndex, SystemTime)> =
             Vec::new();
 
         let candidate_ids: Vec<RawCandidateId> = self.pending_validations.keys().cloned().collect();
         for candidate_id in candidate_ids {
-            let pending = match self.pending_validations.get(&candidate_id) {
-                Some(p) => p,
-                None => continue,
-            };
+            let (slot, source_idx, receive_time, raw_candidate, wait_for_parent_ready) =
+                match self.pending_validations.get(&candidate_id) {
+                    Some(p) => (
+                        p.slot,
+                        p.source_idx,
+                        p.receive_time,
+                        p.raw_candidate.clone(),
+                        self.is_wait_for_parent_ready(p),
+                    ),
+                    None => continue,
+                };
+
+            if !wait_for_parent_ready {
+                continue;
+            }
 
             // Skip if already being validated or decided
             if self.pending_approve.contains(&candidate_id) {
@@ -6175,57 +6994,69 @@ impl SessionProcessor {
                 }
             }
 
-            // Empty blocks skip ValidatorGroup validation but still need FSM-tip reference
-            // check (performed in try_approve_block). C++ block-validator.cpp rejects unless
-            // block == event->state->as_normal().
-            if pending.raw_candidate.block.is_empty() {
-                to_validate.push((
-                    candidate_id.clone(),
-                    pending.slot,
-                    pending.source_idx,
-                    pending.receive_time,
-                ));
-                continue;
-            }
-
-            // Non-empty block: parent slot must be notarized (or finalized) in the FSM.
-            // `is_fully_resolved` (checked before insertion into pending_validations) guarantees
-            // that parent chain data is available; this check confirms the parent reached consensus.
-            match pending.raw_candidate.parent_id.as_ref() {
-                None => {
-                    // Genesis/first-in-epoch: always eligible
-                }
-                Some(parent_id) => {
-                    if !self.simplex_state.has_notarized_block(parent_id.slot) {
-                        continue;
+            if !raw_candidate.block.is_empty() {
+                if let Some(parent_id) = raw_candidate.parent_id.as_ref() {
+                    let parent_info = crate::block::CandidateParentInfo {
+                        slot: parent_id.slot,
+                        hash: parent_id.hash.clone(),
+                    };
+                    if let Some(parent_gen_utime_ms) =
+                        self.resolve_parent_gen_utime_ms(&parent_info)
+                    {
+                        let earliest_validation_time = UNIX_EPOCH
+                            .checked_add(Duration::from_millis(parent_gen_utime_ms))
+                            .and_then(|parent_gen_time| {
+                                parent_gen_time
+                                    .checked_add(self.description.opts().min_block_interval)
+                            });
+                        let Some(earliest_validation_time) = earliest_validation_time else {
+                            log::warn!(
+                                "Session {} check_validation: invalid parent_gen_utime_ms {} for \
+                                parent slot {}",
+                                self.session_id().to_hex_string(),
+                                parent_gen_utime_ms,
+                                parent_info.slot,
+                            );
+                            continue;
+                        };
+                        if now < earliest_validation_time {
+                            self.set_next_awake_time(earliest_validation_time);
+                            continue;
+                        }
                     }
                 }
             }
 
-            to_validate.push((
-                candidate_id.clone(),
-                pending.slot,
-                pending.source_idx,
-                pending.receive_time,
-            ));
-        }
+            if raw_candidate.block.is_empty() {
+                if !self.ensure_empty_parent_tip_ready(&raw_candidate, slot) {
+                    continue;
+                }
 
+                to_validate.push((candidate_id.clone(), slot, source_idx, receive_time));
+                continue;
+            }
+
+            to_validate.push((candidate_id.clone(), slot, source_idx, receive_time));
+        }
         // Process each candidate
         for (candidate_id, slot, source_idx, receive_time) in to_validate {
             self.try_approve_block(&candidate_id, slot, source_idx, receive_time);
         }
     }
 
-    /// Resolve the expected referenced BlockIdExt for an empty candidate.
+    /// Resolve the parent-chain normal tip (`event->state->as_normal()` in C++).
     ///
     /// Walks the parent chain through `received_candidates` until a non-empty
-    /// ancestor is found. Returns its `block_id`, which is the C++ equivalent
-    /// of `event->state->as_normal()` in `block-validator.cpp`.
+    /// ancestor is found. For candidates without an explicit parent, falls back to the
+    /// exact accepted head when it is already known.
     ///
     /// Returns `None` if the parent chain is broken, missing, or contains
-    /// only empty ancestors (no normal tip exists).
-    fn resolve_expected_empty_block(&self, raw_candidate: &RawCandidate) -> Option<BlockIdExt> {
-        let parent_id = raw_candidate.parent_id.as_ref()?;
+    /// only empty ancestors and no exact accepted head is available.
+    fn resolve_parent_normal_tip(&self, raw_candidate: &RawCandidate) -> Option<BlockIdExt> {
+        let parent_id = match raw_candidate.parent_id.as_ref() {
+            Some(parent_id) => parent_id,
+            None => return self.accepted_normal_head_block_id.clone(),
+        };
         let parent = self.received_candidates.get(parent_id)?;
         if !parent.is_empty {
             return Some(parent.block_id.clone());
@@ -6270,6 +7101,7 @@ impl SessionProcessor {
             .entry(candidate_id.clone())
             .and_modify(|c| *c += 1)
             .or_insert(0);
+        self.mark_generated_candidate_validation_started(candidate_id);
 
         // Get pending validation (now safe to borrow after mutable operations)
         let Some(pending) = self.pending_validations.get(candidate_id) else {
@@ -6283,10 +7115,11 @@ impl SessionProcessor {
 
         // Handle empty blocks: C++ block-validator.cpp rejects unless the referenced
         // block equals event->state->as_normal(). We resolve the expected block from
-        // the parent chain and compare before approving.
+        // the parent chain and compare before approving; if metadata is still missing,
+        // the candidate stays pending and waits for the next repair round.
         if pending.raw_candidate.block.is_empty() {
             let referenced_block = pending.raw_candidate.block.block_id().clone();
-            let expected = self.resolve_expected_empty_block(&pending.raw_candidate);
+            let expected = self.resolve_parent_normal_tip(&pending.raw_candidate);
             let cid = candidate_id.clone();
 
             match expected {
@@ -6315,16 +7148,21 @@ impl SessionProcessor {
                     );
                 }
                 None => {
-                    log::warn!(
-                        "Session {} try_approve_block: empty block REJECTED — cannot resolve \
-                        parent normal tip for {:?}",
+                    if let Some(missing_parent) =
+                        self.find_first_missing_parent_metadata(&pending.raw_candidate)
+                    {
+                        self.request_candidate(
+                            missing_parent.slot,
+                            missing_parent.hash,
+                            Some(Duration::ZERO),
+                        );
+                    }
+                    self.pending_approve.remove(candidate_id);
+                    log::trace!(
+                        "Session {} try_approve_block: empty block still waiting for parent \
+                        normal tip for {:?}",
                         self.session_id().to_hex_string(),
                         cid,
-                    );
-                    self.candidate_decision_fail(
-                        slot,
-                        cid,
-                        error!("Cannot resolve parent normal tip for empty candidate"),
                     );
                 }
             }
@@ -6461,24 +7299,33 @@ impl SessionProcessor {
         // has round gating; in roundless Simplex we gate by "still pending").
         if !self.pending_validations.contains_key(&candidate_id) {
             self.validation_late_callback_counter.increment(1);
+            self.note_generated_candidate_validation_missed(
+                &candidate_id,
+                "validation_late_callback_without_pending_entry",
+            );
             self.pending_approve.remove(&candidate_id);
             self.validation_attempt_map.remove(&candidate_id);
             return;
         }
 
-        // If the block is already committed by the time validation completes, drop the result.
-        // (We might have advanced quickly while validation was queued in the higher layer.)
-        if let (Some(committed_seqno), Some(cand_seqno)) = (
-            self.last_committed_seqno,
+        // If the block is already finalized by the time validation completes, drop the result.
+        if let (Some(finalized_seqno), Some(cand_seqno)) = (
+            self.finalized_head_seqno,
             self.pending_validations
                 .get(&candidate_id)
                 .and_then(|p| p.raw_candidate.block.as_block().map(|b| b.id.seq_no)),
         ) {
-            if cand_seqno <= committed_seqno {
+            if cand_seqno <= finalized_seqno {
+                self.note_generated_candidate_validation_missed(
+                    &candidate_id,
+                    format!(
+                        "validation_succeeded_after_finalization finalized_seqno={finalized_seqno} cand_seqno={cand_seqno}"
+                    ),
+                );
                 log::warn!(
                     "Session {} candidate_decision_ok: slot={slot}, hash={:?}, \
-                    committed_seqno={committed_seqno}, cand_seqno={cand_seqno} (drop because \
-                    new block is already committed)",
+                    finalized_seqno={finalized_seqno}, cand_seqno={cand_seqno} (drop because \
+                    block is already finalized)",
                     self.session_id().to_hex_string(),
                     candidate_id,
                 );
@@ -6492,7 +7339,7 @@ impl SessionProcessor {
         self.candidate_decision_ok_internal(candidate_id, slot, receive_time);
 
         // Wake immediately so check_all() runs in the very next main-loop iteration
-        self.set_next_awake_time(self.now());
+        self.wake_now();
     }
 
     /// Internal helper for successful validation (used by both normal and empty block paths)
@@ -6505,10 +7352,14 @@ impl SessionProcessor {
         // Remove from pending_approve
         self.pending_approve.remove(&candidate_id);
 
-        // Get and remove from pending_validations (INT-2: per-slot state)
+        // Get and remove from pending_validations (per-slot state)
         let pending = match self.pending_validations.remove(&candidate_id) {
             Some(p) => p,
             None => {
+                self.note_generated_candidate_validation_missed(
+                    &candidate_id,
+                    "validation_success_missing_pending_entry",
+                );
                 log::warn!(
                     "Session {} candidate_decision_ok_internal: no pending validation for {:?}",
                     self.session_id().to_hex_string(),
@@ -6544,6 +7395,10 @@ impl SessionProcessor {
         let candidate = match pending.raw_candidate.resolve(None) {
             Ok(c) => c,
             Err(e) => {
+                self.note_generated_candidate_validation_missed(
+                    &candidate_id,
+                    format!("validation_success_resolve_failed error={e}"),
+                );
                 log::warn!(
                     "Session {} candidate_decision_ok: failed to resolve candidate: {}",
                     self.session_id().to_hex_string(),
@@ -6552,6 +7407,8 @@ impl SessionProcessor {
                 return;
             }
         };
+
+        self.mark_generated_candidate_validation_succeeded(&candidate_id);
 
         // Mark as approved
         self.approved.insert(
@@ -6584,25 +7441,35 @@ impl SessionProcessor {
         // has round gating; in roundless Simplex we gate by "still pending").
         if !self.pending_validations.contains_key(&candidate_id) {
             self.validation_late_callback_counter.increment(1);
+            self.note_generated_candidate_validation_missed(
+                &candidate_id,
+                "validation_fail_late_callback_without_pending_entry",
+            );
             self.pending_approve.remove(&candidate_id);
             self.validation_attempt_map.remove(&candidate_id);
             return;
         }
 
-        // If the block is already committed by the time validation fails, drop it without retries.
-        if let (Some(committed_seqno), Some(cand_seqno)) = (
-            self.last_committed_seqno,
+        // If the block is already finalized by the time validation fails, drop it without retries.
+        if let (Some(finalized_seqno), Some(cand_seqno)) = (
+            self.finalized_head_seqno,
             self.pending_validations
                 .get(&candidate_id)
                 .and_then(|p| p.raw_candidate.block.as_block().map(|b| b.id.seq_no)),
         ) {
             log::warn!(
                 "Session {} candidate_decision_fail: slot={slot}, hash={:?}, \
-                committed_seqno={committed_seqno}, cand_seqno={cand_seqno} (drop)",
+                finalized_seqno={finalized_seqno}, cand_seqno={cand_seqno} (drop)",
                 self.session_id().to_hex_string(),
                 candidate_id,
             );
-            if cand_seqno <= committed_seqno {
+            if cand_seqno <= finalized_seqno {
+                self.note_generated_candidate_validation_missed(
+                    &candidate_id,
+                    format!(
+                        "validation_failed_after_finalization finalized_seqno={finalized_seqno} cand_seqno={cand_seqno}"
+                    ),
+                );
                 self.pending_approve.remove(&candidate_id);
                 self.pending_validations.remove(&candidate_id);
                 self.validation_attempt_map.remove(&candidate_id);
@@ -6639,6 +7506,7 @@ impl SessionProcessor {
                         );
                         // Remove from pending_approve to allow re-validation
                         processor.pending_approve.remove(&candidate_id_copy);
+                        processor.wake_now();
                     },
                 );
 
@@ -6652,6 +7520,10 @@ impl SessionProcessor {
             slot,
             candidate_id,
             reason,
+        );
+        self.note_generated_candidate_validation_missed(
+            &candidate_id,
+            format!("validation_failed_final reason={reason}"),
         );
 
         // Remove from pending
@@ -6782,10 +7654,18 @@ impl SessionProcessor {
         log::trace!("Session {} broadcast_vote: {:?}", self.session_id().to_hex_string(), vote);
 
         match &vote {
-            Vote::Notarize(_) => self.votes_out_notarize_counter.increment(1),
-            Vote::Finalize(_) => self.votes_out_finalize_counter.increment(1),
-            Vote::Skip(_) => self.votes_out_skip_counter.increment(1),
-            _ => {}
+            Vote::Notarize(_) => {
+                self.votes_out_total_counter.increment(1);
+                self.votes_out_notarize_counter.increment(1);
+            }
+            Vote::Finalize(_) => {
+                self.votes_out_total_counter.increment(1);
+                self.votes_out_finalize_counter.increment(1);
+            }
+            Vote::Skip(_) => {
+                self.votes_out_total_counter.increment(1);
+                self.votes_out_skip_counter.increment(1);
+            }
         }
 
         // WaitCandidateInfoStored parity (C++ consensus.cpp):
@@ -6903,7 +7783,7 @@ impl SessionProcessor {
 
     /*
         Finalization Flow
-        Reference: validator-session/src/session_processor.rs notify_block_committed
+        Reference: Simplex finalized-driven delivery path
 
         ┌─────────────────────────────────────────────────────────────────────────────────┐
         │ Finalization Flow                                                               │
@@ -6912,10 +7792,10 @@ impl SessionProcessor {
         │      │                                                                          │
         │      ▼                                                                          │
         │  handle_block_finalized():                                                      │
-        │      ├── Collect finalization signatures from SimplexState vote accounting      │
-        │      ├── Create signature vectors for on_block_committed                        │
-        │      ├── notify_block_committed(source_info, root_hash, file_hash, ...)         │
-        │      └── Reset round state via reset_slot_state()                               │
+        │      ├── Record pending finalization if body is still missing                   │
+        │      ├── maybe_emit_out_of_order_finalized(...)                                 │
+        │      ├── maybe_apply_finalized_state(...)                                       │
+        │      └── Reset round state once finalized state is materialized                 │
         │                                                                                 │
         │  SimplexEvent::SlotSkipped(slot)                                                │
         │      │                                                                          │
@@ -6939,7 +7819,8 @@ impl SessionProcessor {
 
     /// Schedule a candidate request with delay if not already requested
     ///
-    /// Called by `try_commit_finalized_chains()` when a candidate body or NotarCert is missing.
+    /// Called when we need to repair missing candidate data after learning about a
+    /// finalized or otherwise required block before all body/notar data is present.
     /// Adds the (slot, hash) to `requested_candidates` and schedules a delayed action.
     /// After the delay, if the candidate is still not in `received_candidates`, requests
     /// it from peers (with want_notar=true to get NotarCert).
@@ -6952,7 +7833,7 @@ impl SessionProcessor {
     /// # Parameters
     /// - `initial_delay`: Optional delay before sending the request.
     ///   - `None`: Use default `CANDIDATE_REQUEST_DELAY` (allows broadcast to arrive first)
-    ///   - `Some(Duration::ZERO)`: Request immediately (for commit-critical recovery paths)
+    ///   - `Some(Duration::ZERO)`: Request immediately (for repair-critical paths)
     ///   - `Some(dur)`: Custom delay
     fn request_candidate(
         &mut self,
@@ -6963,6 +7844,17 @@ impl SessionProcessor {
         let delay = initial_delay.unwrap_or(CANDIDATE_REQUEST_DELAY);
 
         let key = RawCandidateId { slot, hash: block_hash.clone() };
+
+        if self.simplex_state.has_skip_certificate_for_slot(&self.description, slot) {
+            log::trace!(
+                "Session {} request_candidate: slot={} hash={} - skipped already, not requesting",
+                &self.session_id().to_hex_string()[..8],
+                slot,
+                &block_hash.to_hex_string()[..8],
+            );
+            self.requested_candidates.remove(&key);
+            return;
+        }
 
         // Throttle repeated requests for the same (slot,hash) to survive transient partitions.
         let now = self.now();
@@ -7017,6 +7909,28 @@ impl SessionProcessor {
 
             self.post_delayed_action(expiration_time, move |processor: &mut SessionProcessor| {
                 let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+                if !processor.requested_candidates.contains_key(&candidate_id) {
+                    log::trace!(
+                        "Session {} delayed_request_candidate: slot={slot} hash={} \
+                        - cancelled before send",
+                        &session_id.to_hex_string()[..8],
+                        &block_hash.to_hex_string()[..8],
+                    );
+                    return;
+                }
+                if processor
+                    .simplex_state
+                    .has_skip_certificate_for_slot(&processor.description, slot)
+                {
+                    log::trace!(
+                        "Session {} delayed_request_candidate: slot={slot} hash={} \
+                        - skipped before send",
+                        &session_id.to_hex_string()[..8],
+                        &block_hash.to_hex_string()[..8],
+                    );
+                    processor.requested_candidates.remove(&candidate_id);
+                    return;
+                }
                 let have_body = processor.has_real_candidate_body(&candidate_id);
                 let have_notar =
                     processor.simplex_state.get_notarize_certificate(slot, &block_hash).is_some();
@@ -7048,1455 +7962,30 @@ impl SessionProcessor {
         }
     }
 
-    /*
-        ========================================================================
-        Batch Finalization Support (C++ finalize_blocks pattern)
-        ========================================================================
+    fn cancel_candidate_repairs_for_slot(&mut self, slot: SlotIndex) {
+        let before = self.requested_candidates.len();
+        self.requested_candidates.retain(|candidate_id, _| candidate_id.slot != slot);
+        let removed_requests = before.saturating_sub(self.requested_candidates.len());
+        let removed_missing_body = self.missing_body_logged.remove(&slot.value());
 
-        When a block finalizes, we need to commit its entire parent chain.
-        C++ pattern: finalize_blocks() walks parent → grandparent → ... until
-        reaching an already-finalized block, then commits in reverse (oldest first).
+        self.receiver.cancel_candidate_requests_for_slot(slot.value());
 
-        - First (triggered) block uses FinalCert signatures
-        - Parent blocks use NotarCert signatures
-        - MC optimization: skip parent walk for masterchain
-    */
-
-    /// Collect a gapless commit chain from finalized block to committed head
-    ///
-    /// Walks from finalized block following parent_id pointers until reaching
-    /// the block that matches `last_committed_block_id`.
-    ///
-    /// # Algorithm
-    /// 1. For each block in the chain, verify body exists in `received_candidates`
-    /// 2. Stop when `received.block_id == last_committed_block_id`
-    /// 3. For non-triggered, non-empty blocks: verify NotarCert exists
-    /// 4. Return chain in commit order (oldest first)
-    ///
-    /// # Returns
-    /// - `Ready { chain }`: Chain is committable (all bodies + NotarCerts present)
-    /// - `AlreadyCommitted`: The finalized block is already the committed head
-    /// - `MissingCandidate { missing_id }`: Body or NotarCert missing, request from peers
-    ///
-    /// # Seqno gap handling
-    /// - **Non-masterchain**: if we successfully walk from finalized block to committed head via parent pointers,
-    ///   the chain is gapless by construction (each block's seqno = parent.seqno + 1 for non-empty).
-    /// - **Masterchain**: we do NOT allow committing non-empty parent blocks with NotarCert-only ("approve")
-    ///   signatures. If the finalized masterchain block's seqno is ahead of expected, we return
-    ///   `WaitingForFinalCert` instead of trying to fill gaps via approve-commits.
-    ///
-    /// # Reference
-    /// C++ `finalize_blocks_inner()` in consensus.cpp:
-    /// - Walks parent chain collecting candidates
-    /// - Uses NotarCert for non-triggered blocks
-    /// - Uses FinalCert for triggered block
-    fn collect_gapless_commit_chain(&self, finalized_id: &RawCandidateId) -> ChainCollectionResult {
-        let mut chain = Vec::new();
-        let mut current_id = finalized_id.clone();
-        let mut is_first = true;
-        let mut triggered_is_empty: Option<bool> = None;
-
-        // Track previous (child) block's seqno and empty status for invariant check
-        // We walk child -> parent, so we check: child.seqno = parent.seqno + 1 (non-empty) or = (empty)
-        let mut prev_child_seqno: Option<u32> = None;
-        let mut prev_child_is_empty: Option<bool> = None;
-
-        loop {
-            // 1. Check if body exists
-            let received = match self.received_candidates.get(&current_id) {
-                Some(r) => r,
-                None => {
-                    log::trace!(
-                        "Session {} collect_gapless_commit_chain: missing body for slot={} hash={}",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                        &current_id.hash.to_hex_string()[..8]
-                    );
-                    return ChainCollectionResult::MissingCandidate { missing_id: current_id };
-                }
-            };
-
-            // 1b. Finalized-boundary stub detection.
-            //
-            // Stubs are inserted by handle_block_finalized() for parent-resolution boundaries.
-            // They are not committable bodies.
-            //
-            // - Triggered block is a stub: treat as missing body and request it.
-            // - Non-triggered ancestor is a stub: stop walking (boundary reached).
-            if received.candidate_hash_data_bytes.is_empty() {
-                if is_first {
-                    log::debug!(
-                        "Session {} collect_gapless_commit_chain: triggered finalized block is \
-                        still a boundary stub, waiting for body: slot={} hash={}",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                        &current_id.hash.to_hex_string()[..8],
-                    );
-                    return ChainCollectionResult::MissingCandidate {
-                        missing_id: current_id.clone(),
-                    };
-                }
-
-                log::trace!(
-                    "Session {} collect_gapless_commit_chain: reached finalized boundary stub \
-                    at slot={}, stopping walk",
-                    &self.session_id().to_hex_string()[..8],
-                    current_id.slot,
-                );
-                break;
-            }
-
-            let current_seqno = received.block_id.seq_no;
-
-            if is_first && triggered_is_empty.is_none() {
-                triggered_is_empty = Some(received.is_empty);
-            }
-
-            // Late-finalization fast path (gremlin / out-of-order FinalCert delivery):
-            //
-            // It is possible to receive `BlockFinalizedEvent` for a block that is already behind
-            // the current committed head by seqno. This happens when:
-            // - we committed this block earlier as part of committing some finalized descendant, and
-            // - the FinalCert for this ancestor arrives later (or is observed later).
-            //
-            // In this case, walking parent_id pointers will never reach the committed head
-            // (because the committed head is a DESCENDANT), and we'll hit the session boundary
-            // (`parent_id == None`). C++ handles this via `finalized_blocks_[id].done` and returns;
-            // Rust should treat it as "already committed" and do nothing.
-            //
-            // NOTE: We only apply this check to the triggered finalized candidate (is_first),
-            // not to intermediate parents in the walk.
-            if is_first {
-                if let Some(committed_seqno) = self.last_committed_seqno {
-                    if current_seqno < committed_seqno {
-                        log::debug!(
-                            "Session {} collect_gapless_commit_chain: finalized candidate is \
-                            behind committed head, treating as already committed. \
-                            triggered_slot={} triggered_seqno={current_seqno} \
-                            committed_seqno={committed_seqno}",
-                            &self.session_id().to_hex_string()[..8],
-                            current_id.slot,
-                        );
-
-                        #[cfg(debug_assertions)]
-                        {
-                            // Debug-only safety: ensure this "old finalized" candidate is an ancestor of the
-                            // committed head in the candidate-parent chain. If not, it's a fork / inconsistency.
-                            if let Some(committed_slot) = self.last_committed_slot {
-                                let head_candidate_id = self
-                                    .finalized_blocks
-                                    .iter()
-                                    .find(|id| id.slot == committed_slot)
-                                    .cloned();
-
-                                if let Some(mut cursor) = head_candidate_id {
-                                    let mut depth: u32 = 0;
-                                    let mut found = false;
-
-                                    while depth < MAX_CHAIN_DEPTH {
-                                        if cursor == *finalized_id {
-                                            found = true;
-                                            break;
-                                        }
-                                        let Some(rcv) = self.received_candidates.get(&cursor)
-                                        else {
-                                            break;
-                                        };
-                                        let Some(parent) = &rcv.parent_id else {
-                                            break;
-                                        };
-                                        cursor = parent.clone();
-                                        depth += 1;
-                                    }
-
-                                    assert!(
-                                        found,
-                                        "Session {} CHAIN INVARIANT VIOLATION: finalized candidate is behind committed head \
-                                        (triggered_seqno={} < committed_seqno={}) but is NOT an ancestor of the committed head \
-                                        in candidate-parent chain. This indicates a fork or state inconsistency.",
-                                        &self.session_id().to_hex_string()[..8],
-                                        current_seqno,
-                                        committed_seqno
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "Session {} collect_gapless_commit_chain: debug ancestry \
-                                        check skipped (cannot locate committed head candidate for \
-                                        last_committed_slot={committed_slot})",
-                                        &self.session_id().to_hex_string()[..8],
-                                    );
-                                }
-                            }
-                        }
-
-                        return ChainCollectionResult::AlreadyCommitted;
-                    }
-                }
-            }
-
-            // 2. Check if we reached the committed head
-            //    KEY: Compare block_id, not membership in finalized_blocks set
-            if let Some(ref committed_block_id) = self.last_committed_block_id {
-                if &received.block_id == committed_block_id {
-                    log::trace!(
-                        "Session {} collect_gapless_commit_chain: reached committed head at \
-                        slot={} seqno={current_seqno}",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                    );
-
-                    // INVARIANT CHECK: verify child->parent seqno relationship with committed head
-                    if let (Some(child_seqno), Some(child_is_empty)) =
-                        (prev_child_seqno, prev_child_is_empty)
-                    {
-                        let expected_child_seqno = if child_is_empty {
-                            current_seqno // Empty: child.seqno = parent.seqno
-                        } else {
-                            current_seqno + 1 // Non-empty: child.seqno = parent.seqno + 1
-                        };
-
-                        assert!(
-                            child_seqno == expected_child_seqno,
-                            "Session {} SEQNO INVARIANT VIOLATION at committed head! \
-                            Child seqno={}, parent (committed head) seqno={}, child_is_empty={}, expected_child_seqno={}. \
-                            This indicates corrupted parent chain data - refusing to commit.",
-                            &self.session_id().to_hex_string()[..8],
-                            child_seqno,
-                            current_seqno,
-                            child_is_empty,
-                            expected_child_seqno
-                        );
-                    }
-
-                    break; // Don't include committed head in chain
-                }
-            }
-
-            // Masterchain parity (C++ consensus.cpp::finalize_blocks_inner):
-            //
-            // C++ has an early-return on MC when `maybe_final_cert` is null, which prevents
-            // committing notarized parents (create_simplex_approve) on masterchain. Only the
-            // finalized (FinalCert) target is committed on MC; parents are resolved only to
-            // obtain their ids.
-            //
-            // Rust equivalent: if the triggered finalized candidate is NON-empty on MC, commit
-            // only this single block (do not walk/commit parents).
-            //
-            // CRITICAL: We must verify seqno continuity BEFORE using this fast-path!
-            // If triggered_seqno > last_committed_seqno + 1, there are missing intermediate
-            // masterchain blocks. We must NOT commit any NotarCert-only ("approve") blocks on MC,
-            // so we wait for the missing FinalCert(s) instead.
-            if is_first && self.description.get_shard().is_masterchain() && !received.is_empty {
-                // Check seqno continuity from committed head
-                let expected_seqno = match self.last_committed_seqno {
-                    Some(prev) => prev + 1,
-                    None => self.description.get_initial_block_seqno(),
-                };
-
-                if current_seqno == expected_seqno {
-                    // Gapless - safe to use MC fast-path
-                    log::trace!(
-                        "Session {} collect_gapless_commit_chain: MC mode - non-empty triggered, \
-                        single commit for slot={} seqno={current_seqno}",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                    );
-                    return ChainCollectionResult::Ready {
-                        chain: vec![BlockToCommit {
-                            candidate_id: current_id,
-                            is_triggered_block: true,
-                        }],
-                    };
-                } else if current_seqno > expected_seqno {
-                    log::debug!(
-                        "Session {} collect_gapless_commit_chain: MC FINAL-ONLY invariant: \
-                        finalized block is ahead of committed head. Waiting for FinalCert of \
-                        expected seqno. triggered=s{}:{} triggered_seqno={current_seqno} \
-                        expected_seqno={expected_seqno} last_committed_seqno={:?}",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                        &current_id.hash.to_hex_string()[..8],
-                        self.last_committed_seqno,
-                    );
-                    return ChainCollectionResult::WaitingForFinalCert {
-                        expected_seqno,
-                        finalized_id: finalized_id.clone(),
-                        finalized_seqno: current_seqno,
-                    };
-                } else {
-                    // current_seqno < expected_seqno: This should be caught by late-finalization
-                    // fast path above. If we reach here, something is very wrong.
-                    log::warn!(
-                        "Session {} collect_gapless_commit_chain: MC unexpected seqno - \
-                        triggered_slot={} has seqno={current_seqno}, expected={expected_seqno}. \
-                        Should have been caught by late-finalization check.",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                    );
-                    // Fall through to normal flow
-                }
-            }
-
-            // 3. INVARIANT CHECK: verify child->parent seqno relationship
-            //    prev_child (if any) should have seqno = current_seqno + 1 (non-empty) or = current_seqno (empty)
-            if let (Some(child_seqno), Some(child_is_empty)) =
-                (prev_child_seqno, prev_child_is_empty)
-            {
-                let expected_child_seqno = if child_is_empty {
-                    current_seqno // Empty child: child.seqno = parent.seqno
-                } else {
-                    current_seqno + 1 // Non-empty child: child.seqno = parent.seqno + 1
-                };
-
-                assert!(
-                    child_seqno == expected_child_seqno,
-                    "Session {} SEQNO INVARIANT VIOLATION! \
-                    Child seqno={}, parent slot={} seqno={}, child_is_empty={}, expected_child_seqno={}. \
-                    This indicates corrupted parent chain data - refusing to commit.",
-                    &self.session_id().to_hex_string()[..8],
-                    child_seqno,
-                    current_id.slot,
-                    current_seqno,
-                    child_is_empty,
-                    expected_child_seqno
-                );
-            }
-
-            // 4. For non-triggered, non-empty blocks: verify NotarCert exists
-            //    (Triggered block uses FinalCert; empty blocks don't need signatures)
-            //
-            // Even on masterchain, if we decide to commit parent non-empty blocks (catch-up path),
-            // we must have a NotarCert to build a valid signature set for accept_block.
-            if !is_first && !received.is_empty {
-                if self
-                    .simplex_state
-                    .get_notarize_certificate(current_id.slot, &current_id.hash)
-                    .is_none()
-                {
-                    log::debug!(
-                        "Session {} collect_gapless_commit_chain: missing NotarCert for slot={} \
-                        hash={}",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                        &current_id.hash.to_hex_string()[..8],
-                    );
-                    // Request candidate (want_notar=true) to get NotarCert
-                    return ChainCollectionResult::MissingCandidate { missing_id: current_id };
-                }
-            }
-
-            // 5. Add to chain
+        if removed_requests > 0 || removed_missing_body {
             log::trace!(
-                "Session {} collect_gapless_commit_chain: adding slot={}, hash={}, \
-                seqno={current_seqno}, is_empty={}, is_triggered={is_first}",
-                &self.session_id().to_hex_string()[..8],
-                current_id.slot,
-                &current_id.hash.to_hex_string()[..8],
-                received.is_empty,
-            );
-            chain.push(BlockToCommit {
-                candidate_id: current_id.clone(),
-                is_triggered_block: is_first,
-            });
-            is_first = false;
-
-            // Remember this block's info for next iteration's invariant check
-            prev_child_seqno = Some(current_seqno);
-            prev_child_is_empty = Some(received.is_empty);
-
-            // Masterchain parity: if the triggered finalized candidate was empty, FinalCert is
-            // propagated through empties to the nearest non-empty ancestor. On MC we should not
-            // notar-commit further parents, so we stop after adding the first non-empty ancestor.
-            //
-            // CRITICAL: Before stopping, verify seqno continuity from the committed head!
-            // If this block's seqno doesn't directly follow last_committed_seqno, there are
-            // missing intermediate masterchain blocks. We must NOT commit NotarCert-only blocks on MC,
-            // so we wait for missing FinalCert(s) instead.
-            // This MC early-stop is ONLY for the "empty-triggered → nearest non-empty ancestor" case.
-            // For a non-empty triggered finalized block, we must be able to catch up under partitions
-            // by walking parents when there is a seqno gap.
-            if self.description.get_shard().is_masterchain()
-                && !received.is_empty
-                && triggered_is_empty == Some(true)
-            {
-                let expected_seqno = match self.last_committed_seqno {
-                    Some(prev) => prev + 1,
-                    None => self.description.get_initial_block_seqno(),
-                };
-
-                if current_seqno == expected_seqno {
-                    // Gapless - safe to stop parent walk
-                    log::trace!(
-                        "Session {} collect_gapless_commit_chain: MC mode - reached nearest \
-                        non-empty ancestor (gapless), stopping at slot={} seqno={current_seqno}",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                    );
-                    break;
-                } else if current_seqno > expected_seqno {
-                    log::debug!(
-                        "Session {} collect_gapless_commit_chain: MC FINAL-ONLY invariant: \
-                        empty-triggered FinalCert resolves to non-empty ancestor with seqno gap. \
-                        Waiting for FinalCert of expected seqno. triggered=s{}:{} ancestor=s{}:{} \
-                        ancestor_seqno={current_seqno} expected_seqno={expected_seqno} \
-                        last_committed_seqno={:?}",
-                        &self.session_id().to_hex_string()[..8],
-                        finalized_id.slot,
-                        &finalized_id.hash.to_hex_string()[..8],
-                        current_id.slot,
-                        &current_id.hash.to_hex_string()[..8],
-                        self.last_committed_seqno,
-                    );
-                    return ChainCollectionResult::WaitingForFinalCert {
-                        expected_seqno,
-                        finalized_id: finalized_id.clone(),
-                        finalized_seqno: current_seqno,
-                    };
-                } else {
-                    // current_seqno < expected_seqno: This block is older than committed head.
-                    // This should have been caught by the committed head check at the start.
-                    log::warn!(
-                        "Session {} collect_gapless_commit_chain: MC ancestor has seqno \
-                        {current_seqno} < expected {expected_seqno}. This should not happen.",
-                        &self.session_id().to_hex_string()[..8],
-                    );
-                    break;
-                }
-            }
-
-            // 6. Move to parent
-            match &received.parent_id {
-                Some(parent) => {
-                    log::trace!(
-                        "Session {} collect_gapless_commit_chain: moving to parent slot={}, \
-                        hash={}",
-                        &self.session_id().to_hex_string()[..8],
-                        parent.slot,
-                        &parent.hash.to_hex_string()[..8],
-                    );
-                    current_id = parent.clone();
-                }
-                None => {
-                    // Genesis/epoch start - verify seqno is initial
-                    let initial_seqno = self.description.get_initial_block_seqno();
-                    assert!(
-                        received.is_empty || current_seqno == initial_seqno,
-                        "Session {} SEQNO INVARIANT VIOLATION: genesis block has seqno={}, expected initial={}. \
-                        This indicates corrupted parent chain data - refusing to commit.",
-                        &self.session_id().to_hex_string()[..8],
-                        current_seqno,
-                        initial_seqno
-                    );
-
-                    assert!(
-                        self.last_committed_block_id.is_none(),
-                        "Session {} CHAIN INVARIANT VIOLATION: hit genesis but last_committed exists. \
-                        Expected to reach committed head via parent chain but reached genesis instead. \
-                        This indicates broken parent chain or state inconsistency - refusing to commit.",
-                        &self.session_id().to_hex_string()[..8]
-                    );
-
-                    // First block in session - OK to break
-                    log::trace!(
-                        "Session {} collect_gapless_commit_chain: slot={} has no parent \
-                        (genesis/epoch start)",
-                        &self.session_id().to_hex_string()[..8],
-                        current_id.slot,
-                    );
-                    break;
-                }
-            }
-        }
-
-        // Reverse to get commit order (oldest first)
-        chain.reverse();
-
-        if chain.is_empty() {
-            log::trace!(
-                "Session {} collect_gapless_commit_chain: finalized block is already committed",
+                "Session {} cancel_candidate_repairs_for_slot: slot={slot} \
+                removed_requests={removed_requests} removed_missing_body={removed_missing_body}",
                 &self.session_id().to_hex_string()[..8]
             );
-            ChainCollectionResult::AlreadyCommitted
-        } else {
-            log::trace!(
-                "Session {} collect_gapless_commit_chain: collected {} blocks for commit",
-                &self.session_id().to_hex_string()[..8],
-                chain.len()
-            );
-            ChainCollectionResult::Ready { chain }
         }
-    }
-
-    /// Commit a single block with seqno validation and proper signatures
-    ///
-    /// This function:
-    /// 1. Validates seqno == last_committed_seqno + 1 (panics on mismatch)
-    /// 2. Prepares signatures:
-    ///    - FinalCert for the committed block selected by `final_sig_target`
-    ///      (nearest non-empty ancestor when the finalized candidate is empty)
-    ///    - NotarCert for other non-empty blocks (create_simplex_approve)
-    /// 3. Marks slot outcome (Commit or Skip) for emission
-    /// 4. Round is derived from slot at emit time
-    ///
-    /// # Arguments
-    /// * `block_info` - Block to commit
-    /// * `triggered_event` - The original BlockFinalizedEvent (for triggered block's FinalCert)
-    ///
-    /// # Reference
-    /// C++ finalize_blocks():
-    /// - `is_first_block`: FinalCert → create_simplex
-    /// - else: NotarCert → create_simplex_approve
-    fn commit_single_block(
-        &mut self,
-        block_info: &BlockToCommit,
-        triggered_event: &BlockFinalizedEvent,
-        final_sig_target: Option<&RawCandidateId>,
-        final_sig_context: &(SlotIndex, Vec<u8>),
-    ) {
-        let candidate_id = block_info.candidate_id.clone();
-        let slot = candidate_id.slot;
-        let block_hash = &candidate_id.hash;
-
-        // Get received candidate data
-        let received = match self.received_candidates.get(&candidate_id) {
-            Some(r) => {
-                r.clone() // Clone to avoid borrow issues
-            }
-            None => {
-                // This should not happen if collect_parent_chain worked correctly
-                log::error!(
-                    "Session {} commit_single_block: CRITICAL - no received candidate for \
-                    slot={slot} hash={}",
-                    &self.session_id().to_hex_string()[..8],
-                    &block_hash.to_hex_string()[..8],
-                );
-                self.increment_error();
-                return;
-            }
-        };
-
-        let is_empty_block = received.is_empty;
-        let seqno = received.block_id.seq_no;
-
-        // Seqno validation: commits must be sequential by seqno on top of the committed head.
-        // This is a fundamental invariant (not a temporary limitation).
-        //
-        // NOTE: We intentionally do NOT derive expected seqno from `received.parent_id` here,
-        // because the parent candidate body may be missing even when the block is finalized
-        // by votes (network loss / out-of-order). Committed-chain tracking is the source of truth.
-        let expected_seqno_from_committed = match (is_empty_block, self.last_committed_seqno) {
-            (false, Some(prev)) => prev + 1,
-            (false, None) => self.description.get_initial_block_seqno(),
-            (true, Some(prev)) => prev, // empty block re-signs the committed head
-            (true, None) => {
-                // INVARIANT: first block cannot be empty
-                panic!(
-                    "Session {} INVARIANT VIOLATION: empty committed block has no parent at slot {}",
-                    self.session_id().to_hex_string(),
-                    slot
-                );
-            }
-        };
-
-        // STRICT SEQNO INVARIANT:
-        // collect_gapless_commit_chain() guarantees the chain is gapless from committed head.
-        // Any mismatch here indicates a bug in the chain collection algorithm.
-        assert!(
-            seqno == expected_seqno_from_committed,
-            "Session {} SEQNO INVARIANT VIOLATION in commit_single_block at slot={}. \
-            Block has seqno={}, expected={}. is_empty={}. \
-            This should never happen - collect_gapless_commit_chain() guarantees gapless chains.",
-            &self.session_id().to_hex_string()[..8],
-            slot,
-            seqno,
-            expected_seqno_from_committed,
-            is_empty_block
-        );
-
-        // Update committed seqno tracking:
-        // - non-empty blocks advance seqno to the actual seqno
-        // - empty blocks keep seqno unchanged
-        if !is_empty_block {
-            self.last_committed_seqno = Some(seqno);
-        }
-
-        // Track last committed slot for diagnostics/recovery.
-        self.last_committed_slot = Some(slot);
-
-        // Track the block id for the last finalized seqno.
-        // For empty blocks this is the re-signed parent block id (same as previous non-empty id).
-        self.last_committed_block_id = Some(received.block_id.clone());
-
-        // Extract and track before_split flag for split/merge handling
-        // C++ parity: C++ checks `is_before_split(prev_block_data)` in should_generate_empty_block()
-        // We extract it here during commit and cache it for the next collation decision.
-        if !is_empty_block {
-            // Only update for non-empty blocks (empty blocks re-use parent's BlockIdExt)
-            if let Ok(before_split) = crate::utils::extract_before_split_flag(received.data.data())
-            {
-                self.last_committed_before_split = before_split;
-                if before_split {
-                    log::info!(
-                        "Session {} commit_single_block: block at slot={slot} seqno={seqno} has \
-                        before_split=true (next block MUST be empty for split/merge)",
-                        &self.session_id().to_hex_string()[..8],
-                    );
-                }
-            } else {
-                // Failed to extract - log at trace level (expected in tests with dummy block data)
-                log::trace!(
-                    "Session {} commit_single_block: failed to extract before_split flag for \
-                    slot={slot}, assuming false",
-                    &self.session_id().to_hex_string()[..8],
-                );
-                self.last_committed_before_split = false;
-            }
-        }
-
-        // ===== Common state updates (for both empty and non-empty) =====
-
-        // Track as finalized
-        self.finalized_blocks.insert(candidate_id.clone());
-
-        log::trace!(
-            "Session {} commit_single_block: slot={}, seqno={}, is_triggered={}, is_empty={}",
-            &self.session_id().to_hex_string()[..8],
-            slot,
-            seqno,
-            block_info.is_triggered_block,
-            is_empty_block
-        );
-
-        // ===== Branch: empty vs non-empty block handling =====
-
-        // Persisted flag for `FinalizedBlockRecord::is_final` (C++ parity):
-        // - Non-empty: true iff this commit uses FinalCert signatures.
-        // - Empty: true iff FinalCert is active for this empty candidate (propagation case).
-        let record_is_final: bool;
-
-        if is_empty_block {
-            // Empty blocks inherit parent's BlockIdExt and should NOT trigger on_block_committed.
-            // C++ only commits non-empty blocks. No ValidatorGroup callback needed.
-
-            // C++ parity: empty finalized records store `is_final = maybe_final_cert.not_null()`.
-            // We approximate this using `final_sig_target`:
-            // - If there is a non-empty FinalCert target in this batch, FinalCert is active for
-            //   empties at/after that target slot.
-            // - If this batch contains no non-empty blocks (all empties until an already-finalized
-            //   ancestor), FinalCert is still considered active for these empties.
-            record_is_final = match final_sig_target {
-                Some(target) => slot >= target.slot,
-                None => true,
-            };
-
-            // DEBUG: Short pattern for quick grep (EMPTY = empty block processed)
-            log::debug!(
-                "Session {} EMPTY BLOCK: slot={}, seqno={} (no ValidatorGroup callback)",
-                &self.session_id().to_hex_string()[..8],
-                slot,
-                seqno,
-            );
-            // TRACE: Method name pattern for detailed tracking
-            log::trace!(
-                "Session {} commit_single_block: empty block slot={slot}, seqno={seqno}, hash={} \
-                - no on_block_committed",
-                self.session_id().to_hex_string(),
-                block_hash.to_hex_string(),
-            );
-        } else {
-            // Non-empty block: prepare signatures and call notify_block_committed directly
-
-            // Determine whether this committed non-empty block should carry FinalCert signatures.
-            //
-            // C++ parity:
-            // - If the finalized (triggered) candidate is non-empty, FinalCert applies to that candidate.
-            // - If the finalized candidate is empty, FinalCert is propagated through empties and applies
-            //   to the nearest non-empty ancestor that is being finalized in this batch.
-            // - Other non-empty blocks in the chain use NotarCert (create_simplex_approve).
-            let use_final_cert = final_sig_target.is_some_and(|id| id == &candidate_id);
-            record_is_final = use_final_cert;
-
-            // MASTERCHAIN INVARIANT (C++ parity):
-            // Masterchain blocks MUST be accepted only with final signatures (FinalCert).
-            // C++ AcceptBlockQuery rejects non-final signature sets on masterchain.
-            assert!(
-                !self.description.get_shard().is_masterchain() || use_final_cert,
-                "Session {} INVARIANT VIOLATION: masterchain non-empty commit without FinalCert (approve-only) is forbidden. \
-                slot={} seqno={} hash={} triggered={} final_sig_target={:?}",
-                &self.session_id().to_hex_string()[..8],
-                slot,
-                seqno,
-                &block_hash.to_hex_string()[..8],
-                block_info.is_triggered_block,
-                final_sig_target.map(|id| (id.slot, id.hash.to_hex_string()))
-            );
-
-            // Prepare signature sets.
-            // - FinalCert: primary signatures from FinalCert, approve_signatures from NotarCert (if any)
-            // - NotarCert: both sets from NotarCert (same as create_simplex_approve)
-            let (signatures, approve_signatures) = if use_final_cert {
-                self.prepare_triggered_block_signatures(triggered_event, slot, block_hash)
-            } else {
-                self.prepare_parent_block_signatures(slot, block_hash)
-            };
-
-            // Signature verification context:
-            // - For FinalCert commits: bind to the finalized candidate's (slot, hash_data)
-            // - For NotarCert commits: bind to this candidate's (slot, hash_data)
-            let (sig_slot, sig_candidate_hash_data_bytes) = if use_final_cert {
-                (final_sig_context.0, final_sig_context.1.clone())
-            } else {
-                (slot, received.candidate_hash_data_bytes.clone())
-            };
-
-            // Create source info with SIMPLEX_ROUNDLESS
-            let source_public_key =
-                self.description.get_source_public_key(received.source_idx).clone();
-            let source_info = crate::BlockSourceInfo {
-                source: source_public_key,
-                priority: BlockCandidatePriority {
-                    round: SIMPLEX_ROUNDLESS,
-                    first_block_round: SIMPLEX_ROUNDLESS,
-                    priority: 0,
-                },
-            };
-
-            // DEBUG: Short pattern for quick grep (COMMIT = block committed)
-            log::debug!(
-                "Session {} COMMIT: slot={}, seqno={}, hash={}, from=v{:03}, sigs={}, is_final={}",
-                &self.session_id().to_hex_string()[..8],
-                slot,
-                seqno,
-                &received.root_hash.to_hex_string()[..8],
-                received.source_idx,
-                signatures.len(),
-                use_final_cert,
-            );
-            // TRACE: Method name pattern for detailed tracking
-            log::trace!(
-                "Session {} commit_single_block: COMMIT at slot={slot}, seqno={seqno}, \
-                root_hash={}, file_hash={}, source={}, triggered={}, is_final={use_final_cert}",
-                self.session_id().to_hex_string(),
-                received.root_hash.to_hex_string(),
-                received.file_hash.to_hex_string(),
-                received.source_idx,
-                block_info.is_triggered_block,
-            );
-
-            let stats = self.build_session_stats();
-            self.notify_block_committed(
-                source_info,
-                received.root_hash.clone(),
-                received.file_hash.clone(),
-                received.data.clone(),
-                signatures,
-                approve_signatures,
-                sig_slot,
-                sig_candidate_hash_data_bytes,
-                use_final_cert,
-                stats,
-            );
-
-            // Increment commits counter
-            self.commits_counter.success();
-
-            // C++ parity: block-producer.cpp advances last_consensus_finalized_seqno_
-            // only on FinalizeBlock when is_final() is true. This is the Rust equivalent.
-            if use_final_cert {
-                let prev = self.last_consensus_finalized_seqno.unwrap_or(0);
-                if seqno > prev {
-                    self.last_consensus_finalized_seqno = Some(seqno);
-                    log::debug!(
-                        "Session {} commit_single_block: advanced last_consensus_finalized_seqno \
-                        {} -> {} (slot={}, is_final=true)",
-                        &self.session_id().to_hex_string()[..8],
-                        prev,
-                        seqno,
-                        slot
-                    );
-                }
-            }
-        }
-
-        // ===== Common finalization (for both empty and non-empty) =====
-        self.last_finalized_slot_gauge.set(slot.0 as f64);
-
-        // Reset stalled round debug timer on each slot processed
-        let now = self.now();
-        self.round_debug_at = now + ROUND_DEBUG_PERIOD;
-        self.last_commit_time = now;
-
-        // ===== Persist finalized block to database =====
-        // Reference: C++ consensus.cpp finalize_blocks()
-        // - Masterchain: co_await db->set(...) — blocking write
-        // - Non-masterchain: db->set(...).start().detach() — fire-and-forget
-        //
-        // C++ parity: for EMPTY candidates, C++ persists finalizedBlock records ONLY on non-masterchain
-        // (`else if (!owning_bus()->shard.is_masterchain()) { db->set(...).start().detach(); }`).
-        // On masterchain, empty finalized records are not persisted.
-        //
-        // IMPORTANT: On masterchain, since empty candidates are not persisted, persisted
-        // `finalizedBlock` records must form a contiguous parent chain across *persisted* blocks.
-        // If a non-empty block's consensus parent is an empty candidate, store the nearest
-        // non-empty ancestor as `parent` (skipping empty slots) to keep the DB chain consistent
-        // across restarts (matches C++ load_from_db chain filtering intent).
-        let record_parent = if self.description.get_shard().is_masterchain() && !is_empty_block {
-            let mut parent = received.parent_id.clone();
-            let mut hops = 0usize;
-            while let Some(pid) = parent.clone() {
-                // Safety: avoid pathological loops if state is corrupted.
-                if hops > MAX_DB_PARENT_WALK_HOPS {
-                    log::error!(
-                        "Session {} commit_block: exceeded parent walk limit while computing DB \
-                        parent for slot={}",
-                        &self.session_id().to_hex_string()[..8],
-                        slot.value(),
-                    );
-                    self.increment_error();
-                    break;
-                }
-                hops += 1;
-
-                match self.received_candidates.get(&pid) {
-                    Some(p) if p.is_empty => {
-                        parent = p.parent_id.clone();
-                    }
-                    _ => break,
-                }
-            }
-            parent
-        } else {
-            received.parent_id.clone()
-        };
-
-        let record = FinalizedBlockRecord {
-            candidate_id,
-            block_id: received.block_id.clone(),
-            parent: record_parent,
-            is_final: record_is_final,
-        };
-        if is_empty_block && self.description.get_shard().is_masterchain() {
-            // MC + empty: do not persist (C++ parity)
-            log::trace!(
-                "Session {} commit_block: skipping finalized block DB write for empty MC slot={} \
-                (C++ parity)",
-                &self.session_id().to_hex_string()[..8],
-                slot.value(),
-            );
-        } else if self.description.get_shard().is_masterchain() {
-            // Masterchain: blocking write (C++ co_await pattern)
-            log::trace!(
-                "Session {} commit_block: saving finalized block (MC, blocking) slot={}, \
-                is_final={}",
-                &self.session_id().to_hex_string()[..8],
-                slot.value(),
-                record.is_final,
-            );
-            match self.db.save_finalized_block_async(&record) {
-                Ok(result) => {
-                    if let Err(e) = result.wait() {
-                        log::error!(
-                            "Session {} commit_block: failed to store finalized block for \
-                            slot={}: {e}",
-                            &self.session_id().to_hex_string()[..8],
-                            slot.value(),
-                        );
-                        self.increment_error();
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        "Session {} commit_block: failed to create finalized block save for \
-                        slot={}: {e}",
-                        &self.session_id().to_hex_string()[..8],
-                        slot.value(),
-                    );
-                    self.increment_error();
-                }
-            }
-        } else {
-            // Non-masterchain: fire-and-forget (C++ .start().detach() pattern)
-            log::trace!(
-                "Session {} commit_block: saving finalized block (non-MC, fire-and-forget) \
-                slot={}, is_final={}",
-                &self.session_id().to_hex_string()[..8],
-                slot.value(),
-                record.is_final,
-            );
-            if let Err(e) = self.db.save_finalized_block(&record) {
-                log::error!(
-                    "Session {} commit_block: failed to store finalized block (non-MC) for \
-                    slot={}: {e}",
-                    &self.session_id().to_hex_string()[..8],
-                    slot.value(),
-                );
-                self.increment_error();
-            }
-        }
-    }
-
-    /// Prepare signatures for triggered (first) block using FinalCert
-    ///
-    /// Reference: C++ create_simplex() for first block
-    fn prepare_triggered_block_signatures(
-        &self,
-        event: &BlockFinalizedEvent,
-        _slot: SlotIndex,
-        _block_hash: &UInt256,
-    ) -> (
-        Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)>,
-        Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)>,
-    ) {
-        let certificate = &event.certificate;
-
-        // Finalize signatures from FinalCert
-        let signatures: Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)> = certificate
-            .signatures
-            .iter()
-            .map(|vote_sig| {
-                let public_key_hash =
-                    self.description.get_source_public_key_hash(vote_sig.validator_idx);
-                let signature = consensus_common::ConsensusCommonFactory::create_block_payload(
-                    vote_sig.signature.clone().into(),
-                );
-                (public_key_hash.clone(), signature)
-            })
-            .collect();
-
-        // Approve signatures from NotarCert (if available)
-        let approve_signatures = self.get_notarize_signatures(event.slot, &event.block_hash);
-
-        (signatures, approve_signatures)
-    }
-
-    /// Prepare signatures for parent block using NotarCert
-    ///
-    /// Reference: C++ create_simplex_approve() for parent blocks
-    fn prepare_parent_block_signatures(
-        &self,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-    ) -> (
-        Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)>,
-        Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)>,
-    ) {
-        // MASTERCHAIN INVARIANT:
-        // Parent-block "approve" signatures (NotarCert-only) must NEVER be used for masterchain commits.
-        assert!(
-            !self.description.get_shard().is_masterchain(),
-            "Session {} INVARIANT VIOLATION: attempted to prepare NotarCert-only signatures \
-            for masterchain slot={} hash={}. This corresponds to C++ create_simplex_approve(), which is forbidden on MC.",
-            &self.session_id().to_hex_string()[..8],
-            slot,
-            &block_hash.to_hex_string()[..8]
-        );
-        // For parent blocks, we use NotarCert for both signature sets
-        // (no finalization certificate available, only notarization)
-        let approve_signatures = self.get_notarize_signatures(slot, block_hash);
-
-        // Primary signatures are also from NotarCert for parent blocks
-        // Reference: C++ create_simplex_approve uses notarization signatures
-        (approve_signatures.clone(), approve_signatures)
-    }
-
-    /// Get notarization signatures for a block
-    fn get_notarize_signatures(
-        &self,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-    ) -> Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)> {
-        if let Some(notar_cert) = self.simplex_state.get_notarize_certificate(slot, block_hash) {
-            notar_cert
-                .signatures
-                .iter()
-                .map(|vote_sig| {
-                    let public_key_hash =
-                        self.description.get_source_public_key_hash(vote_sig.validator_idx);
-                    let signature = consensus_common::ConsensusCommonFactory::create_block_payload(
-                        vote_sig.signature.clone().into(),
-                    );
-                    (public_key_hash.clone(), signature)
-                })
-                .collect()
-        } else {
-            log::warn!(
-                "Session {} get_notarize_signatures: no NotarCert for slot={slot}, hash={} - \
-                using empty signatures",
-                &self.session_id().to_hex_string()[..8],
-                &block_hash.to_hex_string()[..8],
-            );
-            Vec::new()
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    /// Debug-only precheck: verify that committing this chain would satisfy the strict seqno invariant
-    ///
-    /// This produces clearer diagnostics BEFORE the invariant fires in commit_single_block().
-    /// Only enabled in debug builds (release builds skip this overhead).
-    fn debug_precheck_gapless_chain(&self, chain: &[BlockToCommit]) {
-        let mut expected_seqno = match self.last_committed_seqno {
-            Some(prev) => prev + 1,
-            None => self.description.get_initial_block_seqno(),
-        };
-
-        for (idx, block_info) in chain.iter().enumerate() {
-            let Some(received) = self.received_candidates.get(&block_info.candidate_id) else {
-                log::error!(
-                    "Session {} debug_precheck_gapless_chain: body must exist for candidate_id \
-                    slot={}",
-                    &self.description.get_session_id().to_hex_string()[..8],
-                    block_info.candidate_id.slot,
-                );
-                return;
-            };
-
-            let actual_seqno = received.block_id.seq_no;
-            let is_empty = received.is_empty;
-
-            if is_empty {
-                // Empty blocks keep same seqno
-                let expected_for_empty = expected_seqno.saturating_sub(1);
-                assert_eq!(
-                    actual_seqno, expected_for_empty,
-                    "debug_precheck: empty block at chain[{}] (slot={}) has seqno={}, expected={}",
-                    idx, block_info.candidate_id.slot, actual_seqno, expected_for_empty
-                );
-            } else {
-                // Non-empty blocks must match and advance
-                assert_eq!(
-                    actual_seqno, expected_seqno,
-                    "debug_precheck: non-empty block at chain[{}] (slot={}) has seqno={}, expected={}",
-                    idx, block_info.candidate_id.slot, actual_seqno, expected_seqno
-                );
-                expected_seqno = actual_seqno + 1;
-            }
-        }
-
-        log::trace!(
-            "Session {} debug_precheck_gapless_chain: verified {} blocks are gapless (seqno \
-            range: {} -> {})",
-            &self.session_id().to_hex_string()[..8],
-            chain.len(),
-            self.last_committed_seqno
-                .map(|s| s + 1)
-                .unwrap_or(self.description.get_initial_block_seqno()),
-            expected_seqno - 1,
-        );
-    }
-
-    /// Attempt to commit all finalized blocks that are now ready
-    ///
-    /// Called from two triggers:
-    /// - `handle_block_finalized()` after recording finalization
-    /// - `on_candidate_received()` after body arrival / resolution cache update
-    ///
-    /// For each finalized-but-uncommitted block, check if it's commit-ready:
-    /// - If ready: commit the chain and remove from journal
-    /// - If already committed: remove from journal
-    /// - If missing bodies/NotarCerts: request them and keep in journal
-    ///
-    /// This function is idempotent and safe to call multiple times.
-    fn try_commit_finalized_chains(&mut self) {
-        // Collect keys to process, sorted by (seqno, slot) for deterministic
-        // oldest-first commit ordering (avoid arbitrary HashMap iteration order).
-        let mut finalized_keys: Vec<RawCandidateId> =
-            self.finalized_journal_pending_commit.keys().cloned().collect();
-
-        if finalized_keys.is_empty() {
-            return;
-        }
-
-        finalized_keys.sort_unstable_by_key(|id| {
-            let seqno =
-                self.received_candidates.get(id).map(|r| r.block_id.seq_no).unwrap_or(u32::MAX);
-            (seqno, id.slot.0)
-        });
-
-        log::trace!(
-            "Session {} try_commit_finalized_chains: checking {} finalized blocks",
-            &self.session_id().to_hex_string()[..8],
-            finalized_keys.len()
-        );
-
-        let mut committed_keys = Vec::new();
-
-        for finalized_id in finalized_keys {
-            // Get the finalized entry (clone to avoid borrow conflicts)
-            let entry = match self.finalized_journal_pending_commit.get(&finalized_id) {
-                Some(e) => e.clone(),
-                None => continue, // Already removed (committed in this iteration)
-            };
-
-            // Collect gapless commit chain (new unified function)
-            match self.collect_gapless_commit_chain(&finalized_id) {
-                ChainCollectionResult::Ready { chain } => {
-                    log::debug!(
-                        "Session {} try_commit_finalized_chains: committing {} blocks \
-                        (triggered=s{}:{})",
-                        &self.session_id().to_hex_string()[..8],
-                        chain.len(),
-                        finalized_id.slot,
-                        &finalized_id.hash.to_hex_string()[..8],
-                    );
-
-                    // Optional: debug-only gapless precheck
-                    #[cfg(debug_assertions)]
-                    self.debug_precheck_gapless_chain(&chain);
-
-                    // Commit the chain
-                    self.commit_finalized_chain(&entry.event, chain);
-
-                    // Mark for removal from journal
-                    committed_keys.push(finalized_id);
-                }
-
-                ChainCollectionResult::AlreadyCommitted => {
-                    log::debug!(
-                        "Session {} try_commit_finalized_chains: s{}:{} already committed",
-                        &self.session_id().to_hex_string()[..8],
-                        finalized_id.slot,
-                        &finalized_id.hash.to_hex_string()[..8]
-                    );
-                    // Remove from journal
-                    committed_keys.push(finalized_id);
-                }
-
-                ChainCollectionResult::MissingCandidate { missing_id } => {
-                    if self.missing_body_logged.insert(missing_id.slot.0) {
-                        log::debug!(
-                            "Session {} try_commit_finalized_chains: s{}:{} waiting for s{}:{} \
-                            (body or NotarCert)",
-                            &self.session_id().to_hex_string()[..8],
-                            finalized_id.slot,
-                            &finalized_id.hash.to_hex_string()[..8],
-                            missing_id.slot,
-                            &missing_id.hash.to_hex_string()[..8],
-                        );
-                    }
-
-                    // Request the missing candidate (includes body + NotarCert with want_notar=true)
-                    self.request_candidate(missing_id.slot, missing_id.hash, None);
-
-                    // Keep in journal - will retry when candidate arrives
-                }
-
-                ChainCollectionResult::WaitingForFinalCert {
-                    expected_seqno,
-                    finalized_seqno,
-                    ..
-                } => {
-                    log::debug!(
-                        "Session {} try_commit_finalized_chains: MC waiting for FinalCert of \
-                        expected seqno={expected_seqno} (triggered=s{}:{} seqno={finalized_seqno} \
-                        last_committed_seqno={:?})",
-                        &self.session_id().to_hex_string()[..8],
-                        finalized_id.slot,
-                        &finalized_id.hash.to_hex_string()[..8],
-                        self.last_committed_seqno,
-                    );
-                    // Attempt to recover the missing FinalCert via get_committed_candidate.
-                    //
-                    // We must request FinalCert signatures for the *next committable* masterchain block
-                    // (seqno == expected_seqno). We locate it by walking the finalized block's parent
-                    // chain until we find a non-empty candidate with that seqno.
-                    //
-                    // NOTE: If we don't have bodies for some ancestors, we request them first (v1/v2),
-                    // and will retry on the next on_candidate_received() / retry tick.
-                    let mut cursor = finalized_id.clone();
-                    let mut depth: u32 = 0;
-
-                    loop {
-                        if depth >= MAX_CHAIN_DEPTH {
-                            log::warn!(
-                                "Session {} try_commit_finalized_chains: MC WaitingForFinalCert - \
-                                exceeded MAX_CHAIN_DEPTH while walking parents (triggered=s{}:{})",
-                                &self.session_id().to_hex_string()[..8],
-                                finalized_id.slot,
-                                &finalized_id.hash.to_hex_string()[..8],
-                            );
-                            break;
-                        }
-
-                        let Some(rcv) = self.received_candidates.get(&cursor) else {
-                            // Need body to know seqno; request it.
-                            log::debug!(
-                                "Session {} try_commit_finalized_chains: MC WaitingForFinalCert - \
-                                missing body for ancestor s{}:{}; requesting candidate",
-                                &self.session_id().to_hex_string()[..8],
-                                cursor.slot,
-                                &cursor.hash.to_hex_string()[..8],
-                            );
-                            // Commit-critical recovery: request immediately (skip initial 1s delay).
-                            self.request_candidate(
-                                cursor.slot,
-                                cursor.hash.clone(),
-                                Some(Duration::ZERO),
-                            );
-                            break;
-                        };
-
-                        if !rcv.is_empty && rcv.block_id.seq_no == expected_seqno {
-                            let have_final = self
-                                .simplex_state
-                                .get_finalize_certificate(cursor.slot, &cursor.hash)
-                                .is_some();
-
-                            if have_final {
-                                log::trace!(
-                                    "Session {} try_commit_finalized_chains: MC \
-                                    WaitingForFinalCert - already have FinalCert for expected \
-                                    seqno={expected_seqno} at s{}:{}",
-                                    &self.session_id().to_hex_string()[..8],
-                                    cursor.slot,
-                                    &cursor.hash.to_hex_string()[..8],
-                                );
-                                // MC gap recovery:
-                                // If we already obtained the missing FinalCert for the next committable
-                                // masterchain block (seqno == expected_seqno), commit it immediately.
-                                //
-                                // This preserves the C++ "final-only on masterchain" invariant while
-                                // allowing Rust to catch up under partitions by committing the missing
-                                // FinalCert block(s) before the triggered finalized block.
-                                if let Some(final_cert) = self
-                                    .simplex_state
-                                    .get_finalize_certificate(cursor.slot, &cursor.hash)
-                                {
-                                    let commit_target = cursor.clone();
-                                    match self.collect_gapless_commit_chain(&commit_target) {
-                                        ChainCollectionResult::Ready { chain } => {
-                                            log::debug!(
-                                                "Session {} try_commit_finalized_chains: MC gap \
-                                                recovery - committing expected \
-                                                seqno={expected_seqno} at s{}:{} (chain_len={})",
-                                                &self.session_id().to_hex_string()[..8],
-                                                commit_target.slot,
-                                                &commit_target.hash.to_hex_string()[..8],
-                                                chain.len(),
-                                            );
-                                            let synthetic_event = BlockFinalizedEvent {
-                                                slot: commit_target.slot,
-                                                block_hash: commit_target.hash.clone(),
-                                                block_id: None,
-                                                certificate: final_cert.clone(),
-                                            };
-                                            self.commit_finalized_chain(&synthetic_event, chain);
-                                        }
-                                        ChainCollectionResult::AlreadyCommitted => {
-                                            // Nothing to do.
-                                        }
-                                        ChainCollectionResult::MissingCandidate { missing_id } => {
-                                            // Should be rare (we just had body), but handle defensively.
-                                            self.request_candidate(
-                                                missing_id.slot,
-                                                missing_id.hash,
-                                                None,
-                                            );
-                                        }
-                                        ChainCollectionResult::WaitingForFinalCert {
-                                            expected_seqno: inner_expected_seqno,
-                                            finalized_id: inner_finalized_id,
-                                            finalized_seqno: inner_finalized_seqno,
-                                        } => {
-                                            log::error!(
-                                                "Session {} try_commit_finalized_chains: MC gap \
-                                                recovery invariant violated - \
-                                                collect_gapless_commit_chain returned \
-                                                WaitingForFinalCert for commit_target s{}:{} \
-                                                (seqno={inner_finalized_seqno}) \
-                                                outer_expected_seqno={expected_seqno} \
-                                                inner_expected_seqno={inner_expected_seqno} \
-                                                last_committed_seqno={:?}",
-                                                &self.session_id().to_hex_string()[..8],
-                                                inner_finalized_id.slot,
-                                                &inner_finalized_id.hash.to_hex_string()[..8],
-                                                self.last_committed_seqno,
-                                            );
-                                            self.increment_error();
-                                            debug_assert!(
-                                                false,
-                                                "MC gap recovery invariant violated: commit_target s{}:{} (seqno={}) \
-                                                 still reported as ahead of committed head (inner_expected_seqno={}, last_committed_seqno={:?})",
-                                                inner_finalized_id.slot,
-                                                &inner_finalized_id.hash.to_hex_string()[..8],
-                                                inner_finalized_seqno,
-                                                inner_expected_seqno,
-                                                self.last_committed_seqno,
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Request committed block proof from full node
-                                // (C++-compatible mechanism via full node block proof)
-                                let now = self.now();
-                                let block_id = rcv.block_id.clone();
-
-                                if let Some(&next_allowed) =
-                                    self.pending_committed_proof_requests.get(&block_id)
-                                {
-                                    if now < next_allowed {
-                                        break;
-                                    }
-                                }
-
-                                log::debug!(
-                                    "Session {} WaitingForFinalCert: requesting committed \
-                                     proof for seqno={} block_id={} at s{}:{}",
-                                    &self.session_id().to_hex_string()[..8],
-                                    expected_seqno,
-                                    block_id,
-                                    cursor.slot,
-                                    &cursor.hash.to_hex_string()[..8],
-                                );
-
-                                self.pending_committed_proof_requests
-                                    .insert(block_id.clone(), now + COMMITTED_PROOF_RETRY_INTERVAL);
-
-                                self.notify_get_committed_candidate(block_id);
-                            }
-                            break;
-                        }
-
-                        let Some(parent) = &rcv.parent_id else {
-                            // Can't walk further (session boundary). Keep waiting.
-                            break;
-                        };
-
-                        cursor = parent.clone();
-                        depth += 1;
-                    }
-                }
-            }
-        }
-
-        // Remove committed entries from journal
-        let did_commit = !committed_keys.is_empty();
-        for key in committed_keys {
-            self.finalized_journal_pending_commit.remove(&key);
-        }
-
-        // If something was committed, newly-unblocked chains may now be ready.
-        // Reschedule check_all so the session loop re-enters this function.
-        if did_commit {
-            self.set_next_awake_time(self.now());
-        }
-
-        self.finalized_uncommitted_gauge.set(self.finalized_journal_pending_commit.len() as f64);
-    }
-
-    /// Commit a finalized chain that has been verified as commit-ready
-    ///
-    /// This is the ONLY entry point to `commit_single_block()` for finalization-triggered commits.
-    /// The chain MUST have been verified by `check_commit_readiness()` to be gapless and fully-bodied.
-    ///
-    /// # Arguments
-    /// * `triggered_event` - The original BlockFinalizedEvent (for FinalCert signatures)
-    /// * `chain` - The parent chain to commit (oldest first), from `check_commit_readiness`
-    fn commit_finalized_chain(
-        &mut self,
-        triggered_event: &BlockFinalizedEvent,
-        chain: Vec<BlockToCommit>,
-    ) {
-        let slot = triggered_event.slot;
-        let block_hash = &triggered_event.block_hash;
-        let batch_size = chain.len();
-
-        // Derive FinalCert signature context and target commit (existing logic)
-        let triggered_id = RawCandidateId { slot, hash: block_hash.clone() };
-        let Some(triggered_received) = self.received_candidates.get(&triggered_id) else {
-            log::error!(
-                "Session {} commit_finalized_chain: triggered candidate must exist slot={}",
-                &self.description.get_session_id().to_hex_string()[..8],
-                slot
-            );
-            return;
-        };
-
-        let final_sig_context: (SlotIndex, Vec<u8>) =
-            (triggered_id.slot, triggered_received.candidate_hash_data_bytes.clone());
-
-        // Pick the nearest non-empty candidate in this batch for FinalCert application
-        let final_sig_target: Option<RawCandidateId> = chain.iter().rev().find_map(|b| {
-            self.received_candidates
-                .get(&b.candidate_id)
-                .and_then(|rcv| (!rcv.is_empty).then_some(b.candidate_id.clone()))
-        });
-
-        // Log batch commit start
-        let cert_weight = triggered_event.certificate.total_weight(&self.description);
-        let total_weight = self.description.get_total_weight();
-        log::debug!(
-            "Session {} FINALIZED: slot={}, hash={}, batch={} blocks, weight={}/{} ({:.0}%)",
-            &self.session_id().to_hex_string()[..8],
-            slot,
-            &block_hash.to_hex_string()[..8],
-            batch_size,
-            cert_weight,
-            total_weight,
-            100.0 * cert_weight as f64 / total_weight as f64
-        );
-
-        // INVARIANT CHECK - Certificate must have sufficient weight (existing)
-        let threshold = threshold_66(total_weight);
-        debug_assert!(
-            cert_weight >= threshold,
-            "finalization certificate weight {} below threshold {}",
-            cert_weight,
-            threshold
-        );
-
-        // Record slot duration (for triggered block's slot)
-        if let Ok(duration) = self.now().duration_since(self.slot_started_at(slot)) {
-            self.slot_duration_histogram.record(duration.as_millis() as f64);
-        }
-
-        // Track first finalized candidate (stage 3 latency)
-        if !self.slot_first_candidate_finalized(slot) {
-            self.slot_set_first_candidate_finalized(slot, true);
-            if let Ok(latency) = self.now().duration_since(self.slot_started_at(slot)) {
-                self.first_candidate_finalized_latency_histogram.record(latency.as_millis() as f64);
-                log::trace!(
-                    "Session {}: first block finalized in {:.3}ms",
-                    &self.session_id().to_hex_string()[..8],
-                    latency.as_secs_f64() * 1000.0
-                );
-            }
-        }
-
-        // Commit each block in the parent chain (oldest first)
-        // commit_single_block handles: signatures, mark_slot_outcome (round derived at emit time)
-        for block_info in &chain {
-            self.commit_single_block(
-                block_info,
-                triggered_event,
-                final_sig_target.as_ref(),
-                &final_sig_context,
-            );
-        }
-
-        // Record batch metrics
-        self.batch_commit_counter.increment(1);
-        self.batch_commit_size_histogram.record(batch_size as f64);
-
-        // Reset per-slot state for triggered slot
-        // (parent slots were already finalized in previous events or are being cleaned up)
-        self.reset_slot_state(slot);
-
-        log::trace!(
-            "Session {} commit_finalized_chain: completed batch commit of {batch_size} blocks, \
-            triggered_slot={slot}",
-            &self.session_id().to_hex_string()[..8],
-        );
     }
 
     /// Handle block finalized event
     ///
     /// Called when FSM determines a block has finalization certificate.
-    /// Records finalization and attempts commit via unified scheduler.
+    /// Records finalization and applies finalized-driven delivery/state updates.
     ///
     /// This function ALWAYS processes the finalization (never blocks FSM event processing).
-    /// If bodies are missing, the finalization is recorded in the journal and commitment
+    /// If bodies are missing, the finalization is recorded in the journal and local application
     /// is deferred until bodies arrive (triggered by on_candidate_received).
     ///
     /// See Finalization Flow diagram above for full flow.
@@ -8535,56 +8024,16 @@ impl SessionProcessor {
             self.increment_error();
         }
 
-        // ALWAYS record finalization in journal (even if body missing or not yet commit-ready)
-        let entry = FinalizedEntry { event: event.clone(), finalized_at: self.now() };
-        self.finalized_journal_pending_commit.insert(finalized_id.clone(), entry);
-
-        // NOTE: last_consensus_finalized_seqno is NOT advanced here.
-        // C++ parity: block-producer.cpp advances last_consensus_finalized_seqno_ only on
-        // FinalizeBlock(is_final=true), which happens AFTER the state-resolver commits.
-        // In Rust, the equivalent is commit_single_block() with use_final_cert=true.
-
-        // Seed a finalized-boundary entry into received_candidates for parent resolution.
-        // C++ parity: StateResolver::resolve_state_inner() treats finalized blocks as boundaries
-        // and stops recursing into their ancestors. Rust needs the same behavior for live sessions,
-        // not only for restart recovery.
-        if let Some(ref block_id) = event.block_id {
-            if !self.received_candidates.contains_key(&finalized_id) {
-                self.received_candidates.insert(
-                    finalized_id.clone(),
-                    ReceivedCandidate {
-                        slot,
-                        source_idx: self.description.get_self_idx(),
-                        candidate_id_hash: block_hash.clone(),
-                        candidate_hash_data_bytes: Vec::new(),
-                        block_id: block_id.clone(),
-                        root_hash: block_id.root_hash.clone(),
-                        file_hash: block_id.file_hash.clone(),
-                        data: consensus_common::ConsensusCommonFactory::create_block_payload(
-                            Vec::new(),
-                        ),
-                        collated_data:
-                            consensus_common::ConsensusCommonFactory::create_block_payload(
-                                Vec::new(),
-                            ),
-                        receive_time: self.now(),
-                        is_empty: false,
-                        parent_id: None,
-                        is_fully_resolved: true,
-                    },
-                );
-                log::debug!(
-                    "Session {} handle_block_finalized: seeded finalized boundary for slot={} \
-                    seqno={} (for parent resolution)",
-                    &self.session_id().to_hex_string()[..8],
-                    slot,
-                    block_id.seq_no()
-                );
-
-                // Resolve any pending parent resolutions that were waiting for this candidate
-                self.update_resolution_cache_chain(&finalized_id);
-                self.try_resolve_waiting_candidates(&finalized_id);
-            }
+        // Keep only pending finalizations that still wait for candidate body.
+        let should_store_for_later = self
+            .received_candidates
+            .get(&finalized_id)
+            .map(|r| r.candidate_hash_data_bytes.is_empty() || r.is_empty)
+            .unwrap_or(true);
+        if should_store_for_later {
+            let entry = FinalizedEntry { event: event.clone(), finalized_at: self.now() };
+            self.finalized_pending_body.insert(finalized_id.clone(), entry);
+            self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
         }
 
         log::debug!(
@@ -8600,9 +8049,9 @@ impl SessionProcessor {
         // Note: Certificate caching for standstill is handled in handle_finalization_reached()
         // which is triggered by SimplexEvent::FinalizationReached (emitted after BlockFinalized).
 
-        // Attempt commit via unified scheduler
-        // (may commit immediately if ready, or defer if bodies missing)
-        self.try_commit_finalized_chains();
+        // Finalized delivery (with delayed body support + dedup).
+        self.maybe_emit_out_of_order_finalized(&finalized_id, &event);
+        self.maybe_apply_finalized_state(&finalized_id);
 
         // Continue FSM event processing (do NOT push event back to queue)
     }
@@ -8660,6 +8109,19 @@ impl SessionProcessor {
         let first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
         let first_non_finalized_slot = self.simplex_state.get_first_non_finalized_slot();
 
+        let stale_generated_candidates: Vec<RawCandidateId> = self
+            .generated_candidates_waiting_validation
+            .keys()
+            .filter(|candidate_id| candidate_id.slot < up_to_slot)
+            .cloned()
+            .collect();
+        for candidate_id in stale_generated_candidates {
+            self.note_generated_candidate_validation_missed(
+                &candidate_id,
+                format!("cleanup_old_candidates up_to_slot={up_to_slot}"),
+            );
+        }
+
         // Clean up validation state collections (session-level, keyed by RawCandidateId)
         self.pending_validations.retain(|id, _| id.slot >= up_to_slot);
         self.pending_approve.retain(|id| id.slot >= up_to_slot);
@@ -8676,54 +8138,20 @@ impl SessionProcessor {
 
         // Clean up candidate_data_cache in sync with received_candidates
         self.candidate_data_cache.retain(|id, _| id.slot >= up_to_slot);
+        self.seen_broadcast_candidates.retain(|slot, _| *slot >= up_to_slot);
 
         // Remove stale finalized-journal entries for old slots.
-        {
-            let now = self.now();
-            let session_id_hex = self.session_id().to_hex_string();
-            let mut stale_count = 0u32;
-            self.finalized_journal_pending_commit.retain(|id, entry| {
-                if id.slot < up_to_slot {
-                    let age_secs = now
-                        .duration_since(entry.finalized_at)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(0.0);
-                    log::warn!(
-                        "Session {} cleanup: removing stale finalized-journal entry slot={} \
-                        (finalized {:.1}s ago, never committed)",
-                        &session_id_hex[..8],
-                        id.slot,
-                        age_secs,
-                    );
-                    stale_count += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-            if stale_count > 0 {
-                self.session_errors_count
-                    .fetch_add(stale_count, std::sync::atomic::Ordering::Relaxed);
-                self.errors_counter.increment(stale_count as u64);
-                self.finalized_uncommitted_gauge
-                    .set(self.finalized_journal_pending_commit.len() as f64);
-            }
-        }
+        // Prune entries for slots older than the FSM cursor.
+        // This map is a transient "finalized but body not yet received" buffer.
+        self.finalized_pending_body.retain(|id, _| id.slot >= up_to_slot);
+        self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
 
         // Prune log-throttle set to prevent unbounded growth over long sessions
         self.missing_body_logged.retain(|&slot| slot >= up_to_slot.value());
+        self.finalized_delivery_sent.retain(|id| id.slot >= up_to_slot);
 
         // Remove pending candidate requests for slots < up_to_slot
         self.requested_candidates.retain(|id, _| id.slot >= up_to_slot);
-
-        // Remove pending parent resolutions for old slots.
-        // Parent resolution is hash-based; slot is informational only, so we only use
-        // candidate slots (first-seen) to bound memory usage.
-        // TODO: implement cleanup of pending parent resolutions
-        //self.pending_parent_resolutions.retain(|_parent_hash, pending_list| {
-        //    pending_list.retain(|p| p.slot >= up_to_slot);
-        //    !pending_list.is_empty()
-        //});
 
         // Clear SlotRuntime for old slots (keep SlotEntry for outcome emission)
         // TODO: LK: optimize this
@@ -8799,6 +8227,12 @@ impl SessionProcessor {
     /// C++ `candidateAndCert.notar` contains serialized `voteSignatureSet`, not `certificate`.
     fn handle_notarization_reached(&mut self, event: NotarizationReachedEvent) {
         check_execution_time!(1_000);
+
+        let now = self.now();
+        self.observability.last_notarization_at = Some(now);
+        self.observability.last_notarization_slot = Some(event.slot);
+        self.observability.last_notar_cert_at = Some(now);
+        self.observability.last_notar_cert_slot = Some(event.slot);
 
         log::trace!(
             "Session {} notarization reached: slot={} block={} sigs={}",
@@ -8922,7 +8356,7 @@ impl SessionProcessor {
 
     /// Handle skip certificate reached event
     ///
-    /// Called when FSM determines skip threshold reached for a slot (C++ mode only).
+    /// Called when FSM determines skip threshold reached for a slot.
     /// Serializes and broadcasts the skip certificate to all validators.
     ///
     /// Reference: C++ pool.cpp creates skip certificate and broadcasts it
@@ -8990,6 +8424,10 @@ impl SessionProcessor {
     /// Relays certificate to all validators (C++ parity: handle_saved_certificate).
     fn handle_finalization_reached(&mut self, event: FinalizationReachedEvent) {
         check_execution_time!(1_000);
+
+        let now = self.now();
+        self.observability.last_final_cert_at = Some(now);
+        self.observability.last_final_cert_slot = Some(event.slot);
 
         log::trace!(
             "Session {} finalization reached: slot={} block={} sigs={}",
@@ -9065,7 +8503,7 @@ impl SessionProcessor {
 
         // Update standstill tracked slots range
         let (begin, end) = self.simplex_state.get_tracked_slots_interval();
-        self.receiver.set_standstill_slots(begin, end);
+        self.sync_standstill_slots_from_state();
 
         log::trace!(
             "Session {} update_standstill_after_final_cert: slot={} tracked_slots=[{}, {})",
@@ -9096,19 +8534,22 @@ impl SessionProcessor {
         // FSM already updated first_non_finalized_slot and cleaned up internally
         // Reset per-slot state for this slot
         self.reset_slot_state(slot);
+        self.cancel_candidate_repairs_for_slot(slot);
 
         // Update standstill tracked slots range (but DO NOT reschedule standstill on skip)
         // Reference: C++ pool.cpp on_skip() does NOT call reschedule_standstill_resolution()
         let (begin, end) = self.simplex_state.get_tracked_slots_interval();
-        self.receiver.set_standstill_slots(begin, end);
+        self.sync_standstill_slots_from_state();
 
         // Cancel any precollations for the skipped slot
         self.remove_precollated_block(slot);
 
         log::trace!(
-            "Session {} handle_slot_skipped: completed slot={}",
+            "Session {} handle_slot_skipped: completed slot={} tracked_slots=[{}, {})",
             &self.session_id().to_hex_string()[..8],
-            slot
+            slot,
+            begin,
+            end
         );
     }
 
@@ -9223,7 +8664,7 @@ impl SessionProcessor {
                             slot,
                             parent_info
                         );
-                    });
+	                    });
 
                 log::trace!(
                     "Session {} notify_generate_slot: explicit parent for slot {}: {}",
@@ -9251,11 +8692,217 @@ impl SessionProcessor {
         });
     }
 
-    /// Notify listener about a committed block
+    /// Emit finalized callback if all required data is available.
     ///
-    /// Called when a block has been committed with sufficient signatures.
-    fn notify_block_committed(
+    /// This helper is called from:
+    /// - `handle_block_finalized` (immediate path), and
+    /// - `on_candidate_received` (delayed path when body arrives after FinalCert).
+    fn maybe_emit_out_of_order_finalized(
+        &mut self,
+        finalized_id: &RawCandidateId,
+        event: &BlockFinalizedEvent,
+    ) {
+        if self.finalized_delivery_sent.contains(finalized_id) {
+            return;
+        }
+
+        let Some(received) = self.received_candidates.get(finalized_id) else {
+            // Candidate body not known yet.
+            return;
+        };
+        if received.candidate_hash_data_bytes.is_empty() || received.is_empty {
+            // Boundary stubs and empty blocks are not delivered via on_block_finalized.
+            return;
+        }
+
+        let source_idx = received.source_idx;
+        let source_public_key = self.description.get_source_public_key(source_idx).clone();
+        let source_info = crate::BlockSourceInfo {
+            source: source_public_key,
+            priority: crate::BlockCandidatePriority {
+                round: SIMPLEX_ROUNDLESS,
+                priority: 0,
+                first_block_round: SIMPLEX_ROUNDLESS,
+            },
+        };
+
+        let sigs: Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)> = event
+            .certificate
+            .signatures
+            .iter()
+            .map(|s| {
+                (
+                    self.description.get_source_public_key_hash(s.validator_idx).clone(),
+                    consensus_common::ConsensusCommonFactory::create_block_payload(
+                        s.signature.clone(),
+                    ),
+                )
+            })
+            .collect();
+
+        let delivered = self.notify_block_finalized(
+            received.block_id.clone(),
+            source_info,
+            received.root_hash.clone(),
+            received.file_hash.clone(),
+            received.data.clone(),
+            sigs,
+            Vec::new(),
+            event.slot,
+            received.candidate_hash_data_bytes.clone(),
+        );
+        if delivered {
+            self.finalized_delivery_sent.insert(finalized_id.clone());
+            self.finalized_pending_body.remove(finalized_id);
+            self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
+        }
+    }
+
+    /// Apply finalized-driven local state once the candidate body is available.
+    ///
+    /// This replaces the old sequential commit path for Simplex sessions:
+    /// - updates local finalized/head cursors
+    /// - persists finalized records for restart recovery
+    /// - clears per-slot runtime once finalization is materially applied
+    fn maybe_apply_finalized_state(&mut self, finalized_id: &RawCandidateId) {
+        if self.finalized_blocks.contains(finalized_id) {
+            return;
+        }
+
+        let Some(received) = self.received_candidates.get(finalized_id).cloned() else {
+            return;
+        };
+
+        if received.candidate_hash_data_bytes.is_empty() {
+            return;
+        }
+
+        let slot = received.slot;
+        let seqno = received.block_id.seq_no();
+
+        let slot_started_at = self.slot_started_at(slot);
+        if let Ok(duration) = self.now().duration_since(slot_started_at) {
+            self.slot_duration_histogram.record(duration.as_millis() as f64);
+        }
+
+        if !self.slot_first_candidate_finalized(slot) {
+            self.slot_set_first_candidate_finalized(slot, true);
+            if let Ok(latency) = self.now().duration_since(slot_started_at) {
+                self.first_candidate_finalized_latency_histogram.record(latency.as_millis() as f64);
+            }
+        }
+
+        let previous_head_seqno = self.finalized_head_seqno.unwrap_or(0);
+        let should_replace_head = match self.finalized_head_slot {
+            Some(current_slot) => {
+                seqno > previous_head_seqno
+                    || (seqno == previous_head_seqno && slot >= current_slot)
+            }
+            None => true,
+        };
+
+        if !received.is_empty {
+            if seqno > previous_head_seqno {
+                self.finalized_head_seqno = Some(seqno);
+            }
+
+            self.advance_accepted_normal_head_block(received.block_id.clone());
+
+            if should_replace_head {
+                if let Ok(before_split) =
+                    crate::utils::extract_before_split_flag(received.data.data())
+                {
+                    self.finalized_head_before_split = before_split;
+                    if before_split {
+                        log::info!(
+                            "Session {} maybe_apply_finalized_state: block at slot={slot} seqno={seqno} has \
+                            before_split=true (next block MUST be empty for split/merge)",
+                            &self.session_id().to_hex_string()[..8],
+                        );
+                    }
+                } else {
+                    log::trace!(
+                        "Session {} maybe_apply_finalized_state: failed to extract before_split flag for \
+                        slot={slot}, assuming false",
+                        &self.session_id().to_hex_string()[..8],
+                    );
+                    self.finalized_head_before_split = false;
+                }
+            }
+        }
+
+        if should_replace_head {
+            self.finalized_head_slot = Some(slot);
+            self.finalized_head_block_id = Some(received.block_id.clone());
+        }
+
+        if seqno > self.last_consensus_finalized_seqno.unwrap_or(0) {
+            self.last_consensus_finalized_seqno = Some(seqno);
+        }
+
+        self.finalized_blocks.insert(finalized_id.clone());
+
+        self.last_finalized_slot_gauge.set(slot.0 as f64);
+        let now = self.now();
+        self.round_debug_at = now + ROUND_DEBUG_PERIOD;
+        self.last_finalization_time = now;
+
+        let record = FinalizedBlockRecord {
+            candidate_id: finalized_id.clone(),
+            block_id: received.block_id.clone(),
+            parent: received.parent_id.clone(),
+            is_final: true,
+        };
+
+        if self.description.get_shard().is_masterchain() {
+            match self.db.save_finalized_block_async(&record) {
+                Ok(result) => {
+                    if let Err(e) = result.wait() {
+                        log::error!(
+                            "Session {} maybe_apply_finalized_state: failed to store finalized block for \
+                            slot={}: {e}",
+                            &self.session_id().to_hex_string()[..8],
+                            slot.value(),
+                        );
+                        self.increment_error();
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Session {} maybe_apply_finalized_state: failed to create finalized block save for \
+                        slot={}: {e}",
+                        &self.session_id().to_hex_string()[..8],
+                        slot.value(),
+                    );
+                    self.increment_error();
+                }
+            }
+        } else if let Err(e) = self.db.save_finalized_block(&record) {
+            log::error!(
+                "Session {} maybe_apply_finalized_state: failed to store finalized block for slot={}: {e}",
+                &self.session_id().to_hex_string()[..8],
+                slot.value(),
+            );
+            self.increment_error();
+        }
+
+        self.finalized_pending_body.remove(finalized_id);
+        self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
+        if self.simplex_state.is_slot_progressed(&self.description, slot) {
+            self.reset_slot_state(slot);
+        } else {
+            log::trace!(
+                "Session {} maybe_apply_finalized_state: skipping reset_slot_state for \
+                non-progressed slot={slot}",
+                &self.session_id().to_hex_string()[..8],
+            );
+        }
+    }
+
+    /// Emit `on_block_finalized` to the listener for finalized-driven acceptance.
+    fn notify_block_finalized(
         &self,
+        block_id: BlockIdExt,
         source_info: crate::BlockSourceInfo,
         root_hash: crate::BlockHash,
         file_hash: crate::BlockHash,
@@ -9264,36 +8911,33 @@ impl SessionProcessor {
         approve_signatures: Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)>,
         slot: SlotIndex,
         candidate_hash_data_bytes: Vec<u8>,
-        is_final: bool,
-        stats: consensus_common::SessionStats,
-    ) {
+    ) -> bool {
         check_execution_time!(20_000);
 
         log::trace!(
-            "Session {} notify_block_committed: posting on_block_committed event for \
-            root_hash={:x}",
+            "Session {} notify_block_finalized: posting for block_id={} slot={}",
             self.session_id().to_hex_string(),
-            root_hash,
+            block_id,
+            slot,
         );
 
         let listener = self.listener.clone();
 
-        // Build BlockSignaturesVariant::Simplex with proper context for signature verification
         let signatures_variant = match self.build_simplex_signatures_variant(
             &signatures,
             slot,
             candidate_hash_data_bytes,
-            is_final,
+            true, // always final
         ) {
             Ok(v) => v,
             Err(e) => {
                 log::error!(
-                    "Session {} notify_block_committed: failed to build signatures variant: {}",
+                    "Session {} notify_block_finalized: failed to build signatures variant: {}",
                     self.session_id().to_hex_string(),
                     e
                 );
                 self.increment_error();
-                return;
+                return false;
             }
         };
 
@@ -9301,21 +8945,18 @@ impl SessionProcessor {
             check_execution_time!(20_000);
 
             if let Some(listener) = listener.upgrade() {
-                log::trace!("SessionProcessor::notify_block_committed: on_block_committed start");
-
-                listener.on_block_committed(
+                listener.on_block_finalized(
+                    block_id,
                     source_info,
                     root_hash,
                     file_hash,
                     data,
                     signatures_variant,
                     approve_signatures,
-                    stats,
                 );
-
-                log::trace!("SessionProcessor::notify_block_committed: on_block_committed finish");
             }
         });
+        true
     }
 
     /// Build BlockSignaturesVariant::Simplex from raw signature pairs with context
@@ -9437,185 +9078,11 @@ impl SessionProcessor {
         Ok(BlockSignaturesVariant::Simplex(simplex_signatures))
     }
 
-    // ========================================================================
-    // Download committed block proof for MC gap recovery
-    // ========================================================================
-
-    /// Convert BlockSignaturesSimplex from a block proof into VoteSignatureSet
-    /// TL bytes that process_received_final_cert expects.
-    ///
-    /// Maps pure_signatures (node_id_short → CryptoSignature) back to
-    /// VoteSignature (validator_idx → signature bytes) using SessionDescription.
-    fn convert_proof_to_final_cert_bytes(
-        &self,
-        sigs: &BlockSignaturesSimplex,
-    ) -> Result<(SlotIndex, UInt256, Vec<u8>)> {
-        let candidate_data_bytes = sigs.candidate_data_bytes()?;
-        let candidate_hash = sha256_digest(&candidate_data_bytes);
-        let block_hash = UInt256::from_slice(&candidate_hash);
-
-        let mut votes = Vec::new();
-        sigs.pure_signatures.signatures().iterate_slices(|_key, ref mut slice| {
-            let pair = CryptoSignaturePair::construct_from(slice)?;
-            let key_id = KeyId::from_data(*pair.node_id_short.as_slice());
-            let node_id: crate::PublicKeyHash = key_id;
-
-            match self.description.get_source_index(&node_id) {
-                Ok(val_idx) => {
-                    votes.push(
-                        TlVoteSignature {
-                            who: val_idx.value() as i32,
-                            signature: pair.sign.as_bytes().to_vec().into(),
-                        }
-                        .into_boxed(),
-                    );
-                }
-                Err(_) => {
-                    log::trace!(
-                        "Session {} convert_proof_to_final_cert_bytes: \
-                         unknown signer {} (skipping)",
-                        &self.session_id().to_hex_string()[..8],
-                        node_id,
-                    );
-                }
-            }
-            Ok(true)
-        })?;
-
-        if votes.is_empty() {
-            fail!("No known signers in proof for slot={}", sigs.slot);
-        }
-
-        let tl_set = VoteSignatureSet { votes: votes.into() }.into_boxed();
-        let bytes = serialize_boxed(&tl_set)?;
-
-        let slot = SlotIndex::new(sigs.slot);
-        Ok((slot, block_hash, bytes))
-    }
-
-    /// Handle committed block proof received from ValidatorGroup.
-    ///
-    /// Converts proof signatures to VoteSignatureSet bytes and feeds them
-    /// through the existing process_received_final_cert → set_finalize_certificate
-    /// → try_commit_finalized_chains flow.
-    fn process_committed_proof_result(
-        &mut self,
-        block_id: BlockIdExt,
-        result: Result<consensus_common::CommittedBlockProof>,
-    ) {
-        self.pending_committed_proof_requests.remove(&block_id);
-        let proof = match result {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!(
-                    "Session {} process_committed_proof_result: failed for {}: {}",
-                    &self.session_id().to_hex_string()[..8],
-                    block_id,
-                    e
-                );
-                return;
-            }
-        };
-
-        if proof.block_id != block_id {
-            log::warn!(
-                "Session {} process_committed_proof_result: \
-                 proof identity mismatch: requested {} but got {}",
-                &self.session_id().to_hex_string()[..8],
-                block_id,
-                proof.block_id,
-            );
-            return;
-        }
-
-        let simplex_sigs = match &proof.signatures {
-            BlockSignaturesVariant::Simplex(s) if s.is_final => s,
-            _ => {
-                log::warn!(
-                    "Session {} process_committed_proof_result: \
-                     expected Simplex(is_final=true) for {}",
-                    &self.session_id().to_hex_string()[..8],
-                    block_id,
-                );
-                return;
-            }
-        };
-
-        match self.convert_proof_to_final_cert_bytes(simplex_sigs) {
-            Ok((slot, block_hash, final_cert_bytes)) => {
-                log::debug!(
-                    "Session {} process_committed_proof_result: \
-                     converted proof for {} → slot={} hash={} ({} bytes)",
-                    &self.session_id().to_hex_string()[..8],
-                    block_id,
-                    slot,
-                    &block_hash.to_hex_string()[..8],
-                    final_cert_bytes.len(),
-                );
-                self.process_received_final_cert(slot, &block_hash, &final_cert_bytes);
-                self.try_commit_finalized_chains();
-            }
-            Err(e) => {
-                log::warn!(
-                    "Session {} process_committed_proof_result: \
-                     conversion failed for {}: {}",
-                    &self.session_id().to_hex_string()[..8],
-                    block_id,
-                    e
-                );
-            }
-        }
-    }
-
-    /// Request committed block proof from full-node via SessionListener.
-    ///
-    /// Posts callback through invoke_session_callback (SXCB thread), which calls
-    /// listener.get_committed_candidate(). The result is posted back to SXMAIN
-    /// via task_queue.post_closure → process_committed_proof_result.
-    fn notify_get_committed_candidate(&self, block_id: BlockIdExt) {
-        check_execution_time!(20_000);
-
-        log::trace!(
-            "Session {} notify_get_committed_candidate: requesting proof for {}",
-            &self.session_id().to_hex_string()[..8],
-            block_id,
-        );
-
-        let listener = self.listener.clone();
-        let task_queue = self.task_queue.clone();
-        let session_id = self.session_id().clone();
-
-        self.invoke_session_callback(move || {
-            if let Some(listener) = listener.upgrade() {
-                let task_queue_inner = task_queue;
-                let block_id_for_log = block_id.clone();
-
-                listener.get_committed_candidate(
-                    block_id.clone(),
-                    Box::new(move |result| {
-                        crate::task_queue::post_closure(
-                            &task_queue_inner,
-                            move |processor: &mut SessionProcessor| {
-                                processor.process_committed_proof_result(block_id, result);
-                            },
-                        );
-                    }),
-                );
-
-                log::trace!(
-                    "notify_get_committed_candidate: posted for {} (session {})",
-                    block_id_for_log,
-                    session_id.to_hex_string(),
-                );
-            }
-        });
-    }
-
     /// Handle RequestCandidate query fallback when receiver's resolver_cache misses.
     ///
     /// Called from SXRCV thread via ReceiverListener when a peer's RequestCandidate query
-    /// cannot be answered from the in-memory resolver_cache. Attempts to reconstruct the
-    /// response from:
+    /// cannot be fully answered from the in-memory resolver_cache. Attempts to reconstruct
+    /// requested candidate body and/or notar parts from:
     ///   1. `candidate_data_cache` (in-memory, fast path)
     ///   2. SimplexDB `CandidateInfoRecord` (empty blocks only -- reconstructed from metadata)
     ///
@@ -9625,10 +9092,12 @@ impl SessionProcessor {
     /// the validator manager.
     ///
     /// Reference: C++ `CandidateResolver::try_load_candidate_data_from_db()`
+    /// TODO: LK: move DB operations to background thread
     pub fn handle_candidate_query_fallback(
         &mut self,
         slot: SlotIndex,
         block_hash: UInt256,
+        want_candidate: bool,
         want_notar: bool,
         response_callback: crate::QueryResponseCallback,
     ) {
@@ -9637,117 +9106,102 @@ impl SessionProcessor {
         let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
         let session_hex = &self.session_id().to_hex_string()[..8];
 
-        // 1. Fast path: check in-memory candidate_data_cache
-        if let Some(candidate_bytes) = self.candidate_data_cache.get(&candidate_id) {
-            log::debug!(
-                "Session {} candidate_query_fallback: cache HIT for slot={} hash={} ({}B)",
-                session_hex,
-                slot,
-                &block_hash.to_hex_string()[..8],
-                candidate_bytes.len()
-            );
-            let notar_bytes = if want_notar {
-                self.load_notar_cert_bytes_from_db(&candidate_id)
-            } else {
-                Vec::new()
-            };
-            Self::send_candidate_and_cert_response(
-                candidate_bytes.clone(),
-                notar_bytes,
-                response_callback,
-            );
-            return;
-        }
+        // Candidate and notar can be requested independently. Build each part
+        // from the best available source and return partials when only one part exists.
+        let mut candidate_bytes = Vec::new();
 
-        // 2. DB path: load CandidateInfoRecord for metadata
-        let candidate_info = match self.load_candidate_info_from_db(&candidate_id) {
-            Some(info) => info,
-            None => {
+        if want_candidate {
+            // 1. Fast path: in-memory candidate_data_cache
+            if let Some(bytes) = self.candidate_data_cache.get(&candidate_id) {
                 log::debug!(
-                    "Session {} candidate_query_fallback: NOT FOUND for slot={} hash={}",
-                    session_hex,
-                    slot,
-                    &block_hash.to_hex_string()[..8]
+                    "Session {session_hex} candidate_query_fallback: \
+                    candidate cache HIT for slot={slot} hash={} ({}B)",
+                    &block_hash.to_hex_string()[..8],
+                    bytes.len()
                 );
-                Self::send_empty_candidate_response(response_callback);
-                return;
+                candidate_bytes.clone_from(bytes);
+            } else {
+                // 2. DB path: candidate metadata
+                let candidate_info = self.load_candidate_info_from_db(&candidate_id);
+
+                // 3. Persisted payload (works for both empty and non-empty blocks)
+                const DB_TIMEOUT: Duration = Duration::from_secs(2);
+                match self.db.load_candidate_payload_by_id(&candidate_id, DB_TIMEOUT) {
+                    Ok(Some(payload_bytes)) => {
+                        log::debug!(
+                            "Session {session_hex} candidate_query_fallback: \
+                            loaded payload from DB for slot={slot} ({}B)",
+                            payload_bytes.len()
+                        );
+                        candidate_bytes = payload_bytes;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::warn!(
+                            "Session {session_hex} candidate_query_fallback: \
+                            DB payload load error for slot={slot}: {e}"
+                        );
+                    }
+                }
+
+                // 4. Metadata reconstruction for empty blocks when payload missing.
+                if candidate_bytes.is_empty() {
+                    if let Some(info) = candidate_info.as_ref() {
+                        let is_empty = matches!(
+                            info.candidate_hash_data,
+                            CandidateHashData::Consensus_CandidateHashDataEmpty(_)
+                        );
+                        if is_empty {
+                            match self
+                                .reconstruct_empty_candidate_data_from_info(&candidate_id, info)
+                            {
+                                Ok(bytes) => {
+                                    log::debug!(
+                                        "Session {session_hex} candidate_query_fallback: \
+                                        reconstructed empty block for slot={slot} ({}B)",
+                                        bytes.len()
+                                    );
+                                    candidate_bytes = bytes;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Session {session_hex} candidate_query_fallback: \
+                                        failed to reconstruct empty block for slot={slot}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        };
+        }
 
         let notar_bytes =
             if want_notar { self.load_notar_cert_bytes_from_db(&candidate_id) } else { Vec::new() };
 
-        // 3. Try persisted payload from DB first (works for both empty and non-empty blocks,
-        //    since save_candidate_payload_async persists payloads for all candidates).
-        {
-            const DB_TIMEOUT: Duration = Duration::from_secs(2);
-            match self.db.load_candidate_payload_by_id(&candidate_id, DB_TIMEOUT) {
-                Ok(Some(payload_bytes)) => {
-                    log::debug!(
-                        "Session {} candidate_query_fallback: loaded payload from DB for slot={} ({}B)",
-                        session_hex,
-                        slot,
-                        payload_bytes.len()
-                    );
-                    Self::send_candidate_and_cert_response(
-                        payload_bytes,
-                        notar_bytes,
-                        response_callback,
-                    );
-                    return;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!(
-                        "Session {} candidate_query_fallback: DB payload load error for slot={}: {}",
-                        session_hex,
-                        slot,
-                        e
-                    );
-                }
-            }
+        if candidate_bytes.is_empty() && notar_bytes.is_empty() {
+            log::debug!(
+                "Session {} candidate_query_fallback: NOT FOUND for slot={} hash={} \
+                (want_candidate={}, want_notar={})",
+                session_hex,
+                slot,
+                &block_hash.to_hex_string()[..8],
+                want_candidate,
+                want_notar,
+            );
+        } else {
+            log::debug!(
+                "Session {} candidate_query_fallback: responding slot={} hash={} \
+                candidate_bytes={} notar_bytes={}",
+                session_hex,
+                slot,
+                &block_hash.to_hex_string()[..8],
+                candidate_bytes.len(),
+                notar_bytes.len()
+            );
         }
 
-        // 4. DB payload not available: try metadata reconstruction for empty blocks
-        let is_empty = matches!(
-            candidate_info.candidate_hash_data,
-            CandidateHashData::Consensus_CandidateHashDataEmpty(_)
-        );
-
-        if is_empty {
-            match self.reconstruct_empty_candidate_data_from_info(&candidate_id, &candidate_info) {
-                Ok(bytes) => {
-                    log::debug!(
-                        "Session {} candidate_query_fallback: reconstructed empty block for slot={} ({}B)",
-                        session_hex,
-                        slot,
-                        bytes.len()
-                    );
-                    Self::send_candidate_and_cert_response(bytes, notar_bytes, response_callback);
-                    return;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Session {} candidate_query_fallback: failed to reconstruct empty block \
-                        for slot={}: {}",
-                        session_hex,
-                        slot,
-                        e
-                    );
-                }
-            }
-        }
-
-        // 5. Not in memory, DB, or reconstructable: return notar-only if available (partial merge).
-        log::debug!(
-            "Session {} candidate_query_fallback: block NOT FOUND for slot={} hash={}, \
-            returning notar_only={}",
-            session_hex,
-            slot,
-            &block_hash.to_hex_string()[..8],
-            !notar_bytes.is_empty()
-        );
-        Self::send_candidate_and_cert_response(Vec::new(), notar_bytes, response_callback);
+        Self::send_candidate_and_cert_response(candidate_bytes, notar_bytes, response_callback);
     }
 
     /// Load CandidateInfoRecord from DB (blocking, used for rare query fallback).
@@ -9806,11 +9260,6 @@ impl SessionProcessor {
             Err(e) => Err(error!("Failed to serialize fallback response: {}", e)),
         };
         response_callback(result);
-    }
-
-    /// Send empty CandidateAndCert response (when fallback has nothing to return).
-    fn send_empty_candidate_response(response_callback: crate::QueryResponseCallback) {
-        Self::send_candidate_and_cert_response(Vec::new(), Vec::new(), response_callback);
     }
 
     /// Reconstruct CandidateData::Consensus_Empty bytes from CandidateInfoRecord.
@@ -9875,6 +9324,9 @@ impl SessionStartupRecoveryListener for SessionProcessor {
             slot.value()
         );
         self.simplex_state.set_first_non_finalized_slot(slot);
+        self.receiver.set_ingress_slot_begin(slot.value());
+        self.receiver
+            .set_ingress_progress_slot(self.simplex_state.get_first_non_progressed_slot().value());
     }
 
     fn recovery_on_vote(
@@ -9898,8 +9350,6 @@ impl SessionStartupRecoveryListener for SessionProcessor {
             Vote::Notarize(v) => v.slot,
             Vote::Finalize(v) => v.slot,
             Vote::Skip(v) => v.slot,
-            Vote::NotarizeFallback(v) => v.slot,
-            Vote::SkipFallback(v) => v.slot,
         };
         log::trace!(
             "Session {}: recovery_mark_slot_voted_on_restart(slot={})",
@@ -10031,13 +9481,18 @@ impl SessionStartupRecoveryListener for SessionProcessor {
             let block_hash = block.candidate_id.hash.clone();
             let block_id = block.block_id.clone();
             let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+            let is_empty = block
+                .parent
+                .as_ref()
+                .and_then(|parent_id| self.received_candidates.get(parent_id))
+                .is_some_and(|parent| parent.block_id == block_id);
 
             // Skip if already present (shouldn't happen, but be safe)
             if self.received_candidates.contains_key(&candidate_id) {
                 continue;
             }
 
-            // Seed a minimal received candidate record for parent resolution
+            // Seed a minimal received candidate record for restart-side parent/tip lookups.
             self.received_candidates.insert(
                 candidate_id,
                 ReceivedCandidate {
@@ -10050,10 +9505,10 @@ impl SessionStartupRecoveryListener for SessionProcessor {
                     file_hash: block_id.file_hash.clone(),
                     data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
                     collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
+                    gen_utime_ms: None,
                     receive_time: self.now(),
-                    is_empty: false,
+                    is_empty,
                     parent_id: block.parent.clone(),
-                    is_fully_resolved: true,
                 },
             );
         }
@@ -10087,11 +9542,17 @@ impl SessionStartupRecoveryListener for SessionProcessor {
                 .map(|p| format!("s{}:{}", p.slot.value(), &p.hash.to_hex_string()[..8])),
         );
 
-        if self.received_candidates.contains_key(&candidate_id) {
+        if let Some(existing) = self.received_candidates.get_mut(&candidate_id) {
+            existing.source_idx = leader_idx;
+            existing.candidate_hash_data_bytes = candidate_hash_data_bytes;
+            existing.block_id.clone_from(&block_id);
+            existing.root_hash.clone_from(&block_id.root_hash);
+            existing.file_hash.clone_from(&block_id.file_hash);
+            existing.gen_utime_ms = None;
+            existing.is_empty = is_empty;
+            existing.parent_id = parent;
             return;
         }
-
-        let is_fully_resolved = self.compute_is_fully_resolved(&parent);
 
         self.received_candidates.insert(
             candidate_id.clone(),
@@ -10107,10 +9568,10 @@ impl SessionStartupRecoveryListener for SessionProcessor {
                 collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
                     Vec::new(),
                 ),
+                gen_utime_ms: None,
                 receive_time: self.now(),
                 is_empty,
                 parent_id: parent,
-                is_fully_resolved,
             },
         );
     }
@@ -10154,19 +9615,21 @@ impl SessionStartupRecoveryListener for SessionProcessor {
             );
 
         // Update last_committed tracking to reflect the restart state
-        self.last_committed_seqno = Some(seqno);
-        self.last_committed_slot = Some(slot);
-        self.last_committed_block_id = Some(block_id.clone());
+        self.finalized_head_seqno = Some(seqno);
+        self.finalized_head_slot = Some(slot);
+        self.finalized_head_block_id = Some(block_id.clone());
+        self.last_mc_finalized_seqno = Some(self.last_mc_finalized_seqno.unwrap_or(0).max(seqno));
         self.last_consensus_finalized_seqno = Some(seqno);
+        self.advance_accepted_normal_head_block(block_id.clone());
 
         // Note: We do NOT set available_base here anymore. This is now done in
         // recovery_finalize_parent_chain() after all kept votes are restored,
         // because the kept votes may finalize additional slots.
 
-        // Note: We do NOT call notify_block_committed here because:
-        // 1. C++ only publishes BlockFinalized event, not a full re-acceptance
+        // Note: We do NOT notify ValidatorGroup here because:
+        // 1. C++ only republishes finalized state, not a fresh accept callback
         // 2. The block was already accepted before restart
-        // 3. Recommit execution (if enabled) handles ValidatorGroup notification separately
+        // 3. Restart recovery now restores state only; no historical replay callbacks remain
     }
 
     fn recovery_finalize_parent_chain(&mut self) {
@@ -10442,7 +9905,7 @@ impl SessionStartupRecoveryListener for SessionProcessor {
 
         // 4) Update receiver standstill tracked range and timer
         // This also prunes cached votes outside [begin, end).
-        self.receiver.set_standstill_slots(begin, end);
+        self.sync_standstill_slots_from_state();
         self.receiver.reschedule_standstill();
 
         log::info!(
@@ -10452,122 +9915,6 @@ impl SessionStartupRecoveryListener for SessionProcessor {
             tracked_slots=[{begin}, {end})",
             self.session_id().to_hex_string(),
         );
-    }
-
-    fn recovery_apply_restart_recommit_actions(
-        &mut self,
-        actions: &[RestartRoundAction],
-        get_candidate: &mut dyn FnMut(
-            &RestartRoundAction,
-        )
-            -> Result<consensus_common::ValidatorBlockCandidatePtr>,
-    ) -> Result<()> {
-        log::info!(
-            target: "startup_recovery",
-            "Session {}: applying {} restart recommit actions",
-            self.session_id().to_hex_string(),
-            actions.len()
-        );
-
-        let mut committed = 0u32;
-
-        for action in actions {
-            let RestartRoundAction::Commit {
-                slot,
-                block_id,
-                leader_idx,
-                root_hash,
-                file_hash,
-                candidate_hash,
-                candidate_hash_data_bytes,
-                is_empty,
-                ..
-            } = action;
-
-            if *is_empty {
-                log::debug!(
-                    target: "startup_recovery",
-                    "Session {}: replayed empty finalized record slot={}, seqno={} (no callback)",
-                    &self.session_id().to_hex_string()[..8],
-                    slot.value(),
-                    block_id.seq_no()
-                );
-                self.last_committed_slot = Some(*slot);
-                continue;
-            }
-
-            log::debug!(
-                target: "startup_recovery",
-                "Session {}: restart recommit COMMIT slot={}, round=ROUNDLESS, seqno={}",
-                &self.session_id().to_hex_string()[..8],
-                slot.value(),
-                block_id.seq_no()
-            );
-
-            // Fetch candidate via closure (must exist for non-empty actions).
-            let candidate = get_candidate(action).map_err(|e| {
-                error!("restart replay failed to fetch candidate for slot {}: {e}", slot.value())
-            })?;
-
-            // Get signatures from restored notar certificate
-            // After vote replay, simplex_state should have the certificates.
-            let signatures = self.get_notarize_signatures(*slot, candidate_hash);
-            if signatures.is_empty() {
-                fail!(
-                    "restart replay missing notar cert for slot {} hash {}",
-                    slot.value(),
-                    candidate_hash.to_hex_string()
-                );
-            }
-
-            // For restart recommit, use notar signatures for both sets
-            // (same as prepare_parent_block_signatures)
-            let approve_signatures = signatures.clone();
-
-            // Build source info (SIMPLEX_ROUNDLESS)
-            let source_public_key = self.description.get_source_public_key(*leader_idx).clone();
-            let source_info = crate::BlockSourceInfo {
-                source: source_public_key,
-                priority: BlockCandidatePriority {
-                    round: SIMPLEX_ROUNDLESS,             // Simplex roundless mode
-                    first_block_round: SIMPLEX_ROUNDLESS, // Must match round for consistency
-                    priority: 0,
-                },
-            };
-
-            // Build session stats
-            let stats = self.build_session_stats();
-
-            // Notify listener about the commit (SIMPLEX_ROUNDLESS)
-            // is_final = true for all replayed finalized blocks
-            self.notify_block_committed(
-                source_info,
-                root_hash.clone(),
-                file_hash.clone(),
-                candidate.data.clone(),
-                signatures,
-                approve_signatures,
-                *slot,
-                candidate_hash_data_bytes.clone(),
-                true, // is_final
-                stats,
-            );
-
-            // Update seqno tracking
-            self.last_committed_seqno = Some(block_id.seq_no());
-            self.last_committed_slot = Some(*slot);
-
-            committed += 1;
-        }
-
-        log::info!(
-            target: "startup_recovery",
-            "Session {}: restart recommit complete: {} committed",
-            self.session_id().to_hex_string(),
-            committed
-        );
-
-        Ok(())
     }
 }
 

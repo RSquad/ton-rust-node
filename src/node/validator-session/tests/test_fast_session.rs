@@ -21,7 +21,7 @@ use std::{
     },
     time::Duration,
 };
-use ton_block::{error, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256};
 use validator_session::*;
 
 include!("../../../common/src/info.rs");
@@ -147,15 +147,6 @@ impl SessionListener for DummySessionListener {
             source,
             root_hash
         );
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={block_id}");
-        callback(Err(error!("get_committed_candidate not implemented in test")));
     }
 }
 

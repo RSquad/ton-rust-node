@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
+    sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
     Ed25519KeyOption, ShardIdent, UInt256,
 };
 
@@ -52,12 +52,16 @@ struct CollationTestListener {
     collation_requested: Arc<AtomicBool>,
     /// Collation count
     collation_count: Arc<AtomicU32>,
+    /// Set to true when the self-collated block reaches validation
+    candidate_validated: Arc<AtomicBool>,
+    /// Validation callback count
+    candidate_count: Arc<AtomicU32>,
     /// Public key for generating candidates
     public_key: PublicKey,
-    /// Next expected seqno for collation - increases after each successful collation
+    /// Next expected seqno for collation — updated on finalization
     next_expected_collation_seqno: Arc<AtomicU32>,
-    /// Next expected seqno for commit - initialized with initial_block_seqno, +1 for each commit
-    next_expected_commit_seqno: Arc<AtomicU32>,
+    /// Maximum finalized seqno observed (monotonically advances via fetch_max)
+    max_finalized_seqno: Arc<AtomicU32>,
 }
 
 impl SessionListener for CollationTestListener {
@@ -74,6 +78,8 @@ impl SessionListener for CollationTestListener {
             source_info.priority.round,
             root_hash
         );
+        self.candidate_validated.store(true, Ordering::Release);
+        self.candidate_count.fetch_add(1, Ordering::Relaxed);
         // Accept the candidate
         callback(Ok(SystemTime::now()));
     }
@@ -98,20 +104,11 @@ impl SessionListener for CollationTestListener {
         self.collation_requested.store(true, Ordering::Release);
         self.collation_count.fetch_add(1, Ordering::Relaxed);
 
-        // Derive seqno from explicit parent hint or use stable counter value for implicit case
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                // Keep seqno stable across retries for the same slot.
-                // The counter is advanced on commit.
-                self.next_expected_collation_seqno.load(Ordering::SeqCst)
+                self.max_finalized_seqno.load(Ordering::SeqCst)
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => {
-                // Explicit parent: derive seqno from parent (parent_seqno + 1)
-                let derived_seqno = parent_id.seq_no + 1;
-                // Update counter to match derived seqno for next iteration
-                self.next_expected_collation_seqno.store(derived_seqno + 1, Ordering::SeqCst);
-                derived_seqno
-            }
+            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
         };
 
         // Generate dummy candidate with proper hashes
@@ -157,27 +154,40 @@ impl SessionListener for CollationTestListener {
 
     fn on_block_committed(
         &self,
-        source_info: simplex::BlockSourceInfo,
-        root_hash: BlockHash,
+        _source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
         _file_hash: BlockHash,
         _data: BlockPayloadPtr,
         _signatures: BlockSignaturesVariant,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
         _stats: consensus_common::SessionStats,
     ) {
-        let slot = source_info.priority.round;
+        panic!(
+            "on_block_committed must not be called for Simplex sessions (finalized-driven only)"
+        );
+    }
 
-        // Increment next_expected_commit_seqno and update next_expected_collation_seqno
-        let committed_seqno = self.next_expected_commit_seqno.fetch_add(1, Ordering::SeqCst);
-        let next_commit_seqno = committed_seqno + 1;
-        self.next_expected_collation_seqno.store(next_commit_seqno, Ordering::SeqCst);
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
+        source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
+        _file_hash: BlockHash,
+        _data: BlockPayloadPtr,
+        _signatures: BlockSignaturesVariant,
+        _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+    ) {
+        let slot = source_info.priority.round;
+        let seqno = block_id.seq_no;
+
+        self.max_finalized_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
+        self.next_expected_collation_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
 
         log::info!(
-            "CollationTestListener::on_block_committed: slot={}, hash={:?}, committed_seqno={}, next_expected={}",
+            "CollationTestListener::on_block_finalized: slot={}, seqno={}, block_id={}",
             slot,
-            root_hash,
-            committed_seqno,
-            next_commit_seqno
+            seqno,
+            block_id,
         );
     }
 
@@ -188,21 +198,16 @@ impl SessionListener for CollationTestListener {
     fn get_approved_candidate(
         &self,
         _source: PublicKey,
-        _root_hash: BlockHash,
+        root_hash: BlockHash,
         _file_hash: BlockHash,
         _collated_data_hash: BlockHash,
         _callback: ValidatorBlockCandidateCallback,
     ) {
-        // Not used in this test
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        log::info!("get_committed_candidate: STUB for block_id={}", block_id);
-        callback(Err(error!("get_committed_candidate not implemented in test")));
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex collation test \
+             (root_hash={}); active simplex flow must not use this callback",
+            root_hash.to_hex_string()
+        );
     }
 }
 
@@ -314,7 +319,7 @@ fn run_collation_test() {
         .collect();
     let db_path = format!("{}/{}_{}", DB_PATH, TEST_NAME, rand_name);
     let mut rng = rand::thread_rng();
-    let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
+    let session_id: UInt256 = UInt256::from(rng.r#gen::<[u8; 32]>());
 
     // Session options - fast timing for quick test
     let session_opts = SessionOptions {
@@ -328,14 +333,18 @@ fn run_collation_test() {
     // Create listener with tracking
     let collation_requested = Arc::new(AtomicBool::new(false));
     let collation_count = Arc::new(AtomicU32::new(0));
+    let candidate_validated = Arc::new(AtomicBool::new(false));
+    let candidate_count = Arc::new(AtomicU32::new(0));
 
     let initial_block_seqno = 1; // First block will have seqno=1 (seqno 0 is zerostate)
     let listener = Arc::new(CollationTestListener {
         collation_requested: collation_requested.clone(),
         collation_count: collation_count.clone(),
+        candidate_validated: candidate_validated.clone(),
+        candidate_count: candidate_count.clone(),
         public_key,
         next_expected_collation_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
-        next_expected_commit_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
+        max_finalized_seqno: Arc::new(AtomicU32::new(initial_block_seqno)),
     });
 
     let session_listener: Arc<dyn SessionListener + Send + Sync> = listener.clone();
@@ -361,14 +370,20 @@ fn run_collation_test() {
 
     log::info!("Session created, waiting for collation callback...");
 
-    // Wait for collation callback
+    // Wait for collation and self-validation callbacks
     let test_start = Instant::now();
     let mut collation_triggered = false;
+    let mut validation_triggered = false;
 
     while test_start.elapsed() < COLLATION_TIMEOUT {
         if collation_requested.load(Ordering::Acquire) {
             collation_triggered = true;
-            log::info!("COLLATION CALLBACK TRIGGERED after {:?}", test_start.elapsed());
+        }
+        if candidate_validated.load(Ordering::Acquire) {
+            validation_triggered = true;
+        }
+        if collation_triggered && validation_triggered {
+            log::info!("COLLATION+VALIDATION CALLBACKS TRIGGERED after {:?}", test_start.elapsed());
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -382,16 +397,24 @@ fn run_collation_test() {
 
     // Report results
     let final_count = collation_count.load(Ordering::Relaxed);
+    let final_candidate_count = candidate_count.load(Ordering::Relaxed);
     log::info!(
-        "Test completed: collation_triggered={}, collation_count={}",
+        "Test completed: collation_triggered={}, validation_triggered={}, collation_count={}, candidate_count={}",
         collation_triggered,
-        final_count
+        validation_triggered,
+        final_count,
+        final_candidate_count
     );
 
     // Assert
     assert!(
         collation_triggered,
         "Collation callback was NOT triggered within {:?}",
+        COLLATION_TIMEOUT
+    );
+    assert!(
+        validation_triggered,
+        "Self-collated block did NOT reach on_candidate within {:?}",
         COLLATION_TIMEOUT
     );
 

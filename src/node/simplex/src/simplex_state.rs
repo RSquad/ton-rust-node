@@ -7,237 +7,42 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 
-//! SimplexState - Core Consensus State Machine
+//! SimplexState - Core Simplex FSM
 //!
-//! This module implements the core consensus state machine based on:
-//! - Solana Alpenglow White Paper (May 2025), Algorithm 1 (page 21) and Algorithm 2 (page 22)
-//! - C++ reference: `simplex/consensus.cpp`, `simplex/pool.cpp`
+//! Protocol references:
+//! - [Simplex protocol spec (`Simplex.md`)](https://github.com/ton-blockchain/simplex-docs)
+//! - [TON C++ sources](https://github.com/ton-blockchain/ton) (`testnet/validator/consensus/simplex`)
 //!
-//! ## White Paper Algorithm
-//!
-//! ### Algorithm 1: Event Handlers
-//!
-//! ```text
-//! upon Block(s, hash, hashparent) do
-//!     if tryNotar(Block(s, hash, hashparent)) then
-//!         checkPendingBlocks()
-//!     else if Voted ∉ state[s] then
-//!         pendingBlocks[s] ← Block(s, hash, hashparent)
-//!
-//! upon Timeout(s) do
-//!     if Voted ∉ state[s] then
-//!         trySkipWindow(s)
-//!
-//! upon BlockNotarized(s, hash(b)) do
-//!     state[s] ← state[s] ∪ {BlockNotarized(hash(b))}
-//!     tryFinal(s, hash(b))
-//!
-//! upon ParentReady(window, hash(b)) do
-//!     state[window.first_slot] ← state[window.first_slot] ∪ {ParentReady(hash(b))}
-//!     checkPendingBlocks()
-//!     setTimeouts(window)
-//!
-//! upon SafeToNotar(s, hash(b)) do
-//!     trySkipWindow(s)
-//!     if ItsOver ∉ state[s] then
-//!         broadcast NotarFallbackVote(s, hash(b))
-//!         state[s] ← state[s] ∪ {BadWindow}
-//!
-//! upon SafeToSkip(s) do
-//!     trySkipWindow(s)
-//!     if ItsOver ∉ state[s] then
-//!         broadcast SkipFallbackVote(s)
-//!         state[s] ← state[s] ∪ {BadWindow}
-//! ```
-//!
-//! ### Algorithm 2: Helper Functions
-//!
-//! ```text
-//! function tryNotar(Block(s, hash, hashparent))
-//!     if Voted ∈ state[s] then return false
-//!     firstSlot ← (s is the first slot in leader window)
-//!     if firstSlot then
-//!         canVote ← ParentReady(hashparent) ∈ state[s]
-//!     else
-//!         canVote ← VotedNotar(hashparent) ∈ state[s-1]
-//!     if canVote then
-//!         broadcast NotarVote(s, hash)
-//!         state[s] ← state[s] ∪ {Voted, VotedNotar(hash)}
-//!         pendingBlocks[s] ← ⊥
-//!         tryFinal(s, hash)
-//!         return true
-//!     return false
-//!
-//! function tryFinal(s, hash(b))
-//!     if BlockNotarized(hash(b)) ∈ state[s] and VotedNotar(hash(b)) ∈ state[s]
-//!        and BadWindow ∉ state[s] then
-//!         broadcast FinalVote(s)
-//!         state[s] ← state[s] ∪ {ItsOver}
-//!
-//! function trySkipWindow(s)
-//!     for k ∈ windowSlots(s) do
-//!         if Voted ∉ state[k] then
-//!             broadcast SkipVote(k)
-//!             state[k] ← state[k] ∪ {Voted, BadWindow}
-//!             pendingBlocks[k] ← ⊥
-//!
-//! function checkPendingBlocks()
-//!     for s : pendingBlocks[s] ≠ ⊥ do
-//!         tryNotar(pendingBlocks[s])
-//! ```
-//!
-//! ## C++ Implementation vs Alpenglow White Paper
-//!
-//! The C++ reference uses a **simplified protocol** without fallback votes.
-//! Rust supports both modes via `enable_fallback_protocol` constructor parameter.
-//!
-//! ### Vote Types
-//!
-//! | Vote Type | White Paper | C++ (wire) | Rust (internal) |
-//! |-----------|-------------|------------|-----------------|
-//! | Notarize  | ✅          | ✅         | ✅              |
-//! | Finalize  | ✅          | ✅         | ✅              |
-//! | Skip      | ✅          | ✅         | ✅              |
-//! | NotarizeFallback | ✅   | ❌         | ✅ (filtered)   |
-//! | SkipFallback     | ✅   | ❌         | ✅ (filtered)   |
-//!
-//! ### `enable_fallback_protocol` Option
-//!
-//! - **`false` (default, C++ compatible)**: 3 vote types only (Notarize, Finalize, Skip).
-//!   - Fallback votes are filtered in `broadcast_vote()`
-//!   - `SafeToNotar` / `SafeToSkip` events are NOT processed
-//!   - `Notarize + Skip` from same validator is **allowed** (C++ pool.cpp behavior)
-//!   - Timeout check: `its_over` (voted_final in C++) blocks timeout
-//!
-//! - **`true` (full Alpenglow)**: All 5 vote types.
-//!   - Full White Paper algorithm with fallback mechanism
-//!   - `Notarize + Skip` from same validator is **misbehavior**
-//!   - Timeout check: `is_voted` (any vote) blocks timeout
-//!
-//! ### C++ Differences from White Paper
-//!
-//! 1. **No fallback votes**: C++ TL schema has no `NotarizeFallback` / `SkipFallback`
-//!
-//! 2. **Leader Windows**: C++ uses explicit `LeaderWindow` struct with `available_bases`,
-//!    `slots[]`, and `had_timeouts` flag. Windows are created lazily.
-//!
-//! 3. **ParentReady is per-window**: In C++, `ParentReady` event is received per-window,
-//!    not per-slot. The `available_bases` set in `LeaderWindow` tracks valid parents.
-//!
-//! 4. **Timeout behavior**:
-//!    - C++ `alarm()` checks `voted_final` (not `is_voted`), allowing Skip after Notarize
-//!    - C++ uses `multimap<Timestamp, slot>` for timeouts
-//!    - Fresh timeout scheduled on `LeaderWindowObserved` (= `on_window_base_ready`)
-//!
-//! 5. **trySkipWindow**: C++ iterates all window slots and checks `voted_final`,
-//!    not `is_voted`, allowing Skip after Notarize
-//!
-//! 6. **Vote thresholds**:
-//!    - `BlockNotarized`: notar(b) >= 2/3 (certificate threshold)
-//!    - `SafeToNotar`: notar(b) >= 1/3 AND notar(b) + skip >= 2/3
-//!    - `SafeToSkip`: skip + sum(notar) - max(notar) >= 1/3
-//!
-//! 7. **Block identification**: Uses `BlockIdExt` (full block ID) in votes,
-//!    not just hash. Parent references use `CandidateParentInfo` (slot + hash).
-//!
-//! 8. **Empty blocks**: C++ supports empty blocks for finalization recovery
-//!    (not in White Paper). Empty block has `block = None`, must have parent.
-//!
-//! ## Design Principles
-//!
-//! 1. **No external dependencies** - TL, network, etc. are not used directly
-//! 2. **Event-based output** - All actions produce `SimplexEvent` (no callbacks)
-//! 3. **Self-contained timing** - FSM manages its own timeouts via `check_all()` + `get_next_timeout()`
-//! 4. **Independent testing** - FSM can be unit tested without network or TL dependencies
-//! 5. **C++ compatible** - Block types match C++ implementation (BlockIdExt in votes)
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────────┐
-//! │ SimplexState FSM                                                    │
-//! │                                                                     │
-//! │  ┌─────────────────────────────┐  ┌─────────────────────────────┐   │
-//! │  │ Consensus State             │  │ Vote Accounting             │   │
-//! │  │ (from SimplexConsensusImpl) │  │ (from SimplexPoolImpl)      │   │
-//! │  │                             │  │                             │   │
-//! │  │ - leader_windows            │  │ - slot_votes                │   │
-//! │  │ - pending_slots             │  │ - notarize weights          │   │
-//! │  │ - first_non_finalized_slot  │  │ - skip weights              │   │
-//! │  │ - timeout state             │  │ - certificate tracking      │   │
-//! │  └─────────────────────────────┘  └─────────────────────────────┘   │
-//! │                                                                     │
-//! │  ┌─────────────────────────────────────────────────────────────┐    │
-//! │  │ Event Queue (VecDeque<SimplexEvent>)                        │    │
-//! │  │                                                             │    │
-//! │  │  - BroadcastVote(vote)                                      │    │
-//! │  │  - BlockFinalized(slot, block)                              │    │
-//! │  │  - SlotSkipped(slot)                                        │    │
-//! │  └─────────────────────────────────────────────────────────────┘    │
-//! │                                                                     │
-//! │  Input API:                      Output (pull events):              │
-//! │  - on_candidate(desc, ...)       - pull_event() -> SimplexEvent     │
-//! │  - on_vote(desc, ...)            - pending_event_count()            │
-//! │  - check_all(desc)               - has_pending_events()             │
-//! └─────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Event Model
-//!
-//! Instead of callbacks, SimplexState produces events that are queued internally:
-//! 1. Call FSM methods (`on_candidate`, `on_vote`, `check_all`)
-//! 2. Pull events with `pull_event()` until it returns `None`
-//! 3. Process each event (broadcast vote, notify listener, etc.)
-//!
-//! This enables:
-//! - **Testing**: Inspect produced events without mocking
-//! - **Debugging**: Dump event queue for diagnostics
-//! - **Tracing**: All FSM outputs go through a single mechanism
-//!
-//! ## Timeout Model
-//!
-//! The FSM controls its own timing. Clients should:
-//! 1. Call `check_all(desc)` whenever `get_next_timeout()` has elapsed (or earlier is ok)
-//! 2. `check_all()` processes pending timeouts and updates `next_timeout`
-//! 3. After any event (`on_candidate`, `on_vote`), `next_timeout` may change
+//! Flow summary:
+//! 1. `on_candidate()` stores and validates candidates, then attempts `try_notar()`.
+//! 2. `on_vote()` updates per-slot vote weights and calls `check_thresholds_and_trigger()`.
+//! 3. Threshold handling emits certificates/events and can trigger `try_final()`.
+//! 4. `check_all()` drives timeout handling via `process_timeouts()` / `try_skip_window()`.
+//! 5. Callers drain `SimplexEvent` via `pull_event()` and execute side effects.
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! use simplex::{SimplexState, SimplexEvent};
+//! use simplex::{RawVoteData, SimplexEvent, SimplexState};
 //!
-//! // Create FSM
-//! let mut state = SimplexState::new(&session_description, false).expect("Invalid session config");
+//! let mut state = SimplexState::new(&session_description)?;
+//! let _ = state.on_candidate(&session_description, candidate);
+//! let _ = state.on_vote(
+//!     &session_description,
+//!     validator_idx,
+//!     vote,
+//!     signature,
+//!     RawVoteData::default(),
+//! );
+//! state.check_all(&session_description);
 //!
-//! // Main loop
-//! loop {
-//!     let timeout = state.get_next_timeout();
-//!     // wait for timeout or incoming event...
-//!     
-//!     // Process incoming events (handle errors as needed)
-//!     if let Err(e) = state.on_candidate(&session_description, candidate) {
-//!         log::warn!("Misbehavior: {}", e);
-//!     }
-//!     if let Err(e) = state.on_vote(&session_description, validator_idx, vote) {
-//!         log::warn!("Misbehavior: {}", e);
-//!     }
-//!     
-//!     // Check for timeouts and pending actions
-//!     state.check_all(&session_description);
-//!     
-//!     // Process all produced events
-//!     while let Some(event) = state.pull_event() {
-//!         match event {
-//!             SimplexEvent::BroadcastVote(vote) => {
-//!                 receiver.send_vote(vote);
-//!             }
-//!             SimplexEvent::BlockFinalized(e) => {
-//!                 listener.on_block_committed(e.slot, e.block, ...);
-//!             }
-//!             SimplexEvent::SlotSkipped(e) => {
-//!                 listener.on_block_skipped(e.slot);
-//!             }
+//! while let Some(event) = state.pull_event() {
+//!     match event {
+//!         SimplexEvent::BroadcastVote(v) => receiver.send_vote(v),
+//!         SimplexEvent::BlockFinalized(e) => {
+//!             listener.on_block_committed(e.slot, e.block_hash, ...);
 //!         }
+//!         _ => {}
 //!     }
 //! }
 //! ```
@@ -255,18 +60,9 @@ use crate::{
         ConflictReason, ConflictingVoteType, MisbehaviorProof, VoteDescriptor, VoteResult,
     },
     session_description::SessionDescription,
+    session_processor::{SlotDiagnostic, SlotWaitPhase, WindowDiagnostic},
     RawVoteData, ValidatorWeight,
 };
-
-/// Maximum number of slots ahead of `first_non_finalized_slot` that the FSM
-/// will accept. Any vote, candidate, or certificate referencing a slot beyond
-/// this horizon is rejected to prevent a Byzantine validator from triggering
-/// unbounded window/slot allocation (DoS).
-///
-/// Note: C++ has no equivalent cap. This is a Rust-only defense-in-depth measure.
-/// 10,000 is generous enough to never affect liveness under normal conditions.
-pub const MAX_FUTURE_SLOTS: u32 = 10_000;
-
 use std::{
     cmp,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -276,132 +72,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use ton_block::{error, fail, BlockIdExt, Result, UInt256};
-
-/*
-    ============================================================================
-    SimplexState Options
-    ============================================================================
-*/
-
-/// Configuration options for SimplexState
-///
-/// Controls behavior of the consensus FSM, particularly around fallback
-/// protocol and C++ compatibility.
-#[derive(Clone, Debug)]
-pub struct SimplexStateOptions {
-    /// Enable fallback protocol (SafeToNotar/SafeToSkip and fallback votes)
-    ///
-    /// When `false` (default, C++ compatible):
-    /// - SafeToNotar/SafeToSkip events are not processed
-    /// - Fallback votes (NotarizeFallback, SkipFallback) are not broadcast
-    ///
-    /// When `true` (full Alpenglow):
-    /// - Full White Paper algorithm with fallback mechanism
-    pub enable_fallback_protocol: bool,
-
-    /// Allow skip vote after notarize for same slot (and vice versa)
-    ///
-    /// When `true` (default, C++ compatible):
-    /// - Notarize + Skip from same validator is ALLOWED
-    /// - Matches C++ pool.cpp behavior
-    ///
-    /// When `false` (Alpenglow strict mode):
-    /// - Notarize + Skip from same validator is MISBEHAVIOR
-    pub allow_skip_after_notarize: bool,
-
-    /// Require parent to be finalized (not just notarized) for block generation
-    ///
-    /// When `false` (default, C++ compatible):
-    /// - Parent can be notarized OR finalized to build child block
-    /// - Matches C++ pool.cpp behavior (parent_slot->state->notarized.has_value())
-    /// - Allows progress even when finalization is delayed
-    /// - Prevents deadlock when some validators vote skip while others vote finalize
-    ///
-    /// When `true` (strict mode):
-    /// - Parent must be finalized before child block can be generated
-    /// - Use for testing sequential finalization scenarios
-    /// - WARNING: Can cause deadlock if finalization is blocked
-    ///
-    /// C++ uses notarized parent check (not finalized) for collation availability.
-    pub require_finalized_parent: bool,
-
-    /// Use notarized-parent chain semantics for parenting/progress (C++ pool `now_` model).
-    ///
-    /// When `false` (legacy ParentReady-driven window progression):
-    /// - Leader window advancement / timeout scheduling is driven via `on_window_base_ready()` (finalization)
-    /// - First-slot parent readiness is tracked per-window (`LeaderWindow.available_bases`)
-    /// - `first_non_progressed_slot` / `Slot.available_base` / `Slot.skipped` are still tracked for consistency,
-    ///   but do not drive leader-window progression
-    ///
-    /// When `true` (C++ pool.cpp parity, default for `cpp_compatible()`):
-    /// - Progress cursor `first_non_progressed_slot` advances on **(notarized OR skipped)**,
-    ///   like C++ `PoolImpl::advance_present()` / `maybe_publish_new_leader_windows()`
-    /// - Per-slot `available_base` (optional-of-optional) is the canonical parent chain:
-    ///   - `None` = base unknown
-    ///   - `Some(None)` = genesis base
-    ///   - `Some(Some(id))` = concrete parent candidate id
-    /// - Leader window advancement / timeout scheduling follows the progress cursor
-    ///
-    /// Both modes maintain the tracking state (`available_base`, `skipped`, `first_non_progressed_slot`)
-    /// to keep `SimplexState` internally consistent.
-    pub use_notarized_parent_chain: bool,
-}
-
-impl Default for SimplexStateOptions {
-    fn default() -> Self {
-        Self {
-            // C++ compatible mode by default
-            enable_fallback_protocol: false,
-            allow_skip_after_notarize: true,
-            // C++ allows notarized blocks as parents (not just finalized)
-            require_finalized_parent: false,
-            // C++ pool.cpp parity: notarized-parent chain drives window progression.
-            use_notarized_parent_chain: true,
-        }
-    }
-}
-
-impl SimplexStateOptions {
-    /// Create options for C++ compatible mode (default)
-    pub fn cpp_compatible() -> Self {
-        Self::default()
-    }
-
-    /// Create options for full Alpenglow mode
-    #[allow(dead_code)]
-    pub fn alpenglow() -> Self {
-        Self {
-            enable_fallback_protocol: true,
-            allow_skip_after_notarize: false,
-            require_finalized_parent: false,
-            use_notarized_parent_chain: false,
-        }
-    }
-
-    /// Create options for strict sequential mode (for testing deadlock scenarios)
-    ///
-    /// WARNING: This mode requires parent to be finalized, which can cause deadlock
-    /// if some validators vote skip while others vote finalize. Use only for testing.
-    #[allow(dead_code)]
-    pub fn strict_sequential() -> Self {
-        Self {
-            enable_fallback_protocol: false,
-            allow_skip_after_notarize: true,
-            require_finalized_parent: true,
-            use_notarized_parent_chain: false,
-        }
-    }
-}
-
-/*
-    ============================================================================
-    Constants
-    ============================================================================
-*/
-
-/// Maximum number of notar-fallback votes allowed per validator per slot
-/// Reference: C++ pool.cpp TooManyFallbackVotesMisbehaviorProof (>3 = misbehavior)
-const MAX_NOTAR_FALLBACK_VOTES_PER_VALIDATOR: usize = 3;
 
 /*
     ============================================================================
@@ -456,26 +126,6 @@ pub struct SkipVote {
     pub slot: SlotIndex,
 }
 
-/// Notarization fallback vote - fallback notarization for a block
-///
-/// Algorithm 1: upon SafeToNotar(s, hash(b)) do broadcast NotarFallbackVote(s, hash(b))
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NotarizeFallbackVote {
-    /// Slot number
-    pub slot: SlotIndex,
-    /// Candidate hash being notarized via fallback
-    pub block_hash: UInt256,
-}
-
-/// Skip fallback vote - fallback skip for a slot
-///
-/// Algorithm 1: upon SafeToSkip(s) do broadcast SkipFallbackVote(s)
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkipFallbackVote {
-    /// Slot to skip
-    pub slot: SlotIndex,
-}
-
 /// Vote enum - all vote types for FSM processing
 ///
 /// Reference: C++ Vote variant in consensus-bus.h
@@ -487,10 +137,6 @@ pub enum Vote {
     Finalize(FinalizeVote),
     /// Skip vote
     Skip(SkipVote),
-    /// Notarization fallback vote
-    NotarizeFallback(NotarizeFallbackVote),
-    /// Skip fallback vote
-    SkipFallback(SkipFallbackVote),
 }
 
 /*
@@ -587,8 +233,7 @@ pub struct NotarizationReachedEvent {
 ///
 /// This event is emitted when a slot receives enough skip votes
 /// (2/3 + 1 of validator weight). Used for broadcasting the skip
-/// certificate to other validators (C++ mode only - Alpenglow paper
-/// doesn't have explicit skip certificates).
+/// certificate to other validators.
 #[derive(Clone, Debug)]
 pub struct SkipCertificateReachedEvent {
     /// Slot number
@@ -626,7 +271,7 @@ pub struct FinalizationReachedEvent {
 /// - `BlockFinalized` → Notify SessionListener::on_block_committed
 /// - `SlotSkipped` → Notify SessionListener::on_block_skipped
 /// - `NotarizationReached` → Cache serialized notarization certificate in receiver
-/// - `SkipCertificateReached` → Broadcast skip certificate to validators (C++ mode only)
+/// - `SkipCertificateReached` → Relay skip certificate to validators
 /// - `FinalizationReached` → Cache finalization certificate and relay to peers
 #[derive(Clone, Debug)]
 pub enum SimplexEvent {
@@ -655,7 +300,7 @@ pub enum SimplexEvent {
     ///
     /// Reference: C++ pool.cpp skip certificate creation
     /// Used to broadcast skip certificate to validators.
-    /// Only emitted in C++ compatibility mode.
+    /// Emitted once per newly stored skip certificate.
     SkipCertificateReached(SkipCertificateReachedEvent),
 
     /// A finalization threshold was reached (certificate created)
@@ -685,21 +330,20 @@ struct Slot {
     /// - `Some(None)` = genesis base (RawParentId{})
     /// - `Some(Some(id))` = concrete parent candidate id
     ///
-    /// This field is always maintained for state consistency. When
-    /// `SimplexStateOptions::use_notarized_parent_chain` is enabled, it is used
-    /// to propagate bases across (notarized OR skipped) slots like C++ pool.cpp.
+    /// This field tracks the canonical parent chain across (notarized OR skipped)
+    /// slots like C++ pool.cpp.
     available_base: Option<CandidateParent>,
 
     /// Pending block candidate waiting for parent/conditions
-    /// Alpenglow: pendingBlocks[s]
+    /// Pending candidate for slot retry logic.
     pending_block: Option<Candidate>,
 
     /// Has this node voted in this slot?
-    /// Alpenglow: Voted ∈ state[s]
+    /// Local voted flag for this slot.
     is_voted: bool,
 
     /// Block we voted to notarize (if any)
-    /// Alpenglow: VotedNotar(hash) ∈ state[s]
+    /// Local notar vote marker for this slot.
     voted_notar: Option<CandidateParentInfo>,
 
     /// Have we voted to skip this slot?
@@ -722,7 +366,7 @@ struct Slot {
     voted_final: bool,
 
     /// Observed notarization certificate for a block
-    /// Alpenglow: BlockNotarized(hash(b)) ∈ state[s]
+    /// Observed notarization certificate for this slot.
     observed_notar_certificate: Option<CandidateParentInfo>,
 
     /// Has this slot reached skip certificate threshold (2/3)?
@@ -732,12 +376,12 @@ struct Slot {
     skipped: bool,
 
     /// Is consensus finished for this slot?
-    /// Alpenglow: ItsOver ∈ state[s]
-    its_over: bool,
+    /// Local completion marker for this slot.
+    is_completed: bool,
 
-    /// Have we entered fallback mode for this slot's window?
-    /// Alpenglow: BadWindow ∈ state[s]
-    is_bad_window: bool,
+    /// Did this slot get marked by timeout-driven skip handling?
+    /// Window skip marker for this slot.
+    is_timeout_skipped: bool,
 }
 
 impl Slot {
@@ -865,27 +509,6 @@ struct ValidatorVotes {
     /// Finalize vote raw bytes (stored for misbehavior proofs)
     /// Uses Arc<RawBuffer> for memory-efficient sharing
     finalize_raw: Option<RawVoteData>,
-
-    /// Skip fallback vote (at most one per validator)
-    fallback_skip: Option<SkipFallbackVote>,
-
-    /// Skip fallback vote signature (stored for certificate creation, if fallback is added to TL)
-    #[allow(dead_code)]
-    fallback_skip_signature: Option<Vec<u8>>,
-
-    /// Skip fallback vote raw bytes (stored for misbehavior proofs)
-    /// Uses Arc<RawBuffer> for memory-efficient sharing
-    fallback_skip_raw: Option<RawVoteData>,
-
-    /// Notar fallback votes (up to MAX_NOTAR_FALLBACK_VOTES_PER_VALIDATOR)
-    /// Key is candidate hash, value is raw bytes for misbehavior proofs
-    /// Uses Arc<RawBuffer> for memory-efficient sharing
-    fallback_notarize: HashMap<UInt256, RawVoteData>,
-
-    /// Notar fallback vote signatures (stored for certificate creation, if fallback is added to TL)
-    /// Key is candidate hash
-    #[allow(dead_code)]
-    fallback_notarize_signatures: HashMap<UInt256, Vec<u8>>,
 }
 
 /*
@@ -947,23 +570,17 @@ struct SlotVotes {
     /// Total weight that voted notarize OR skip
     notarize_or_skip_weight: ValidatorWeight,
 
-    /// Total weight that voted skip OR skip-fallback
-    skip_or_skip_fallback_weight: ValidatorWeight,
+    /// Total weight that voted skip
+    skip_weight: ValidatorWeight,
 
     /// Have we published BlockNotarized event?
     block_notarized_published: bool,
-
-    /// Have we published SafeToSkip event?
-    safe_to_skip_published: bool,
 
     /// Have we published BlockFinalized event?
     block_finalized_published: bool,
 
     /// Have we published SlotSkipped event?
     slot_skipped_published: bool,
-
-    /// Blocks (by candidate_hash) for which we've published SafeToNotar
-    safe_to_notar_blocks: HashSet<UInt256>,
 
     /// Cached notarization certificate (only one per slot)
     /// Created when notarization threshold (2/3) is reached.
@@ -989,12 +606,10 @@ impl SlotVotes {
             notarize_weight_by_block: HashMap::new(),
             finalize_weight_by_block: HashMap::new(),
             notarize_or_skip_weight: 0,
-            skip_or_skip_fallback_weight: 0,
+            skip_weight: 0,
             block_notarized_published: false,
-            safe_to_skip_published: false,
             block_finalized_published: false,
             slot_skipped_published: false,
-            safe_to_notar_blocks: HashSet::new(),
             notarize_certificate: None,
             finalize_certificate: None,
             skip_certificate: None,
@@ -1070,11 +685,6 @@ impl SlotVotes {
         }
         self.skip_certificate = Some(certificate);
         Ok(true)
-    }
-
-    /// Get validator votes with bounds checking (returns None if out of bounds)
-    fn get_validator_votes(&self, validator_idx: ValidatorIndex) -> Option<&ValidatorVotes> {
-        self.votes.get(validator_idx.value() as usize)
     }
 
     /// Get mutable validator votes with bounds checking (returns None if out of bounds)
@@ -1154,7 +764,6 @@ impl SlotVotes {
     /// # Returns
     ///
     /// SkipCert containing the vote and all matching signatures
-    #[allow(dead_code)]
     fn create_skip_cert(&self, slot: SlotIndex) -> SkipCert {
         let vote = SkipVote { slot };
         let signatures = self.collect_skip_signatures();
@@ -1370,9 +979,8 @@ pub(crate) struct SimplexState {
     ///
     /// Mirrors C++ `PoolImpl::now_` (pool.cpp maybe_publish_new_leader_windows()).
     ///
-    /// This field is always maintained for state consistency. When
-    /// `SimplexStateOptions::use_notarized_parent_chain` is enabled, it is used
-    /// to drive leader-window progression / timeout scheduling.
+    /// This field drives leader-window progression / timeout scheduling and
+    /// mirrors C++ `PoolImpl::now_`.
     first_non_progressed_slot: SlotIndex,
 
     /*
@@ -1385,6 +993,12 @@ pub(crate) struct SimplexState {
 
     /// Timestamp when current skip_slot times out
     skip_timestamp: Option<SystemTime>,
+
+    /// Fixed per-window base from which all slot deadlines are derived.
+    /// C++ `timeout_base_` (consensus.cpp): set to `now + first_block_timeout`
+    /// when a new leader window starts, never modified within the window.
+    /// Slot at offset k has deadline `timeout_base + (k+1) * target_rate`.
+    timeout_base: Option<SystemTime>,
 
     /// First block timeout (adaptive)
     first_block_timeout: Duration,
@@ -1399,9 +1013,10 @@ pub(crate) struct SimplexState {
     */
     /// Slots per leader window
     slots_per_leader_window: u32,
-
-    /// SimplexState options (fallback protocol, etc.)
-    opts: SimplexStateOptions,
+    /// Maximum accepted leader-window desync.
+    ///
+    /// C++ parity: `params_.max_leader_window_desync` bound used in consensus/pool ingress.
+    max_leader_window_desync: u32,
 
     /// Throttle counter for `ensure_window_exists` rejection warnings.
     /// Prevents log flooding when standstill re-broadcasts reference far-future windows.
@@ -1426,7 +1041,6 @@ impl SimplexState {
     /// # Arguments
     ///
     /// * `desc` - Session description with validators and options
-    /// * `opts` - SimplexState-specific options (fallback protocol, etc.)
     ///
     /// # Errors
     ///
@@ -1438,9 +1052,9 @@ impl SimplexState {
     ///
     /// ```ignore
     /// // C++ compatible mode (default)
-    /// let state = SimplexState::new(&desc, SimplexStateOptions::default())?;
+    /// let state = SimplexState::new(&desc)?;
     /// ```
-    pub fn new(desc: &SessionDescription, opts: SimplexStateOptions) -> Result<Self> {
+    pub fn new(desc: &SessionDescription) -> Result<Self> {
         let slots_per_window = desc.opts().slots_per_leader_window;
         let num_validators = desc.get_total_nodes() as usize;
 
@@ -1454,10 +1068,9 @@ impl SimplexState {
         }
 
         log::trace!(
-            "SimplexState::new: initializing FSM with {} validators, {} slots/window, opts={:?}",
+            "SimplexState::new: initializing FSM with {} validators, {} slots/window",
             num_validators,
-            slots_per_window,
-            opts
+            slots_per_window
         );
 
         let first_block_timeout = desc.opts().first_block_timeout;
@@ -1476,10 +1089,11 @@ impl SimplexState {
             first_non_progressed_slot: SlotIndex(0),
             skip_slot: SlotIndex(0),
             skip_timestamp: None,
+            timeout_base: None,
             first_block_timeout,
             target_rate_timeout,
             slots_per_leader_window: slots_per_window,
-            opts,
+            max_leader_window_desync: desc.opts().max_leader_window_desync,
             window_reject_count: 0,
         };
 
@@ -1552,10 +1166,10 @@ impl SimplexState {
 
     /// Ensure window exists at index.
     ///
-    /// Defense-in-depth: refuses to allocate beyond `MAX_FUTURE_SLOTS` horizon
+    /// Defense-in-depth: refuses to allocate beyond configured future horizon
     /// even if the caller forgot to pre-validate.
     fn ensure_window_exists(&mut self, idx: WindowIndex) {
-        let max_slot = self.first_non_finalized_slot.value() + MAX_FUTURE_SLOTS;
+        let max_slot = self.max_acceptable_slot().value();
         let max_window = WindowIndex(max_slot / self.slots_per_leader_window + 1);
         if idx > max_window {
             self.window_reject_count += 1;
@@ -1651,7 +1265,6 @@ impl SimplexState {
         if self.first_non_finalized_slot > self.first_non_progressed_slot {
             self.first_non_progressed_slot = self.first_non_finalized_slot;
         }
-
         log::trace!(
             "SimplexState::set_first_non_finalized_slot: setting to {} (slots_per_window={})",
             self.first_non_finalized_slot.value(),
@@ -1709,8 +1322,6 @@ impl SimplexState {
             Vote::Notarize(v) => v.slot,
             Vote::Finalize(v) => v.slot,
             Vote::Skip(v) => v.slot,
-            Vote::NotarizeFallback(v) => v.slot,
-            Vote::SkipFallback(v) => v.slot,
         };
         let window_idx = desc.get_window_idx(slot);
         let offset = desc.get_slot_offset_in_window(slot) as usize;
@@ -1746,33 +1357,21 @@ impl SimplexState {
                             &v.block_hash.to_hex_string()[..8]
                         );
                     }
-                    Vote::NotarizeFallback(v) => {
-                        window.slots[offset].is_voted = true;
-                        window.slots[offset].voted_notar =
-                            Some(CandidateParentInfo { slot, hash: v.block_hash.clone() });
-                        log::trace!(
-                            "SimplexState::mark_slot_voted_on_restart: slot {} marked voted_notar_fb={}:{}",
-                            slot.value(),
-                            slot.value(),
-                            &v.block_hash.to_hex_string()[..8]
-                        );
-                    }
                     Vote::Finalize(_) => {
                         // C++: slot->state->voted_final = true
                         window.slots[offset].is_voted = true;
-                        window.slots[offset].its_over = true;
+                        window.slots[offset].is_completed = true;
                         window.slots[offset].voted_final = true;
                         log::trace!(
                             "SimplexState::mark_slot_voted_on_restart: slot {} marked voted_final=true",
                             slot.value()
                         );
                     }
-                    Vote::Skip(_) | Vote::SkipFallback(_) => {
+                    Vote::Skip(_) => {
                         // C++: slot->state->voted_skip = true
                         window.slots[offset].is_voted = true;
                         window.slots[offset].voted_skip = true;
-                        window.slots[offset].is_bad_window = true;
-                        window.slots[offset].pending_block = None;
+                        window.slots[offset].is_timeout_skipped = true;
                         log::trace!(
                             "SimplexState::mark_slot_voted_on_restart: slot {} marked voted_skip=true",
                             slot.value()
@@ -1825,9 +1424,9 @@ impl SimplexState {
             // Ensure window exists
             let _ = self.window_at_mut(window_idx);
 
-            // Check if slot is already finalized (its_over in C++)
+            // Check if slot is already finalized (is_completed in C++)
             let should_skip = if let Some(window) = self.get_window(window_idx) {
-                offset < window.slots.len() && !window.slots[offset].its_over
+                offset < window.slots.len() && !window.slots[offset].is_completed
             } else {
                 false
             };
@@ -1839,8 +1438,7 @@ impl SimplexState {
                         // Reference: C++ consensus.cpp start_up() sets voted_skip=true before publishing SkipVote.
                         window.slots[offset].is_voted = true;
                         window.slots[offset].voted_skip = true;
-                        window.slots[offset].is_bad_window = true;
-                        window.slots[offset].pending_block = None;
+                        window.slots[offset].is_timeout_skipped = true;
 
                         log::trace!(
                             "SimplexState::generate_restart_skip_votes: queueing skip for slot {}",
@@ -1897,12 +1495,6 @@ impl SimplexState {
         self.events.pop_front()
     }
 
-    /// Get the number of pending events in the queue
-    #[allow(dead_code)]
-    pub fn pending_event_count(&self) -> usize {
-        self.events.len()
-    }
-
     /// Check if there are any pending events
     #[cfg(test)]
     pub fn has_pending_events(&self) -> bool {
@@ -1916,6 +1508,16 @@ impl SimplexState {
     #[cfg(test)]
     pub fn try_skip_window_for_test(&mut self, window_idx: WindowIndex) {
         self.try_skip_window(window_idx);
+    }
+
+    #[cfg(test)]
+    pub fn on_block_notarized_for_test(
+        &mut self,
+        desc: &SessionDescription,
+        slot: SlotIndex,
+        block_hash: UInt256,
+    ) {
+        self.on_block_notarized(desc, slot, block_hash);
     }
 
     #[cfg(test)]
@@ -1962,10 +1564,6 @@ impl SimplexState {
                 format!("finalize {}", Self::format_block(v.slot, &v.block_hash))
             }
             Vote::Skip(v) => format!("skip {}", v.slot),
-            Vote::NotarizeFallback(v) => {
-                format!("notar-fb {}", Self::format_block(v.slot, &v.block_hash))
-            }
-            Vote::SkipFallback(v) => format!("skip-fb {}", v.slot),
         }
     }
 
@@ -2032,31 +1630,8 @@ impl SimplexState {
         self.events.push_front(event);
     }
 
-    /// Push a broadcast vote event
-    ///
-    /// Filters out fallback votes (NotarizeFallback, SkipFallback) when
-    /// enable_fallback_protocol is false.
+    /// Push a broadcast vote event.
     fn broadcast_vote(&mut self, vote: Vote) {
-        // Filter fallback votes in C++ compatible mode
-        if !self.opts.enable_fallback_protocol {
-            match &vote {
-                Vote::NotarizeFallback(v) => {
-                    log::warn!(
-                        "SimplexState::broadcast_vote: FILTERED notar-fb (fallback disabled) slot={}",
-                        v.slot
-                    );
-                    return;
-                }
-                Vote::SkipFallback(v) => {
-                    log::warn!(
-                        "SimplexState::broadcast_vote: FILTERED skip-fb (fallback disabled) slot={}",
-                        v.slot
-                    );
-                    return;
-                }
-                _ => {} // Allow Notarize, Finalize, Skip
-            }
-        }
         self.push_event_back(SimplexEvent::BroadcastVote(vote));
     }
 
@@ -2067,14 +1642,9 @@ impl SimplexState {
 
         Reference: C++ pool.cpp check_invariants()
 
-        The C++ implementation (enable_fallback_protocol=false) checks:
+        The C++ implementation checks:
         1. notarize + finalize must have same candidate id (if both exist)
         2. finalize + skip is misbehavior (conflicting votes)
-
-        Full Alpenglow (enable_fallback_protocol=true) is stricter:
-        1. notarize + skip is misbehavior (a validator cannot hedge)
-        2. notarize + finalize must have same candidate id
-        3. finalize + skip is misbehavior
 
         These invariants are checked at the start of check_all() and
         check_thresholds_and_trigger() to ensure state consistency.
@@ -2104,23 +1674,13 @@ impl SimplexState {
 
     /// Check invariants for a single validator's votes in a slot
     ///
-    /// # Invariants (C++ compatible, enable_fallback_protocol=false)
-    ///
     /// 1. If both notarize and finalize exist, they must be for the same candidate:
     ///    `notarize.id == finalize.id`
     ///
     /// 2. Finalize + Skip is conflicting (misbehavior):
     ///    `!(finalize.is_some() && skip.is_some())`
     ///
-    /// # Invariants (Full Alpenglow, enable_fallback_protocol=true)
-    ///
-    /// All of the above, plus:
-    ///
-    /// 3. Notarize + Skip is conflicting (a validator cannot hedge):
-    ///    `!(notarize.is_some() && skip.is_some())`
-    ///
     /// Reference: C++ pool.cpp check_invariants()
-    /// Reference: Solana Alpenglow White Paper (May 2025), voting rules
     fn check_validator_invariants(
         &self,
         _desc: &SessionDescription,
@@ -2144,7 +1704,7 @@ impl SimplexState {
             );
         }
 
-        // Invariant 2: Finalize + Skip is misbehavior (applies to both modes)
+        // Invariant 2: Finalize + Skip is misbehavior.
         assert!(
             !(votes.finalize.is_some() && votes.skip.is_some()),
             "SimplexState INVARIANT VIOLATION: {}/{} has both finalize and skip votes \
@@ -2154,21 +1714,6 @@ impl SimplexState {
             votes.finalize,
             votes.skip
         );
-
-        // Invariant 3: Notarize + Skip is misbehavior when not allowed
-        // When allow_skip_after_notarize=false (Alpenglow strict mode):
-        //   A validator cannot hedge by voting both notarize and skip
-        if !self.opts.allow_skip_after_notarize {
-            assert!(
-                !(votes.notarize.is_some() && votes.skip.is_some()),
-                "SimplexState INVARIANT VIOLATION: {}/{} has both notarize \
-                and skip votes (notarize={:?}, skip={:?})",
-                validator_idx,
-                slot,
-                votes.notarize,
-                votes.skip
-            );
-        }
     }
 
     /*
@@ -2188,29 +1733,42 @@ impl SimplexState {
     ///
     /// Reference: C++ set_timeouts()
     ///
-    /// Alpenglow Algorithm 2:
+    /// Pseudocode equivalent:
     /// ```text
     /// function setTimeouts(s)   // s is first slot of window
     ///   for i ∈ windowSlots(s) do   // set timeouts for all slots
     ///     schedule event Timeout(i) at time clock()+Δtimeout+(i−s+1)·Δblock
     /// ```
-    pub(crate) fn set_timeouts(&mut self, desc: &SessionDescription) {
+    fn set_timeouts(&mut self, desc: &SessionDescription) {
         let window_start = self.current_leader_window_idx * self.slots_per_leader_window;
 
         self.skip_slot = window_start;
-        //TODO: LK: in C++ first slot in a window has timeout first_block_timeout without target_rate_timeout
-        self.skip_timestamp =
-            Some(desc.get_time() + self.first_block_timeout + self.target_rate_timeout);
+        // C++ consensus.cpp:
+        //   timeout_base_ = Timestamp::in(first_block_timeout_);          // base = now + first_block
+        //   alarm_timestamp() = Timestamp::in(target_rate, timeout_base_); // alarm = base + target_rate
+        // First alarm fires at: now + first_block_timeout + target_rate.
+        self.timeout_base = Some(desc.get_time() + self.first_block_timeout);
+        let first_timeout = self.first_block_timeout + self.target_rate_timeout;
+        self.skip_timestamp = Some(desc.get_time() + first_timeout);
 
-        log::warn!(
+        log::debug!(
             "SimplexState::set_timeouts: ({}/{}) scheduling timeout in {:.3}s \
             (first_block={:.3}s, target_rate={:.3}s)",
             self.current_leader_window_idx,
             self.skip_slot,
-            (self.first_block_timeout + self.target_rate_timeout).as_secs_f64(),
+            first_timeout.as_secs_f64(),
             self.first_block_timeout.as_secs_f64(),
             self.target_rate_timeout.as_secs_f64(),
         );
+    }
+
+    /// Arm/reset startup timeouts when session processing actually starts.
+    ///
+    /// This is called by SessionProcessor on the first active tick (after startup/recovery),
+    /// so skip timers are anchored to "ready" time instead of FSM construction time.
+    pub(crate) fn reset_timeouts_on_start(&mut self, desc: &SessionDescription) {
+        self.restore_default_timeouts(desc);
+        self.set_timeouts(desc);
     }
 
     /// Restore default timeouts (reset adaptive backoff)
@@ -2251,16 +1809,11 @@ impl SimplexState {
         }
     }
 
-    /// Process expired timeouts
+    /// Process expired timeouts.
     ///
-    /// Reference: C++ alarm()
-    ///
-    /// Alpenglow Algorithm 1:
-    /// ```text
-    /// upon Timeout(s) do
-    ///   if Voted ∉ state[s] then
-    ///     trySkipWindow(s)
-    /// ```
+    /// Rule mapping:
+    /// - `Simplex.md` timeout-to-skip transition for the active leader window.
+    /// - C++ `consensus.cpp::alarm()` driving skip escalation.
     fn process_timeouts(&mut self, desc: &SessionDescription) {
         // Check if we have a timeout pending
         let Some(mut skip_timestamp) = self.skip_timestamp else {
@@ -2295,10 +1848,6 @@ impl SimplexState {
             // Ensure window exists
             self.ensure_window_exists(window_idx);
 
-            // Check if we should skip the timeout:
-            // - Alpenglow (enable_fallback_protocol=true): Check is_voted (any vote blocks skip)
-            // - C++ compatible (enable_fallback_protocol=false): Check voted_final OR voted_skip
-            //
             // C++ alarm() checks voted_final and fires once per window (one-shot alarm).
             // Rust process_timeouts fires per-slot, so we must also check voted_skip to
             // prevent repeated skip vote broadcasts for the same window.
@@ -2306,15 +1855,10 @@ impl SimplexState {
             let should_skip_timeout = {
                 let window = self.get_window(window_idx);
                 if let Some(window) = window {
-                    if self.opts.enable_fallback_protocol {
-                        // Alpenglow: Any vote blocks timeout (Voted ∈ state[s])
-                        window.slots[offset].is_voted
-                    } else {
-                        // C++: voted_final or voted_skip blocks timeout.
-                        // C++ alarm is one-shot so only checks voted_final, but Rust fires
-                        // per-slot so we also check voted_skip to avoid re-broadcasting.
-                        window.slots[offset].voted_final || window.slots[offset].voted_skip
-                    }
+                    // C++: voted_final or voted_skip blocks timeout.
+                    // C++ alarm is one-shot so only checks voted_final, but Rust fires
+                    // per-slot so we also check voted_skip to avoid re-broadcasting.
+                    window.slots[offset].voted_final || window.slots[offset].voted_skip
                 } else {
                     continue;
                 }
@@ -2323,17 +1867,14 @@ impl SimplexState {
             // Skip if condition is met
             if !should_skip_timeout {
                 // Get slot state for logging
-                let (is_voted, its_over) = self
+                let (is_voted, is_completed) = self
                     .get_window(window_idx)
-                    .map(|w| (w.slots[offset].is_voted, w.slots[offset].its_over))
+                    .map(|w| (w.slots[offset].is_voted, w.slots[offset].is_completed))
                     .unwrap_or((false, false));
 
                 log::trace!(
-                    "SimplexState::process_timeouts: ({}/{}) timeout expired, voted={}, its_over={} -> skip window",
-                    window_idx,
-                    slot_id,
-                    is_voted,
-                    its_over
+                    "SimplexState::process_timeouts: ({window_idx}/{slot_id}) timeout expired, \
+                    voted={is_voted}, is_completed={is_completed} -> skip window"
                 );
 
                 // Mark window as having timeouts
@@ -2341,42 +1882,43 @@ impl SimplexState {
                     window.had_timeouts = true;
                 }
 
-                // Alpenglow: trySkipWindow(s)
                 self.try_skip_window(window_idx);
 
-                // C++ compatibility: skip entire remaining window at once, then BREAK.
-                // Reference: C++ consensus.cpp alarm() lines 120-133:
+                // C++ behavior: skip entire remaining window at once, then STOP.
+                // Reference: C++ consensus.cpp alarm():
                 //   C++ fires alarm once and skips ALL remaining slots in the window,
-                //   then sets timeout_slot_ = window_end and reschedules.
-                //   Between alarm firings, incoming events (NotarizationObserved,
-                //   skip certs from peers) can advance timeout_slot_ past active slots.
-                //   We break after one window to give incoming events a chance to
-                //   advance skip_slot before we vote skip for more slots.
-                if !self.opts.enable_fallback_protocol {
-                    let window_end_slot = (window_idx + 1) * self.slots_per_leader_window;
-                    if self.skip_slot < window_end_slot {
-                        log::debug!(
-                            "SimplexState::process_timeouts: C++ window skip: \
-                            advancing skip_slot {} -> {} (window_end)",
-                            self.skip_slot,
-                            window_end_slot
-                        );
-                        self.skip_slot = window_end_slot;
-                    }
-                    // Schedule next timeout at target_rate from now (not accumulated)
-                    skip_timestamp = desc.get_time() + self.target_rate_timeout;
-                    self.skip_timestamp = Some(skip_timestamp);
-                    break;
+                //   then sets timeout_slot_ = window_end. Crucially, C++ does NOT
+                //   schedule a new alarm here — the next alarm is only armed when
+                //   LeaderWindowObserved fires for the next window (which applies
+                //   first_block_timeout). Without this, the skip timer races ahead
+                //   of actual window advancement, firing for future windows with
+                //   only target_rate delay instead of first_block_timeout + target_rate,
+                //   causing nodes to vote skip before leaders can produce blocks.
+                let window_end_slot = (window_idx + 1) * self.slots_per_leader_window;
+                if self.skip_slot < window_end_slot {
+                    log::debug!(
+                        "SimplexState::process_timeouts: C++ window skip: \
+                        advancing skip_slot {} -> {} (window_end)",
+                        self.skip_slot,
+                        window_end_slot
+                    );
+                    self.skip_slot = window_end_slot;
                 }
+                // Do NOT reschedule — let advance_leader_window_on_progress_cursor()
+                // re-arm via set_timeouts() with proper first_block_timeout when
+                // the next window actually starts.
+                self.skip_timestamp = None;
+                self.timeout_base = None;
+                break;
             }
         }
     }
 
     /// Apply adaptive timeout backoff based on previous window's timeout history
     ///
-    /// This is used by both:
-    /// - `on_window_base_ready()` (legacy finalization-driven window progression)
-    /// - `advance_leader_window_on_progress_cursor()` (notarized-parent-chain mode)
+    /// This is used by helper paths that populate available bases for collation,
+    /// including `on_window_base_ready()` and
+    /// `advance_leader_window_on_progress_cursor()`.
     ///
     /// Reference: C++ pool.cpp (adaptive backoff logic in window progression)
     ///
@@ -2399,7 +1941,7 @@ impl SimplexState {
             let max_delay = desc.opts().max_backoff_delay;
 
             // Only back off first_block_timeout, not target_rate_timeout.
-            // C++ reference (consensus.cpp:98-99) only backs off first_block_timeout_s_,
+            // C++ reference (`consensus.cpp`) only backs off first_block_timeout_s_,
             // keeping target_rate_s_ constant. Backing off target_rate causes the full
             // rotation of 16 slots to take 16s instead of 8s, making blocks from remote
             // leaders arrive after the skip timeout and preventing finalization.
@@ -2432,7 +1974,7 @@ impl SimplexState {
 
     /// Handle incoming block candidate
     ///
-    /// Reference: Alpenglow Algorithm 1, "upon Block(s, hash, hashparent) do"
+    /// Reference: protocol event handler for candidate reception.
     ///
     /// ```text
     /// if tryNotar(Block(s, hash, hashparent)) then
@@ -2460,7 +2002,7 @@ impl SimplexState {
         );
 
         // Validate leader index
-        // Alpenglow: Each slot has a designated leader from the set of nodes
+        // Each slot has a designated leader from the validator set.
         if leader.value() >= self.num_validators as u32 {
             log::trace!(
                 "SimplexState::on_candidate: ({}/{}) INVALID leader {} >= max {}, dropping",
@@ -2525,17 +2067,17 @@ impl SimplexState {
             parent
         );
 
-        // Alpenglow: if tryNotar(Block(s, hash, hashparent)) then
+        // If try_notar succeeds, continue with pending checks.
         if self.try_notar(desc, slot, &candidate.id.hash, parent.as_ref()) {
             log::trace!(
                 "SimplexState::on_candidate: ({}/{}) try_notar succeeded, checking pending blocks",
                 window_idx,
                 slot
             );
-            // Alpenglow: checkPendingBlocks()
+            // Retry any queued pending candidates.
             self.check_pending_blocks(desc);
         }
-        // Alpenglow: else if Voted ∉ state[s] then
+        // Otherwise, store as pending when slot is not already dominated.
         else {
             let offset = desc.get_slot_offset_in_window(slot) as usize;
 
@@ -2546,13 +2088,8 @@ impl SimplexState {
             // pending — the pending retry (`check_pending_blocks`) will notarize it once
             // the parent base propagates through skip certs.
             //
-            // Alpenglow uses the stricter `is_voted` (any local vote blocks storage).
             let dominated = if let Some(window) = self.get_window(window_idx) {
-                if self.opts.enable_fallback_protocol {
-                    window.slots[offset].is_voted
-                } else {
-                    window.slots[offset].voted_notar.is_some()
-                }
+                window.slots[offset].voted_notar.is_some()
             } else {
                 false
             };
@@ -2630,8 +2167,6 @@ impl SimplexState {
             Vote::Notarize(v) => v.slot,
             Vote::Finalize(v) => v.slot,
             Vote::Skip(v) => v.slot,
-            Vote::NotarizeFallback(v) => v.slot,
-            Vote::SkipFallback(v) => v.slot,
         };
         let window_idx = desc.get_window_idx(slot);
 
@@ -2659,18 +2194,19 @@ impl SimplexState {
             ));
         }
 
-        // Reject far-future slots (DoS protection)
-        if self.is_slot_too_far_ahead(slot) {
+        // Reject far-future vote slots using the C++ `first_too_new_slot` rule.
+        if self.is_vote_slot_too_far_ahead(slot) {
             log::warn!(
-                "SimplexState::on_vote: ({}/{}) REJECTED - slot too far ahead (max={})",
+                "SimplexState::on_vote: ({}/{}) REJECTED - slot too far ahead \
+                (first_too_new={})",
                 window_idx,
                 slot,
-                self.max_acceptable_slot()
+                self.first_too_new_vote_slot()
             );
             return VoteResult::Rejected(format!(
-                "slot {} too far ahead (max={})",
+                "slot {} too far ahead (first_too_new={})",
                 slot,
-                self.max_acceptable_slot()
+                self.first_too_new_vote_slot()
             ));
         }
 
@@ -2683,16 +2219,9 @@ impl SimplexState {
             Vote::Finalize(v) => {
                 self.handle_finalize_vote(desc, validator_idx, v, signature, raw_vote)
             }
-            Vote::NotarizeFallback(v) => {
-                self.handle_notar_fallback_vote(validator_idx, v, raw_vote)
-            }
-            Vote::SkipFallback(v) => {
-                self.handle_skip_fallback_vote(desc, validator_idx, v, raw_vote)
-            }
         };
 
-        // Check thresholds after successful vote processing
-        // This is called once for all vote types, including notar-fallback
+        // Check thresholds after successful vote processing.
         if result.is_applied() && slot >= self.first_non_finalized_slot {
             self.check_thresholds_and_trigger(desc, slot);
         }
@@ -2800,9 +2329,6 @@ impl SimplexState {
             return VoteResult::SlotAlreadyFinalized;
         }
 
-        // Capture before mutable borrow
-        let allow_skip_after_notarize = self.opts.allow_skip_after_notarize;
-
         let slot_votes = self.slot_votes_at(slot);
         let Some(votes) = slot_votes.get_validator_votes_mut(validator_idx) else {
             return VoteResult::Rejected(format!(
@@ -2871,35 +2397,6 @@ impl SimplexState {
             }
         }
 
-        // C++ pool.cpp check_invariants() does NOT check notarize+skip conflict.
-        // Only finalize+skip is misbehavior in C++.
-        //
-        // When allow_skip_after_notarize=true (C++ compatible mode):
-        //   Notarize + Skip is ALLOWED (matches C++ behavior)
-        //
-        // When allow_skip_after_notarize=false (Alpenglow strict mode):
-        //   Notarize + Skip is MISBEHAVIOR (in Alpenglow, once you vote notarize
-        //   on the fast path, you shouldn't also vote skip)
-        if !allow_skip_after_notarize && votes.skip.is_some() {
-            log::trace!(
-                "SimplexState::handle_notarize_vote: ({}/{}) {} has skip, rejecting notarize",
-                window_idx,
-                slot,
-                validator_idx
-            );
-            // Use stored raw bytes from existing skip vote and new raw bytes for proof
-            let existing_raw = votes.skip_raw.clone().unwrap_or_default();
-            return VoteResult::Misbehavior(MisbehaviorProof::conflicting_types(
-                slot,
-                validator_idx,
-                VoteDescriptor::Skip,
-                VoteDescriptor::Notarize(vote.block_hash.clone()),
-                existing_raw,
-                raw_vote,
-                ConflictReason::NotarizeAfterSkip,
-            ));
-        }
-
         // Record vote, signature, and raw bytes (for certificate creation and misbehavior proofs)
         let had_notarize_or_skip = votes.notarize.is_some() || votes.skip.is_some();
         votes.notarize = Some(vote.clone());
@@ -2962,9 +2459,6 @@ impl SimplexState {
             return VoteResult::SlotAlreadyFinalized;
         }
 
-        // Capture before mutable borrow
-        let allow_skip_after_notarize = self.opts.allow_skip_after_notarize;
-
         let slot_votes = self.slot_votes_at(slot);
         let Some(votes) = slot_votes.get_validator_votes_mut(validator_idx) else {
             return VoteResult::Rejected(format!(
@@ -2983,39 +2477,9 @@ impl SimplexState {
             return VoteResult::Duplicate;
         }
 
-        // C++ pool.cpp check_invariants() does NOT check notarize+skip conflict.
-        // Only finalize+skip is misbehavior in C++.
-        //
-        // When allow_skip_after_notarize=true (C++ compatible mode):
-        //   Skip + Notarize is ALLOWED (matches C++ behavior)
-        //
-        // When allow_skip_after_notarize=false (Alpenglow strict mode):
-        //   Skip + Notarize is MISBEHAVIOR (in Alpenglow, once you vote skip
-        //   you shouldn't also vote notarize for the same slot)
-        if !allow_skip_after_notarize && votes.notarize.is_some() {
-            let existing_notar = votes.notarize.as_ref().unwrap();
-            log::trace!(
-                "SimplexState::handle_skip_vote: ({}/{}) {} has notarize, rejecting skip",
-                window_idx,
-                slot,
-                validator_idx
-            );
-            // Use stored raw bytes from existing notarize vote and new raw bytes for proof
-            let existing_raw = votes.notarize_raw.clone().unwrap_or_default();
-            return VoteResult::Misbehavior(MisbehaviorProof::conflicting_types(
-                slot,
-                validator_idx,
-                VoteDescriptor::Notarize(existing_notar.block_hash.clone()),
-                VoteDescriptor::Skip,
-                existing_raw,
-                raw_vote,
-                ConflictReason::NotarizeAfterSkip,
-            ));
-        }
-
         // Record vote, signature, and raw bytes (for certificate creation and misbehavior proofs)
         let had_notarize_or_skip = votes.notarize.is_some() || votes.skip.is_some();
-        let had_skip_or_skip_fallback = votes.skip.is_some() || votes.fallback_skip.is_some();
+        let had_skip = votes.skip.is_some();
         votes.skip = Some(vote);
         votes.skip_signature = Some(signature);
         votes.skip_raw = Some(raw_vote);
@@ -3025,22 +2489,22 @@ impl SimplexState {
         if !had_notarize_or_skip {
             slot_votes.notarize_or_skip_weight += weight;
         }
-        if !had_skip_or_skip_fallback {
-            slot_votes.skip_or_skip_fallback_weight += weight;
+        if !had_skip {
+            slot_votes.skip_weight += weight;
         }
 
         if log::log_enabled!(log::Level::Trace) {
             let total_weight = desc.get_total_weight();
             log::trace!(
-                "SimplexState::handle_skip_vote: ({}/{}) {} +{} -> n|s={}({:.0}%) s|fb={}({:.0}%)",
+                "SimplexState::handle_skip_vote: ({}/{}) {} +{} -> n|s={}({:.0}%) skip={}({:.0}%)",
                 window_idx,
                 slot,
                 validator_idx,
                 weight,
                 slot_votes.notarize_or_skip_weight,
                 100.0 * slot_votes.notarize_or_skip_weight as f64 / total_weight as f64,
-                slot_votes.skip_or_skip_fallback_weight,
-                100.0 * slot_votes.skip_or_skip_fallback_weight as f64 / total_weight as f64
+                slot_votes.skip_weight,
+                100.0 * slot_votes.skip_weight as f64 / total_weight as f64
             );
         }
 
@@ -3167,45 +2631,6 @@ impl SimplexState {
             ));
         }
 
-        // Check conflicts with fallback votes
-        if let Some((first_fb_hash, first_fb_raw)) = votes.fallback_notarize.iter().next() {
-            log::trace!(
-                "SimplexState::handle_finalize_vote: ({}/{}) {} has notar-fb, rejecting finalize",
-                window_idx,
-                slot,
-                validator_idx
-            );
-            return VoteResult::Misbehavior(MisbehaviorProof::conflicting_types(
-                slot,
-                validator_idx,
-                VoteDescriptor::NotarizeFallback(first_fb_hash.clone()),
-                VoteDescriptor::Finalize(vote.block_hash.clone()),
-                first_fb_raw.clone(),
-                raw_vote,
-                ConflictReason::FinalizeAfterNotarFallback,
-            ));
-        }
-
-        if votes.fallback_skip.is_some() {
-            log::trace!(
-                "SimplexState::handle_finalize_vote: ({}/{}) {} has skip-fb, rejecting finalize",
-                window_idx,
-                slot,
-                validator_idx
-            );
-            // Use stored raw bytes from existing skip-fallback vote and new raw bytes for proof
-            let existing_raw = votes.fallback_skip_raw.clone().unwrap_or_default();
-            return VoteResult::Misbehavior(MisbehaviorProof::conflicting_types(
-                slot,
-                validator_idx,
-                VoteDescriptor::SkipFallback,
-                VoteDescriptor::Finalize(vote.block_hash.clone()),
-                existing_raw,
-                raw_vote,
-                ConflictReason::FinalizeAfterSkipFallback,
-            ));
-        }
-
         // Record vote, signature, and raw bytes (for certificate creation and misbehavior proofs)
         votes.finalize = Some(vote.clone());
         votes.finalize_signature = Some(signature);
@@ -3235,225 +2660,16 @@ impl SimplexState {
         VoteResult::Applied
     }
 
-    /// Handle notar-fallback vote
+    /// Check thresholds and trigger internal FSM events.
     ///
-    /// Reference: C++ handle_vote<NotarizeFallbackVote>
-    ///
-    /// # Arguments
-    ///
-    /// * `validator_idx` - Validator index
-    /// * `vote` - Notar-fallback vote content
-    /// * `raw_vote` - Serialized vote bytes (stored for misbehavior proofs)
-    fn handle_notar_fallback_vote(
-        &mut self,
-        validator_idx: ValidatorIndex,
-        vote: NotarizeFallbackVote,
-        raw_vote: RawVoteData,
-    ) -> VoteResult {
-        let slot = vote.slot;
-        let window_idx = slot.window_index(self.slots_per_leader_window);
-
-        if slot < self.first_non_finalized_slot {
-            log::trace!(
-                "SimplexState::handle_notar_fallback_vote: {} < first_non_finalized={}, ignoring",
-                slot,
-                self.first_non_finalized_slot
-            );
-            return VoteResult::SlotAlreadyFinalized;
-        }
-
-        // First pass: check conditions
-        {
-            let slot_votes = self.slot_votes_at(slot);
-            let Some(votes) = slot_votes.get_validator_votes(validator_idx) else {
-                return VoteResult::Rejected(format!(
-                    "validator {} out of bounds for slot {}",
-                    validator_idx, slot
-                ));
-            };
-
-            if votes.fallback_notarize.len() >= MAX_NOTAR_FALLBACK_VOTES_PER_VALIDATOR {
-                log::trace!(
-                    "SimplexState::handle_notar_fallback_vote: ({}/{}) {} too many notar-fb ({})",
-                    window_idx,
-                    slot,
-                    validator_idx,
-                    votes.fallback_notarize.len()
-                );
-                // Note: Exceeding max votes is rejected but not classic misbehavior
-                return VoteResult::Rejected(format!(
-                    "validator {} exceeded max notar-fallback votes ({}) for {}",
-                    validator_idx, MAX_NOTAR_FALLBACK_VOTES_PER_VALIDATOR, slot
-                ));
-            }
-
-            if let Some(ref finalize) = votes.finalize {
-                log::trace!(
-                    "SimplexState::handle_notar_fallback_vote: ({}/{}) {} has finalize, rejecting notar-fb",
-                    window_idx,
-                    slot,
-                    validator_idx
-                );
-                // Use stored raw bytes from existing finalize vote and new raw bytes for proof
-                let existing_raw = votes.finalize_raw.clone().unwrap_or_default();
-                return VoteResult::Misbehavior(MisbehaviorProof::conflicting_types(
-                    slot,
-                    validator_idx,
-                    VoteDescriptor::Finalize(finalize.block_hash.clone()),
-                    VoteDescriptor::NotarizeFallback(vote.block_hash.clone()),
-                    existing_raw,
-                    raw_vote,
-                    ConflictReason::NotarFallbackAfterFinalize,
-                ));
-            }
-        }
-
-        // Second pass: insert vote
-        let slot_votes = self.slot_votes_at(slot);
-        let Some(votes) = slot_votes.get_validator_votes_mut(validator_idx) else {
-            return VoteResult::Rejected(format!(
-                "validator {} out of bounds for slot {}",
-                validator_idx, slot
-            ));
-        };
-
-        // Check if already voted for this block hash
-        if votes.fallback_notarize.contains_key(&vote.block_hash) {
-            log::trace!(
-                "SimplexState::handle_notar_fallback_vote: {}, {}, duplicate hash={}, ignoring",
-                slot,
-                validator_idx,
-                vote.block_hash.to_hex_string()
-            );
-            return VoteResult::Duplicate;
-        }
-
-        // Insert vote with raw bytes
-        votes.fallback_notarize.insert(vote.block_hash.clone(), raw_vote);
-        log::trace!(
-            "SimplexState::handle_notar_fallback_vote: {}, {}, hash={}, fallback_count={}",
-            slot,
-            validator_idx,
-            vote.block_hash.to_hex_string(),
-            votes.fallback_notarize.len()
-        );
-        VoteResult::Applied
-    }
-
-    /// Handle skip-fallback vote
-    ///
-    /// Reference: C++ handle_vote<SkipFallbackVote>
-    ///
-    /// # Arguments
-    ///
-    /// * `desc` - Session description
-    /// * `validator_idx` - Validator index
-    /// * `vote` - Skip-fallback vote content
-    /// * `raw_vote` - Serialized vote bytes (stored for misbehavior proofs)
-    fn handle_skip_fallback_vote(
-        &mut self,
-        desc: &SessionDescription,
-        validator_idx: ValidatorIndex,
-        vote: SkipFallbackVote,
-        raw_vote: RawVoteData,
-    ) -> VoteResult {
-        let slot = vote.slot;
-        let window_idx = desc.get_window_idx(slot);
-
-        if slot < self.first_non_finalized_slot {
-            log::trace!(
-                "SimplexState::handle_skip_fallback_vote: {} < first_non_finalized={}, ignoring",
-                slot,
-                self.first_non_finalized_slot
-            );
-            return VoteResult::SlotAlreadyFinalized;
-        }
-
-        // First pass: check conditions
-        let weight = desc.get_node_weight(validator_idx);
-        {
-            let slot_votes = self.slot_votes_at(slot);
-            let Some(votes) = slot_votes.get_validator_votes(validator_idx) else {
-                return VoteResult::Rejected(format!(
-                    "validator {} out of bounds for slot {}",
-                    validator_idx, slot
-                ));
-            };
-
-            // Already voted (not an error)
-            if votes.fallback_skip.is_some() {
-                log::trace!(
-                    "SimplexState::handle_skip_fallback_vote: {}, {} duplicate skip-fallback, ignoring",
-                    slot,
-                    validator_idx
-                );
-                return VoteResult::Duplicate;
-            }
-
-            if let Some(ref finalize) = votes.finalize {
-                log::trace!(
-                    "SimplexState::handle_skip_fallback_vote: ({}/{}) {} has finalize, rejecting skip-fb",
-                    window_idx,
-                    slot,
-                    validator_idx
-                );
-                // Use stored raw bytes from existing finalize vote and new raw bytes for proof
-                let existing_raw = votes.finalize_raw.clone().unwrap_or_default();
-                return VoteResult::Misbehavior(MisbehaviorProof::conflicting_types(
-                    slot,
-                    validator_idx,
-                    VoteDescriptor::Finalize(finalize.block_hash.clone()),
-                    VoteDescriptor::SkipFallback,
-                    existing_raw,
-                    raw_vote,
-                    ConflictReason::SkipFallbackAfterFinalize,
-                ));
-            }
-        }
-
-        // Second pass: update state
-        let slot_votes = self.slot_votes_at(slot);
-        let Some(votes) = slot_votes.get_validator_votes_mut(validator_idx) else {
-            return VoteResult::Rejected(format!(
-                "validator {} out of bounds for slot {}",
-                validator_idx, slot
-            ));
-        };
-
-        let had_skip_or_skip_fallback = votes.skip.is_some() || votes.fallback_skip.is_some();
-        votes.fallback_skip = Some(vote);
-        votes.fallback_skip_raw = Some(raw_vote);
-
-        // Update weights
-        if !had_skip_or_skip_fallback {
-            slot_votes.skip_or_skip_fallback_weight += weight;
-        }
-
-        if log::log_enabled!(log::Level::Trace) {
-            let total_weight = desc.get_total_weight();
-            log::trace!(
-                "SimplexState::handle_skip_fallback_vote: ({}/{}) {} +{} -> s|fb={}({:.0}%)",
-                window_idx,
-                slot,
-                validator_idx,
-                weight,
-                slot_votes.skip_or_skip_fallback_weight,
-                100.0 * slot_votes.skip_or_skip_fallback_weight as f64 / total_weight as f64
-            );
-        }
-
-        VoteResult::Applied
-    }
-
-    /// Check thresholds and trigger internal FSM events
-    ///
-    /// Reference: C++ check_and_publish_events
+    /// Rule mapping:
+    /// - `Simplex.md` threshold transitions for `Notarize`, `Finalize`, and `Skip`.
+    /// - C++ `pool.cpp::check_and_publish_events`.
     fn check_thresholds_and_trigger(&mut self, desc: &SessionDescription, slot_id: SlotIndex) {
         // Check invariants at the start of threshold processing
         self.check_invariants(desc);
 
         let threshold_66 = desc.get_threshold_66();
-        let threshold_33 = desc.get_threshold_33();
 
         // Clone data we need to avoid borrow issues
         let (notarize_weights, finalize_weights, flags) = {
@@ -3465,24 +2681,18 @@ impl SimplexState {
                 sv.finalize_weight_by_block.clone(),
                 (
                     sv.block_notarized_published,
-                    sv.safe_to_skip_published,
                     sv.block_finalized_published,
                     sv.slot_skipped_published,
-                    sv.notarize_or_skip_weight,
-                    sv.skip_or_skip_fallback_weight,
-                    sv.safe_to_notar_blocks.clone(),
+                    sv.skip_weight,
                 ),
             )
         };
 
         let (
             block_notarized_published,
-            safe_to_skip_published,
             block_finalized_published,
             slot_skipped_published,
-            notarize_or_skip_weight,
-            skip_or_skip_fallback_weight,
-            safe_to_notar_blocks,
+            skip_weight,
         ) = flags;
 
         let window_idx = desc.get_window_idx(slot_id);
@@ -3539,74 +2749,6 @@ impl SimplexState {
                     }
                 }
                 self.on_block_notarized(desc, slot_id, block.clone());
-            }
-
-            // SafeToNotar: skip(s) + notar(b) >= 2/3 AND notar(b) >= 1/3
-            // Reference: Alpenglow White Paper Section 2.5
-            // "SafeToNotar(s, hash(b)): Moreover: skip(s) + notar(b) ≥ 2/3 and notar(b) ≥ 1/3"
-            //
-            // Only relevant when notar alone isn't enough for BlockNotarized.
-            // If notar(b) >= 2/3, BlockNotarized triggers via normal path - no fallback needed.
-            //
-            // SKIP when enable_fallback_protocol = false (C++ compatible mode)
-            if self.opts.enable_fallback_protocol {
-                let skip_plus_notar_b = skip_or_skip_fallback_weight + *weight;
-                if !safe_to_notar_blocks.contains(block)
-                    && *weight < threshold_66  // notar alone isn't enough for normal path
-                    && *weight >= threshold_33
-                    && skip_plus_notar_b >= threshold_66
-                {
-                    log::trace!(
-                        "SimplexState::check_thresholds: ({}/{}) SAFE_TO_NOTAR {}:{} notar={}({:.0}%) skip+notar={}({:.0}%)",
-                        window_idx,
-                        slot_id,
-                        slot_id,
-                        &block.to_hex_string()[..8],
-                        weight,
-                        100.0 * *weight as f64 / total_weight as f64,
-                        skip_plus_notar_b,
-                        100.0 * skip_plus_notar_b as f64 / total_weight as f64
-                    );
-
-                    if let Some(sv) = self.slot_votes.get_mut(&slot_id) {
-                        sv.safe_to_notar_blocks.insert(block.clone());
-                    }
-                    self.on_safe_to_notar(slot_id, block.clone());
-                }
-            }
-        }
-
-        // SafeToSkip: skip(s) + sum(notar(b)) - max(notar(b)) >= 1/3
-        // Reference: Alpenglow White Paper Section 2.5
-        // "SafeToSkip(s): Moreover: skip(s) + sum(notar(b)) − max_b(notar(b)) >= 1/3"
-        //
-        // notarize_or_skip_weight = skip + sum(notar) because each validator votes skip OR notar
-        // So the condition: skip + sum(notar) - max(notar) >= 1/3
-        // Becomes: notarize_or_skip_weight - max(notar) >= threshold_33
-        // Or: notarize_or_skip_weight >= threshold_33 + max(notar)
-        //
-        // Only relevant when skip alone isn't enough for SlotSkipped.
-        // If skip >= 2/3, SlotSkipped triggers via normal path - no fallback needed.
-        //
-        // SKIP when enable_fallback_protocol = false (C++ compatible mode)
-        if self.opts.enable_fallback_protocol && !safe_to_skip_published {
-            let max_notarize = notarize_weights.values().max().copied().unwrap_or(0);
-            if skip_or_skip_fallback_weight < threshold_66  // skip alone isn't enough for normal path
-                && notarize_or_skip_weight >= threshold_33 + max_notarize
-            {
-                log::trace!(
-                    "SimplexState::check_thresholds: ({}/{}) SAFE_TO_SKIP n|s={}({:.0}%) max_notar={}",
-                    window_idx,
-                    slot_id,
-                    notarize_or_skip_weight,
-                    100.0 * notarize_or_skip_weight as f64 / total_weight as f64,
-                    max_notarize
-                );
-
-                if let Some(sv) = self.slot_votes.get_mut(&slot_id) {
-                    sv.safe_to_skip_published = true;
-                }
-                self.on_safe_to_skip(slot_id);
             }
         }
 
@@ -3729,68 +2871,26 @@ impl SimplexState {
                         }
                         self.propagate_base_after_notarization(desc, parent_info.clone());
                     }
+                    // C++ parity: finalization path must run the progress cursor walk
+                    // (`advance_present`) before leader-window publication logic.
+                    self.advance_progress_cursor(desc);
 
-                    // Choose window advancement strategy based on mode
                     log::trace!(
-                        "SimplexState::check_thresholds: ({}/{}) window advancement strategy: \
-                        use_notarized_parent_chain={} current_window={} first_non_progressed_slot={}",
+                        "SimplexState::check_thresholds: ({}/{}) advancing leader window on \
+                        progress cursor current_window={} first_non_progressed_slot={}",
                         window_idx,
                         slot_id,
-                        self.opts.use_notarized_parent_chain,
                         self.current_leader_window_idx,
                         self.first_non_progressed_slot
                     );
-                    if self.opts.use_notarized_parent_chain {
-                        // Behavioral mode: advance leader window based on progress cursor (not finalization).
-                        // Reference: C++ pool.cpp maybe_publish_new_leader_windows()
-                        self.advance_leader_window_on_progress_cursor(desc);
-                    } else {
-                        // Trigger ParentReady for the next window
-                        // When a block is finalized, it becomes a valid parent for the next window's first slot
-                        // Reference: Alpenglow Algorithm 1 "upon ParentReady(window, hash(b))"
-                        //
-                        // Note: C++ reference has this in pool.cpp comment but NOT implemented.
-                        // We implement it here: finalized block in window W becomes parent for window W+1.
-                        //
-                        // No recursion risk: on_window_base_ready -> check_pending_blocks -> try_notar
-                        // only broadcasts votes, doesn't call check_thresholds_and_trigger.
-                        let next_window_idx =
-                            slot_id.window_index(self.slots_per_leader_window) + 1;
-
-                        log::trace!(
-                            "SimplexState::check_thresholds: ({}/{}) triggering ParentReady for {} parent={}:{}",
-                            window_idx,
-                            slot_id,
-                            next_window_idx,
-                            slot_id,
-                            &block.to_hex_string()[..8]
-                        );
-
-                        // Call on_window_base_ready to handle all the logic:
-                        // - Add to available_bases
-                        // - Check pending blocks
-                        // - Update timeouts with adaptive backoff
-                        // Note: This cannot fail because:
-                        // - next_window_idx is small (no overflow)
-                        // - parent slot < next window start slot (by construction)
-                        if let Err(e) =
-                            self.on_window_base_ready(desc, next_window_idx, Some(parent_info))
-                        {
-                            log::error!(
-                                "SimplexState::check_thresholds: ({}/{}) ParentReady failed: {}",
-                                window_idx,
-                                slot_id,
-                                e
-                            );
-                        }
-                    }
+                    self.advance_leader_window_on_progress_cursor(desc);
 
                     break;
                 }
             }
         }
 
-        // SlotSkipped: skip_or_skip_fallback >= 2/3 (skip certificate)
+        // SlotSkipped: skip >= 2/3 (skip certificate)
         // This means finalization is no longer possible for this slot.
         // We only emit this if we haven't already finalized the slot.
         // C++ doesn't gate on sequential order - events are emitted as thresholds are reached.
@@ -3802,17 +2902,17 @@ impl SimplexState {
         if !slot_skipped_published
             && !block_finalized_published
             && can_emit_skip
-            && skip_or_skip_fallback_weight >= threshold_66
+            && skip_weight >= threshold_66
         {
             log::trace!(
-                "SimplexState::check_thresholds: ({}/{}) SKIPPED s|fb={}({:.0}%)",
+                "SimplexState::check_thresholds: ({}/{}) SKIPPED skip={}({:.0}%)",
                 window_idx,
                 slot_id,
-                skip_or_skip_fallback_weight,
-                100.0 * skip_or_skip_fallback_weight as f64 / total_weight as f64
+                skip_weight,
+                100.0 * skip_weight as f64 / total_weight as f64
             );
 
-            // Create and cache skip certificate, emit event (C++ mode only for broadcast)
+            // Create and cache skip certificate, then emit relay event.
             let skip_cert = if let Some(sv) = self.slot_votes.get_mut(&slot_id) {
                 sv.slot_skipped_published = true;
 
@@ -3846,14 +2946,10 @@ impl SimplexState {
 
             self.push_event_back(SimplexEvent::SlotSkipped(SlotSkippedEvent { slot: slot_id }));
 
-            // Emit SkipCertificateReached event for broadcasting (C++ mode only)
-            // Alpenglow paper doesn't require explicit skip certificate broadcast
-            if !self.opts.enable_fallback_protocol {
-                if let Some(cert) = skip_cert {
-                    self.push_event_back(SimplexEvent::SkipCertificateReached(
-                        SkipCertificateReachedEvent { slot: slot_id, certificate: cert },
-                    ));
-                }
+            if let Some(cert) = skip_cert {
+                self.push_event_back(SimplexEvent::SkipCertificateReached(
+                    SkipCertificateReachedEvent { slot: slot_id, certificate: cert },
+                ));
             }
 
             // Update notarized-parent chain tracking (C++ pool.cpp parity, always maintained):
@@ -3863,15 +2959,11 @@ impl SimplexState {
             // Reference: C++ pool.cpp on_skip() → slot.skipped=true, propagate base if needed
             self.propagate_base_after_skip_cert(desc, slot_id);
 
-            // When notarized-parent chain mode is enabled, trigger leader window advancement
-            // based on progress cursor instead of waiting for finalization.
-            // Otherwise, use the legacy per-window propagation approach.
             log::trace!(
                 "SimplexState::check_thresholds: ({}/{}) window advancement after skip: \
-                use_notarized_parent_chain={} current_window={} first_non_progressed_slot={}",
+                current_window={} first_non_progressed_slot={}",
                 window_idx,
                 slot_id,
-                self.opts.use_notarized_parent_chain,
                 self.current_leader_window_idx,
                 self.first_non_progressed_slot
             );
@@ -3889,70 +2981,7 @@ impl SimplexState {
                 );
             }
 
-            if self.opts.use_notarized_parent_chain {
-                self.advance_leader_window_on_progress_cursor(desc);
-            } else {
-                // Check if this is the last slot in the window BEFORE cleanup
-                // If so, and if no block was finalized in this window, we need to
-                // propagate the available bases to the next window (including genesis/None)
-                // This handles the startup case where an entire window is skipped.
-                let current_window_idx = slot_id.window_index(self.slots_per_leader_window);
-                let slot_offset_in_window = slot_id.offset_in_window(self.slots_per_leader_window);
-                let is_last_slot_in_window =
-                    slot_offset_in_window == self.slots_per_leader_window - 1;
-
-                // Capture bases BEFORE cleanup (window may be removed by cleanup)
-                let bases_to_propagate: Option<Vec<CandidateParent>> = if is_last_slot_in_window {
-                    let next_window_idx = current_window_idx + 1;
-
-                    // Check if next window already has available bases (from finalization)
-                    let next_window_has_bases = self
-                        .get_window(next_window_idx)
-                        .map(|w| !w.available_bases.is_empty())
-                        .unwrap_or(false);
-
-                    if !next_window_has_bases {
-                        // Capture current window's available bases before cleanup
-                        self.get_window(current_window_idx)
-                            .map(|w| w.available_bases.iter().cloned().collect())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Propagate bases to next window after cleanup
-                if let Some(bases) = bases_to_propagate {
-                    if !bases.is_empty() {
-                        let next_window_idx = current_window_idx + 1;
-
-                        log::trace!(
-                            "SimplexState: Last slot {} of window {} skipped without finalization, \
-                                propagating {} available base(s) to window {}",
-                            slot_id,
-                            current_window_idx,
-                            bases.len(),
-                            next_window_idx
-                        );
-
-                        for parent in bases {
-                            // Use on_window_base_ready to handle the logic consistently
-                            // Note: No recursion risk (same as BlockFinalized case)
-                            if let Err(e) =
-                                self.on_window_base_ready(desc, next_window_idx, parent.clone())
-                            {
-                                log::error!(
-                                    "SimplexState: SlotSkipped failed to propagate parent {:?} to window {}: {}",
-                                    parent,
-                                    next_window_idx,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            self.advance_leader_window_on_progress_cursor(desc);
         }
     }
 
@@ -3964,7 +2993,7 @@ impl SimplexState {
 
     /// upon BlockNotarized(s, hash(b)) do
     ///
-    /// Reference: Alpenglow Algorithm 1
+    /// Reference: protocol event handler for notarized block.
     ///
     /// ```text
     /// state[s] ← state[s] ∪ {BlockNotarized(hash(b))}
@@ -3999,7 +3028,7 @@ impl SimplexState {
 
         self.ensure_window_exists(window_idx);
 
-        // Alpenglow: state[s] ← state[s] ∪ {BlockNotarized(hash(b))}
+        // Record observed notarization certificate in slot state.
         if let Some(window) = self.get_window_mut(window_idx) {
             window.slots[offset].observed_notar_certificate =
                 Some(CandidateParentInfo { slot, hash: block_hash.clone() });
@@ -4012,168 +3041,67 @@ impl SimplexState {
         let parent_info = CandidateParentInfo { slot, hash: block_hash.clone() };
         self.propagate_base_after_notarization(desc, parent_info.clone());
 
-        // When notarized-parent chain mode is enabled, trigger leader window advancement
-        // based on progress cursor instead of waiting for finalization.
         // Reference: C++ pool.cpp maybe_publish_new_leader_windows()
         log::trace!(
             "SimplexState::on_block_notarized: ({}/{}) window advancement check: \
-            use_notarized_parent_chain={} first_non_progressed_slot={}",
+            first_non_progressed_slot={}",
             window_idx,
             slot,
-            self.opts.use_notarized_parent_chain,
             self.first_non_progressed_slot
         );
-        if self.opts.use_notarized_parent_chain {
-            self.advance_leader_window_on_progress_cursor(desc);
-        }
+        self.advance_leader_window_on_progress_cursor(desc);
 
-        // C++ compatibility: advance skip timer when NotarCert arrives
-        // Reference: C++ consensus.cpp lines 228-243 (NotarizationObserved handler)
-        // When a NotarCert is observed, C++ advances timeout_slot_ to slot+1 and
-        // reschedules the alarm to now + target_rate. This prevents the skip cascade
-        // from racing ahead of active block production.
+        // C++ compatibility: advance skip timer when NotarCert arrives.
+        // Reference: C++ consensus.cpp NotarizationObserved handler.
         //
-        // Important: do NOT shrink skip_timestamp below the current scheduled value.
-        // During the first_block_timeout window, the skip timer is intentionally set
-        // far in the future to give all nodes time to join the overlay. Setting it to
-        // now + target_rate here would bypass that protection entirely.
-        if !self.opts.enable_fallback_protocol {
-            let next_slot = slot + 1;
-            if self.skip_slot <= next_slot {
-                let new_timestamp = desc.get_time() + self.target_rate_timeout;
-                // Only update skip_timestamp if it would be later than current,
-                // preserving the first_block_timeout window.
-                let effective_timestamp = match self.skip_timestamp {
-                    Some(current) if current > new_timestamp => current,
-                    _ => new_timestamp,
-                };
+        // C++ computes the deadline from a fixed per-window timeout_base_:
+        //   alarm = timeout_base_ + (timeout_slot_ - window_start) * target_rate
+        // This anchors all deadlines to the window start time, not to "now".
+        //
+        // Guard: C++ checks `timeout_slot_ <= event->id.slot + 1`.
+        // Since C++ timeout_slot_ = Rust skip_slot + 1, this maps to:
+        //   skip_slot + 1 <= slot + 1  →  skip_slot <= slot
+        // This prevents stale updates and also prevents overwriting a deadline
+        // that was freshly set by advance_leader_window_on_progress_cursor when
+        // notarization of the last window slot caused a window transition.
+        let next_slot = slot + 1;
+        if self.skip_slot <= slot {
+            if let Some(base) = self.timeout_base {
+                let window_start =
+                    self.current_leader_window_idx.window_start(self.slots_per_leader_window);
+
+                // C++ timeout_slot_ = slot+2 normally, slot+1 at window end.
+                // Rust skip_slot = C++ timeout_slot_ - 1.
+                let is_window_end = next_slot.value() % self.slots_per_leader_window == 0;
+                let cpp_timeout_slot =
+                    if is_window_end { next_slot.value() } else { next_slot.value() + 1 };
+
+                let offset = cpp_timeout_slot - window_start.value();
+                let new_deadline = base + self.target_rate_timeout * offset;
+
                 log::debug!(
                     "SimplexState::on_block_notarized: advancing skip timer: \
-                    skip_slot {} -> {next_slot}, new timeout in {:?}{}",
+                    skip_slot {} -> {next_slot}, deadline at base+{}*target_rate",
                     self.skip_slot,
-                    self.target_rate_timeout,
-                    if effective_timestamp != new_timestamp {
-                        " (preserved first_block_timeout)"
-                    } else {
-                        ""
-                    }
+                    offset,
                 );
                 self.skip_slot = next_slot;
-                self.skip_timestamp = Some(effective_timestamp);
+                self.skip_timestamp = Some(new_deadline);
             }
         }
 
-        // Alpenglow: tryFinal(s, hash(b))
+        // Attempt finalization after notarization update.
         self.try_final(desc, slot, &block_hash);
-    }
-
-    /// upon SafeToNotar(s, hash(b)) do
-    ///
-    /// Reference: Alpenglow Algorithm 1
-    ///
-    /// ```text
-    /// trySkipWindow(s)
-    /// if ItsOver ∉ state[s] then
-    ///     broadcast NotarFallbackVote(s, hash(b))
-    ///     state[s] ← state[s] ∪ {BadWindow}
-    /// ```
-    fn on_safe_to_notar(&mut self, slot: SlotIndex, block_hash: UInt256) {
-        log::trace!(
-            "SimplexState::on_safe_to_notar: slot={}, block_hash={}",
-            slot,
-            block_hash.to_hex_string()
-        );
-
-        if slot < self.first_non_finalized_slot {
-            return;
-        }
-
-        let window_idx = slot.window_index(self.slots_per_leader_window);
-        let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
-
-        // Alpenglow: trySkipWindow(s)
-        self.try_skip_window(window_idx);
-
-        // Alpenglow: if ItsOver ∉ state[s] then
-        self.ensure_window_exists(window_idx);
-
-        // Check if we should broadcast (without holding mutable borrow)
-        let should_broadcast =
-            self.get_window(window_idx).map(|w| !w.slots[offset].its_over).unwrap_or(false);
-
-        if should_broadcast {
-            // Alpenglow: broadcast NotarFallbackVote(s, hash(b))
-            log::trace!(
-                "SimplexState::on_safe_to_notar: ({}/{}) broadcasting notar-fb for {}:{}, marking BadWindow",
-                window_idx,
-                slot,
-                slot,
-                &block_hash.to_hex_string()[..8]
-            );
-
-            self.broadcast_vote(Vote::NotarizeFallback(NotarizeFallbackVote { slot, block_hash }));
-
-            // Alpenglow: state[s] ← state[s] ∪ {BadWindow}
-            if let Some(window) = self.get_window_mut(window_idx) {
-                window.slots[offset].is_bad_window = true;
-            }
-        }
-    }
-
-    /// upon SafeToSkip(s) do
-    ///
-    /// Reference: Alpenglow Algorithm 1
-    ///
-    /// ```text
-    /// trySkipWindow(s)
-    /// if ItsOver ∉ state[s] then
-    ///     broadcast SkipFallbackVote(s)
-    ///     state[s] ← state[s] ∪ {BadWindow}
-    /// ```
-    fn on_safe_to_skip(&mut self, slot: SlotIndex) {
-        log::trace!("SimplexState::on_safe_to_skip: slot={}", slot);
-
-        if slot < self.first_non_finalized_slot {
-            return;
-        }
-
-        let window_idx = slot.window_index(self.slots_per_leader_window);
-        let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
-
-        // Alpenglow: trySkipWindow(s)
-        self.try_skip_window(window_idx);
-
-        // Alpenglow: if ItsOver ∉ state[s] then
-        self.ensure_window_exists(window_idx);
-
-        // Check if we should broadcast (without holding mutable borrow)
-        let should_broadcast =
-            self.get_window(window_idx).map(|w| !w.slots[offset].its_over).unwrap_or(false);
-
-        if should_broadcast {
-            // Alpenglow: broadcast SkipFallbackVote(s)
-            log::trace!(
-                "SimplexState::on_safe_to_skip: ({}/{}) broadcasting skip-fb, marking BadWindow",
-                window_idx,
-                slot
-            );
-
-            self.broadcast_vote(Vote::SkipFallback(SkipFallbackVote { slot }));
-
-            // Alpenglow: state[s] ← state[s] ∪ {BadWindow}
-            if let Some(window) = self.get_window_mut(window_idx) {
-                window.slots[offset].is_bad_window = true;
-            }
-        }
     }
 
     /// upon ParentReady(window, hash(b)) do
     ///
-    /// Reference: C++ handle ParentReady event, Alpenglow Algorithm 1
+    /// Reference: C++ parent-ready event handling.
     ///
     /// # Errors
     ///
     /// Returns error if window_idx would cause overflow or parent slot is invalid.
+    #[cfg(test)]
     pub fn on_window_base_ready(
         &mut self,
         desc: &SessionDescription,
@@ -4236,7 +3164,7 @@ impl SimplexState {
 
         self.ensure_window_exists(window_idx);
 
-        // Alpenglow: state[window.first_slot] ← state[window.first_slot] ∪ {ParentReady(hash(b))}
+        // Store newly available parent base for this window.
         if let Some(window) = self.get_window_mut(window_idx) {
             let is_new = window.available_bases.insert(parent.clone());
             log::trace!(
@@ -4274,10 +3202,10 @@ impl SimplexState {
             }
         }
 
-        // Alpenglow: checkPendingBlocks()
+        // Retry pending candidates after parent-base update.
         self.check_pending_blocks(desc);
 
-        // Alpenglow: setTimeouts(window) with adaptive backoff
+        // Arm timeout schedule for the window with adaptive backoff.
         if self.current_leader_window_idx < window_idx {
             log::trace!(
                 "SimplexState::on_window_base_ready: ({}/{}) advancing window {}->{}",
@@ -4327,7 +3255,9 @@ impl SimplexState {
 
     /// function tryNotar(Block(s, hash, hashparent))
     ///
-    /// Reference: Alpenglow Algorithm 2
+    /// Rule mapping:
+    /// - `Simplex.md` helper `tryNotar`.
+    /// - C++ `consensus.cpp::on_candidate_to_notarize` / `try_notarize`.
     ///
     /// ```text
     /// if Voted ∈ state[s] then return false
@@ -4353,47 +3283,18 @@ impl SimplexState {
     ) -> bool {
         let window_idx = desc.get_window_idx(slot);
         let offset = desc.get_slot_offset_in_window(slot) as usize;
-        let is_first = desc.is_first_in_window(slot);
 
         self.ensure_window_exists(window_idx);
 
-        // "Already voted" semantics differ by mode:
-        // - Alpenglow (enable_fallback_protocol=true): any local vote blocks notar
-        // - C++ compatible (enable_fallback_protocol=false): skip does NOT block notar
-        //
-        // Reference (C++): consensus.cpp on_candidate_to_notarize checks only voted_notar,
+        // C++ parity: consensus.cpp on_candidate_to_notarize checks only voted_notar,
         // allowing Notarize after Skip.
         if let Some(window) = self.get_window(window_idx) {
             let slot_state = &window.slots[offset];
-            let already_voted = if self.opts.enable_fallback_protocol {
-                // Alpenglow: Voted ∈ state[s]
-                //
-                // Invariant (debug only): if any "local decision" flag is set,
-                // then `is_voted` must also be set.
-                debug_assert!(
-                    !slot_state.voted_skip || slot_state.is_voted,
-                    "SimplexState invariant violated: voted_skip implies is_voted (slot={})",
-                    slot.value()
-                );
-                debug_assert!(
-                    slot_state.voted_notar.is_none() || slot_state.is_voted,
-                    "SimplexState invariant violated: voted_notar implies is_voted (slot={})",
-                    slot.value()
-                );
-                debug_assert!(
-                    !slot_state.its_over || slot_state.is_voted,
-                    "SimplexState invariant violated: its_over implies is_voted (slot={})",
-                    slot.value()
-                );
-
-                slot_state.is_voted
-            } else {
-                // C++ parity: only voted_notar gates notarization. C++ try_notarize()
-                // does NOT check voted_final/its_over — a slot that was finalized on a
-                // previous run can still be re-notarized after restart (the later
-                // auto-finalize simply skips re-broadcasting).
-                slot_state.voted_notar.is_some()
-            };
+            // C++ parity: only voted_notar gates notarization. C++ try_notarize()
+            // does NOT check voted_final/is_completed — a slot that was finalized on a
+            // previous run can still be re-notarized after restart (the later
+            // auto-finalize simply skips re-broadcasting).
+            let already_voted = slot_state.voted_notar.is_some();
 
             if already_voted {
                 log::trace!("SimplexState::try_notar: slot {} already voted", slot);
@@ -4402,75 +3303,22 @@ impl SimplexState {
         }
 
         // Check can_vote_notar
-        let can_vote_notar = if self.opts.use_notarized_parent_chain {
-            // C++ pool.cpp parity:
-            // Parent readiness is determined by per-slot `available_base` chain (not ParentReady/available_bases).
-            //
-            // Reference: C++ pool.cpp `SlotState::available_base` and request/resolve logic that only
-            // allows extending the chain from the known base.
-            let expected_base = self.get_slot_available_base(desc, slot);
-            let (base_known, expected_parent): (bool, CandidateParent) = match expected_base {
-                Some(parent) => (true, parent),
-                None => (false, None),
-            };
-
-            let candidate_parent: CandidateParent = parent.cloned();
-            let matches_parent = base_known && expected_parent == candidate_parent;
-
-            log::trace!(
-                "SimplexState::try_notar: ({window_idx}/{slot}) notarized-parent chain: \
-                base_known={base_known} expected_base={} candidate_parent={} matches={}",
-                Self::format_parent(expected_parent.as_ref()),
-                Self::format_parent(parent),
-                matches_parent
-            );
-
-            matches_parent
-        } else if is_first {
-            // Alpenglow: firstSlot: ParentReady(hashparent) ∈ state[s]
-            let parent_key: CandidateParent = parent.cloned();
-            let has_parent = self
-                .get_window(window_idx)
-                .map(|w| w.available_bases.contains(&parent_key))
-                .unwrap_or(false);
-
-            log::trace!(
-                "SimplexState::try_notar: ({}/{}) first_in_window, parent={} in_bases={}",
-                window_idx,
-                slot,
-                Self::format_parent(parent),
-                has_parent
-            );
-            has_parent
-        } else {
-            // Alpenglow: not firstSlot: VotedNotar(hashparent) ∈ state[s-1]
-            let Some(parent) = parent else {
-                log::trace!(
-                    "SimplexState::try_notar: ({}/{}) non-first slot, no parent -> cannot vote",
-                    window_idx,
-                    slot
-                );
-                return false;
-            };
-            let prev_slot = slot - 1;
-            let prev_window_idx = desc.get_window_idx(prev_slot);
-            let prev_offset = desc.get_slot_offset_in_window(prev_slot) as usize;
-
-            let voted_notar = self
-                .get_window(prev_window_idx)
-                .and_then(|w| w.slots[prev_offset].voted_notar.as_ref());
-            let matches_parent = voted_notar.map(|voted| voted == parent).unwrap_or(false);
-
-            log::trace!(
-                "SimplexState::try_notar: ({}/{}) parent={} prev_voted={} matches={}",
-                window_idx,
-                slot,
-                Self::format_parent(Some(parent)),
-                Self::format_parent(voted_notar),
-                matches_parent
-            );
-            matches_parent
+        let expected_base = self.get_slot_available_base(desc, slot);
+        let (base_known, expected_parent): (bool, CandidateParent) = match expected_base {
+            Some(parent) => (true, parent),
+            None => (false, None),
         };
+
+        let candidate_parent: CandidateParent = parent.cloned();
+        let can_vote_notar = base_known && expected_parent == candidate_parent;
+
+        log::trace!(
+            "SimplexState::try_notar: ({window_idx}/{slot}) canonical parent check: \
+            base_known={base_known} expected_base={} candidate_parent={} matches={}",
+            Self::format_parent(expected_parent.as_ref()),
+            Self::format_parent(parent),
+            can_vote_notar
+        );
 
         if can_vote_notar {
             log::trace!(
@@ -4481,22 +3329,22 @@ impl SimplexState {
                 &block_hash.to_hex_string()[..8]
             );
 
-            // Alpenglow: broadcast NotarVote(s, hash)
+            // Broadcast notarize vote.
             self.broadcast_vote(Vote::Notarize(NotarizeVote {
                 slot,
                 block_hash: block_hash.clone(),
             }));
 
-            // Alpenglow: state[s] ← state[s] ∪ {Voted, VotedNotar(hash)}
+            // Mark local notar vote state.
             if let Some(window) = self.get_window_mut(window_idx) {
                 window.slots[offset].is_voted = true;
                 window.slots[offset].voted_notar =
                     Some(CandidateParentInfo { slot, hash: block_hash.clone() });
-                // Alpenglow: pendingBlocks[s] ← ⊥
+                // Clear pending candidate after successful notar vote.
                 window.slots[offset].pending_block = None;
             }
 
-            // Alpenglow: tryFinal(s, hash)
+            // Try to finalize immediately if conditions are met.
             self.try_final(desc, slot, block_hash);
 
             return true;
@@ -4507,11 +3355,13 @@ impl SimplexState {
 
     /// function tryFinal(s, hash(b))
     ///
-    /// Reference: Alpenglow Algorithm 2
+    /// Rule mapping:
+    /// - `Simplex.md` helper `tryFinal`.
+    /// - C++ `consensus.cpp` finalize gating on local slot state.
     ///
     /// ```text
     /// if BlockNotarized(hash(b)) ∈ state[s] and VotedNotar(hash(b)) ∈ state[s]
-    ///    and BadWindow ∉ state[s] then
+    ///    and TimeoutSkipped ∉ state[s] then
     ///     broadcast FinalVote(s)
     ///     state[s] ← state[s] ∪ {ItsOver}
     /// ```
@@ -4524,45 +3374,36 @@ impl SimplexState {
         let should_vote_final = if let Some(window) = self.get_window(window_idx) {
             let slot_state = &window.slots[offset];
 
-            // Alpenglow: BlockNotarized(hash(b)) ∈ state[s]
+            // Slot has observed notarization for this hash.
             let has_notar_cert = slot_state
                 .observed_notar_certificate
                 .as_ref()
                 .map(|c| c.hash == *block_hash)
                 .unwrap_or(false);
 
-            // Alpenglow: VotedNotar(hash(b)) ∈ state[s]
+            // Local node voted notarize for this hash.
             let voted_notar =
                 slot_state.voted_notar.as_ref().map(|c| c.hash == *block_hash).unwrap_or(false);
 
-            // Alpenglow: BadWindow ∉ state[s]
-            // C++ try_vote_final does NOT check bad_window — it only checks
-            // voted_skip, voted_final, and voted_notar==notar_cert.
-            let not_bad_window = if self.opts.enable_fallback_protocol {
-                !slot_state.is_bad_window
-            } else {
-                true // C++ doesn't check bad_window in try_vote_final
-            };
-            let not_its_over = !slot_state.its_over;
+            let not_is_completed = !slot_state.is_completed;
             // C++: do not auto-finalize if we already voted skip for this slot.
             // Reference: C++ consensus.cpp: `!voted_skip && !voted_final && voted_notar==id`
-            // Both modes now match C++ strictly: once voted_skip, never finalize.
+            // C++ rule: once voted_skip, never auto-finalize this slot.
             let not_voted_skip = !slot_state.voted_skip;
 
-            let result =
-                has_notar_cert && voted_notar && not_bad_window && not_its_over && not_voted_skip;
+            let result = has_notar_cert && voted_notar && not_is_completed && not_voted_skip;
 
-            // Log when finalize is blocked specifically by voted_skip (Alpenglow mode only)
+            // Log when finalize is blocked by local skip vote.
             if has_notar_cert && voted_notar && !not_voted_skip {
                 log::warn!(
                     "SimplexState::try_final: ({}/{}) FINALIZE BLOCKED by voted_skip! \
-                     cert={} notar={} bad_window={} its_over={} voted_skip={}",
+                     cert={} notar={} bad_window={} is_completed={} voted_skip={}",
                     window_idx,
                     slot,
                     has_notar_cert,
                     voted_notar,
-                    slot_state.is_bad_window,
-                    slot_state.its_over,
+                    slot_state.is_timeout_skipped,
+                    slot_state.is_completed,
                     slot_state.voted_skip,
                 );
             }
@@ -4574,13 +3415,13 @@ impl SimplexState {
                 if slot_state.is_voted {
                     flags.push("V");
                 }
-                if slot_state.is_bad_window {
+                if slot_state.is_timeout_skipped {
                     flags.push("Bad");
                 }
                 if slot_state.voted_skip {
                     flags.push("Skip");
                 }
-                if slot_state.its_over {
+                if slot_state.is_completed {
                     flags.push("Over");
                 }
                 if slot_state.pending_block.is_some() {
@@ -4663,16 +3504,16 @@ impl SimplexState {
                 &block_hash.to_hex_string()[..8]
             );
 
-            // Alpenglow: broadcast FinalVote(s)
+            // Broadcast finalize vote.
             self.broadcast_vote(Vote::Finalize(FinalizeVote {
                 slot,
                 block_hash: block_hash.clone(),
             }));
 
-            // Alpenglow: state[s] ← state[s] ∪ {ItsOver}
+            // Mark slot locally completed.
             // C++: slot->state->voted_final = true
             if let Some(window) = self.get_window_mut(window_idx) {
-                window.slots[offset].its_over = true;
+                window.slots[offset].is_completed = true;
                 window.slots[offset].voted_final = true;
             }
         }
@@ -4680,13 +3521,15 @@ impl SimplexState {
 
     /// function trySkipWindow(s)
     ///
-    /// Reference: Alpenglow Algorithm 2
+    /// Rule mapping:
+    /// - `Simplex.md` helper `trySkipWindow`.
+    /// - C++ `consensus.cpp::alarm()` skip broadcast loop.
     ///
     /// ```text
     /// for k ∈ windowSlots(s) do
     ///     if Voted ∉ state[k] then
     ///         broadcast SkipVote(k)
-    ///         state[k] ← state[k] ∪ {Voted, BadWindow}
+    ///         state[k] ← state[k] ∪ {Voted, TimeoutSkipped}
     ///         pendingBlocks[k] ← ⊥
     /// ```
     fn try_skip_window(&mut self, window_idx: WindowIndex) {
@@ -4694,28 +3537,17 @@ impl SimplexState {
 
         let start_slot = window_idx * self.slots_per_leader_window;
         let num_slots = self.slots_per_leader_window as usize;
-        let enable_fallback = self.opts.enable_fallback_protocol;
-
-        // Collect slots to skip
-        // - Alpenglow (enable_fallback_protocol=true): Skip only unvoted slots (Voted ∉ state[k])
-        // - C++ compatible (enable_fallback_protocol=false): Skip all non-finalized slots
-        //
+        // Collect slots to skip.
         // C++ alarm() checks voted_final, not voted_notar:
         // Reference: C++ consensus.cpp alarm(): if (!affected_slot->voted_final)
         let mut slots_to_skip = Vec::new();
         if let Some(window) = self.get_window(window_idx) {
-            // Alpenglow: for k ∈ windowSlots(s) do
             for i in 0..num_slots {
-                let should_skip = if enable_fallback {
-                    // Alpenglow: if Voted ∉ state[k] then
-                    !window.slots[i].is_voted
-                } else {
-                    // C++: if !voted_final — once this node votes final, it cannot
-                    // vote skip. This prevents split-brain deadlocks where some
-                    // nodes vote skip and others vote final.
-                    // Reference: C++ consensus.cpp alarm(): if (!affected_slot->voted_final)
-                    !window.slots[i].voted_final
-                };
+                // C++: if !voted_final — once this node votes final, it cannot
+                // vote skip. This prevents split-brain deadlocks where some
+                // nodes vote skip and others vote final.
+                // Reference: C++ consensus.cpp alarm(): if (!affected_slot->voted_final)
+                let should_skip = !window.slots[i].voted_final;
                 if should_skip {
                     slots_to_skip.push(start_slot + i as u32);
                 }
@@ -4736,39 +3568,32 @@ impl SimplexState {
             );
         }
 
-        // Skip each unvoted slot
-        // Alpenglow: broadcast SkipVote(k)
+        // Skip each eligible slot.
         for slot in slots_to_skip {
             self.broadcast_vote(Vote::Skip(SkipVote { slot }));
 
-            // Alpenglow: state[k] ← state[k] ∪ {Voted, BadWindow}
-            // Alpenglow: pendingBlocks[k] ← ⊥
             let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
             if let Some(window) = self.get_window_mut(window_idx) {
                 window.slots[offset].is_voted = true;
                 window.slots[offset].voted_skip = true;
-                window.slots[offset].is_bad_window = true;
+                window.slots[offset].is_timeout_skipped = true;
                 // C++ alarm() only sets voted_skip — it does NOT clear pending_block.
                 // The async try_notarize() coroutine can still complete after a skip
                 // vote, producing both Skip and Notar votes for the same slot.
-                // Only clear pending_block in Alpenglow mode (strict Voted gate).
-                if enable_fallback {
-                    window.slots[offset].pending_block = None;
-                }
             }
         }
     }
 
     /// function checkPendingBlocks()
     ///
-    /// Reference: Alpenglow Algorithm 2
+    /// Reference: protocol helper logic.
     ///
     /// ```text
     /// for s : pendingBlocks[s] ≠ ⊥ do   // iterate with increasing s
     ///     tryNotar(pendingBlocks[s])
     /// ```
     fn check_pending_blocks(&mut self, desc: &SessionDescription) {
-        // Alpenglow: for s : pendingBlocks[s] ≠ ⊥ do (iterate with increasing s)
+        // Iterate pending slots in increasing order and retry notarization.
         //
         // Take ownership of pending slots for processing. Slots that still need retry
         // are pushed directly to `self.pending_slots` (which is now empty).
@@ -4797,7 +3622,7 @@ impl SimplexState {
                 });
 
             if let Some((candidate_hash, parent)) = pending_info {
-                // Alpenglow: tryNotar(pendingBlocks[s])
+                // Retry notarization for pending candidate.
                 log::trace!(
                     "SimplexState::check_pending_blocks: ({}/{}) trying pending {}",
                     window_idx,
@@ -4832,14 +3657,41 @@ impl SimplexState {
         self.first_non_finalized_slot
     }
 
-    /// Returns the maximum slot the FSM will accept (inclusive).
-    pub fn max_acceptable_slot(&self) -> SlotIndex {
-        self.first_non_finalized_slot + MAX_FUTURE_SLOTS
+    /// Returns the configured future-slot span for present/progress horizon checks.
+    #[inline]
+    fn max_future_slot_span(&self) -> u32 {
+        self.max_leader_window_desync.saturating_mul(self.slots_per_leader_window)
     }
 
-    /// Returns `true` if `slot` exceeds the acceptable future horizon.
+    /// Returns the maximum slot candidate precheck will accept (inclusive).
+    ///
+    /// Mirrors C++ `PrecheckCandidateBroadcast`:
+    /// `slot > now_ + max_leader_window_desync * slots_per_leader_window`.
+    pub fn max_acceptable_slot(&self) -> SlotIndex {
+        SlotIndex::new(
+            self.first_non_progressed_slot.value().saturating_add(self.max_future_slot_span()),
+        )
+    }
+
+    /// Returns `true` if a candidate slot exceeds the acceptable future horizon.
     pub fn is_slot_too_far_ahead(&self, slot: SlotIndex) -> bool {
         slot > self.max_acceptable_slot()
+    }
+
+    /// Returns the first slot that is considered "too new" for votes/certificates.
+    ///
+    /// Mirrors C++ `pool.cpp`:
+    /// `(now_ / slots_per_window + max_desync + 1) * slots_per_window`
+    pub fn first_too_new_vote_slot(&self) -> SlotIndex {
+        let current_window = self.first_non_progressed_slot.value() / self.slots_per_leader_window;
+        let first_too_new_window =
+            current_window.saturating_add(self.max_leader_window_desync).saturating_add(1);
+        SlotIndex::new(first_too_new_window.saturating_mul(self.slots_per_leader_window))
+    }
+
+    /// Returns `true` if a vote slot is beyond the C++ `first_too_new_slot` bound.
+    pub fn is_vote_slot_too_far_ahead(&self, slot: SlotIndex) -> bool {
+        slot >= self.first_too_new_vote_slot()
     }
 
     /// Get first non-progressed slot (progress cursor)
@@ -4853,7 +3705,6 @@ impl SimplexState {
     }
 
     /// Get current leader window index
-    #[allow(dead_code)]
     pub fn get_current_leader_window_idx(&self) -> WindowIndex {
         self.current_leader_window_idx
     }
@@ -4994,6 +3845,41 @@ impl SimplexState {
         false
     }
 
+    /// Returns the notarized block hash for a slot, if known.
+    ///
+    /// For finalized slots, this prefers the finalization certificate hash and falls back
+    /// to notarization certificate hash from persisted vote state.
+    pub fn get_notarized_block_hash(
+        &self,
+        desc: &SessionDescription,
+        slot: SlotIndex,
+    ) -> Option<UInt256> {
+        if slot < self.first_non_finalized_slot {
+            let sv = self.slot_votes.get(&slot)?;
+            if let Some(cert) = &sv.finalize_certificate {
+                return Some(cert.vote.block_hash.clone());
+            }
+            if let Some(cert) = &sv.notarize_certificate {
+                return Some(cert.vote.block_hash.clone());
+            }
+            return None;
+        }
+
+        self.get_slot_ref(desc, slot)
+            .and_then(|s| s.observed_notar_certificate.as_ref().map(|c| c.hash.clone()))
+    }
+
+    /// Check if a slot has reached Skip certificate state.
+    ///
+    /// This mirrors C++ `slot->state->is_skipped()` checks used by `WaitForParent`.
+    pub fn has_skip_certificate_for_slot(
+        &self,
+        desc: &SessionDescription,
+        slot: SlotIndex,
+    ) -> bool {
+        self.is_slot_skipped_cert(desc, slot)
+    }
+
     /// Check if a slot is finalized (ItsOver flag)
     ///
     /// Used for debug logging to show consensus progress.
@@ -5010,48 +3896,11 @@ impl SimplexState {
 
             if slot >= window_start && slot < window_end {
                 let offset = (slot - window_start) as usize;
-                return window.slots[offset].its_over;
+                return window.slots[offset].is_completed;
             }
         }
 
         false
-    }
-
-    /// Check if this node should generate a block for the current slot
-    #[allow(dead_code)]
-    pub fn should_generate_block(
-        &self,
-        desc: &SessionDescription,
-    ) -> Option<(SlotIndex, Option<CandidateParentInfo>)> {
-        let slot = self.first_non_finalized_slot;
-        let window_idx = desc.get_window_idx(slot);
-        let offset = desc.get_slot_offset_in_window(slot) as usize;
-
-        // Check if we're the leader
-        if !desc.is_self_leader(slot) {
-            return None;
-        }
-
-        // Check if already voted
-        if let Some(window) = self.get_window(window_idx) {
-            if window.slots[offset].is_voted {
-                return None;
-            }
-
-            // Get parent from available bases or previous slot
-            let parent = if desc.is_first_in_window(slot) {
-                // For first slot, pick any available base
-                window.available_bases.iter().next().cloned().flatten()
-            } else {
-                // For other slots, use voted_notar from previous slot
-                let prev_offset = offset - 1;
-                window.slots[prev_offset].voted_notar.clone()
-            };
-
-            return Some((slot, parent));
-        }
-
-        None
     }
 
     /// Get available parent for block generation at a given slot
@@ -5062,10 +3911,6 @@ impl SimplexState {
     /// - `available_base == None` → base unknown yet (no parent available)
     /// - `available_base == Some(None)` → genesis base (parent is None)
     /// - `available_base == Some(Some(id))` → use `id` as parent
-    ///
-    /// Parent validity depends on `require_finalized_parent` option:
-    /// - `require_finalized_parent=false` (C++ mode, default): parent can be notarized OR finalized
-    /// - `require_finalized_parent=true` (strict mode): parent must be finalized
     ///
     /// Reference: C++ pool.cpp `SlotState::available_base`, block-producer.cpp `get_parent()`.
     pub fn get_available_parent(
@@ -5095,9 +3940,6 @@ impl SimplexState {
     /// - `available_base == Some(None)` → genesis base (parent is available)
     /// - `available_base == Some(Some(id))` → parent is available if it is valid
     ///
-    /// Parent validity depends on the `require_finalized_parent` option:
-    /// - `require_finalized_parent=false` (C++ mode, default): parent can be notarized OR finalized
-    /// - `require_finalized_parent=true` (strict mode): parent must be finalized
     pub fn has_available_parent(&self, desc: &SessionDescription, slot: SlotIndex) -> bool {
         let base = self.get_slot_available_base(desc, slot);
         match base {
@@ -5111,79 +3953,15 @@ impl SimplexState {
     ///
     /// A parent is valid if:
     /// - Slot is finalized (< first_non_finalized_slot), OR
-    /// - When `require_finalized_parent = false`: slot has observed notarization certificate
+    /// - Slot has observed notarization certificate
     pub fn is_parent_valid(&self, parent_slot: SlotIndex) -> bool {
         // Finalized slots are always valid parents
         if parent_slot < self.first_non_finalized_slot {
             return true;
         }
 
-        // Strict mode: require finalized parent
-        if self.opts.require_finalized_parent {
-            return false;
-        }
-
-        // C++ mode: notarized block is valid parent
-        // Check if the slot has observed notarization certificate
+        // Notarized block is a valid parent.
         self.has_notarized_block(parent_slot)
-    }
-
-    /// Get indices of validators who voted finalize for a block in a slot
-    ///
-    /// Returns indices of validators who have finalize votes matching the block.
-    /// Used by SessionProcessor to collect signatures for on_block_committed.
-    #[allow(dead_code)] // Replaced by certificate.signatures
-    pub fn get_finalize_voters(
-        &self,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-    ) -> Vec<ValidatorIndex> {
-        if let Some(slot_votes) = self.slot_votes.get(&slot) {
-            slot_votes
-                .votes
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, v)| {
-                    if let Some(ref finalize) = v.finalize {
-                        if finalize.block_hash == *block_hash {
-                            return Some(ValidatorIndex::from(idx));
-                        }
-                    }
-                    None
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Get indices of validators who voted notarize for a block in a slot
-    ///
-    /// Returns indices of validators who have notarize votes matching the block.
-    /// Note: Prefer `get_notarize_certificate` which includes actual signatures.
-    #[allow(dead_code)]
-    pub fn get_notarize_voters(
-        &self,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-    ) -> Vec<ValidatorIndex> {
-        if let Some(slot_votes) = self.slot_votes.get(&slot) {
-            slot_votes
-                .votes
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, v)| {
-                    if let Some(ref notarize) = v.notarize {
-                        if notarize.block_hash == *block_hash {
-                            return Some(ValidatorIndex::from(idx));
-                        }
-                    }
-                    None
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
     }
 
     /// Get cached notarization certificate for a block in a slot
@@ -5201,7 +3979,11 @@ impl SimplexState {
         self.slot_votes.get(&slot).and_then(|sv| sv.get_notarize_certificate(block_hash))
     }
 
-    /// Set notarization certificate from external source (query response)
+    /// Set notarization certificate from external source (query response).
+    ///
+    /// Rule mapping:
+    /// - `Simplex.md` certificate import path for notarized state.
+    /// - C++ `pool.cpp::handle_foreign_certificate` / `handle_saved_certificate`.
     ///
     /// Updates vote accounting with votes from the certificate so FSM recognizes
     /// the block as notarized. Called when we receive a candidate + notar cert
@@ -5337,7 +4119,11 @@ impl SimplexState {
         Ok(true)
     }
 
-    /// Set finalization certificate from external source
+    /// Set finalization certificate from external source.
+    ///
+    /// Rule mapping:
+    /// - `Simplex.md` finalize-certificate state transition.
+    /// - C++ `pool.cpp::handle_foreign_certificate`.
     ///
     /// Updates FSM state as if we had received enough finalize votes to create
     /// the certificate. This is used when receiving a `consensus.simplex.certificate`
@@ -5514,27 +4300,20 @@ impl SimplexState {
         if self.first_non_finalized_slot > self.first_non_progressed_slot {
             self.first_non_progressed_slot = self.first_non_finalized_slot;
         }
+        // C++ parity: after finalization, `now_` is advanced with
+        // `advance_present()` before leader-window publication.
+        self.advance_progress_cursor(desc);
 
-        // Advance leader windows using the active mode's strategy.
-        if self.opts.use_notarized_parent_chain {
-            self.advance_leader_window_on_progress_cursor(desc);
-        } else {
-            let next_window_idx = slot.window_index(self.slots_per_leader_window) + 1;
-            if let Err(e) = self.on_window_base_ready(desc, next_window_idx, Some(parent_info)) {
-                log::error!(
-                    "SimplexState::set_finalize_certificate: ParentReady failed for w{} parent={}:{}: {}",
-                    next_window_idx,
-                    slot,
-                    &block_hash.to_hex_string()[..8],
-                    e
-                );
-            }
-        }
+        self.advance_leader_window_on_progress_cursor(desc);
 
         Ok(true)
     }
 
-    /// Set skip certificate from external source (C++ parity)
+    /// Set skip certificate from external source.
+    ///
+    /// Rule mapping:
+    /// - `Simplex.md` skip-certificate transition.
+    /// - C++ `pool.cpp::handle_foreign_certificate`.
     ///
     /// Updates FSM state as if we had received enough skip votes to create
     /// the certificate. This is used when receiving a `consensus.simplex.certificate`
@@ -5617,7 +4396,7 @@ impl SimplexState {
                 if !had_notarize_or_skip {
                     sv.notarize_or_skip_weight += weight;
                 }
-                sv.skip_or_skip_fallback_weight += weight;
+                sv.skip_weight += weight;
             }
         }
 
@@ -5647,14 +4426,11 @@ impl SimplexState {
         // Only finalization advances it (C++ state.h notify_finalized()).
         // The progress cursor (first_non_progressed_slot) DOES advance on skip.
 
-        // Advance progress cursor
-        if self.opts.use_notarized_parent_chain {
-            // Advance first_non_progressed_slot if this slot was blocking progress
-            if slot == self.first_non_progressed_slot {
-                self.advance_progress_cursor(desc);
-            }
-            self.advance_leader_window_on_progress_cursor(desc);
+        // Advance progress cursor / leader window if this slot was blocking progress.
+        if slot == self.first_non_progressed_slot {
+            self.advance_progress_cursor(desc);
         }
+        self.advance_leader_window_on_progress_cursor(desc);
 
         // Emit SlotSkipped event so SessionProcessor can progress/cleanup state.
         // This mirrors the threshold-driven path which emits SlotSkipped when the
@@ -5664,13 +4440,10 @@ impl SimplexState {
         // C++ parity (pool.cpp handle_saved_certificate): re-gossip every newly
         // accepted certificate regardless of origin.
         //
-        // SkipCertificateReached is only relevant in C++-compatible mode
-        // (Alpenglow paper does not require explicit skip certificate broadcast).
-        if !self.opts.enable_fallback_protocol {
-            self.push_event_back(SimplexEvent::SkipCertificateReached(
-                SkipCertificateReachedEvent { slot, certificate: certificate.clone() },
-            ));
-        }
+        self.push_event_back(SimplexEvent::SkipCertificateReached(SkipCertificateReachedEvent {
+            slot,
+            certificate: certificate.clone(),
+        }));
 
         Ok(true)
     }
@@ -5694,7 +4467,7 @@ impl SimplexState {
     /// Used for testing vote accounting.
     #[cfg(test)]
     pub fn get_skip_weight(&self, slot: SlotIndex) -> ValidatorWeight {
-        self.slot_votes.get(&slot).map_or(0, |sv| sv.skip_or_skip_fallback_weight)
+        self.slot_votes.get(&slot).map_or(0, |sv| sv.skip_weight)
     }
 
     /// Check if a slot has a finalize certificate
@@ -5704,6 +4477,7 @@ impl SimplexState {
     }
 
     /// Get finalization certificate for a specific candidate (slot, hash), if present.
+    #[cfg(test)]
     pub fn get_finalize_certificate(
         &self,
         slot: SlotIndex,
@@ -5733,23 +4507,6 @@ impl SimplexState {
             .unwrap_or(0)
     }
 
-    /// Get the candidate stored in slot state (if any)
-    ///
-    /// Returns the pending block or the voted_notar block info.
-    /// Used for retrieving block data during finalization.
-    #[allow(dead_code)]
-    pub fn get_slot_candidate(&self, slot: SlotIndex) -> Option<&Candidate> {
-        let window_idx = slot.window_index(self.slots_per_leader_window);
-        let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
-
-        if let Some(window) = self.get_window(window_idx) {
-            if offset < window.slots.len() {
-                return window.slots[offset].pending_block.as_ref();
-            }
-        }
-        None
-    }
-
     /*
         ========================================================================
         Notarized-Parent Chain Base Propagation (C++ pool.cpp parity)
@@ -5760,22 +4517,15 @@ impl SimplexState {
         - `Slot.skipped` (skip certificate flag, C++ `SlotState::skipped`)
         - `SimplexState.first_non_progressed_slot` (progress cursor, C++ `PoolImpl::now_`)
 
-        The tracking state is **always maintained** for consistency, regardless of
-        the `SimplexStateOptions::use_notarized_parent_chain` flag.
+        This tracking state drives the active C++-parity progression model.
 
-        When `use_notarized_parent_chain` is **disabled** (legacy ParentReady-driven mode):
-        - Tracking state is updated but does not drive leader-window progression
-        - Leader window advancement / timeout scheduling is driven by `on_window_base_ready()` (finalization)
-
-        When `use_notarized_parent_chain` is **enabled** (C++ pool.cpp parity, default for `cpp_compatible()`):
-        - Tracking state drives leader window advancement / timeout scheduling
         - `first_non_progressed_slot` cursor determines when to advance `current_leader_window_idx`
         - Parent readiness for notarization follows `available_base` chain (not `available_bases`)
 
         This design allows:
         - State consistency: no mode-dependent null/partial state
         - Easy testing: always inspect tracking state in tests
-        - Clean migration: flip flag without restructuring core FSM logic
+        - Clear C++ parity: a single progression model without legacy branching
 
         Reference: C++ pool.cpp `PoolImpl::now_`, `SlotState::available_base`,
         `on_notarization()`, `on_skip()`, `maybe_publish_new_leader_windows()`
@@ -5788,8 +4538,7 @@ impl SimplexState {
     /// Note: the Rust implementation uses max-merge (`add_available_base_max`) instead of
     /// unconditional assignment, to prevent regression when duplicate/late notarizations arrive.
     ///
-    /// This is always called when a block is notarized, regardless of mode.
-    /// The tracked state is used for progress when `use_notarized_parent_chain` is enabled.
+    /// This is always called when a block is notarized.
     fn propagate_base_after_notarization(
         &mut self,
         desc: &SessionDescription,
@@ -5809,11 +4558,8 @@ impl SimplexState {
         // Advance progress cursor through any progressed slots
         self.advance_progress_cursor(desc);
 
-        // In notarized-parent chain mode, base propagation can make pending blocks voteable.
-        // Retry pending blocks immediately to match C++ pool behavior.
-        if self.opts.use_notarized_parent_chain {
-            self.check_pending_blocks(desc);
-        }
+        // Base propagation can make pending blocks voteable immediately.
+        self.check_pending_blocks(desc);
     }
 
     /// Set available base for the first non-finalized slot after restart recovery
@@ -5861,8 +4607,7 @@ impl SimplexState {
     /// allows `check_pending_blocks` / `try_notar` to find the base for any pending
     /// block regardless of skip-cert arrival order.
     ///
-    /// This is always called when a slot is skipped, regardless of mode.
-    /// The tracked state is used for progress when `use_notarized_parent_chain` is enabled.
+    /// This is always called when a slot is skipped.
     fn propagate_base_after_skip_cert(&mut self, desc: &SessionDescription, slot: SlotIndex) {
         // Mark slot as skipped (skip certificate reached)
         if let Some(slot_state) = self.get_slot_mut(desc, slot) {
@@ -5907,52 +4652,25 @@ impl SimplexState {
             }
         }
 
-        // C++ compatibility: advance skip timer when SkipCert arrives
-        // Reference: C++ consensus.cpp lines 228-248 (NotarizationObserved handler)
-        // C++ advances timeout_slot_ on both NotarCert and SkipCert (via LeaderWindowObserved).
-        // Without this, the Rust skip cascade takes ~27s for 27 slots (1s/slot) while
-        // C++ processes entire windows at once and advances the timer on each event.
-        //
-        // Important: do NOT shrink skip_timestamp below the current scheduled value
-        // to preserve the first_block_timeout window.
-        if !self.opts.enable_fallback_protocol {
-            let next_slot = slot + 1;
-            if self.skip_slot <= next_slot {
-                let new_timestamp = desc.get_time() + self.target_rate_timeout;
-                let effective_timestamp = match self.skip_timestamp {
-                    Some(current) if current > new_timestamp => current,
-                    _ => new_timestamp,
-                };
-                log::debug!(
-                    "SimplexState::propagate_base_after_skip_cert: advancing skip timer: \
-                    skip_slot {} -> {}, new timeout in {:?}{}",
-                    self.skip_slot,
-                    next_slot,
-                    self.target_rate_timeout,
-                    if effective_timestamp != new_timestamp {
-                        " (preserved first_block_timeout)"
-                    } else {
-                        ""
-                    }
-                );
-                self.skip_slot = next_slot;
-                self.skip_timestamp = Some(effective_timestamp);
-            }
-        }
+        // C++ parity: do NOT advance the skip timer on skip certs.
+        // C++ consensus.cpp never touches the alarm on skip certificates — they
+        // flow through the pool layer only. Window-crossing skip certs trigger
+        // advance_progress_cursor → advance_leader_window_on_progress_cursor →
+        // set_timeouts(), which properly re-arms with fresh timeout_base. Within
+        // the same window, the fixed-base schedule handles deadlines correctly.
 
         // Advance progress cursor through any progressed slots
         self.advance_progress_cursor(desc);
 
-        // In notarized-parent chain mode, base propagation can make pending blocks voteable.
-        // Retry pending blocks immediately to match C++ pool behavior.
-        if self.opts.use_notarized_parent_chain {
-            self.check_pending_blocks(desc);
-        }
+        // Base propagation can make pending blocks voteable immediately.
+        self.check_pending_blocks(desc);
     }
 
-    /// Advance progress cursor through all progressed slots
+    /// Advance progress cursor through all progressed slots.
     ///
-    /// Reference: C++ pool.cpp maybe_publish_new_leader_windows():
+    /// Rule mapping:
+    /// - `Simplex.md` progress cursor over notarized/skipped slots.
+    /// - C++ `pool.cpp::maybe_publish_new_leader_windows`:
     ///   `while (slot(now_).notarized || slot(now_).skipped) ++now_`
     ///
     /// This helper is always called to keep `first_non_progressed_slot` up-to-date with consensus progress.
@@ -6019,7 +4737,7 @@ impl SimplexState {
     /// Reference: C++ pool.cpp maybe_publish_new_leader_windows()
     ///
     /// This triggers timeout scheduling for the new window and applies adaptive backoff.
-    /// Only called when `SimplexStateOptions::use_notarized_parent_chain` is enabled.
+    /// Called by the active C++-parity progression path.
     ///
     /// # Ordering guarantee (C++ parity: PR #2195)
     ///
@@ -6140,13 +4858,13 @@ impl SimplexState {
                     if slot.is_voted {
                         flags.push("V");
                     }
-                    if slot.is_bad_window {
+                    if slot.is_timeout_skipped {
                         flags.push("Bad");
                     }
                     if slot.voted_skip {
                         flags.push("Skip");
                     }
-                    if slot.its_over {
+                    if slot.is_completed {
                         flags.push("Over");
                     }
                     if slot.pending_block.is_some() {
@@ -6174,21 +4892,15 @@ impl SimplexState {
             .unwrap_or_else(|| ("-".to_string(), "-".to_string(), "-".to_string()));
 
         // Get current slot vote weights
-        let (notar_weight, skip_weight, final_weight, notar_or_skip, skip_or_fb) = self
+        let (notar_weight, skip_weight, final_weight, notar_or_skip) = self
             .slot_votes
             .get(&current_slot)
             .map(|sv| {
                 let max_notar = sv.notarize_weight_by_block.values().max().copied().unwrap_or(0);
                 let max_final = sv.finalize_weight_by_block.values().max().copied().unwrap_or(0);
-                (
-                    max_notar,
-                    sv.skip_or_skip_fallback_weight,
-                    max_final,
-                    sv.notarize_or_skip_weight,
-                    sv.skip_or_skip_fallback_weight,
-                )
+                (max_notar, sv.skip_weight, max_final, sv.notarize_or_skip_weight)
             })
-            .unwrap_or((0, 0, 0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
 
         // Get available bases for current window (formatted list)
         let bases_list: String = self
@@ -6222,7 +4934,7 @@ impl SimplexState {
                 "SimplexState: {current_window_idx}/{current_slot} \
                 first_non_finalized={} first_non_progressed={} flags=[{slot_flags}] \
                 notar={}({:.0}%) skip={}({:.0}%) final={}({:.0}%) n|s={}({:.0}%) \
-                s|fb={}({:.0}%) th66/33={}({:.0}%)/{}({:.0}%) bases=[{bases_list}] \
+                th66/33={}({:.0}%)/{}({:.0}%) bases=[{bases_list}] \
                 voted={voted_notar_short} cert={notar_cert_short} evts=[{events_list}]",
                 self.first_non_finalized_slot,
                 self.first_non_progressed_slot,
@@ -6234,8 +4946,6 @@ impl SimplexState {
                 pct(final_weight),
                 notar_or_skip,
                 pct(notar_or_skip),
-                skip_or_fb,
-                pct(skip_or_fb),
                 threshold_66,
                 pct(threshold_66),
                 threshold_33,
@@ -6270,12 +4980,11 @@ impl SimplexState {
             result.push_str(&format!(
                 "  - {current_slot} weights: notar={notar_weight}({:.1}%), \
                 skip={skip_weight}({:.1}%), final={final_weight}({:.1}%), \
-                n|s={notar_or_skip}({:.1}%), s|fb={skip_or_fb}({:.1}%)\n",
+                n|s={notar_or_skip}({:.1}%)\n",
                 pct(notar_weight),
                 pct(skip_weight),
                 pct(final_weight),
-                pct(notar_or_skip),
-                pct(skip_or_fb)
+                pct(notar_or_skip)
             ));
 
             // State info
@@ -6323,13 +5032,13 @@ impl SimplexState {
                     if slot.is_voted {
                         flags.push("Voted");
                     }
-                    if slot.is_bad_window {
-                        flags.push("BadWindow");
+                    if slot.is_timeout_skipped {
+                        flags.push("TimeoutSkipped");
                     }
                     if slot.voted_skip {
                         flags.push("VotedSkip");
                     }
-                    if slot.its_over {
+                    if slot.is_completed {
                         flags.push("ItsOver");
                     }
                     if slot.pending_block.is_some() {
@@ -6367,9 +5076,6 @@ impl SimplexState {
                     if sv.block_notarized_published {
                         pub_flags.push("Notarized");
                     }
-                    if sv.safe_to_skip_published {
-                        pub_flags.push("SafeToSkip");
-                    }
                     if sv.block_finalized_published {
                         pub_flags.push("Finalized");
                     }
@@ -6380,12 +5086,12 @@ impl SimplexState {
                         if pub_flags.is_empty() { "none".to_string() } else { pub_flags.join("|") };
 
                     result.push_str(&format!(
-                        "    - s{}: n|s={}({:.1}%), s|fb={}({:.1}%), published=[{}]\n",
+                        "    - s{}: n|s={}({:.1}%), skip={}({:.1}%), published=[{}]\n",
                         slot_id,
                         sv.notarize_or_skip_weight,
                         pct(sv.notarize_or_skip_weight),
-                        sv.skip_or_skip_fallback_weight,
-                        pct(sv.skip_or_skip_fallback_weight),
+                        sv.skip_weight,
+                        pct(sv.skip_weight),
                         pub_flags_str
                     ));
 
@@ -6406,6 +5112,25 @@ impl SimplexState {
 
             result
         }
+    }
+
+    /// Produce the C++-style standstill diagnostic dump.
+    ///
+    /// Mirrors `pool.cpp::alarm()` by emitting the latest final certificate
+    /// summary first (if any), followed by the per-slot grid.
+    pub fn standstill_diagnostic_dump(&self, desc: &SessionDescription) -> String {
+        let mut sb = String::default();
+
+        if let Some((slot, cert)) = self.get_last_finalize_certificate() {
+            sb.push_str(&format!(
+                "Last final cert is for slot={} hash={}\n",
+                slot.value(),
+                cert.vote.block_hash.to_hex_string(),
+            ));
+        }
+
+        sb.push_str(&self.standstill_slot_grid_dump(desc));
+        sb
     }
 
     /// Produce C++-style standstill slot-grid dump.
@@ -6431,7 +5156,7 @@ impl SimplexState {
             if let Some(sv) = self.slot_votes.get(&slot_idx) {
                 for j in 0..num_validators {
                     let vv = &sv.votes[j];
-                    let has_skip = vv.skip.is_some() || vv.fallback_skip.is_some();
+                    let has_skip = vv.skip.is_some();
                     if vv.finalize.is_some() {
                         sb.push('F');
                     } else if vv.notarize.is_some() && has_skip {
@@ -6464,6 +5189,115 @@ impl SimplexState {
         }
 
         sb
+    }
+
+    /// Collect structured diagnostics for non-finalized slots, grouped by leader window.
+    ///
+    /// Each window reports its leader identity and each non-finalized slot within it
+    /// reports its wait phase, vote weight percentages, and flags.
+    pub fn collect_window_diagnostics(&self, desc: &SessionDescription) -> Vec<WindowDiagnostic> {
+        let total_weight = desc.get_total_weight();
+        let pct = |w: u64| -> f64 {
+            if total_weight == 0 {
+                0.0
+            } else {
+                100.0 * w as f64 / total_weight as f64
+            }
+        };
+        let first_nf = self.first_non_finalized_slot;
+
+        let mut windows = Vec::new();
+        for window in &self.leader_windows {
+            let w_start = window.start_slot;
+            let w_end = w_start + window.slots.len() as u32;
+
+            let mut slot_diags = Vec::new();
+            for (i, slot) in window.slots.iter().enumerate() {
+                let slot_idx = w_start + i as u32;
+                if slot_idx < first_nf {
+                    continue;
+                }
+
+                let sv = self.slot_votes.get(&slot_idx);
+
+                let max_notar_weight = sv
+                    .map(|v| v.notarize_weight_by_block.values().max().copied().unwrap_or(0))
+                    .unwrap_or(0);
+                let max_final_weight = sv
+                    .map(|v| v.finalize_weight_by_block.values().max().copied().unwrap_or(0))
+                    .unwrap_or(0);
+                let skip_weight = sv.map(|v| v.skip_weight).unwrap_or(0);
+                let notar_or_skip_weight = sv.map(|v| v.notarize_or_skip_weight).unwrap_or(0);
+                let has_notar_cert = sv.map(|v| v.notarize_certificate.is_some()).unwrap_or(false);
+                let has_final_cert = sv.map(|v| v.finalize_certificate.is_some()).unwrap_or(false);
+                let has_skip_cert = sv.map(|v| v.skip_certificate.is_some()).unwrap_or(false);
+
+                let (phase, reason) = if slot.is_completed && has_final_cert {
+                    (SlotWaitPhase::Finalized, "finalized".to_string())
+                } else if slot.is_timeout_skipped {
+                    (SlotWaitPhase::TimeoutSkipped, "bad_window_active".to_string())
+                } else if slot.skipped {
+                    (SlotWaitPhase::Skipped, "skip_cert_reached".to_string())
+                } else if slot.observed_notar_certificate.is_some() {
+                    if has_final_cert {
+                        (SlotWaitPhase::Finalized, "final_cert_present".to_string())
+                    } else {
+                        (
+                            SlotWaitPhase::NotarizedWaitingForFinalization,
+                            format!("final_weight_below_th66 ({:.0}%)", pct(max_final_weight)),
+                        )
+                    }
+                } else if slot.pending_block.is_some() {
+                    if slot.available_base.is_none() {
+                        (SlotWaitPhase::WaitingForParentBase, "no_available_base".to_string())
+                    } else {
+                        (
+                            SlotWaitPhase::WaitingForNotarization,
+                            format!("notar_weight_below_th66 ({:.0}%)", pct(max_notar_weight)),
+                        )
+                    }
+                } else if slot.available_base.is_none() {
+                    (SlotWaitPhase::WaitingForParentBase, "no_available_base".to_string())
+                } else {
+                    (SlotWaitPhase::WaitingForCandidate, "no_pending_block".to_string())
+                };
+
+                slot_diags.push(SlotDiagnostic {
+                    slot: slot_idx,
+                    window_idx: window.window_idx,
+                    phase,
+                    reason,
+                    has_pending_block: slot.pending_block.is_some(),
+                    available_parent: slot.available_base.is_some(),
+                    voted_notar: slot.voted_notar.is_some(),
+                    voted_skip: slot.voted_skip,
+                    voted_final: slot.voted_final,
+                    has_notar_cert,
+                    has_final_cert,
+                    has_skip_cert,
+                    notar_weight_pct: pct(max_notar_weight),
+                    final_weight_pct: pct(max_final_weight),
+                    skip_weight_pct: pct(skip_weight),
+                    notar_or_skip_weight_pct: pct(notar_or_skip_weight),
+                    is_timeout_skipped: slot.is_timeout_skipped,
+                });
+            }
+
+            if slot_diags.is_empty() {
+                continue;
+            }
+
+            let leader_idx = desc.get_leader(w_start);
+            windows.push(WindowDiagnostic {
+                window_idx: window.window_idx,
+                slot_begin: w_start,
+                slot_end: SlotIndex(w_end.0.saturating_sub(1)),
+                leader_idx,
+                had_timeouts: window.had_timeouts,
+                slots: slot_diags,
+            });
+        }
+        windows
     }
 }
 

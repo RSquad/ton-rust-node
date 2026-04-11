@@ -111,15 +111,6 @@ fn test_conflict_reason_descriptions() {
         "notarize and finalize for different blocks"
     );
     assert_eq!(ConflictReason::FinalizeAfterSkip.description(), "finalize after skip");
-    assert_eq!(ConflictReason::NotarizeAfterSkip.description(), "notarize after skip");
-    assert_eq!(
-        ConflictReason::FinalizeAfterNotarFallback.description(),
-        "finalize after notar-fallback"
-    );
-    assert_eq!(
-        ConflictReason::FinalizeAfterSkipFallback.description(),
-        "finalize after skip-fallback"
-    );
 }
 
 #[test]
@@ -377,15 +368,15 @@ fn test_misbehavior_proof_accessors() {
     assert_eq!(proof.hash1(), Some(&hash1));
     assert_eq!(proof.hash2(), Some(&hash2));
 
-    let notarize_hash = UInt256::rand();
+    let finalize_hash = UInt256::rand();
     let proof2 = MisbehaviorProof::conflicting_types(
         SlotIndex::new(88),
         ValidatorIndex(22),
         VoteDescriptor::Skip,
-        VoteDescriptor::Notarize(notarize_hash.clone()),
+        VoteDescriptor::Finalize(finalize_hash.clone()),
         RawVoteData::default(),
         RawVoteData::default(),
-        ConflictReason::NotarizeAfterSkip,
+        ConflictReason::FinalizeAfterSkip,
     );
     assert_eq!(proof2.slot(), SlotIndex::new(88));
     assert_eq!(proof2.validator_idx(), ValidatorIndex(22));
@@ -394,5 +385,5 @@ fn test_misbehavior_proof_accessors() {
     assert_eq!(proof2.hash2(), None);
     // But we can access the vote descriptors
     assert_eq!(proof2.existing_vote(), Some(&VoteDescriptor::Skip));
-    assert_eq!(proof2.new_vote(), Some(&VoteDescriptor::Notarize(notarize_hash)));
+    assert_eq!(proof2.new_vote(), Some(&VoteDescriptor::Finalize(finalize_hash)));
 }

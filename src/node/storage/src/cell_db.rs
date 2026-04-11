@@ -196,6 +196,16 @@ impl CellDb {
         }
     }
 
+    /// Check if a cell is present in the in-memory LRU cache.
+    pub fn is_in_cache(&self, cell_id: &UInt256) -> bool {
+        self.cell_cache.get(cell_id).is_some()
+    }
+
+    /// Remove a cell from the in-memory LRU cache.
+    pub fn remove_from_cache(&self, cell_id: &UInt256) {
+        self.cell_cache.remove(cell_id);
+    }
+
     #[cfg(test)]
     pub fn count(&self) -> usize {
         if let Ok(cf) = self.cells_cf() {

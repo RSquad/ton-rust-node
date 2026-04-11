@@ -16,7 +16,9 @@ use crate::{
     ConsensusOverlayManager, ConsensusOverlayManagerPtr, ConsensusOverlayPtr, OverlayTransportType,
     PrivateKey, PrivateOverlayShortId, PublicKeyHash, QueryResponseCallback,
 };
-use adnl::{node::AdnlNode, DhtNode, NetworkStack, OverlayNode, QuicNode, RldpNode};
+use adnl::{
+    node::AdnlNode, DhtNode, NetworkStack, OverlayNode, QuicNode, QuicRateLimitConfig, RldpNode,
+};
 use futures;
 use lazy_static::lazy_static;
 use std::{
@@ -248,6 +250,7 @@ impl<'a> NodeTestNetwork<'a> {
                         cancellation_token.clone(),
                         None,
                         tokio::runtime::Handle::current(),
+                        Some(QuicRateLimitConfig::disabled()),
                     );
                     overlay.set_quic(quic.clone()).unwrap();
                     Some(quic)

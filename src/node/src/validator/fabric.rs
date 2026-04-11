@@ -39,6 +39,7 @@ use ton_block::{
 pub async fn run_validate_query_any_candidate(
     block_candidate: BlockCandidate,
     engine: Arc<dyn EngineOperations>,
+    pipeline_context: PipelineContext,
     is_simplex: bool,
 ) -> Result<SystemTime> {
     let block_id = block_candidate.block_id.clone();
@@ -77,6 +78,7 @@ pub async fn run_validate_query_any_candidate(
         info.shard().clone(),
         min_mc_seqno,
         prev_blocks_ids,
+        pipeline_context,
         block_candidate,
         validator_set,
         engine.clone(),
@@ -172,6 +174,7 @@ pub async fn run_validate_query(
             shard.clone(),
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
+            Default::default(),
             block,
             set,
             engine.clone(),
@@ -186,6 +189,7 @@ pub async fn run_validate_query(
             shard.clone(),
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
+            Default::default(),
             block.clone(),
             set,
             engine.clone(),
@@ -281,7 +285,7 @@ pub async fn run_accept_block_query(
 
 pub async fn run_collate_query(
     shard: ShardIdent,
-    _min_ts: SystemTime,
+    min_ts: SystemTime,
     min_mc_seqno: u32,
     prev: &PrevBlockHistory,
     pipeline_context: PipelineContext,
@@ -304,7 +308,14 @@ pub async fn run_collate_query(
         UInt256::from(collator_id.pub_key()?),
         engine.clone(),
         None,
-        CollatorSettings { is_simplex, ..Default::default() },
+        CollatorSettings {
+            is_simplex,
+            min_gen_utime_ms: Some(
+                min_ts.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis()
+                    as u64,
+            ),
+            ..Default::default()
+        },
     )?;
     let collate_result = collator.collate().await;
 
@@ -339,7 +350,6 @@ pub async fn run_collate_query(
     let labels = [("shard", shard.to_string())];
     metrics::counter!("ton_node_collator_failures_total", &labels).increment(1);
     let test_bundles_config = &engine.test_bundles_config().collator;
-
     let err_str = if test_bundles_config.is_enable() { err.to_string() } else { String::default() };
 
     #[cfg(feature = "telemetry")]

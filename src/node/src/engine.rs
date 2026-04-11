@@ -660,6 +660,8 @@ impl Engine {
         log::info!("Engine is created.");
 
         let now = UnixTime::now() as u32;
+        let (ext_messages_pool, applied_blocks_rx) =
+            MessagesPool::new(now, external_messages_maximum_queue_length);
         let candidate_db = CandidateDbPool::with_path(db.db_root_dir()?);
         let engine = Arc::new(Engine {
             db,
@@ -688,10 +690,7 @@ impl Engine {
                 engine_telemetry.clone(),
                 engine_allocated.clone(),
             ),
-            external_messages: Arc::new(MessagesPool::new(
-                now,
-                external_messages_maximum_queue_length,
-            )),
+            external_messages: Arc::new(ext_messages_pool),
 
             servers: lockfree::queue::Queue::new(),
             stopper,
@@ -745,6 +744,7 @@ impl Engine {
 
         engine.acquire_stop(Self::MASK_SERVICE_SHARDSTATE_GC);
         save_top_shard_blocks_worker(engine.clone(), shard_blocks_receiver);
+        engine.external_messages().clone().start_applied_blocks_worker(applied_blocks_rx);
         Ok(engine)
     }
 
@@ -1260,6 +1260,10 @@ impl Engine {
             recursion_depth,
         )
         .await?;
+
+        if !pre_apply {
+            self.external_messages().push_applied_block(Arc::new(block.clone()));
+        }
 
         let gen_utime = block.gen_utime()?;
         let ago = UnixTime::now() as i32 - gen_utime as i32;

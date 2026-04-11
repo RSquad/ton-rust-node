@@ -27,6 +27,7 @@ function find_block {
         echo $LOOP_RES
     fi
 }
+date
 echo "Waiting for first master block"
 counter=0
 until [ "$(find_block '-1\:8000000000000000, 1' 'LOOP')" == "$NODES" ]
@@ -34,6 +35,7 @@ do
     sleep 10
     counter=$((counter + 1))
     if [ $counter -gt 5 ]; then
+        date
         find_block "-1\:8000000000000000, 1"
         echo "Reached timeout limit"
         bash "$TEST_ROOT/stop_network.sh"
@@ -42,12 +44,14 @@ do
 done
 find_block "-1\:8000000000000000, 1"
 
+date
 echo "Waiting for 50th master block"
 until [ "$(find_block '-1\:8000000000000000, 50' 'LOOP')" == "$NODES" ]
 do
     sleep 10
     counter=$((counter + 1))
     if [ $counter -gt 20 ]; then
+        date
         find_block "-1\:8000000000000000, 50"
         echo "Reached timeout limit"
         bash "$TEST_ROOT/stop_network.sh"
@@ -56,6 +60,7 @@ do
 done
 find_block "-1\:8000000000000000, 50"
 
+date
 echo "Waiting for 50th shard block"
 counter=0
 until [ "$(find_block '0:(.*), 50' 'LOOP')" == "$NODES" ]
@@ -63,6 +68,7 @@ do
     sleep 10
     counter=$((counter + 1))
     if [ $counter -gt 30 ]; then
+        date
         find_block "0:(.*), 50"
         echo "Reached timeout limit"
         bash "$TEST_ROOT/stop_network.sh"
@@ -71,5 +77,6 @@ do
 done
 find_block "0:(.*), 50"
 
+date
 bash "$TEST_ROOT/stop_network.sh"
 echo "TEST PASSED"

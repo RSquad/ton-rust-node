@@ -100,6 +100,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             balance: acc_balance.clone(),
             config_params,
             storage_fees_collected,
+            due_payment: account.due_payment().map_or(0, Coins::as_u128),
             prev_blocks_info: params.prev_blocks_info.clone(),
             ..Default::default()
         };

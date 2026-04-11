@@ -8,6 +8,7 @@
 #include "rldp/rldp.h"
 #include "rldp2/rldp.h"
 #include "quic-sender.h"
+#include "td/fec/fec.h"
 #include "keys/keys.hpp"
 #include "keyring/keyring.h"
 #include "td/actor/actor.h"
@@ -194,6 +195,8 @@ private:
     void cmd_enable_quic(td::JsonObject &obj);
     void cmd_send_quic_message(td::JsonObject &obj);
     void cmd_send_quic_query(td::JsonObject &obj);
+    void cmd_raptorq_encode(td::JsonObject &obj);
+    void cmd_raptorq_decode(td::JsonObject &obj);
 
     // Helpers
     std::string get_string(td::JsonObject &obj, const std::string &key);

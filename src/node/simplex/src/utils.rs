@@ -53,7 +53,8 @@ use ton_api::{
     IntoBoxed,
 };
 use ton_block::{
-    error, fail, sha256_digest, Block, BlockIdExt, Deserializable, Result, ShardIdent, UInt256,
+    error, fail, read_boc, sha256_digest, Block, BlockIdExt, ConsensusExtraData, Deserializable,
+    Result, ShardIdent, UInt256,
 };
 
 /*
@@ -103,7 +104,7 @@ pub(crate) fn install_simplex_panic_hook_once() {
                 let bt = Backtrace::force_capture();
 
                 log::error!(
-                    "FATAL PANIC (PANIC-1): thread={} location={} payload=\"{}\" backtrace={:?}",
+                    "FATAL PANIC: thread={} location={} payload=\"{}\" backtrace={:?}",
                     thread_name,
                     location,
                     payload,
@@ -443,6 +444,17 @@ pub fn build_candidate_hash_data_bytes_empty(
     Extracts BlockIdExt and collated_file_hash from validatorSession.candidate bytes.
 */
 
+/// Extract `gen_utime_ms` from collated data if it carries `ConsensusExtraData`.
+///
+/// Returns `None` for empty / invalid BOCs or when the collated data does not
+/// carry Simplex `ConsensusExtraData`.
+pub fn extract_consensus_gen_utime_ms(collated_data: &[u8]) -> Option<u64> {
+    let roots = read_boc(collated_data).ok()?.roots;
+    roots.into_iter().find_map(|root| {
+        ConsensusExtraData::construct_from_cell(root).ok().map(|extra| extra.gen_utime_ms)
+    })
+}
+
 /// Block info extracted from candidate bytes
 #[derive(Clone, Debug)]
 pub struct ExtractedBlockInfo {
@@ -658,15 +670,10 @@ pub fn sign_candidate_u32(
     - Vote::Notarize(NotarizeVote)
     - Vote::Finalize(FinalizeVote)
     - Vote::Skip(SkipVote)
-    - Vote::NotarizeFallback(NotarizeFallbackVote)
-    - Vote::SkipFallback(SkipFallbackVote)
-
     TL types (ton_api::ton::simplex_consensus::*):
     - UnsignedVote::SimplexConsensus_NotarizeVote
     - UnsignedVote::SimplexConsensus_FinalizeVote
     - UnsignedVote::SimplexConsensus_SkipVote
-    - UnsignedVote::SimplexConsensus_NotarizeFallbackVote
-    - UnsignedVote::SimplexConsensus_SkipFallbackVote
 
     Wire format: consensus.simplex.vote { vote, signature }
 */
@@ -688,12 +695,9 @@ use ton_api::ton::consensus::simplex::{self as tl_simplex, unsignedvote as tl_un
 /// - FinalizeVote { id: CandidateId }
 /// - SkipVote { slot: int }
 ///
-/// Fallback votes (NotarizeFallback, SkipFallback) are FSM-internal only and
-/// should NOT be serialized to wire. This function returns an error for them.
-///
 /// # Returns
 ///
-/// Ok(UnsignedVote) for wire-compatible votes, Err for fallback votes.
+/// Serialized TL vote for wire-compatible vote types.
 pub fn vote_to_tl_unsigned(vote: &Vote) -> Result<tl_simplex::UnsignedVote> {
     match vote {
         Vote::Notarize(v) => {
@@ -712,14 +716,6 @@ pub fn vote_to_tl_unsigned(vote: &Vote) -> Result<tl_simplex::UnsignedVote> {
         }
 
         Vote::Skip(v) => Ok(tl_unsigned::SkipVote { slot: v.slot.value() as i32 }.into_boxed()),
-
-        Vote::NotarizeFallback(v) => {
-            Err(error!("NotarizeFallback cannot be serialized to wire (slot={})", v.slot))
-        }
-
-        Vote::SkipFallback(v) => {
-            Err(error!("SkipFallback cannot be serialized to wire (slot={})", v.slot))
-        }
     }
 }
 
@@ -728,7 +724,6 @@ pub fn vote_to_tl_unsigned(vote: &Vote) -> Result<tl_simplex::UnsignedVote> {
 /// Used when processing incoming votes from the network.
 ///
 /// Note: C++ protocol only sends 3 vote types (Notarize, Finalize, Skip).
-/// Fallback votes are FSM-internal and never appear on the wire.
 ///
 /// # Errors
 ///
@@ -793,13 +788,13 @@ pub fn serialize_unsigned_vote(vote: &tl_simplex::UnsignedVote) -> Vec<u8> {
 ///
 /// # Returns
 ///
-/// Ok(signed vote) for wire-compatible votes, Err for fallback votes.
+/// Signed vote for network broadcast.
 pub fn sign_vote(
     vote: &Vote,
     session_id: &SessionId,
     private_key: &PrivateKey,
 ) -> Result<tl_simplex::Vote> {
-    // Convert to TL unsigned vote (returns error for fallback votes)
+    // Convert to TL unsigned vote.
     let unsigned_vote = vote_to_tl_unsigned(vote)?;
 
     // Serialize for signing (boxed, as in C++)

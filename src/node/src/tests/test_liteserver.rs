@@ -33,11 +33,13 @@ use ton_api::{
     ton::lite_server::{accountid::AccountId as AccountIdTl, BlockHeader, LookupBlockResult},
 };
 use ton_block::{
-    fail, read_single_root_boc, write_boc, AccountDispatchQueue, BlkPrevInfo, Block, BlockExtra,
-    BlockIdExt, BlockInfo, ChildCell, CurrencyCollection, DispatchQueue, EnqueuedMsg, ExtBlkRef,
-    GetRepresentationHash, IntermediateAddress, InternalMessageHeader, KeyId, MerkleUpdate,
-    Message, MsgAddressInt, MsgEnvelope, OutMsgQueue, OutMsgQueueExtra, OutMsgQueueInfo,
-    OutMsgQueueKey, ShardIdent, UInt256, ValueFlow,
+    fail, read_single_root_boc, write_boc, AccountBlock, AccountDispatchQueue, AccountStatus,
+    BlkPrevInfo, Block, BlockExtra, BlockIdExt, BlockInfo, ChildCell, ConfigParam0,
+    ConfigParamEnum, ConfigParams, CurrencyCollection, DispatchQueue, EnqueuedMsg, ExtBlkRef,
+    GetRepresentationHash, HashUpdate, IntermediateAddress, InternalMessageHeader, KeyExtBlkRef,
+    KeyId, McBlockExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope,
+    OldMcBlocksInfo, OutMsgQueue, OutMsgQueueExtra, OutMsgQueueInfo, OutMsgQueueKey,
+    ShardAccountBlocks, ShardIdent, Transaction, Transactions, UInt256, ValueFlow,
 };
 
 //static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1785,19 +1787,22 @@ impl EngineOperations for ConfigParamsTestEngine {
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         Ok(Some(Arc::new(self.state_id.clone())))
     }
-}
 
-const CFG_FROM_PREV_KEY_BLOCK: i32 = 0x8000;
+    fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(Some(Arc::new(self.state_id.clone())))
+    }
+}
 
 /// Test that get_all_config_params returns empty state_proof for zerostate (seqno = 0)
 #[tokio::test]
 async fn test_get_all_config_params_zerostate() -> Result<()> {
     let engine = Arc::new(ConfigParamsTestEngine::new_zerostate());
 
-    let result = LiteServerQuerySubscriber::get_all_config_params(
+    let result = LiteServerQuerySubscriber::get_config_params(
         &(engine.clone() as Arc<dyn EngineOperations>),
-        0,
+        CFG_VISIT_ROOT,
         engine.state_id.clone(),
+        Vec::new(),
     )
     .await?;
 
@@ -1812,26 +1817,175 @@ async fn test_get_all_config_params_zerostate() -> Result<()> {
     Ok(())
 }
 
-/// Test CFG_FROM_PREV_KEY_BLOCK flag: for zerostate it should resolve to zerostate itself
-/// (since there are no previous key blocks)
-#[tokio::test]
-async fn test_get_config_params_from_prev_key_block_zerostate() -> Result<()> {
-    let engine = Arc::new(ConfigParamsTestEngine::new_zerostate());
+/// Build a masterchain key block at `seq_no` whose McBlockExtra carries `config`.
+fn create_key_block_with_config(
+    seq_no: u32,
+    config: ConfigParams,
+) -> Result<(Vec<u8>, BlockIdExt)> {
+    let mut info = BlockInfo::default();
+    info.set_shard(ShardIdent::masterchain());
+    info.set_seq_no(seq_no)?;
+    info.set_key_block(true);
+    info.set_prev_stuff(
+        false,
+        &BlkPrevInfo::Block {
+            prev: ExtBlkRef {
+                end_lt: 1,
+                seq_no: seq_no.saturating_sub(1),
+                root_hash: UInt256::from([0xAB; 32]),
+                file_hash: UInt256::from([0xCD; 32]),
+            },
+        },
+    )?;
 
-    // Request with CFG_FROM_PREV_KEY_BLOCK flag
-    let result = LiteServerQuerySubscriber::get_all_config_params(
-        &(engine.clone() as Arc<dyn EngineOperations>),
-        CFG_FROM_PREV_KEY_BLOCK,
-        engine.state_id.clone(),
+    let mut mc_extra = McBlockExtra::default();
+    mc_extra.set_config(config);
+
+    let mut extra = BlockExtra::default();
+    extra.write_custom(&mc_extra)?;
+
+    let block = Block::with_params(0, info, ValueFlow::default(), MerkleUpdate::default(), extra)?;
+    finalize_block_to_boc(
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq_no,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+        &block,
     )
-    .await?;
+}
 
-    // Should resolve to zerostate (no previous key blocks exist)
-    assert_eq!(result.id.seq_no(), 0, "should resolve to zerostate");
-    assert!(result.state_proof.is_empty(), "state_proof should be empty for zerostate");
+/// Test CFG_FROM_PREV_KEY_BLOCK flag with a real (non-zerostate) chain:
+/// state at seqno 20 has prev_blocks referencing key block at seqno 5.
+/// Blocks after key block resolve to it; blocks before it fail.
+#[tokio::test]
+async fn test_get_config_params_from_prev_key_block() -> Result<()> {
+    let mut cfg = ConfigParams::default();
+    cfg.set_config(ConfigParamEnum::ConfigParam0(ConfigParam0 {
+        config_addr: AccountId::from([0x55; 32]),
+    }))?;
+    let (key_block_data, key_block_id) = create_key_block_with_config(5, cfg)?;
+
+    // prev_blocks: zerostate(0), regular(2), key(5), regular(15)
+    let mut prev_blocks = OldMcBlocksInfo::default();
+    let add_block = |prev_blocks: &mut OldMcBlocksInfo,
+                     seq_no: u32,
+                     key: bool,
+                     rh: Option<UInt256>,
+                     fh: Option<UInt256>| {
+        let rh = rh.unwrap_or(UInt256::from([seq_no as u8; 32]));
+        let fh = fh.unwrap_or(UInt256::from([seq_no as u8 | 0x80; 32]));
+        prev_blocks.set_augmentable(
+            &seq_no,
+            &KeyExtBlkRef {
+                key,
+                blk_ref: ExtBlkRef {
+                    seq_no,
+                    end_lt: seq_no as u64 * 10000,
+                    root_hash: rh,
+                    file_hash: fh,
+                },
+            },
+        )
+    };
+    add_block(&mut prev_blocks, 0, false, None, None)?;
+    add_block(&mut prev_blocks, 2, false, None, None)?;
+
+    // Last known state is key block state
+    let state = gen_master_state(
+        GenMasterStateParams {
+            master_state_id: Some(key_block_id.clone()),
+            prev_blocks: Some(prev_blocks.clone()),
+            after_key_block: true,
+            ..Default::default()
+        },
+        #[cfg(feature = "telemetry")]
+        None,
+        None,
+    );
+
+    let mut engine = LiteServerTestEngine::new().await;
+    engine.add_mock_block_with_handle(key_block_id.clone(), key_block_data.clone()).await?;
+    engine.set_last_mc_block_id(state.block_id().clone());
+    engine.add_ready_state(state.block_id().clone(), state);
+    let engine = Arc::new(engine);
+
+    let get_cfg = |engine: &Arc<LiteServerTestEngine>, id: BlockIdExt| {
+        let engine = engine.clone() as Arc<dyn EngineOperations>;
+        async move {
+            LiteServerQuerySubscriber::get_config_params(
+                &engine,
+                CFG_FROM_PREV_KEY_BLOCK | CFG_VISIT_ROOT,
+                id,
+                Vec::new(),
+            )
+            .await
+        }
+    };
+
+    // Key block → should resolve to itself
+    let result = get_cfg(&engine, key_block_id.clone()).await?;
+    assert_eq!(result.id, key_block_id);
+
+    // Add blocks after key block
+    add_block(
+        &mut prev_blocks,
+        5,
+        true,
+        Some(key_block_id.root_hash.clone()),
+        Some(key_block_id.file_hash.clone()),
+    )?;
+    add_block(&mut prev_blocks, 15, false, None, None)?;
+
+    let mc_id = |seq_no: u32| {
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            seq_no,
+            UInt256::from([seq_no as u8; 32]),
+            UInt256::from([seq_no as u8 | 0x80; 32]),
+        )
+    };
+
+    let state_id = mc_id(20);
+    let state = gen_master_state(
+        GenMasterStateParams {
+            master_state_id: Some(state_id.clone()),
+            prev_blocks: Some(prev_blocks),
+            ..Default::default()
+        },
+        #[cfg(feature = "telemetry")]
+        None,
+        None,
+    );
+
+    let mut engine = LiteServerTestEngine::new().await;
+    engine.add_mock_block_with_handle(key_block_id.clone(), key_block_data).await?;
+    engine.set_last_mc_block_id(state.block_id().clone());
+    engine.add_ready_state(state.block_id().clone(), state);
+    let engine = Arc::new(engine);
+
+    // Block after key block → should resolve to key block at seqno 5
+    let result = get_cfg(&engine, mc_id(15)).await?;
+    assert_eq!(result.id.seq_no(), 5);
+    assert_eq!(result.id.root_hash, key_block_id.root_hash);
+    assert!(result.state_proof.is_empty());
     assert!(!result.config_proof.is_empty());
-    // Mode should preserve CFG_FROM_PREV_KEY_BLOCK flag
     assert_eq!(result.mode, CFG_FROM_PREV_KEY_BLOCK);
+
+    // Last known block → the same
+    let result = get_cfg(&engine, state_id).await?;
+    assert_eq!(result.id.seq_no(), 5);
+
+    // Key block → should resolve to itself
+    let result = get_cfg(&engine, key_block_id.clone()).await?;
+    assert_eq!(result.id, key_block_id);
+
+    // Block before key block → no previous key block, must fail
+    assert!(dbg!(get_cfg(&engine, mc_id(2)).await).is_err(), "no key block before seqno 2");
+
+    // Zerostate → no previous key block, must fail
+    assert!(dbg!(get_cfg(&engine, mc_id(0)).await).is_err(), "no key block before zerostate");
 
     Ok(())
 }
@@ -2510,4 +2664,315 @@ async fn test_account_state_lru_eviction() -> Result<()> {
     assert_eq!(compute_count.load(Ordering::SeqCst), 5);
 
     Ok(())
+}
+
+// list_block_transactions tests
+fn build_block_with_txs(
+    shard: ShardIdent,
+    seq_no: u32,
+    txs: &[(UInt256, u64)],
+) -> Result<(Vec<u8>, BlockIdExt)> {
+    let mut sab = ShardAccountBlocks::default();
+    for (account_id, lt) in txs {
+        let mut tx = Transaction::with_address_and_status(
+            account_id.clone().into(),
+            AccountStatus::AccStateActive,
+        );
+        tx.set_logical_time(*lt);
+        let acc_block = AccountBlock::with_transaction(account_id.clone().into(), &tx)?;
+        sab.insert(&acc_block)?;
+    }
+    let mut extra = BlockExtra::default();
+    extra.write_account_blocks(&sab)?;
+
+    let mut info = BlockInfo::default();
+    info.set_shard(shard.clone());
+    info.set_seq_no(seq_no)?;
+    info.set_prev_stuff(
+        false,
+        &BlkPrevInfo::Block {
+            prev: ExtBlkRef {
+                end_lt: 1,
+                seq_no: seq_no.saturating_sub(1),
+                root_hash: UInt256::from([0xAB; 32]),
+                file_hash: UInt256::from([0xCD; 32]),
+            },
+        },
+    )?;
+    let block = Block::with_params(0, info, ValueFlow::default(), MerkleUpdate::default(), extra)?;
+    finalize_block_to_boc(
+        BlockIdExt {
+            shard_id: shard,
+            seq_no,
+            root_hash: UInt256::default(),
+            file_hash: UInt256::default(),
+        },
+        &block,
+    )
+}
+
+fn build_block_with_multi_tx_account(
+    shard: ShardIdent,
+    seq_no: u32,
+    account_id: &UInt256,
+    lts: &[u64],
+) -> Result<(Vec<u8>, BlockIdExt)> {
+    let account_addr: AccountId = account_id.clone().into();
+    let mut transactions = Transactions::default();
+    for lt in lts {
+        let mut tx = Transaction::with_address_and_status(
+            account_addr.clone(),
+            AccountStatus::AccStateActive,
+        );
+        tx.set_logical_time(*lt);
+        transactions.insert(&tx)?;
+    }
+    let hash_update = HashUpdate::with_hashes(UInt256::default(), UInt256::default());
+    let acc_block = AccountBlock::with_params(&account_addr, &transactions, &hash_update)?;
+    let mut sab = ShardAccountBlocks::default();
+    sab.insert(&acc_block)?;
+
+    let mut extra = BlockExtra::default();
+    extra.write_account_blocks(&sab)?;
+
+    let mut info = BlockInfo::default();
+    info.set_shard(shard.clone());
+    info.set_seq_no(seq_no)?;
+    info.set_prev_stuff(
+        false,
+        &BlkPrevInfo::Block {
+            prev: ExtBlkRef {
+                end_lt: 1,
+                seq_no: seq_no.saturating_sub(1),
+                root_hash: UInt256::from([0xAB; 32]),
+                file_hash: UInt256::from([0xCD; 32]),
+            },
+        },
+    )?;
+    let block = Block::with_params(0, info, ValueFlow::default(), MerkleUpdate::default(), extra)?;
+    finalize_block_to_boc(
+        BlockIdExt {
+            shard_id: shard,
+            seq_no,
+            root_hash: UInt256::default(),
+            file_hash: UInt256::default(),
+        },
+        &block,
+    )
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_empty_block() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let (data, block_id) = build_block_with_txs(shard, 200, &[])?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.ids.len(), 0);
+    assert_eq!(result.incomplete, false.into());
+    assert_eq!(result.req_count, 100);
+    assert_eq!(result.id, block_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_single_tx() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let acc = UInt256::from([0x11; 32]);
+    let (data, block_id) = build_block_with_txs(shard, 201, &[(acc.clone(), 100)])?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.ids.len(), 1);
+    assert_eq!(result.incomplete, false.into());
+    let tid = &result.ids[0];
+    assert_eq!(tid.account.as_ref().unwrap(), &acc);
+    assert_eq!(tid.lt.unwrap(), 100);
+    assert!(tid.hash.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_with_proof() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let txs = vec![(UInt256::from([0x11; 32]), 100)];
+    let (data, block_id) = build_block_with_txs(shard, 206, &txs)?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result_no_proof = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+    assert!(result_no_proof.proof.is_empty());
+
+    let result_with_proof = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0x20, // WANT_PROOF
+        100,
+        None,
+    )
+    .await?;
+    assert!(!result_with_proof.proof.is_empty());
+    let proof_cell = read_single_root_boc(&result_with_proof.proof)?;
+    let _proof = MerkleProof::construct_from_cell(proof_cell)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_ext_returns_tx_cells() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let txs = vec![(UInt256::from([0x11; 32]), 100), (UInt256::from([0x22; 32]), 200)];
+    let (data, block_id) = build_block_with_txs(shard, 207, &txs)?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions_ext(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.id, block_id);
+    assert_eq!(result.incomplete, false.into());
+    assert!(!result.transactions.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_block_transactions_multiple_txs_per_account() -> Result<()> {
+    let mut engine = LiteServerTestEngine::new().await;
+    let shard = ShardIdent::masterchain();
+    let acc = UInt256::from([0x42; 32]);
+    let (data, block_id) = build_block_with_multi_tx_account(shard, 210, &acc, &[10, 20, 30])?;
+    engine.add_mock_block_with_handle(block_id.clone(), data).await?;
+    let engine = Arc::new(engine);
+
+    let result = LiteServerQuerySubscriber::list_block_transactions(
+        &(engine.clone() as Arc<dyn EngineOperations>),
+        block_id.clone(),
+        0,
+        100,
+        None,
+    )
+    .await?;
+
+    assert_eq!(result.ids.len(), 3);
+    assert_eq!(result.ids[0].lt.unwrap(), 10);
+    assert_eq!(result.ids[1].lt.unwrap(), 20);
+    assert_eq!(result.ids[2].lt.unwrap(), 30);
+    for tid in &result.ids {
+        assert_eq!(tid.account.as_ref().unwrap(), &acc);
+    }
+    Ok(())
+}
+
+// VM stack BOC serialization roundtrip tests
+#[test]
+fn test_vm_stack_boc_roundtrip_mixed_types() {
+    let empty_cell = ton_block::BuilderData::new().into_cell().unwrap();
+    let cases: Vec<Vec<StackItem>> = vec![
+        vec![],
+        vec![StackItem::int(0)],
+        vec![StackItem::int(42), StackItem::int(-1)],
+        vec![StackItem::int(1), StackItem::int(2), StackItem::int(3)],
+        vec![StackItem::cell(empty_cell), StackItem::None],
+    ];
+    for items in &cases {
+        let boc = write_boc(&serialize_vm_stack(items).unwrap()).unwrap();
+        let decoded = deserialize_vm_stack_boc(&boc).unwrap();
+        assert_eq!(decoded.len(), items.len(), "length mismatch for {:?}", items);
+    }
+}
+
+#[test]
+fn test_vm_stack_boc_roundtrip_extreme_ints() {
+    let items = vec![StackItem::int(i64::MAX), StackItem::int(i64::MIN)];
+    let boc = write_boc(&serialize_vm_stack(&items).unwrap()).unwrap();
+    let decoded = deserialize_vm_stack_boc(&boc).unwrap();
+    assert_eq!(decoded.len(), 2);
+    match &decoded[0] {
+        StackItem::Integer(v) => {
+            assert_eq!(v.as_integer_value(i64::MIN..=i64::MAX).unwrap(), i64::MAX)
+        }
+        other => panic!("expected int(MAX), got {:?}", other),
+    }
+    match &decoded[1] {
+        StackItem::Integer(v) => {
+            assert_eq!(v.as_integer_value(i64::MIN..=i64::MAX).unwrap(), i64::MIN)
+        }
+        other => panic!("expected int(MIN), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_vm_stack_boc_roundtrip_bigints() {
+    use ton_vm::stack::integer::IntegerData;
+
+    let cases: Vec<StackItem> = vec![
+        // positive 256-bit: 2^200
+        StackItem::integer(
+            IntegerData::from_str_radix(
+                "1606938044258990275541962092341162602522202993782792835301376",
+                10,
+            )
+            .unwrap(),
+        ),
+        // max unsigned 256-bit: 2^256 - 1
+        StackItem::integer(IntegerData::from_unsigned_bytes_be([0xFF; 32])),
+        // negative big: -(2^200)
+        StackItem::integer(
+            IntegerData::from_str_radix(
+                "-1606938044258990275541962092341162602522202993782792835301376",
+                10,
+            )
+            .unwrap(),
+        ),
+        // just outside i64 range: i64::MAX + 1
+        StackItem::integer(IntegerData::from_str_radix("9223372036854775808", 10).unwrap()),
+        // just outside i64 range: i64::MIN - 1
+        StackItem::integer(IntegerData::from_str_radix("-9223372036854775809", 10).unwrap()),
+    ];
+
+    let boc = write_boc(&serialize_vm_stack(&cases).unwrap()).unwrap();
+    let decoded = deserialize_vm_stack_boc(&boc).unwrap();
+    assert_eq!(decoded.len(), cases.len());
+    for (i, (orig, dec)) in cases.iter().zip(decoded.iter()).enumerate() {
+        let orig_int = orig.as_integer().expect("original is integer");
+        let dec_int = dec.as_integer().expect("decoded is integer");
+        assert_eq!(
+            orig_int, dec_int,
+            "bigint mismatch at index {i}: orig={orig_int:?}, decoded={dec_int:?}"
+        );
+    }
 }

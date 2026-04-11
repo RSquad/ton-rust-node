@@ -46,8 +46,9 @@ use ton_api::ton::{
     ton_node::broadcast::{BlockBroadcast, ExternalMessageBroadcast, NewShardBlockBroadcast},
 };
 use ton_block::{
-    error, fail, AccountIdPrefixFull, BlockIdExt, BlockSignaturesVariant, Cell, CellsFactory,
-    ConfigParams, CryptoSignaturePair, KeyId, Message, OutMsgQueue, Result, ShardIdent, UInt256,
+    error, fail, AccountIdPrefixFull, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter,
+    Cell, CellsFactory, ConfigParams, CryptoSignaturePair, KeyId, Message, OutMsgQueue, Result,
+    ShardIdent, UInt256,
 };
 use validator_session::{BlockHash, SessionId, ValidatorBlockCandidate};
 
@@ -130,23 +131,30 @@ impl EngineOperations for Engine {
     /// Register the local node's participation in a validator list and update network overlays.
     ///
     /// Delegates to [`PrivateOverlayOperations::set_validator_list`] for key matching and
-    /// ADNL setup, then refreshes private and custom overlays **only** when the network
-    /// layer is fully ready (`network_ready == true`). Overlay updates require the ADNL key
-    /// to be loaded into the ADNL stack first, which is why they happen here rather than
-    /// at the call site.
+    /// ADNL setup. Membership is decided by pubkey match only; overlay updates are
+    /// performed only when per-list network context is actually available.
     async fn set_validator_list(
         &self,
         validator_list_id: UInt256,
         validators: &[CatchainNode],
     ) -> Result<ValidatorListOutcome> {
-        let outcome =
-            self.validator_network().set_validator_list(validator_list_id, validators).await?;
+        let network = self.validator_network();
+        let outcome = network.set_validator_list(validator_list_id.clone(), validators).await?;
 
-        if matches!(&outcome, ValidatorListOutcome::Selected { network_ready: true, .. }) {
-            let state = self.load_last_applied_mc_state().await?;
-            let config = state.config_params()?;
-            self.overlays_router()?.update_private_overlays(config).await?;
-            self.overlays_router()?.update_custom_overlays(None).await?;
+        if matches!(&outcome, ValidatorListOutcome::Selected { .. }) {
+            if network.has_validator_list_context(&validator_list_id) {
+                let state = self.load_last_applied_mc_state().await?;
+                let config = state.config_params()?;
+                self.overlays_router()?.update_private_overlays(config).await?;
+                self.overlays_router()?.update_custom_overlays(None).await?;
+            } else {
+                log::warn!(
+                    target: "validator_manager",
+                    "Validator list {:x} selected by pubkey, but network context is not ready yet; \
+                     overlay refresh is deferred",
+                    validator_list_id
+                );
+            }
         }
         Ok(outcome)
     }
@@ -1067,6 +1075,10 @@ impl EngineOperations for Engine {
         block_root: &Cell,
     ) -> Result<()> {
         log::trace!("send_block_candidate_broadcast {}", id);
+        self.cache_block_candidate(
+            id,
+            BocWriter::with_flags([block_root.clone()], BocFlags::all())?.write_to_vec()?,
+        )?;
         self.overlays_router()?
             .send_block_candidate_broadcast(id, cc_seqno, validator_set_hash, block_root)
             .await?;

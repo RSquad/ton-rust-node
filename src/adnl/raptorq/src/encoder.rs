@@ -186,7 +186,7 @@ impl SourceBlockEncoder {
         since = "1.3.0",
         note = "Use the new2() function instead. In version 2.0, that function will replace this one"
     )]
-    pub fn new(source_block_id: u8, symbol_size: u16, data: &[u8]) -> SourceBlockEncoder {
+    pub fn new(source_block_id: u8, symbol_size: u32, data: &[u8]) -> SourceBlockEncoder {
         let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
         SourceBlockEncoder::new2(source_block_id, &config, data)
     }
@@ -196,7 +196,7 @@ impl SourceBlockEncoder {
         if config.sub_blocks() > 1 {
             let mut symbols = vec![vec![]; data.len() / config.symbol_size() as usize];
             let (tl, ts, nl, ns) = partition(
-                (config.symbol_size() / config.symbol_alignment() as u16) as u32,
+                config.symbol_size() / config.symbol_alignment() as u32,
                 config.sub_blocks(),
             );
             // Divide the block into sub-blocks and then concatenate the sub-symbols into symbols
@@ -247,7 +247,7 @@ impl SourceBlockEncoder {
     )]
     pub fn with_encoding_plan(
         source_block_id: u8,
-        symbol_size: u16,
+        symbol_size: u32,
         data: &[u8],
         plan: &SourceBlockEncodingPlan,
     ) -> SourceBlockEncoder {

@@ -8,15 +8,16 @@
  */
 //! # Simplex Consensus Protocol
 //!
-//! This crate implements the Simplex consensus protocol for TON blockchain,
-//! based on the Solana Alpenglow White Paper with modifications for TON.
+//! This crate implements the Simplex consensus protocol for TON blockchain.
 //!
-//! ## Key Differences from Original Alpenglow
+//! ## Key Protocol Properties
 //!
 //! - **Conservative path only** (no fast finality/optimistic path)
 //! - **Fault tolerance**: <1/3 Byzantine nodes (not 20% as in original)
 //! - **Certificate threshold**: 2/3 stake weight
 //! - **No erasure coding**: Simple broadcast instead of Rotor shreds
+//! - **Spec mapping**: protocol rules tracked in [ton-blockchain/simplex-docs](https://github.com/ton-blockchain/simplex-docs)
+//! - **Finalized-driven semantics**: `on_block_finalized()` is the delivery path; `on_block_committed()` stays legacy-only
 //!
 //! ## Quick Start
 //!
@@ -37,7 +38,6 @@
 //!     validator_nodes,
 //!     &local_private_key,
 //!     db_path,
-//!     db_suffix,
 //!     overlay_manager,
 //!     session_listener,  // Weak<dyn SessionListener>
 //! )?;
@@ -92,7 +92,8 @@
 //! Implements callbacks via [`SessionListener`] trait (from validator-session):
 //! - `on_candidate` - Validate incoming block candidate
 //! - `on_generate_slot` - Generate new block when leader
-//! - `on_block_committed` - Block finalized in consensus
+//! - `on_block_finalized` - Finalized block delivered to validator side
+//! - `on_block_committed` - legacy sequential callback; not used by Simplex
 //! - `on_block_skipped` - Slot was skipped
 //!
 //! ## Type Relationships
@@ -111,7 +112,7 @@
 //! SessionListener (trait, implemented by caller)
 //!     ├── on_candidate()
 //!     ├── on_generate_slot()
-//!     ├── on_block_committed()
+//!     ├── on_block_finalized()
 //!     └── on_block_skipped()
 //!
 //! Receiver (trait) ──sends──► Votes, BlockBroadcasts
@@ -220,7 +221,7 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-use ton_block::{fail, Result, ShardIdent};
+use ton_block::{fail, BlockIdExt, Result, ShardIdent};
 
 /*
     Shared Raw Vote Data (memory-efficient storage)
@@ -314,7 +315,7 @@ pub mod ton {
 /// Sentinel value indicating Simplex roundless mode.
 ///
 /// When Simplex uses this value for the `round` field in callbacks (`on_candidate`,
-/// `on_generate_slot`, `on_block_committed`), it signals to `ValidatorGroup` that
+/// `on_generate_slot`, `on_block_finalized`), it signals to `ValidatorGroup` that
 /// round-based invariants should be bypassed.
 ///
 /// # Rationale
@@ -351,40 +352,6 @@ pub type SessionListenerPtr = Weak<dyn SessionListener + Send + Sync>;
 pub type SessionReplayListenerPtr = consensus_common::ConsensusReplayListenerPtr;
 
 /*
-    RestartRecommitStrategy for session restart behavior
-*/
-
-/// Strategy for replaying finalized blocks to ValidatorGroup on restart.
-///
-/// After session restart, the consensus state is restored from the database.
-/// This strategy controls how persisted finalized history is replayed in
-/// roundless mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RestartRecommitStrategy {
-    /// Replay the full persisted finalized chain in deterministic order.
-    ///
-    /// Replay uses commit-path semantics only:
-    /// - non-empty finalized records emit `on_block_committed`
-    /// - empty finalized records are replayed internally without
-    ///   `on_block_skipped` callbacks
-    ///
-    /// The replay source must be consistent (parent-chain continuity and seqno
-    /// invariants); inconsistencies fail startup recovery.
-    #[default]
-    FullReplay,
-
-    /// Do not replay historical finalized records (C++-like behavior).
-    ///
-    /// Only restore receiver caches and resume from first new block.
-    /// The first `on_block_committed` after restart will be for a newly
-    /// produced block, not a historical one.
-    ///
-    /// **Caution**: This assumes engine state is already consistent with
-    /// consensus progress. Use only when that invariant is guaranteed.
-    FirstCommitAfterFinalized,
-}
-
-/*
     SessionOptions for Simplex consensus
 */
 
@@ -409,6 +376,10 @@ pub struct SessionOptions {
     /// Target time between blocks
     /// Default: 1 second
     pub target_rate: Duration,
+
+    /// Minimum interval between a parent block's exact generation time and
+    /// validation / generation of the next non-empty block.
+    pub min_block_interval: Duration,
 
     /// Timeout for first block in window
     /// Default: 3 seconds
@@ -460,16 +431,6 @@ pub struct SessionOptions {
     /// Default: false (non-blocking)
     pub wait_for_db_init: bool,
 
-    /// Strategy for replaying finalized blocks to ValidatorGroup on restart.
-    ///
-    /// Controls how the session handles the gap between restored consensus state
-    /// (from DB) and ValidatorGroup's `expected_current_round` (starts at 0).
-    ///
-    /// See [`RestartRecommitStrategy`] for available options.
-    ///
-    /// Default: `FullReplay`
-    pub restart_recommit_strategy: RestartRecommitStrategy,
-
     /// Use QUIC overlay transport instead of ADNL UDP for this session.
     /// When true, overlay messages/queries are sent via QUIC streams.
     /// Default: false
@@ -484,15 +445,10 @@ pub struct SessionOptions {
     pub health_stall_warning_secs: u64,
     pub health_stall_error_secs: u64,
 
-    /// Parent resolution aging thresholds (seconds).
-    /// Default: 30s (warn), 120s (error)
-    pub health_parent_aging_warning_secs: u64,
-    pub health_parent_aging_error_secs: u64,
-
     // -- Noncritical params (from simplex_config_v2 HashmapE) --
     //
-    // These fields are deserialized from on-chain config and passed through, but not yet
-    // consumed by the Rust session logic.
+    // Most of these fields are deserialized from on-chain config and passed through.
+    // `min_block_interval` is consumed directly by the Rust session timing logic.
 
     // TODO: replace `timeout_increase_factor` / `max_backoff_delay` with these two fields.
     //   C++ consensus.cpp applies multiplier+cap on window skip (exponential backoff of
@@ -507,12 +463,12 @@ pub struct SessionOptions {
     pub candidate_resolve_timeout_cap: Duration,
     pub candidate_resolve_cooldown: Duration,
 
-    // TODO: wire into standstill recovery egress shaping. C++ pool.cpp uses this to
-    //   rate-limit bytes/s during standstill_resolution_task.
+    // Wired into Receiver standstill replay token-bucket shaping.
+    // C++ parity: pool.cpp standstill_resolution_task byte budget.
     pub standstill_max_egress_bytes_per_s: u32,
 
-    // TODO: wire into slot/vote acceptance bounds. C++ consensus.cpp and pool.cpp use this
-    //   to reject candidates/votes from too-far-future windows.
+    // Wired into slot/vote acceptance bounds in SimplexState + Receiver.
+    // C++ parity: consensus.cpp/pool.cpp future-window rejection.
     pub max_leader_window_desync: u32,
 
     // TODO: wire into peer ban logic. C++ pool.cpp bans peers with bad vote/cert signatures
@@ -522,6 +478,10 @@ pub struct SessionOptions {
     // TODO: wire into candidate resolver rate limiting. C++ candidate-resolver.cpp uses a
     //   1-second sliding window with this limit per peer for requestCandidate.
     pub candidate_resolve_rate_limit: u32,
+
+    // TODO: wire into empty-block error backoff. C++ block-producer.cpp suppresses
+    // empty blocks for this period after a failed normal collation.
+    pub no_empty_blocks_on_error_timeout: Duration,
 }
 
 impl Default for SessionOptions {
@@ -532,6 +492,7 @@ impl Default for SessionOptions {
             max_backoff_delay: Duration::from_secs(100),
             slots_per_leader_window: 1,
             target_rate: Duration::from_secs(1),
+            min_block_interval: Duration::from_secs(0),
             first_block_timeout: Duration::from_secs(3),
             max_block_size: 4 << 20,         // 4 MB
             max_collated_data_size: 4 << 20, // 4 MB
@@ -543,13 +504,10 @@ impl Default for SessionOptions {
             standstill_timeout: Duration::from_secs(10),
             empty_block_mc_lag_threshold: None,
             wait_for_db_init: false,
-            restart_recommit_strategy: RestartRecommitStrategy::default(),
             use_quic: false,
             health_alert_cooldown: Duration::from_secs(30),
             health_stall_warning_secs: 15,
             health_stall_error_secs: 60,
-            health_parent_aging_warning_secs: 30,
-            health_parent_aging_error_secs: 120,
             first_block_timeout_multiplier: 1.2,
             first_block_timeout_cap: Duration::from_secs(100),
             candidate_resolve_timeout: Duration::from_secs(1),
@@ -560,6 +518,7 @@ impl Default for SessionOptions {
             max_leader_window_desync: 250,
             bad_signature_ban_duration: Duration::from_secs(5),
             candidate_resolve_rate_limit: 10,
+            no_empty_blocks_on_error_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -612,14 +571,6 @@ impl SessionOptions {
 
         if self.health_stall_error_secs < self.health_stall_warning_secs {
             fail!("health_stall_error_secs must be >= health_stall_warning_secs")
-        }
-
-        if self.health_parent_aging_warning_secs == 0 {
-            fail!("health_parent_aging_warning_secs must be > 0")
-        }
-
-        if self.health_parent_aging_error_secs < self.health_parent_aging_warning_secs {
-            fail!("health_parent_aging_error_secs must be >= health_parent_aging_warning_secs")
         }
 
         // Noncritical params from on-chain config
@@ -691,43 +642,38 @@ impl SessionOptions {
 ///
 /// # MC Finalization Notification
 ///
-/// For **shard chains**, empty block generation depends on masterchain
-/// finalization status. When `last_mc_finalized_seqno + 8 < new_seqno`,
-/// the session generates empty blocks instead of normal blocks.
+/// For **shard chains**, empty block generation depends on the masterchain-applied
+/// top for that shard. When `last_mc_finalized_seqno + 8 < new_seqno`, the session
+/// generates empty blocks instead of normal blocks.
 ///
 /// The higher layer (ValidatorManager) should call `notify_mc_finalized()`
-/// when masterchain blocks are finalized to enable this functionality.
+/// when masterchain state is updated, passing the current applied top for
+/// each simplex session shard.
 ///
 /// # Example
 ///
 /// ```ignore
-/// // When MC block is finalized, notify shard sessions
-/// if !shard.is_masterchain() {
-///     simplex_session.notify_mc_finalized(mc_block_seqno);
-/// }
+/// // When MC state is updated, notify simplex sessions with their applied top.
+/// simplex_session.notify_mc_finalized(applied_top_for_session_shard);
 /// ```
 pub trait SimplexSession: ConsensusSession {
-    /// Notify session about masterchain finalization
+    /// Notify session about the current applied top for its shard
     ///
     /// # Purpose
     ///
-    /// For shard sessions, this updates `last_mc_finalized_seqno` which is used by
-    /// `should_generate_empty_block()` to decide if an empty block should be generated.
+    /// This updates session-local applied-top tracking:
+    /// - shard sessions use it for empty-block recovery against MC-registered tops
+    /// - masterchain sessions use it to mirror the applied MC head for validation/empty logic
     ///
     /// # When to Call
     ///
-    /// When a masterchain block is finalized, ValidatorManager should call this for all
-    /// shard validator sessions with the MC block's seqno.
-    ///
-    /// # For Masterchain Sessions
-    ///
-    /// This method is a no-op for masterchain sessions (they track their own finalization
-    /// internally via `last_committed_seqno`).
+    /// When masterchain state is updated, ValidatorManager should call this for all
+    /// simplex validator sessions with the current applied top for that session shard.
     ///
     /// # Arguments
     ///
-    /// * `mc_block_seqno` - The seqno of the finalized masterchain block
-    fn notify_mc_finalized(&self, mc_block_seqno: u32);
+    /// * `applied_top` - Current applied top for this session shard
+    fn notify_mc_finalized(&self, applied_top: BlockIdExt);
 
     /// Check if the session has fully stopped (all threads have terminated).
     ///

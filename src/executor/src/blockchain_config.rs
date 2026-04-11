@@ -229,6 +229,10 @@ impl BlockchainConfig {
         })
     }
 
+    pub fn global_version(&self) -> u32 {
+        self.global_version
+    }
+
     /// Get `MsgForwardPrices` for message forward fee calculation
     pub fn get_fwd_prices(&self, is_masterchain: bool) -> &MsgForwardPrices {
         if is_masterchain {

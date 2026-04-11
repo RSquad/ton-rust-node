@@ -77,3 +77,7 @@ path = "tests/test_quic_transport.rs"
 [[test]]
 name = "test_quic_overlay"
 path = "tests/test_quic_overlay.rs"
+
+[[test]]
+name = "test_raptorq"
+path = "tests/test_raptorq.rs"
