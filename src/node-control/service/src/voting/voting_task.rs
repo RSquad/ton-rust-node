@@ -183,7 +183,11 @@ impl VotingRunner {
         vset: &ValidatorSet,
     ) -> anyhow::Result<()> {
         let node = self.nodes.get_mut(node_id).expect("node not found");
-        let (validator_idx, validator_entry) = Self::find_validator_entry(node, vset).await?;
+        let Some((validator_idx, validator_entry)) = Self::find_validator_entry(node, vset).await?
+        else {
+            tracing::warn!(target: "voting", "node [{}] voting skipped: not a validator", node_id);
+            return Ok(());
+        };
 
         if proposal.voters.contains(&validator_idx) {
             tracing::info!(target: "voting",
@@ -250,7 +254,7 @@ impl VotingRunner {
     async fn find_validator_entry(
         node: &mut Node,
         vset: &ValidatorSet,
-    ) -> anyhow::Result<(u16, ValidatorEntry)> {
+    ) -> anyhow::Result<Option<(u16, ValidatorEntry)>> {
         let config = node
             .api
             .validator_config()
@@ -281,10 +285,10 @@ impl VotingRunner {
                 .position(|item| item.public_key.as_slice() == &key)
                 .map(|idx| (idx as u16, entry.clone()));
             if let Some((idx, entry)) = vset_entry {
-                return Ok((idx, entry));
+                return Ok(Some((idx, entry)));
             }
         }
-        anyhow::bail!("not a validator")
+        Ok(None)
     }
 
     async fn shutdown(&mut self) -> anyhow::Result<()> {

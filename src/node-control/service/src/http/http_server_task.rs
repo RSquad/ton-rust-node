@@ -8,11 +8,11 @@
  */
 use super::{
     config_handlers::{
-        v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
-        v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_wallets_handler,
         BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
         ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
         NodeDto, NodesResponse, PoolDto, PoolsResponse, WalletDto, WalletsResponse,
+        v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
+        v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_wallets_handler,
     },
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
@@ -144,20 +144,14 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
     // request and passes through when `http.auth` is not configured.
     let authenticated = axum::Router::new()
         .route("/v1/elections", axum::routing::get(v1_elections_handler))
-        .route(
-            "/v1/elections/settings",
-            axum::routing::get(v1_elections_settings_handler),
-        )
+        .route("/v1/elections/settings", axum::routing::get(v1_elections_settings_handler))
         .route("/v1/validators", axum::routing::get(v1_validators_handler))
         .route("/v1/nodes", axum::routing::get(v1_nodes_handler))
         .route("/v1/wallets", axum::routing::get(v1_wallets_handler))
         .route("/v1/pools", axum::routing::get(v1_pools_handler))
         .route("/v1/bindings", axum::routing::get(v1_bindings_handler))
         .route("/v1/log", axum::routing::get(v1_log_handler))
-        .route(
-            "/v1/master-wallet",
-            axum::routing::get(v1_master_wallet_handler),
-        )
+        .route("/v1/master-wallet", axum::routing::get(v1_master_wallet_handler))
         .route("/auth/me", axum::routing::get(me_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -8,10 +8,13 @@
  */
 use super::http_server_task::{AppError, AppState};
 use crate::runtime_config::{RuntimeConfig, open_wallet};
-use common::{app_config::{
-    BindingStatus, ElectionsConfig, KeyConfig, LogConfig, LogOutput, LogRotation, PoolConfig,
-    StakePolicy, WalletConfig,
-}, ton_utils::display_tons};
+use common::{
+    app_config::{
+        BindingStatus, ElectionsConfig, KeyConfig, LogConfig, LogOutput, LogRotation, PoolConfig,
+        StakePolicy, WalletConfig,
+    },
+    ton_utils::display_tons,
+};
 use control_client::client_adnl::ControlClientAdnl;
 use std::{collections::HashMap, str::FromStr};
 use ton_block::MsgAddressInt;
@@ -344,8 +347,7 @@ pub async fn v1_pools_handler(
                 // Pool is bound to a node — use pre-loaded instance
                 let (addr, bal) = if let Some(pool) = cached_pools.get(name) {
                     let addr = pool.address().to_string();
-                    let bal =
-                        pool.balance().await.ok().map(|b| display_tons(b));
+                    let bal = pool.balance().await.ok().map(|b| display_tons(b));
                     (Some(addr), bal)
                 // Pool has an explicit address in config — try to fetch balance directly
                 } else if let Some(a) = address {

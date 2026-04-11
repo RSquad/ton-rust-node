@@ -9,16 +9,17 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, api_get, get_wallet_config, load_config_vault,
-        load_config_vault_rpc_client, make_wallet, require_config, resolve_service_url, save_config,
-        wait_for_seqno_change, wallet_info, warn_missing_secret,
+        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, api_get, fetch_network_max_factor,
+        get_wallet_config, load_config_vault, load_config_vault_rpc_client, make_wallet,
+        require_config, resolve_service_url, save_config, wait_for_seqno_change, wallet_info,
+        warn_missing_secret,
     },
 };
 use anyhow::Context;
 use colored::Colorize;
 use common::{
     TonWalletVersion,
-    app_config::{AppConfig, KeyConfig, PoolConfig, WalletConfig},
+    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
     task_cancellation::CancellationCtx,
     time_format,
     ton_utils::{display_tons, tons_f64_to_nanotons},
@@ -119,7 +120,12 @@ pub struct WalletStakeCmd {
     binding: String,
     #[arg(short = 'a', long = "amount", help = "Stake amount in TONs")]
     amount: f64,
-    #[arg(short = 'm', long = "max-factor", default_value = "3.0", help = "Max factor (1.0..3.0)")]
+    #[arg(
+        short = 'm',
+        long = "max-factor",
+        default_value = "3.0",
+        help = "Max factor from 1.0 up to the network limit (config param 17)"
+    )]
     max_factor: f32,
 }
 
@@ -361,11 +367,10 @@ impl WalletSendCmd {
 
 impl WalletStakeCmd {
     pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
-        if !(1.0..=3.0).contains(&self.max_factor) {
-            anyhow::bail!("max-factor must be between 1.0 and 3.0");
-        }
-
         let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+        let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
+        ElectionsConfig { max_factor: self.max_factor, ..Default::default() }
+            .validate(Some(network_max_factor))?;
 
         // Resolve binding → wallet, pool, node
         let binding = config

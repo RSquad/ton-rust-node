@@ -21,7 +21,10 @@ use common::{
     },
     task_cancellation::CancellationCtx,
     time_format,
-    ton_utils::{display_tons, nanotons_to_dec_string, nanotons_to_tons_f64},
+    ton_utils::{
+        MAX_STAKE_FACTOR_SCALE, display_tons, max_stake_factor_raw_to_multiplier,
+        nanotons_to_dec_string, nanotons_to_tons_f64,
+    },
 };
 use contracts::{
     ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
@@ -391,7 +394,11 @@ impl ElectionRunner {
             elections_info.participants.len()
         );
 
-        self.build_elections_snapshot(election_id, &cfg15, &elections_info);
+        // Config param 17: effective `max_factor` in snapshot; 16/17: participation (e.g. AdaptiveSplit50).
+        let cfg16 = self.fetch_config_param_16().await?;
+        let cfg17 = self.fetch_config_param_17().await?;
+
+        self.build_elections_snapshot(election_id, &cfg15, &elections_info, &cfg17);
 
         if elections_info.finished {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Finished;
@@ -436,9 +443,6 @@ impl ElectionRunner {
                 );
             }
         }
-        // Fetch config params 16/17 - used for AdaptiveSplit50 strategy
-        let cfg16 = self.fetch_config_param_16().await?;
-        let cfg17 = self.fetch_config_param_17().await?;
 
         // walk through the nodes and try to participate in the elections
         let mut nodes = self.nodes.keys().cloned().collect::<Vec<String>>();
@@ -491,8 +495,9 @@ impl ElectionRunner {
         election_id: u64,
         cfg15: &ConfigParam15,
         elections_info: &ElectionsInfo,
+        cfg17: &ConfigParam17,
     ) {
-        self.snapshot_cache.last_max_factor = Some(self.calc_max_factor());
+        self.snapshot_cache.last_max_factor = Some(self.calc_max_factor(cfg17.max_stake_factor).1);
 
         // It can be a validator wallet or nominator pool address.
         let wallet_addrs: HashSet<Vec<u8>> =
@@ -549,7 +554,15 @@ impl ElectionRunner {
         election_id: u64,
         params: &ConfigParams<'_>,
     ) -> anyhow::Result<()> {
-        let max_factor = (self.calc_max_factor() * 65536.0) as u32;
+        let configured_raw = self.configured_max_factor_raw();
+        let (max_factor, _) = self.calc_max_factor(params.cfg17.max_stake_factor);
+        if max_factor != configured_raw {
+            tracing::warn!(
+                "max_factor clamped: configured={}, used={} (network limit from cfg17)",
+                max_stake_factor_raw_to_multiplier(configured_raw),
+                max_stake_factor_raw_to_multiplier(max_factor),
+            );
+        }
         let stake_ctx = StakeContext {
             past_elections: &self.past_elections,
             our_max_factor: max_factor,
@@ -798,9 +811,6 @@ impl ElectionRunner {
                 participant.adnl_addr.as_slice()
             )
         );
-        if !(1.0..=3.0).contains(&(participant.max_factor as f32 / 65536.0)) {
-            anyhow::bail!("<max-factor> must be a real number 1..3");
-        }
         // todo: move to ElectorWrapper
         // validator-elect-req.fif
         let mut data = 0x654C5074u32.to_be_bytes().to_vec();
@@ -923,8 +933,20 @@ impl ElectionRunner {
         tracing::info!("elections: start={}, end={}", elections_start, elections_end);
     }
 
-    fn calc_max_factor(&self) -> f32 {
-        self.default_max_factor
+    #[inline]
+    fn configured_max_factor_raw(&self) -> u32 {
+        (self.default_max_factor * MAX_STAKE_FACTOR_SCALE) as u32
+    }
+
+    /// Resolves elector `max_factor`: fixed-point `raw` for the Elector and `multiplier` for logs/UI.
+    ///
+    /// Applies configured `default_max_factor` and clamps to the chain cap
+    /// (`network_max_stake_factor_raw` from masterchain config param 17), in fixed-point
+    /// `[65536, network_max_stake_factor_raw]` (see [`MAX_STAKE_FACTOR_SCALE`]).
+    fn calc_max_factor(&self, network_max_stake_factor_raw: u32) -> (u32, f32) {
+        let configured_raw = self.configured_max_factor_raw();
+        let raw = configured_raw.clamp(MAX_STAKE_FACTOR_SCALE as u32, network_max_stake_factor_raw);
+        (raw, max_stake_factor_raw_to_multiplier(raw))
     }
 
     /// Calculate stake for a node according to the stake policy.

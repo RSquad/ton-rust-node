@@ -11,6 +11,7 @@ use colored::Colorize;
 use common::{
     app_config::{AppConfig, WalletConfig},
     task_cancellation::CancellationCtx,
+    ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
 use contracts::{WalletContract, contract_provider};
@@ -31,6 +32,11 @@ pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 
 /// Logical name for the master wallet in CLI, `get_wallet_config`, and `config wallet ls`.
 pub const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
+
+/// `max_stake_factor` from masterchain config param 17 as a float multiplier (e.g. `3.0`).
+pub async fn fetch_network_max_factor(rpc_client: &ClientJsonRpc) -> anyhow::Result<f32> {
+    extract_max_factor(rpc_client.get_config_param(17).await?)
+}
 
 pub fn warn_missing_secret(secret_name: &str) {
     println!("\n{} {}", "[WARNING]".yellow().bold(), "Vault secret is missing".yellow(),);
@@ -234,17 +240,12 @@ pub async fn wait_for_seqno_change(
 
 /// Returns the config path or an error if not provided.
 pub fn require_config(config_path: Option<&str>) -> anyhow::Result<&Path> {
-    config_path
-        .map(Path::new)
-        .ok_or_else(|| anyhow::anyhow!("config is required for this command"))
+    config_path.map(Path::new).ok_or_else(|| anyhow::anyhow!("config is required for this command"))
 }
 
 /// Resolves the base URL for the nodectl service API.
 /// Priority: `--url` flag, then `http.bind` from config file, then error.
-pub fn resolve_service_url(
-    url: Option<&str>,
-    config_path: Option<&str>,
-) -> anyhow::Result<String> {
+pub fn resolve_service_url(url: Option<&str>, config_path: Option<&str>) -> anyhow::Result<String> {
     if let Some(u) = url {
         return Ok(normalize_base_url(u));
     }

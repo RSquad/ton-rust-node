@@ -8,8 +8,9 @@
  */
 use anyhow::Context;
 use common::{
-    app_config::{AppConfig, KeyConfig, PoolConfig, WalletConfig},
+    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
     time_format,
+    ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
 use contracts::{
@@ -93,6 +94,9 @@ impl RuntimeConfigStore {
 
         let vault = Some(SecretVaultBuilder::from_env().await?);
         let rpc_client = Self::load_rpc_client(&app_cfg).await?;
+        if let Some(elections) = app_cfg.elections.as_ref() {
+            Self::validate_max_factor(&rpc_client, elections).await?;
+        }
         let master_wallet =
             Self::load_master_wallet(&app_cfg, rpc_client.clone(), vault.clone()).await?;
         let wallets = Self::load_wallets(&app_cfg, rpc_client.clone(), vault.clone()).await?;
@@ -116,6 +120,9 @@ impl RuntimeConfigStore {
     async fn reload(&self, new_config: AppConfig) -> anyhow::Result<()> {
         let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
         let rpc_client = Self::load_rpc_client(&new_config).await?;
+        if let Some(elections) = new_config.elections.as_ref() {
+            Self::validate_max_factor(&rpc_client, elections).await?;
+        }
         let master_wallet =
             Self::load_master_wallet(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
         let wallets =
@@ -133,6 +140,22 @@ impl RuntimeConfigStore {
         *self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))? = new_state;
         self.updated_at.store(time_format::now(), Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn validate_max_factor(
+        rpc_client: &ClientJsonRpc,
+        elections: &ElectionsConfig,
+    ) -> anyhow::Result<()> {
+        match rpc_client.get_config_param(17).await.and_then(extract_max_factor) {
+            Ok(network_max_factor) => elections.validate(Some(network_max_factor)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot validate max_factor: failed to get config param 17; max_factor may be clamped"
+                );
+                elections.validate(None)
+            }
+        }
     }
 
     #[cfg(test)]

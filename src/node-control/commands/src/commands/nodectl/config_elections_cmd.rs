@@ -8,7 +8,10 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_get, require_config, resolve_service_url, save_config},
+    utils::{
+        api_get, fetch_network_max_factor, require_config, resolve_service_url, save_config,
+        try_create_rpc_client,
+    },
 };
 use colored::Colorize;
 use common::{
@@ -74,7 +77,9 @@ pub struct TickIntervalCmd {
 
 #[derive(clap::Args, Clone)]
 pub struct MaxFactorCmd {
-    #[arg(help = "Max factor (1.0..3.0)")]
+    #[arg(
+        help = "Max factor: from 1.0 up to the network limit (config param 17 max_stake_factor)"
+    )]
     value: f32,
 }
 
@@ -263,15 +268,17 @@ impl TickIntervalCmd {
 
 impl MaxFactorCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if !(1.0..=3.0).contains(&self.value) {
-            anyhow::bail!("max-factor must be in range [1.0..3.0]");
-        }
         let mut config = AppConfig::load(path)?;
-        config
+        config.elections.as_ref().ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?;
+
+        let rpc_client = try_create_rpc_client(&config).await?;
+        let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
+        let elections = config
             .elections
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?
-            .max_factor = self.value;
+            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?;
+        elections.max_factor = self.value;
+        elections.validate(Some(network_max_factor))?;
         save_config(&config, path)?;
         println!("{} Max factor set to {}", "OK".green().bold(), self.value);
         Ok(())

@@ -7,9 +7,14 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::{
-    config_bind_cmd::BindCmd, config_elections_cmd::ElectionsCfgCmd, config_log_cmd::LogCmd,
-    config_node_cmd::NodeCmd, config_pool_cmd::PoolCmd, config_ton_http_api_cmd::TonHttpApiCmd,
-    config_wallet_cmd::WalletCmd, master_wallet_cmd::MasterWalletCmd,
+    config_bind_cmd::BindCmd,
+    config_elections_cmd::ElectionsCfgCmd,
+    config_log_cmd::LogCmd,
+    config_node_cmd::NodeCmd,
+    config_pool_cmd::PoolCmd,
+    config_ton_http_api_cmd::TonHttpApiCmd,
+    config_wallet_cmd::WalletCmd,
+    master_wallet_cmd::MasterWalletCmd,
     utils::{require_config, save_config},
 };
 use anyhow::Context;
@@ -123,9 +128,7 @@ impl ConfigCmd {
         match &self.action {
             ConfigAction::Generate(cmd) => cmd.run().await,
             ConfigAction::Node(cmd) => cmd.run(config_path, url, token).await,
-            ConfigAction::Wallet(cmd) => {
-                cmd.run(config_path, cancellation_ctx, url, token).await
-            }
+            ConfigAction::Wallet(cmd) => cmd.run(config_path, cancellation_ctx, url, token).await,
             ConfigAction::Pool(cmd) => cmd.run(config_path, url, token).await,
             ConfigAction::Bind(cmd) => cmd.run(config_path, url, token).await,
             ConfigAction::TonHttpApi(cmd) => cmd.run(require_config(config_path)?).await,
