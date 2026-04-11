@@ -288,7 +288,7 @@ Add a pool: **`--kind snp`** (Single Nominator Pool) or **`--kind core`** (TONCo
 |------|------------|-------------|
 | `--kind <KIND>` | | `snp` (default) or `core` |
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--address <ADDRESS>` | `-a` | SNP: pool address. Core: slot 0 (even); not with `--address-even`/`--address-odd` |
+| `--address <ADDRESS>` | `-a` | SNP: deployed pool address. Core: only the even-round pool (`addresses[0]`); mutually exclusive with `--address-even` / `--address-odd` |
 | `--address-even`, `--address-odd` | | Core only: per-slot addresses (optional) |
 | `--owner <ADDRESS>` | `-o` | SNP: owner for deployment/verification |
 | `--validator-share` | | Core: basis points (required for core) |

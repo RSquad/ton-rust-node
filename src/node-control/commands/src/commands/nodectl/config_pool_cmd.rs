@@ -72,7 +72,7 @@ pub struct PoolAddCmd {
     #[arg(
         short = 'a',
         long = "address",
-        help = "SNP: pool address. Core: slot 0 (even round); do not combine with --address-even/--address-odd"
+        help = "SNP: deployed pool contract address. For --kind core: saves one address for the even-round pool only (config `addresses[0]`); do not use together with --address-even or --address-odd"
     )]
     address: Option<String>,
     #[arg(
@@ -143,6 +143,9 @@ pub struct PoolDepositValidatorCmd {
         help = "Core: use the pool for odd validation rounds"
     )]
     pool_odd: bool,
+    /// Skip the interactive confirmation prompt (for scripts and CI)
+    #[arg(long = "yes", help = "Do not ask for confirmation")]
+    yes: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -933,7 +936,7 @@ impl PoolDepositValidatorCmd {
             self.amount,
         );
 
-        if !confirm_action("Confirm deposit?")? {
+        if !self.yes && !confirm_action("Confirm deposit?")? {
             println!("{}", "Deposit cancelled".yellow());
             return Ok(());
         }

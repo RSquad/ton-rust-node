@@ -24,7 +24,10 @@ Required env var:
 
 Optional env vars:
   HTTP_API_URL, NODE_CNT, MASTER_TOPUP_TON, WALLET_TOPUP_TON, POOL_TOPUP_TON,
-  PARTICIPANTS_WAIT_SECONDS, NOBUILD, KEEP_NODECTL_ON_SUCCESS, NODECTL_LOG, SCRIPT_LOG
+  PARTICIPANTS_WAIT_SECONDS, NOBUILD, KEEP_NODECTL_ON_SUCCESS, NODECTL_LOG, SCRIPT_LOG,
+  TONCORE_VALIDATOR_SHARE (basis points for the last node's TONCore dual pool; default 5000)
+  TONCORE_VALIDATOR_DEPOSIT_TON (per-slot deposit-validator amount in TON; default 100100,
+    must be >= min_validator_stake from pool config; auto-raises MASTER_TOPUP_TON if needed)
 """
 
 from __future__ import annotations
@@ -49,6 +52,8 @@ from typing import Optional
 ELECTOR_ADDR   = "-1:3333333333333333333333333333333333333333333333333333333333333333"
 TOTAL_PHASES   = 11
 WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2"]
+# min_validator_stake default (100k TON) + 100 TON margin; matches app_config.rs
+DEFAULT_TONCORE_DEPOSIT_TON = 100_100
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -57,27 +62,33 @@ WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2"]
 
 @dataclasses.dataclass
 class Config:
-    http_api_url:      str  = "http://127.0.0.1:3301"
-    node_cnt:          int  = 6
-    master_topup:      str  = "1000"
-    wallet_topup:      str  = "100"
-    pool_topup:        str  = "100000"
-    participants_wait: int  = 600
-    nobuild:           bool = False
-    keep_on_success:   bool = True
-    wallet_versions:   list = dataclasses.field(default_factory=lambda: list(WALLET_VERSIONS))
+    http_api_url:             str  = "http://127.0.0.1:3301"
+    node_cnt:                 int  = 6
+    master_topup:             str  = "1000"
+    wallet_topup:             str  = "100"
+    pool_topup:               str  = "100000"
+    participants_wait:        int  = 600
+    nobuild:                  bool = False
+    keep_on_success:          bool = True
+    toncore_validator_share:      int  = 5000   # basis points; last node's pool when node_cnt > 1
+    toncore_validator_deposit_ton: int = DEFAULT_TONCORE_DEPOSIT_TON  # per-slot deposit-validator amount
+    wallet_versions:              list = dataclasses.field(default_factory=lambda: list(WALLET_VERSIONS))
 
     @classmethod
     def from_env(cls) -> Config:
         return cls(
-            http_api_url      = os.environ.get("HTTP_API_URL", "http://127.0.0.1:3301"),
-            node_cnt          = int(os.environ.get("NODE_CNT", "6")),
-            master_topup      = os.environ.get("MASTER_TOPUP_TON", "1000"),
-            wallet_topup      = os.environ.get("WALLET_TOPUP_TON", "100"),
-            pool_topup        = os.environ.get("POOL_TOPUP_TON", "100000"),
-            participants_wait = int(os.environ.get("PARTICIPANTS_WAIT_SECONDS", "600")),
-            nobuild           = os.environ.get("NOBUILD", "0") in ("1", "true"),
-            keep_on_success   = os.environ.get("KEEP_NODECTL_ON_SUCCESS", "1") not in ("0", "false"),
+            http_api_url            = os.environ.get("HTTP_API_URL", "http://127.0.0.1:3301"),
+            node_cnt                = int(os.environ.get("NODE_CNT", "6")),
+            master_topup            = os.environ.get("MASTER_TOPUP_TON", "1000"),
+            wallet_topup            = os.environ.get("WALLET_TOPUP_TON", "100"),
+            pool_topup              = os.environ.get("POOL_TOPUP_TON", "100000"),
+            participants_wait       = int(os.environ.get("PARTICIPANTS_WAIT_SECONDS", "600")),
+            nobuild                 = os.environ.get("NOBUILD", "0") in ("1", "true"),
+            keep_on_success         = os.environ.get("KEEP_NODECTL_ON_SUCCESS", "1") not in ("0", "false"),
+            toncore_validator_share = int(os.environ.get("TONCORE_VALIDATOR_SHARE", "5000")),
+            toncore_validator_deposit_ton = int(os.environ.get(
+                "TONCORE_VALIDATOR_DEPOSIT_TON", str(DEFAULT_TONCORE_DEPOSIT_TON)
+            )),
         )
 
 
@@ -295,7 +306,49 @@ class Bootstrap:
     def _bun_topup(self, address: str, amount: str) -> None:
         subprocess.run(["bun", "run", "topup", address, amount],
                        cwd=self.paths.load_net_dir, check=True,
-                       stdin=subprocess.DEVNULL, timeout=30)
+                       stdin=subprocess.DEVNULL, timeout=120)
+
+    def _address_balance_nanotons(self, address: str) -> Optional[int]:
+        try:
+            return int(self._json_rpc("getAddressInformation", {"address": address})["result"]["balance"])
+        except Exception:
+            return None
+
+    def _wait_balance(self, address: str, min_nanotons: int, label: str, timeout: int = 120) -> None:
+        """Poll until account balance >= min_nanotons; fail with context on timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            bal = self._address_balance_nanotons(address)
+            if bal is not None and bal >= min_nanotons:
+                return
+            time.sleep(2)
+        self._fail(f"{label}: {address} balance still below {min_nanotons / 1e9:.0f} TON after {timeout}s")
+
+    def _toncore_wallet_topup_ton(self) -> int:
+        """How much TON the validator wallet needs to cover two deposit-validator calls + gas."""
+        return 2 * self.cfg.toncore_validator_deposit_ton + 50
+
+    def _toncore_deposit_validator(self, log_text: str) -> None:
+        """Fund validator wallet, then deposit-validator even + odd for last node's TONCore pool."""
+        n = self.cfg.node_cnt
+        binding = f"node{n}"
+        dep = self.cfg.toncore_validator_deposit_ton
+        m = re.search(rf"\[node{n}\] opened wallet: address=(\S+)", log_text)
+        if not m:
+            self._fail(f"Could not find validator wallet address for {binding} in nodectl log")
+        waddr = m.group(1)
+
+        wallet_ton = self._toncore_wallet_topup_ton()
+        need_one_nano = (dep + 2) * 1_000_000_000  # deposit + gas
+        self.log.info(f"  TONCore ({binding}): fund validator wallet ({wallet_ton} TON), deposit {dep} TON/slot")
+        self._bun_topup(waddr, str(wallet_ton))
+        self._wait_balance(waddr, need_one_nano, "Validator wallet not funded")
+
+        for slot in ("even", "odd"):
+            self.log.info(f"  TONCore deposit-validator --pool-{slot} ({dep} TON)")
+            self._nctl("config", "pool", "deposit-validator",
+                       "-b", binding, "-a", str(dep), f"--pool-{slot}", "--yes", timeout=120)
+            time.sleep(8)
 
     def _node_console(self, i: int) -> dict:
         path = self.paths.tmp_dir / f"node_{i}" / "console.json"
@@ -504,9 +557,29 @@ class Bootstrap:
         self.log.info("  Setting elections tick interval → 20")
         self._nctl("config", "elections", "tick-interval", "20")
 
-        self.log.info("  Adding pools...")
+        self.log.info(
+            "  Adding pools (SNP for node1..n-1, TONCore dual nominator on last node when n>1)..."
+        )
         for i in range(1, self.cfg.node_cnt + 1):
-            self._nctl("config", "pool", "add", "-n", f"pool{i}", "-o", master_addr)
+            toncore_last = self.cfg.node_cnt > 1 and i == self.cfg.node_cnt
+            if toncore_last:
+                self._nctl(
+                    "config",
+                    "pool",
+                    "add",
+                    "--kind",
+                    "core",
+                    "-n",
+                    f"pool{i}",
+                    "--validator-share",
+                    str(self.cfg.toncore_validator_share),
+                )
+            else:
+                self._nctl("config", "pool", "add", "-n", f"pool{i}", "-o", master_addr)
+
+
+        time.sleep(10)
+        self._nctl("config", "pool", "ls")
 
         self.log.info("  Adding bindings...")
         for i in range(1, self.cfg.node_cnt + 1):
@@ -520,9 +593,26 @@ class Bootstrap:
 
     # ── Phase 6: Top up master wallet ─────────────────────────────────────────
 
+    def _minimum_master_topup_ton(self) -> int:
+        """Minimum TON on master to cover TONCore deposits + all pool top-ups + cushion."""
+        n = self.cfg.node_cnt
+        pool_top = int(float(self.cfg.pool_topup))
+        if n <= 1:
+            return n * pool_top + 500
+        n_pool_addrs = n + 1  # (n-1) SNP + 2 TONCore contracts
+        return self._toncore_wallet_topup_ton() + n_pool_addrs * pool_top + 500
+
     def phase6_topup_master(self, master_addr: str) -> None:
-        self._phase(6, f"Topping up master wallet ({self.cfg.master_topup} TON)...")
-        self._bun_topup(master_addr, self.cfg.master_topup)
+        floor_ton = int(float(self.cfg.master_topup))
+        need_ton = self._minimum_master_topup_ton()
+        planned = max(floor_ton, need_ton)
+        if planned > floor_ton:
+            self.log.info(
+                f"  Master top-up raised to {planned} TON (env floor {floor_ton}; "
+                f"auto minimum for pools + TONCore validator deposits {need_ton} TON)"
+            )
+        self._phase(6, f"Topping up master wallet ({planned} TON)...")
+        self._bun_topup(master_addr, str(planned))
 
     # ── Phase 7: Start nodectl service ────────────────────────────────────────
 
@@ -561,7 +651,9 @@ class Bootstrap:
             self.log.warn("No 'opened wallet' in log yet; continuing")
 
         self.log.info("  Waiting for nominator pools to open (up to 300s)...")
-        if not self._wait_log("opened nominator pool: address=", 300):
+        # runtime_config: `[node] opened nominator pool(s): addr` (comma-separated for dual pools).
+        # Older builds: `opened nominator pool: address=…`
+        if not self._wait_log("opened nominator pool", 300):
             self.log.warn("No 'opened nominator pool' in log yet; continuing")
 
         self.log.info("  Waiting for all contracts to be deployed (up to 300s)...")
@@ -570,8 +662,17 @@ class Bootstrap:
 
         log_text     = self._nodectl_log.read_text()  # type: ignore[union-attr]
         wallet_addrs = sorted(set(re.findall(r"opened wallet: address=(\S+)", log_text)))
-        pool_addrs   = sorted(set(re.findall(r"opened nominator pool: address=(\S+)", log_text)))
+        pool_addrs_set: set[str] = set(re.findall(r"opened nominator pool: address=(\S+)", log_text))
+        for m in re.finditer(r"opened nominator pool\(s\): (.+)", log_text):
+            for part in m.group(1).split(","):
+                a = part.strip()
+                if a:
+                    pool_addrs_set.add(a)
+        pool_addrs = sorted(pool_addrs_set)
         self.log.info(f"  Wallets opened: {len(wallet_addrs)}, pools opened: {len(pool_addrs)}")
+
+        if self.cfg.node_cnt > 1:
+            self._toncore_deposit_validator(log_text)
 
         for addr in pool_addrs:
             self.log.info(f"  Top up pool   {addr} ({self.cfg.pool_topup} TON)")
