@@ -9,10 +9,9 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, check_ton_api_connection, get_wallet_config,
-        load_config_vault, load_config_vault_rpc_client, make_wallet, save_config,
-        wait_for_seqno_change, wallet_address, wallet_info, warn_missing_secret,
-        warn_ton_api_unavailable,
+        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, api_get, get_wallet_config, load_config_vault,
+        load_config_vault_rpc_client, make_wallet, require_config, resolve_service_url, save_config,
+        wait_for_seqno_change, wallet_info, warn_missing_secret,
     },
 };
 use anyhow::Context;
@@ -29,10 +28,9 @@ use contracts::{
     nominator,
 };
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
-use secrets_vault::{errors::error::VaultError, vault::SecretVault};
-use std::{borrow::Cow, io::Write, path::Path, sync::Arc};
-use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, Cell, MsgAddressInt, write_boc};
-use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
+use std::{io::Write, path::Path};
+use ton_block::{Cell, MsgAddressInt, write_boc};
+use ton_http_api_client::v2::data_models::AccountState;
 
 const WALLET_SEND_GAS: u64 = 1_000_000; // 0.001 TON
 /// Value in nanotons required by elector to execute stake operations.
@@ -126,13 +124,23 @@ pub struct WalletStakeCmd {
 }
 
 impl WalletCmd {
-    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        config_path: Option<&str>,
+        cancellation_ctx: CancellationCtx,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<()> {
         match &self.action {
-            WalletAction::Add(cmd) => cmd.run(path).await,
-            WalletAction::Ls(cmd) => cmd.run(path).await,
-            WalletAction::Rm(cmd) => cmd.run(path).await,
-            WalletAction::Send(cmd) => cmd.run(path, cancellation_ctx).await,
-            WalletAction::Stake(cmd) => cmd.run(path, cancellation_ctx).await,
+            WalletAction::Add(cmd) => cmd.run(require_config(config_path)?).await,
+            WalletAction::Ls(cmd) => cmd.run(url, token, config_path).await,
+            WalletAction::Rm(cmd) => cmd.run(require_config(config_path)?).await,
+            WalletAction::Send(cmd) => {
+                cmd.run(require_config(config_path)?, cancellation_ctx).await
+            }
+            WalletAction::Stake(cmd) => {
+                cmd.run(require_config(config_path)?, cancellation_ctx).await
+            }
         }
     }
 }
@@ -174,7 +182,7 @@ impl WalletAddCmd {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct WalletView {
     name: String,
     secret: String,
@@ -185,22 +193,18 @@ struct WalletView {
 }
 
 impl WalletLsCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = api_get(&base_url, "/v1/wallets", token).await?;
+        let resp: serde_json::Value = serde_json::from_str(&body)?;
+        let views: Vec<WalletView> = serde_json::from_value(resp["result"].clone())?;
 
-        if let Err(e) = check_ton_api_connection(&rpc_client).await {
-            if matches!(self.format, OutputFormat::Table) {
-                warn_ton_api_unavailable(&e, "State and balances will not be available");
-            }
-        }
-
-        let mut all_wallets: Vec<(&str, &WalletConfig)> =
-            config.wallets.iter().map(|(k, v)| (k.as_str(), v)).collect();
-        if let Some(mw) = config.master_wallet.as_ref() {
-            all_wallets.push((MASTER_WALLET_RESERVED_NAME, mw));
-        }
-
-        if all_wallets.is_empty() {
+        if views.is_empty() {
             match self.format {
                 OutputFormat::Json => println!("[]"),
                 OutputFormat::Table => println!("\n{}\n", "No wallets configured".yellow()),
@@ -210,62 +214,18 @@ impl WalletLsCmd {
 
         match self.format {
             OutputFormat::Json => {
-                print_wallets_json(all_wallets, vault, rpc_client).await?;
+                println!("{}", serde_json::to_string_pretty(&views)?);
             }
             OutputFormat::Table => {
-                print_wallets_table(all_wallets, vault, rpc_client).await;
+                print_wallets_table_from_views(&views);
             }
         }
         Ok(())
     }
 }
 
-async fn print_wallets_json(
-    wallets: Vec<(&str, &WalletConfig)>,
-    vault: Arc<SecretVault>,
-    rpc_client: Arc<ClientJsonRpc>,
-) -> anyhow::Result<()> {
-    let mut views = Vec::new();
-    for (name, wallet_cfg) in wallets {
-        let secret = match &wallet_cfg.key {
-            KeyConfig::VaultKey { name } => name.clone(),
-            _ => "-".to_string(),
-        };
-        let (address, state, balance) = match wallet_address(wallet_cfg, vault.clone()).await {
-            Ok((address, _)) => {
-                let address_str = address
-                    .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
-                    .unwrap_or_else(|_| address.to_string());
-                match rpc_client.get_wallet_information(&address).await {
-                    Ok(info) => (
-                        Some(address_str),
-                        Some(info.account_state.to_string()),
-                        Some(display_tons(info.balance)),
-                    ),
-                    Err(_) => (Some(address_str), None, None),
-                }
-            }
-            Err(_) => (None, None, None),
-        };
-        views.push(WalletView {
-            name: name.to_string(),
-            secret,
-            version: wallet_cfg.version.to_string(),
-            state,
-            balance,
-            address,
-        });
-    }
-    println!("{}", serde_json::to_string_pretty(&views)?);
-    Ok(())
-}
-
-async fn print_wallets_table(
-    wallets: Vec<(&str, &WalletConfig)>,
-    vault: Arc<SecretVault>,
-    rpc_client: Arc<ClientJsonRpc>,
-) {
-    println!("\n{} {} ({})\n", "OK".green().bold(), "Wallets:".green(), wallets.len());
+fn print_wallets_table_from_views(views: &[WalletView]) {
+    println!("\n{} {} ({})\n", "OK".green().bold(), "Wallets:".green(), views.len());
     println!(
         "  {:<20} {:<22} {:<8} {:<9} {:<14} {}",
         "Name".cyan().bold(),
@@ -277,49 +237,15 @@ async fn print_wallets_table(
     );
     println!("  {}", "─".repeat(125).dimmed());
 
-    let red_dash = Cow::Borrowed(&"-".red());
-    for (name, wallet_cfg) in wallets {
-        let (address, account_state, balance) =
-            match wallet_address(wallet_cfg, vault.clone()).await {
-                Ok((address, _)) => {
-                    let address_str = address
-                        .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
-                        .unwrap_or_else(|_| address.to_string());
-
-                    match rpc_client.get_wallet_information(&address).await {
-                        Ok(info) => (
-                            address_str.white(),
-                            Cow::Owned(info.account_state.to_string().white()),
-                            Cow::Owned(display_tons(info.balance).white()),
-                        ),
-                        Err(_) => (address_str.white(), red_dash.clone(), red_dash.clone()),
-                    }
-                }
-                Err(e) => {
-                    let error_message = if e
-                        .downcast_ref::<VaultError>()
-                        .is_some_and(|e| e.code() == VaultError::NOT_FOUND)
-                    {
-                        "not found in the vault".red()
-                    } else {
-                        e.root_cause().to_string().red()
-                    };
-                    (error_message, red_dash.clone(), red_dash.clone())
-                }
-            };
-
-        let secret_name = match &wallet_cfg.key {
-            KeyConfig::VaultKey { name } => Cow::Owned(name.white()),
-            _ => red_dash.clone(),
-        };
+    for v in views {
         println!(
             "  {:<20} {:<22} {:<8} {:<9} {:<14} {}",
-            name,
-            secret_name,
-            wallet_cfg.version.to_string(),
-            account_state,
-            balance,
-            address,
+            v.name,
+            v.secret,
+            v.version,
+            v.state.as_deref().unwrap_or("-"),
+            v.balance.as_deref().unwrap_or("-"),
+            v.address.as_deref().unwrap_or("-"),
         );
     }
     println!();

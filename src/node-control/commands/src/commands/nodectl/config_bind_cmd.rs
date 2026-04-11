@@ -6,7 +6,10 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
+use crate::commands::nodectl::{
+    output_format::OutputFormat,
+    utils::{api_get, require_config, resolve_service_url, save_config},
+};
 use colored::Colorize;
 use common::app_config::{AppConfig, BindingStatus, NodeBinding};
 use std::path::Path;
@@ -54,11 +57,16 @@ pub struct BindLsCmd {
 }
 
 impl BindCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        config_path: Option<&str>,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<()> {
         match &self.action {
-            BindAction::Add(cmd) => cmd.run(path).await,
-            BindAction::Rm(cmd) => cmd.run(path).await,
-            BindAction::Ls(cmd) => cmd.run(path).await,
+            BindAction::Add(cmd) => cmd.run(require_config(config_path)?).await,
+            BindAction::Rm(cmd) => cmd.run(require_config(config_path)?).await,
+            BindAction::Ls(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
@@ -137,7 +145,7 @@ impl BindRmCmd {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct BindingView {
     node: String,
     wallet: String,
@@ -147,29 +155,24 @@ struct BindingView {
 }
 
 impl BindLsCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let config = AppConfig::load(path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = api_get(&base_url, "/v1/bindings", token).await?;
+        let resp: serde_json::Value = serde_json::from_str(&body)?;
+        let views: Vec<BindingView> = serde_json::from_value(resp["result"].clone())?;
 
-        if config.bindings.is_empty() {
+        if views.is_empty() {
             match self.format {
                 OutputFormat::Json => println!("[]"),
                 OutputFormat::Table => println!("\n{}\n", "No bindings configured".yellow()),
             }
             return Ok(());
         }
-
-        let mut views: Vec<BindingView> = config
-            .bindings
-            .into_iter()
-            .map(|(node, b)| BindingView {
-                node,
-                wallet: b.wallet,
-                pool: b.pool,
-                enable: b.enable,
-                status: b.status.to_string(),
-            })
-            .collect();
-        views.sort_by(|a, b| a.node.cmp(&b.node));
 
         match self.format {
             OutputFormat::Json => print_bindings_json(&views)?,

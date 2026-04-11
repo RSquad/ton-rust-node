@@ -6,7 +6,10 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
+use crate::commands::nodectl::{
+    output_format::OutputFormat,
+    utils::{api_get, require_config, resolve_service_url, save_config},
+};
 use colored::Colorize;
 use common::app_config::{AppConfig, LogConfig, LogOutput, LogRotation};
 use std::path::{Path, PathBuf};
@@ -116,24 +119,37 @@ pub struct LogSetCmd {
 }
 
 impl LogCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        config_path: Option<&str>,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<()> {
         match &self.action {
-            LogAction::Ls(cmd) => cmd.run(path).await,
-            LogAction::Set(cmd) => cmd.run(path).await,
+            LogAction::Ls(cmd) => cmd.run(url, token, config_path).await,
+            LogAction::Set(cmd) => cmd.run(require_config(config_path)?).await,
         }
     }
 }
 
 impl LogLsCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let config = AppConfig::load(path)?;
-        let log = config.log.as_ref().cloned().unwrap_or_default();
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = api_get(&base_url, "/v1/log", token).await?;
+        let resp: serde_json::Value = serde_json::from_str(&body)?;
+        let result = &resp["result"];
 
         match self.format {
             OutputFormat::Json => {
-                println!("{}", serde_json::to_string_pretty(&log)?);
+                println!("{}", serde_json::to_string_pretty(result)?);
             }
             OutputFormat::Table => {
+                let log = serde_json::from_value::<LogConfig>(result.clone()).unwrap_or_default();
                 print_log_table(&log);
             }
         }
