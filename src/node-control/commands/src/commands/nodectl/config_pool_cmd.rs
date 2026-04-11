@@ -10,8 +10,9 @@ use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
         SEND_TIMEOUT, calculate_wallet_address, get_wallet_config, load_config_vault_rpc_client,
-        make_wallet, save_config, toncore_pool_slot_from_cli_flags, try_create_rpc_client,
-        wait_for_seqno_change, wallet_info, warn_ton_api_unavailable,
+        make_wallet, resolve_pool_address_from_config, save_config,
+        toncore_pool_slot_from_cli_flags, try_create_rpc_client, wait_for_seqno_change,
+        wallet_info, warn_ton_api_unavailable,
     },
 };
 use colored::Colorize;
@@ -167,6 +168,9 @@ pub struct PoolWithdrawValidatorCmd {
         help = "Core: use the pool for odd validation rounds"
     )]
     pool_odd: bool,
+    /// Skip the interactive confirmation prompt (for scripts and CI)
+    #[arg(long = "yes", help = "Do not ask for confirmation")]
+    yes: bool,
 }
 
 impl PoolCmd {
@@ -813,64 +817,6 @@ impl PoolRmCmd {
     }
 }
 
-fn resolve_toncore_pool_address(
-    pool_cfg: &PoolConfig,
-    wallet_address: &MsgAddressInt,
-    pool_index: usize,
-) -> anyhow::Result<MsgAddressInt> {
-    match pool_cfg {
-        PoolConfig::TONCore { dual_pools: false, .. } if pool_index != 0 => {
-            anyhow::bail!(
-                "--pool-odd is only valid for TONCore nominator (single TONCore has one pool)"
-            );
-        }
-        PoolConfig::TONCore {
-            dual_pools: false,
-            validator_share,
-            address,
-            max_nominators,
-            min_validator_stake,
-            min_nominator_stake,
-            ..
-        } => {
-            let resolved = resolve_toncore_pool(
-                wallet_address,
-                *validator_share,
-                address.as_deref(),
-                Some(*max_nominators),
-                Some(*min_validator_stake),
-                Some(*min_nominator_stake),
-            )?;
-            Ok(resolved.address)
-        }
-        PoolConfig::TONCore { dual_pools: true, .. } if pool_index > 1 => {
-            anyhow::bail!("TONCore pool slot must be even or odd (0 or 1)");
-        }
-        PoolConfig::TONCore {
-            dual_pools: true,
-            validator_share,
-            addresses,
-            max_nominators,
-            min_validator_stake,
-            min_nominator_stake,
-            ..
-        } => {
-            let resolved = resolve_toncore_nominator_pools(
-                wallet_address,
-                *validator_share,
-                addresses.as_ref().map(|v| v.as_slice()),
-                Some(*max_nominators),
-                Some(*min_validator_stake),
-                Some(*min_nominator_stake),
-            )?;
-            Ok(resolved[pool_index].address.clone())
-        }
-        PoolConfig::SNP { .. } => {
-            anyhow::bail!("This command is only supported for TONCore pools, not SNP");
-        }
-    }
-}
-
 fn confirm_action(prompt: &str) -> anyhow::Result<bool> {
     print!("{prompt} [y/N]: ");
     std::io::stdout().flush()?;
@@ -910,7 +856,7 @@ impl PoolDepositValidatorCmd {
         }
 
         let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
-        let pool_address = resolve_toncore_pool_address(pool_cfg, &wallet_address, pool_slot)?;
+        let pool_address = resolve_pool_address_from_config(pool_cfg, &wallet_address, pool_slot)?;
 
         let deposit_nanotons = tons_f64_to_nanotons(self.amount);
         if deposit_nanotons == 0 {
@@ -1003,7 +949,7 @@ impl PoolWithdrawValidatorCmd {
         }
 
         let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
-        let pool_address = resolve_toncore_pool_address(pool_cfg, &wallet_address, pool_slot)?;
+        let pool_address = resolve_pool_address_from_config(pool_cfg, &wallet_address, pool_slot)?;
 
         let withdraw_nanotons = tons_f64_to_nanotons(self.amount);
         if withdraw_nanotons == 0 {
@@ -1020,7 +966,7 @@ impl PoolWithdrawValidatorCmd {
             self.amount,
         );
 
-        if !confirm_action("Confirm withdrawal?")? {
+        if !self.yes && !confirm_action("Confirm withdrawal?")? {
             println!("{}", "Withdrawal cancelled".yellow());
             return Ok(());
         }

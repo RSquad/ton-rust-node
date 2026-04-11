@@ -1045,9 +1045,9 @@ impl ElectionRunner {
         }
 
         // TONCore nominator: two pools alternate rounds — reserve is the *other* pool.
-        // Split50 would halve (frozen + pool + elections) and under-stake the active pool;
-        // instead stake the full liquid balance of the selected pool (still >= min_stake).
-        if matches!(&node.stake_policy, StakePolicy::Split50)
+        // Split50/AdaptiveSplit50 would halve (frozen + pool + elections) and under-stake the
+        // active pool; instead stake the full liquid balance of the selected pool (still >= min_stake).
+        if matches!(&node.stake_policy, StakePolicy::Split50 | StakePolicy::AdaptiveSplit50)
             && node.pools.as_ref().is_some_and(|p| p.is_toncore_nominator_pair())
         {
             if pool_free_balance < min_stake {

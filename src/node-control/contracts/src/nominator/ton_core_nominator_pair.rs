@@ -45,6 +45,10 @@ impl SmartContract for TonCoreNominatorPair {
 
 #[async_trait::async_trait]
 impl NominatorWrapper for TonCoreNominatorPair {
+    fn is_toncore_pool(&self) -> bool {
+        true
+    }
+
     fn state_init(&self) -> Option<StateInit> {
         None
     }

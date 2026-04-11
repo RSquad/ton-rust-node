@@ -207,7 +207,9 @@ pub fn resolve_toncore_nominator_pools(
         }
     };
 
-    let min_v_1 = min_v.saturating_add(1);
+    let min_v_1 = min_v
+        .checked_add(1)
+        .context("min_validator_stake overflow: cannot add 1 to differentiate pool[1]")?;
     let pool1 = {
         let (address, state_init) =
             toncore_pool_address_and_state(validator_addr, validator_share, max_n, min_v_1, min_n)?;
@@ -352,6 +354,10 @@ impl SmartContract for NominatorPoolWrapperImpl {
 
 #[async_trait::async_trait]
 impl NominatorWrapper for NominatorPoolWrapperImpl {
+    fn is_toncore_pool(&self) -> bool {
+        true
+    }
+
     fn state_init(&self) -> Option<StateInit> {
         self.state_init.clone()
     }

@@ -197,6 +197,7 @@ mock! {
         async fn get_pool_data(&self) -> anyhow::Result<PoolData>;
         fn state_init(&self) -> Option<ton_block::StateInit>;
         async fn resolve_staking_address(&self) -> anyhow::Result<MsgAddressInt>;
+        fn is_toncore_pool(&self) -> bool;
         fn is_toncore_nominator_pair(&self) -> bool;
     }
 }
@@ -543,6 +544,7 @@ fn setup_default_provider_without_account(
 fn setup_pool(pool: &mut MockNominatorWrapperImpl) {
     pool.expect_address().returning(|| pool_address());
     pool.expect_resolve_staking_address().returning(|| Ok(pool_address()));
+    pool.expect_is_toncore_pool().returning(|| false);
     pool.expect_is_toncore_nominator_pair().returning(|| false);
 }
 

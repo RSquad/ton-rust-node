@@ -39,6 +39,11 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
         Ok(self.address())
     }
 
+    /// `true` for any TONCore nominator pool (single or pair).
+    fn is_toncore_pool(&self) -> bool {
+        false
+    }
+
     /// `true` only for TONCore nominator with two pools ([`crate::nominator::TonCoreNominatorPair`]).
     fn is_toncore_nominator_pair(&self) -> bool {
         false

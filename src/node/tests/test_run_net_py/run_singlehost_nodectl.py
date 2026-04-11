@@ -74,6 +74,11 @@ class Config:
     toncore_validator_deposit_ton: int = DEFAULT_TONCORE_DEPOSIT_TON  # per-slot deposit-validator amount
     wallet_versions:              list = dataclasses.field(default_factory=lambda: list(WALLET_VERSIONS))
 
+    @property
+    def has_toncore(self) -> bool:
+        """Last node gets a TONCore dual pool when there are at least 2 nodes."""
+        return self.node_cnt > 1
+
     @classmethod
     def from_env(cls) -> Config:
         return cls(
@@ -348,7 +353,7 @@ class Bootstrap:
             self.log.info(f"  TONCore deposit-validator --pool-{slot} ({dep} TON)")
             self._nctl("config", "pool", "deposit-validator",
                        "-b", binding, "-a", str(dep), f"--pool-{slot}", "--yes", timeout=120)
-            time.sleep(8)
+            time.sleep(8)  # wait for masterchain block confirmation before next deposit
 
     def _node_console(self, i: int) -> dict:
         path = self.paths.tmp_dir / f"node_{i}" / "console.json"
@@ -561,7 +566,7 @@ class Bootstrap:
             "  Adding pools (SNP for node1..n-1, TONCore dual nominator on last node when n>1)..."
         )
         for i in range(1, self.cfg.node_cnt + 1):
-            toncore_last = self.cfg.node_cnt > 1 and i == self.cfg.node_cnt
+            toncore_last = self.cfg.has_toncore and i == self.cfg.node_cnt
             if toncore_last:
                 self._nctl(
                     "config",
@@ -578,7 +583,7 @@ class Bootstrap:
                 self._nctl("config", "pool", "add", "-n", f"pool{i}", "-o", master_addr)
 
 
-        time.sleep(10)
+        time.sleep(10)  # let config settle before listing
         self._nctl("config", "pool", "ls")
 
         self.log.info("  Adding bindings...")
@@ -597,7 +602,7 @@ class Bootstrap:
         """Minimum TON on master to cover TONCore deposits + all pool top-ups + cushion."""
         n = self.cfg.node_cnt
         pool_top = int(float(self.cfg.pool_topup))
-        if n <= 1:
+        if not self.cfg.has_toncore:
             return n * pool_top + 500
         n_pool_addrs = n + 1  # (n-1) SNP + 2 TONCore contracts
         return self._toncore_wallet_topup_ton() + n_pool_addrs * pool_top + 500
@@ -671,7 +676,7 @@ class Bootstrap:
         pool_addrs = sorted(pool_addrs_set)
         self.log.info(f"  Wallets opened: {len(wallet_addrs)}, pools opened: {len(pool_addrs)}")
 
-        if self.cfg.node_cnt > 1:
+        if self.cfg.has_toncore:
             self._toncore_deposit_validator(log_text)
 
         for addr in pool_addrs:

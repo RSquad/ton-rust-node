@@ -9,12 +9,15 @@
 use anyhow::Context;
 use colored::Colorize;
 use common::{
-    app_config::{AppConfig, WalletConfig},
+    app_config::{AppConfig, PoolConfig, WalletConfig},
     task_cancellation::CancellationCtx,
     ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
-use contracts::{WalletContract, contract_provider};
+use contracts::{
+    NominatorWrapperImpl, WalletContract, contract_provider, resolve_toncore_nominator_pools,
+    resolve_toncore_pool,
+};
 use secrets_vault::{
     errors::error::VaultError, types::secret::Secret, vault::SecretVault,
     vault_builder::SecretVaultBuilder,
@@ -44,6 +47,77 @@ pub fn toncore_pool_slot_from_cli_flags(pool_even: bool, pool_odd: bool) -> usiz
     match (pool_even, pool_odd) {
         (_, true) => 1,
         (true, false) | (false, false) => 0,
+    }
+}
+
+/// Resolve the on-chain pool address from config, validator wallet address, and pool slot index.
+///
+/// Handles SNP (address or derived from owner), single TONCore, and dual-pool TONCore.
+/// `pool_slot` is `0` for even rounds (or SNP) and `1` for odd rounds (`--pool-odd`).
+pub fn resolve_pool_address_from_config(
+    pool_cfg: &PoolConfig,
+    validator_addr: &MsgAddressInt,
+    pool_slot: usize,
+) -> anyhow::Result<MsgAddressInt> {
+    match pool_cfg {
+        PoolConfig::SNP { .. } if pool_slot != 0 => {
+            anyhow::bail!("--pool-odd is not applicable for SNP pools");
+        }
+        PoolConfig::SNP { address, owner } => match (address, owner) {
+            (Some(addr), _) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
+            (None, Some(owner)) => {
+                let owner_addr =
+                    owner.parse::<MsgAddressInt>().context("invalid pool owner address")?;
+                NominatorWrapperImpl::calculate_address(-1, &owner_addr, validator_addr)
+            }
+            (None, None) => anyhow::bail!("Pool has neither address nor owner configured"),
+        },
+        PoolConfig::TONCore { dual_pools: false, .. } if pool_slot != 0 => {
+            anyhow::bail!(
+                "--pool-odd is only valid for TONCore nominator (single TONCore has one pool)"
+            );
+        }
+        PoolConfig::TONCore {
+            dual_pools: false,
+            validator_share,
+            address,
+            max_nominators,
+            min_validator_stake,
+            min_nominator_stake,
+            ..
+        } => {
+            let resolved = resolve_toncore_pool(
+                validator_addr,
+                *validator_share,
+                address.as_deref(),
+                Some(*max_nominators),
+                Some(*min_validator_stake),
+                Some(*min_nominator_stake),
+            )?;
+            Ok(resolved.address)
+        }
+        PoolConfig::TONCore { dual_pools: true, .. } if pool_slot > 1 => {
+            anyhow::bail!("TONCore pool slot must be even or odd (0 or 1)");
+        }
+        PoolConfig::TONCore {
+            dual_pools: true,
+            validator_share,
+            addresses,
+            max_nominators,
+            min_validator_stake,
+            min_nominator_stake,
+            ..
+        } => {
+            let resolved = resolve_toncore_nominator_pools(
+                validator_addr,
+                *validator_share,
+                addresses.as_ref().map(|v| v.as_slice()),
+                Some(*max_nominators),
+                Some(*min_validator_stake),
+                Some(*min_nominator_stake),
+            )?;
+            Ok(resolved[pool_slot].address.clone())
+        }
     }
 }
 

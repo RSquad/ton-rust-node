@@ -448,11 +448,14 @@ impl ContractsMonitor {
 
                 tracing::info!(
                     target: "contracts",
-                    "[{}] pool={} state={} ={}",
+                    "[{}] pool={} state={} vsc_count={}",
                     node_id, pool.address(), pool_data.state, pool_data.validator_set_changes_count
                 );
 
-                if pool_data.state != 2 || pool_data.validator_set_changes_count >= 2 {
+                if !pool.is_toncore_pool()
+                    || pool_data.state != 2
+                    || pool_data.validator_set_changes_count >= 2
+                {
                     continue;
                 }
 
