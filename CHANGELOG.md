@@ -6,6 +6,28 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.5.0] - 2026-04-11
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.0`
+
+### Added
+
+- Support non-standard RaptorQ symbol size (> 65536)
+- Simplex consensus updates (pipeline context, latest protocol changes)
+- QUIC connection deduplication
+
+### Changed
+
+- LiteServer runSmcMethod implementation
+- Optimized collection of overlay statistics
+
+### Fixed
+
+- Stability fix for fast Merkle update apply
+- Transaction execution fixes (two rounds)
+- Fix pipeline context for Simplex consensus
+- Fix config params creation for emulator
+
 ## [v0.4.0] - 2026-04-05
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.4.0`
