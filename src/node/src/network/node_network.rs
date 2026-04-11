@@ -845,6 +845,11 @@ impl PrivateOverlayOperations for NodeNetwork {
 
     fn activate_validator_list(&self, validator_list_id: UInt256) -> Result<()> {
         log::trace!("activate_validator_list {:x}", validator_list_id);
+        if let Some(context) = self.validator_context.sets_contexts.get(&validator_list_id) {
+            if let Some(quic) = &self.network_context.stack.quic {
+                quic.activate_key(context.val().validator_adnl_key.id());
+            }
+        }
         self.validator_context.current_set.insert(0, validator_list_id);
         Ok(())
     }

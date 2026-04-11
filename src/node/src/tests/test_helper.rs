@@ -598,7 +598,7 @@ impl TestEngine {
             db,
             res_path: res_path.map(|s| s.to_string()),
             now: AtomicU32::new(0),
-            ext_messages: Arc::new(MessagesPool::new(0, None)),
+            ext_messages: Arc::new(MessagesPool::new(0, None).0),
             shard_states: Default::default(),
             check_only_transactions: false,
             check_only_masterchain: false,

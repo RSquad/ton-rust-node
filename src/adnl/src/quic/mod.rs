@@ -61,7 +61,7 @@ enum SendError {
 /// connections from the same peer address but different key pairs (e.g.
 /// current + next validator keys) coexist instead of evicting each other.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct QuicInboundKey(Arc<KeyId>, Arc<KeyId>);
+struct QuicInboundKey(Arc<KeyId>, Arc<KeyId>, usize);
 
 type QuicInboundMap = lockfree::map::Map<QuicInboundKey, quinn::Connection>;
 type QuicSendQueue = SendQueue<Vec<u8>>;
@@ -479,6 +479,9 @@ enum KeyCommand {
         bind_addr: SocketAddr,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    ActivateKey {
+        key_id: Arc<KeyId>,
+    },
 }
 
 pub struct QuicNode {
@@ -609,6 +612,11 @@ impl QuicNode {
                                 };
                                 let _ = reply.send(result);
                             }
+                            KeyCommand::ActivateKey { key_id } => {
+                                if let Some(this) = weak.upgrade() {
+                                    this.activate_key_inner(&key_id);
+                                }
+                            }
                         }
                     }
                     _ = token.cancelled() => break,
@@ -738,9 +746,17 @@ impl QuicNode {
             }
         }
 
-        // Update last-added name for SNI fallback (C++ ngtcp2 doesn't send SNI)
+        // Auto-activate the first key so the server always has an active identity
         if let Ok(mut last) = endpoint_state.last_added_name.lock() {
-            *last = Some(name);
+            if last.is_none() {
+                *last = Some(name);
+                log::info!(
+                    target: TARGET,
+                    "Registered and auto-activated QUIC identity {} on port {}",
+                    key_id, bind_addr.port()
+                );
+                return Ok(());
+            }
         }
 
         log::info!(
@@ -812,6 +828,34 @@ impl QuicNode {
         );
 
         Ok(())
+    }
+
+    /// Activate a previously added key as the current SNI fallback identity.
+    /// Called when the validator set containing this key becomes active.
+    pub fn activate_key(&self, key_id: &Arc<KeyId>) {
+        let _ = self.key_cmd_tx.send(KeyCommand::ActivateKey { key_id: key_id.clone() });
+    }
+
+    fn activate_key_inner(&self, key_id: &Arc<KeyId>) {
+        let Some(local_key) = self.local_keys.get(key_id) else {
+            log::warn!(target: TARGET, "activate_key: unknown key {key_id}");
+            return;
+        };
+        let port = local_key.val().bound_port;
+        let Ok(endpoints) = self.endpoints.lock() else {
+            log::error!(target: TARGET, "activate_key: endpoints lock poisoned");
+            return;
+        };
+        let Some(endpoint_state) = endpoints.get(&port) else {
+            log::warn!(target: TARGET, "activate_key: no endpoint on port {port} for key {key_id}");
+            return;
+        };
+        let name = Self::key_id_to_server_name(key_id);
+        // Update last-added name for SNI fallback (C++ ngtcp2 doesn't send SNI)
+        if let Ok(mut last) = endpoint_state.last_added_name.lock() {
+            *last = Some(name);
+        }
+        log::info!(target: TARGET, "Activated QUIC identity {} on port {}", key_id, port);
     }
 
     pub fn add_peer_key(&self, key_id: Arc<KeyId>, addr: SocketAddr) -> Result<()> {
@@ -1364,18 +1408,11 @@ impl QuicNode {
             local {local_key_id} peer {peer_key_id}"
         );
 
-        // Replace any existing inbound connection for this peer path and close the
-        // old one immediately (matches C++ QuicSender::on_connected_inner behaviour).
-        let inbound_key = QuicInboundKey(local_key_id.clone(), peer_key_id.clone());
-        let old_conn = inbound.remove(&inbound_key).map(|g| g.val().clone());
+        // Keep all inbound connections (no dedup) so old ones stay until the peer
+        // closes them.  Each connection gets a unique map slot via stable_id().
+        let inbound_key =
+            QuicInboundKey(local_key_id.clone(), peer_key_id.clone(), conn.stable_id());
         let _ = add_unbound_object_to_map(&inbound, inbound_key.clone(), || Ok(conn.clone()));
-        if let Some(old) = old_conn {
-            log::info!(
-                target: TARGET,
-                "Replacing duplicate inbound from {addr} key {peer_key_id}, closing old"
-            );
-            old.close(0u32.into(), b"duplicate replaced");
-        }
 
         let peers = AdnlPeers::with_keys(local_key_id, peer_key_id);
         let conn_id = conn.stable_id();
@@ -1478,11 +1515,7 @@ impl QuicNode {
             }
         }
         let total_streams = streams_accepted.load(Ordering::Relaxed);
-        let is_current =
-            inbound.get(&inbound_key).map(|e| e.val().stable_id() == conn_id).unwrap_or(false);
-        if is_current {
-            inbound.remove(&inbound_key);
-        }
+        inbound.remove(&inbound_key);
 
         // If the connection was productive (streams were opened), clear the
         // reconnect tracker for this IP. This resets the fallback state so
@@ -1496,7 +1529,7 @@ impl QuicNode {
         log::info!(
             target: TARGET,
             "Exit QUIC inbound receiver for {addr} \
-            (conn_id={conn_id}, streams={total_streams}, removed={is_current})"
+            (conn_id={conn_id}, streams={total_streams})"
         );
     }
 
@@ -2360,7 +2393,7 @@ impl QuicNode {
                 };
                 for pool in &pools {
                     for conn_entry in pool.iter() {
-                        let QuicInboundKey(ref local_id, ref peer_id) = *conn_entry.key();
+                        let QuicInboundKey(ref local_id, ref peer_id, _) = *conn_entry.key();
                         let addr = conn_entry.val().remote_address();
                         let conn = conn_entry.val();
                         let s = conn.stats();
