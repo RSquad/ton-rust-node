@@ -47,7 +47,8 @@ pub fn resolve_deploy_pool_params(
 
 fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Result<MsgAddressInt> {
     let cell = state_init.write_to_new_cell()?.into_cell()?;
-    MsgAddressInt::with_params(POOL_WORKCHAIN, cell.hash(0))
+    let addr = MsgAddressInt::with_params(POOL_WORKCHAIN, cell.hash(0))?;
+    Ok(addr)
 }
 
 /// Build the `StateInit` for deploying a new TONCore nominator pool.
