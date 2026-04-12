@@ -19,7 +19,6 @@ use common::{
 };
 use contracts::{
     NominatorWrapperImpl, TonWallet, resolve_toncore_nominator_pools, resolve_toncore_pool,
-    ton_core_nominator::messages as pool_messages,
 };
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
 use ton_block::{Cell, MsgAddressInt, write_boc};
