@@ -165,7 +165,7 @@ fn test_runvm_transaction() {
         "real_boc/runvm_account_old.boc",
         "real_boc/runvm_account_new.boc",
         "real_boc/runvm_transaction.boc",
-        "real_boc/config10.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -175,7 +175,7 @@ fn test_account_exceeds_size_after_action() {
         "real_boc/size_exceeds_account_old.boc",
         "real_boc/size_exceeds_account_new.boc",
         "real_boc/size_exceeds_transaction.boc",
-        "real_boc/config10.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -465,7 +465,7 @@ fn test_storage_limit() {
         "real_boc/storage_limit_old.boc",
         "real_boc/storage_limit_new.boc",
         "real_boc/storage_limit_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -475,7 +475,7 @@ fn test_state_init_cell_same_in_body() {
         "real_boc/state_init_cell_same_in_body_account_old.boc",
         "real_boc/state_init_cell_same_in_body_account_new.boc",
         "real_boc/state_init_cell_same_in_body_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -485,7 +485,7 @@ fn test_body_with_pruned_cell() {
         "real_boc/body_with_pruned_cell_account_old.boc",
         "real_boc/body_with_pruned_cell_account_new.boc",
         "real_boc/body_with_pruned_cell_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -495,7 +495,7 @@ fn test_out_of_gas_on_commit() {
         "real_boc/out_of_gas_on_commit_account_old.boc",
         "real_boc/out_of_gas_on_commit_account_new.boc",
         "real_boc/out_of_gas_on_commit_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -505,17 +505,17 @@ fn test_init_wo_state() {
         "real_boc/init_wo_state_account_old.boc",
         "real_boc/init_wo_state_account_new.boc",
         "real_boc/init_wo_state_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
 #[test]
-fn test_bad_action() {
+fn test_bad_action_error() {
     replay_transaction_by_files(
         "real_boc/bad_action_account_old.boc",
         "real_boc/bad_action_account_new.boc",
         "real_boc/bad_action_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -525,7 +525,7 @@ fn test_bad_action_with_ignore_flag() {
         "real_boc/bad_action_with_ignore_flag_account_old.boc",
         "real_boc/bad_action_with_ignore_flag_account_new.boc",
         "real_boc/bad_action_with_ignore_flag_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -535,7 +535,7 @@ fn test_size_limits_v12() {
         "real_boc/size_limits_v12_account_old.boc",
         "real_boc/size_limits_v12_account_new.boc",
         "real_boc/size_limits_v12_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -545,7 +545,7 @@ fn test_due_payment_in_smc() {
         "real_boc/due_payment_in_smc_account_old.boc",
         "real_boc/due_payment_in_smc_account_new.boc",
         "real_boc/due_payment_in_smc_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -555,7 +555,7 @@ fn test_fwd_fee_payment_in_smc() {
         "real_boc/fwd_fee_payment_in_smc_account_old.boc",
         "real_boc/fwd_fee_payment_in_smc_account_new.boc",
         "real_boc/fwd_fee_payment_in_smc_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -565,9 +565,29 @@ fn test_raw_reserve_with_flag4() {
         "real_boc/raw_reserve_with_flag4_account_old.boc",
         "real_boc/raw_reserve_with_flag4_account_new.boc",
         "real_boc/raw_reserve_with_flag4_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
         "",
         "real_boc/raw_reserve_with_flag4_libs.boc",
+    )
+}
+
+#[test]
+fn test_wrong_coins_serial_in_actions() {
+    replay_transaction_by_files(
+        "real_boc/wrong_coins_serial_in_actions_account_old.boc",
+        "real_boc/wrong_coins_serial_in_actions_account_new.boc",
+        "real_boc/wrong_coins_serial_in_actions_transaction.boc",
+        "real_boc/config.boc",
+    )
+}
+
+#[test]
+fn test_msg_cell_fine_calc() {
+    replay_transaction_by_files(
+        "real_boc/msg_cell_fine_calc_account_old.boc",
+        "real_boc/msg_cell_fine_calc_account_new.boc",
+        "real_boc/msg_cell_fine_calc_transaction.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -635,7 +655,7 @@ fn test_bad_single() {
         "real_boc/bad_account_old.boc",
         "real_boc/bad_account_new.boc",
         "real_boc/bad_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -660,7 +680,7 @@ fn test_bad_trans() {
         acc,
         &(prefix + "account_new.boc"),
         tr,
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
         prev,
         &libs,
     );

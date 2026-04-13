@@ -620,6 +620,15 @@ impl Deserializable for MsgAddressIntOrNone {
         }
         Ok(())
     }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        let addr_type = slice.get_next_int(2)? as u8;
+        match addr_type & 0b11 {
+            0b00 => Ok(()),
+            0b10 => MsgAddrStd::skip(slice),
+            0b11 => MsgAddrVar::skip(slice),
+            _ => fail!(BlockError::Other("Wrong type of address".to_string())),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -755,6 +764,17 @@ impl Deserializable for InternalMessageHeader {
 
         self.created_lt.read_from(cell)?; //created_lt
         self.created_at.read_from(cell)?; //created_at
+        Ok(())
+    }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        slice.move_by(3)?; // ihr_disabled, bounce, bounced
+        MsgAddressIntOrNone::skip(slice)?; // addr src
+        MsgAddressInt::skip(slice)?; // addr dst
+        CurrencyCollection::skip(slice)?; // value - balance
+        VarUInteger16::skip(slice)?; //extra_flags
+        Coins::skip(slice)?; //fwd_fee
+        slice.move_by(64)?; //created_lt
+        slice.move_by(32)?; //created_at
         Ok(())
     }
 }
@@ -996,7 +1016,6 @@ impl Serializable for CommonMsgInfo {
 impl Deserializable for CommonMsgInfo {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
         *self = if !cell.get_next_bit()? {
-            // CommonMsgInfo::int_msg_info
             let mut int_msg = InternalMessageHeader::default();
             int_msg.read_from(cell)?;
             CommonMsgInfo::IntMsgInfo(int_msg)
@@ -1010,6 +1029,16 @@ impl Deserializable for CommonMsgInfo {
             CommonMsgInfo::ExtOutMsgInfo(ext_out_ms)
         };
 
+        Ok(())
+    }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        if !slice.get_next_bit()? {
+            InternalMessageHeader::skip(slice)?;
+        } else if !slice.get_next_bit()? {
+            ExternalInboundMessageHeader::skip(slice)?;
+        } else {
+            ExtOutMessageHeader::skip(slice)?;
+        }
         Ok(())
     }
 }
@@ -1806,6 +1835,31 @@ impl Deserializable for Message {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
         self.read_with_gas_consumer(cell, &mut 0)
     }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        // skip header
+        CommonMsgInfo::skip(slice)?;
+
+        // skip StateInit
+        if slice.get_next_bit()? {
+            // maybe of init
+            if slice.get_next_bit()? {
+                // either of init
+                // skip reference
+                let cell = slice.checked_drain_reference()?;
+                StateInit::skip(&mut SliceData::load_cell(cell)?)?;
+            } else {
+                // skip from current cell
+                StateInit::skip(slice)?;
+            }
+        }
+
+        // skip body
+        if slice.get_next_bit()? {
+            // body in reference
+            slice.checked_drain_reference()?;
+        }
+        Ok(())
+    }
 }
 
 ////////////////////////////////////////////////////////////////
@@ -2037,6 +2091,11 @@ impl Deserializable for AnycastInfo {
         self.rewrite_pfx = cell.get_next_slice(self.depth.as_usize())?;
         Ok(())
     }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        let depth = Number5::construct_from(slice)?;
+        slice.move_by(depth.as_usize())?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -2090,6 +2149,12 @@ impl Deserializable for MsgAddrStd {
         self.address = cell.get_next_slice(256)?;
         Ok(())
     }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        Option::<AnycastInfo>::skip(slice)?;
+        slice.move_by(8)?; // workchain_id
+        slice.move_by(256)?; // address
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -2106,6 +2171,13 @@ impl Deserializable for MsgAddrVar {
         self.addr_len.read_from(cell)?;
         self.workchain_id.read_from(cell)?;
         self.address = cell.get_next_slice(self.addr_len.as_usize())?;
+        Ok(())
+    }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        Option::<AnycastInfo>::skip(slice)?;
+        let addr_len = Number9::construct_from(slice)?;
+        slice.move_by(32)?; // workchain_id
+        slice.move_by(addr_len.as_usize())?; // address
         Ok(())
     }
 }
@@ -2137,6 +2209,14 @@ impl Deserializable for MsgAddressInt {
             *self = MsgAddressInt::AddrVar(data);
         }
         */
+        Ok(())
+    }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        match slice.get_next_int(2)? {
+            0b10 => MsgAddrStd::skip(slice)?,
+            0b11 => MsgAddrVar::skip(slice)?,
+            _ => fail!(BlockError::Other("Wrong type of address".to_string())),
+        };
         Ok(())
     }
 }

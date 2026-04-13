@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
     AccountId, AccountStatus, BuilderData, Cell, Coins, CurrencyCollection, GetRepresentationHash,
-    HashmapE, MsgAddressInt, Serializable, SliceData, StateInit, Status, TrComputePhase,
+    HashmapE, MsgAddressInt, Serializable, SimpleLib, SliceData, StateInit, Status, TrComputePhase,
     Transaction, DICT_HASH_MIN_CELLS, SENDMSG_ORDINARY, SET_LIB_CODE_ADD_PRIVATE,
 };
 
@@ -156,7 +156,7 @@ fn set_library_test() {
     let code = "
         ACCEPT
         PUSHCTR C4
-        PUSHINT 1
+        PUSHINT 1 ; private library
         SETLIBCODE
     ";
 
@@ -173,6 +173,9 @@ fn set_library_test() {
     let trans = execute(&msg, &mut acc, tr_lt).unwrap();
     assert_eq!(trans.out_msgs.len().unwrap(), 0);
     assert_eq!(acc.libraries().len().unwrap(), 1);
+    let (_key, mut slice) = acc.libraries().find_min_max_raw(true, false).unwrap().unwrap();
+    let lib = SimpleLib::construct_from(&mut slice).unwrap();
+    assert!(!lib.is_public_library());
 
     /*
     let code = format!("
@@ -344,7 +347,6 @@ fn test_my_code() {
 
 #[test]
 fn test_library_cell_code() {
-    cross_check::disable_cross_check(); // need to support mc_state_proof update
     let my_code = ton_assembler::compile_code_to_cell(
         "
         MYCODE
@@ -705,7 +707,7 @@ fn test_account_non_zero_level() -> Status {
 
 #[test]
 fn test_change_lib_implicity() {
-    // manually create an output action list with one ChangeLib action
+    // manually create an output action list with one ChangeLib action with private library
     let code = compile_code_to_cell(
         "
         PUSHREF
@@ -734,6 +736,9 @@ fn test_change_lib_implicity() {
     );
     let res = execute_acc_with_message(acc, &msg);
     assert_eq!(res.acc.libraries().len().unwrap(), 1);
+    let (_key, mut slice) = res.acc.libraries().find_min_max_raw(true, false).unwrap().unwrap();
+    let lib = SimpleLib::construct_from(&mut slice).unwrap();
+    assert!(!lib.is_public_library());
 }
 
 #[test]

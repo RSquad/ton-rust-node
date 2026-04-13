@@ -520,28 +520,28 @@ fn init_test_gas(acc_balance: u128, msg_balance: u128) -> Gas {
 #[test]
 fn test_gas_init1() {
     let gas_test = init_test_gas(15000000, 0);
-    let gas_etalon = Gas::new(0, 10000, 15000, 1000);
+    let gas_etalon = Gas::new(0, 10000, 37500, 400);
     pretty_assertions::assert_eq!(gas_test, gas_etalon);
 }
 
 #[test]
 fn test_gas_init2() {
     let gas_test = init_test_gas(4000000, 0);
-    let gas_etalon = Gas::new(0, 4000, 4000, 1000);
+    let gas_etalon = Gas::new(0, 10000, 10000, 400);
     pretty_assertions::assert_eq!(gas_test, gas_etalon);
 }
 
 #[test]
 fn test_gas_init3() {
     let gas_test = init_test_gas(10000000, 100000);
-    let gas_etalon = Gas::new(100, 0, 10000, 1000);
+    let gas_etalon = Gas::new(250, 0, 25000, 400);
     pretty_assertions::assert_eq!(gas_test, gas_etalon);
 }
 
 #[test]
 fn test_gas_init4() {
     let gas_test = init_test_gas(1_000_000_000_000_000_000, 1_000_000_000_000);
-    let gas_etalon = Gas::new(1000000, 0, 1000000, 1000);
+    let gas_etalon = Gas::new(1000000, 0, 1000000, 400);
     pretty_assertions::assert_eq!(gas_test, gas_etalon);
 }
 

@@ -431,6 +431,13 @@ impl<T: Deserializable> Deserializable for Option<T> {
         *self = Self::construct_from(slice)?;
         Ok(())
     }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        if slice.get_next_bit()? {
+            T::skip(slice)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub trait GetRepresentationHash: Serializable + Debug {

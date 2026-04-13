@@ -68,12 +68,14 @@ fn test_transaction() {
     let p = transaction_emulator_create(config_params_boc.as_ptr(), 5);
 
     // 6. Set block parameters
-    transaction_emulator_set_unixtime(p, 1770822950);
-    transaction_emulator_set_lt(p, 66815326000001);
+    let unixtime = json["now"].as_u64().unwrap();
+    let lt = json["lt"].as_u64().unwrap();
+    transaction_emulator_set_unixtime(p, unixtime as u32);
+    transaction_emulator_set_lt(p, lt);
 
     // rand_seed
-    let rand_seed_hex =
-        CString::new("628d5512834b482d4982d69d445da5f63e79de5f45f7ac52b25a9efc9a0db11c").unwrap();
+    let rand_seed_str = json["rand_seed"].as_str().unwrap();
+    let rand_seed_hex = CString::new(rand_seed_str).unwrap();
     transaction_emulator_set_rand_seed(p, rand_seed_hex.as_ptr());
 
     // 7. Set prev blocks info

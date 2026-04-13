@@ -28,11 +28,11 @@ use ton_block::{
         TrStoragePhase, Transaction, TransactionDescr,
     },
     AccountId, AccountStatus, AnycastInfo, BouncedByPhase, BuilderData, BurningConfig, Cell, Coins,
-    ComputeSkipReason, ConfigParam8, ConfigParamEnum, ConfigParams, CurrencyCollection,
-    Deserializable, ExceptionCode, GetRepresentationHash, GlobalVersion, IBitstring,
-    InternalMessageHeader, MerkleProof, NewBounceBody, NewBounceComputePhaseInfo,
-    NewBounceOriginalInfo, Serializable, SliceData, StateInit, StorageUsed, TrBouncePhaseNofunds,
-    UInt256, DICT_HASH_MIN_CELLS, SENDMSG_PAY_FEE_SEPARATELY,
+    ComputeSkipReason, ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable,
+    ExceptionCode, GetRepresentationHash, IBitstring, InternalMessageHeader, MerkleProof,
+    NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, Serializable, SliceData,
+    StateInit, StorageUsed, TrBouncePhaseNofunds, UInt256, DICT_HASH_MIN_CELLS,
+    SENDMSG_PAY_FEE_SEPARATELY,
 };
 use ton_vm::{
     int,
@@ -57,7 +57,7 @@ fn test_simple_transaction() {
         SENDRAWMSG
     ";
     let start_balance = 100_000_000_000;
-    let compute_phase_gas_fees = 1317000;
+    let gas_used = 1317;
     let msg_income = 1_400_200_000;
 
     let acc_id = RECEIVER_ACCOUNT.clone();
@@ -98,8 +98,7 @@ fn test_simple_transaction() {
     ));
     description.credit_ph = Some(TrCreditPhase::new(CurrencyCollection::with_coins(msg_income)));
 
-    let gas_used = (compute_phase_gas_fees / 1000) as u32;
-    let gas_fees = compute_phase_gas_fees;
+    let gas_fees = (gas_used * 400) as u64;
     let mut vm_phase = TrComputePhaseVm::default();
     vm_phase.success = true;
     vm_phase.gas_used = gas_used.into();
@@ -115,7 +114,7 @@ fn test_simple_transaction() {
     if let Some(int_header) = msg1.int_header_mut() {
         if let Some(int_header2) = msg2.int_header_mut() {
             int_header.value.coins =
-                Coins::from(MSG1_BALANCE + msg_income - compute_phase_gas_fees - MSG_FWD_FEE);
+                Coins::from(dbg!(MSG1_BALANCE + msg_income - gas_fees - MSG_FWD_FEE));
             int_header2.value.coins = Coins::from(MSG2_BALANCE - MSG_FWD_FEE);
             int_header.fwd_fee = msg_remain_fee.into();
             int_header2.fwd_fee = msg_remain_fee.into();
@@ -283,7 +282,7 @@ fn test_trexecutor_with_code_without_accept() {
     assert_eq!(err.downcast::<ExecutorError>().unwrap(), ExecutorError::NoAcceptError(-13, None));
 
     // not exist code but special account - transaction will be aborted
-    let acc_id = AccountId::from([0x66; 32]);
+    let acc_id = AccountId::from([0x33; 32]);
     assert!(BLOCKCHAIN_CONFIG.is_special_account(true, &acc_id).unwrap());
     let code = compile_code_to_cell("NOP").unwrap();
     let mut acc =
@@ -2047,7 +2046,7 @@ fn test_uninit_account(
     addr_eq_state_hash: bool,
     result_account_balance: u64,
     count_out_msgs: usize,
-    config: &ConfigParams,
+    config: BlockchainConfig,
 ) {
     let mut state_init = StateInit::default();
     if let Some(code) = code {
@@ -2075,10 +2074,8 @@ fn test_uninit_account(
     if code.is_some() {
         msg.set_state_init(state_init);
     }
-    acc.update_storage_stat(config.size_limits_config().unwrap().acc_state_cells_for_storage_dict)
-        .unwrap();
+    acc.update_storage_stat(config.size_limits_config().acc_state_cells_for_storage_dict).unwrap();
     let acc_copy = acc.clone();
-    let config = BlockchainConfig::with_config(config.clone()).unwrap();
     let trans =
         try_replay_transaction(&mut acc, Some(&msg), config, &execute_params_none()).unwrap();
     assert_eq!(acc.status(), end_status);
@@ -2100,7 +2097,7 @@ fn test_uninit_account_initstate_default(
     end_status: AccountStatus,
     result_account_balance: u64,
     count_out_msgs: usize,
-    config: &ConfigParams,
+    config: BlockchainConfig,
 ) {
     let mut acc;
     let acc_id = SENDER_ACCOUNT.clone();
@@ -2116,7 +2113,6 @@ fn test_uninit_account_initstate_default(
     let mut msg = create_int_msg(THIRD_ACCOUNT.clone(), acc_id, msg_balance, bounce, PREV_BLOCK_LT);
     msg.set_state_init(StateInit::default());
     let acc_copy = acc.clone();
-    let config = BlockchainConfig::with_config(config.clone()).unwrap();
     let trans =
         try_replay_transaction(&mut acc, Some(&msg), config, &execute_params_none()).unwrap();
     assert_eq!(acc.status(), end_status);
@@ -2141,11 +2137,7 @@ fn test_uninit_accounts() {
     )
     .unwrap();
 
-    let mut config = ConfigParams::construct_from_file("real_boc/config.boc").unwrap();
-    let capabilities = 0x2e;
-    let global_version = GlobalVersion { version: 0, capabilities };
-
-    config.set_config(ConfigParamEnum::ConfigParam8(ConfigParam8 { global_version })).unwrap();
+    let config = default_config();
 
     // code hash matches with account address
     test_uninit_account(
@@ -2155,9 +2147,9 @@ fn test_uninit_accounts() {
         AccountStatus::AccStateNonexist,
         AccountStatus::AccStateActive,
         true,
-        990_000_000,
+        998_980_000,
         0,
-        &config,
+        config.clone(),
     );
     // code hash does not match with account address
     test_uninit_account(
@@ -2169,7 +2161,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
     // code hash does not match with account address
     test_uninit_account(
@@ -2181,7 +2173,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
     // not enougt money to execute
     test_uninit_account(
@@ -2193,7 +2185,7 @@ fn test_uninit_accounts() {
         false,
         1000,
         0,
-        &config,
+        config.clone(),
     );
     // code hash matches with account address
     test_uninit_account(
@@ -2203,9 +2195,9 @@ fn test_uninit_accounts() {
         AccountStatus::AccStateUninit,
         AccountStatus::AccStateActive,
         true,
-        990_000_000,
+        998_980_000,
         0,
-        &config,
+        config.clone(),
     );
     // not enougt money to execute
     test_uninit_account(
@@ -2217,7 +2209,7 @@ fn test_uninit_accounts() {
         true,
         1000,
         0,
-        &config,
+        config.clone(),
     );
     // absence of code for init account
     test_uninit_account(
@@ -2229,7 +2221,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
 
     // if message has money, change account to AccStateUninit state
@@ -2242,7 +2234,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
     test_uninit_account(
         None,
@@ -2253,7 +2245,7 @@ fn test_uninit_accounts() {
         false,
         1_000,
         0,
-        &config,
+        config.clone(),
     );
     // if bounce, account no need to create
     test_uninit_account(
@@ -2265,7 +2257,7 @@ fn test_uninit_accounts() {
         false,
         0,
         1,
-        &config,
+        config.clone(),
     );
     // message has not money
     test_uninit_account(
@@ -2277,7 +2269,7 @@ fn test_uninit_accounts() {
         false,
         0,
         0,
-        &config,
+        config.clone(),
     );
 
     // code hash matches with account address
@@ -2288,9 +2280,9 @@ fn test_uninit_accounts() {
         AccountStatus::AccStateNonexist,
         AccountStatus::AccStateActive,
         true,
-        990_000_000,
+        998_980_000,
         0,
-        &config,
+        config.clone(),
     );
     // code hash does not match with account address
     test_uninit_account(
@@ -2302,7 +2294,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
     // code hash does not match with account address
     test_uninit_account(
@@ -2314,7 +2306,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
     // not enougt money to execute
     test_uninit_account(
@@ -2326,7 +2318,7 @@ fn test_uninit_accounts() {
         false,
         1000,
         0,
-        &config,
+        config.clone(),
     );
     // code hash matches with account address
     test_uninit_account(
@@ -2336,9 +2328,9 @@ fn test_uninit_accounts() {
         AccountStatus::AccStateUninit,
         AccountStatus::AccStateActive,
         true,
-        990_000_000,
+        998_980_000,
         0,
-        &config,
+        config.clone(),
     );
     // not enougt money to execute
     test_uninit_account(
@@ -2350,7 +2342,7 @@ fn test_uninit_accounts() {
         true,
         1000,
         0,
-        &config,
+        config.clone(),
     );
     // absence of code for init account
     test_uninit_account(
@@ -2362,7 +2354,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
 
     // if message has money, change account to AccStateUninit state
@@ -2375,7 +2367,7 @@ fn test_uninit_accounts() {
         false,
         1_000_000_000,
         0,
-        &config,
+        config.clone(),
     );
     test_uninit_account(
         None,
@@ -2386,7 +2378,7 @@ fn test_uninit_accounts() {
         false,
         1_000,
         0,
-        &config,
+        config.clone(),
     );
     // if bounce, account no need to create
     test_uninit_account(
@@ -2398,7 +2390,7 @@ fn test_uninit_accounts() {
         false,
         0,
         1,
-        &config,
+        config.clone(),
     );
     // message has not money
     test_uninit_account(
@@ -2410,7 +2402,7 @@ fn test_uninit_accounts() {
         false,
         0,
         0,
-        &config,
+        config.clone(),
     );
 
     // if init state is default, change account to AccStateUninit that save moneys
@@ -2421,7 +2413,7 @@ fn test_uninit_accounts() {
         AccountStatus::AccStateUninit,
         1000,
         0,
-        &config,
+        config.clone(),
     );
 }
 
@@ -2698,7 +2690,7 @@ fn sendmsg_64_fail() {
 }
 
 #[test]
-fn test_account_with_enought_balance_to_run_compute_phase() {
+fn test_account_with_not_enough_balance_to_import_msg() {
     let acc_id = AccountId::from([0x66; 32]);
     let mut acc = create_test_account(
         0,
@@ -2714,10 +2706,7 @@ fn test_account_with_enought_balance_to_run_compute_phase() {
     }
 
     let err = execute(&msg, &mut acc, BLOCK_LT + 1).expect_err("no funds for external message");
-    assert_eq!(
-        err.downcast::<ExecutorError>().unwrap(),
-        ExecutorError::ExtMsgComputeSkipped(ComputeSkipReason::NoGas)
-    );
+    assert_eq!(err.downcast::<ExecutorError>().unwrap(), ExecutorError::NoFundsToImportMsg);
 }
 
 fn make_transaction_from_workchain_to_masterchain(
@@ -2774,7 +2763,7 @@ fn make_transaction_from_workchain_to_masterchain(
 #[test]
 fn send_message_from_workchain_to_masterchain() {
     make_transaction_from_workchain_to_masterchain(true, 42867458, false);
-    make_transaction_from_workchain_to_masterchain(false, 203443677, false);
+    make_transaction_from_workchain_to_masterchain(false, 203804277, false);
 
     make_transaction_from_workchain_to_masterchain(true, 47869017, true);
     make_transaction_from_workchain_to_masterchain(false, 199847869, true);
@@ -2825,7 +2814,7 @@ fn make_transaction_from_workchain_to_masterchain2(
 
 #[test]
 fn send_message_from_workchain_to_masterchain2() {
-    make_transaction_from_workchain_to_masterchain2(true, 203443677);
+    make_transaction_from_workchain_to_masterchain2(true, 203804277);
     make_transaction_from_workchain_to_masterchain2(false, 42867458);
 }
 
@@ -2873,10 +2862,10 @@ fn test_message_with_anycast_output_address() {
     );
 
     let tr_lt = BLOCK_LT + 1;
-    let trans = execute_c(&msg, &mut acc, tr_lt, 399999424996, 0).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, 399999769996, 0).unwrap();
 
     let mut new_acc = create_test_account_workchain(
-        399999424996,
+        399999769996,
         0,
         acc_id,
         acc.get_code().unwrap(),
@@ -2900,7 +2889,7 @@ fn test_message_with_anycast_output_address() {
     vm_phase.success = true;
     vm_phase.gas_used = 575.into();
     vm_phase.gas_limit = 1000000.into();
-    vm_phase.gas_fees = 575000.into();
+    vm_phase.gas_fees = 230000.into();
     vm_phase.vm_steps = 4;
     description.compute_ph = TrComputePhase::Vm(vm_phase);
 
@@ -2924,7 +2913,7 @@ fn test_message_with_anycast_output_address() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_coins(575004));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(230004));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -2975,10 +2964,10 @@ fn test_message_with_anycast_output_address_2() {
     );
 
     let tr_lt = BLOCK_LT + 1;
-    let trans = execute_c(&msg, &mut acc, tr_lt, 399999424996, 0).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, 399999769996, 0).unwrap();
 
     let mut new_acc = create_test_account_workchain(
-        399999424996,
+        399999769996,
         0,
         acc_id,
         acc.get_code().unwrap(),
@@ -3002,7 +2991,7 @@ fn test_message_with_anycast_output_address_2() {
     vm_phase.success = true;
     vm_phase.gas_used = 575.into();
     vm_phase.gas_limit = 1000000.into();
-    vm_phase.gas_fees = 575000.into();
+    vm_phase.gas_fees = 230000.into();
     vm_phase.vm_steps = 4;
     description.compute_ph = TrComputePhase::Vm(vm_phase);
 
@@ -3029,7 +3018,7 @@ fn test_message_with_anycast_output_address_2() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_coins(575004));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(230004));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3262,10 +3251,10 @@ fn test_message_with_var_address() {
     );
 
     let tr_lt = BLOCK_LT + 1;
-    let trans = execute_c(&msg, &mut acc, tr_lt, 399999424996, 0).unwrap();
+    let trans = execute_c(&msg, &mut acc, tr_lt, 399999769996, 0).unwrap();
 
     let mut new_acc = create_test_account_workchain(
-        399999424996,
+        399999769996,
         0,
         acc_id,
         acc.get_code().unwrap(),
@@ -3289,7 +3278,7 @@ fn test_message_with_var_address() {
     vm_phase.success = true;
     vm_phase.gas_used = 575.into();
     vm_phase.gas_limit = 1000000.into();
-    vm_phase.gas_fees = 575000.into();
+    vm_phase.gas_fees = 230000.into();
     vm_phase.vm_steps = 4;
     description.compute_ph = TrComputePhase::Vm(vm_phase);
 
@@ -3317,7 +3306,7 @@ fn test_message_with_var_address() {
 
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
-    good_trans.set_total_fees(CurrencyCollection::with_coins(575004));
+    good_trans.set_total_fees(CurrencyCollection::with_coins(230004));
     good_trans.set_now(BLOCK_UT);
 
     good_trans.write_description(&description).unwrap();
@@ -3395,15 +3384,15 @@ fn test_message_with_var_address_in_masterchain() {
     description.compute_ph = TrComputePhase::Vm(vm_phase);
 
     let mut action_ph = TrActionPhase::default();
-    action_ph.success = false;
+    action_ph.success = true;
     action_ph.valid = true;
     action_ph.status_change = AccStatusChange::Unchanged;
     action_ph.tot_actions = 1;
-    action_ph.skipped_actions = 0;
+    action_ph.skipped_actions = 1;
     action_ph.msgs_created = 0;
     action_ph.action_list_hash =
         "0x6e4d01ecc1c74a741dacd6d4250bc9f7b72b519abbaa57c255f781fd305288c7".parse().unwrap();
-    action_ph.result_code = 34;
+    action_ph.result_code = 0;
     action_ph.result_arg = None;
     action_ph.no_funds = false;
     action_ph.tot_msg_size = StorageUsed::default();
@@ -3412,7 +3401,7 @@ fn test_message_with_var_address_in_masterchain() {
 
     description.credit_first = false;
     description.bounce = None;
-    description.aborted = true;
+    description.aborted = false;
     description.destroyed = false;
     let description = TransactionDescr::Ordinary(description);
 
@@ -3528,7 +3517,7 @@ fn test_send_message_to_nonexisting_workchain() {
 
 #[test]
 fn bounced_message_with_special_account() {
-    let acc_id = AccountId::from([0x66; 32]);
+    let acc_id = AccountId::from([0x33; 32]);
     assert!(BLOCKCHAIN_CONFIG.is_special_account(true, &acc_id).unwrap());
 
     let mut acc = Account::uninit(
@@ -3599,7 +3588,7 @@ fn test_bouncable() -> Result<()> {
     let msg = tr.get_out_msg(0)?.unwrap();
     let hdr = msg.int_header().unwrap();
     assert!(!hdr.bounced);
-    assert_eq!(hdr.value().coins.as_u128(), 373_000);
+    assert_eq!(hdr.value().coins.as_u128(), 1_829_200);
     assert_eq!(account.balance().unwrap().coins.as_u128(), 0);
     assert_eq!(account.due_payment().unwrap().as_u128(), 2_118_021);
 
@@ -3612,7 +3601,7 @@ fn test_bouncable() -> Result<()> {
     let msg = tr.get_out_msg(0)?.unwrap();
     let hdr = msg.int_header().unwrap();
     assert!(hdr.bounced);
-    assert_eq!(hdr.value().coins.as_u128(), 1_700_000);
+    assert_eq!(hdr.value().coins.as_u128(), 2_360_000);
     assert_eq!(account.balance().unwrap().coins.as_u128(), 0);
     assert_eq!(account.due_payment().unwrap().as_u128(), 2_106_850);
 
@@ -3884,7 +3873,7 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
 
 #[test]
 fn test_acc_size_limits() {
-    let config = ConfigParams::construct_from_file("real_boc/config12.boc").unwrap();
+    let config = ConfigParams::construct_from_file("real_boc/config.boc").unwrap();
     do_test_acc_size_limits(0, &SENDER_ACCOUNT, config.clone());
     do_test_acc_size_limits(-1, &SENDER_ACCOUNT, config.clone());
 }
@@ -3993,7 +3982,9 @@ fn test_new_bounce() {
     original_body.append_bitstring(b"Original body root").unwrap();
     msg.set_body(SliceData::load_builder(original_body.clone()).unwrap());
 
-    let tr = execute(&msg, &mut acc, BLOCK_LT).unwrap();
+    let config = custom_config(Some(13), None);
+    let tr = try_replay_transaction(&mut acc, Some(&msg), config.clone(), &execute_params_none())
+        .unwrap();
     let out_msg = tr.get_out_msg(0).unwrap().unwrap();
     let hdr = out_msg.int_header().unwrap();
     assert!(hdr.bounced);
@@ -4018,7 +4009,8 @@ fn test_new_bounce() {
 
     let code = compile_code_to_cell("CTOS").unwrap();
     let mut acc = create_test_account(balance, RECEIVER_ACCOUNT.clone(), code, Cell::default());
-    let tr = execute(&msg, &mut acc, BLOCK_LT).unwrap();
+    let tr = try_replay_transaction(&mut acc, Some(&msg), config.clone(), &execute_params_none())
+        .unwrap();
     let out_msg = tr.get_out_msg(0).unwrap().unwrap();
     assert!(out_msg.int_header().unwrap().bounced);
     let bounce_body = NewBounceBody::construct_from(&mut out_msg.body().unwrap().clone()).unwrap();
@@ -4053,7 +4045,8 @@ fn test_new_bounce() {
 
     let mut acc =
         create_test_account(balance, RECEIVER_ACCOUNT.clone(), code, data.into_cell().unwrap());
-    let tr = execute(&msg, &mut acc, BLOCK_LT).unwrap();
+    let tr = try_replay_transaction(&mut acc, Some(&msg), config.clone(), &execute_params_none())
+        .unwrap();
     let out_msg = tr.get_out_msg(0).unwrap().unwrap();
     assert!(out_msg.int_header().unwrap().bounced);
     let bounce_body = NewBounceBody::construct_from(&mut out_msg.body().unwrap().clone()).unwrap();

@@ -111,7 +111,7 @@ pub fn create_config(cfg_name: &str) -> Result<ConfigParams> {
 
 #[allow(dead_code)]
 pub fn custom_config(version: Option<u32>, capabilities: Option<u64>) -> BlockchainConfig {
-    let mut config = create_config("real_boc/default_config.boc").unwrap();
+    let mut config = create_config("real_boc/config.boc").unwrap();
     let mut param8 = ConfigParam8 { global_version: config.get_global_version().unwrap() };
     if let Some(version) = version {
         param8.global_version.version = version
@@ -124,7 +124,7 @@ pub fn custom_config(version: Option<u32>, capabilities: Option<u64>) -> Blockch
 }
 
 pub fn default_config() -> BlockchainConfig {
-    BlockchainConfig::with_config(create_config("real_boc/default_config.boc").unwrap()).unwrap()
+    BlockchainConfig::with_config(create_config("real_boc/config.boc").unwrap()).unwrap()
 }
 
 #[cfg(not(feature = "cross_check"))]
@@ -777,6 +777,11 @@ pub fn get_tr_descr(tr: &Transaction) -> TransactionDescrOrdinary {
 }
 
 pub fn compare_transaction(trans: &Transaction, good_trans: &Transaction) {
+    pretty_assertions::assert_eq!(
+        trans.read_description().unwrap(),
+        good_trans.read_description().unwrap(),
+        "description mismatch"
+    );
     trans
         .out_msgs
         .scan_diff(&good_trans.out_msgs, |key: UInt15, msg1, msg2| {
@@ -795,11 +800,6 @@ pub fn compare_transaction(trans: &Transaction, good_trans: &Transaction) {
             Ok(true)
         })
         .unwrap();
-    pretty_assertions::assert_eq!(
-        trans.read_description().unwrap(),
-        good_trans.read_description().unwrap(),
-        "description mismatch"
-    );
     pretty_assertions::assert_eq!(trans, good_trans, "transaction mismatch")
 }
 
