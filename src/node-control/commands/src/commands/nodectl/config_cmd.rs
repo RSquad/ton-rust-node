@@ -47,7 +47,7 @@ pub struct ConfigCmd {
         short = 'u',
         long = "url",
         value_hint = clap::ValueHint::Url,
-        help = "URL to the node control service API (takes precedence over --config for reads; defaults to http://127.0.0.1:8080 if not --url and --config are provided)",
+        help = "URL to the node control service API (takes precedence over --config; defaults to http://127.0.0.1:8080 if not --url and --config are provided)",
         global = true
     )]
     url: Option<String>,
@@ -55,8 +55,9 @@ pub struct ConfigCmd {
     #[arg(
         long = "token",
         env = "NODECTL_API_TOKEN",
+        hide_env = true,
         value_name = "TOKEN",
-        help = "JWT token to authenticate with the service API (or NODECTL_API_TOKEN)",
+        help = "JWT token to authenticate with the service API",
         global = true
     )]
     token: Option<String>,
