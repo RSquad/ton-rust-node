@@ -540,12 +540,7 @@ pub async fn v1_master_wallet_handler(
         match rpc_client.get_wallet_information(&addr).await {
             Ok(info) => {
                 let pk = extract_public_key(&state).await;
-                (
-                    Some(addr_str),
-                    Some(info.account_state.to_string()),
-                    Some(info.balance),
-                    pk,
-                )
+                (Some(addr_str), Some(info.account_state.to_string()), Some(info.balance), pk)
             }
             Err(_) => (Some(addr_str), None, None, None),
         };

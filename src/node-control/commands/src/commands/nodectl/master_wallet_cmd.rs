@@ -85,7 +85,11 @@ impl MasterWalletInfoCmd {
 fn print_master_wallet_table_from_view(view: &MasterWalletView) {
     println!("\n{} {}\n", "OK".green().bold(), "Master Wallet".green());
     println!("  {:<16} {}", "Address:".cyan().bold(), view.address.as_deref().unwrap_or("unknown"));
-    println!("  {:<16} {}", "Balance:".cyan().bold(), view.balance.map(|b| display_tons(b)).unwrap_or("unknown".to_string()));
+    println!(
+        "  {:<16} {}",
+        "Balance:".cyan().bold(),
+        view.balance.map(|b| display_tons(b)).unwrap_or("unknown".to_string())
+    );
     println!("  {:<16} {}", "State:".cyan().bold(), view.state.as_deref().unwrap_or("unknown"));
     println!("  {:<16} {}", "Version:".cyan().bold(), view.version);
     println!("  {:<16} {}", "Subwallet ID:".cyan().bold(), view.subwallet_id);

@@ -964,7 +964,10 @@ mod tests {
 
     #[test]
     fn test_normalize_base_url_adds_http_scheme_when_missing() {
-        assert_eq!(normalize_base_url(Cow::Borrowed("example.com:8080")), "http://example.com:8080");
+        assert_eq!(
+            normalize_base_url(Cow::Borrowed("example.com:8080")),
+            "http://example.com:8080"
+        );
         assert_eq!(normalize_base_url(Cow::Borrowed("127.0.0.1:9000")), "http://127.0.0.1:9000");
     }
 
