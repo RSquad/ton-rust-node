@@ -232,15 +232,12 @@ impl Serializable for OutAction {
 
 impl Deserializable for OutAction {
     fn construct_from(slice: &mut SliceData) -> Result<Self> {
-        if slice.remaining_bits() < std::mem::size_of::<u32>() * 8 {
-            fail!(BlockError::InvalidArg("cell can't be shorter than 32 bits".to_string()))
-        }
         let tag = slice.get_next_u32()?;
         let action = match tag {
             ACTION_SEND_MSG => {
                 let mode = slice.get_next_byte()?;
                 match Message::construct_from_reference(slice) {
-                    Ok(msg) => OutAction::new_send(mode, msg),
+                    Ok(out_msg) => OutAction::new_send(mode, out_msg),
                     Err(err) => fail!(BlockError::OutActionError(err, mode)),
                 }
             }
@@ -256,15 +253,17 @@ impl Deserializable for OutAction {
                 let mode = slice.get_next_byte()?;
                 let flags = (mode >> 1) & SET_LIB_CODE_ADD_PRIVATE_OR_PUBLIC_MASK;
                 match (mode & CHANGE_SET_LIB_MASK, flags) {
-                    (CHANGE_LIB_MODE, 0) => {
-                        let hash = UInt256::construct_from(slice)?;
-                        OutAction::new_change_library(mode, None, Some(hash))
-                    }
+                    (CHANGE_LIB_MODE, 0) => match UInt256::construct_from(slice) {
+                        Ok(hash) => OutAction::new_change_library(mode, None, Some(hash)),
+                        Err(err) => fail!(BlockError::OutActionError(err, mode)),
+                    },
                     (SET_LIB_CODE_MODE, SET_LIB_CODE_REMOVE)
                     | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PRIVATE)
                     | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PUBLIC) => {
-                        let code = slice.checked_drain_reference()?;
-                        OutAction::new_change_library(mode, Some(code), None)
+                        match slice.checked_drain_reference() {
+                            Ok(code) => OutAction::new_change_library(mode, Some(code), None),
+                            Err(err) => fail!(BlockError::OutActionError(err, mode)),
+                        }
                     }
                     _ => fail!("wrong mode for ChangeLibrary action: {mode}"),
                 }
@@ -272,5 +271,47 @@ impl Deserializable for OutAction {
             tag => fail!(BlockError::InvalidConstructorTag { t: tag, s: "OutAction".to_string() }),
         };
         Ok(action)
+    }
+    fn skip(slice: &mut SliceData) -> Result<()> {
+        let tag = slice.get_next_u32()?;
+        match tag {
+            ACTION_SEND_MSG => {
+                let mode = slice.get_next_byte()?;
+                let out_msg_cell = slice.checked_drain_reference()?;
+                if let Err(err) = Message::skip(&mut SliceData::load_cell(out_msg_cell)?) {
+                    fail!(BlockError::OutActionError(err, mode))
+                }
+            }
+            ACTION_SET_CODE => {
+                slice.checked_drain_reference()?;
+            }
+            ACTION_RESERVE => {
+                let mode = slice.get_next_byte()?;
+                if let Err(err) = CurrencyCollection::skip(slice) {
+                    fail!(BlockError::OutActionError(err, mode))
+                }
+            }
+            ACTION_CHANGE_LIB => {
+                let mode = slice.get_next_byte()?;
+                let flags = (mode >> 1) & SET_LIB_CODE_ADD_PRIVATE_OR_PUBLIC_MASK;
+                match (mode & CHANGE_SET_LIB_MASK, flags) {
+                    (CHANGE_LIB_MODE, 0) => {
+                        if let Err(err) = slice.move_by(256) {
+                            fail!(BlockError::OutActionError(err, mode))
+                        }
+                    }
+                    (SET_LIB_CODE_MODE, SET_LIB_CODE_REMOVE)
+                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PRIVATE)
+                    | (SET_LIB_CODE_MODE, SET_LIB_CODE_ADD_PUBLIC) => {
+                        if let Err(err) = slice.checked_drain_reference() {
+                            fail!(BlockError::OutActionError(err, mode))
+                        }
+                    }
+                    _ => fail!("wrong mode for ChangeLibrary action: {mode}"),
+                }
+            }
+            tag => fail!(BlockError::InvalidConstructorTag { t: tag, s: "OutAction".to_string() }),
+        }
+        Ok(())
     }
 }

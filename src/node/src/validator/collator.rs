@@ -3928,7 +3928,7 @@ impl Collator {
         mut exec_manager: ExecutionManager,
         output_queue_manager: &MsgQueueManager,
     ) -> Result<(CollateResult, ExecutionManager)> {
-        log::trace!("{}: finalize_block", self.collated_block_descr);
+        log::debug!("{}: finalize_block", self.collated_block_descr);
         let (want_split, overload_history) = collator_data.want_split();
         let (want_merge, underload_history) = collator_data.want_merge();
 
@@ -3979,7 +3979,7 @@ impl Collator {
             new_config_opt = Some(new_config);
         }
 
-        log::trace!("{}: finalize_block: calc value flow", self.collated_block_descr);
+        log::debug!("{}: finalize_block: calc value flow", self.collated_block_descr);
         // calc value flow
         let mut value_flow = collator_data.value_flow.clone();
         value_flow.imported = collator_data.in_msgs.root_extra().value_imported.clone();
@@ -4021,7 +4021,7 @@ impl Collator {
             self.validator_set.catchain_seqno(),
         )?;
 
-        log::trace!("{}: finalize_block: fill block info", self.collated_block_descr);
+        log::debug!("{}: finalize_block: fill block info", self.collated_block_descr);
         // calc block info
         let mut info = BlockInfo::default();
         info.set_version(0);
@@ -4049,7 +4049,7 @@ impl Collator {
             }));
         }
 
-        log::trace!("{}: finalize_block: calc new state", self.collated_block_descr);
+        log::debug!("{}: finalize_block: calc new state", self.collated_block_descr);
         // Calc new state, then state update
 
         let mut new_state = ShardStateUnsplit::with_ident(self.shard.clone());
@@ -4121,7 +4121,7 @@ impl Collator {
             )?;
         }
 
-        log::trace!("{}: finalize_block: calc merkle update", self.collated_block_descr);
+        log::debug!("{}: finalize_block: calc merkle update", self.collated_block_descr);
         let new_ss_root = new_state.serialize()?;
 
         self.check_stop_flag()?;
@@ -4138,11 +4138,11 @@ impl Collator {
         self.check_stop_flag()?;
 
         // calc block extra
+        log::debug!("{}: finalize_block: fill BlockExtra", self.collated_block_descr);
         let mut extra = BlockExtra::default();
         extra.write_in_msg_descr(&collator_data.in_msgs)?;
         extra.write_out_msg_descr(&collator_data.out_msgs)?;
         extra.write_account_blocks(&accounts)?;
-        log::trace!("{}: finalize_block: BlockExtra 1", self.collated_block_descr);
         // mc block extra
         if let Some(mc_state_extra) = mc_state_extra {
             log::trace!("{}: finalize_block: McBlockExtra", self.collated_block_descr);
@@ -4175,9 +4175,8 @@ impl Collator {
         // construct block
         let new_block = Block::with_params(global_id, info, value_flow, state_update, extra)?;
         let mut block_id = self.new_block_id_part.clone();
-        let workchain_id = block_id.shard().workchain_id();
 
-        log::trace!("{}: finalize_block: fill block candidate", self.collated_block_descr);
+        log::debug!("{}: finalize_block: fill block candidate", self.collated_block_descr);
         let cell = new_block.serialize()?;
         block_id.root_hash = cell.repr_hash();
         let mut data = Vec::new();
@@ -4211,34 +4210,11 @@ impl Collator {
             collated_data,
             created_by: self.created_by.clone(),
         };
-        if workchain_id != -1
-            && (collator_data.dequeue_count != 0
-                || collator_data.enqueue_count != 0
-                || collator_data.in_msg_count != 0
-                || collator_data.out_msg_count != 0
-                || collator_data.execute_count != 0
-                || collator_data.transit_count != 0
-                || collator_data.remove_count != 0)
-        {
-            log::debug!(
-                "{}: finalize_block finished: \
-                dequeue_count: {}, enqueue_count: {}, in_msg_count: {}, out_msg_count: {}, \
-                execute_count: {}, transit_count: {}, remove_count: {} msg_queue_depth_sum: {}",
-                self.collated_block_descr,
-                collator_data.dequeue_count,
-                collator_data.enqueue_count,
-                collator_data.in_msg_count,
-                collator_data.out_msg_count,
-                collator_data.execute_count,
-                collator_data.transit_count,
-                collator_data.remove_count,
-                collator_data.msg_queue_depth_sum
-            );
-        }
-        log::trace!(
+        log::debug!(
             "{}: finalize_block finished: \
             dequeue_count: {}, enqueue_count: {}, in_msg_count: {}, out_msg_count: {}, \
-            execute_count: {}, transit_count: {}, remove_count: {}, data len: {}",
+            execute_count: {}, transit_count: {}, remove_count: {}, msg_queue_depth_sum: {}, \
+            data len: {}",
             self.collated_block_descr,
             collator_data.dequeue_count,
             collator_data.enqueue_count,
@@ -4247,6 +4223,7 @@ impl Collator {
             collator_data.execute_count,
             collator_data.transit_count,
             collator_data.remove_count,
+            collator_data.msg_queue_depth_sum,
             candidate.data.len()
         );
         let collate_result = CollateResult::Ok {

@@ -545,7 +545,7 @@ impl SliceData {
                 return cell.reference(self.references_window.start - 1);
             }
         }
-        fail!(ExceptionCode::CellUnderflow)
+        fail!(ExceptionCode::CellUnderflow, "not enough references to drain")
     }
 
     pub fn get_references(&self) -> Range<usize> {
@@ -575,7 +575,8 @@ impl SliceData {
     }
 
     pub fn get_bit(&self, offset: usize) -> Result<bool> {
-        self.get_bit_opt(offset).ok_or_else(|| error!(ExceptionCode::CellUnderflow))
+        self.get_bit_opt(offset)
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "no bits to read"))
     }
 
     pub fn get_bits(&self, offset: usize, bits: usize) -> Result<u8> {
@@ -625,7 +626,8 @@ impl SliceData {
     }
 
     pub fn get_next_bit_int(&mut self) -> Result<usize> {
-        Ok(self.get_next_bit_opt().ok_or(ExceptionCode::CellUnderflow)?)
+        self.get_next_bit_opt()
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "no bits to read"))
     }
 
     pub fn get_next_bit_opt(&mut self) -> Option<usize> {

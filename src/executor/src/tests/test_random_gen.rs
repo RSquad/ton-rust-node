@@ -150,7 +150,7 @@ fn test_rand_1() {
     let mut rng = rand::SeedableRng::seed_from_u64(234235253453);
 
     let ordinary_acc_id = SENDER_ACCOUNT.clone();
-    let special_acc_id = AccountId::from([0x66u8; 32]);
+    let special_acc_id = AccountId::from([0x33; 32]);
 
     let blockchain_config = BLOCKCHAIN_CONFIG.to_owned();
     assert!(blockchain_config.is_special_account(true, &special_acc_id).unwrap());
@@ -356,7 +356,7 @@ fn test_rand_reverse_and_messages() {
     let mut rng = rand::SeedableRng::seed_from_u64(234235253453);
 
     let ordinary_acc_id = SENDER_ACCOUNT.clone();
-    let special_acc_id = AccountId::from([0x66u8; 32]);
+    let special_acc_id = AccountId::from([0x33; 32]);
 
     let blockchain_config = BLOCKCHAIN_CONFIG.to_owned();
     assert!(blockchain_config.is_special_account(true, &special_acc_id).unwrap());

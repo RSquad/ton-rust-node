@@ -19,6 +19,7 @@ use super::{
 use crate::{
     block::BlockStuff,
     collator_test_bundle::CollatorTestBundle,
+    config::CollatorTestBundlesConfig,
     engine_traits::EngineOperations,
     shard_state::ShardStateStuff,
     validating_utils::fmt_next_block_descr,
@@ -33,7 +34,7 @@ use crate::{
 use std::{sync::Arc, time::SystemTime};
 use ton_block::{
     Block, BlockIdExt, BlockSignaturesVariant, Cell, Deserializable, Result, ShardIdent, UInt256,
-    ValidatorSet,
+    UsageTree, ValidatorSet,
 };
 
 pub async fn run_validate_query_any_candidate(
@@ -322,6 +323,7 @@ pub async fn run_collate_query(
     let labels = [("shard", shard.to_string())];
     metrics::gauge!("ton_node_collator_active", &labels).decrement(1.0);
     let mut usage_tree_opt = None;
+    let test_bundles_config = &engine.test_bundles_config().collator;
 
     let err = match collate_result {
         Ok(CollateResult::Ok { candidate, new_state, new_block, block_root, .. }) => {
@@ -333,6 +335,19 @@ pub async fn run_collate_query(
                 engine.engine_allocated(),
             )?;
             metrics::counter!("ton_node_collator_successes_total", &labels).increment(1);
+
+            if test_bundles_config.build_all() {
+                spawn_build_test_bundle(
+                    test_bundles_config,
+                    &candidate.block_id,
+                    prev.get_prevs().to_vec(),
+                    None,
+                    None,
+                    next_block_descr.clone(),
+                    engine.clone(),
+                );
+            }
+
             return Ok((
                 validator_query_candidate_to_validator_block_candidate(collator_id, candidate),
                 new_state,
@@ -349,7 +364,6 @@ pub async fn run_collate_query(
 
     let labels = [("shard", shard.to_string())];
     metrics::counter!("ton_node_collator_failures_total", &labels).increment(1);
-    let test_bundles_config = &engine.test_bundles_config().collator;
     let err_str = if test_bundles_config.is_enable() { err.to_string() } else { String::default() };
 
     #[cfg(feature = "telemetry")]
@@ -357,41 +371,58 @@ pub async fn run_collate_query(
 
     if test_bundles_config.is_enable() && test_bundles_config.need_to_build_for(&err_str) {
         let id = prev.get_next_block_id(&UInt256::default(), &UInt256::default());
-        let prev_vec = prev.get_prevs().to_vec();
+        spawn_build_test_bundle(
+            test_bundles_config,
+            &id,
+            prev.get_prevs().to_vec(),
+            usage_tree_opt,
+            Some(err_str),
+            next_block_descr,
+            engine.clone(),
+        );
+    }
+    Err(err)
+}
 
-        if !CollatorTestBundle::exists(test_bundles_config.path(), &id) {
-            let path = test_bundles_config.path().to_string();
-            let engine = engine.clone();
-            tokio::spawn(async move {
-                match CollatorTestBundle::build_for_collating_block(
-                    &engine,
-                    prev_vec.to_vec(),
-                    usage_tree_opt,
-                )
-                .await
-                {
-                    Err(e) => log::error!(
-                        "({}): Error while test bundle for {} building: {}",
+fn spawn_build_test_bundle(
+    config: &CollatorTestBundlesConfig,
+    id: &BlockIdExt,
+    prev_blocks_ids: Vec<BlockIdExt>,
+    usage_tree: Option<UsageTree>,
+    notes: Option<String>,
+    next_block_descr: String,
+    engine: Arc<dyn EngineOperations>,
+) {
+    if CollatorTestBundle::exists(config.path(), id) {
+        return;
+    }
+    let path = config.path().to_string();
+    let id = id.clone();
+    tokio::spawn(async move {
+        match CollatorTestBundle::build_for_collating_block(&engine, prev_blocks_ids, usage_tree)
+            .await
+        {
+            Err(e) => log::error!(
+                "({}): Error while test bundle for {} building: {}",
+                next_block_descr,
+                id,
+                e
+            ),
+            Ok(mut b) => {
+                if let Some(notes) = notes {
+                    b.set_notes(notes);
+                }
+                if let Err(e) = b.save(&path) {
+                    log::error!(
+                        "({}): Error while test bundle for {} saving: {}",
                         next_block_descr,
                         id,
                         e
-                    ),
-                    Ok(mut b) => {
-                        b.set_notes(err_str.to_string());
-                        if let Err(e) = b.save(&path) {
-                            log::error!(
-                                "({}): Error while test bundle for {} saving: {}",
-                                next_block_descr,
-                                id,
-                                e
-                            );
-                        } else {
-                            log::info!("({}): Built test bundle for {}", next_block_descr, id);
-                        }
-                    }
+                    );
+                } else {
+                    log::info!("({}): Built test bundle for {}", next_block_descr, id);
                 }
-            });
+            }
         }
-    }
-    Err(err)
+    });
 }

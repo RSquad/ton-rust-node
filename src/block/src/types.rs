@@ -548,6 +548,14 @@ macro_rules! define_VarIntegerN {
                 self.0 = Self::read_from_cell(cell)?;
                 Ok(())
             }
+            fn skip(slice: &mut SliceData) -> Result<()> {
+                let len = slice.get_next_int(Self::get_len_len())? as usize;
+                if len >= $N {
+                    fail!("deserialization of {} error {} >= {}", stringify!($varname), len, $N)
+                }
+                slice.move_by(len * 8)?;
+                Ok(())
+            }
         }
 
         impl fmt::Display for $varname {
@@ -640,7 +648,16 @@ macro_rules! define_VarIntegerN {
                 let bytes = slice.get_next_int(bits as usize)? as usize;
                 let max = std::mem::size_of::<$tt>();
                 let mut buffer = [0; std::mem::size_of::<$tt>()];
-                slice.get_next_bytes_to_slice(&mut buffer[max - bytes..])?;
+                if bytes > 0 {
+                    let first = slice.get_next_byte()?;
+                    if first == 0 {
+                        fail!("non-canonical {} encoding: leading zero byte", stringify!($varname))
+                    }
+                    buffer[max - bytes] = first;
+                    if bytes > 1 {
+                        slice.get_next_bytes_to_slice(&mut buffer[max - bytes + 1..])?;
+                    }
+                }
                 self.0 = <$tt>::from_be_bytes(buffer);
                 Ok(())
             }
@@ -1012,6 +1029,10 @@ macro_rules! define_NumberN_up32bit {
         impl Deserializable for $varname {
             fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
                 self.0 = cell.get_next_int($N)? as u32;
+                Ok(())
+            }
+            fn skip(slice: &mut SliceData) -> Result<()> {
+                slice.move_by($N)?;
                 Ok(())
             }
         }

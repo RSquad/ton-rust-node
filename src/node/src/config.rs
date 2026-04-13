@@ -461,12 +461,20 @@ pub struct CollatorTestBundlesConfig {
     known_errors: Vec<String>,
     build_for_errors: bool,
     errors: Vec<String>,
+    #[serde(default)]
+    build_all: bool,
     path: String,
 }
 
 impl CollatorTestBundlesConfig {
     pub fn is_enable(&self) -> bool {
-        self.build_for_unknown_errors || (self.build_for_errors && !self.errors.is_empty())
+        self.build_all
+            || self.build_for_unknown_errors
+            || (self.build_for_errors && !self.errors.is_empty())
+    }
+
+    pub fn build_all(&self) -> bool {
+        self.build_all
     }
 
     pub fn need_to_build_for(&self, error: &str) -> bool {
