@@ -7,12 +7,14 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use serde_json::json;
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::str::FromStr;
+use std::{
+    ffi::{c_char, c_void, CStr, CString},
+    str::FromStr,
+};
 use ton_block::{
-    base64_decode, base64_encode, fail, read_single_root_boc, write_boc, BuilderData, Cell,
-    ConfigParams, Deserializable, HashUpdate, HashmapE, IBitstring, MsgAddressInt, Result,
-    Serializable, ShardAccount, SliceData, TransactionTickTock, UInt256,
+    base64_decode, base64_encode, error, fail, read_single_root_boc, write_boc, BuilderData, Cell,
+    ConfigParams, CurrencyCollection, Deserializable, HashUpdate, HashmapE, IBitstring,
+    MsgAddressInt, Result, Serializable, ShardAccount, SliceData, TransactionTickTock, UInt256,
 };
 use ton_executor::{
     BlockchainConfig, ExecuteParams, ExecutorError, OrdinaryTransactionExecutor,
@@ -22,9 +24,7 @@ use ton_vm::{
     error::tvm_exception_or_custom_code,
     executor::{gas::gas_state::Gas, BehaviorModifiers, Engine},
     smart_contract_info::{PrevBlocksInfo, SmartContractInfo},
-    stack::{
-        integer::IntegerData, read_stack_item, savelist::SaveList, Stack, StackItem,
-    },
+    stack::{integer::IntegerData, read_stack_item, savelist::SaveList, Stack, StackItem},
 };
 
 include!("../../common/src/log.rs");
@@ -562,9 +562,7 @@ impl TvmEmulator {
     ) -> StackItem {
         let mut smc_info = SmartContractInfo {
             unix_time: unixtime,
-            balance: ton_block::CurrencyCollection::from_coins(
-                ton_block::Coins::new(balance),
-            ),
+            balance: CurrencyCollection::with_coins(balance),
             myself: address.clone(),
             rand_seed,
             mycode: self.code.clone(),
@@ -590,10 +588,7 @@ impl TvmEmulator {
             libraries.push(HashmapE::with_hashmap(256, Some(libs.clone())));
         }
 
-        let caps = self
-            .config_params
-            .as_ref()
-            .map_or(0, |cp| cp.capabilities());
+        let caps = self.config_params.as_ref().map_or(0, |cp| cp.capabilities());
         let mut vm = Engine::with_capabilities(caps).setup_checked(
             self.code.clone(),
             ctrls,
@@ -646,11 +641,7 @@ impl TvmEmulator {
         Ok(format!("{result:#}"))
     }
 
-    fn send_message(
-        &self,
-        message_body: Cell,
-        amount: Option<u64>,
-    ) -> Result<String> {
+    fn send_message(&self, message_body: Cell, amount: Option<u64>) -> Result<String> {
         let is_external = amount.is_none();
         let msg_balance = amount.unwrap_or(0);
         let function_selector = StackItem::int(if is_external { -1i32 } else { 0i32 });
@@ -896,7 +887,9 @@ pub extern "C" fn tvm_emulator_set_prev_blocks_info(
     // which is complex. The user should call set_c7 after this.
     match deserialize_boc(info_boc) {
         Ok(_info_cell) => {
-            log::warn!("tvm_emulator_set_prev_blocks_info: to take effect, call tvm_emulator_set_c7 after this");
+            log::warn!(
+                "tvm_emulator_set_prev_blocks_info: to take effect, call tvm_emulator_set_c7 after this"
+            );
             true
         }
         Err(err) => {
@@ -913,10 +906,7 @@ pub extern "C" fn tvm_emulator_set_prev_blocks_info(
  * @return true in case of success, false in case of error
  */
 #[unsafe(no_mangle)]
-pub extern "C" fn tvm_emulator_set_gas_limit(
-    tvm_emulator: *mut c_void,
-    gas_limit: i64,
-) -> bool {
+pub extern "C" fn tvm_emulator_set_gas_limit(tvm_emulator: *mut c_void, gas_limit: i64) -> bool {
     if tvm_emulator.is_null() {
         log::error!("Received null pointer for tvm_emulator");
         return false;
@@ -1109,9 +1099,7 @@ fn parse_address(address: &str) -> Result<SliceData> {
     if parts.len() != 2 {
         fail!("Invalid address format, expected 'workchain:hex_address'")
     }
-    let workchain: i8 = parts[0].parse().map_err(|e| {
-        ton_block::error!("Failed to parse workchain: {}", e)
-    })?;
+    let workchain: i8 = parts[0].parse().map_err(|e| error!("Failed to parse workchain: {}", e))?;
     let account_id = UInt256::from_str(parts[1])?;
     let addr = MsgAddressInt::with_standart(None, workchain, account_id.into())?;
     addr.write_to_bitstring()

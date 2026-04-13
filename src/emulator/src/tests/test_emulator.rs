@@ -8,8 +8,8 @@
  */
 use super::*;
 use ton_block::{
-    Account, Deserializable, Serializable, Transaction, base64_decode, base64_encode,
-    read_single_root_boc, write_boc,
+    base64_decode, base64_encode, read_single_root_boc, write_boc, Account, Deserializable,
+    Serializable, Transaction,
 };
 
 fn cell_to_base64(cell: &Cell) -> String {
@@ -401,9 +401,7 @@ fn test_tvm_emulator_null_safety() {
     ));
     assert!(tvm_emulator_run_get_method(std::ptr::null_mut(), 0, std::ptr::null()).is_null());
     assert!(tvm_emulator_send_external_message(std::ptr::null_mut(), std::ptr::null()).is_null());
-    assert!(
-        tvm_emulator_send_internal_message(std::ptr::null_mut(), std::ptr::null(), 0).is_null()
-    );
+    assert!(tvm_emulator_send_internal_message(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
     // destroy with null should not crash
     tvm_emulator_destroy(std::ptr::null_mut());
 }
