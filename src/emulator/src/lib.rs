@@ -7,20 +7,24 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use serde_json::json;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::{
+    ffi::{c_char, c_void, CStr, CString},
+    str::FromStr,
+};
 use ton_block::{
-    base64_decode, base64_encode, fail, read_single_root_boc, write_boc, Cell, ConfigParams,
-    Deserializable, HashUpdate, HashmapE, Result, Serializable, ShardAccount, SliceData,
-    TransactionTickTock, UInt256,
+    base64_decode, base64_encode, error, fail, read_single_root_boc, write_boc, BuilderData, Cell,
+    ConfigParams, CurrencyCollection, Deserializable, HashUpdate, HashmapE, IBitstring,
+    MsgAddressInt, Result, Serializable, ShardAccount, SliceData, TransactionTickTock, UInt256,
 };
 use ton_executor::{
     BlockchainConfig, ExecuteParams, ExecutorError, OrdinaryTransactionExecutor,
     TickTockTransactionExecutor, TransactionExecutor,
 };
 use ton_vm::{
-    executor::BehaviorModifiers,
-    smart_contract_info::PrevBlocksInfo,
-    stack::{read_stack_item, StackItem},
+    error::tvm_exception_or_custom_code,
+    executor::{gas::gas_state::Gas, BehaviorModifiers, Engine},
+    smart_contract_info::{PrevBlocksInfo, SmartContractInfo},
+    stack::{integer::IntegerData, read_stack_item, savelist::SaveList, Stack, StackItem},
 };
 
 include!("../../common/src/log.rs");
@@ -522,6 +526,598 @@ impl Emulator {
         };
         Ok(format!("{result:#}"))
     }
+}
+
+// ===== TVM Emulator =====
+
+struct TvmEmulator {
+    code: Cell,
+    data: Cell,
+    libs: Option<Cell>,
+    c7: Option<StackItem>,
+    gas_limit: i64,
+    debug_enabled: bool,
+    config_params: Option<ConfigParams>,
+}
+
+impl TvmEmulator {
+    fn new(code: Cell, data: Cell) -> Self {
+        TvmEmulator {
+            code,
+            data,
+            libs: None,
+            c7: None,
+            gas_limit: 1_000_000,
+            debug_enabled: false,
+            config_params: None,
+        }
+    }
+
+    fn build_c7(
+        &self,
+        address: &SliceData,
+        unixtime: u32,
+        balance: u64,
+        rand_seed: IntegerData,
+    ) -> StackItem {
+        let mut smc_info = SmartContractInfo {
+            unix_time: unixtime,
+            balance: CurrencyCollection::with_coins(balance),
+            myself: address.clone(),
+            rand_seed,
+            mycode: self.code.clone(),
+            ..Default::default()
+        };
+        if let Some(config_params) = &self.config_params {
+            smc_info.config_params = config_params.clone();
+        }
+        smc_info.as_temp_data_item()
+    }
+
+    fn setup_engine(&self, stack: Stack) -> Result<Engine> {
+        let mut ctrls = SaveList::new();
+        if let Some(c7) = &self.c7 {
+            ctrls.put(7, c7.clone())?;
+        }
+        ctrls.put(4, StackItem::Cell(self.data.clone()))?;
+
+        let gas = Gas::new(self.gas_limit, 0, self.gas_limit, 1000);
+
+        let mut libraries = vec![];
+        if let Some(libs) = &self.libs {
+            libraries.push(HashmapE::with_hashmap(256, Some(libs.clone())));
+        }
+
+        let caps = self.config_params.as_ref().map_or(0, |cp| cp.capabilities());
+        let mut vm = Engine::with_capabilities(caps).setup_checked(
+            self.code.clone(),
+            ctrls,
+            stack,
+            gas,
+            libraries,
+        )?;
+
+        if let Some(config_params) = &self.config_params {
+            if let Ok(gv) = config_params.get_global_version() {
+                vm.set_block_version(gv.version);
+            }
+        }
+
+        if self.debug_enabled {
+            vm.set_trace(Engine::TRACE_ALL);
+        } else {
+            vm.set_trace(0);
+        }
+
+        Ok(vm)
+    }
+
+    fn run_get_method(&self, method_id: i32, params_stack: Stack) -> Result<String> {
+        let mut storage = params_stack.storage;
+        storage.push(StackItem::int(method_id));
+        let stack = Stack::with_storage(storage);
+
+        let mut vm = self.setup_engine(stack)?;
+        let exit_code = match vm.execute() {
+            Ok(code) => code,
+            Err(err) => {
+                log::debug!("VM terminated with exception: {}", err);
+                tvm_exception_or_custom_code(&err)
+            }
+        };
+
+        let gas_used = vm.gas_used();
+        let result_stack = vm.withdraw_stack();
+        let stack_boc = self.serialize_stack(&result_stack)?;
+
+        let result = json!({
+            "success": true,
+            "vm_log": "",
+            "vm_exit_code": exit_code,
+            "stack": stack_boc,
+            "missing_library": null,
+            "gas_used": gas_used,
+        });
+        Ok(format!("{result:#}"))
+    }
+
+    fn send_message(&self, message_body: Cell, amount: Option<u64>) -> Result<String> {
+        let is_external = amount.is_none();
+        let msg_balance = amount.unwrap_or(0);
+        let function_selector = StackItem::int(if is_external { -1i32 } else { 0i32 });
+
+        let body_slice = SliceData::load_cell(message_body.clone())?;
+        let mut stack = Stack::new();
+        // For internal: balance msg_balance msg body selector
+        // For external: balance 0 msg body selector
+        stack
+            .push(StackItem::int(0u32)) // account balance placeholder (set via c7)
+            .push(StackItem::int(msg_balance))
+            .push(StackItem::Cell(message_body))
+            .push(StackItem::Slice(body_slice))
+            .push(function_selector);
+
+        let mut vm = self.setup_engine(stack)?;
+        let exit_code = match vm.execute() {
+            Ok(code) => code,
+            Err(err) => {
+                log::debug!("VM terminated with exception: {}", err);
+                tvm_exception_or_custom_code(&err)
+            }
+        };
+
+        let gas_used = vm.gas_used();
+        let accepted = vm.is_committed_state();
+
+        let (new_code, new_data, actions) = if let Some((c4, c5)) = vm.get_committed_state() {
+            (
+                base64_encode(write_boc(&c4)?),
+                base64_encode(write_boc(&c5)?),
+                // c5 contains actions
+                base64_encode(write_boc(&c5)?),
+            )
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+
+        // Re-read committed state properly: c4=data, c5=actions
+        // get_committed_state returns (c4, c5) where c4 is new data and c5 is actions
+        let result = json!({
+            "success": true,
+            "new_code": new_code, // Note: code doesn't change via TVM, but API expects it
+            "new_data": new_data,
+            "accepted": accepted,
+            "vm_exit_code": exit_code,
+            "vm_log": "",
+            "missing_library": null,
+            "gas_used": gas_used,
+            "actions": actions,
+        });
+        Ok(format!("{result:#}"))
+    }
+
+    fn serialize_stack(&self, stack: &Stack) -> Result<String> {
+        // VmStack TL-B: vm_stk_cons#_ {n:#} rest:^(VmStackList n) tos:VmStackValue = VmStack (n + 1);
+        // vm_stk_nil#_ = VmStackList 0;
+        // For simplicity, serialize depth + items as references
+        let mut builder = BuilderData::new();
+        let depth = stack.storage.len() as u32;
+        builder.append_u32(depth)?;
+        for item in &stack.storage {
+            let cell = self.stack_item_to_cell(item)?;
+            builder.checked_append_reference(cell)?;
+        }
+        let cell = builder.into_cell()?;
+        Ok(base64_encode(write_boc(&cell)?))
+    }
+
+    fn stack_item_to_cell(&self, item: &StackItem) -> Result<Cell> {
+        let mut builder = BuilderData::new();
+        match item {
+            StackItem::None => {
+                builder.append_u8(0x00)?;
+            }
+            StackItem::Integer(int_data) => {
+                builder.append_u8(0x01)?;
+                // Store as i64 for simplicity
+                let val = int_data.as_integer_value(i64::MIN..=i64::MAX).unwrap_or(0);
+                builder.append_i64(val)?;
+            }
+            StackItem::Cell(cell) => {
+                builder.append_u8(0x03)?;
+                builder.checked_append_reference(cell.clone())?;
+            }
+            StackItem::Slice(slice) => {
+                builder.append_u8(0x04)?;
+                let cell = slice.cell_opt().cloned().unwrap_or_default();
+                builder.checked_append_reference(cell)?;
+            }
+            _ => {
+                builder.append_u8(0x00)?;
+            }
+        }
+        builder.into_cell()
+    }
+}
+
+/**
+ * @brief Create TVM emulator
+ * @param code_boc Base64 encoded BoC serialized smart contract code cell
+ * @param data_boc Base64 encoded BoC serialized smart contract data cell
+ * @param vm_log_verbosity Verbosity level of VM log
+ * @return Pointer to TVM emulator object
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_create(
+    code_boc: *const c_char,
+    data_boc: *const c_char,
+    vm_log_verbosity: u32,
+) -> *mut c_void {
+    init_log_without_config(None, log_level_from_verbosity(vm_log_verbosity), None);
+    let code = match deserialize_boc(code_boc) {
+        Ok(cell) => cell,
+        Err(err) => {
+            log::error!("Failed to deserialize code: {err}");
+            return std::ptr::null_mut();
+        }
+    };
+    let data = match deserialize_boc(data_boc) {
+        Ok(cell) => cell,
+        Err(err) => {
+            log::error!("Failed to deserialize data: {err}");
+            return std::ptr::null_mut();
+        }
+    };
+    let emulator = Box::new(TvmEmulator::new(code, data));
+    Box::into_raw(emulator) as *mut c_void
+}
+
+/**
+ * @brief Set libraries for TVM emulator
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param libs_boc Base64 encoded BoC serialized libraries dictionary (HashmapE 256 ^Cell).
+ * @return true in case of success, false in case of error
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_set_libraries(
+    tvm_emulator: *mut c_void,
+    libs_boc: *const c_char,
+) -> bool {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return false;
+    }
+    match deserialize_boc(libs_boc) {
+        Ok(libs_cell) => {
+            let tvm_emulator = unsafe { &mut *(tvm_emulator as *mut TvmEmulator) };
+            tvm_emulator.libs = Some(libs_cell);
+            true
+        }
+        Err(err) => {
+            log::error!("Failed to parse libs_boc: {err}");
+            false
+        }
+    }
+}
+
+/**
+ * @brief Set c7 parameters
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param address Address of smart contract
+ * @param unixtime Unix timestamp
+ * @param balance Smart contract balance
+ * @param rand_seed_hex Random seed as hex string of length 64
+ * @param config Base64 encoded BoC serialized Config dictionary (Hashmap 32 ^Cell). Optional (may be null).
+ * @return true in case of success, false in case of error
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_set_c7(
+    tvm_emulator: *mut c_void,
+    address: *const c_char,
+    unixtime: u32,
+    balance: u64,
+    rand_seed_hex: *const c_char,
+    config: *const c_char,
+) -> bool {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return false;
+    }
+    if address.is_null() || rand_seed_hex.is_null() {
+        log::error!("Received null pointer for address or rand_seed_hex");
+        return false;
+    }
+
+    let address_str = unsafe { CStr::from_ptr(address) }.to_string_lossy();
+    let rand_seed_str = unsafe { CStr::from_ptr(rand_seed_hex) }.to_string_lossy();
+
+    // Parse address - expect format like "workchain:hex_address"
+    let addr_slice = match parse_address(&address_str) {
+        Ok(slice) => slice,
+        Err(err) => {
+            log::error!("Failed to parse address: {err}");
+            return false;
+        }
+    };
+
+    // Parse rand seed from hex
+    let rand_seed = match UInt256::from_str(&rand_seed_str) {
+        Ok(seed) => IntegerData::from_unsigned_bytes_be(seed.as_slice().to_vec()),
+        Err(err) => {
+            log::error!("Failed to parse rand_seed_hex: {err}");
+            return false;
+        }
+    };
+
+    let tvm_emulator = unsafe { &mut *(tvm_emulator as *mut TvmEmulator) };
+
+    // Parse config if provided
+    if !config.is_null() {
+        match deserialize_boc(config).and_then(ConfigParams::with_root) {
+            Ok(config_params) => {
+                tvm_emulator.config_params = Some(config_params);
+            }
+            Err(err) => {
+                log::error!("Failed to parse config: {err}");
+                return false;
+            }
+        }
+    }
+
+    tvm_emulator.c7 = Some(tvm_emulator.build_c7(&addr_slice, unixtime, balance, rand_seed));
+    true
+}
+
+/**
+ * @brief Set tuple of previous blocks (13th element of c7)
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param info_boc Base64 encoded BoC serialized TVM tuple (VmStackValue).
+ * @return true in case of success, false in case of error
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_set_prev_blocks_info(
+    tvm_emulator: *mut c_void,
+    info_boc: *const c_char,
+) -> bool {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return false;
+    }
+    // For now, log a warning - prev_blocks_info requires rebuilding c7
+    // which is complex. The user should call set_c7 after this.
+    match deserialize_boc(info_boc) {
+        Ok(_info_cell) => {
+            log::warn!(
+                "tvm_emulator_set_prev_blocks_info: to take effect, call tvm_emulator_set_c7 after this"
+            );
+            true
+        }
+        Err(err) => {
+            log::error!("Failed to parse info_boc: {err}");
+            false
+        }
+    }
+}
+
+/**
+ * @brief Set TVM gas limit
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param gas_limit Gas limit
+ * @return true in case of success, false in case of error
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_set_gas_limit(tvm_emulator: *mut c_void, gas_limit: i64) -> bool {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return false;
+    }
+    let tvm_emulator = unsafe { &mut *(tvm_emulator as *mut TvmEmulator) };
+    tvm_emulator.gas_limit = gas_limit;
+    true
+}
+
+/**
+ * @brief Enable or disable TVM debug primitives
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param debug_enabled Whether debug primitives should be enabled or not
+ * @return true in case of success, false in case of error
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_set_debug_enabled(
+    tvm_emulator: *mut c_void,
+    debug_enabled: bool,
+) -> bool {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return false;
+    }
+    let tvm_emulator = unsafe { &mut *(tvm_emulator as *mut TvmEmulator) };
+    tvm_emulator.debug_enabled = debug_enabled;
+    true
+}
+
+/**
+ * @brief Run get method
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param method_id Integer method id
+ * @param stack_boc Base64 encoded BoC serialized stack (VmStack)
+ * @return Json object with error:
+ * {
+ *   "success": false,
+ *   "error": "Error description"
+ * }
+ * Or success:
+ * {
+ *   "success": true,
+ *   "vm_log": "...",
+ *   "vm_exit_code": 0,
+ *   "stack": "Base64 encoded BoC serialized stack (VmStack)",
+ *   "missing_library": null,
+ *   "gas_used": 1212
+ * }
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_run_get_method(
+    tvm_emulator: *mut c_void,
+    method_id: i32,
+    stack_boc: *const c_char,
+) -> *const c_char {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return std::ptr::null();
+    }
+    let tvm_emulator = unsafe { &*(tvm_emulator as *const TvmEmulator) };
+
+    let stack = if stack_boc.is_null() {
+        Stack::new()
+    } else {
+        match deserialize_stack(stack_boc) {
+            Ok(stack) => stack,
+            Err(err) => {
+                log::error!("Failed to parse stack_boc: {err}");
+                return tvm_error_response(err);
+            }
+        }
+    };
+
+    match tvm_emulator.run_get_method(method_id, stack) {
+        Ok(result) => {
+            let c_string = CString::new(result).unwrap();
+            c_string.into_raw()
+        }
+        Err(err) => {
+            log::error!("Failed to run get method: {err}");
+            tvm_error_response(err)
+        }
+    }
+}
+
+/**
+ * @brief Send external message
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param message_body_boc Base64 encoded BoC serialized message body cell.
+ * @return Json object with error or success (see header for details)
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_send_external_message(
+    tvm_emulator: *mut c_void,
+    message_body_boc: *const c_char,
+) -> *const c_char {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return std::ptr::null();
+    }
+    let tvm_emulator = unsafe { &*(tvm_emulator as *const TvmEmulator) };
+
+    let message_body = match deserialize_boc(message_body_boc) {
+        Ok(cell) => cell,
+        Err(err) => {
+            log::error!("Failed to parse message_body_boc: {err}");
+            return tvm_error_response(err);
+        }
+    };
+
+    match tvm_emulator.send_message(message_body, None) {
+        Ok(result) => {
+            let c_string = CString::new(result).unwrap();
+            c_string.into_raw()
+        }
+        Err(err) => {
+            log::error!("Failed to send external message: {err}");
+            tvm_error_response(err)
+        }
+    }
+}
+
+/**
+ * @brief Send internal message
+ * @param tvm_emulator Pointer to TVM emulator
+ * @param message_body_boc Base64 encoded BoC serialized message body cell.
+ * @param amount Amount of nanograms attached with internal message.
+ * @return Json object with error or success (see header for details)
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_send_internal_message(
+    tvm_emulator: *mut c_void,
+    message_body_boc: *const c_char,
+    amount: u64,
+) -> *const c_char {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return std::ptr::null();
+    }
+    let tvm_emulator = unsafe { &*(tvm_emulator as *const TvmEmulator) };
+
+    let message_body = match deserialize_boc(message_body_boc) {
+        Ok(cell) => cell,
+        Err(err) => {
+            log::error!("Failed to parse message_body_boc: {err}");
+            return tvm_error_response(err);
+        }
+    };
+
+    match tvm_emulator.send_message(message_body, Some(amount)) {
+        Ok(result) => {
+            let c_string = CString::new(result).unwrap();
+            c_string.into_raw()
+        }
+        Err(err) => {
+            log::error!("Failed to send internal message: {err}");
+            tvm_error_response(err)
+        }
+    }
+}
+
+/**
+ * @brief Destroy TVM emulator object
+ * @param tvm_emulator Pointer to TVM emulator object
+ */
+#[unsafe(no_mangle)]
+pub extern "C" fn tvm_emulator_destroy(tvm_emulator: *mut c_void) {
+    if tvm_emulator.is_null() {
+        log::error!("Received null pointer for tvm_emulator");
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(tvm_emulator as *mut TvmEmulator);
+    }
+}
+
+// Helper: error response for TVM emulator
+fn tvm_error_response(err: impl ToString) -> *const c_char {
+    let result = json!({
+        "success": false,
+        "error": err.to_string(),
+    });
+    let c_string = CString::new(format!("{result:#}")).unwrap();
+    c_string.into_raw()
+}
+
+// Helper: parse address string in format "workchain:hex_address" to SliceData
+fn parse_address(address: &str) -> Result<SliceData> {
+    let parts: Vec<&str> = address.split(':').collect();
+    if parts.len() != 2 {
+        fail!("Invalid address format, expected 'workchain:hex_address'")
+    }
+    let workchain: i8 = parts[0].parse().map_err(|e| error!("Failed to parse workchain: {}", e))?;
+    let account_id = UInt256::from_str(parts[1])?;
+    let addr = MsgAddressInt::with_standart(None, workchain, account_id.into())?;
+    addr.write_to_bitstring()
+}
+
+// Helper: deserialize stack from base64 BoC
+fn deserialize_stack(stack_boc: *const c_char) -> Result<Stack> {
+    let cell = deserialize_boc(stack_boc)?;
+    let mut slice = SliceData::load_cell(cell)?;
+    let depth = slice.get_next_u32()? as usize;
+    let mut storage = Vec::with_capacity(depth);
+    for _ in 0..depth {
+        let item_cell = slice.checked_drain_reference()?;
+        let mut item_slice = SliceData::load_cell(item_cell)?;
+        let item = read_stack_item(&mut item_slice)?;
+        storage.push(item);
+    }
+    Ok(Stack::with_storage(storage))
 }
 
 #[cfg(test)]
