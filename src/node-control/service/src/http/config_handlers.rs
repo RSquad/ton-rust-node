@@ -933,6 +933,12 @@ pub async fn v1_bindings_add_handler(
     let req = req.0;
 
     let cfg = state.runtime_cfg.get();
+    if cfg.bindings.contains_key(&req.node) {
+        return Err(AppError::bad_request(format!(
+            "binding for node '{}' already exists",
+            req.node
+        )));
+    }
     if !cfg.nodes.contains_key(&req.node) {
         return Err(AppError::bad_request(format!("node '{}' not found", req.node)));
     }
@@ -944,10 +950,8 @@ pub async fn v1_bindings_add_handler(
             return Err(AppError::bad_request(format!("pool '{pool_name}' not found")));
         }
         // A pool may be bound to at most one node.
-        if let Some((other_node, _)) = cfg
-            .bindings
-            .iter()
-            .find(|(n, b)| b.pool.as_deref() == Some(pool_name) && *n != &req.node)
+        if let Some((other_node, _)) =
+            cfg.bindings.iter().find(|(_, b)| b.pool.as_deref() == Some(pool_name))
         {
             return Err(AppError::bad_request(format!(
                 "pool '{pool_name}' is already bound to node '{other_node}'"
