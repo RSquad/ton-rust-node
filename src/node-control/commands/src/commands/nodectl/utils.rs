@@ -250,10 +250,14 @@ pub fn resolve_service_url(url: Option<&str>, config_path: Option<&str>) -> anyh
         return Ok(normalize_base_url(u));
     }
     if let Some(path) = config_path {
-        let app_cfg = AppConfig::load(Path::new(path))?;
-        return Ok(normalize_base_url(&app_cfg.http.bind));
+        let path = Path::new(path);
+        if path.exists() {
+            let app_cfg = AppConfig::load(Path::new(path))?;
+            return Ok(normalize_base_url(&app_cfg.http.bind));
+        }
     }
-    anyhow::bail!("cannot determine service URL: provide --url or --config or CONFIG_PATH")
+    // Fallback to localhost:8080 if no URL or config path is provided.
+    Ok("http://127.0.0.1:8080".to_string())
 }
 
 fn normalize_base_url(url: &str) -> String {

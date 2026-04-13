@@ -37,6 +37,7 @@ pub struct ConfigCmd {
         short = 'c',
         long = "config",
         help = "Path to the configuration file",
+        default_value = "nodectl-config.json",
         env = "CONFIG_PATH",
         global = true
     )]
@@ -46,7 +47,7 @@ pub struct ConfigCmd {
         short = 'u',
         long = "url",
         value_hint = clap::ValueHint::Url,
-        help = "URL to the node control service API (takes precedence over --config for reads)",
+        help = "URL to the node control service API (takes precedence over --config for reads; defaults to http://127.0.0.1:8080 if not --url and --config are provided)",
         global = true
     )]
     url: Option<String>,
