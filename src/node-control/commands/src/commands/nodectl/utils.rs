@@ -273,16 +273,51 @@ fn normalize_base_url(url: &str) -> String {
 
 /// Sends a GET request to the service API and returns the response body.
 pub async fn api_get(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::GET, base_url, path, token, None::<&()>).await
+}
+
+/// Sends a POST request with a JSON body and returns the response body.
+pub async fn api_post<B: serde::Serialize>(
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &B,
+) -> anyhow::Result<String> {
+    send_request(reqwest::Method::POST, base_url, path, token, Some(body)).await
+}
+
+/// Sends a DELETE request and returns the response body.
+pub async fn api_delete(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::DELETE, base_url, path, token, None::<&()>).await
+}
+
+async fn send_request<B: serde::Serialize>(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&B>,
+) -> anyhow::Result<String> {
     let url = format!("{}/{}", base_url.trim_end_matches('/'), path.trim_start_matches('/'));
     let client = reqwest::Client::new();
-    let mut req = client.get(&url);
+    let mut req = client.request(method, &url);
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    if let Some(b) = body {
+        req = req.json(b);
     }
     let response = req.send().await.context(format!("failed to connect to {}", url))?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
+        // Try to extract `error.message` from the standard ApiErrorResponse.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(msg) =
+                v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        {
+            anyhow::bail!("{msg}");
+        }
         anyhow::bail!("request failed: status={}, body={}", status, body);
     }
     Ok(body)

@@ -9,17 +9,16 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, api_get, fetch_network_max_factor,
-        get_wallet_config, load_config_vault, load_config_vault_rpc_client, make_wallet,
-        require_config, resolve_service_url, save_config, wait_for_seqno_change, wallet_info,
-        warn_missing_secret,
+        SEND_TIMEOUT, api_delete, api_get, api_post, fetch_network_max_factor, get_wallet_config,
+        load_config_vault_rpc_client, make_wallet, require_config, resolve_service_url,
+        wait_for_seqno_change, wallet_info, warn_missing_secret,
     },
 };
 use anyhow::Context;
 use colored::Colorize;
 use common::{
     TonWalletVersion,
-    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
+    app_config::{ElectionsConfig, PoolConfig},
     task_cancellation::CancellationCtx,
     time_format,
     ton_utils::{display_tons, tons_f64_to_nanotons},
@@ -29,6 +28,7 @@ use contracts::{
     nominator,
 };
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
+use secrets_vault::vault_builder::SecretVaultBuilder;
 use std::{io::Write, path::Path};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
@@ -138,9 +138,9 @@ impl WalletCmd {
         token: Option<&str>,
     ) -> anyhow::Result<()> {
         match &self.action {
-            WalletAction::Add(cmd) => cmd.run(require_config(config_path)?).await,
+            WalletAction::Add(cmd) => cmd.run(url, token, config_path).await,
             WalletAction::Ls(cmd) => cmd.run(url, token, config_path).await,
-            WalletAction::Rm(cmd) => cmd.run(require_config(config_path)?).await,
+            WalletAction::Rm(cmd) => cmd.run(url, token, config_path).await,
             WalletAction::Send(cmd) => {
                 cmd.run(require_config(config_path)?, cancellation_ctx).await
             }
@@ -151,40 +151,45 @@ impl WalletCmd {
     }
 }
 
+#[derive(serde::Serialize)]
+struct WalletAddBody<'a> {
+    name: &'a str,
+    secret: &'a str,
+    version: String,
+    subwallet_id: u32,
+    workchain: i32,
+}
+
 impl WalletAddCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if self.name == MASTER_WALLET_RESERVED_NAME {
-            anyhow::bail!("'master_wallet' is a reserved name");
-        }
-
-        let (config, vault) = load_config_vault(path).await?;
-
-        if config.wallets.contains_key(&self.name) {
-            anyhow::bail!(
-                "Wallet '{}' already exists. Remove it first or use a different name.",
-                self.name
-            );
-        }
-
-        let wallet_config = WalletConfig {
-            key: KeyConfig::VaultKey { name: self.secret_name.clone() },
-            version: self.version,
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = WalletAddBody {
+            name: &self.name,
+            secret: &self.secret_name,
+            version: self.version.to_string(),
             subwallet_id: self.subwallet_id,
             workchain: self.workchain,
         };
+        api_post(&base_url, "/v1/wallets", token, &body).await?;
 
-        let secret_id = self.secret_name.as_str().into();
-
-        if !vault.exists(&secret_id).await? {
+        if vault_secret_missing(&self.secret_name).await {
             warn_missing_secret(&self.secret_name);
         }
-
-        let mut config = config.clone();
-        config.wallets.insert(self.name.clone(), wallet_config);
-        save_config(&config, path)?;
-
         println!("\n{} Wallet '{}' added\n", "OK".green().bold(), self.name);
         Ok(())
+    }
+}
+
+/// Best-effort vault check; returns true only if vault is reachable and the secret is absent.
+async fn vault_secret_missing(secret_name: &str) -> bool {
+    match SecretVaultBuilder::from_env().await {
+        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
+        Err(_) => false,
     }
 }
 
@@ -258,30 +263,14 @@ fn print_wallets_table_from_views(views: &[WalletView]) {
 }
 
 impl WalletRmCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if self.name == MASTER_WALLET_RESERVED_NAME {
-            anyhow::bail!("The master wallet cannot be removed");
-        }
-
-        let mut config = AppConfig::load(path)?;
-
-        if !config.wallets.contains_key(&self.name) {
-            anyhow::bail!("Wallet '{}' not found in configuration", self.name);
-        }
-
-        for (node_name, binding) in &config.bindings {
-            if binding.wallet == self.name {
-                anyhow::bail!(
-                    "Cannot remove wallet '{}': referenced by binding for node '{}'",
-                    self.name,
-                    node_name
-                );
-            }
-        }
-
-        config.wallets.remove(&self.name);
-        save_config(&config, path)?;
-
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_delete(&base_url, &format!("/v1/wallets/{}", self.name), token).await?;
         println!("\n{} Wallet '{}' removed\n", "OK".green().bold(), self.name);
         Ok(())
     }

@@ -8,14 +8,10 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_get, require_config, resolve_service_url, save_config, warn_missing_secret},
+    utils::{api_delete, api_get, api_post, resolve_service_url, warn_missing_secret},
 };
-use adnl::common::Timeouts;
-use anyhow::Context;
 use colored::Colorize;
-use common::app_config::{AdnlConfig, AppConfig, KeyConfig, TimeoutVariant};
 use secrets_vault::vault_builder::SecretVaultBuilder;
-use std::path::Path;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage nodes in the configuration")]
@@ -81,57 +77,53 @@ impl NodeCmd {
         token: Option<&str>,
     ) -> anyhow::Result<()> {
         match &self.action {
-            NodeAction::Add(cmd) => cmd.run(require_config(config_path)?).await,
+            NodeAction::Add(cmd) => cmd.run(url, token, config_path).await,
             NodeAction::Ls(cmd) => cmd.run(url, token, config_path).await,
-            NodeAction::Rm(cmd) => cmd.run(require_config(config_path)?).await,
+            NodeAction::Rm(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
 
+#[derive(serde::Serialize)]
+struct NodeAddBody<'a> {
+    name: &'a str,
+    control_server_endpoint: &'a str,
+    control_server_pubkey: &'a str,
+    control_client_secret: &'a str,
+}
+
 impl NodeAddCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        if config.nodes.contains_key(&self.name) {
-            anyhow::bail!(
-                "Node '{}' already exists. Remove it first or use a different name.",
-                self.name
-            );
-        }
-
-        let server_key = KeyConfig::PublicKey {
-            type_id: 1209251014,
-            pub_key: base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &self.control_server_pubkey,
-            )
-            .context("Failed to decode control server public key")?,
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = NodeAddBody {
+            name: &self.name,
+            control_server_endpoint: &self.control_server_endpoint,
+            control_server_pubkey: &self.control_server_pubkey,
+            control_client_secret: &self.control_client_secret_name,
         };
+        api_post(&base_url, "/v1/nodes", token, &body).await?;
 
-        let client_key = KeyConfig::VaultKey { name: self.control_client_secret_name.clone() };
-        let adnl_config = AdnlConfig {
-            server_address: self.control_server_endpoint.clone(),
-            server_key,
-            client_key,
-            timeouts: TimeoutVariant::Single(Timeouts::DEFAULT_TIMEOUT.as_secs()),
-        };
-        config.nodes.insert(self.name.clone(), adnl_config);
-        save_config(&config, path)?;
-
-        let secret_exists_in_vault = match SecretVaultBuilder::from_env().await {
-            Ok(vault) => {
-                let secret_id = self.control_client_secret_name.as_str().into();
-                vault.exists(&secret_id).await.ok()
-            }
-            Err(_) => None,
-        };
-
-        if secret_exists_in_vault == Some(false) {
+        if vault_secret_missing(&self.control_client_secret_name).await {
             warn_missing_secret(&self.control_client_secret_name);
             println!();
         }
         println!("\n{} Node '{}' added\n", "OK".green().bold(), self.name);
         Ok(())
+    }
+}
+
+/// Best-effort check that returns `true` only if we could reach the local vault
+/// AND the secret is definitely absent. Any other outcome (no vault, lookup
+/// error) is treated as "unknown" and produces no warning.
+async fn vault_secret_missing(secret_name: &str) -> bool {
+    match SecretVaultBuilder::from_env().await {
+        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
+        Err(_) => false,
     }
 }
 
@@ -208,15 +200,14 @@ fn print_nodes_table(views: &[NodeView]) {
 }
 
 impl NodeRmCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        if config.nodes.remove(&self.name).is_none() {
-            anyhow::bail!("Node '{}' not found in configuration", self.name);
-        }
-
-        save_config(&config, path)?;
-
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_delete(&base_url, &format!("/v1/nodes/{}", self.name), token).await?;
         println!("\n{} Node '{}' removed\n", "OK".green().bold(), self.name);
         Ok(())
     }

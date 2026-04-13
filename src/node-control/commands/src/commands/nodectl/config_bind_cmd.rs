@@ -8,11 +8,9 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_get, require_config, resolve_service_url, save_config},
+    utils::{api_delete, api_get, api_post, resolve_service_url},
 };
 use colored::Colorize;
-use common::app_config::{AppConfig, BindingStatus, NodeBinding};
-use std::path::Path;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage node bindings in the configuration")]
@@ -64,48 +62,32 @@ impl BindCmd {
         token: Option<&str>,
     ) -> anyhow::Result<()> {
         match &self.action {
-            BindAction::Add(cmd) => cmd.run(require_config(config_path)?).await,
-            BindAction::Rm(cmd) => cmd.run(require_config(config_path)?).await,
+            BindAction::Add(cmd) => cmd.run(url, token, config_path).await,
+            BindAction::Rm(cmd) => cmd.run(url, token, config_path).await,
             BindAction::Ls(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
 
+#[derive(serde::Serialize)]
+struct BindingAddBody<'a> {
+    node: &'a str,
+    wallet: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool: Option<&'a str>,
+}
+
 impl BindAddCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        if !config.nodes.contains_key(&self.node) {
-            anyhow::bail!("Node '{}' not found in configuration", self.node);
-        }
-
-        if !config.wallets.contains_key(&self.wallet) {
-            anyhow::bail!("Wallet '{}' not found in configuration", self.wallet);
-        }
-
-        if let Some(pool_name) = &self.pool {
-            if !config.pools.contains_key(pool_name) {
-                anyhow::bail!("Pool '{}' not found in configuration", pool_name);
-            }
-            for (node_name, binding) in &config.bindings {
-                if binding.pool.as_deref() == Some(pool_name) && *node_name != self.node {
-                    anyhow::bail!(
-                        "Pool '{}' is already bound to node '{}'. A pool can only be bound to one node.",
-                        pool_name,
-                        node_name
-                    );
-                }
-            }
-        }
-
-        let binding = NodeBinding {
-            wallet: self.wallet.clone(),
-            pool: self.pool.clone(),
-            enable: false,
-            status: Default::default(),
-        };
-        config.bindings.insert(self.node.clone(), binding);
-        save_config(&config, path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body =
+            BindingAddBody { node: &self.node, wallet: &self.wallet, pool: self.pool.as_deref() };
+        api_post(&base_url, "/v1/bindings", token, &body).await?;
 
         let pool_info = self.pool.as_deref().map(|p| format!(", pool='{}'", p)).unwrap_or_default();
         println!(
@@ -120,26 +102,14 @@ impl BindAddCmd {
 }
 
 impl BindRmCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        let binding = config
-            .bindings
-            .get(&self.node)
-            .ok_or_else(|| anyhow::anyhow!("Binding for node '{}' not found", self.node))?;
-
-        if binding.status != BindingStatus::Idle {
-            anyhow::bail!(
-                "Cannot remove binding for node '{}': status is '{}', must be 'idle'. \
-                 Disable elections first and wait for stake recovery to complete.",
-                self.node,
-                binding.status
-            );
-        }
-
-        config.bindings.remove(&self.node);
-        save_config(&config, path)?;
-
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_delete(&base_url, &format!("/v1/bindings/{}", self.node), token).await?;
         println!("\n{} Binding {} removed\n", "OK".green().bold(), self.node);
         Ok(())
     }
