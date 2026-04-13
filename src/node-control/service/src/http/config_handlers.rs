@@ -143,7 +143,7 @@ pub struct LogResponse {
 #[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct MasterWalletDto {
     pub address: Option<String>,
-    pub balance: Option<String>,
+    pub balance: Option<u64>,
     pub state: Option<String>,
     pub version: String,
     pub subwallet_id: u32,
@@ -543,7 +543,7 @@ pub async fn v1_master_wallet_handler(
                 (
                     Some(addr_str),
                     Some(info.account_state.to_string()),
-                    Some(common::ton_utils::display_tons(info.balance)),
+                    Some(info.balance),
                     pk,
                 )
             }

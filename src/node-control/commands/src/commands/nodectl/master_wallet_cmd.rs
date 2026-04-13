@@ -11,6 +11,7 @@ use crate::commands::nodectl::{
     utils::{api_get, resolve_service_url},
 };
 use colored::Colorize;
+use common::ton_utils::display_tons;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Master wallet info")]
@@ -48,7 +49,7 @@ impl MasterWalletCmd {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MasterWalletView {
     address: Option<String>,
-    balance: Option<String>,
+    balance: Option<u64>,
     state: Option<String>,
     version: String,
     subwallet_id: u32,
@@ -84,7 +85,7 @@ impl MasterWalletInfoCmd {
 fn print_master_wallet_table_from_view(view: &MasterWalletView) {
     println!("\n{} {}\n", "OK".green().bold(), "Master Wallet".green());
     println!("  {:<16} {}", "Address:".cyan().bold(), view.address.as_deref().unwrap_or("unknown"));
-    println!("  {:<16} {}", "Balance:".cyan().bold(), view.balance.as_deref().unwrap_or("unknown"));
+    println!("  {:<16} {}", "Balance:".cyan().bold(), view.balance.map(|b| display_tons(b)).unwrap_or("unknown".to_string()));
     println!("  {:<16} {}", "State:".cyan().bold(), view.state.as_deref().unwrap_or("unknown"));
     println!("  {:<16} {}", "Version:".cyan().bold(), view.version);
     println!("  {:<16} {}", "Subwallet ID:".cyan().bold(), view.subwallet_id);

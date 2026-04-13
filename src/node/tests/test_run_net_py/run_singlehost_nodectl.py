@@ -525,7 +525,7 @@ class Bootstrap:
                 if addr and addr not in ("unknown", "null"):
                     self.log.info(f"  Master wallet: {addr}")
                     return addr
-            except Exception:
+            except Exception as e:
                 self.log.warn(f"  Could not parse master wallet info: {e}; skipping")
                 pass
             time.sleep(3)
@@ -660,16 +660,15 @@ class Bootstrap:
     def phase13_validate_api(self) -> None:
         self._phase(13, "Validating REST API stakes...")
 
-        elections = self._fetch_nodectl_elections()
-        if elections is None:
-            return
         # wait until node_cnt stakes are accepted - time gap between stake accepted by elector and next nodectl tick
-        deadline = time.time() + 60
-        while len(elections.get("our_participants", [])) < self.cfg.node_cnt and time.time() < deadline:
-            time.sleep(5)
+        deadline = time.time() + 120
+        while time.time() < deadline:
             elections = self._fetch_nodectl_elections()
-            if elections is None:
-                return
+            if elections is not None:
+                # check if all node_cnt stakes are accepted
+                if all(p.get("stake_accepted") for p in elections.get("our_participants", [])):
+                    break
+            time.sleep(5)
 
         elector_map = self._fetch_elector_stake_map()
         if elector_map is None:
@@ -726,7 +725,7 @@ class Bootstrap:
     def _compare_stakes(self, elections: dict, elector_map: dict) -> None:
         mismatches, accepted = 0, 0
         if len(elections.get("our_participants", [])) != len(elector_map):
-            self.log._fail(f"  [ERROR] number of participants in nodectl API elections != number of participants in elector contract: {len(elections.get('our_participants', []))} != {len(elector_map)}")
+            self._fail(f"  [ERROR] number of participants in nodectl API elections != number of participants in elector contract: {len(elections.get('our_participants', []))} != {len(elector_map)}")
 
         for p in elections.get("our_participants", []):
             if not p.get("stake_accepted"):
@@ -754,6 +753,8 @@ class Bootstrap:
         self.log.info(f"  Participants with accepted stake: {accepted}, mismatches: {mismatches}")
         if accepted == 0:
             self._fail("No accepted stakes in nodectl API response")
+        if accepted < len(elector_map):
+            self._fail(f"Expected {len(elector_map)} accepted stakes but got {accepted}")
         if mismatches:
             self._fail("Stake mismatch between nodectl REST API and elector contract")
         self.log.info("  REST API stake comparison: OK")
@@ -845,12 +846,12 @@ def main() -> None:
         bootstrap.run()
     except BootstrapError:
         exit_code = 1   # error already logged inside _fail()
-    except Exception:
+    except Exception as e:
         import traceback
-        log.error(f"Unexpected error:\n{traceback.format_exc()}")
+        log.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
         exit_code = 1
     finally:
-        bootstrap.shutdown(force=(0))
+        bootstrap.shutdown(force=(exit_code != 0))
         log.close()
 
     sys.exit(exit_code)

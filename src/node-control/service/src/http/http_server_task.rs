@@ -868,7 +868,7 @@ impl utoipa::Modify for BearerAuthAddon {
         v1_validators_handler,
         v1_stake_strategy_handler,
         v1_task_elections_handler,
-        // It' won't compile without full names
+        // It won't compile without full names
         super::config_handlers::v1_nodes_handler,
         super::config_handlers::v1_wallets_handler,
         super::config_handlers::v1_pools_handler,
