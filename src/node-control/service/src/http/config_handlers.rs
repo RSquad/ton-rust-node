@@ -8,12 +8,9 @@
  */
 use super::http_server_task::{AppError, AppState};
 use crate::runtime_config::{RuntimeConfig, open_wallet};
-use common::{
-    app_config::{
-        BindingStatus, ElectionsConfig, KeyConfig, LogConfig, LogOutput, LogRotation, PoolConfig,
-        StakePolicy, WalletConfig,
-    },
-    ton_utils::display_tons,
+use common::app_config::{
+    BindingStatus, ElectionsConfig, KeyConfig, LogConfig, LogOutput, LogRotation, PoolConfig,
+    StakePolicy, WalletConfig,
 };
 use control_client::client_adnl::ControlClientAdnl;
 use std::{collections::HashMap, str::FromStr};
@@ -48,7 +45,7 @@ pub struct WalletDto {
     pub secret: String,
     pub version: String,
     pub state: Option<String>,
-    pub balance: Option<String>,
+    pub balance: Option<u64>,
     pub address: Option<String>,
 }
 
@@ -64,7 +61,7 @@ pub struct WalletsResponse {
 pub struct PoolDto {
     pub name: String,
     pub kind: String,
-    pub balance: Option<String>,
+    pub balance: Option<u64>,
     pub address: Option<String>,
     pub owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,11 +295,9 @@ pub async fn v1_wallets_handler(
             let addr = wallet.address();
             let addr_str = addr.to_string();
             match rpc_client.get_wallet_information(&addr).await {
-                Ok(info) => (
-                    Some(addr_str),
-                    Some(info.account_state.to_string()),
-                    Some(common::ton_utils::display_tons(info.balance)),
-                ),
+                Ok(info) => {
+                    (Some(addr_str), Some(info.account_state.to_string()), Some(info.balance))
+                }
                 Err(_) => (Some(addr_str), None, None),
             }
         } else {
@@ -344,11 +339,23 @@ pub async fn v1_pools_handler(
     for (name, pool_cfg) in &config.pools {
         let (kind, address, balance, owner, addresses, validator_share) = match pool_cfg {
             PoolConfig::SNP { address, owner } => {
-                // Pool is bound to a node — use pre-loaded instance
-                let (addr, bal) = if let Some(pool) = cached_pools.get(name) {
-                    let addr = pool.address().to_string();
-                    let bal = pool.balance().await.ok().map(|b| display_tons(b));
-                    (Some(addr), bal)
+                // If Pool is bound to a node — use pre-loaded pool instance.
+                //First, get the name of the node that is bound to the pool.
+                let bound_node = config
+                    .bindings
+                    .iter()
+                    .find(|(_, b)| b.pool == Some(name.clone()))
+                    .map(|(node, _)| node.clone());
+                let (addr, bal) = if let Some(n) = bound_node {
+                    // Pool is bound to a node - get the pool instance from the cached pools.
+                    if let Some(pool) = cached_pools.get(&n) {
+                        let addr = pool.address().to_string();
+                        let bal = pool.balance().await.ok();
+                        (Some(addr), bal)
+                    } else {
+                        // For some reason, the pool is not in the cached pools - return None.
+                        (None, None)
+                    }
                 // Pool has an explicit address in config — try to fetch balance directly
                 } else if let Some(a) = address {
                     match MsgAddressInt::from_str(a) {
@@ -357,7 +364,7 @@ pub async fn v1_pools_handler(
                                 .get_address_information(&parsed)
                                 .await
                                 .ok()
-                                .map(|info| display_tons(info.balance));
+                                .map(|info| info.balance);
                             (Some(a.clone()), bal)
                         }
                         Err(_) => (Some(a.clone()), None),

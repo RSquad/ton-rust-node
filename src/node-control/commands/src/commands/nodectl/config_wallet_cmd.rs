@@ -194,7 +194,7 @@ struct WalletView {
     secret: String,
     version: String,
     state: Option<String>,
-    balance: Option<String>,
+    balance: Option<u64>,
     address: Option<String>,
 }
 
@@ -249,9 +249,9 @@ fn print_wallets_table_from_views(views: &[WalletView]) {
             v.name,
             v.secret,
             v.version,
-            v.state.as_deref().unwrap_or("-"),
-            v.balance.as_deref().unwrap_or("-"),
-            v.address.as_deref().unwrap_or("-"),
+            v.state.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red()),
+            v.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red()),
+            v.address.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red()),
         );
     }
     println!();

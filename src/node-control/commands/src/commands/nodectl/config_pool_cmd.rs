@@ -10,10 +10,13 @@ use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{api_get, require_config, resolve_service_url, save_config},
 };
-use colored::Colorize;
-use common::app_config::{AppConfig, PoolConfig};
+use colored::{ColoredString, Colorize};
+use common::{
+    app_config::{AppConfig, PoolConfig},
+    ton_utils::display_tons,
+};
 use std::{path::Path, str::FromStr};
-use ton_block::MsgAddressInt;
+use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt};
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage pools in the configuration")]
@@ -125,7 +128,7 @@ impl PoolAddCmd {
 struct PoolView {
     name: String,
     kind: String,
-    balance: Option<String>,
+    balance: Option<u64>,
     address: Option<String>,
     owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,6 +170,16 @@ fn print_pools_json(views: &[PoolView]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn display_ton_address(addr: Option<&str>) -> ColoredString {
+    addr.map(|s| {
+        MsgAddressInt::from_str(s)
+            .and_then(|a| a.to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE))
+            .unwrap_or_else(|_| s.to_string())
+    })
+    .map(|s| s.white())
+    .unwrap_or_else(|| "-".red())
+}
+
 fn print_pools_table(views: &[PoolView]) {
     println!("\n{} {} ({})\n", "OK".green().bold(), "Pools:".green(), views.len());
     println!(
@@ -182,12 +195,10 @@ fn print_pools_table(views: &[PoolView]) {
     for v in views {
         match v.kind.as_str() {
             "SNP" => {
-                let display_addr =
-                    v.address.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
-                let display_owner =
-                    v.owner.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
+                let display_addr = display_ton_address(v.address.as_deref());
+                let display_owner = display_ton_address(v.owner.as_deref());
                 let display_balance =
-                    v.balance.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
+                    v.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
 
                 println!(
                     "  {:<15} {:<6} {:<14} {:<50} {}",
