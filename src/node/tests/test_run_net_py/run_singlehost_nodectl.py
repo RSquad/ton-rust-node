@@ -9,14 +9,17 @@ Phases:
   3.  Start singlehost network (--elections --control-client-public-key <key>),
       stop, restart all nodes once
   4.  Wait for blockchain progress
-  5.  Complete nodectl config via CLI (import per-node keys, wallets, nodes,
-      tick intervals, pools, bindings, enable elections)
-  6.  Top up master wallet
+  5.  Wait for HTTP API to become available
+  6.  Generate all vault secrets (keys) before the service starts
   7.  Start nodectl service in background
-  8.  Wait for validator wallets/pools to open, top them up
-  9.  Wait for election participants
-  10. Validate REST API: compare nodectl stake data with on-chain elector data
-  11. Summary and exit assertions
+  8.  Set up auth, complete nodectl config via CLI (wallets, nodes,
+      tick intervals, pools, bindings, enable elections)
+  9.  Install bun dependencies
+  10. Top up master wallet
+  11. Wait for validator wallets/pools to open, top them up
+  12. Wait for election participants
+  13. Validate REST API: compare nodectl stake data with on-chain elector data
+  14. Summary and exit assertions
 
 Required env var:
   MASTER_WALLET_KEY  — 64-byte hex private key of the funded zerostate faucet wallet
@@ -47,7 +50,7 @@ from typing import Optional
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ELECTOR_ADDR   = "-1:3333333333333333333333333333333333333333333333333333333333333333"
-TOTAL_PHASES   = 11
+TOTAL_PHASES   = 14
 WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2"]
 
 
@@ -168,17 +171,19 @@ class Bootstrap:
         pub_key = self.phase2_generate_config()
         self.phase3_start_network(pub_key)
         self.phase4_wait_progress()
-        master_addr = self.phase5_complete_config()
-        self._ensure_bun_deps()
-        self.phase6_topup_master(master_addr)
+        self.phase5_wait_http_api()
+        self.phase6_generate_keys()
         self.phase7_start_service()
-        wallet_addrs, pool_addrs = self.phase8_wait_and_topup()
-        last_count = self.phase9_wait_participants()
+        master_addr = self.phase8_complete_config()
+        self.phase9_ensure_bun_deps()
+        self.phase10_topup_master(master_addr)
+        wallet_addrs, pool_addrs = self.phase11_wait_and_topup()
+        last_count = self.phase12_wait_participants()
         if last_count > 0:
-            self.phase10_validate_api()
+            self.phase13_validate_api()
         else:
             self.log.warn("Skipping API validation — no participants found")
-        self.phase11_summary(master_addr, wallet_addrs, pool_addrs, last_count)
+        self.phase14_summary(master_addr, wallet_addrs, pool_addrs, last_count)
 
     def shutdown(self, *, force: bool = False) -> None:
         """Terminate the nodectl service and network nodes if needed.
@@ -297,6 +302,29 @@ class Bootstrap:
                        cwd=self.paths.load_net_dir, check=True,
                        stdin=subprocess.DEVNULL, timeout=30)
 
+    def _setup_auth(self) -> None:
+        """Create API user and obtain JWT token."""
+        password = secrets.token_hex(16)
+        result = subprocess.run(
+            [str(self.paths.nodectl_bin), "auth", "add",
+             "--username", "admin", "--role", "operator", "--password-stdin"],
+            input=password, text=True, capture_output=True, timeout=15,
+        )
+        if result.returncode != 0:
+            self._fail(f"auth add failed (exit {result.returncode}): {result.stderr.strip()}")
+        self.log.info("  Created auth user 'admin' (operator)")
+
+        # Service reloads config from disk every 10s — wait for it to pick up the new user
+        time.sleep(12)
+
+        result = subprocess.run(
+            [str(self.paths.nodectl_bin), "api", "login", "admin", "--password-stdin"],
+            input=password, capture_output=True, text=True, check=True, timeout=15,
+        )
+        os.environ["NODECTL_API_TOKEN"] = json.loads(result.stdout)["token"]
+        self.log.info("  Logged in and exported NODECTL_API_TOKEN")
+        self.log.info("  NODECTL_API_TOKEN=" + os.environ["NODECTL_API_TOKEN"])
+
     def _node_console(self, i: int) -> dict:
         path = self.paths.tmp_dir / f"node_{i}" / "console.json"
         return json.loads(path.read_text())
@@ -346,12 +374,6 @@ class Bootstrap:
         self._nctl("config", "generate", "--output", str(self.paths.nodectl_config), "--force")
         self.log.info("  config ton-http-api set...")
         self._nctl("config", "ton-http-api", "set", "--url", self.cfg.http_api_url)
-
-        # Patch global tick_interval — no CLI command exists for this field
-        cfg_json = json.loads(self.paths.nodectl_config.read_text())
-        cfg_json["tick_interval"] = 20
-        self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
-        self.log.info("  global tick_interval → 20")
 
         # Create the key used by nodes 3+ (nodes 1-2 get per-node keys in phase 5)
         self.log.info("  key add control-client-secret...")
@@ -427,15 +449,33 @@ class Bootstrap:
             self._fail(f"Masterchain seqno not growing ({seq_a} → {seq_b})")
         self.log.info(f"  seqno: {seq_a} → {seq_b}")
 
-    # ── Phase 5: Complete config ──────────────────────────────────────────────
+    # ── Phase 5: Wait for HTTP API ───────────────────────────────────────────
 
-    def phase5_complete_config(self) -> str:
-        """Complete nodectl config via CLI. Returns the master wallet address."""
-        self._phase(5, "Completing nodectl config via CLI...")
-
-        self._add_keys()
-        self._add_wallets()
+    def phase5_wait_http_api(self) -> None:
+        self._phase(5, "Waiting for HTTP API...")
         self._wait_http_api()
+
+    # ── Phase 6: Generate vault secrets ─────────────────────────────────────
+
+    def phase6_generate_keys(self) -> None:
+        self._phase(6, "Generating vault secrets...")
+        self._add_keys()
+
+    # ── Phase 8: Auth + complete config ──────────────────────────────────────
+
+    def phase8_complete_config(self) -> str:
+        """Set up auth, complete nodectl config via CLI. Returns the master wallet address."""
+        self._phase(8, "Setting up auth and completing nodectl config...")
+
+        self._setup_auth()
+
+        # Patch global tick_interval — no CLI command exists for this field
+        cfg_json = json.loads(self.paths.nodectl_config.read_text())
+        cfg_json["tick_interval"] = 20
+        self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
+        self.log.info("  global tick_interval → 20")
+
+        self._add_wallets()
         master_addr = self._resolve_master_wallet()
         self._add_nodes()
         self._configure_elections(master_addr)
@@ -460,6 +500,9 @@ class Bootstrap:
             self._nctl("config", "wallet", "add",
                        "-n", f"wallet{i}", "-s", f"wallet{i}-secret", "-v", version)
             self.log.info(f"    wallet{i} → {version}")
+        # wait for the config hot-reload
+        time.sleep(10)
+        self._nctl("config", "wallet", "ls")
 
     def _wait_http_api(self, timeout: int = 120) -> None:
         self.log.info(f"  Waiting for HTTP API ({self.cfg.http_api_url}, timeout {timeout}s)...")
@@ -483,6 +526,7 @@ class Bootstrap:
                     self.log.info(f"  Master wallet: {addr}")
                     return addr
             except Exception:
+                self.log.warn(f"  Could not parse master wallet info: {e}; skipping")
                 pass
             time.sleep(3)
         self._fail("Could not resolve master wallet address")
@@ -498,6 +542,8 @@ class Bootstrap:
                        "-e", console["config"]["server_address"],
                        "-p", console["config"]["server_key"]["pub_key"],
                        "-s", secret)
+        # wait for the config hot-reload
+        time.sleep(10)
         self._nctl("config", "node", "ls")
 
     def _configure_elections(self, master_addr: str) -> None:
@@ -516,13 +562,10 @@ class Bootstrap:
         self.log.info("  Enabling elections...")
         self._nctl("config", "elections", "enable",
                    *[f"node{i}" for i in range(1, self.cfg.node_cnt + 1)])
+        
+        # wait for the config hot-reload
+        time.sleep(10)
         self._nctl("config", "bind", "ls")
-
-    # ── Phase 6: Top up master wallet ─────────────────────────────────────────
-
-    def phase6_topup_master(self, master_addr: str) -> None:
-        self._phase(6, f"Topping up master wallet ({self.cfg.master_topup} TON)...")
-        self._bun_topup(master_addr, self.cfg.master_topup)
 
     # ── Phase 7: Start nodectl service ────────────────────────────────────────
 
@@ -546,11 +589,23 @@ class Bootstrap:
         self.log.info(f"  nodectl service running (pid {self._proc.pid})")
         self.log.info(f"  log: {self._nodectl_log}")
 
-    # ── Phase 8: Wait for wallets/pools, top them up ──────────────────────────
+    # ── Phase 9: Ensure bun deps ────────────────────────────────────────────
 
-    def phase8_wait_and_topup(self) -> tuple:
+    def phase9_ensure_bun_deps(self) -> None:
+        self._phase(9, "Installing bun dependencies...")
+        self._ensure_bun_deps()
+
+    # ── Phase 10: Top up master wallet ────────────────────────────────────────
+
+    def phase10_topup_master(self, master_addr: str) -> None:
+        self._phase(10, f"Topping up master wallet ({self.cfg.master_topup} TON)...")
+        self._bun_topup(master_addr, self.cfg.master_topup)
+
+    # ── Phase 11: Wait for wallets/pools, top them up ────────────────────────
+
+    def phase11_wait_and_topup(self) -> tuple:
         """Returns (wallet_addrs, pool_addrs) after opening and topping up."""
-        self._phase(8, "Waiting for master wallet to open (up to 90s)...")
+        self._phase(11, "Waiting for master wallet to open (up to 90s)...")
         if not self._wait_log("master wallet opened: address=", 90):
             self.log.error("No 'master wallet opened' after 90s")
             print(self._log_tail(120), file=sys.stderr)
@@ -581,52 +636,40 @@ class Bootstrap:
 
         return wallet_addrs, pool_addrs
 
-    # ── Phase 9: Wait for election participants ────────────────────────────────
+    # ── Phase 12: Wait for election participants ──────────────────────────────
 
-    def phase9_wait_participants(self) -> int:
+    def phase12_wait_participants(self) -> int:
         expected = self.cfg.node_cnt
-        self._phase(9, f"Waiting for {expected} election participants (up to {self.cfg.participants_wait}s)...")
+        self._phase(12, f"Waiting for {expected} election participants (up to {self.cfg.participants_wait}s)...")
         deadline = time.time() + self.cfg.participants_wait
         while time.time() < deadline:
             cnt = self._participant_count()
             if cnt >= expected:
+                self.log.info(f"  participants: {cnt}/{expected} - returning")
                 return cnt
-            self.log.info(f"  participants: {cnt}/{expected}")
+            self.log.info(f"  participants: {cnt}/{expected} - sleeping")
             time.sleep(5)
         cnt = self._participant_count()
+        self.log.info(f"  participants: {cnt}/{expected} - deadline reached")
         if cnt < expected:
             self._fail(f"Expected {expected} participants but got {cnt} after {self.cfg.participants_wait}s")
         return cnt
 
-    # ── Phase 10: Auth + REST API stake validation ──────────────────────────
+    # ── Phase 13: REST API stake validation ──────────────────────────────────
 
-    def phase10_validate_api(self) -> None:
-        self._phase(10, "Setting up auth and validating REST API stakes...")
-
-        # Create API user and obtain JWT token
-        password = secrets.token_hex(16)
-        result = subprocess.run(
-            [str(self.paths.nodectl_bin), "auth", "add",
-             "--username", "admin", "--role", "operator", "--password-stdin"],
-            input=password, text=True, capture_output=True, timeout=15,
-        )
-        if result.returncode != 0:
-            self._fail(f"auth add failed (exit {result.returncode}): {result.stderr.strip()}")
-        self.log.info("  Created auth user 'admin' (operator)")
-
-        # Service reloads config from disk every 10s — wait for it to pick up the new user
-        time.sleep(12)
-
-        result = subprocess.run(
-            [str(self.paths.nodectl_bin), "api", "login", "admin", "--password-stdin"],
-            input=password, capture_output=True, text=True, check=True, timeout=15,
-        )
-        os.environ["NODECTL_API_TOKEN"] = json.loads(result.stdout)["token"]
-        self.log.info("  Logged in and exported NODECTL_API_TOKEN")
+    def phase13_validate_api(self) -> None:
+        self._phase(13, "Validating REST API stakes...")
 
         elections = self._fetch_nodectl_elections()
         if elections is None:
             return
+        # wait until node_cnt stakes are accepted - time gap between stake accepted by elector and next nodectl tick
+        deadline = time.time() + 60
+        while len(elections.get("our_participants", [])) < self.cfg.node_cnt and time.time() < deadline:
+            time.sleep(5)
+            elections = self._fetch_nodectl_elections()
+            if elections is None:
+                return
 
         elector_map = self._fetch_elector_stake_map()
         if elector_map is None:
@@ -682,6 +725,9 @@ class Bootstrap:
 
     def _compare_stakes(self, elections: dict, elector_map: dict) -> None:
         mismatches, accepted = 0, 0
+        if len(elections.get("our_participants", [])) != len(elector_map):
+            self.log._fail(f"  [ERROR] number of participants in nodectl API elections != number of participants in elector contract: {len(elections.get('our_participants', []))} != {len(elector_map)}")
+
         for p in elections.get("our_participants", []):
             if not p.get("stake_accepted"):
                 continue
@@ -707,18 +753,17 @@ class Bootstrap:
 
         self.log.info(f"  Participants with accepted stake: {accepted}, mismatches: {mismatches}")
         if accepted == 0:
-            self.log.warn("  No accepted stakes in nodectl API response; skipping comparison")
-            return
+            self._fail("No accepted stakes in nodectl API response")
         if mismatches:
             self._fail("Stake mismatch between nodectl REST API and elector contract")
         self.log.info("  REST API stake comparison: OK")
 
-    # ── Phase 11: Summary ─────────────────────────────────────────────────────
+    # ── Phase 14: Summary ─────────────────────────────────────────────────────
 
-    def phase11_summary(
+    def phase14_summary(
         self, master_addr: str, wallet_addrs: list, pool_addrs: list, last_count: int
     ) -> None:
-        self._phase(11, "Summary")
+        self._phase(14, "Summary")
         rows = [
             ("nodectl pid",    str(self._proc.pid) if self._proc else "N/A"),
             ("nodectl log",    str(self._nodectl_log)),
@@ -805,7 +850,7 @@ def main() -> None:
         log.error(f"Unexpected error:\n{traceback.format_exc()}")
         exit_code = 1
     finally:
-        bootstrap.shutdown(force=(exit_code != 0))
+        bootstrap.shutdown(force=(0))
         log.close()
 
     sys.exit(exit_code)
