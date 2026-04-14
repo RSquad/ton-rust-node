@@ -12,13 +12,13 @@ use adnl::common::Timeouts;
 use common::{
     TonWalletVersion,
     app_config::{
-        AdnlConfig, BindingStatus, ElectionsConfig, KeyConfig, LogConfig, LogOutput, LogRotation,
-        NodeBinding, PoolConfig, StakePolicy, TimeoutVariant, WalletConfig,
+        AdnlConfig, BindingStatus, ElectionsConfig, EndpointEntry, KeyConfig, LogConfig, LogOutput,
+        LogRotation, NodeBinding, PoolConfig, StakePolicy, TimeoutVariant, WalletConfig,
     },
-    ton_utils::normalize_ton_address,
+    ton_utils::{extract_max_factor, normalize_ton_address},
 };
 use control_client::client_adnl::ControlClientAdnl;
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 use ton_block::MsgAddressInt;
 
 /// `type_id` for ADNL public keys (Ed25519).
@@ -121,6 +121,7 @@ pub struct ElectionsSettingsDto {
     pub policy_overrides: HashMap<String, StakePolicy>,
     pub max_factor: f32,
     pub tick_interval: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingElectionStatusDto>,
 }
 
@@ -216,6 +217,65 @@ pub struct EntityRefDto {
 pub struct EntityRefResponse {
     pub ok: bool,
     pub result: EntityRefDto,
+}
+
+// --- Generic OK response (no payload) ---
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct OkResponse {
+    pub ok: bool,
+}
+
+// --- Elections settings mutation ---
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ElectionsSettingsUpdateRequest {
+    /// Stake policy to set. Ignored when `reset` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<StakePolicy>,
+    /// Target node for per-node policy override. Omit to set the default policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Remove the per-node override (requires `node`). Other fields are still applied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset: bool,
+    /// Elections tick interval in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_interval: Option<u64>,
+    /// Max stake factor (validated against network param 17).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_factor: Option<f32>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct TonHttpApiRequest {
+    pub urls: Vec<String>,
+    pub api_key: Option<String>,
+    /// When true, appends to existing endpoints (skipping duplicates).
+    /// When false (default), replaces all endpoints.
+    #[serde(default)]
+    pub append: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct TonHttpApiResult {
+    pub endpoints: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct TonHttpApiResponse {
+    pub ok: bool,
+    pub result: TonHttpApiResult,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct LogSetRequest {
+    pub level: Option<String>,
+    pub path: Option<String>,
+    pub rotation: Option<LogRotation>,
+    pub output: Option<LogOutput>,
+    pub max_size_mb: Option<u64>,
+    pub max_files: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,4 +1081,256 @@ pub async fn v1_bindings_rm_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: node } }))
+}
+
+// ---------------------------------------------------------------------------
+// Settings mutation handlers
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/v1/elections/settings",
+    request_body = ElectionsSettingsUpdateRequest,
+    responses(
+        (status = 200, description = "Elections settings updated", body = ElectionsSettingsResponse),
+        (status = 400, description = "Invalid request or elections not configured", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_elections_settings_update_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<ElectionsSettingsUpdateRequest>,
+) -> Result<axum::Json<ElectionsSettingsResponse>, AppError> {
+    let req = req.0;
+
+    if req.policy.is_none() && !req.reset && req.tick_interval.is_none() && req.max_factor.is_none()
+    {
+        return Err(AppError::bad_request("at least one setting is required"));
+    }
+
+    let cfg = state.runtime_cfg.get();
+    let elections = cfg
+        .elections
+        .as_ref()
+        .ok_or_else(|| AppError::bad_request("elections are not configured"))?;
+
+    // --- Validate max_factor against network param 17 (best-effort) ---
+    if let Some(value) = req.max_factor {
+        let network_limit = state
+            .runtime_cfg
+            .rpc_client()
+            .get_config_param(17)
+            .await
+            .ok()
+            .and_then(|p| extract_max_factor(p).ok());
+
+        let probe = ElectionsConfig { max_factor: value, ..elections.clone() };
+        probe.validate(network_limit).map_err(|e| AppError::bad_request(e.to_string()))?;
+    }
+
+    // --- Validate policy ---
+    if let Some(ref policy) = req.policy {
+        if !req.reset && matches!(policy, StakePolicy::Fixed(0)) {
+            return Err(AppError::bad_request("fixed stake must be > 0"));
+        }
+    }
+    if req.reset && req.node.is_none() {
+        return Err(AppError::bad_request("reset requires 'node' to be set"));
+    }
+    drop(cfg);
+
+    // --- Apply all changes in a single update ---
+    let policy = req.policy;
+    let node = req.node;
+    let reset = req.reset;
+    let tick_interval = req.tick_interval;
+    let max_factor = req.max_factor;
+
+    state
+        .runtime_cfg
+        .update_with(|cfg| {
+            if let Some(elections) = &mut cfg.elections {
+                // Stake policy
+                if reset {
+                    if let Some(ref node_id) = node {
+                        elections.policy_overrides.remove(node_id);
+                    }
+                } else if let Some(policy) = policy {
+                    if let Some(ref node_id) = node {
+                        elections.policy_overrides.insert(node_id.clone(), policy);
+                    } else {
+                        elections.policy = policy;
+                    }
+                }
+
+                if let Some(seconds) = tick_interval {
+                    elections.tick_interval = seconds;
+                }
+                if let Some(value) = max_factor {
+                    elections.max_factor = value;
+                }
+            }
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
+
+    // Restart elections task so changes take effect immediately.
+    let task = state.elections_task.clone();
+    tokio::spawn(async move {
+        let _ = task.restart().await;
+    });
+
+    // Return updated settings (without bindings — use GET for the full view).
+    let config = state.runtime_cfg.get();
+    let elections = config.elections.as_ref().expect("validated above");
+    let dto = ElectionsSettingsDto {
+        stake_policy: elections.policy.clone(),
+        policy_overrides: elections.policy_overrides.clone(),
+        max_factor: elections.max_factor,
+        tick_interval: elections.tick_interval,
+        bindings: vec![],
+    };
+
+    Ok(axum::Json(ElectionsSettingsResponse { ok: true, result: dto }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/ton-http-api",
+    request_body = TonHttpApiRequest,
+    responses(
+        (status = 200, description = "TON HTTP API config updated", body = TonHttpApiResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_ton_http_api_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<TonHttpApiRequest>,
+) -> Result<axum::Json<TonHttpApiResponse>, AppError> {
+    let req = req.0;
+    let urls: Vec<String> =
+        req.urls.into_iter().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+    if urls.is_empty() {
+        return Err(AppError::bad_request("at least one non-empty url is required"));
+    }
+
+    let api_key = req.api_key;
+    let append = req.append;
+    state
+        .runtime_cfg
+        .update_with(|cfg| {
+            if append {
+                let existing = cfg.ton_http_api.endpoints();
+                for url in &urls {
+                    if !existing.iter().any(|e| e == url) {
+                        let entry = match &api_key {
+                            Some(key) => {
+                                EndpointEntry::WithKey { url: url.clone(), api_key: key.clone() }
+                            }
+                            None => EndpointEntry::Url(url.clone()),
+                        };
+                        cfg.ton_http_api.urls.push(entry);
+                    }
+                }
+            } else {
+                cfg.ton_http_api.urls = urls.into_iter().map(|u| EndpointEntry::Url(u)).collect();
+                cfg.ton_http_api.api_key = api_key;
+            }
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
+
+    let endpoints = state.runtime_cfg.get().ton_http_api.endpoints();
+    Ok(axum::Json(TonHttpApiResponse { ok: true, result: TonHttpApiResult { endpoints } }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/log",
+    request_body = LogSetRequest,
+    responses(
+        (status = 200, description = "Log settings updated", body = LogResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_log_set_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<LogSetRequest>,
+) -> Result<axum::Json<LogResponse>, AppError> {
+    let req = req.0;
+    if req.level.is_none()
+        && req.path.is_none()
+        && req.rotation.is_none()
+        && req.output.is_none()
+        && req.max_size_mb.is_none()
+        && req.max_files.is_none()
+    {
+        return Err(AppError::bad_request("at least one setting is required"));
+    }
+
+    let level = req
+        .level
+        .as_deref()
+        .map(|l| {
+            tracing::Level::from_str(l)
+                .map_err(|_| AppError::bad_request(format!("invalid log level: '{l}'")))
+        })
+        .transpose()?;
+
+    // Pre-validate: file/all output requires a path (check against current + incoming)
+    if let Some(ref output) = req.output {
+        if matches!(output, LogOutput::File | LogOutput::All) {
+            let has_path = req.path.is_some()
+                || state.runtime_cfg.get().log.as_ref().and_then(|l| l.path.as_ref()).is_some();
+            if !has_path {
+                let mode = match output {
+                    LogOutput::File => "file",
+                    LogOutput::All => "all",
+                    _ => unreachable!(),
+                };
+                return Err(AppError::bad_request(format!(
+                    "output mode '{mode}' requires a log file path"
+                )));
+            }
+        }
+    }
+
+    state
+        .runtime_cfg
+        .update_with(|cfg| {
+            let log = cfg.log.get_or_insert_with(LogConfig::default);
+            if let Some(l) = level {
+                log.level = l;
+            }
+            if let Some(p) = &req.path {
+                log.path = Some(PathBuf::from(p));
+            }
+            if let Some(r) = req.rotation {
+                log.rotation = r;
+            }
+            if let Some(o) = req.output {
+                log.output = o;
+            }
+            if let Some(s) = req.max_size_mb {
+                log.max_size_mb = s;
+            }
+            if let Some(f) = req.max_files {
+                log.max_files = f;
+            }
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
+
+    let config = state.runtime_cfg.get();
+    let log = config.log.as_ref().cloned().unwrap_or_default();
+    let dto = log_config_to_dto(&log);
+    Ok(axum::Json(LogResponse { ok: true, result: dto }))
 }

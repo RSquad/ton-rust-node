@@ -6,10 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::utils::save_config;
+use crate::commands::nodectl::utils::{api_post, resolve_service_url};
 use colored::Colorize;
-use common::app_config::{AppConfig, EndpointEntry};
-use std::path::Path;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage ton-http-api configuration")]
@@ -47,66 +45,71 @@ pub struct TonHttpApiAddCmd {
 }
 
 impl TonHttpApiCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
         match &self.action {
-            TonHttpApiAction::Set(cmd) => cmd.run(path).await,
-            TonHttpApiAction::Add(cmd) => cmd.run(path).await,
+            TonHttpApiAction::Set(cmd) => cmd.run(url, token, config_path).await,
+            TonHttpApiAction::Add(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
 
+/// Shared body for `POST /v1/ton-http-api`.
+#[derive(serde::Serialize)]
+struct TonHttpApiBody<'a> {
+    urls: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    append: bool,
+}
+
+fn print_endpoints(resp: &str) -> anyhow::Result<()> {
+    let parsed: serde_json::Value = serde_json::from_str(resp)?;
+    let endpoints = parsed["result"]["endpoints"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    println!("\n{} ton-http-api endpoints: [{}]\n", "OK".green().bold(), endpoints);
+    Ok(())
+}
+
 impl TonHttpApiSetCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-        let url = self.url.trim().to_string();
-        if url.is_empty() {
-            anyhow::bail!("--url value must not be empty");
-        }
-
-        config.ton_http_api.urls = vec![EndpointEntry::Url(url)];
-        config.ton_http_api.api_key = self.api_key.clone();
-        save_config(&config, path)?;
-
-        let api_key_info =
-            self.api_key.as_deref().map(|_| ", api_key=***").unwrap_or(", api_key=none");
-        println!(
-            "\n{} ton-http-api set: url='{}'{}\n",
-            "OK".green().bold(),
-            config.ton_http_api.urls[0].url(),
-            api_key_info
-        );
-        Ok(())
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = TonHttpApiBody {
+            urls: vec![self.url.as_str()],
+            api_key: self.api_key.as_deref(),
+            append: false,
+        };
+        let resp = api_post(&base_url, "/v1/ton-http-api", token, &body).await?;
+        print_endpoints(&resp)
     }
 }
 
 impl TonHttpApiAddCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-        let new_urls: Vec<String> =
-            self.urls.iter().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
-
-        if new_urls.is_empty() {
-            anyhow::bail!("At least one non-empty --url value is required");
-        }
-
-        let mut existing = config.ton_http_api.endpoints();
-        for url in &new_urls {
-            if !existing.iter().any(|e| e == url) {
-                let entry = match &self.api_key {
-                    Some(key) => EndpointEntry::WithKey { url: url.clone(), api_key: key.clone() },
-                    None => EndpointEntry::Url(url.clone()),
-                };
-                config.ton_http_api.urls.push(entry);
-                existing.push(url.clone());
-            }
-        }
-        save_config(&config, path)?;
-
-        println!(
-            "\n{} ton-http-api endpoints: [{}]\n",
-            "OK".green().bold(),
-            config.ton_http_api.endpoints().join(", "),
-        );
-        Ok(())
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = TonHttpApiBody {
+            urls: self.urls.iter().map(|s| s.as_str()).collect(),
+            api_key: self.api_key.as_deref(),
+            append: true,
+        };
+        let resp = api_post(&base_url, "/v1/ton-http-api", token, &body).await?;
+        print_endpoints(&resp)
     }
 }

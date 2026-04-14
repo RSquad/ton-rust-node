@@ -372,8 +372,6 @@ class Bootstrap:
 
         self.log.info("  config generate...")
         self._nctl("config", "generate", "--output", str(self.paths.nodectl_config), "--force")
-        self.log.info("  config ton-http-api set...")
-        self._nctl("config", "ton-http-api", "set", "--url", self.cfg.http_api_url)
 
         # Create the key used by nodes 3+ (nodes 1-2 get per-node keys in phase 5)
         self.log.info("  key add control-client-secret...")
@@ -468,6 +466,11 @@ class Bootstrap:
         self._phase(8, "Setting up auth and completing nodectl config...")
 
         self._setup_auth()
+
+        # Set ton-http-api URL via REST API (moved from phase 2; service starts
+        # with the default URL which matches the CI default).
+        self.log.info("  config ton-http-api set...")
+        self._nctl("config", "ton-http-api", "set", "--url", self.cfg.http_api_url)
 
         # Patch global tick_interval — no CLI command exists for this field
         cfg_json = json.loads(self.paths.nodectl_config.read_text())

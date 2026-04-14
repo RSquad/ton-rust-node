@@ -330,6 +330,16 @@ where
     Ok(body)
 }
 
+/// Best-effort check that returns `true` only if we could reach the local vault
+/// AND the secret is definitely absent. Any other outcome (no vault, lookup
+/// error) is treated as "unknown" and produces no warning.
+pub async fn vault_secret_missing(secret_name: &str) -> bool {
+    match SecretVaultBuilder::from_env().await {
+        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

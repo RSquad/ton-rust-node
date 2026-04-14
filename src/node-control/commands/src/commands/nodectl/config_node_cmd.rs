@@ -8,10 +8,12 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_delete, api_get, api_post, resolve_service_url, warn_missing_secret},
+    utils::{
+        api_delete, api_get, api_post, resolve_service_url, vault_secret_missing,
+        warn_missing_secret,
+    },
 };
 use colored::Colorize;
-use secrets_vault::vault_builder::SecretVaultBuilder;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage nodes in the configuration")]
@@ -114,16 +116,6 @@ impl NodeAddCmd {
         }
         println!("\n{} Node '{}' added\n", "OK".green().bold(), self.name);
         Ok(())
-    }
-}
-
-/// Best-effort check that returns `true` only if we could reach the local vault
-/// AND the secret is definitely absent. Any other outcome (no vault, lookup
-/// error) is treated as "unknown" and produces no warning.
-async fn vault_secret_missing(secret_name: &str) -> bool {
-    match SecretVaultBuilder::from_env().await {
-        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
-        Err(_) => false,
     }
 }
 
