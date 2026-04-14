@@ -137,7 +137,7 @@ impl UserStore {
                 revoked_after: None,
             });
         }))?;
-        self.runtime_cfg.save_to_file();
+        self.runtime_cfg.save_to_file()?;
 
         Ok(())
     }
@@ -168,7 +168,7 @@ impl UserStore {
                 auth.users.retain(|u| u.username != user_name);
             }
         }))?;
-        self.runtime_cfg.save_to_file();
+        self.runtime_cfg.save_to_file()?;
 
         Ok(())
     }
@@ -400,8 +400,8 @@ mod tests {
             Ok(())
         }
 
-        fn save_to_file(&self) {
-            // no-op in tests
+        fn save_to_file(&self) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 

@@ -81,7 +81,7 @@ pub trait RuntimeConfig: Send + Sync {
     fn rpc_client(&self) -> Arc<ClientJsonRpc>;
     fn vault(&self) -> Option<Arc<SecretVault>>;
     fn update_config(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()>;
-    fn save_to_file(&self);
+    fn save_to_file(&self) -> anyhow::Result<()>;
 }
 
 impl RuntimeConfigStore {
@@ -281,28 +281,23 @@ impl RuntimeConfigStore {
 
     /// Save the current in-memory config to the config file if it has changed.
     /// Only saves the `bindings` `enable` field and `elections` section.
-    pub fn save_to_file(&self) {
+    pub fn save_to_file(&self) -> anyhow::Result<()> {
         let path = Path::new(&self.config_path);
         let config = self.get();
-        match serde_json::to_string_pretty(&*config) {
-            Ok(json) => {
-                let current_hash = Self::hash_bytes(&json.as_bytes());
-                let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
-                if Some(current_hash) == last_hash {
-                    return;
-                }
-                if let Err(e) = std::fs::write(path, &json) {
-                    tracing::error!("save config error: path='{}' error={}", path.display(), e);
-                } else {
-                    tracing::debug!("config saved to '{}'", path.display());
-                    // Update the file hash so we don't treat our own write as an external change.
-                    *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
-                }
-            }
-            Err(e) => {
-                tracing::error!("serialize config error: {}", e);
-            }
+        let json = serde_json::to_string_pretty(&*config)
+            .map_err(|e| anyhow::anyhow!("serialize config error: {e}"))?;
+        let current_hash = Self::hash_bytes(json.as_bytes());
+        let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
+        if Some(current_hash) == last_hash {
+            return Ok(());
         }
+        std::fs::write(path, &json).map_err(|e| {
+            anyhow::anyhow!("save config error: path='{}' error={e}", path.display())
+        })?;
+        tracing::debug!("config saved to '{}'", path.display());
+        // Update the file hash so we don't treat our own write as an external change.
+        *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
+        Ok(())
     }
 
     /// Reload config from the file if it has changed externally.
@@ -465,7 +460,7 @@ impl RuntimeConfig for RuntimeConfigStore {
         self.update_with(f)
     }
 
-    fn save_to_file(&self) {
+    fn save_to_file(&self) -> anyhow::Result<()> {
         RuntimeConfigStore::save_to_file(self)
     }
 }

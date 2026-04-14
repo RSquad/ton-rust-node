@@ -209,7 +209,9 @@ mod tests {
         fn update_config(&self, _f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
             unimplemented!()
         }
-        fn save_to_file(&self) {}
+        fn save_to_file(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     fn runtime_config() -> Arc<dyn RuntimeConfig> {

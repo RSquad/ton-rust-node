@@ -65,7 +65,9 @@ pub async fn run_with_config(
                 }
             }
         });
-        cfg.save_to_file();
+        if let Err(e) = cfg.save_to_file() {
+            tracing::error!("failed to persist binding status: {e:#}");
+        }
     });
 
     let mut tasks = HashMap::new();
