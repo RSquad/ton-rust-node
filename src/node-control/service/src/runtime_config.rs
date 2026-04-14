@@ -584,6 +584,9 @@ fn open_nominator_pool(
             let provider = contract_provider!(rpc_client.clone());
             let w0 = open_toncore_pool_slot(&pools[0], provider.clone(), validator_addr)?;
             let w1 = open_toncore_pool_slot(&pools[1], provider, validator_addr)?;
+            if w0.is_none() && w1.is_none() {
+                anyhow::bail!("TONCore pool has no configured slots; at least one pool slot must be configured");
+            }
             Ok(Arc::new(TonCoreNominatorRouter::from_wrappers([w0, w1])))
         }
     }
