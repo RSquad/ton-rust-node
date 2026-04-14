@@ -10,7 +10,7 @@ use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
 use contracts::{
-    NominatorWrapper, TonWallet, contract_provider, nominator_constituents,
+    NominatorWrapper, TonWallet, contract_provider, nominator::SNP_STORAGE_RESERVE,
     ton_core_nominator::messages as tc_messages,
 };
 use std::{
@@ -89,7 +89,7 @@ impl ContractsMonitor {
         }
         let provider = contract_provider!(self.rpc_client.clone());
         let mut seqno = provider
-            .get_method(self.master_wallet.address().to_string(), "seqno", vec![])
+            .get_method(self.master_wallet.address().await.to_string(), "seqno", vec![])
             .await?
             .i64(0)?;
         if !self.ensure_wallets_deployed(&mut seqno).await? {
@@ -134,7 +134,7 @@ impl ContractsMonitor {
     /// Returns `true` when master is active and ready for subsequent steps.
     /// Returns an error if master is frozen or has insufficient balance.
     async fn ensure_master_deployed(&self) -> anyhow::Result<bool> {
-        let addr = self.master_wallet.address();
+        let addr = self.master_wallet.address().await;
         let (state, balance) = self.account_info(&addr).await.context("get master wallet state")?;
 
         match state {
@@ -175,7 +175,7 @@ impl ContractsMonitor {
         let mut processed_wallets = HashSet::new();
 
         for (node_id, wallet) in self.wallets.iter() {
-            let wallet_addr = wallet.address();
+            let wallet_addr = wallet.address().await;
             let is_new = processed_wallets.insert(wallet_addr.clone());
             if !is_new {
                 tracing::debug!(
@@ -208,8 +208,8 @@ impl ContractsMonitor {
         wallet: Arc<dyn TonWallet>,
         seqno: i64,
     ) -> anyhow::Result<bool> {
-        let addr = wallet.address();
-        let (state, balance) = self.account_info(&addr).await.context("wallet state")?;
+        let addr = wallet.address().await;
+        let (state, balance) = self.account_info(&addr).await.context("get wallet state")?;
 
         match state {
             AccountState::Active => return Ok(true),
@@ -265,7 +265,9 @@ impl ContractsMonitor {
     async fn ensure_pools_deployed(&self, seqno: &mut i64) -> anyhow::Result<bool> {
         let mut all_deployed = true;
         for (node_id, pool_binding) in self.pools.iter() {
-            for pool in nominator_constituents(pool_binding.clone()) {
+            let inner = pool_binding.inner_pools();
+            let pools = if inner.is_empty() { vec![pool_binding.clone()] } else { inner };
+            for pool in pools {
                 match self.deploy_pool(node_id, pool, *seqno).await {
                     Ok(true) => (),
                     Ok(false) => {
@@ -288,7 +290,7 @@ impl ContractsMonitor {
         pool: Arc<dyn NominatorWrapper>,
         seqno: i64,
     ) -> anyhow::Result<bool> {
-        let pool_addr = pool.address();
+        let pool_addr = pool.address().await;
         let (state, _) = self.account_info(&pool_addr).await.context("get pool state")?;
 
         match state {
@@ -345,7 +347,7 @@ impl ContractsMonitor {
         let mut all_topped_up = true;
         let mut processed_wallets = HashSet::new();
         for (node_id, wallet) in self.wallets.iter() {
-            let addr = wallet.address();
+            let addr = wallet.address().await;
             let is_new = processed_wallets.insert(addr.clone());
             if !is_new {
                 tracing::debug!(
@@ -433,14 +435,16 @@ impl ContractsMonitor {
             self.pools.len()
         );
         for (node_id, pool_binding) in self.pools.iter() {
-            for pool in nominator_constituents(pool_binding.clone()) {
+            let inner = pool_binding.inner_pools();
+            let pools = if inner.is_empty() { vec![pool_binding.clone()] } else { inner };
+            for pool in pools {
                 let pool_data = match pool.get_pool_data().await {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::warn!(
                             target: "contracts",
                             "[{}] get_pool_data error (skipping update_validator_set): pool={} {:#}",
-                            node_id, pool.address(), e
+                            node_id, pool.address().await, e
                         );
                         continue;
                     }
@@ -449,10 +453,10 @@ impl ContractsMonitor {
                 tracing::info!(
                     target: "contracts",
                     "[{}] pool={} state={} vsc_count={}",
-                    node_id, pool.address(), pool_data.state, pool_data.validator_set_changes_count
+                    node_id, pool.address().await, pool_data.state, pool_data.validator_set_changes_count
                 );
 
-                if !pool.is_toncore_pool()
+                if pool.storage_reserve() <= SNP_STORAGE_RESERVE
                     || pool_data.state != 2
                     || pool_data.validator_set_changes_count >= 2
                 {
@@ -463,7 +467,7 @@ impl ContractsMonitor {
                     target: "contracts",
                     "[{}] update_validator_set: pool={}, state={}, vsc_count={}",
                     node_id,
-                    pool.address(),
+                    pool.address().await,
                     pool_data.state,
                     pool_data.validator_set_changes_count,
                 );
@@ -472,7 +476,7 @@ impl ContractsMonitor {
                 let msg = self
                     .master_wallet
                     .build_message(
-                        pool.address(),
+                        pool.address().await,
                         POOL_OP_GAS,
                         body,
                         true,
@@ -620,7 +624,7 @@ mod tests {
             Ok(u64::MAX)
         }
 
-        fn address(&self) -> MsgAddressInt {
+        async fn address(&self) -> MsgAddressInt {
             self.addr.clone()
         }
     }
