@@ -47,7 +47,7 @@
 |   Feature   | Status | Comment |
 |-------------|------------|-------------|
 | Automatic elections | Done | - |
-| Nominator pools (SNP + TONCore) | Done | SNP via `config pool add`; TONCore via `config pool add-core` |
+| Nominator pools (SNP + TONCore) | Done | SNP via `config pool add`; TONCore via `config pool add core` |
 | Automatic Voting for proposals | Done | - |
 | REST API Server | Done | Includes Swagger UI |
 | REST API cli commands | Done | - |
@@ -281,7 +281,7 @@ nodectl config wallet send \
 Manage nominator pools in the configuration file. Pools are stored as tagged JSON: **`kind: "snp"`** or **`kind: "core"`**.
 
 - **`config pool add`** — **Single Nominator Pool (SNP)** only (`PoolConfig::SNP`: optional `address`, `owner`).
-- **`config pool add-core`** — **TONCore nominator** (`PoolConfig::TONCore`): up to **two** logical slots (`pools[0]`, `pools[1]`) for even/odd validation rounds. Each slot has its own optional `address` and/or `params` (`TonCoreInitParams`). Configure slot 1 explicitly with **`--validator-share-odd`** (and optional `--*-odd` flags) and/or **`--address-odd`** — there is no single `--dual` shortcut that duplicates slot-0 deploy parameters.
+- **`config pool add core`** — **TONCore nominator** (`PoolConfig::TONCore`): up to **two** logical slots (`pools[0]`, `pools[1]`) for even/odd validation rounds. Each slot is configured by a separate command call with explicit **`--even`** or **`--odd`**, and optional `address` and/or deploy `params` (`TonCoreInitParams`) for that slot.
 
 ##### `config pool add` (SNP)
 
@@ -298,42 +298,46 @@ nodectl config pool add --name pool0 --address "-1:pool_contract_address"
 nodectl config pool add --name pool0 --owner "-1:owner_address"
 ```
 
-##### `config pool add-core` (TONCore)
+##### `config pool add core` (TONCore)
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--validator-share` | | Validator reward share in **basis points** (e.g. `1000` = 10%). Required when adding deploy params without an existing `--address`. |
+| `--validator-share` | | Slot deploy: reward share in **basis points** (e.g. `1000` = 10%). Required when adding deploy params without an existing `--address`. |
 | `--max-nominators` | | Optional; default from contract defaults |
 | `--min-validator-stake` | | Optional; minimum validator stake in **TON** |
 | `--min-nominator-stake` | | Optional; minimum nominator stake in **TON** |
-| `--address` | | Existing pool for **slot 0** (even rounds) |
-| `--address-odd` | | Existing pool for **slot 1** (odd rounds) |
-| `--validator-share-odd` | | Slot 1 deploy: reward share (basis points); required if any other `--*-odd` deploy flag is set |
-| `--max-nominators-odd` | | Slot 1: max nominators |
-| `--min-validator-stake-odd` | | Slot 1: min validator stake (TON) |
-| `--min-nominator-stake-odd` | | Slot 1: min nominator stake (TON) |
+| `--address` | | Existing pool address for selected slot |
+| `--even` | | Configure slot 0 (even rounds), required unless `--odd` is set |
+| `--odd` | | Configure slot 1 (odd rounds), required unless `--even` is set |
 
-At least one of `--address` or `--validator-share` must be set for slot 0. Slot 1 appears when **`--address-odd`** and/or **`--validator-share-odd`** (or full slot-1 deploy via `--validator-share-odd` with optional `--*-odd`) is set.
+At least one of `--address` or `--validator-share` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
 
 ```bash
-# TONCore: deploy params for slot 0 only (single on-chain pool)
-nodectl config pool add-core --name pool0 --validator-share 5000
+# TONCore: configure slot 0 (even)
+nodectl config pool add core --name pool0 --validator-share 5000 --even
 
-# Two pools derived from config: pass full params for each slot (they must differ where the
-# contract requires distinct `StateInit`; e.g. different min stakes — adjust to your deployment plan)
-nodectl config pool add-core \
+# Configure both slots with explicit separate commands
+nodectl config pool add core \
   --name pool0 \
   --validator-share 5000 \
   --min-validator-stake 10000 \
-  --validator-share-odd 5000 \
-  --min-validator-stake-odd 10001
+  --even
+nodectl config pool add core \
+  --name pool0 \
+  --validator-share 5000 \
+  --min-validator-stake 10001 \
+  --odd
 
-# Two existing pool addresses (no deploy params)
-nodectl config pool add-core \
+# Configure existing deployed addresses per slot
+nodectl config pool add core \
   --name pool0 \
   --address "-1:..." \
-  --address-odd "-1:..."
+  --even
+nodectl config pool add core \
+  --name pool0 \
+  --address "-1:..." \
+  --odd
 ```
 
 ##### `config pool ls`

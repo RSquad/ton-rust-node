@@ -585,21 +585,32 @@ class Bootstrap:
         for i in range(1, self.cfg.node_cnt + 1):
             toncore_last = self.cfg.has_toncore and i == self.cfg.node_cnt
             if toncore_last:
-                # add-core: explicit params for both slots (no implicit second pool).
+                # add core: one command per slot with explicit slot selector.
                 self._nctl(
                     "config",
                     "pool",
-                    "add-core",
+                    "add",
+                    "core",
                     "-n",
                     f"pool{i}",
                     "--validator-share",
                     str(self.cfg.toncore_validator_share),
                     "--min-validator-stake",
                     str(self.cfg.toncore_min_validator_stake_ton),
-                    "--validator-share-odd",
+                    "--even",
+                )
+                self._nctl(
+                    "config",
+                    "pool",
+                    "add",
+                    "core",
+                    "-n",
+                    f"pool{i}",
+                    "--validator-share",
                     str(self.cfg.toncore_validator_share_odd),
-                    "--min-validator-stake-odd",
+                    "--min-validator-stake",
                     str(self.cfg.toncore_min_validator_stake_odd_ton),
+                    "--odd",
                 )
             else:
                 self._nctl("config", "pool", "add", "-n", f"pool{i}", "-o", master_addr)

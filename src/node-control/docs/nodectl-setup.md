@@ -341,7 +341,7 @@ nodectl config wallet ls
 Nominator pools are configured in two ways:
 
 1. **`config pool add`** — **Single Nominator Pool (SNP)** — classic single-nominator contract (`kind: "snp"` in JSON).
-2. **`config pool add-core`** — **TONCore nominator** — one or two on-chain pool contracts for even/odd rounds (`kind: "core"`, `pools: [slot0, slot1]`). Use **`add-core`** only for TONCore; SNP stays on **`pool add`**.
+2. **`config pool add core`** — **TONCore nominator** — one or two on-chain pool contracts for even/odd rounds (`kind: "core"`, `pools: [slot0, slot1]`). Use **`add core`** only for TONCore; SNP stays on **`pool add`**.
 
 ### SNP (default for simple setups)
 
@@ -369,7 +369,7 @@ nodectl config pool add -n pool3 -o "0:<OWNER_ADDRESS_3>"
 
 ### TONCore
 
-Use **`nodectl config pool add-core`** with `--validator-share` for slot 0; for a second pool set **`--validator-share-odd`** (and optional `--max-nominators-odd`, stake flags) and/or **`--address-odd`**. See the main [README.md](../README.md) (`config pool`) for the full flag list and examples.
+Use **`nodectl config pool add core`** with one explicit slot flag per call: **`--even`** for slot 0 or **`--odd`** for slot 1, plus either `--validator-share` (deploy params) or `--address` (already deployed). Configure two slots with two separate commands using the same pool name.
 
 List configured pools:
 

@@ -42,9 +42,10 @@ pub struct PoolCmd {
 
 #[derive(clap::Subcommand, Clone)]
 pub enum PoolAction {
-    /// Add an SNP pool to the configuration
-    Add(PoolAddCmd),
-    /// Add a TONCore nominator pool to the configuration
+    /// Add a pool to the configuration
+    Add(PoolAddSubCmd),
+    /// Backward-compatible alias for `add core` (hidden)
+    #[command(hide = true)]
     AddCore(PoolAddCoreCmd),
     /// List all configured pools
     Ls(PoolLsCmd),
@@ -57,10 +58,27 @@ pub enum PoolAction {
 }
 
 #[derive(clap::Args, Clone)]
+#[command(about = "Add a pool to the configuration")]
+pub struct PoolAddSubCmd {
+    #[command(subcommand)]
+    action: Option<PoolAddAction>,
+    #[command(flatten)]
+    snp: PoolAddCmd,
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum PoolAddAction {
+    /// Add an SNP pool to the configuration
+    Snp(PoolAddCmd),
+    /// Add a TONCore nominator pool to the configuration
+    Core(PoolAddCoreCmd),
+}
+
+#[derive(clap::Args, Clone)]
 #[command(about = "Add an SNP pool to the configuration")]
 pub struct PoolAddCmd {
     #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
-    name: String,
+    name: Option<String>,
     #[arg(
         short = 'a',
         long = "address",
@@ -77,6 +95,7 @@ pub struct PoolAddCmd {
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Add a TONCore nominator pool to the configuration")]
+#[command(group(clap::ArgGroup::new("slot").required(true).args(&["even", "odd"])))]
 pub struct PoolAddCoreCmd {
     #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
     name: String,
@@ -87,7 +106,7 @@ pub struct PoolAddCoreCmd {
     )]
     validator_share: Option<u16>,
 
-    #[arg(long = "max-nominators", help = "Maximum number of nominators (default: 40)")]
+    #[arg(long = "max-nominators", help = "Max nominators (default: 40)")]
     max_nominators: Option<u16>,
 
     #[arg(long = "min-validator-stake", help = "Minimum validator stake in TON (default: 10 000)")]
@@ -96,38 +115,21 @@ pub struct PoolAddCoreCmd {
     #[arg(long = "min-nominator-stake", help = "Minimum nominator stake in TON (default: 10 000)")]
     min_nominator_stake: Option<f64>,
 
-    #[arg(
-        long = "address",
-        help = "Existing pool address for even-round slot (slot 0), raw or base64url"
-    )]
+    #[arg(long = "address", help = "Existing pool address for selected slot, raw or base64url")]
     address: Option<String>,
 
     #[arg(
-        long = "address-odd",
-        help = "Existing pool address for odd-round slot (slot 1), raw or base64url"
+        long = "even",
+        conflicts_with = "odd",
+        help = "Configure/deploy TONCore slot 0 (even rounds)"
     )]
-    address_odd: Option<String>,
-
+    even: bool,
     #[arg(
-        long = "validator-share-odd",
-        help = "Slot 1: validator reward share in basis points (required to deploy/configure slot 1; independent from slot 0)"
+        long = "odd",
+        conflicts_with = "even",
+        help = "Configure/deploy TONCore slot 1 (odd rounds)"
     )]
-    validator_share_odd: Option<u16>,
-
-    #[arg(long = "max-nominators-odd", help = "Slot 1: max nominators (default: 40)")]
-    max_nominators_odd: Option<u16>,
-
-    #[arg(
-        long = "min-validator-stake-odd",
-        help = "Slot 1: minimum validator stake in TON (default: 10 000)"
-    )]
-    min_validator_stake_odd: Option<f64>,
-
-    #[arg(
-        long = "min-nominator-stake-odd",
-        help = "Slot 1: minimum nominator stake in TON (default: 10 000)"
-    )]
-    min_nominator_stake_odd: Option<f64>,
+    odd: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -195,7 +197,11 @@ pub struct PoolWithdrawValidatorCmd {
 impl PoolCmd {
     pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         match &self.action {
-            PoolAction::Add(cmd) => cmd.run(path).await,
+            PoolAction::Add(cmd) => match &cmd.action {
+                Some(PoolAddAction::Snp(cmd)) => cmd.run(path).await,
+                Some(PoolAddAction::Core(cmd)) => cmd.run(path).await,
+                None => cmd.snp.run(path).await,
+            },
             PoolAction::AddCore(cmd) => cmd.run(path).await,
             PoolAction::Ls(cmd) => cmd.run(path).await,
             PoolAction::Rm(cmd) => cmd.run(path).await,
@@ -207,6 +213,7 @@ impl PoolCmd {
 
 impl PoolAddCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+        let name = self.name.as_ref().ok_or_else(|| anyhow::anyhow!("--name must be specified"))?;
         if self.address.is_none() && self.owner.is_none() {
             anyhow::bail!("At least one of --address or --owner must be specified");
         }
@@ -221,10 +228,10 @@ impl PoolAddCmd {
 
         let mut config = AppConfig::load(path)?;
 
-        if config.pools.contains_key(&self.name) {
+        if config.pools.contains_key(name) {
             anyhow::bail!(
                 "Pool '{}' already exists. Remove it first or use a different name.",
-                self.name
+                name
             );
         }
 
@@ -233,7 +240,7 @@ impl PoolAddCmd {
             owner: normalized_owner.clone(),
         };
 
-        config.pools.insert(self.name.clone(), pool_config);
+        config.pools.insert(name.clone(), pool_config);
         save_config(&config, path)?;
 
         let info = match (&normalized_address, &normalized_owner) {
@@ -243,7 +250,7 @@ impl PoolAddCmd {
             _ => unreachable!(),
         };
 
-        println!("\n{} Pool '{}' added ({})\n", "OK".green().bold(), self.name, info);
+        println!("\n{} Pool '{}' added ({})\n", "OK".green().bold(), name, info);
         Ok(())
     }
 }
@@ -254,32 +261,13 @@ impl PoolAddCoreCmd {
             anyhow::bail!("At least one of --address or --validator-share must be specified");
         }
 
+        let slot = if self.odd { 1usize } else { 0usize };
+        let slot_name = if slot == 0 { "even" } else { "odd" };
+
         let mut config = AppConfig::load(path)?;
 
-        if config.pools.contains_key(&self.name) {
-            anyhow::bail!(
-                "Pool '{}' already exists. Remove it first or use a different name.",
-                self.name
-            );
-        }
-
-        let address0 =
+        let address =
             self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
-
-        let address_odd = self
-            .address_odd
-            .as_deref()
-            .map(|a| normalize_ton_address(a, "address-odd"))
-            .transpose()?;
-
-        let odd_deploy_fields = self.max_nominators_odd.is_some()
-            || self.min_validator_stake_odd.is_some()
-            || self.min_nominator_stake_odd.is_some();
-        if odd_deploy_fields && self.validator_share_odd.is_none() {
-            anyhow::bail!(
-                "--validator-share-odd is required when setting slot-1 deploy options (--max-nominators-odd, --min-validator-stake-odd, --min-nominator-stake-odd)"
-            );
-        }
 
         let params = self.validator_share.map(|vs| TonCoreInitParams {
             validator_share: vs,
@@ -294,49 +282,47 @@ impl PoolAddCoreCmd {
                 .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
         });
 
-        let params_odd = self.validator_share_odd.map(|vs| TonCoreInitParams {
-            validator_share: vs,
-            max_nominators: self.max_nominators_odd.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
-            min_validator_stake: self
-                .min_validator_stake_odd
-                .map(tons_f64_to_nanotons)
-                .unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE),
-            min_nominator_stake: self
-                .min_nominator_stake_odd
-                .map(tons_f64_to_nanotons)
-                .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
-        });
+        match config.pools.get_mut(&self.name) {
+            Some(PoolConfig::TONCore { pools }) => {
+                if pools[slot].is_some() {
+                    anyhow::bail!(
+                        "TONCore pool '{}' slot '{}' is already configured. Remove pool first or use another name.",
+                        self.name,
+                        slot_name
+                    );
+                }
+                pools[slot] =
+                    Some(TonCorePoolConfig { address: address.clone(), params: params.clone() });
+            }
+            Some(PoolConfig::SNP { .. }) => {
+                anyhow::bail!(
+                    "Pool '{}' already exists and is SNP. Remove it first or use another name.",
+                    self.name
+                );
+            }
+            None => {
+                let mut pools: [Option<TonCorePoolConfig>; 2] = [None, None];
+                pools[slot] =
+                    Some(TonCorePoolConfig { address: address.clone(), params: params.clone() });
+                config.pools.insert(self.name.clone(), PoolConfig::TONCore { pools });
+            }
+        }
 
-        let slot0 = Some(TonCorePoolConfig { address: address0.clone(), params: params.clone() });
-        let has_slot1 = address_odd.is_some() || params_odd.is_some();
-        let slot1 = if has_slot1 {
-            Some(TonCorePoolConfig { address: address_odd.clone(), params: params_odd })
-        } else {
-            None
-        };
-
-        config.pools.insert(self.name.clone(), PoolConfig::TONCore { pools: [slot0, slot1] });
         save_config(&config, path)?;
 
         let mut info_parts = Vec::new();
         if let Some(vs) = self.validator_share {
             info_parts.push(format!("validator_share={vs} bp"));
         }
-        if let Some(a) = &address0 {
+        if let Some(a) = &address {
             info_parts.push(format!("address='{a}'"));
-        }
-        if let Some(vs) = self.validator_share_odd {
-            info_parts.push(format!("validator_share_odd={vs} bp"));
-        }
-        if has_slot1 {
-            let odd_str = address_odd.as_deref().unwrap_or("<to deploy>");
-            info_parts.push(format!("address-odd='{odd_str}'"));
         }
 
         println!(
-            "\n{} TONCore pool '{}' added ({})\n",
+            "\n{} TONCore pool '{}' slot '{}' configured ({})\n",
             "OK".green().bold(),
             self.name,
+            slot_name,
             info_parts.join(", ")
         );
         Ok(())
