@@ -333,16 +333,6 @@ fn default_toncore_min_nominator_stake() -> u64 {
     DEFAULT_TONCORE_MIN_NOMINATOR_STAKE
 }
 
-fn is_default_toncore_max_nominators(v: &u16) -> bool {
-    *v == DEFAULT_TONCORE_MAX_NOMINATORS
-}
-fn is_default_toncore_min_validator_stake(v: &u64) -> bool {
-    *v == DEFAULT_TONCORE_MIN_VALIDATOR_STAKE
-}
-fn is_default_toncore_min_nominator_stake(v: &u64) -> bool {
-    *v == DEFAULT_TONCORE_MIN_NOMINATOR_STAKE
-}
-
 /// Single TONCore pool slot config (address + optional deploy params).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct TonCorePoolConfig {
@@ -359,13 +349,10 @@ pub struct TonCorePoolConfig {
 pub struct TonCoreInitParams {
     pub validator_share: u16,
     #[serde(default = "default_toncore_max_nominators")]
-    #[serde(skip_serializing_if = "is_default_toncore_max_nominators")]
     pub max_nominators: u16,
     #[serde(default = "default_toncore_min_validator_stake")]
-    #[serde(skip_serializing_if = "is_default_toncore_min_validator_stake")]
     pub min_validator_stake: u64,
     #[serde(default = "default_toncore_min_nominator_stake")]
-    #[serde(skip_serializing_if = "is_default_toncore_min_nominator_stake")]
     pub min_nominator_stake: u64,
 }
 
@@ -387,10 +374,8 @@ pub struct WalletConfig {
 pub enum PoolConfig {
     #[serde(rename = "snp")]
     SNP {
-        #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
         address: Option<String>,
-        #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
     },
@@ -966,7 +951,18 @@ mod tests {
         assert_eq!(json["kind"], "core");
         assert!(json["pools"][0]["params"]["validator_share"] == 50);
         assert!(json["pools"][0].get("address").is_none());
-        assert!(json["pools"][0]["params"].get("max_nominators").is_none());
+        assert_eq!(
+            json["pools"][0]["params"]["max_nominators"],
+            serde_json::json!(DEFAULT_TONCORE_MAX_NOMINATORS)
+        );
+        assert_eq!(
+            json["pools"][0]["params"]["min_validator_stake"],
+            serde_json::json!(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE)
+        );
+        assert_eq!(
+            json["pools"][0]["params"]["min_nominator_stake"],
+            serde_json::json!(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE)
+        );
     }
 
     #[test]
