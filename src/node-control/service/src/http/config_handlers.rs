@@ -706,9 +706,16 @@ pub async fn v1_nodes_rm_handler(
     state: axum::extract::State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
-    if !state.runtime_cfg.get().nodes.contains_key(&name) {
+    let cfg = state.runtime_cfg.get();
+    if !cfg.nodes.contains_key(&name) {
         return Err(AppError::not_found(format!("node '{name}' not found")));
     }
+    if cfg.bindings.contains_key(&name) {
+        return Err(AppError::bad_request(format!(
+            "cannot remove node '{name}': referenced by a binding"
+        )));
+    }
+    drop(cfg);
 
     let target = name.clone();
     state

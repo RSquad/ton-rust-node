@@ -260,9 +260,10 @@ pub fn resolve_service_url(url: Option<&str>, config_path: Option<&str>) -> anyh
     Ok("http://127.0.0.1:8080".to_string())
 }
 
-fn normalize_base_url(url: &str) -> String {
+pub(crate) fn normalize_base_url(url: &str) -> String {
     let mut base = url.to_string();
-    if base.starts_with("0.0.0.0") {
+    let trimmed = base.trim_start_matches("http://").trim_start_matches("https://");
+    if trimmed.starts_with("0.0.0.0") {
         base = base.replacen("0.0.0.0", "127.0.0.1", 1);
     }
     if !base.starts_with("http://") && !base.starts_with("https://") {
@@ -321,4 +322,63 @@ async fn send_request<B: serde::Serialize>(
         anyhow::bail!("request failed: status={}, body={}", status, body);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_base_url_adds_http_scheme_when_missing() {
+        assert_eq!(normalize_base_url("example.com:8080"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1:9000"), "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_http_scheme() {
+        assert_eq!(normalize_base_url("http://example.com:8080"), "http://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_https_scheme() {
+        assert_eq!(normalize_base_url("https://example.com:8080"), "https://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_bare_0_0_0_0_with_loopback() {
+        assert_eq!(normalize_base_url("0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_http_scheme() {
+        assert_eq!(normalize_base_url("http://0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_https_scheme() {
+        assert_eq!(normalize_base_url("https://0.0.0.0:8080"), "https://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_only_first_0_0_0_0_occurrence() {
+        assert_eq!(
+            normalize_base_url("http://0.0.0.0/redirect/0.0.0.0"),
+            "http://127.0.0.1/redirect/0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_base_url_leaves_non_0_0_0_0_host_unchanged() {
+        assert_eq!(normalize_base_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(normalize_base_url("http://10.0.0.0:8080"), "http://10.0.0.0:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_path() {
+        assert_eq!(
+            normalize_base_url("http://example.com:8080/api/v1"),
+            "http://example.com:8080/api/v1"
+        );
+        assert_eq!(normalize_base_url("example.com/path"), "http://example.com/path");
+    }
 }

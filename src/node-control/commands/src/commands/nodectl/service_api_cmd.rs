@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::utils::normalize_base_url;
 use anyhow::Context;
 use colored::Colorize;
 use common::{
@@ -13,7 +14,6 @@ use common::{
     ton_utils::display_tons_from_str,
 };
 use std::{
-    borrow::Cow,
     collections::HashSet,
     io::{self, Read},
     path::Path,
@@ -188,10 +188,10 @@ pub struct StakePolicyCmd {
 impl ApiCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
         let base_url = if let Some(url) = self.url.as_deref() {
-            normalize_base_url(Cow::Borrowed(url))
+            normalize_base_url(url)
         } else {
             let app_cfg = AppConfig::load(Path::new(&self.config))?;
-            normalize_base_url(Cow::Owned(app_cfg.http.bind.clone()))
+            normalize_base_url(&app_cfg.http.bind)
         };
         let client = reqwest::Client::new();
         let token = self.token.as_deref();
@@ -385,18 +385,6 @@ struct ElectionsTaskControlRequest {
 #[derive(Clone, serde::Serialize)]
 struct NodeListPayload {
     nodes: Vec<String>,
-}
-
-fn normalize_base_url(url: Cow<'_, str>) -> String {
-    let mut base = url.into_owned();
-    let trimmed = base.trim_start_matches("http://").trim_start_matches("https://");
-    if trimmed.starts_with("0.0.0.0") {
-        base = base.replacen("0.0.0.0", "127.0.0.1", 1);
-    }
-    if !base.starts_with("http://") && !base.starts_with("https://") {
-        base = format!("http://{}", base);
-    }
-    base
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -960,92 +948,6 @@ mod tests {
 
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0]["node_id"], "node2");
-    }
-
-    #[test]
-    fn test_normalize_base_url_adds_http_scheme_when_missing() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("example.com:8080")),
-            "http://example.com:8080"
-        );
-        assert_eq!(normalize_base_url(Cow::Borrowed("127.0.0.1:9000")), "http://127.0.0.1:9000");
-    }
-
-    #[test]
-    fn test_normalize_base_url_preserves_existing_http_scheme() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("http://example.com:8080")),
-            "http://example.com:8080"
-        );
-    }
-
-    #[test]
-    fn test_normalize_base_url_preserves_existing_https_scheme() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("https://example.com:8080")),
-            "https://example.com:8080"
-        );
-    }
-
-    #[test]
-    fn test_normalize_base_url_replaces_bare_0_0_0_0_with_loopback() {
-        assert_eq!(normalize_base_url(Cow::Borrowed("0.0.0.0:8080")), "http://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn test_normalize_base_url_replaces_0_0_0_0_with_http_scheme() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("http://0.0.0.0:8080")),
-            "http://127.0.0.1:8080"
-        );
-    }
-
-    #[test]
-    fn test_normalize_base_url_replaces_0_0_0_0_with_https_scheme() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("https://0.0.0.0:8080")),
-            "https://127.0.0.1:8080"
-        );
-    }
-
-    #[test]
-    fn test_normalize_base_url_replaces_only_first_0_0_0_0_occurrence() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("http://0.0.0.0/redirect/0.0.0.0")),
-            "http://127.0.0.1/redirect/0.0.0.0"
-        );
-    }
-
-    #[test]
-    fn test_normalize_base_url_leaves_non_0_0_0_0_host_unchanged() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("http://127.0.0.1:8080")),
-            "http://127.0.0.1:8080"
-        );
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("http://10.0.0.0:8080")),
-            "http://10.0.0.0:8080"
-        );
-    }
-
-    #[test]
-    fn test_normalize_base_url_preserves_path() {
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("http://example.com:8080/api/v1")),
-            "http://example.com:8080/api/v1"
-        );
-        assert_eq!(
-            normalize_base_url(Cow::Borrowed("example.com/path")),
-            "http://example.com/path"
-        );
-    }
-
-    #[test]
-    fn test_normalize_base_url_accepts_owned_cow() {
-        assert_eq!(
-            normalize_base_url(Cow::Owned("0.0.0.0:8080".to_string())),
-            "http://127.0.0.1:8080"
-        );
     }
 
     #[test]
