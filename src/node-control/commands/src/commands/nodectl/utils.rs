@@ -82,28 +82,10 @@ pub fn resolve_pool_address_from_config(
                 anyhow::anyhow!("TONCore pool slot {} is not configured", pool_slot)
             })?;
             match (&slot.address, &slot.params) {
-                (Some(addr), Some(params)) => {
-                    // Validate explicit address against deterministic TONCore state init derived from params.
-                    let resolved = resolve_toncore_pool(
-                        validator_addr,
-                        params.validator_share,
-                        Some(addr),
-                        Some(params.max_nominators),
-                        Some(params.min_validator_stake),
-                        Some(params.min_nominator_stake),
-                    )?;
-                    Ok(resolved.address)
-                }
                 (Some(addr), None) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
-                (None, Some(params)) => {
-                    let resolved = resolve_toncore_pool(
-                        validator_addr,
-                        params.validator_share,
-                        None,
-                        Some(params.max_nominators),
-                        Some(params.min_validator_stake),
-                        Some(params.min_nominator_stake),
-                    )?;
+                (addr, Some(params)) => {
+                    let resolved =
+                        resolve_toncore_pool(validator_addr, addr.as_deref(), params.clone())?;
                     Ok(resolved.address)
                 }
                 (None, None) => {

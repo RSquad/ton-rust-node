@@ -26,7 +26,7 @@ use common::{
 };
 use contracts::{
     NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, TonWallet,
-    ton_core_nominator::messages as pool_messages,
+    nominator::ton_core_pool as pool_messages,
 };
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
 use std::{io::Write, path::Path, str::FromStr, sync::Arc};

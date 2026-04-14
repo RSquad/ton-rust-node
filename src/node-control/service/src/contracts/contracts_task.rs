@@ -11,7 +11,7 @@ use anyhow::Context;
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
 use contracts::{
     NominatorWrapper, PoolKind, TonWallet, contract_provider,
-    ton_core_nominator::messages as tc_messages,
+    nominator::ton_core_pool as tc_messages,
 };
 use std::{
     collections::{HashMap, HashSet},

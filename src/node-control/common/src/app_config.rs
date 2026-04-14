@@ -14,7 +14,6 @@ use secrets_vault::{
     types::{algorithm::Algorithm, metadata::Metadata, secret::Secret},
     vault::SecretVault,
 };
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
@@ -334,7 +333,7 @@ fn default_toncore_min_nominator_stake() -> u64 {
 }
 
 /// Single TONCore pool slot config (address + optional deploy params).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub struct TonCorePoolConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -345,7 +344,7 @@ pub struct TonCorePoolConfig {
 }
 
 /// Deploy-time parameters for a TONCore nominator pool contract.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub struct TonCoreInitParams {
     pub validator_share: u16,
     #[serde(default = "default_toncore_max_nominators")]
@@ -369,7 +368,7 @@ pub struct WalletConfig {
 /// Nominator pool entry in the app config.
 ///
 /// JSON uses `kind: "snp"` or `"core"`.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "kind")]
 pub enum PoolConfig {
     #[serde(rename = "snp")]

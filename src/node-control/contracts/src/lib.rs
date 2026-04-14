@@ -12,7 +12,6 @@ pub mod nominator;
 pub mod provider;
 pub mod smart_contract;
 mod stack_utils;
-pub mod ton_core_nominator;
 pub mod wallet;
 
 pub use config_contract::{
@@ -20,12 +19,10 @@ pub use config_contract::{
 };
 pub use elector::{ElectionsInfo, ElectorWrapper, ElectorWrapperImpl, Participant};
 pub use nominator::{
-    NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, NominatorWrapperImpl, PoolKind,
-    TonCoreNominatorRouter,
+    NOMINATOR_POOL_WORKCHAIN, NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl,
+    PoolKind, ResolvedTonCorePool, TonCoreNominatorRouter, resolve_deploy_pool_params,
+    resolve_toncore_pool,
 };
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;
-pub use ton_core_nominator::{
-    NominatorPoolWrapperImpl, ResolvedTonCorePool, resolve_deploy_pool_params, resolve_toncore_pool,
-};
 pub use wallet::{TonWallet, WalletContract};

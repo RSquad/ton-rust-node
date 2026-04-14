@@ -419,7 +419,6 @@ impl TestHarness {
             Arc::new(wallets),
             Arc::new(pools),
         )
-        .await
     }
 }
 
@@ -1315,8 +1314,7 @@ async fn test_multiple_nodes_one_excluded() {
         providers,
         Arc::new(wallets),
         Arc::new(pools),
-    )
-    .await;
+    );
 
     let result = runner.run().await;
     assert!(result.is_ok());
@@ -1717,8 +1715,7 @@ async fn test_node_without_wallet_skipped() {
         providers,
         Arc::new(wallets),
         Arc::new(pools),
-    )
-    .await;
+    );
 
     assert!(
         runner.nodes.is_empty(),

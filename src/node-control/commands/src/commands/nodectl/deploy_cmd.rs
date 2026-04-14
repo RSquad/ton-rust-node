@@ -374,11 +374,8 @@ impl DeployPoolCmd {
                         (_, Some(params)) => {
                             let resolved = resolve_toncore_pool(
                                 &wallet_address,
-                                params.validator_share,
                                 cfg.address.as_deref(),
-                                Some(params.max_nominators),
-                                Some(params.min_validator_stake),
-                                Some(params.min_nominator_stake),
+                                params.clone(),
                             )
                             .map_err(set_err)?;
                             targets.push((resolved.address, resolved.state_init));

@@ -121,33 +121,6 @@ impl Node {
         }
     }
 
-    /// Resolve the pool/elector address to use for the current staking operation.
-    /// For TONCore nominator (two pools), queries `get_pool_data` to pick the free pool.
-    /// For single pools, returns the pool address.
-    /// For direct staking (no pool), returns the elector address.
-    async fn resolve_staking_target(
-        &self,
-        elector_addr: &MsgAddressInt,
-    ) -> anyhow::Result<MsgAddressInt> {
-        let Some(pool) = &self.pool else {
-            return Ok(elector_addr.clone());
-        };
-        let inner = pool.inner_pools();
-        if inner.is_empty() {
-            return Ok(pool.address().await);
-        }
-        // TONCore pair: pick the first pool that is not currently staking
-        for p in &inner {
-            let data = p.get_pool_data().await?;
-            let is_free =
-                data.state == 0 || (data.state == 2 && data.validator_set_changes_count >= 2);
-            if is_free {
-                return Ok(p.address().await);
-            }
-        }
-        anyhow::bail!("all TONCore nominator pools are busy")
-    }
-
     fn reset_participation(&mut self) {
         self.participant = None;
         self.submission_time = None;
@@ -270,7 +243,7 @@ struct StakeContext<'a> {
 }
 
 impl ElectionRunner {
-    pub(crate) async fn new(
+    pub(crate) fn new(
         elections_config: &ElectionsConfig,
         bindings: &HashMap<String, NodeBinding>,
         elector: Arc<dyn ElectorWrapper>,
@@ -605,16 +578,11 @@ impl ElectionRunner {
         };
         let node = self.nodes.get_mut(node_id).expect("node not found");
 
-        // Resolve the target address and wallet_addr once per tick so that
-        // calc_stake, send_stake, and the elector signed payload all use the
-        // same pool (critical for TONCore nominator pair where `resolve_staking_target` picks one of two).
+        // Resolve target once per tick:
+        // if pool address is cached use it, otherwise fallback to elector.
         let elector_addr = self.elector.address().await;
-        let staking_target =
-            node.resolve_staking_target(&elector_addr).await.context("resolve staking target")?;
-        let staking_wallet_addr = match &node.pool {
-            Some(_) => staking_target.address().clone().storage().to_vec(),
-            None => node.wallet.address().await.address().clone().storage().to_vec(),
-        };
+        let staking_target = node.pool_addr_cache.as_ref().cloned().unwrap_or(elector_addr);
+        let staking_wallet_addr = node.stake_addr().await;
         // Find validator key for current elections in the validator config
         let validator_key = node.find_election_key(election_id).await;
         // Find participant in the elections info by validator public key

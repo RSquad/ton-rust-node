@@ -6,8 +6,6 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-/// TON Core pool message builders (same as [`crate::nominator::ton_core_pool`]).
-pub use crate::nominator::ton_core_pool as messages;
 use crate::{
     ContractProvider, SmartContract,
     nominator::{
@@ -129,24 +127,10 @@ pub struct ResolvedTonCorePool {
 /// Validate and resolve the pool address from TONCore config fields.
 pub fn resolve_toncore_pool(
     validator_addr: &MsgAddressInt,
-    validator_share: u16,
     pool_address: Option<&str>,
-    max_nominators: Option<u16>,
-    min_validator_stake: Option<u64>,
-    min_nominator_stake: Option<u64>,
+    params: TonCoreInitParams,
 ) -> anyhow::Result<ResolvedTonCorePool> {
-    let (max_n, min_v, min_n) =
-        resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
-
-    let (address, state_init) = toncore_pool_address_and_state(
-        TonCoreInitParams {
-            validator_share,
-            max_nominators: max_n,
-            min_validator_stake: min_v,
-            min_nominator_stake: min_n,
-        },
-        validator_addr,
-    )?;
+    let (address, state_init) = toncore_pool_address_and_state(params.clone(), validator_addr)?;
     if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
@@ -158,10 +142,10 @@ pub fn resolve_toncore_pool(
     }
 
     Ok(ResolvedTonCorePool {
-        reward_share: validator_share,
-        max_nominators: max_n,
-        min_validator_stake: min_v,
-        min_nominator_stake: min_n,
+        reward_share: params.validator_share,
+        max_nominators: params.max_nominators,
+        min_validator_stake: params.min_validator_stake,
+        min_nominator_stake: params.min_nominator_stake,
         address,
         state_init,
     })
