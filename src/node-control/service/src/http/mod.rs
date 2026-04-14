@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+pub mod config_handlers;
 pub mod http_server_task;
 pub(crate) mod login_rate_limiter;
 

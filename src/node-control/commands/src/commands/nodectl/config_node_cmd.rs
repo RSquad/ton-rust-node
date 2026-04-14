@@ -8,15 +8,14 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{save_config, warn_missing_secret},
+    utils::{api_get, require_config, resolve_service_url, save_config, warn_missing_secret},
 };
 use adnl::common::Timeouts;
 use anyhow::Context;
 use colored::Colorize;
 use common::app_config::{AdnlConfig, AppConfig, KeyConfig, TimeoutVariant};
-use control_client::client_adnl::ControlClientAdnl;
-use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use secrets_vault::vault_builder::SecretVaultBuilder;
+use std::path::Path;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage nodes in the configuration")]
@@ -75,11 +74,16 @@ pub struct NodeRmCmd {
 }
 
 impl NodeCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        config_path: Option<&str>,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<()> {
         match &self.action {
-            NodeAction::Add(cmd) => cmd.run(path).await,
-            NodeAction::Ls(cmd) => cmd.run(path).await,
-            NodeAction::Rm(cmd) => cmd.run(path).await,
+            NodeAction::Add(cmd) => cmd.run(require_config(config_path)?).await,
+            NodeAction::Ls(cmd) => cmd.run(url, token, config_path).await,
+            NodeAction::Rm(cmd) => cmd.run(require_config(config_path)?).await,
         }
     }
 }
@@ -131,7 +135,7 @@ impl NodeAddCmd {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct NodeView {
     name: String,
     control_server_endpoint: String,
@@ -141,57 +145,24 @@ struct NodeView {
 }
 
 impl NodeLsCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let config = AppConfig::load(path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = api_get(&base_url, "/v1/nodes", token).await?;
+        let resp: serde_json::Value = serde_json::from_str(&body)?;
+        let views: Vec<NodeView> = serde_json::from_value(resp["result"].clone())?;
 
-        if config.nodes.is_empty() {
+        if views.is_empty() {
             match self.format {
                 OutputFormat::Json => println!("[]"),
                 OutputFormat::Table => println!("\n{}\n", "No nodes configured".yellow()),
             }
             return Ok(());
         }
-
-        let vault: Option<Arc<SecretVault>> = SecretVaultBuilder::from_env().await.ok();
-
-        // Check connectivity for all nodes concurrently
-        let mut set = tokio::task::JoinSet::new();
-        for (name, adnl) in config.nodes.clone() {
-            let vault = vault.clone();
-            set.spawn(async move { (name, check_node_status(adnl, vault).await) });
-        }
-
-        let mut statuses: HashMap<String, Result<(), String>> = HashMap::new();
-        while let Some(result) = set.join_next().await {
-            if let Ok((name, status)) = result {
-                statuses.insert(name, status);
-            }
-        }
-
-        let mut views: Vec<NodeView> = config
-            .nodes
-            .into_iter()
-            .map(|(name, adnl)| NodeView {
-                control_server_pubkey: match &adnl.server_key {
-                    KeyConfig::PublicKey { pub_key, .. } => {
-                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pub_key)
-                    }
-                    _ => "-".to_string(),
-                },
-                control_client_secret: match &adnl.client_key {
-                    KeyConfig::VaultKey { name } => name.clone(),
-                    _ => "-".to_string(),
-                },
-                status: match statuses.get(&name) {
-                    Some(Ok(())) => "ok".to_string(),
-                    Some(Err(msg)) => msg.clone(),
-                    None => "unknown".to_string(),
-                },
-                control_server_endpoint: adnl.server_address,
-                name,
-            })
-            .collect();
-        views.sort_by(|a, b| a.name.cmp(&b.name));
 
         match self.format {
             OutputFormat::Json => print_nodes_json(&views)?,
@@ -234,25 +205,6 @@ fn print_nodes_table(views: &[NodeView]) {
         );
     }
     println!();
-}
-
-const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
-
-async fn check_node_status(
-    mut adnl: AdnlConfig,
-    vault: Option<Arc<SecretVault>>,
-) -> Result<(), String> {
-    adnl.timeouts = TimeoutVariant::Single(STATUS_CHECK_TIMEOUT_SECS);
-
-    let adnl_config =
-        adnl.to_node_adnl_config(vault).await.map_err(|e| e.root_cause().to_string())?;
-
-    let mut client = ControlClientAdnl::new(adnl_config, 1);
-    client.connect().await.map_err(|e| e.root_cause().to_string())?;
-    client.ping().await.map_err(|e| e.root_cause().to_string())?;
-    let _ = client.shutdown().await;
-
-    Ok(())
 }
 
 impl NodeRmCmd {

@@ -7,9 +7,15 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::{
-    config_bind_cmd::BindCmd, config_elections_cmd::ElectionsCfgCmd, config_log_cmd::LogCmd,
-    config_node_cmd::NodeCmd, config_pool_cmd::PoolCmd, config_ton_http_api_cmd::TonHttpApiCmd,
-    config_wallet_cmd::WalletCmd, master_wallet_cmd::MasterWalletCmd, utils::save_config,
+    config_bind_cmd::BindCmd,
+    config_elections_cmd::ElectionsCfgCmd,
+    config_log_cmd::LogCmd,
+    config_node_cmd::NodeCmd,
+    config_pool_cmd::PoolCmd,
+    config_ton_http_api_cmd::TonHttpApiCmd,
+    config_wallet_cmd::WalletCmd,
+    master_wallet_cmd::MasterWalletCmd,
+    utils::{require_config, save_config},
 };
 use anyhow::Context;
 use common::{
@@ -35,7 +41,25 @@ pub struct ConfigCmd {
         env = "CONFIG_PATH",
         global = true
     )]
-    config: String,
+    config: Option<String>,
+
+    #[arg(
+        short = 'u',
+        long = "url",
+        value_hint = clap::ValueHint::Url,
+        help = "URL to the node control service API (takes precedence over --config for reads; defaults to http://127.0.0.1:8080 if not --url and --config are provided)",
+        global = true
+    )]
+    url: Option<String>,
+
+    #[arg(
+        long = "token",
+        env = "NODECTL_API_TOKEN",
+        value_name = "TOKEN",
+        help = "JWT token to authenticate with the service API (or NODECTL_API_TOKEN)",
+        global = true
+    )]
+    token: Option<String>,
 
     #[command(subcommand)]
     action: ConfigAction,
@@ -98,19 +122,21 @@ pub struct StakePolicyCmd {
 
 impl ConfigCmd {
     pub async fn run(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
-        let path = Path::new(&self.config);
+        let url = self.url.as_deref();
+        let token = self.token.as_deref();
+        let config_path = self.config.as_deref();
 
         match &self.action {
             ConfigAction::Generate(cmd) => cmd.run().await,
-            ConfigAction::Node(cmd) => cmd.run(path).await,
-            ConfigAction::Wallet(cmd) => cmd.run(path, cancellation_ctx).await,
-            ConfigAction::Pool(cmd) => cmd.run(path).await,
-            ConfigAction::Bind(cmd) => cmd.run(path).await,
-            ConfigAction::TonHttpApi(cmd) => cmd.run(path).await,
-            ConfigAction::MasterWallet(cmd) => cmd.run(path).await,
-            ConfigAction::Elections(cmd) => cmd.run(path).await,
-            ConfigAction::Log(cmd) => cmd.run(path).await,
-            ConfigAction::StakePolicy(cmd) => cmd.run(path).await,
+            ConfigAction::Node(cmd) => cmd.run(config_path, url, token).await,
+            ConfigAction::Wallet(cmd) => cmd.run(config_path, cancellation_ctx, url, token).await,
+            ConfigAction::Pool(cmd) => cmd.run(config_path, url, token).await,
+            ConfigAction::Bind(cmd) => cmd.run(config_path, url, token).await,
+            ConfigAction::TonHttpApi(cmd) => cmd.run(require_config(config_path)?).await,
+            ConfigAction::MasterWallet(cmd) => cmd.run(url, token, config_path).await,
+            ConfigAction::Elections(cmd) => cmd.run(config_path, url, token).await,
+            ConfigAction::Log(cmd) => cmd.run(config_path, url, token).await,
+            ConfigAction::StakePolicy(cmd) => cmd.run(require_config(config_path)?).await,
         }
     }
 }
