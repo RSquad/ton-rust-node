@@ -757,6 +757,13 @@ impl PoolDepositValidatorCmd {
             .pools
             .get(pool_name)
             .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))?;
+        if !matches!(pool_cfg, PoolConfig::TONCore { .. }) {
+            anyhow::bail!(
+                "Binding '{}' points to non-TONCore pool '{}'; deposit-validator is only supported for TONCore pools",
+                self.binding,
+                pool_name
+            );
+        }
 
         let (wallet_address, wallet_info_data, wallet_secret) =
             wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
@@ -850,6 +857,13 @@ impl PoolWithdrawValidatorCmd {
             .pools
             .get(pool_name)
             .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))?;
+        if !matches!(pool_cfg, PoolConfig::TONCore { .. }) {
+            anyhow::bail!(
+                "Binding '{}' points to non-TONCore pool '{}'; withdraw-validator is only supported for TONCore pools",
+                self.binding,
+                pool_name
+            );
+        }
 
         let (wallet_address, wallet_info_data, wallet_secret) =
             wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;

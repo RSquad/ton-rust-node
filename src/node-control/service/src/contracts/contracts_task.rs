@@ -438,6 +438,11 @@ impl ContractsMonitor {
             let inner = pool_binding.inner_pools();
             let pools = if inner.is_empty() { vec![pool_binding.clone()] } else { inner };
             for pool in pools {
+                // Skip SNP pools early: update_validator_set is TONCore-specific.
+                if pool.storage_reserve() <= SNP_STORAGE_RESERVE {
+                    continue;
+                }
+
                 let pool_data = match pool.get_pool_data().await {
                     Ok(d) => d,
                     Err(e) => {
@@ -456,10 +461,7 @@ impl ContractsMonitor {
                     node_id, pool.address().await, pool_data.state, pool_data.validator_set_changes_count
                 );
 
-                if pool.storage_reserve() <= SNP_STORAGE_RESERVE
-                    || pool_data.state != 2
-                    || pool_data.validator_set_changes_count >= 2
-                {
+                if pool_data.state != 2 || pool_data.validator_set_changes_count >= 2 {
                     continue;
                 }
 

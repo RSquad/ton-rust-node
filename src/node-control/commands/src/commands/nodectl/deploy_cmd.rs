@@ -282,8 +282,17 @@ struct DeployPoolResult {
     pub config: String,
     pub account_state: AccountState,
     pub address: String,
+    #[serde(default)]
+    pub targets: Vec<DeployPoolTargetResult>,
     pub deployed: bool,
     pub error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DeployPoolTargetResult {
+    pub address: String,
+    pub account_state: AccountState,
+    pub deployed: bool,
 }
 
 impl DeployPoolCmd {
@@ -428,7 +437,12 @@ impl DeployPoolCmd {
         let mut seqno = wallet_info.seqno;
 
         for (i, (pool_address, state_init)) in deploy_targets.iter().enumerate() {
-            res.borrow_mut().address = pool_address.to_string();
+            let mut target_result = DeployPoolTargetResult {
+                address: pool_address.to_string(),
+                account_state: AccountState::Uninitialized,
+                deployed: false,
+            };
+            res.borrow_mut().address = target_result.address.clone();
 
             if self.verbose {
                 println!("Update pool info [{}/{}] ...", i + 1, deploy_targets.len());
@@ -437,13 +451,17 @@ impl DeployPoolCmd {
             let pool_info =
                 rpc_client.get_address_information(pool_address).await.map_err(set_err)?;
             res.borrow_mut().account_state = pool_info.state.clone();
+            target_result.account_state = pool_info.state.clone();
 
             if pool_info.state == AccountState::Active {
                 if self.verbose {
                     println!("The pool '{}' is already deployed", pool_address);
                 }
+                target_result.deployed = true;
+                res.borrow_mut().targets.push(target_result);
                 continue;
             } else if pool_info.state == AccountState::Frozen {
+                res.borrow_mut().targets.push(target_result);
                 return Err(set_err(anyhow::anyhow!("The pool '{}' is frozen", pool_address)));
             }
 
@@ -498,6 +516,9 @@ impl DeployPoolCmd {
             .map_err(set_err)?;
 
             seqno = seqno.map(|s| s + 1);
+            target_result.account_state = AccountState::Active;
+            target_result.deployed = true;
+            res.borrow_mut().targets.push(target_result);
         }
 
         res.borrow_mut().deployed = true;
