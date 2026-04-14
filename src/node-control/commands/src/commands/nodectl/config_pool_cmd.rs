@@ -18,29 +18,20 @@ use crate::commands::nodectl::{
 use colored::Colorize;
 use common::{
     app_config::{
-        AppConfig, DEFAULT_TONCORE_MAX_NOMINATORS, DEFAULT_TONCORE_MIN_NOMINATOR_STAKE_NANOTONS,
-        DEFAULT_TONCORE_MIN_VALIDATOR_STAKE_NANOTONS, PoolConfig,
+        AppConfig, DEFAULT_TONCORE_MAX_NOMINATORS, DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
+        DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, PoolConfig, TonCoreInitParams, TonCorePoolConfig,
     },
     task_cancellation::CancellationCtx,
     ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
 use contracts::{
-    NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, TonWallet, resolve_toncore_nominator_pools,
-    resolve_toncore_pool, ton_core_nominator::messages as pool_messages,
+    NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl, TonWallet,
+    ton_core_nominator::messages as pool_messages,
 };
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
 use std::{io::Write, path::Path, str::FromStr, sync::Arc};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
-
-#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
-enum PoolAddKind {
-    /// Single Nominator Pool (`kind: "snp"` in config)
-    #[default]
-    Snp,
-    /// TONCore nominator (`kind: "core"`): dual pools by default; `--single-pool` for one pool
-    Core,
-}
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage pools in the configuration")]
@@ -51,8 +42,10 @@ pub struct PoolCmd {
 
 #[derive(clap::Subcommand, Clone)]
 pub enum PoolAction {
-    /// Add a pool to the configuration
+    /// Add an SNP pool to the configuration
     Add(PoolAddCmd),
+    /// Add a TONCore nominator pool to the configuration
+    AddCore(PoolAddCoreCmd),
     /// List all configured pools
     Ls(PoolLsCmd),
     /// Remove a pool from the configuration
@@ -64,56 +57,62 @@ pub enum PoolAction {
 }
 
 #[derive(clap::Args, Clone)]
-#[command(about = "Add a pool to the configuration")]
+#[command(about = "Add an SNP pool to the configuration")]
 pub struct PoolAddCmd {
     #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
     name: String,
-    #[arg(long = "kind", value_enum, default_value_t = PoolAddKind::Snp, help = "snp or core")]
-    kind: PoolAddKind,
     #[arg(
         short = 'a',
         long = "address",
-        help = "SNP: deployed pool address. Core dual: slot 0 (`addresses[0]`). Core `--single-pool`: config `address` (one contract). Mutually exclusive with --address-even/--address-odd except dual+--address"
+        help = "Pool contract address, raw or base64url (if already deployed)"
     )]
     address: Option<String>,
     #[arg(
-        long = "address-even",
-        conflicts_with = "single_pool",
-        help = "Core dual only: even-round pool address (optional; derived if omitted)"
-    )]
-    address_even: Option<String>,
-    #[arg(
-        long = "address-odd",
-        conflicts_with = "single_pool",
-        help = "Core dual only: odd-round pool address (optional; derived if omitted)"
-    )]
-    address_odd: Option<String>,
-    /// Core: one TONCore contract (`dual_pools: false`); cannot combine with --address-even / --address-odd
-    #[arg(long = "single-pool", conflicts_with_all = ["address_even", "address_odd"])]
-    single_pool: bool,
-    #[arg(
         short = 'o',
         long = "owner",
-        help = "SNP: owner address, raw or base64url (for deployment/verification)"
+        help = "Owner address, raw or base64url (for deployment/verification)"
     )]
     owner: Option<String>,
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Add a TONCore nominator pool to the configuration")]
+pub struct PoolAddCoreCmd {
+    #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
+    name: String,
+
     #[arg(
         long = "validator-share",
-        help = "Core: validator reward share (basis points, 0–65535; e.g. 5000 ≈ 50%)"
+        help = "Validator reward share in basis points (e.g. 1000 = 10%)"
     )]
     validator_share: Option<u16>,
-    #[arg(long = "max-nominators", help = "Core: max nominators (default: 40)")]
+
+    #[arg(long = "max-nominators", help = "Maximum number of nominators (default: 40)")]
     max_nominators: Option<u16>,
-    #[arg(
-        long = "min-validator-stake",
-        help = "Core: min validator stake in TON (embedded at deploy; optional)"
-    )]
+
+    #[arg(long = "min-validator-stake", help = "Minimum validator stake in TON (default: 10 000)")]
     min_validator_stake: Option<f64>,
-    #[arg(
-        long = "min-nominator-stake",
-        help = "Core: min nominator stake in TON (embedded at deploy; optional)"
-    )]
+
+    #[arg(long = "min-nominator-stake", help = "Minimum nominator stake in TON (default: 10 000)")]
     min_nominator_stake: Option<f64>,
+
+    #[arg(
+        long = "address",
+        help = "Existing pool address for even-round slot (slot 0), raw or base64url"
+    )]
+    address: Option<String>,
+
+    #[arg(
+        long = "address-odd",
+        help = "Existing pool address for odd-round slot (slot 1), raw or base64url"
+    )]
+    address_odd: Option<String>,
+
+    #[arg(
+        long = "dual",
+        help = "Configure two pool slots (even + odd rounds) with the same deploy params"
+    )]
+    dual: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -182,6 +181,7 @@ impl PoolCmd {
     pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         match &self.action {
             PoolAction::Add(cmd) => cmd.run(path).await,
+            PoolAction::AddCore(cmd) => cmd.run(path).await,
             PoolAction::Ls(cmd) => cmd.run(path).await,
             PoolAction::Rm(cmd) => cmd.run(path).await,
             PoolAction::DepositValidator(cmd) => cmd.run(path, cancellation_ctx).await,
@@ -192,6 +192,18 @@ impl PoolCmd {
 
 impl PoolAddCmd {
     pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+        if self.address.is_none() && self.owner.is_none() {
+            anyhow::bail!("At least one of --address or --owner must be specified");
+        }
+
+        let normalized_address = self
+            .address
+            .as_deref()
+            .map(|addr| normalize_ton_address(addr, "address"))
+            .transpose()?;
+        let normalized_owner =
+            self.owner.as_deref().map(|owner| normalize_ton_address(owner, "owner")).transpose()?;
+
         let mut config = AppConfig::load(path)?;
 
         if config.pools.contains_key(&self.name) {
@@ -201,153 +213,91 @@ impl PoolAddCmd {
             );
         }
 
-        if self.single_pool && !matches!(self.kind, PoolAddKind::Core) {
-            anyhow::bail!("--single-pool is only valid with --kind core");
-        }
-
-        let (pool_config, info) = match self.kind {
-            PoolAddKind::Snp => {
-                if self.address.is_none() && self.owner.is_none() {
-                    anyhow::bail!(
-                        "For SNP: at least one of --address or --owner must be specified"
-                    );
-                }
-
-                let normalized_address = self
-                    .address
-                    .as_deref()
-                    .map(|addr| normalize_ton_address(addr, "address"))
-                    .transpose()?;
-                let normalized_owner = self
-                    .owner
-                    .as_deref()
-                    .map(|owner| normalize_ton_address(owner, "owner"))
-                    .transpose()?;
-
-                let info = match (&normalized_address, &normalized_owner) {
-                    (Some(a), Some(o)) => format!("kind=snp address='{}', owner='{}'", a, o),
-                    (Some(a), None) => format!("kind=snp address='{}'", a),
-                    (None, Some(o)) => {
-                        format!("kind=snp owner='{}' (address will be calculated on bind)", o)
-                    }
-                    _ => unreachable!(),
-                };
-
-                (
-                    PoolConfig::SNP {
-                        address: normalized_address.clone(),
-                        owner: normalized_owner.clone(),
-                    },
-                    info,
-                )
-            }
-            PoolAddKind::Core => {
-                let share = self
-                    .validator_share
-                    .ok_or_else(|| anyhow::anyhow!("For core: --validator-share is required"))?;
-
-                if !self.single_pool
-                    && self.address.is_some()
-                    && (self.address_even.is_some() || self.address_odd.is_some())
-                {
-                    anyhow::bail!(
-                        "For core dual: use either --address (slot 0) or --address-even / --address-odd, not both"
-                    );
-                }
-
-                let normalized_address = self
-                    .address
-                    .as_deref()
-                    .map(|a| normalize_ton_address(a, "address"))
-                    .transpose()?;
-
-                let max_n = self.max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS);
-                let min_validator_stake_nano = self
-                    .min_validator_stake
-                    .map(tons_f64_to_nanotons)
-                    .unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE_NANOTONS);
-                let min_nominator_stake_nano = self
-                    .min_nominator_stake
-                    .map(tons_f64_to_nanotons)
-                    .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE_NANOTONS);
-
-                if self.single_pool {
-                    let addr_disp = normalized_address.as_deref().unwrap_or("<will be derived>");
-                    let info = format!(
-                        "kind=core single_pool (dual_pools=false) validator_share={}, address={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
-                        share, addr_disp, max_n, min_validator_stake_nano, min_nominator_stake_nano
-                    );
-                    (
-                        PoolConfig::TONCore {
-                            dual_pools: false,
-                            validator_share: share,
-                            address: normalized_address.clone(),
-                            addresses: None,
-                            max_nominators: max_n,
-                            min_validator_stake: min_validator_stake_nano,
-                            min_nominator_stake: min_nominator_stake_nano,
-                        },
-                        info,
-                    )
-                } else {
-                    let addr_even = self
-                        .address_even
-                        .as_deref()
-                        .map(|a| normalize_ton_address(a, "address-even"))
-                        .transpose()?;
-                    let addr_odd = self
-                        .address_odd
-                        .as_deref()
-                        .map(|a| normalize_ton_address(a, "address-odd"))
-                        .transpose()?;
-
-                    let addresses = if normalized_address.is_some() {
-                        Some(vec![normalized_address.clone()])
-                    } else if addr_even.is_some() || addr_odd.is_some() {
-                        Some(vec![addr_even.clone(), addr_odd.clone()])
-                    } else {
-                        None
-                    };
-
-                    let (even_disp, odd_disp) = match &addresses {
-                        Some(v) => {
-                            let e =
-                                v.first().and_then(|x| x.as_deref()).unwrap_or("<will be derived>");
-                            let o =
-                                v.get(1).and_then(|x| x.as_deref()).unwrap_or("<will be derived>");
-                            (e, o)
-                        }
-                        None => ("<will be derived>", "<will be derived>"),
-                    };
-                    let info = format!(
-                        "kind=core dual_pools (default) validator_share={}, even_round={}, odd_round={}, deploy_params: max_nominators={}, min_validator_stake={}, min_nominator_stake={}",
-                        share,
-                        even_disp,
-                        odd_disp,
-                        max_n,
-                        min_validator_stake_nano,
-                        min_nominator_stake_nano
-                    );
-
-                    (
-                        PoolConfig::TONCore {
-                            dual_pools: true,
-                            validator_share: share,
-                            address: None,
-                            addresses,
-                            max_nominators: max_n,
-                            min_validator_stake: min_validator_stake_nano,
-                            min_nominator_stake: min_nominator_stake_nano,
-                        },
-                        info,
-                    )
-                }
-            }
+        let pool_config = PoolConfig::SNP {
+            address: normalized_address.clone(),
+            owner: normalized_owner.clone(),
         };
 
         config.pools.insert(self.name.clone(), pool_config);
         save_config(&config, path)?;
+
+        let info = match (&normalized_address, &normalized_owner) {
+            (Some(a), Some(o)) => format!("address='{}', owner='{}'", a, o),
+            (Some(a), None) => format!("address='{}'", a),
+            (None, Some(o)) => format!("owner='{}' (address will be calculated on bind)", o),
+            _ => unreachable!(),
+        };
+
         println!("\n{} Pool '{}' added ({})\n", "OK".green().bold(), self.name, info);
+        Ok(())
+    }
+}
+
+impl PoolAddCoreCmd {
+    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+        if self.address.is_none() && self.validator_share.is_none() {
+            anyhow::bail!("At least one of --address or --validator-share must be specified");
+        }
+
+        let mut config = AppConfig::load(path)?;
+
+        if config.pools.contains_key(&self.name) {
+            anyhow::bail!(
+                "Pool '{}' already exists. Remove it first or use a different name.",
+                self.name
+            );
+        }
+
+        let address0 =
+            self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
+
+        let address_odd = self
+            .address_odd
+            .as_deref()
+            .map(|a| normalize_ton_address(a, "address-odd"))
+            .transpose()?;
+
+        let params = self.validator_share.map(|vs| TonCoreInitParams {
+            validator_share: vs,
+            max_nominators: self.max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
+            min_validator_stake: self
+                .min_validator_stake
+                .map(tons_f64_to_nanotons)
+                .unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE),
+            min_nominator_stake: self
+                .min_nominator_stake
+                .map(tons_f64_to_nanotons)
+                .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
+        });
+
+        let slot0 = Some(TonCorePoolConfig { address: address0.clone(), params: params.clone() });
+        let slot1 = if self.dual || address_odd.is_some() {
+            Some(TonCorePoolConfig { address: address_odd.clone(), params: params.clone() })
+        } else {
+            None
+        };
+
+        config.pools.insert(self.name.clone(), PoolConfig::TONCore { pools: [slot0, slot1] });
+        save_config(&config, path)?;
+
+        let mut info_parts = Vec::new();
+        if let Some(vs) = self.validator_share {
+            info_parts.push(format!("validator_share={vs} bp"));
+        }
+        if let Some(a) = &address0 {
+            info_parts.push(format!("address='{a}'"));
+        }
+        if self.dual || address_odd.is_some() {
+            let odd_str = address_odd.as_deref().unwrap_or("<to deploy>");
+            info_parts.push(format!("address-odd='{odd_str}'"));
+        }
+
+        println!(
+            "\n{} TONCore pool '{}' added ({})\n",
+            "OK".green().bold(),
+            self.name,
+            info_parts.join(", ")
+        );
         Ok(())
     }
 }
@@ -456,69 +406,30 @@ async fn collect_pool_views(
                     validator_share: None,
                 });
             }
-            PoolConfig::TONCore { dual_pools: false, validator_share, address, .. } => {
-                let resolved_addr = if address.is_some() {
-                    address.clone()
-                } else {
-                    resolve_toncore_pool_address_via_binding(
-                        name,
-                        pool,
-                        config,
-                        &mut vault,
-                        warn_on_error,
-                    )
-                    .await
-                    .ok()
-                };
+            PoolConfig::TONCore { pools } => {
+                let is_dual = pools[1].is_some();
+                let validator_share = pools
+                    .iter()
+                    .flatten()
+                    .find_map(|s| s.params.as_ref().map(|p| p.validator_share));
 
-                let balance_result = if let Some(ref addr_str) = resolved_addr {
-                    resolve_pool_balance(&Ok(addr_str.clone()), rpc_client).await.ok()
-                } else {
-                    None
-                };
+                if is_dual {
+                    // Two-pool (even + odd) view
+                    let mut resolved_addrs: Vec<String> = Vec::new();
+                    for slot in pools.iter().flatten() {
+                        let addr_str = slot.address.clone().unwrap_or_else(|| {
+                            resolve_toncore_pool_address_via_binding_for_slot(slot, name, config)
+                                .unwrap_or_else(|| "<not deployed>".into())
+                        });
+                        resolved_addrs.push(addr_str);
+                    }
+                    while resolved_addrs.len() < 2 {
+                        resolved_addrs.push("<not deployed>".into());
+                    }
 
-                views.push(PoolView {
-                    name: name.clone(),
-                    kind: "Core".to_string(),
-                    balance: balance_result,
-                    address: resolved_addr,
-                    owner: None,
-                    addresses: None,
-                    balances: None,
-                    validator_share: Some(*validator_share),
-                });
-            }
-            PoolConfig::TONCore { dual_pools: true, validator_share, addresses, .. } => {
-                let has_stored = addresses.as_ref().is_some_and(|a| a.iter().any(|o| o.is_some()));
-
-                let resolved_addrs = if has_stored {
-                    addresses.as_ref().map(|a| {
-                        let mut labels: Vec<String> = a
-                            .iter()
-                            .map(|o| o.clone().unwrap_or_else(|| "<not deployed>".into()))
-                            .collect();
-                        while labels.len() < 2 {
-                            labels.push("<not deployed>".into());
-                        }
-                        labels.truncate(2);
-                        labels
-                    })
-                } else {
-                    resolve_toncore_nominator_pools_addresses_via_binding(
-                        name,
-                        pool,
-                        config,
-                        &mut vault,
-                        warn_on_error,
-                    )
-                    .await
-                    .ok()
-                };
-
-                let pool_balances =
-                    if let (Some(addrs), Some(client)) = (&resolved_addrs, rpc_client) {
+                    let pool_balances = if let Some(client) = rpc_client {
                         let mut bals = Vec::new();
-                        for addr_str in addrs {
+                        for addr_str in &resolved_addrs {
                             if let Ok(addr) = MsgAddressInt::from_str(addr_str) {
                                 match client.get_address_information(&addr).await {
                                     Ok(info) => bals.push(display_tons(info.balance)),
@@ -533,16 +444,42 @@ async fn collect_pool_views(
                         None
                     };
 
-                views.push(PoolView {
-                    name: name.clone(),
-                    kind: "TONCore".to_string(),
-                    balance: None,
-                    address: None,
-                    owner: None,
-                    addresses: resolved_addrs,
-                    balances: pool_balances,
-                    validator_share: Some(*validator_share),
-                });
+                    views.push(PoolView {
+                        name: name.clone(),
+                        kind: "TONCore".to_string(),
+                        balance: None,
+                        address: None,
+                        owner: None,
+                        addresses: Some(resolved_addrs),
+                        balances: pool_balances,
+                        validator_share,
+                    });
+                } else {
+                    // Single-pool view (slot 0 only)
+                    let slot0 = pools[0].as_ref();
+                    let resolved_addr = slot0.and_then(|s| s.address.clone()).or_else(|| {
+                        slot0.and_then(|s| {
+                            resolve_toncore_pool_address_via_binding_for_slot(s, name, config)
+                        })
+                    });
+
+                    let balance_result = if let Some(ref addr_str) = resolved_addr {
+                        resolve_pool_balance(&Ok(addr_str.clone()), rpc_client).await.ok()
+                    } else {
+                        None
+                    };
+
+                    views.push(PoolView {
+                        name: name.clone(),
+                        kind: "Core".to_string(),
+                        balance: balance_result,
+                        address: resolved_addr,
+                        owner: None,
+                        addresses: None,
+                        balances: None,
+                        validator_share,
+                    });
+                }
             }
         }
     }
@@ -697,122 +634,14 @@ async fn resolve_pool_address(
     Ok(addr_str)
 }
 
-async fn resolve_validator_addr_via_binding(
-    pool_name: &str,
-    config: &AppConfig,
-    vault: &mut Option<Option<Arc<SecretVault>>>,
-    warn_on_error: bool,
-) -> Result<MsgAddressInt, String> {
-    if vault.is_none() {
-        *vault = Some(match SecretVaultBuilder::from_env().await {
-            Ok(v) => Some(v),
-            Err(e) => {
-                if warn_on_error {
-                    println!(
-                        "{}: {}",
-                        "Warning: failed to initialize secret vault".yellow(),
-                        e.to_string().yellow()
-                    );
-                }
-                None
-            }
-        });
-    }
-    let vault_arc = vault.as_ref().and_then(|v| v.clone()).ok_or("vault unavailable")?;
-
-    let mut matching: Vec<_> =
-        config.bindings.iter().filter(|(_, b)| b.pool.as_deref() == Some(pool_name)).collect();
-    if matching.is_empty() {
-        return Err("no binding found".to_string());
-    }
-    matching.sort_by_key(|(k, b)| (!b.enable, k.as_str()));
-    let (_, binding) = matching[0];
-
-    let wallet_cfg = config.wallets.get(&binding.wallet).ok_or("wallet not configured")?;
-    let secret =
-        wallet_cfg.key.read_secret(Some(vault_arc)).await.map_err(|_| "get wallet key error")?;
-    let keypair = secret.as_keypair().map_err(|_| "wallet key is not a keypair")?;
-    let pub_key = keypair
-        .public_key()
-        .await
-        .map_err(|_| "get public key error")?
-        .ok_or("empty public key")?;
-    calculate_wallet_address(wallet_cfg, &pub_key)
-        .map_err(|_| "address calculation error".to_string())
-}
-
-async fn resolve_toncore_pool_address_via_binding(
-    pool_name: &str,
-    pool: &PoolConfig,
-    config: &AppConfig,
-    vault: &mut Option<Option<Arc<SecretVault>>>,
-    warn_on_error: bool,
-) -> Result<String, String> {
-    let PoolConfig::TONCore {
-        dual_pools: false,
-        validator_share,
-        max_nominators,
-        min_validator_stake,
-        min_nominator_stake,
-        ..
-    } = pool
-    else {
-        return Err("not a single-pool TONCore".into());
-    };
-    let wallet_addr =
-        resolve_validator_addr_via_binding(pool_name, config, vault, warn_on_error).await?;
-    let resolved = resolve_toncore_pool(
-        &wallet_addr,
-        *validator_share,
-        None,
-        Some(*max_nominators),
-        Some(*min_validator_stake),
-        Some(*min_nominator_stake),
-    )
-    .map_err(|e| format!("resolve error: {e}"))?;
-    resolved
-        .address
-        .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
-        .map_err(|_| "address conversion error".into())
-}
-
-async fn resolve_toncore_nominator_pools_addresses_via_binding(
-    pool_name: &str,
-    pool: &PoolConfig,
-    config: &AppConfig,
-    vault: &mut Option<Option<Arc<SecretVault>>>,
-    warn_on_error: bool,
-) -> Result<Vec<String>, String> {
-    let PoolConfig::TONCore {
-        dual_pools: true,
-        validator_share,
-        max_nominators,
-        min_validator_stake,
-        min_nominator_stake,
-        ..
-    } = pool
-    else {
-        return Err("not a TONCore nominator (dual_pools) pool".into());
-    };
-    let wallet_addr =
-        resolve_validator_addr_via_binding(pool_name, config, vault, warn_on_error).await?;
-    let resolved = resolve_toncore_nominator_pools(
-        &wallet_addr,
-        *validator_share,
-        None,
-        Some(*max_nominators),
-        Some(*min_validator_stake),
-        Some(*min_nominator_stake),
-    )
-    .map_err(|e| format!("resolve error: {e}"))?;
-    resolved
-        .iter()
-        .map(|r| {
-            r.address
-                .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
-                .map_err(|_| "address conversion error".to_string())
-        })
-        .collect()
+/// Resolve a single TONCore pool slot address (synchronous, no vault needed —
+/// only used when the address is already stored in config).
+fn resolve_toncore_pool_address_via_binding_for_slot(
+    slot: &TonCorePoolConfig,
+    _pool_name: &str,
+    _config: &AppConfig,
+) -> Option<String> {
+    slot.address.clone()
 }
 
 fn normalize_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<String> {

@@ -13,5 +13,5 @@ mod wrapper;
 
 pub use wrapper::{
     NominatorPoolWrapperImpl, ResolvedTonCorePool, resolve_deploy_pool_params,
-    resolve_toncore_nominator_pools, resolve_toncore_pool,
+    resolve_toncore_nominator_pools, resolve_toncore_pool, toncore_pool_address_and_state,
 };

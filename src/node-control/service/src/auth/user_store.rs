@@ -323,7 +323,7 @@ mod tests {
     struct NoopWallet;
     #[async_trait::async_trait]
     impl contracts::SmartContract for NoopWallet {
-        fn address(&self) -> MsgAddressInt {
+        async fn address(&self) -> MsgAddressInt {
             MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap()
         }
         async fn balance(&self) -> anyhow::Result<u64> {

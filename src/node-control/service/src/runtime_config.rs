@@ -8,15 +8,14 @@
  */
 use anyhow::Context;
 use common::{
-    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
+    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, TonCorePoolConfig, WalletConfig},
     time_format,
     ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
 use contracts::{
-    NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl, TonCoreNominatorPair,
-    TonWallet, WalletContract, contract_provider, nominator_constituents,
-    resolve_toncore_nominator_pools, resolve_toncore_pool,
+    ContractProvider, NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl,
+    TonCoreNominatorRouter, TonWallet, WalletContract, contract_provider, resolve_toncore_pool,
 };
 use secrets_vault::{
     types::{algorithm::Algorithm, secret_id::SecretId, secret_spec::SecretSpec},
@@ -168,7 +167,7 @@ impl RuntimeConfigStore {
         struct NoopWallet;
         #[async_trait::async_trait]
         impl SmartContract for NoopWallet {
-            fn address(&self) -> MsgAddressInt {
+            async fn address(&self) -> MsgAddressInt {
                 MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap()
             }
             async fn balance(&self) -> anyhow::Result<u64> {
@@ -341,7 +340,10 @@ impl RuntimeConfigStore {
         let master_wallet = open_wallet(&master_config, rpc_client, vault, true)
             .await
             .context("open master wallet")?;
-        tracing::info!("master wallet opened: address={}", master_wallet.address().to_string());
+        tracing::info!(
+            "master wallet opened: address={}",
+            master_wallet.address().await.to_string()
+        );
         Ok(master_wallet)
     }
 
@@ -360,15 +362,18 @@ impl RuntimeConfigStore {
                 let validator_address = wallets
                     .get(node_name)
                     .context(format!("validator wallet not found: {}", node_name))?
-                    .address();
+                    .address()
+                    .await;
                 let pool = open_nominator_pool(cfg, rpc_client.clone(), &validator_address)
                     .map_err(|e| {
                         anyhow::anyhow!("node [{}] open nominator pool error: {:#}", node_name, e)
                     })?;
-                let addrs: Vec<String> = nominator_constituents(pool.clone())
-                    .into_iter()
-                    .map(|p| p.address().to_string())
-                    .collect();
+                let inner = pool.inner_pools();
+                let all_pools = if inner.is_empty() { vec![pool.clone()] } else { inner };
+                let mut addrs = Vec::with_capacity(all_pools.len());
+                for p in all_pools {
+                    addrs.push(p.address().await.to_string());
+                }
                 tracing::info!("[{}] opened nominator pool(s): {}", node_name, addrs.join(", "));
                 map.insert(node_name.to_owned(), pool);
             }
@@ -394,7 +399,7 @@ impl RuntimeConfigStore {
             tracing::info!(
                 "[{}] opened wallet: address={}",
                 node_name,
-                wallet.address().to_string()
+                wallet.address().await.to_string()
             );
             map.insert(node_name.to_owned(), wallet);
         }
@@ -488,6 +493,40 @@ async fn open_wallet(
     Ok(Arc::new(wallet))
 }
 
+/// One TONCore pool slot from config: existing address only, or deploy params (via [`resolve_toncore_pool`]).
+fn open_toncore_pool_slot(
+    slot: &Option<TonCorePoolConfig>,
+    provider: Arc<dyn ContractProvider>,
+    validator_addr: &MsgAddressInt,
+) -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
+    let Some(cfg) = slot else {
+        return Ok(None);
+    };
+    match (&cfg.address, &cfg.params) {
+        (Some(addr_str), None) => {
+            let addr = MsgAddressInt::from_str(addr_str)
+                .context(format!("invalid TONCore pool address: {addr_str}"))?;
+            Ok(Some(Arc::new(NominatorPoolWrapperImpl::new(provider, addr))))
+        }
+        (_, Some(params)) => {
+            let resolved = resolve_toncore_pool(
+                validator_addr,
+                params.validator_share,
+                cfg.address.as_deref(),
+                Some(params.max_nominators),
+                Some(params.min_validator_stake),
+                Some(params.min_nominator_stake),
+            )?;
+            Ok(Some(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
+                provider,
+                resolved.address,
+                resolved.state_init,
+            ))))
+        }
+        (None, None) => anyhow::bail!("TONCore pool slot has neither address nor params"),
+    }
+}
+
 fn open_nominator_pool(
     config: &PoolConfig,
     rpc_client: Arc<ClientJsonRpc>,
@@ -539,60 +578,11 @@ fn open_nominator_pool(
             };
             Ok(Arc::new(pool))
         }
-        PoolConfig::TONCore {
-            dual_pools: false,
-            validator_share,
-            address,
-            max_nominators,
-            min_validator_stake,
-            min_nominator_stake,
-            ..
-        } => {
-            let resolved = resolve_toncore_pool(
-                validator_addr,
-                *validator_share,
-                address.as_deref(),
-                Some(*max_nominators),
-                Some(*min_validator_stake),
-                Some(*min_nominator_stake),
-            )?;
-            Ok(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
-                contract_provider!(rpc_client.clone()),
-                resolved.address,
-                resolved.state_init,
-            )))
-        }
-        PoolConfig::TONCore {
-            dual_pools: true,
-            validator_share,
-            addresses,
-            max_nominators,
-            min_validator_stake,
-            min_nominator_stake,
-            ..
-        } => {
-            let resolved = resolve_toncore_nominator_pools(
-                validator_addr,
-                *validator_share,
-                addresses.as_ref().map(|v| v.as_slice()),
-                Some(*max_nominators),
-                Some(*min_validator_stake),
-                Some(*min_nominator_stake),
-            )?;
-            let [r0, r1] = resolved;
-            let p0: Arc<dyn NominatorWrapper> =
-                Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
-                    contract_provider!(rpc_client.clone()),
-                    r0.address,
-                    r0.state_init,
-                ));
-            let p1: Arc<dyn NominatorWrapper> =
-                Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
-                    contract_provider!(rpc_client.clone()),
-                    r1.address,
-                    r1.state_init,
-                ));
-            Ok(Arc::new(TonCoreNominatorPair::new([p0, p1])))
+        PoolConfig::TONCore { pools } => {
+            let provider = contract_provider!(rpc_client.clone());
+            let w0 = open_toncore_pool_slot(&pools[0], provider.clone(), validator_addr)?;
+            let w1 = open_toncore_pool_slot(&pools[1], provider, validator_addr)?;
+            Ok(Arc::new(TonCoreNominatorRouter::from_wrappers([w0, w1])))
         }
     }
 }

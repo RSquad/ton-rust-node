@@ -10,12 +10,21 @@ use crate::SmartContract;
 use std::sync::Arc;
 use ton_block::{MsgAddressInt, StateInit};
 
+/// Minimum TON to keep in an SNP pool (or validator wallet for direct staking) for storage.
+/// Matches the `MIN_TONS_FOR_STORAGE` constant in the single-nominator contract (~1 TON).
+pub const SNP_STORAGE_RESERVE: u64 = 1_000_000_000;
+/// Minimum TON to keep in a TONCore nominator pool for storage.
+/// Matches `MIN_TONS_FOR_STORAGE` in pool.fc (10 TON).
+pub const TONCORE_STORAGE_RESERVE: u64 = 10_000_000_000;
+
 /// Trait for interacting with single-nominator or TONCore nominator pool contracts.
 ///
 /// Based on https://github.com/ton-blockchain/single-nominator
 ///
-/// TONCore nominator with two pools uses [`crate::nominator::TonCoreNominatorPair`], which
-/// implements this trait and picks the first pool with `get_pool_data().state == 0` for staking.
+/// TONCore nominator with two pools uses [`crate::nominator::TonCoreNominatorRouter`], which
+/// implements this trait. Use [`inner_pools`](NominatorWrapper::inner_pools) to iterate the
+/// physical pool contracts (deploy, RPC). For single pools `inner_pools` returns an empty vec —
+/// the pool itself is the only physical contract.
 #[async_trait::async_trait]
 pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Get the owner and validator addresses stored in the contract
@@ -26,37 +35,16 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     fn state_init(&self) -> Option<StateInit> {
         None
     }
-
-    /// TONCore nominator (two pools): the two on-chain pool contracts. Default `None`.
-    fn as_toncore_nominator_slots(
-        &self,
-    ) -> Option<(Arc<dyn NominatorWrapper>, Arc<dyn NominatorWrapper>)> {
-        None
-    }
-
-    /// Pool (or elector-facing) address to use for the current stake operation.
-    async fn resolve_staking_address(&self) -> anyhow::Result<MsgAddressInt> {
-        Ok(self.address())
-    }
-
-    /// `true` for any TONCore nominator pool (single or pair).
-    fn is_toncore_pool(&self) -> bool {
-        false
-    }
-
-    /// `true` only for TONCore nominator with two pools ([`crate::nominator::TonCoreNominatorPair`]).
-    fn is_toncore_nominator_pair(&self) -> bool {
-        false
-    }
-}
-
-/// Physical pool contracts for this node binding (one, or two for TONCore nominator pair).
-#[must_use]
-pub fn nominator_constituents(pool: Arc<dyn NominatorWrapper>) -> Vec<Arc<dyn NominatorWrapper>> {
-    match pool.as_toncore_nominator_slots() {
-        Some((a, b)) => vec![a, b],
-        None => vec![pool],
-    }
+    /// Physical sub-pool contracts (TONCore pair only).
+    ///
+    /// Returns the two on-chain [`NominatorWrapper`] contracts for a
+    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter), or an empty `Vec`
+    /// for every other pool type (SNP, single TONCore). When the result is empty the pool itself
+    /// is the single physical contract.
+    fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>>;
+    /// Minimum nanotons that must remain in the staking account after a stake withdrawal
+    /// (contract storage reserve). SNP = [`SNP_STORAGE_RESERVE`]; TONCore = [`TONCORE_STORAGE_RESERVE`].
+    fn storage_reserve(&self) -> u64;
 }
 
 /// Roles stored in the single nominator contract

@@ -78,7 +78,7 @@ pub async fn run(
     let elector = Arc::new(ElectorWrapperImpl::new(contract_provider!(rpc_client)));
 
     let mut runner =
-        ElectionRunner::new(config, &app_config.bindings, elector, providers, wallets, pools);
+        ElectionRunner::new(config, &app_config.bindings, elector, providers, wallets, pools).await;
     runner
         .run_loop(
             Duration::from_secs(config.tick_interval),

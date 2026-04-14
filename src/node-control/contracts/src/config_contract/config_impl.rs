@@ -41,10 +41,10 @@ impl ConfigContractImpl {
 #[async_trait::async_trait]
 impl SmartContract for ConfigContractImpl {
     async fn balance(&self) -> anyhow::Result<u64> {
-        self.provider.balance(&self.address()).await
+        self.provider.balance(&self.address().await).await
     }
 
-    fn address(&self) -> MsgAddressInt {
+    async fn address(&self) -> MsgAddressInt {
         MsgAddressInt::standard(-1, [0x55u8; 32])
     }
 }
@@ -696,11 +696,11 @@ mod tests {
         assert_eq!(balance, 5_000_000_000);
     }
 
-    #[test]
-    fn test_address() {
+    #[tokio::test]
+    async fn test_address() {
         let provider = MockContractProvider::new();
         let config = ConfigContractImpl::new(Arc::new(provider));
-        let addr = config.address();
+        let addr = config.address().await;
         // Config contract is at -1:5555...5555
         assert_eq!(addr.workchain_id(), -1);
         assert_eq!(addr.address().get_bytestring(0), [0x55u8; 32]);

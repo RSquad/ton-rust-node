@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::{NominatorRoles, NominatorWrapper, PoolConfig, PoolData};
+use super::{NominatorRoles, NominatorWrapper, PoolConfig, PoolData, SNP_STORAGE_RESERVE};
 use crate::{ContractProvider, SmartContract};
 use anyhow::Context;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ impl SmartContract for NominatorWrapperImpl {
         self.provider.balance(&self.nominator_addr).await
     }
 
-    fn address(&self) -> MsgAddressInt {
+    async fn address(&self) -> MsgAddressInt {
         self.nominator_addr.clone()
     }
 }
@@ -94,6 +94,14 @@ impl SmartContract for NominatorWrapperImpl {
 impl NominatorWrapper for NominatorWrapperImpl {
     fn state_init(&self) -> Option<StateInit> {
         self.state_init.clone()
+    }
+
+    fn storage_reserve(&self) -> u64 {
+        SNP_STORAGE_RESERVE
+    }
+
+    fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
+        vec![]
     }
 
     async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {

@@ -18,7 +18,7 @@ use common::{
     ton_utils::{nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
 use contracts::{
-    NominatorWrapperImpl, TonWallet, resolve_toncore_nominator_pools, resolve_toncore_pool,
+    NominatorWrapperImpl, TonWallet, resolve_toncore_pool,
 };
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
 use ton_block::{Cell, MsgAddressInt, write_boc};
@@ -224,7 +224,10 @@ impl DeployWalletsCmd {
             let res = res_details.get_mut(node_id).unwrap();
             if *balance < Self::MIN_BALANCE {
                 if self.verbose {
-                    println!("Failed to deploy wallet {}, balance is too low", wallet.address());
+                    println!(
+                        "Failed to deploy wallet {}, balance is too low",
+                        wallet.address().await
+                    );
                 }
 
                 res.deployed = false;
@@ -233,7 +236,7 @@ impl DeployWalletsCmd {
             }
 
             if self.verbose {
-                println!("Deploy wallet {}...", wallet.address());
+                println!("Deploy wallet {}...", wallet.address().await);
             }
 
             let msg_boc =
@@ -252,7 +255,7 @@ impl DeployWalletsCmd {
         for (wallet, node_id) in &wallets_to_wait {
             wait_for_deploy(
                 rpc_client.clone(),
-                &wallet.address(),
+                &wallet.address().await,
                 &cancellation_ctx,
                 self.verbose,
                 DEPLOY_TIMEOUT,
@@ -332,11 +335,9 @@ impl DeployPoolCmd {
             .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))
             .map_err(set_err)?;
 
-        if !matches!(pool_cfg, PoolConfig::TONCore { dual_pools: true, .. })
-            && (self.pool_even || self.pool_odd)
-        {
+        if !matches!(pool_cfg, PoolConfig::TONCore { .. }) && (self.pool_even || self.pool_odd) {
             return Err(set_err(anyhow::anyhow!(
-                "--pool-even and --pool-odd apply only to TONCore nominator (`dual_pools: true`)"
+                "--pool-even and --pool-odd apply only to TONCore nominator"
             )));
         }
 
@@ -358,45 +359,33 @@ impl DeployPoolCmd {
         }
 
         let mut deploy_targets: Vec<(MsgAddressInt, ton_block::StateInit)> = match pool_cfg {
-            PoolConfig::TONCore {
-                dual_pools: false,
-                validator_share,
-                address,
-                max_nominators,
-                min_validator_stake,
-                min_nominator_stake,
-                ..
-            } => {
-                let resolved = resolve_toncore_pool(
-                    &wallet_address,
-                    *validator_share,
-                    address.as_deref(),
-                    Some(*max_nominators),
-                    Some(*min_validator_stake),
-                    Some(*min_nominator_stake),
-                )
-                .map_err(set_err)?;
-                vec![(resolved.address, resolved.state_init)]
-            }
-            PoolConfig::TONCore {
-                dual_pools: true,
-                validator_share,
-                addresses,
-                max_nominators,
-                min_validator_stake,
-                min_nominator_stake,
-                ..
-            } => {
-                let resolved = resolve_toncore_nominator_pools(
-                    &wallet_address,
-                    *validator_share,
-                    addresses.as_ref().map(|v| v.as_slice()),
-                    Some(*max_nominators),
-                    Some(*min_validator_stake),
-                    Some(*min_nominator_stake),
-                )
-                .map_err(set_err)?;
-                resolved.into_iter().map(|r| (r.address, r.state_init)).collect()
+            PoolConfig::TONCore { pools } => {
+                let mut targets = Vec::new();
+                for slot in pools.iter() {
+                    let Some(cfg) = slot else { continue };
+                    match (&cfg.address, &cfg.params) {
+                        (_, Some(params)) => {
+                            let resolved = resolve_toncore_pool(
+                                &wallet_address,
+                                params.validator_share,
+                                cfg.address.as_deref(),
+                                Some(params.max_nominators),
+                                Some(params.min_validator_stake),
+                                Some(params.min_nominator_stake),
+                            )
+                            .map_err(set_err)?;
+                            targets.push((resolved.address, resolved.state_init));
+                        }
+                        (Some(address), None) => {
+                            return Err(set_err(anyhow::anyhow!(
+                                "TONCore pool slot has address '{}' but no deploy params",
+                                address
+                            )));
+                        }
+                        (None, None) => {}
+                    }
+                }
+                targets
             }
             PoolConfig::SNP { .. } => {
                 let owner = self.owner.as_ref().ok_or_else(|| {
@@ -411,7 +400,7 @@ impl DeployPoolCmd {
             }
         };
 
-        if matches!(pool_cfg, PoolConfig::TONCore { dual_pools: true, .. }) {
+        if matches!(pool_cfg, PoolConfig::TONCore { pools } if pools[1].is_some()) {
             let slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
             let one = deploy_targets
                 .get(slot)
