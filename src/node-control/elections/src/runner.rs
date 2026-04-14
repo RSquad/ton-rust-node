@@ -455,7 +455,16 @@ impl ElectionRunner {
                 // Reset previous state; only mark as accepted if present in current participants
                 node.stake_accepted = false;
                 node.accepted_stake_amount = None;
-                let addrs = node.all_staking_addresses().await;
+
+                let mut addrs = node.all_staking_addresses().await;
+                if node.inner_pools().is_empty() {
+                    if let Some(pool) = node.pool.as_ref() {
+                        let pool_addr = pool.address().await;
+                        if !addrs.contains(&pool_addr) {
+                            addrs.push(pool_addr);
+                        }
+                    }
+                }
                 if let Some(p) =
                     elections_info.participants.iter().find(|p| addrs.contains(&p.wallet_addr))
                 {
