@@ -113,28 +113,6 @@ struct Node {
 }
 
 impl Node {
-    /// All addresses that may have stakes at the elector (for recovery and snapshot matching).
-    ///
-    /// TONCore pair ([`NominatorWrapper::inner_pools`]): returns both pool contract addresses so
-    /// finished-election participant matching works when the elector lists either pool.
-    /// Otherwise uses [`pool_addr_cache`] (single pool) or the validator wallet.
-    async fn all_staking_addresses(&self) -> Vec<Vec<u8>> {
-        if let Some(pool) = &self.pool {
-            let inner = pool.inner_pools();
-            if !inner.is_empty() {
-                let mut out = Vec::with_capacity(inner.len());
-                for p in inner {
-                    out.push(p.address().await.address().clone().storage().to_vec());
-                }
-                return out;
-            }
-        }
-        match &self.pool_addr_cache {
-            Some(addr) => vec![addr.address().clone().storage().to_vec()],
-            None => vec![self.wallet.address().await.address().clone().storage().to_vec()],
-        }
-    }
-
     /// Raw address bytes used for elector queries (pool cache when available, else wallet).
     async fn stake_addr(&self) -> Vec<u8> {
         match &self.pool_addr_cache {
@@ -456,9 +434,9 @@ impl ElectionRunner {
                 node.stake_accepted = false;
                 node.accepted_stake_amount = None;
 
-                let addrs = node.all_staking_addresses().await;
+                let staking_addr = node.stake_addr().await;
                 if let Some(p) =
-                    elections_info.participants.iter().find(|p| addrs.contains(&p.wallet_addr))
+                    elections_info.participants.iter().find(|p| p.wallet_addr == staking_addr)
                 {
                     node.stake_accepted = true;
                     node.accepted_stake_amount = Some(p.stake);
@@ -552,10 +530,10 @@ impl ElectionRunner {
     ) {
         self.snapshot_cache.last_max_factor = Some(self.calc_max_factor(cfg17.max_stake_factor).1);
 
-        // Include all pool addresses (even + odd for TONCore) so we can match any participant.
+        // Include the selected staking target (pool_addr_cache) or wallet fallback.
         let mut wallet_addrs: HashSet<Vec<u8>> = HashSet::new();
         for node in self.nodes.values() {
-            wallet_addrs.extend(node.all_staking_addresses().await);
+            wallet_addrs.insert(node.stake_addr().await);
         }
 
         let participants = Self::build_participants_snapshot(elections_info, &wallet_addrs);
@@ -1441,12 +1419,8 @@ impl ElectionRunner {
                 })
                 .collect();
 
-            let staking_addrs: Vec<String> = node
-                .all_staking_addresses()
-                .await
-                .iter()
-                .map(|a| format!("-1:{}", hex::encode(a)))
-                .collect();
+            let staking_addrs: Vec<String> =
+                vec![format!("-1:{}", hex::encode(node.stake_addr().await))];
             let accepted_stake = if node.stake_accepted {
                 node.accepted_stake_amount.map(nanotons_to_dec_string).or_else(|| {
                     node.stake_submissions.last().map(|s| nanotons_to_dec_string(s.stake))

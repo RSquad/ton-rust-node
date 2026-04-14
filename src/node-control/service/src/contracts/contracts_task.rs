@@ -10,7 +10,7 @@ use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
 use contracts::{
-    NominatorWrapper, TonWallet, contract_provider, nominator::SNP_STORAGE_RESERVE,
+    NominatorWrapper, PoolKind, TonWallet, contract_provider,
     ton_core_nominator::messages as tc_messages,
 };
 use std::{
@@ -438,8 +438,8 @@ impl ContractsMonitor {
             let inner = pool_binding.inner_pools();
             let pools = if inner.is_empty() { vec![pool_binding.clone()] } else { inner };
             for pool in pools {
-                // Skip SNP pools early: update_validator_set is TONCore-specific.
-                if pool.storage_reserve() <= SNP_STORAGE_RESERVE {
+                // Skip non-TONCore pools early: update_validator_set is TONCore-specific.
+                if pool.pool_kind() != PoolKind::TONCore {
                     continue;
                 }
 

@@ -8,16 +8,14 @@
  */
 use anyhow::Context;
 use common::{
-    app_config::{
-        AppConfig, ElectionsConfig, KeyConfig, PoolConfig, TonCorePoolConfig, WalletConfig,
-    },
+    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, WalletConfig},
     time_format,
     ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
 use contracts::{
-    ContractProvider, NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl,
-    TonCoreNominatorRouter, TonWallet, WalletContract, contract_provider, resolve_toncore_pool,
+    NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl, TonCoreNominatorRouter,
+    TonWallet, WalletContract, contract_provider,
 };
 use secrets_vault::{
     types::{algorithm::Algorithm, secret_id::SecretId, secret_spec::SecretSpec},
@@ -370,10 +368,9 @@ impl RuntimeConfigStore {
                     .map_err(|e| {
                         anyhow::anyhow!("node [{}] open nominator pool error: {:#}", node_name, e)
                     })?;
-                let inner = pool.inner_pools();
-                let all_pools = if inner.is_empty() { vec![pool.clone()] } else { inner };
-                let mut addrs = Vec::with_capacity(all_pools.len());
-                for p in all_pools {
+                let inner_pools = pool.inner_pools();
+                let mut addrs = vec![];
+                for p in inner_pools.into_iter() {
                     addrs.push(p.address().await.to_string());
                 }
                 tracing::info!("[{}] opened nominator pool(s): {}", node_name, addrs.join(", "));
@@ -495,40 +492,6 @@ async fn open_wallet(
     Ok(Arc::new(wallet))
 }
 
-/// One TONCore pool slot from config: existing address only, or deploy params (via [`resolve_toncore_pool`]).
-fn open_toncore_pool_slot(
-    slot: &Option<TonCorePoolConfig>,
-    provider: Arc<dyn ContractProvider>,
-    validator_addr: &MsgAddressInt,
-) -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
-    let Some(cfg) = slot else {
-        return Ok(None);
-    };
-    match (&cfg.address, &cfg.params) {
-        (Some(addr_str), None) => {
-            let addr = MsgAddressInt::from_str(addr_str)
-                .context(format!("invalid TONCore pool address: {addr_str}"))?;
-            Ok(Some(Arc::new(NominatorPoolWrapperImpl::new(provider, addr))))
-        }
-        (_, Some(params)) => {
-            let resolved = resolve_toncore_pool(
-                validator_addr,
-                params.validator_share,
-                cfg.address.as_deref(),
-                Some(params.max_nominators),
-                Some(params.min_validator_stake),
-                Some(params.min_nominator_stake),
-            )?;
-            Ok(Some(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
-                provider,
-                resolved.address,
-                resolved.state_init,
-            ))))
-        }
-        (None, None) => anyhow::bail!("TONCore pool slot has neither address nor params"),
-    }
-}
-
 fn open_nominator_pool(
     config: &PoolConfig,
     rpc_client: Arc<ClientJsonRpc>,
@@ -582,8 +545,48 @@ fn open_nominator_pool(
         }
         PoolConfig::TONCore { pools } => {
             let provider = contract_provider!(rpc_client.clone());
-            let w0 = open_toncore_pool_slot(&pools[0], provider.clone(), validator_addr)?;
-            let w1 = open_toncore_pool_slot(&pools[1], provider, validator_addr)?;
+            let open_slot = |i: usize| -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
+                let Some(cfg) = &pools[i] else {
+                    return Ok(None);
+                };
+                match (&cfg.address, &cfg.params) {
+                    (Some(addr_str), None) => {
+                        let addr = MsgAddressInt::from_str(addr_str)
+                            .context(format!("invalid TONCore pool address: {addr_str}"))?;
+                        Ok(Some(Arc::new(NominatorPoolWrapperImpl::new(provider.clone(), addr))
+                            as Arc<dyn NominatorWrapper>))
+                    }
+                    (_, Some(params)) => {
+                        if let Some(addr_str) = &cfg.address {
+                            let explicit = MsgAddressInt::from_str(addr_str)
+                                .context(format!("invalid TONCore pool address: {addr_str}"))?;
+                            let derived = NominatorPoolWrapperImpl::calculate_address(
+                                validator_addr,
+                                params.validator_share,
+                                params.max_nominators,
+                                params.min_validator_stake,
+                                params.min_nominator_stake,
+                            )?;
+                            anyhow::ensure!(
+                                explicit == derived,
+                                "TONCore pool address ({}) does not match derived address ({})",
+                                explicit,
+                                derived
+                            );
+                        }
+                        Ok(Some(Arc::new(NominatorPoolWrapperImpl::from_init_data(
+                            provider.clone(),
+                            validator_addr,
+                            params.clone(),
+                        )?) as Arc<dyn NominatorWrapper>))
+                    }
+                    (None, None) => {
+                        anyhow::bail!("TONCore pool slot {} has neither address nor params", i)
+                    }
+                }
+            };
+            let w0 = open_slot(0)?;
+            let w1 = open_slot(1)?;
             if w0.is_none() && w1.is_none() {
                 anyhow::bail!(
                     "TONCore pool has no configured slots; at least one pool slot must be configured"

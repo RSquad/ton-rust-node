@@ -17,6 +17,12 @@ pub const SNP_STORAGE_RESERVE: u64 = 1_000_000_000;
 /// Matches `MIN_TONS_FOR_STORAGE` in pool.fc (10 TON).
 pub const TONCORE_STORAGE_RESERVE: u64 = 10_000_000_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    SNP,
+    TONCore,
+}
+
 /// Trait for interacting with single-nominator or TONCore nominator pool contracts.
 ///
 /// Based on https://github.com/ton-blockchain/single-nominator
@@ -45,6 +51,8 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Minimum nanotons that must remain in the staking account after a stake withdrawal
     /// (contract storage reserve). SNP = [`SNP_STORAGE_RESERVE`]; TONCore = [`TONCORE_STORAGE_RESERVE`].
     fn storage_reserve(&self) -> u64;
+    /// Pool type for routing/optimization decisions.
+    fn pool_kind(&self) -> PoolKind;
 }
 
 /// Roles stored in the single nominator contract

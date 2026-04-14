@@ -10,7 +10,7 @@
 //! exposed as one [`NominatorWrapper`] handle. Use [`NominatorWrapper::inner_pools`]
 //! to iterate both contracts for deploy and RPC.
 
-use super::{NominatorRoles, NominatorWrapper, PoolData, TONCORE_STORAGE_RESERVE};
+use super::{NominatorRoles, NominatorWrapper, PoolData, PoolKind, TONCORE_STORAGE_RESERVE};
 use crate::{
     ContractProvider, SmartContract,
     ton_core_nominator::{NominatorPoolWrapperImpl, toncore_pool_address_and_state},
@@ -29,46 +29,33 @@ pub struct TonCoreNominatorRouter {
 
 impl TonCoreNominatorRouter {
     pub fn new(provider: Arc<dyn ContractProvider>, pools: [Option<MsgAddressInt>; 2]) -> Self {
-        let [a0, a1] = pools;
-        Self {
-            pools: [
-                a0.map(|addr| {
-                    Arc::new(NominatorPoolWrapperImpl::new(provider.clone(), addr))
-                        as Arc<dyn NominatorWrapper>
-                }),
-                a1.map(|addr| {
-                    Arc::new(NominatorPoolWrapperImpl::new(provider, addr))
-                        as Arc<dyn NominatorWrapper>
-                }),
-            ],
-        }
+        let pools: [Option<Arc<dyn NominatorWrapper>>; 2] = pools.map(|addr| {
+            addr.map(|addr| {
+                Arc::new(NominatorPoolWrapperImpl::new(provider.clone(), addr))
+                    as Arc<dyn NominatorWrapper>
+            })
+        });
+        Self { pools }
     }
+
     pub fn from_state_init(
         provider: Arc<dyn ContractProvider>,
-        pools: [Option<(TonCoreInitParams, MsgAddressInt)>; 2],
+        pools: [Option<TonCoreInitParams>; 2],
         validator_address: &MsgAddressInt,
     ) -> anyhow::Result<Self> {
+        let pools = pools.map(|slot| -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
+            let Some(init_params) = slot else {
+                return Ok(None);
+            };
+            let (addr, si) = toncore_pool_address_and_state(init_params, validator_address)?;
+            Ok(Some(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
+                provider.clone(),
+                addr,
+                si,
+            )) as Arc<dyn NominatorWrapper>))
+        });
         let [p0, p1] = pools;
-        let w0 = match p0 {
-            Some((init_params, _)) => {
-                let (addr, si) = toncore_pool_address_and_state(init_params, validator_address)?;
-                Some(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
-                    provider.clone(),
-                    addr,
-                    si,
-                )) as Arc<dyn NominatorWrapper>)
-            }
-            None => None,
-        };
-        let w1 = match p1 {
-            Some((init_params, _)) => {
-                let (addr, si) = toncore_pool_address_and_state(init_params, validator_address)?;
-                Some(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(provider, addr, si))
-                    as Arc<dyn NominatorWrapper>)
-            }
-            None => None,
-        };
-        Ok(Self { pools: [w0, w1] })
+        Ok(Self { pools: [p0?, p1?] })
     }
 
     /// Build a router from optional per-slot pool wrappers (e.g. from config).
@@ -80,23 +67,45 @@ impl TonCoreNominatorRouter {
 #[async_trait::async_trait]
 impl SmartContract for TonCoreNominatorRouter {
     async fn balance(&self) -> anyhow::Result<u64> {
-        let a = if let Some(p) = &self.pools[0] { p.balance().await? } else { 0 };
-        let b = if let Some(p) = &self.pools[1] { p.balance().await? } else { 0 };
-        Ok(a.saturating_add(b))
+        let active_addr = self.address().await;
+        for pool in self.pools.iter().flatten() {
+            if pool.address().await == active_addr {
+                return pool.balance().await;
+            }
+        }
+        anyhow::bail!("TonCoreNominatorRouter: active pool is not configured")
     }
 
     async fn address(&self) -> MsgAddressInt {
-        for pool in &self.pools {
-            if let Some(p) = pool {
-                return p.address().await;
+        // TONCore: pick the first pool that is not currently staking.
+        for p in self.pools.iter().flatten() {
+            match p.get_pool_data().await {
+                Ok(data) => {
+                    let is_free = data.state == 0
+                        || (data.state == 2 && data.validator_set_changes_count >= 2);
+                    if is_free {
+                        return p.address().await;
+                    }
+                }
+                Err(e) => panic!("TonCoreNominatorRouter: failed to resolve active pool: {e:#}"),
             }
         }
-        panic!("TonCoreNominatorRouter: no pools configured")
+        if let Some(pool) = self.pools.iter().flatten().next().cloned() {
+            eprintln!(
+                "TonCoreNominatorRouter: no active pool found, fallback to first configured pool"
+            );
+            return pool.address().await;
+        }
+        panic!("TonCoreNominatorRouter: no pools configured");
     }
 }
 
 #[async_trait::async_trait]
 impl NominatorWrapper for TonCoreNominatorRouter {
+    fn pool_kind(&self) -> PoolKind {
+        PoolKind::TONCore
+    }
+
     fn storage_reserve(&self) -> u64 {
         TONCORE_STORAGE_RESERVE
     }

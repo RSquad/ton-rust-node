@@ -20,7 +20,8 @@ pub use config_contract::{
 };
 pub use elector::{ElectionsInfo, ElectorWrapper, ElectorWrapperImpl, Participant};
 pub use nominator::{
-    NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, NominatorWrapperImpl, TonCoreNominatorRouter,
+    NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, NominatorWrapperImpl, PoolKind,
+    TonCoreNominatorRouter,
 };
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;

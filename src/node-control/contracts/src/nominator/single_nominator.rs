@@ -6,7 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::{NominatorRoles, NominatorWrapper, PoolConfig, PoolData, SNP_STORAGE_RESERVE};
+use super::{
+    NominatorRoles, NominatorWrapper, PoolConfig, PoolData, PoolKind, SNP_STORAGE_RESERVE,
+};
 use crate::{ContractProvider, SmartContract};
 use anyhow::Context;
 use std::sync::Arc;
@@ -92,6 +94,10 @@ impl SmartContract for NominatorWrapperImpl {
 
 #[async_trait::async_trait]
 impl NominatorWrapper for NominatorWrapperImpl {
+    fn pool_kind(&self) -> PoolKind {
+        PoolKind::SNP
+    }
+
     fn state_init(&self) -> Option<StateInit> {
         self.state_init.clone()
     }

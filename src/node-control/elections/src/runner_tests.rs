@@ -14,7 +14,7 @@ use common::{
     time_format,
 };
 use contracts::{
-    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonCoreNominatorRouter,
+    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, PoolKind, TonCoreNominatorRouter,
     TonWallet,
     elector::{FrozenParticipant, PastElections},
     nominator::{NominatorRoles, PoolData, SNP_STORAGE_RESERVE, TONCORE_STORAGE_RESERVE, opcodes},
@@ -199,6 +199,7 @@ mock! {
         fn state_init(&self) -> Option<ton_block::StateInit>;
         fn inner_pools(&self) -> Vec<std::sync::Arc<dyn NominatorWrapper>>;
         fn storage_reserve(&self) -> u64;
+        fn pool_kind(&self) -> PoolKind;
     }
 }
 
@@ -2696,13 +2697,9 @@ async fn test_toncore_nominator_both_pools_busy_skips_elections() {
 
     let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
-    // Should fail because both pools are busy
-    assert!(
-        result.is_err() || {
-            let node = runner.nodes.get(node_id).unwrap();
-            node.last_error.is_some()
-        }
-    );
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(!node.stake_accepted);
 }
 
 #[tokio::test]
@@ -2762,7 +2759,7 @@ async fn test_toncore_nominator_recover_stake_uses_cached_pool_address() {
 }
 
 #[tokio::test]
-async fn test_toncore_nominator_elections_finished_matches_any_pool() {
+async fn test_toncore_nominator_elections_finished_checks_active_pool_only() {
     let node_id = "node-1";
     let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
@@ -2807,7 +2804,7 @@ async fn test_toncore_nominator_elections_finished_matches_any_pool() {
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
     let node = runner.nodes.get(node_id).unwrap();
-    // Stake from pool[1] should be matched even though primary is pool[0]
-    assert!(node.stake_accepted, "stake_accepted should be true for TONCore nominator slot 1");
-    assert_eq!(node.accepted_stake_amount, Some(50_000_000_000_000));
+    // Router now resolves a single active pool address; participant from non-active slot is not matched.
+    assert!(!node.stake_accepted);
+    assert_eq!(node.accepted_stake_amount, None);
 }
