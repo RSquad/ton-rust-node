@@ -28,7 +28,7 @@ pub struct TonCoreNominatorRouter {
 }
 
 impl TonCoreNominatorRouter {
-    async fn active_pool(&self) -> Option<Arc<dyn NominatorWrapper>> {
+    async fn active_pool(&self) -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
         // TONCore: pick the first pool that is not currently staking.
         for pool in self.pools.iter().flatten() {
             match pool.get_pool_data().await {
@@ -36,23 +36,24 @@ impl TonCoreNominatorRouter {
                     let is_free = data.state == 0
                         || (data.state == 2 && data.validator_set_changes_count >= 2);
                     if is_free {
-                        return Some(pool.clone());
+                        return Ok(Some(pool.clone()));
                     }
                 }
                 Err(e) => {
-                    eprintln!("TonCoreNominatorRouter: ERROR failed to resolve active pool: {e:#}");
+                    anyhow::bail!(
+                        "TonCoreNominatorRouter: ERROR failed to resolve active pool: {e:#}"
+                    );
                 }
             }
         }
 
-        if let Some(pool) = self.pools.iter().flatten().next().cloned() {
-            eprintln!(
-                "TonCoreNominatorRouter: no active pool found, fallback to first configured pool"
+        if self.pools.iter().flatten().next().is_some() {
+            anyhow::bail!(
+                "TonCoreNominatorRouter: no active pool found, fallback to first configured pool is disabled"
             );
-            return Some(pool);
         }
 
-        None
+        anyhow::bail!("TonCoreNominatorRouter: no pools configured")
     }
 
     pub fn new(provider: Arc<dyn ContractProvider>, pools: [Option<MsgAddressInt>; 2]) -> Self {
@@ -94,17 +95,16 @@ impl TonCoreNominatorRouter {
 #[async_trait::async_trait]
 impl SmartContract for TonCoreNominatorRouter {
     async fn balance(&self) -> anyhow::Result<u64> {
-        if let Some(pool) = self.active_pool().await {
+        if let Some(pool) = self.active_pool().await? {
             return pool.balance().await;
         }
         anyhow::bail!("TonCoreNominatorRouter: no pools configured")
     }
 
     async fn address(&self) -> MsgAddressInt {
-        if let Some(pool) = self.active_pool().await {
+        if let Some(pool) = self.active_pool().await.ok().flatten() {
             return pool.address().await;
         }
-        eprintln!("TonCoreNominatorRouter: ERROR no pools configured");
         MsgAddressInt::default()
     }
 }
@@ -133,7 +133,7 @@ impl NominatorWrapper for TonCoreNominatorRouter {
     /// Returns pool data for the first configured pool. For per-pool data use
     /// [`inner_pools`](NominatorWrapper::inner_pools) and query each pool individually.
     async fn get_pool_data(&self) -> anyhow::Result<PoolData> {
-        if let Some(pool) = self.active_pool().await {
+        if let Some(pool) = self.active_pool().await? {
             return pool.get_pool_data().await;
         }
         anyhow::bail!("TonCoreNominatorRouter: no pools configured")

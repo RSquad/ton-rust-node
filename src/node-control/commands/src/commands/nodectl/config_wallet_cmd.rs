@@ -9,7 +9,7 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, check_ton_api_connection,
+        MASTER_WALLET_RESERVED_NAME, SEND_TIMEOUT, check_ton_api_connection, confirm,
         fetch_network_max_factor, get_wallet_config, load_config_vault,
         load_config_vault_rpc_client, make_wallet, resolve_pool_address_from_config, save_config,
         toncore_pool_slot_from_cli_flags, wait_for_seqno_change, wallet_address, wallet_info,
@@ -28,7 +28,7 @@ use common::{
 use contracts::{ElectorWrapper, ElectorWrapperImpl, TonWallet, contract_provider, nominator};
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use secrets_vault::{errors::error::VaultError, vault::SecretVault};
-use std::{borrow::Cow, io::Write, path::Path, sync::Arc};
+use std::{borrow::Cow, path::Path, sync::Arc};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
 
@@ -701,12 +701,4 @@ async fn wait_for_stake_accepted(
     tokio::time::timeout(max_wait, poll)
         .await
         .map_err(|_| anyhow::anyhow!("Timeout waiting for stake to appear in elector"))?
-}
-
-fn confirm(prompt: &str) -> anyhow::Result<bool> {
-    print!("{prompt} [y/N]: ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }

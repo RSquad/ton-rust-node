@@ -9,8 +9,8 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        SEND_TIMEOUT, calculate_wallet_address, get_wallet_config, load_config_vault_rpc_client,
-        make_wallet, resolve_pool_address_from_config, save_config,
+        SEND_TIMEOUT, calculate_wallet_address, confirm, get_wallet_config,
+        load_config_vault_rpc_client, make_wallet, resolve_pool_address_from_config, save_config,
         toncore_pool_slot_from_cli_flags, try_create_rpc_client, wait_for_seqno_change,
         wallet_info, warn_ton_api_unavailable,
     },
@@ -29,7 +29,7 @@ use contracts::{
     nominator::ton_core_pool as pool_messages,
 };
 use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
-use std::{io::Write, path::Path, str::FromStr, sync::Arc};
+use std::{path::Path, str::FromStr, sync::Arc};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
@@ -434,7 +434,7 @@ async fn collect_pool_views(
                 });
             }
             PoolConfig::TONCore { pools } => {
-                let is_dual = pools[1].is_some();
+                let is_dual = pools[0].is_some() && pools[1].is_some();
                 let validator_share = pools
                     .iter()
                     .flatten()
@@ -444,10 +444,8 @@ async fn collect_pool_views(
                     // Two-pool (even + odd) view
                     let mut resolved_addrs: Vec<String> = Vec::new();
                     for slot in pools.iter().flatten() {
-                        let addr_str = slot.address.clone().unwrap_or_else(|| {
-                            resolve_toncore_pool_address_via_binding_for_slot(slot, name, config)
-                                .unwrap_or_else(|| "<not deployed>".into())
-                        });
+                        let addr_str =
+                            slot.address.clone().unwrap_or_else(|| "<not deployed>".into());
                         resolved_addrs.push(addr_str);
                     }
                     while resolved_addrs.len() < 2 {
@@ -484,11 +482,7 @@ async fn collect_pool_views(
                 } else {
                     // Single-pool view (slot 0 only)
                     let slot0 = pools[0].as_ref();
-                    let resolved_addr = slot0.and_then(|s| s.address.clone()).or_else(|| {
-                        slot0.and_then(|s| {
-                            resolve_toncore_pool_address_via_binding_for_slot(s, name, config)
-                        })
-                    });
+                    let resolved_addr = slot0.and_then(|s| s.address.clone());
 
                     let balance_result = if let Some(ref addr_str) = resolved_addr {
                         resolve_pool_balance(&Ok(addr_str.clone()), rpc_client).await.ok()
@@ -661,16 +655,6 @@ async fn resolve_pool_address(
     Ok(addr_str)
 }
 
-/// Resolve a single TONCore pool slot address (synchronous, no vault needed —
-/// only used when the address is already stored in config).
-fn resolve_toncore_pool_address_via_binding_for_slot(
-    slot: &TonCorePoolConfig,
-    _pool_name: &str,
-    _config: &AppConfig,
-) -> Option<String> {
-    slot.address.clone()
-}
-
 fn normalize_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<String> {
     let trimmed = addr.trim();
     if trimmed.is_empty() {
@@ -713,14 +697,6 @@ impl PoolRmCmd {
         println!("\n{} Pool '{}' removed\n", "OK".green().bold(), self.name);
         Ok(())
     }
-}
-
-fn confirm_action(prompt: &str) -> anyhow::Result<bool> {
-    print!("{prompt} [y/N]: ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 impl PoolDepositValidatorCmd {
@@ -787,7 +763,7 @@ impl PoolDepositValidatorCmd {
             self.amount,
         );
 
-        if !self.yes && !confirm_action("Confirm deposit?")? {
+        if !self.yes && !confirm("Confirm deposit?")? {
             println!("{}", "Deposit cancelled".yellow());
             return Ok(());
         }
@@ -878,7 +854,7 @@ impl PoolWithdrawValidatorCmd {
             self.amount,
         );
 
-        if !self.yes && !confirm_action("Confirm withdrawal?")? {
+        if !self.yes && !confirm("Confirm withdrawal?")? {
             println!("{}", "Withdrawal cancelled".yellow());
             return Ok(());
         }

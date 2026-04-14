@@ -19,7 +19,7 @@ use secrets_vault::{
     errors::error::VaultError, types::secret::Secret, vault::SecretVault,
     vault_builder::SecretVaultBuilder,
 };
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{collections::HashMap, fs, io::Write, path::Path, sync::Arc};
 use ton_block::MsgAddressInt;
 use ton_http_api_client::v2::{
     client_json_rpc::ClientJsonRpc,
@@ -114,6 +114,14 @@ pub fn warn_ton_api_unavailable(error: &anyhow::Error, note: &str) {
     println!("\n{} {}", "[WARNING]".yellow().bold(), "Failed to connect to TON API".yellow(),);
     println!("  {} {}", "Reason:".yellow().bold(), error.root_cause().to_string());
     println!("  {} {}", "Note:".yellow().bold(), note.yellow().italic());
+}
+
+pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
+    print!("{prompt} [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 pub fn save_config(config: &AppConfig, path: &Path) -> anyhow::Result<()> {

@@ -373,6 +373,10 @@ impl RuntimeConfigStore {
                 for p in inner_pools.into_iter() {
                     addrs.push(p.address().await.to_string());
                 }
+                if addrs.is_empty() {
+                    // SNP/single-pool wrappers expose no inner pools; use the pool address itself.
+                    addrs.push(pool.address().await.to_string());
+                }
                 tracing::info!("[{}] opened nominator pool(s): {}", node_name, addrs.join(", "));
                 map.insert(node_name.to_owned(), pool);
             }
