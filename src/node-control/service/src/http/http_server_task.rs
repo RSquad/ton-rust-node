@@ -44,6 +44,9 @@ pub struct AppState {
     pub jwt_auth: Arc<JwtAuth>,
     pub user_store: Arc<UserStore>,
     pub(crate) login_rate_limiter: Arc<tokio::sync::Mutex<LoginRateLimiter>>,
+    /// Signalled by mutation handlers after structural config changes
+    /// (entity CRUD, ton-http-api) so the service loop can rebuild caches.
+    pub config_changed: Arc<tokio::sync::Notify>,
 }
 
 pub async fn run(
@@ -51,6 +54,7 @@ pub async fn run(
     store: Arc<SnapshotStore>,
     runtime_cfg: Arc<RuntimeConfigStore>,
     tasks: HashMap<&'static str, Arc<TaskController>>,
+    config_changed: Arc<tokio::sync::Notify>,
 ) {
     tracing::info!("http-server task started");
 
@@ -100,8 +104,15 @@ pub async fn run(
     let elections_task = tasks.get("elections").cloned().expect("elections task is not registered");
 
     let login_rate_limiter = Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default()));
-    let state =
-        AppState { store, runtime_cfg, elections_task, jwt_auth, user_store, login_rate_limiter };
+    let state = AppState {
+        store,
+        runtime_cfg,
+        elections_task,
+        jwt_auth,
+        user_store,
+        login_rate_limiter,
+        config_changed,
+    };
     let app = routes(enable_swagger, state);
 
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
@@ -972,6 +983,7 @@ mod tests {
             jwt_auth: test_jwt_auth().await,
             user_store,
             login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
+            config_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
