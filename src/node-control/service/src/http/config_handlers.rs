@@ -745,6 +745,7 @@ pub async fn v1_nodes_add_handler(
             cfg.nodes.insert(name, adnl_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
@@ -784,6 +785,7 @@ pub async fn v1_nodes_rm_handler(
             cfg.nodes.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
@@ -833,6 +835,7 @@ pub async fn v1_wallets_add_handler(
             cfg.wallets.insert(name, wallet_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
@@ -877,6 +880,7 @@ pub async fn v1_wallets_rm_handler(
             cfg.wallets.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
@@ -929,6 +933,7 @@ pub async fn v1_pools_add_handler(
             cfg.pools.insert(name, pool_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
@@ -971,6 +976,7 @@ pub async fn v1_pools_rm_handler(
             cfg.pools.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
@@ -1036,6 +1042,7 @@ pub async fn v1_bindings_add_handler(
             cfg.bindings.insert(node, binding);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.node } }))
 }
@@ -1079,6 +1086,7 @@ pub async fn v1_bindings_rm_handler(
             cfg.bindings.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: node } }))
 }
@@ -1244,6 +1252,7 @@ pub async fn v1_ton_http_api_handler(
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
 
     let endpoints = state.runtime_cfg.get().ton_http_api.endpoints();
     Ok(axum::Json(TonHttpApiResponse { ok: true, result: TonHttpApiResult { endpoints } }))

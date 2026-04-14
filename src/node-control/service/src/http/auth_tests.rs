@@ -123,6 +123,7 @@ async fn state_with_auth() -> AppState {
         jwt_auth: test_jwt_auth().await,
         user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        config_changed: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -135,6 +136,7 @@ async fn state_no_auth() -> AppState {
         jwt_auth: test_jwt_auth().await,
         user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        config_changed: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
