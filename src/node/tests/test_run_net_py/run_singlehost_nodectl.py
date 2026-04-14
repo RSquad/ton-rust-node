@@ -25,9 +25,11 @@ Required env var:
 Optional env vars:
   HTTP_API_URL, NODE_CNT, MASTER_TOPUP_TON, WALLET_TOPUP_TON, POOL_TOPUP_TON,
   PARTICIPANTS_WAIT_SECONDS, NOBUILD, KEEP_NODECTL_ON_SUCCESS, NODECTL_LOG, SCRIPT_LOG,
-  TONCORE_VALIDATOR_SHARE (basis points for the last node's TONCore dual pool; default 5000)
+  TONCORE_VALIDATOR_SHARE / TONCORE_VALIDATOR_SHARE_ODD (basis points per TONCore slot; odd defaults to share)
+  TONCORE_MIN_VALIDATOR_STAKE_TON / TONCORE_MIN_VALIDATOR_STAKE_ODD_TON (must differ so two derived pools
+    are distinct; defaults 100000 / 100001)
   TONCORE_VALIDATOR_DEPOSIT_TON (per-slot deposit-validator amount in TON; default 100100,
-    must be >= min_validator_stake from pool config; auto-raises MASTER_TOPUP_TON if needed)
+    must be >= max(slot min stakes); auto-raises MASTER_TOPUP_TON if needed)
 """
 
 from __future__ import annotations
@@ -70,13 +72,16 @@ class Config:
     participants_wait:        int  = 600
     nobuild:                  bool = False
     keep_on_success:          bool = True
-    toncore_validator_share:      int  = 5000   # basis points; last node's pool when node_cnt > 1
+    toncore_validator_share:      int  = 5000   # basis points, slot 0 (even)
+    toncore_validator_share_odd:  int  = 5000   # basis points, slot 1 (odd); env may override
+    toncore_min_validator_stake_ton: int = 100_000   # slot 0 deploy param (TON)
+    toncore_min_validator_stake_odd_ton: int = 100_001  # slot 1; must != slot 0 for two distinct pools
     toncore_validator_deposit_ton: int = DEFAULT_TONCORE_DEPOSIT_TON  # per-slot deposit-validator amount
     wallet_versions:              list = dataclasses.field(default_factory=lambda: list(WALLET_VERSIONS))
 
     @property
     def has_toncore(self) -> bool:
-        """Last node gets a TONCore dual pool when there are at least 2 nodes."""
+        """Last node gets a TONCore pool (two on-chain slots) when there are at least 2 nodes."""
         return self.node_cnt > 1
 
     @classmethod
@@ -91,6 +96,18 @@ class Config:
             nobuild                 = os.environ.get("NOBUILD", "0") in ("1", "true"),
             keep_on_success         = os.environ.get("KEEP_NODECTL_ON_SUCCESS", "1") not in ("0", "false"),
             toncore_validator_share = int(os.environ.get("TONCORE_VALIDATOR_SHARE", "5000")),
+            toncore_validator_share_odd = int(
+                os.environ.get(
+                    "TONCORE_VALIDATOR_SHARE_ODD",
+                    os.environ.get("TONCORE_VALIDATOR_SHARE", "5000"),
+                )
+            ),
+            toncore_min_validator_stake_ton = int(
+                os.environ.get("TONCORE_MIN_VALIDATOR_STAKE_TON", "100000")
+            ),
+            toncore_min_validator_stake_odd_ton = int(
+                os.environ.get("TONCORE_MIN_VALIDATOR_STAKE_ODD_TON", "100001")
+            ),
             toncore_validator_deposit_ton = int(os.environ.get(
                 "TONCORE_VALIDATOR_DEPOSIT_TON", str(DEFAULT_TONCORE_DEPOSIT_TON)
             )),
@@ -563,21 +580,26 @@ class Bootstrap:
         self._nctl("config", "elections", "tick-interval", "20")
 
         self.log.info(
-            "  Adding pools (SNP for node1..n-1, TONCore dual nominator on last node when n>1)..."
+            "  Adding pools (SNP for node1..n-1, TONCore nominator on last node when n>1)..."
         )
         for i in range(1, self.cfg.node_cnt + 1):
             toncore_last = self.cfg.has_toncore and i == self.cfg.node_cnt
             if toncore_last:
+                # add-core: explicit params for both slots (no implicit second pool).
                 self._nctl(
                     "config",
                     "pool",
-                    "add",
-                    "--kind",
-                    "core",
+                    "add-core",
                     "-n",
                     f"pool{i}",
                     "--validator-share",
                     str(self.cfg.toncore_validator_share),
+                    "--min-validator-stake",
+                    str(self.cfg.toncore_min_validator_stake_ton),
+                    "--validator-share-odd",
+                    str(self.cfg.toncore_validator_share_odd),
+                    "--min-validator-stake-odd",
+                    str(self.cfg.toncore_min_validator_stake_odd_ton),
                 )
             else:
                 self._nctl("config", "pool", "add", "-n", f"pool{i}", "-o", master_addr)
@@ -656,7 +678,7 @@ class Bootstrap:
             self.log.warn("No 'opened wallet' in log yet; continuing")
 
         self.log.info("  Waiting for nominator pools to open (up to 300s)...")
-        # runtime_config: `[node] opened nominator pool(s): addr` (comma-separated for dual pools).
+        # runtime_config: `[node] opened nominator pool(s): addr` (comma-separated for TONCore two slots).
         # Older builds: `opened nominator pool: address=…`
         if not self._wait_log("opened nominator pool", 300):
             self.log.warn("No 'opened nominator pool' in log yet; continuing")

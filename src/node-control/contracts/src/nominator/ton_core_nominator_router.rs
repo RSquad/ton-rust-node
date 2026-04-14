@@ -11,12 +11,13 @@
 //! to iterate both contracts for deploy and RPC.
 
 use super::{NominatorRoles, NominatorWrapper, PoolData, TONCORE_STORAGE_RESERVE};
-use crate::SmartContract;
-use std::sync::Arc;
-use ton_block::{StateInit, MsgAddressInt};
-use crate::ton_core_nominator::{NominatorPoolWrapperImpl, toncore_pool_address_and_state};
-use crate::ContractProvider;
+use crate::{
+    ContractProvider, SmartContract,
+    ton_core_nominator::{NominatorPoolWrapperImpl, toncore_pool_address_and_state},
+};
 use common::app_config::TonCoreInitParams;
+use std::sync::Arc;
+use ton_block::{MsgAddressInt, StateInit};
 
 /// TONCore nominator binding: two pool contracts (even/odd validation rounds).
 ///

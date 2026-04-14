@@ -578,8 +578,7 @@ async fn test_participate_new_key_no_pool() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
     let expected_stake =
-        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - SNP_STORAGE_RESERVE)
-            / 2;
+        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - SNP_STORAGE_RESERVE) / 2;
     // validate the election bid payload
     harness
         .wallet_mock
@@ -2707,11 +2706,11 @@ async fn test_toncore_nominator_both_pools_busy_skips_elections() {
 }
 
 #[tokio::test]
-async fn test_toncore_nominator_recover_stake_both_pools() {
+async fn test_toncore_nominator_recover_stake_uses_cached_pool_address() {
     let node_id = "node-1";
     let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
-    let returned_per_pool = 50_000_000_000_000u64;
+    let returned_for_stake_addr = 50_000_000_000_000u64;
 
     // Elector returns active elections so run() proceeds to recover
     harness.elector_mock.expect_address().returning(|| elector_address());
@@ -2728,11 +2727,11 @@ async fn test_toncore_nominator_recover_stake_both_pools() {
         })
     });
     harness.elector_mock.expect_past_elections().returning(|| Ok(vec![]));
-    // Both pools have returnable stake
+    // `recover_stake` asks the elector once using `stake_addr()` (pool_addr_cache → primary pool).
     harness
         .elector_mock
         .expect_compute_returned_stake()
-        .returning(move |_addr| Ok(returned_per_pool));
+        .returning(move |_addr| Ok(returned_for_stake_addr));
 
     setup_wallet(&mut harness.wallet_mock);
     harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
@@ -2759,8 +2758,7 @@ async fn test_toncore_nominator_recover_stake_both_pools() {
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
     let node = runner.nodes.get(node_id).unwrap();
-    // Both pools had returnables, so total recovered = 2 * returned_per_pool
-    assert_eq!(node.last_recover_amount, returned_per_pool * 2);
+    assert_eq!(node.last_recover_amount, returned_for_stake_addr);
 }
 
 #[tokio::test]

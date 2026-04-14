@@ -12,9 +12,8 @@ use crate::{
 };
 use anyhow::Context;
 use common::app_config::{
-    TonCoreInitParams,
     DEFAULT_TONCORE_MAX_NOMINATORS, DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
-    DEFAULT_TONCORE_MIN_VALIDATOR_STAKE,
+    DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, TonCoreInitParams,
 };
 use std::sync::Arc;
 use ton_block::{
@@ -172,89 +171,6 @@ pub fn resolve_toncore_pool(
     })
 }
 
-/// Resolve two TONCore nominator pool addresses (`dual_pools: true` in config).
-///
-/// `pool[0]` uses `min_validator_stake`, `pool[1]` uses `min_validator_stake + 1`.
-/// `addresses`, when set, is a slice of 1 or 2 optional strings (missing index = derive that slot).
-pub fn resolve_toncore_nominator_pools(
-    validator_addr: &MsgAddressInt,
-    validator_share: u16,
-    addresses: Option<&[Option<String>]>,
-    max_nominators: Option<u16>,
-    min_validator_stake: Option<u64>,
-    min_nominator_stake: Option<u64>,
-) -> anyhow::Result<[ResolvedTonCorePool; 2]> {
-    let (max_n, min_v, min_n) =
-        resolve_deploy_pool_params(max_nominators, min_validator_stake, min_nominator_stake);
-
-    let explicit = |idx: usize| -> Option<&str> {
-        addresses.and_then(|a| a.get(idx)).and_then(|x| x.as_deref())
-    };
-
-    let pool0 = {
-        let (address, state_init) = toncore_pool_address_and_state(
-            TonCoreInitParams {
-                validator_share: validator_share,
-                max_nominators: max_n,
-                min_validator_stake: min_v,
-                min_nominator_stake: min_n,
-            },
-            validator_addr,
-        )?;
-        if let Some(addr) = explicit(0) {
-            let parsed = addr
-                .parse::<MsgAddressInt>()
-                .context(format!("invalid TONCore nominator addresses[0]: {addr}"))?;
-            anyhow::ensure!(
-                parsed == address,
-                "TONCore nominator addresses[0] ({parsed}) does not match derived address ({address})"
-            );
-        }
-        ResolvedTonCorePool {
-            reward_share: validator_share,
-            max_nominators: max_n,
-            min_validator_stake: min_v,
-            min_nominator_stake: min_n,
-            address,
-            state_init,
-        }
-    };
-
-    let min_v_1 = min_v
-        .checked_add(1)
-        .context("min_validator_stake overflow: cannot add 1 to differentiate pool[1]")?;
-    let pool1 = {
-        let (address, state_init) = toncore_pool_address_and_state(
-            TonCoreInitParams {
-                validator_share: validator_share,
-                max_nominators: max_n,
-                min_validator_stake: min_v_1,
-                min_nominator_stake: min_n,
-            },
-            validator_addr,
-        )?;
-        if let Some(addr) = explicit(1) {
-            let parsed = addr
-                .parse::<MsgAddressInt>()
-                .context(format!("invalid TONCore nominator addresses[1]: {addr}"))?;
-            anyhow::ensure!(
-                parsed == address,
-                "TONCore nominator addresses[1] ({parsed}) does not match derived address ({address})"
-            );
-        }
-        ResolvedTonCorePool {
-            reward_share: validator_share,
-            max_nominators: max_n,
-            min_validator_stake: min_v_1,
-            min_nominator_stake: min_n,
-            address,
-            state_init,
-        }
-    };
-
-    Ok([pool0, pool1])
-}
-
 /// Wrapper for the TON Nominator Pool contract.
 ///
 /// See: <https://github.com/ton-blockchain/nominator-pool>
@@ -304,7 +220,8 @@ impl NominatorPoolWrapperImpl {
                 max_nominators: max_nominators_count,
                 min_validator_stake: min_validator_stake,
                 min_nominator_stake: min_nominator_stake,
-            },           validator_address,
+            },
+            validator_address,
         )?;
         Ok(Self { provider, pool_addr, state_init: Some(state_init) })
     }
@@ -323,7 +240,8 @@ impl NominatorPoolWrapperImpl {
                 max_nominators: max_nominators_count,
                 min_validator_stake,
                 min_nominator_stake,
-            },            validator_address,
+            },
+            validator_address,
         )
         .map(|(addr, _)| addr)
     }

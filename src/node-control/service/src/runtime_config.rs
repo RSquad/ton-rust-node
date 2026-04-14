@@ -8,7 +8,9 @@
  */
 use anyhow::Context;
 use common::{
-    app_config::{AppConfig, ElectionsConfig, KeyConfig, PoolConfig, TonCorePoolConfig, WalletConfig},
+    app_config::{
+        AppConfig, ElectionsConfig, KeyConfig, PoolConfig, TonCorePoolConfig, WalletConfig,
+    },
     time_format,
     ton_utils::extract_max_factor,
     vault_signer::VaultSigner,

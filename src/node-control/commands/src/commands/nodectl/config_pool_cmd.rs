@@ -109,10 +109,25 @@ pub struct PoolAddCoreCmd {
     address_odd: Option<String>,
 
     #[arg(
-        long = "dual",
-        help = "Configure two pool slots (even + odd rounds) with the same deploy params"
+        long = "validator-share-odd",
+        help = "Slot 1: validator reward share in basis points (required to deploy/configure slot 1; independent from slot 0)"
     )]
-    dual: bool,
+    validator_share_odd: Option<u16>,
+
+    #[arg(long = "max-nominators-odd", help = "Slot 1: max nominators (default: 40)")]
+    max_nominators_odd: Option<u16>,
+
+    #[arg(
+        long = "min-validator-stake-odd",
+        help = "Slot 1: minimum validator stake in TON (default: 10 000)"
+    )]
+    min_validator_stake_odd: Option<f64>,
+
+    #[arg(
+        long = "min-nominator-stake-odd",
+        help = "Slot 1: minimum nominator stake in TON (default: 10 000)"
+    )]
+    min_nominator_stake_odd: Option<f64>,
 }
 
 #[derive(clap::Args, Clone)]
@@ -257,6 +272,15 @@ impl PoolAddCoreCmd {
             .map(|a| normalize_ton_address(a, "address-odd"))
             .transpose()?;
 
+        let odd_deploy_fields = self.max_nominators_odd.is_some()
+            || self.min_validator_stake_odd.is_some()
+            || self.min_nominator_stake_odd.is_some();
+        if odd_deploy_fields && self.validator_share_odd.is_none() {
+            anyhow::bail!(
+                "--validator-share-odd is required when setting slot-1 deploy options (--max-nominators-odd, --min-validator-stake-odd, --min-nominator-stake-odd)"
+            );
+        }
+
         let params = self.validator_share.map(|vs| TonCoreInitParams {
             validator_share: vs,
             max_nominators: self.max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
@@ -270,9 +294,23 @@ impl PoolAddCoreCmd {
                 .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
         });
 
+        let params_odd = self.validator_share_odd.map(|vs| TonCoreInitParams {
+            validator_share: vs,
+            max_nominators: self.max_nominators_odd.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
+            min_validator_stake: self
+                .min_validator_stake_odd
+                .map(tons_f64_to_nanotons)
+                .unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE),
+            min_nominator_stake: self
+                .min_nominator_stake_odd
+                .map(tons_f64_to_nanotons)
+                .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
+        });
+
         let slot0 = Some(TonCorePoolConfig { address: address0.clone(), params: params.clone() });
-        let slot1 = if self.dual || address_odd.is_some() {
-            Some(TonCorePoolConfig { address: address_odd.clone(), params: params.clone() })
+        let has_slot1 = address_odd.is_some() || params_odd.is_some();
+        let slot1 = if has_slot1 {
+            Some(TonCorePoolConfig { address: address_odd.clone(), params: params_odd })
         } else {
             None
         };
@@ -287,7 +325,10 @@ impl PoolAddCoreCmd {
         if let Some(a) = &address0 {
             info_parts.push(format!("address='{a}'"));
         }
-        if self.dual || address_odd.is_some() {
+        if let Some(vs) = self.validator_share_odd {
+            info_parts.push(format!("validator_share_odd={vs} bp"));
+        }
+        if has_slot1 {
             let odd_str = address_odd.as_deref().unwrap_or("<to deploy>");
             info_parts.push(format!("address-odd='{odd_str}'"));
         }

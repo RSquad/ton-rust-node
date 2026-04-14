@@ -25,7 +25,6 @@ pub use nominator::{
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;
 pub use ton_core_nominator::{
-    NominatorPoolWrapperImpl, ResolvedTonCorePool, resolve_deploy_pool_params,
-    resolve_toncore_nominator_pools, resolve_toncore_pool,
+    NominatorPoolWrapperImpl, ResolvedTonCorePool, resolve_deploy_pool_params, resolve_toncore_pool,
 };
 pub use wallet::{TonWallet, WalletContract};

@@ -114,7 +114,21 @@ struct Node {
 
 impl Node {
     /// All addresses that may have stakes at the elector (for recovery and snapshot matching).
+    ///
+    /// TONCore pair ([`NominatorWrapper::inner_pools`]): returns both pool contract addresses so
+    /// finished-election participant matching works when the elector lists either pool.
+    /// Otherwise uses [`pool_addr_cache`] (single pool) or the validator wallet.
     async fn all_staking_addresses(&self) -> Vec<Vec<u8>> {
+        if let Some(pool) = &self.pool {
+            let inner = pool.inner_pools();
+            if !inner.is_empty() {
+                let mut out = Vec::with_capacity(inner.len());
+                for p in inner {
+                    out.push(p.address().await.address().clone().storage().to_vec());
+                }
+                return out;
+            }
+        }
         match &self.pool_addr_cache {
             Some(addr) => vec![addr.address().clone().storage().to_vec()],
             None => vec![self.wallet.address().await.address().clone().storage().to_vec()],
@@ -691,9 +705,10 @@ impl ElectionRunner {
         }
         let elections_stake = participant.as_ref().map(|p| p.stake).unwrap_or(0);
         let pool_staking_addr = node.pool.as_ref().map(|_| &staking_target);
-        let stake = Self::calc_stake(node, node_id, elections_stake, params, &stake_ctx, pool_staking_addr)
-            .await
-            .context("stake calculation error")?;
+        let stake =
+            Self::calc_stake(node, node_id, elections_stake, params, &stake_ctx, pool_staking_addr)
+                .await
+                .context("stake calculation error")?;
 
         if stake == 0 {
             tracing::info!("node [{}] skipping elections this tick (stake=0)", node_id);
