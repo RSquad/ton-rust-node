@@ -874,18 +874,7 @@ impl PoolWithdrawValidatorCmd {
             anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_data.account_state);
         }
 
-        let pool_slot = match pool_cfg {
-            PoolConfig::TONCore(_) => {
-                let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
-                if pool_slot.is_none() {
-                    anyhow::bail!(
-                        "withdraw-validator requires a TONCore pool slot; pass exactly one of --pool-even or --pool-odd"
-                    );
-                }
-                pool_slot
-            }
-            _ => anyhow::bail!("withdraw-validator is only supported for TONCore pools"),
-        };
+        let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
         let pool_address = resolve_pool_address_from_config(pool_cfg, &wallet_address, pool_slot)?;
 
         let withdraw_nanotons = tons_f64_to_nanotons(self.amount);
