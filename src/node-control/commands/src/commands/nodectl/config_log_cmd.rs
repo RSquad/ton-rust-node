@@ -8,11 +8,11 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_get, require_config, resolve_service_url, save_config},
+    utils::{api_get, api_post, resolve_service_url},
 };
 use colored::Colorize;
-use common::app_config::{AppConfig, LogConfig, LogOutput, LogRotation};
-use std::path::{Path, PathBuf};
+use common::app_config::{LogConfig, LogOutput, LogRotation};
+use std::path::PathBuf;
 
 /// Manage log configuration
 #[derive(clap::Args, Clone)]
@@ -127,7 +127,7 @@ impl LogCmd {
     ) -> anyhow::Result<()> {
         match &self.action {
             LogAction::Ls(cmd) => cmd.run(url, token, config_path).await,
-            LogAction::Set(cmd) => cmd.run(require_config(config_path)?).await,
+            LogAction::Set(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
@@ -158,60 +158,46 @@ impl LogLsCmd {
     }
 }
 
+#[derive(serde::Serialize)]
+struct LogSetBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation: Option<LogRotation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<LogOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_size_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_files: Option<usize>,
+}
+
 impl LogSetCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if self.level.is_none()
-            && self.path.is_none()
-            && self.rotation.is_none()
-            && self.output.is_none()
-            && self.max_size_mb.is_none()
-            && self.max_files.is_none()
-        {
-            anyhow::bail!(
-                "No settings specified. Use --level, --path, --rotation, --output, --max-size-mb, or --max-files"
-            );
-        }
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
 
-        let mut config = AppConfig::load(path)?;
-        let log = config.log.get_or_insert_with(LogConfig::default);
+        let body = LogSetBody {
+            level: self.level.as_ref().map(|l| format!("{}", l.to_tracing_level())),
+            path: self.path.as_ref().map(|p| p.display().to_string()),
+            rotation: self.rotation.as_ref().map(|r| r.clone().into()),
+            output: self.output.as_ref().map(|o| o.clone().into()),
+            max_size_mb: self.max_size_mb,
+            max_files: self.max_files,
+        };
 
-        let mut changes = Vec::new();
-
-        if let Some(level) = &self.level {
-            log.level = level.to_tracing_level();
-            changes.push(format!("level = {}", log.level));
-        }
-        if let Some(p) = &self.path {
-            log.path = Some(p.clone());
-            changes.push(format!("path = {}", p.display()));
-        }
-        if let Some(rotation) = &self.rotation {
-            log.rotation = rotation.clone().into();
-            changes.push(format!("rotation = {:?}", log.rotation).to_lowercase());
-        }
-        if let Some(output) = &self.output {
-            log.output = output.clone().into();
-            changes.push(format!("output = {:?}", log.output).to_lowercase());
-        }
-        if let Some(max_size) = self.max_size_mb {
-            log.max_size_mb = max_size;
-            changes.push(format!("max_size_mb = {}", max_size));
-        }
-        if let Some(max_files) = self.max_files {
-            log.max_files = max_files;
-            changes.push(format!("max_files = {}", max_files));
-        }
-
-        // Validate: file/all output requires a log path
-        if matches!(log.output, LogOutput::File | LogOutput::All) && log.path.is_none() {
-            anyhow::bail!(
-                "Output mode '{}' requires a log file path. Use --path to set one.",
-                output_display(&log.output)
-            );
-        }
-
-        save_config(&config, path)?;
-        println!("{} Log settings updated: {}", "OK".green().bold(), changes.join(", "));
+        let resp = api_post(&base_url, "/v1/log", token, &body).await?;
+        let parsed: serde_json::Value = serde_json::from_str(&resp)?;
+        let result = &parsed["result"];
+        let log: LogConfig = serde_json::from_value(result.clone())
+            .map_err(|e| anyhow::anyhow!("failed to parse log config: {e}"))?;
+        print_log_table(&log);
         Ok(())
     }
 }

@@ -254,11 +254,15 @@ impl ApiCmd {
                 send_post(&client, &url, &payload, token).await?;
             }
             ServiceAction::StakePolicy(cmd) => {
-                let url = join_url(&base_url, "/v1/stake_strategy");
+                let url = join_url(&base_url, "/v1/elections/settings");
                 let Some(policy) = cmd.to_policy() else {
                     anyhow::bail!("no policy specified");
                 };
-                let request = StakePolicyRequest { policy, node: cmd.node.clone() };
+                let request = ElectionsSettingsRequest {
+                    policy: Some(policy),
+                    node: cmd.node.clone(),
+                    ..Default::default()
+                };
                 send_post(&client, &url, &request, token).await?;
             }
             ServiceAction::Login(cmd) => {
@@ -350,12 +354,20 @@ fn filter_response_by_nodes(
     Ok(serde_json::to_string(&value).context("failed to re-serialize filtered response to JSON")?)
 }
 
-#[derive(Clone, serde::Serialize)]
-struct StakePolicyRequest {
-    policy: StakePolicy,
-    /// If set, the policy is applied as a per-node override.
+/// Client-side mirror of `ElectionsSettingsUpdateRequest` in `service::http::config_handlers`.
+/// Must stay in sync with the server-side definition.
+#[derive(Clone, Default, serde::Serialize)]
+struct ElectionsSettingsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<StakePolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tick_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_factor: Option<f32>,
 }
 
 impl StakePolicyCmd {
