@@ -409,9 +409,14 @@ class Bootstrap:
             return ""
 
     def _bun_topup(self, address: str, amount: str) -> None:
+        timeout_raw = os.environ.get("BUN_TOPUP_TIMEOUT_SECONDS", "120")
+        try:
+            timeout = int(timeout_raw)
+        except ValueError:
+            timeout = 120
         subprocess.run(["bun", "run", "topup", address, amount],
                        cwd=self.paths.load_net_dir, check=True,
-                       stdin=subprocess.DEVNULL, timeout=30)
+                       stdin=subprocess.DEVNULL, timeout=timeout)
 
     def _wallet_address_from_config(self, wallet_name: str) -> str:
         """Resolve raw workchain address for a named wallet via nodectl JSON."""
