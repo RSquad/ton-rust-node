@@ -1232,9 +1232,10 @@ pub async fn v1_ton_http_api_handler(
         .runtime_cfg
         .update_and_save(|cfg| {
             if append {
-                let existing = cfg.ton_http_api.endpoints();
+                let mut seen: std::collections::HashSet<String> =
+                    cfg.ton_http_api.endpoints().into_iter().collect();
                 for url in &urls {
-                    if !existing.iter().any(|e| e == url) {
+                    if seen.insert(url.clone()) {
                         let entry = match &api_key {
                             Some(key) => {
                                 EndpointEntry::WithKey { url: url.clone(), api_key: key.clone() }
@@ -1273,8 +1274,12 @@ pub async fn v1_log_set_handler(
     req: axum::Json<LogSetRequest>,
 ) -> Result<axum::Json<LogResponse>, AppError> {
     let req = req.0;
-    if req.level.is_none()
-        && req.path.is_none()
+    // Normalize inputs: treat whitespace-only strings as unset.
+    let level_str = req.level.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let path_str = req.path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    if level_str.is_none()
+        && path_str.is_none()
         && req.rotation.is_none()
         && req.output.is_none()
         && req.max_size_mb.is_none()
@@ -1283,9 +1288,7 @@ pub async fn v1_log_set_handler(
         return Err(AppError::bad_request("at least one setting is required"));
     }
 
-    let level = req
-        .level
-        .as_deref()
+    let level = level_str
         .map(|l| {
             tracing::Level::from_str(l)
                 .map_err(|_| AppError::bad_request(format!("invalid log level: '{l}'")))
@@ -1295,7 +1298,7 @@ pub async fn v1_log_set_handler(
     // Pre-validate: file/all output requires a path (check against current + incoming)
     if let Some(ref output) = req.output {
         if matches!(output, LogOutput::File | LogOutput::All) {
-            let has_path = req.path.is_some()
+            let has_path = path_str.is_some()
                 || state.runtime_cfg.get().log.as_ref().and_then(|l| l.path.as_ref()).is_some();
             if !has_path {
                 let mode = match output {
@@ -1317,7 +1320,7 @@ pub async fn v1_log_set_handler(
             if let Some(l) = level {
                 log.level = l;
             }
-            if let Some(p) = &req.path {
+            if let Some(p) = path_str {
                 log.path = Some(PathBuf::from(p));
             }
             if let Some(r) = req.rotation {

@@ -132,12 +132,20 @@ pub async fn run_with_config(
                 }
             }
             _ = config_changed.notified() => {
-                // REST mutation changed structural config — rebuild caches
-                if let Err(e) = runtime_cfg.force_reload().await {
-                    tracing::error!("cache rebuild after config mutation failed: {e:#}");
-                }
-                for task in tasks.values() {
-                    let _ = task.restart().await;
+                // REST mutation changed structural config — rebuild caches.
+                // Only restart tasks if caches are consistent; otherwise tasks
+                // keep running against the previous caches.
+                match runtime_cfg.force_reload().await {
+                    Ok(()) => {
+                        for task in tasks.values() {
+                            let _ = task.restart().await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "cache rebuild after config mutation failed; skipping task restart: {e:#}"
+                        );
+                    }
                 }
             }
             _ = cancel.changed() => {
