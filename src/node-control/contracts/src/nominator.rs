@@ -17,8 +17,6 @@ mod wrapper;
 
 pub use messages::*;
 pub use single_nominator::{NOMINATOR_POOL_WORKCHAIN, SingleNominatorWrapper};
-pub use ton_core_nominator::{
-    TonCoreNominatorWrapper, ResolvedTonCorePool, resolve_toncore_pool,
-};
+pub use ton_core_nominator::{ResolvedTonCorePool, TonCoreNominatorWrapper, resolve_toncore_pool};
 pub use ton_core_nominator_router::TonCoreNominatorRouter;
 pub use wrapper::*;

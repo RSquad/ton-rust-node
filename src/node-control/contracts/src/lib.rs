@@ -19,9 +19,8 @@ pub use config_contract::{
 };
 pub use elector::{ElectionsInfo, ElectorWrapper, ElectorWrapperImpl, Participant};
 pub use nominator::{
-    NOMINATOR_POOL_WORKCHAIN, TonCoreNominatorWrapper, NominatorWrapper, SingleNominatorWrapper,
-    PoolKind, ResolvedTonCorePool, TonCoreNominatorRouter,
-    resolve_toncore_pool,
+    NOMINATOR_POOL_WORKCHAIN, NominatorWrapper, PoolKind, ResolvedTonCorePool,
+    SingleNominatorWrapper, TonCoreNominatorRouter, TonCoreNominatorWrapper, resolve_toncore_pool,
 };
 pub use provider::ContractProvider;
 pub use smart_contract::SmartContract;

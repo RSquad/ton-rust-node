@@ -13,9 +13,7 @@ use crate::{
     },
 };
 use anyhow::Context;
-use common::app_config::{
-    TonCoreInitParams,
-};
+use common::app_config::TonCoreInitParams;
 use std::sync::Arc;
 use ton_block::{
     BuilderData, Coins, IBitstring, MsgAddressInt, Serializable, StateInit, read_single_root_boc,
