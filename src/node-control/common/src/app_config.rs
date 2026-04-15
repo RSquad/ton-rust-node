@@ -317,6 +317,44 @@ impl Default for HttpConfig {
     }
 }
 
+/// Default TONCore deploy parameters. Canonical source of truth; re-used by `contracts` crate.
+pub const DEFAULT_TONCORE_MAX_NOMINATORS: u16 = 40;
+pub const DEFAULT_TONCORE_MIN_VALIDATOR_STAKE: u64 = 100_000_000_000_000;
+pub const DEFAULT_TONCORE_MIN_NOMINATOR_STAKE: u64 = 10_000_000_000_000;
+
+fn default_toncore_max_nominators() -> u16 {
+    DEFAULT_TONCORE_MAX_NOMINATORS
+}
+fn default_toncore_min_validator_stake() -> u64 {
+    DEFAULT_TONCORE_MIN_VALIDATOR_STAKE
+}
+fn default_toncore_min_nominator_stake() -> u64 {
+    DEFAULT_TONCORE_MIN_NOMINATOR_STAKE
+}
+
+/// Single TONCore pool slot config (address + optional deploy params).
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+pub struct TonCorePoolConfig {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<TonCoreInitParams>,
+}
+
+/// Deploy-time parameters for a TONCore nominator pool contract.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+pub struct TonCoreInitParams {
+    pub validator_share: u16,
+    #[serde(default = "default_toncore_max_nominators")]
+    pub max_nominators: u16,
+    #[serde(default = "default_toncore_min_validator_stake")]
+    pub min_validator_stake: u64,
+    #[serde(default = "default_toncore_min_nominator_stake")]
+    pub min_nominator_stake: u64,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct WalletConfig {
     pub key: KeyConfig,
@@ -327,6 +365,9 @@ pub struct WalletConfig {
     pub workchain: i32,
 }
 
+/// Nominator pool entry in the app config.
+///
+/// JSON uses `kind: "snp"` or `"core"`.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "kind")]
 pub enum PoolConfig {
@@ -338,7 +379,7 @@ pub enum PoolConfig {
         owner: Option<String>,
     },
     #[serde(rename = "core")]
-    TONCore { addresses: [String; 2], validator_share: u64 },
+    TONCore { pools: [Option<TonCorePoolConfig>; 2] },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -880,26 +921,119 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_config_serde_core() {
-        let addr1 = ADDR;
-        let addr2 = OWNER;
+    fn test_pool_config_serde_core_single_pool_no_address() {
         let value = serde_json::json!({
             "kind": "core",
-            "addresses": [addr1.to_string(), addr2.to_string()],
-            "validator_share": 50,
+            "pools": [
+                { "params": { "validator_share": 50 } },
+                null,
+            ],
         });
         let cfg: PoolConfig = serde_json::from_value(value).unwrap();
         assert_eq!(
             cfg,
             PoolConfig::TONCore {
-                addresses: [addr1.to_string(), addr2.to_string()],
-                validator_share: 50,
+                pools: [
+                    Some(TonCorePoolConfig {
+                        address: None,
+                        params: Some(TonCoreInitParams {
+                            validator_share: 50,
+                            max_nominators: DEFAULT_TONCORE_MAX_NOMINATORS,
+                            min_validator_stake: DEFAULT_TONCORE_MIN_VALIDATOR_STAKE,
+                            min_nominator_stake: DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
+                        }),
+                    }),
+                    None,
+                ],
             }
         );
 
         let json = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["kind"], "core");
-        assert_eq!(json["validator_share"], 50);
+        assert!(json["pools"][0]["params"]["validator_share"] == 50);
+        assert!(json["pools"][0].get("address").is_none());
+        assert_eq!(
+            json["pools"][0]["params"]["max_nominators"],
+            serde_json::json!(DEFAULT_TONCORE_MAX_NOMINATORS)
+        );
+        assert_eq!(
+            json["pools"][0]["params"]["min_validator_stake"],
+            serde_json::json!(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE)
+        );
+        assert_eq!(
+            json["pools"][0]["params"]["min_nominator_stake"],
+            serde_json::json!(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE)
+        );
+    }
+
+    #[test]
+    fn test_pool_config_serde_core_single_pool_with_address() {
+        let addr = ADDR;
+        let value = serde_json::json!({
+            "kind": "core",
+            "pools": [
+                {
+                    "address": addr,
+                    "params": {
+                        "validator_share": 100,
+                        "max_nominators": 10,
+                        "min_validator_stake": 5_000_000_000_000u64,
+                        "min_nominator_stake": 1_000_000_000_000u64,
+                    },
+                },
+                null,
+            ],
+        });
+        let cfg: PoolConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            cfg,
+            PoolConfig::TONCore {
+                pools: [
+                    Some(TonCorePoolConfig {
+                        address: Some(addr.to_string()),
+                        params: Some(TonCoreInitParams {
+                            validator_share: 100,
+                            max_nominators: 10,
+                            min_validator_stake: 5_000_000_000_000,
+                            min_nominator_stake: 1_000_000_000_000,
+                        }),
+                    }),
+                    None,
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn test_pool_config_serde_core_dual_pools_roundtrip() {
+        let addr0 = ADDR;
+        let addr1 = OWNER;
+        let value = serde_json::json!({
+            "kind": "core",
+            "pools": [
+                { "address": addr0, "params": { "validator_share": 50 } },
+                { "address": addr1, "params": { "validator_share": 50 } },
+            ],
+        });
+        let cfg: PoolConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            matches!(cfg, PoolConfig::TONCore { ref pools } if pools[0].is_some() && pools[1].is_some())
+        );
+
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["kind"], "core");
+        assert_eq!(json["pools"][0]["address"], addr0);
+        assert_eq!(json["pools"][1]["address"], addr1);
+    }
+
+    #[test]
+    fn test_pool_config_serde_core_both_none() {
+        let value = serde_json::json!({
+            "kind": "core",
+            "pools": [null, null],
+        });
+        let cfg: PoolConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg, PoolConfig::TONCore { pools: [None, None] });
     }
 
     #[test]

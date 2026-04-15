@@ -10,7 +10,8 @@ use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
         SEND_TIMEOUT, api_delete, api_get, api_post, fetch_network_max_factor, get_wallet_config,
-        load_config_vault_rpc_client, make_wallet, require_config, resolve_service_url,
+        load_config_vault_rpc_client, make_wallet, require_config,
+        resolve_pool_address_from_config, resolve_service_url, toncore_pool_slot_from_cli_flags,
         vault_secret_missing, wait_for_seqno_change, wallet_info, warn_missing_secret,
     },
 };
@@ -18,15 +19,12 @@ use anyhow::Context;
 use colored::Colorize;
 use common::{
     TonWalletVersion,
-    app_config::{ElectionsConfig, PoolConfig},
+    app_config::ElectionsConfig,
     task_cancellation::CancellationCtx,
     time_format,
     ton_utils::{display_tons, tons_f64_to_nanotons},
 };
-use contracts::{
-    ElectorWrapper, ElectorWrapperImpl, NominatorWrapperImpl, TonWallet, contract_provider,
-    nominator,
-};
+use contracts::{ElectorWrapper, ElectorWrapperImpl, TonWallet, contract_provider, nominator};
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use std::{io::Write, path::Path};
 use ton_block::{Cell, MsgAddressInt, write_boc};
@@ -126,6 +124,18 @@ pub struct WalletStakeCmd {
         help = "Max factor from 1.0 up to the network limit (config param 17)"
     )]
     max_factor: f32,
+    #[arg(
+        long = "pool-even",
+        conflicts_with = "pool_odd",
+        help = "TONCore nominator: use the pool for even validation rounds (default if neither flag is set)"
+    )]
+    pool_even: bool,
+    #[arg(
+        long = "pool-odd",
+        conflicts_with = "pool_even",
+        help = "TONCore nominator: use the pool for odd validation rounds"
+    )]
+    pool_odd: bool,
 }
 
 impl WalletCmd {
@@ -381,7 +391,8 @@ impl WalletStakeCmd {
         if wallet_info_res.account_state != AccountState::Active {
             anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_res.account_state);
         }
-        let pool_address = resolve_pool_address(pool_cfg, &wallet_address)?;
+        let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
+        let pool_address = resolve_pool_address_from_config(pool_cfg, &wallet_address, pool_slot)?;
         let pool_addr_bytes = pool_address.address().clone().storage().to_vec();
 
         // Connect to validator node via control protocol
@@ -605,22 +616,4 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
-}
-
-fn resolve_pool_address(
-    pool_cfg: &PoolConfig,
-    validator_addr: &MsgAddressInt,
-) -> anyhow::Result<MsgAddressInt> {
-    match pool_cfg {
-        PoolConfig::SNP { address, owner } => match (address, owner) {
-            (Some(addr), _) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
-            (None, Some(owner)) => {
-                let owner_addr =
-                    owner.parse::<MsgAddressInt>().context("invalid pool owner address")?;
-                NominatorWrapperImpl::calculate_address(-1, &owner_addr, validator_addr)
-            }
-            (None, None) => anyhow::bail!("Pool has neither address nor owner configured"),
-        },
-        _ => anyhow::bail!("Unsupported pool kind for manual stake"),
-    }
 }

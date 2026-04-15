@@ -9,17 +9,17 @@
 use anyhow::Context;
 use colored::Colorize;
 use common::{
-    app_config::{AppConfig, WalletConfig},
+    app_config::{AppConfig, PoolConfig, WalletConfig},
     task_cancellation::CancellationCtx,
     ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
-use contracts::{WalletContract, contract_provider};
+use contracts::{SingleNominatorWrapper, WalletContract, contract_provider, resolve_toncore_pool};
 use secrets_vault::{
     errors::error::VaultError, types::secret::Secret, vault::SecretVault,
     vault_builder::SecretVaultBuilder,
 };
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{collections::HashMap, fs, io::Write, path::Path, sync::Arc};
 use ton_block::MsgAddressInt;
 use ton_http_api_client::v2::{
     client_json_rpc::ClientJsonRpc,
@@ -38,6 +38,64 @@ pub async fn fetch_network_max_factor(rpc_client: &ClientJsonRpc) -> anyhow::Res
     extract_max_factor(rpc_client.get_config_param(17).await?)
 }
 
+/// TONCore nominator (two pools): slot index from `--pool-even` / `--pool-odd` (`0` = even round, `1` = odd).
+#[inline]
+pub fn toncore_pool_slot_from_cli_flags(pool_even: bool, pool_odd: bool) -> usize {
+    match (pool_even, pool_odd) {
+        (_, true) => 1,
+        (true, false) | (false, false) => 0,
+    }
+}
+
+/// Resolve the on-chain pool address from config, validator wallet address, and pool slot index.
+///
+/// Handles SNP (address or derived from owner), single TONCore, and dual-pool TONCore.
+/// `pool_slot` is `0` for even rounds (or SNP) and `1` for odd rounds (`--pool-odd`).
+pub fn resolve_pool_address_from_config(
+    pool_cfg: &PoolConfig,
+    validator_addr: &MsgAddressInt,
+    pool_slot: usize,
+) -> anyhow::Result<MsgAddressInt> {
+    match pool_cfg {
+        PoolConfig::SNP { .. } if pool_slot != 0 => {
+            anyhow::bail!("--pool-odd is not applicable for SNP pools");
+        }
+        PoolConfig::SNP { address, owner } => match (address, owner) {
+            (Some(addr), _) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
+            (None, Some(owner)) => {
+                let owner_addr =
+                    owner.parse::<MsgAddressInt>().context("invalid pool owner address")?;
+                SingleNominatorWrapper::calculate_address(-1, &owner_addr, validator_addr)
+            }
+            (None, None) => anyhow::bail!("Pool has neither address nor owner configured"),
+        },
+        PoolConfig::TONCore { pools } => {
+            if pool_slot > 1 {
+                anyhow::bail!("TONCore pool slot must be 0 (even) or 1 (odd)");
+            }
+            if pool_slot == 1 && pools[1].is_none() {
+                anyhow::bail!(
+                    "--pool-odd is only valid for TONCore nominator with two pool slots configured"
+                );
+            }
+            let slot = pools[pool_slot].as_ref().ok_or_else(|| {
+                anyhow::anyhow!("TONCore pool slot {} is not configured", pool_slot)
+            })?;
+            match (&slot.address, &slot.params) {
+                (Some(addr), None) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
+                (addr, Some(params)) => {
+                    let resolved =
+                        resolve_toncore_pool(validator_addr, addr.as_deref(), params.clone())?;
+                    Ok(resolved.address)
+                }
+                (None, None) => {
+                    anyhow::bail!("TONCore pool slot {} has neither address nor params", pool_slot)
+                }
+            }
+        }
+    }
+}
+
 pub fn warn_missing_secret(secret_name: &str) {
     println!("\n{} {}", "[WARNING]".yellow().bold(), "Vault secret is missing".yellow(),);
     println!(
@@ -52,11 +110,12 @@ pub fn warn_missing_secret(secret_name: &str) {
     );
 }
 
-#[allow(dead_code)]
-pub fn warn_ton_api_unavailable(error: &anyhow::Error, note: &str) {
-    println!("\n{} {}", "[WARNING]".yellow().bold(), "Failed to connect to TON API".yellow(),);
-    println!("  {} {}", "Reason:".yellow().bold(), error.root_cause().to_string());
-    println!("  {} {}", "Note:".yellow().bold(), note.yellow().italic());
+pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
+    print!("{prompt} [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 pub fn save_config(config: &AppConfig, path: &Path) -> anyhow::Result<()> {
@@ -72,22 +131,6 @@ pub async fn load_config_vault(
     let vault = SecretVaultBuilder::from_env().await?;
 
     Ok((config, vault))
-}
-
-// Remove after all config commands switch to use the service API
-#[allow(dead_code)]
-pub async fn check_ton_api_connection(rpc_client: &ClientJsonRpc) -> anyhow::Result<()> {
-    rpc_client.get_config_param(1).await.map(|_| ())
-}
-
-// Remove after all config commands switch to use the service API
-#[allow(dead_code)]
-pub async fn try_create_rpc_client(config: &AppConfig) -> anyhow::Result<Arc<ClientJsonRpc>> {
-    let client = ClientJsonRpc::connect_many(
-        config.ton_http_api.resolved_endpoints(),
-        config.ton_http_api.api_key.clone(),
-    )?;
-    check_ton_api_connection(&client).await.map(|_| Arc::new(client))
 }
 
 pub async fn load_config_vault_rpc_client(

@@ -14,9 +14,10 @@ use common::{
     time_format,
 };
 use contracts::{
-    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
+    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, PoolKind, TonCoreNominatorRouter,
+    TonWallet,
     elector::{FrozenParticipant, PastElections},
-    nominator::{NominatorRoles, PoolData, opcodes},
+    nominator::{NominatorRoles, PoolData, SNP_STORAGE_RESERVE, TONCORE_STORAGE_RESERVE, opcodes},
 };
 use mockall::mock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -30,6 +31,7 @@ use ton_block::{
 // ---- Address helpers ----
 
 const POOL_ADDR: [u8; 32] = [0xBBu8; 32];
+const POOL_ADDR_1: [u8; 32] = [0xCCu8; 32];
 
 fn wallet_address() -> MsgAddressInt {
     MsgAddressInt::standard(-1, [0xAAu8; 32])
@@ -37,6 +39,10 @@ fn wallet_address() -> MsgAddressInt {
 
 fn pool_address() -> MsgAddressInt {
     MsgAddressInt::standard(-1, POOL_ADDR)
+}
+
+fn pool_address_1() -> MsgAddressInt {
+    MsgAddressInt::standard(-1, POOL_ADDR_1)
 }
 
 fn elector_address() -> MsgAddressInt {
@@ -123,7 +129,7 @@ mock! {
     #[async_trait::async_trait]
     impl contracts::SmartContract for ElectorWrapperImpl {
         async fn balance(&self) -> anyhow::Result<u64>;
-        fn address(&self) -> MsgAddressInt;
+        async fn address(&self) -> anyhow::Result<MsgAddressInt>;
     }
 
     #[async_trait::async_trait]
@@ -144,7 +150,7 @@ mock! {
     #[async_trait::async_trait]
     impl contracts::SmartContract for TonWalletImpl {
         async fn balance(&self) -> anyhow::Result<u64>;
-        fn address(&self) -> MsgAddressInt;
+        async fn address(&self) -> anyhow::Result<MsgAddressInt>;
     }
 
     #[async_trait::async_trait]
@@ -178,19 +184,22 @@ mock! {
 // ---- Mock: NominatorWrapper ----
 
 mock! {
-    NominatorWrapperImpl {}
+    SingleNominatorWrapper {}
 
     #[async_trait::async_trait]
-    impl contracts::SmartContract for NominatorWrapperImpl {
+    impl contracts::SmartContract for SingleNominatorWrapper {
         async fn balance(&self) -> anyhow::Result<u64>;
-        fn address(&self) -> MsgAddressInt;
+        async fn address(&self) -> anyhow::Result<MsgAddressInt>;
     }
 
     #[async_trait::async_trait]
-    impl NominatorWrapper for NominatorWrapperImpl {
+    impl NominatorWrapper for SingleNominatorWrapper {
         async fn get_roles(&self) -> anyhow::Result<NominatorRoles>;
         async fn get_pool_data(&self) -> anyhow::Result<PoolData>;
         fn state_init(&self) -> Option<ton_block::StateInit>;
+        fn inner_pools(&self) -> Vec<std::sync::Arc<dyn NominatorWrapper>>;
+        fn storage_reserve(&self) -> u64;
+        fn pool_kind(&self) -> PoolKind;
     }
 }
 
@@ -341,7 +350,8 @@ struct TestHarness {
     elector_mock: MockElectorWrapperImpl,
     provider_mock: MockElectionsProviderImpl,
     wallet_mock: MockTonWalletImpl,
-    pool_mock: Option<MockNominatorWrapperImpl>,
+    pool_mock: Option<MockSingleNominatorWrapper>,
+    toncore_nominator_mocks: Option<(MockSingleNominatorWrapper, MockSingleNominatorWrapper)>,
     elections_config: ElectionsConfig,
     bindings: HashMap<String, NodeBinding>,
 }
@@ -353,6 +363,7 @@ impl TestHarness {
             provider_mock: MockElectionsProviderImpl::new(),
             wallet_mock: MockTonWalletImpl::new(),
             pool_mock: None,
+            toncore_nominator_mocks: None,
             elections_config: ElectionsConfig {
                 policy: StakePolicy::Split50,
                 policy_overrides: HashMap::new(),
@@ -366,11 +377,17 @@ impl TestHarness {
     }
 
     fn with_pool(mut self) -> Self {
-        self.pool_mock = Some(MockNominatorWrapperImpl::new());
+        self.pool_mock = Some(MockSingleNominatorWrapper::new());
         self
     }
 
-    fn build(mut self, node_id: &str) -> ElectionRunner {
+    fn with_toncore_nominator_pair(mut self) -> Self {
+        self.toncore_nominator_mocks =
+            Some((MockSingleNominatorWrapper::new(), MockSingleNominatorWrapper::new()));
+        self
+    }
+
+    async fn build(mut self, node_id: &str) -> ElectionRunner {
         self.bindings.entry(node_id.to_string()).or_insert_with(|| default_binding(true));
 
         let wallet: Arc<dyn TonWallet> = Arc::new(self.wallet_mock);
@@ -383,6 +400,13 @@ impl TestHarness {
         let mut pools: HashMap<String, Arc<dyn NominatorWrapper>> = HashMap::new();
         if let Some(pool) = self.pool_mock {
             pools.insert(node_id.to_string(), Arc::new(pool));
+        } else if let Some((p0, p1)) = self.toncore_nominator_mocks {
+            let p0: Arc<dyn NominatorWrapper> = Arc::new(p0);
+            let p1: Arc<dyn NominatorWrapper> = Arc::new(p1);
+            pools.insert(
+                node_id.to_string(),
+                Arc::new(TonCoreNominatorRouter::from_wrappers([Some(p0), Some(p1)])),
+            );
         }
 
         let elector: Arc<dyn ElectorWrapper> = Arc::new(self.elector_mock);
@@ -469,7 +493,7 @@ fn setup_default_elector(
     election_id: u64,
     returned_stake: u64,
 ) {
-    elector.expect_address().returning(|| elector_address());
+    elector.expect_address().returning(|| Ok(elector_address()));
 
     elector.expect_get_active_election_id().returning(move || Ok(election_id));
 
@@ -491,17 +515,56 @@ fn setup_default_elector(
 }
 
 fn setup_elector_no_elections(elector: &mut MockElectorWrapperImpl) {
-    elector.expect_address().returning(|| elector_address());
+    elector.expect_address().returning(|| Ok(elector_address()));
     elector.expect_get_active_election_id().returning(|| Ok(0));
 }
 
 fn setup_wallet(wallet: &mut MockTonWalletImpl) {
-    wallet.expect_address().returning(|| wallet_address());
+    wallet.expect_address().returning(|| Ok(wallet_address()));
     wallet.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
 }
 
-fn setup_pool(pool: &mut MockNominatorWrapperImpl) {
-    pool.expect_address().returning(|| pool_address());
+/// Like `setup_default_provider` but without `expect_account` — caller sets up account mock separately.
+fn setup_default_provider_without_account(
+    provider: &mut MockElectionsProviderImpl,
+    _wallet_balance: u64,
+) {
+    provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    provider.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    provider.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    provider.expect_get_next_vset().returning(|| Ok(None));
+    provider
+        .expect_new_validator_key()
+        .returning(|_since, _until| Ok((KEY_ID.to_vec(), PUB_KEY.to_vec())));
+    provider.expect_new_adnl_addr().returning(|_key_id, _until| Ok(ADNL_ADDR.to_vec()));
+    provider.expect_export_public_key().returning(|_key_id| Ok(PUB_KEY.to_vec()));
+    provider.expect_sign().returning(|_key, _data| Ok(SIGNATURE.to_vec()));
+    provider.expect_send_boc().returning(|_boc| Ok(()));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
+    provider.expect_shutdown().returning(|| Ok(()));
+}
+
+fn setup_pool(pool: &mut MockSingleNominatorWrapper) {
+    pool.expect_address().returning(|| Ok(pool_address()));
+    pool.expect_inner_pools().returning(|| vec![]);
+    pool.expect_storage_reserve().returning(|| SNP_STORAGE_RESERVE);
+    pool.expect_pool_kind().returning(|| PoolKind::SNP);
+}
+
+fn pool_data_with_state(state: i32) -> PoolData {
+    PoolData { state, ..Default::default() }
+}
+
+fn setup_toncore_nominator_slot(
+    pool: &mut MockSingleNominatorWrapper,
+    addr: MsgAddressInt,
+    state: i32,
+) {
+    pool.expect_address().returning(move || Ok(addr.clone()));
+    pool.expect_get_pool_data().returning(move || Ok(pool_data_with_state(state)));
+    pool.expect_storage_reserve().returning(|| TONCORE_STORAGE_RESERVE);
+    pool.expect_pool_kind().returning(|| PoolKind::TONCore);
 }
 
 // =====================================================
@@ -517,7 +580,7 @@ async fn test_participate_new_key_no_pool() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
     let expected_stake =
-        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - MIN_NANOTON_FOR_STORAGE) / 2;
+        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - WALLET_STORAGE_RESERVE) / 2;
     // validate the election bid payload
     harness
         .wallet_mock
@@ -527,7 +590,7 @@ async fn test_participate_new_key_no_pool() {
         })
         .returning(|_dest, _value, _payload| Ok(dummy_cell()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
 
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
@@ -558,7 +621,7 @@ async fn test_participate_new_key_with_pool() {
     setup_wallet(&mut harness.wallet_mock);
     setup_pool(harness.pool_mock.as_mut().unwrap());
 
-    let expected_stake = (POOL_BALANCE - MIN_NANOTON_FOR_STORAGE) / 2;
+    let expected_stake = (POOL_BALANCE - SNP_STORAGE_RESERVE - EXTRA_STORAGE_FEES) / 2;
     // validate the election bid payload
     harness
         .wallet_mock
@@ -568,7 +631,7 @@ async fn test_participate_new_key_with_pool() {
         })
         .returning(|_dest, _value, _payload| Ok(dummy_cell()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
 
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
@@ -611,7 +674,7 @@ async fn test_participate_existing_key_not_in_elector() {
         Ok(ValidatorConfig { keys })
     });
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     runner.refresh_validator_configs().await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
@@ -634,7 +697,7 @@ async fn test_stake_already_accepted() {
 
     let wallet_addr = addr_bytes(&wallet_address());
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     let wallet_addr_clone = wallet_addr.clone();
@@ -684,7 +747,7 @@ async fn test_stake_already_accepted() {
     provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     runner.refresh_validator_configs().await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
@@ -721,7 +784,7 @@ async fn test_recover_stake_returns_funds() {
     provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -754,7 +817,7 @@ async fn test_recover_stake_low_wallet_balance() {
     provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     // run() catches per-node errors and continues; it itself returns Ok
     assert!(result.is_ok());
@@ -781,7 +844,7 @@ async fn test_no_active_elections() {
 
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok());
 
@@ -800,7 +863,7 @@ async fn test_closed_elections_without_submission_stays_not_submitted() {
     provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok());
     assert_eq!(runner.snapshot_cache.last_elections_status, ElectionsStatus::Closed);
@@ -848,7 +911,7 @@ async fn test_excluded_node_skips_elections() {
     provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok());
 
@@ -893,7 +956,7 @@ async fn test_elections_finished_stake_accepted() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, Some(POOL_BALANCE));
 
     setup_wallet(&mut harness.wallet_mock);
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok());
 
@@ -915,7 +978,7 @@ async fn test_run_loop_cancellation() {
     setup_elector_no_elections(&mut harness.elector_mock);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
 
     let mut ctx = CancellationCtx::new();
     let cancel_ctx = ctx.clone();
@@ -951,7 +1014,7 @@ async fn test_run_loop_tick_then_cancel() {
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cc = call_count.clone();
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(move || {
         let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 { Ok(ELECTION_ID) } else { Ok(0) }
@@ -973,7 +1036,7 @@ async fn test_run_loop_tick_then_cancel() {
     setup_wallet(&mut harness.wallet_mock);
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let mut ctx = CancellationCtx::new();
     let cancel_ctx = ctx.clone();
     let store = Arc::new(SnapshotStore::new());
@@ -1010,7 +1073,7 @@ async fn test_fixed_stake_policy() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1033,7 +1096,7 @@ async fn test_minimum_stake_policy() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1096,7 +1159,7 @@ async fn test_recover_with_past_elections_frozen() {
         Ok(ValidatorConfig { keys })
     });
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1106,7 +1169,7 @@ async fn test_recover_with_past_elections_frozen() {
     let p = node.participant.as_ref().unwrap();
     // With Split50 policy, stake = max(total_balance / 2, min_stake)
     // total_balance = frozen_stake + pool_free_balance + 0
-    // pool_free_balance = WALLET_BALANCE - gas_fee - MIN_NANOTON_FOR_STORAGE
+    // pool_free_balance = WALLET_BALANCE - gas_fee - SNP_STORAGE_RESERVE
     assert!(p.stake >= MIN_STAKE, "stake should be at least min_stake");
 }
 
@@ -1136,7 +1199,7 @@ async fn test_low_stake_balance() {
 
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     // run() itself is Ok, but the node should have an error
     assert!(result.is_ok());
@@ -1168,7 +1231,7 @@ async fn test_shutdown() {
     provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
     provider.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.shutdown().await;
     assert!(result.is_ok());
 }
@@ -1215,11 +1278,11 @@ async fn test_multiple_nodes_one_excluded() {
     );
 
     let mut wallet1 = MockTonWalletImpl::new();
-    wallet1.expect_address().returning(|| wallet_address());
+    wallet1.expect_address().returning(|| Ok(wallet_address()));
     wallet1.expect_message().returning(|_, _, _| Ok(dummy_cell()));
 
     let mut wallet2 = MockTonWalletImpl::new();
-    wallet2.expect_address().returning(|| MsgAddressInt::standard(-1, [0xCCu8; 32]));
+    wallet2.expect_address().returning(|| Ok(MsgAddressInt::standard(-1, [0xCCu8; 32])));
     wallet2.expect_message().returning(|_, _, _| Ok(dummy_cell()));
 
     let mut wallets: HashMap<String, Arc<dyn TonWallet>> = HashMap::new();
@@ -1276,7 +1339,7 @@ async fn test_elections_failed_still_processes_nodes() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     harness.elector_mock.expect_elections_info().returning(move || {
@@ -1296,7 +1359,7 @@ async fn test_elections_failed_still_processes_nodes() {
     setup_wallet(&mut harness.wallet_mock);
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1323,7 +1386,7 @@ async fn test_elections_finished_node_not_in_participants() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     // Finished elections with a different participant
@@ -1357,7 +1420,7 @@ async fn test_elections_finished_node_not_in_participants() {
 
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok());
 
@@ -1384,7 +1447,7 @@ async fn test_election_parameters_all_nodes_fail() {
 
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_err(), "run() should fail when all nodes fail to return cfg15");
     let err = result.unwrap_err();
@@ -1418,7 +1481,7 @@ async fn test_new_validator_key_failure() {
     provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() should still be Ok, per-node error captured");
 
@@ -1459,7 +1522,7 @@ async fn test_send_boc_failure() {
     provider.expect_shutdown().returning(|| Ok(()));
     provider.expect_sign().returning(|_key, _data| Ok(SIGNATURE.to_vec()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() should be Ok, per-node error captured");
 
@@ -1487,7 +1550,7 @@ async fn test_split50_stake_calculation() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1495,11 +1558,8 @@ async fn test_split50_stake_calculation() {
     assert!(node.participant.is_some());
     let p = node.participant.as_ref().unwrap();
 
-    // With Split50: stake = max(total_balance / 2, min_stake)
-    // total_balance = frozen_stake(0) + pool_free_balance + elections_stake(0)
-    // pool_free_balance = WALLET_BALANCE - gas_fee - MIN_NANOTON_FOR_STORAGE
     let gas_fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
-    let pool_free_balance = WALLET_BALANCE - gas_fee - MIN_NANOTON_FOR_STORAGE;
+    let pool_free_balance = WALLET_BALANCE - gas_fee - WALLET_STORAGE_RESERVE;
     let expected = (pool_free_balance / 2).max(MIN_STAKE);
     assert_eq!(
         p.stake, expected,
@@ -1519,7 +1579,7 @@ async fn test_build_elections_snapshot() {
 
     let wallet_addr = addr_bytes(&wallet_address());
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     let wallet_addr_clone = wallet_addr.clone();
@@ -1559,7 +1619,7 @@ async fn test_build_elections_snapshot() {
     setup_wallet(&mut harness.wallet_mock);
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1739,7 +1799,7 @@ async fn test_second_tick_stake_already_sent() {
     setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, Some(POOL_BALANCE));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
 
     // First tick: no key → generates new key, sends stake
     runner.refresh_validator_configs().await;
@@ -1774,7 +1834,7 @@ async fn test_publish_snapshot_validators() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let _ = runner.run().await;
 
     let store = Arc::new(SnapshotStore::new());
@@ -1815,7 +1875,7 @@ async fn test_policy_override_per_node() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1845,7 +1905,7 @@ async fn test_withf_verify_stake_message_payload() {
 
     // -- wallet mock: verify dest, value, and payload body --
     let wallet = &mut harness.wallet_mock;
-    wallet.expect_address().returning(|| wallet_address());
+    wallet.expect_address().returning(|| Ok(wallet_address()));
 
     wallet
         .expect_message()
@@ -1870,7 +1930,7 @@ async fn test_withf_verify_stake_message_payload() {
 
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, Some(POOL_BALANCE));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -1948,7 +2008,7 @@ fn setup_adaptive_elector(
     participants: Vec<Participant>,
     past_elections_factory: impl Fn() -> Vec<PastElections> + Send + 'static,
 ) {
-    elector.expect_address().returning(|| elector_address());
+    elector.expect_address().returning(|| Ok(elector_address()));
     elector.expect_get_active_election_id().returning(move || Ok(election_id));
 
     let total_stake: u64 = participants.iter().map(|p| p.stake).sum();
@@ -2004,7 +2064,7 @@ async fn test_adaptive_wait_for_participants() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -2072,7 +2132,7 @@ async fn test_adaptive_proceed_after_wait_timeout() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -2117,7 +2177,7 @@ async fn test_adaptive_sleep_period_delays_even_with_enough_participants() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     assert!(result.is_ok(), "run() failed: {:?}", result.err());
 
@@ -2159,7 +2219,7 @@ async fn test_adaptive_topup_three_ticks() {
     let wallet_addr = addr_bytes(&wallet_address());
 
     let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
-    let pool_free_balance = wallet_balance - fee - MIN_NANOTON_FOR_STORAGE;
+    let pool_free_balance = wallet_balance - fee - WALLET_STORAGE_RESERVE;
     let initial_stake = pool_free_balance / 2; // stake half on tick 1
 
     // --- Helper: build participants with given stakes ---
@@ -2320,7 +2380,7 @@ async fn test_adaptive_topup_three_ticks() {
     setup_default_provider(&mut harness.provider_mock, wallet_balance, None);
     setup_wallet(&mut harness.wallet_mock);
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
 
     // === Tick 1: emulate election → stake half ===
     runner.refresh_validator_configs().await;
@@ -2363,7 +2423,7 @@ async fn test_adaptive_topup_three_ticks() {
     // Remaining wallet ≈ 50k, current_stake ≈ 50k in elector.
     // total ≈ 100k, half ≈ 50k < min_eff (~60k) → stake all remaining.
     let remaining_balance = wallet_balance - initial_stake - fee;
-    let pool_free_tick3 = remaining_balance - fee - MIN_NANOTON_FOR_STORAGE;
+    let pool_free_tick3 = remaining_balance - fee - WALLET_STORAGE_RESERVE;
     assert!(
         tick3_stake > tick2_stake,
         "tick 3: stake should increase via top-up: tick2={}, tick3={}",
@@ -2413,36 +2473,36 @@ fn test_elections_config_defaults() {
     assert_eq!(config.waiting_period_pct, 0.4);
 }
 
-#[test]
-fn test_calc_max_factor_clamps_to_network_cap() {
+#[tokio::test]
+async fn test_calc_max_factor_clamps_to_network_cap() {
     let mut harness = TestHarness::new();
     setup_elector_no_elections(&mut harness.elector_mock);
     harness.elections_config.max_factor = 5.0;
-    let runner = harness.build("node-1");
+    let runner = harness.build("node-1").await;
     let network_raw = 3 * 65536u32; // chain allows 3×
     let (raw, mult) = runner.calc_max_factor(network_raw);
     assert_eq!(raw, network_raw, "configured 5× must clamp to network 3× (raw)");
     assert!((mult - 3.0).abs() < 1e-3);
 }
 
-#[test]
-fn test_calc_max_factor_no_clamp_when_below_cap() {
+#[tokio::test]
+async fn test_calc_max_factor_no_clamp_when_below_cap() {
     let mut harness = TestHarness::new();
     setup_elector_no_elections(&mut harness.elector_mock);
     harness.elections_config.max_factor = 2.0;
-    let runner = harness.build("node-1");
+    let runner = harness.build("node-1").await;
     let network_raw = 3 * 65536u32;
     let (raw, mult) = runner.calc_max_factor(network_raw);
     assert_eq!(raw, 2 * 65536, "2× should pass through when network cap is 3×");
     assert!((mult - 2.0).abs() < 1e-3);
 }
 
-#[test]
-fn test_calc_max_factor_clamps_to_minimum_1x() {
+#[tokio::test]
+async fn test_calc_max_factor_clamps_to_minimum_1x() {
     let mut harness = TestHarness::new();
     setup_elector_no_elections(&mut harness.elector_mock);
     harness.elections_config.max_factor = 0.5;
-    let runner = harness.build("node-1");
+    let runner = harness.build("node-1").await;
     let network_raw = 3 * 65536u32;
     let (raw, mult) = runner.calc_max_factor(network_raw);
     assert_eq!(raw, 65536, "below 1× fixed-point must clamp to 65536");
@@ -2470,17 +2530,20 @@ async fn test_participation_status_lifecycle() {
     provider.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
     provider.expect_shutdown().returning(|| Ok(()));
 
-    let mut runner = harness.build(node_id);
+    let mut runner = harness.build(node_id).await;
 
-    // Helper to get the status of our node
-    let get_status = |r: &ElectionRunner| -> ParticipationStatus {
-        let participants = r.build_our_participants_snapshot();
-        participants.into_iter().find(|p| p.node_id == node_id).unwrap().status
-    };
+    async fn participation_status(r: &ElectionRunner, nid: &str) -> ParticipationStatus {
+        r.build_our_participants_snapshot()
+            .await
+            .into_iter()
+            .find(|p| p.node_id == nid)
+            .unwrap()
+            .status
+    }
 
     // --- Phase 1: Idle (no elections, not validating) ---
     runner.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
-    assert_eq!(get_status(&runner), ParticipationStatus::Idle);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Idle);
 
     // --- Phase 2: Participating (elections active, participant set, no submissions) ---
     runner.snapshot_cache.last_elections_status = ElectionsStatus::Active;
@@ -2494,7 +2557,7 @@ async fn test_participation_status_lifecycle() {
         max_factor: 0,
         stake_message_boc: None,
     });
-    assert_eq!(get_status(&runner), ParticipationStatus::Participating);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Participating);
 
     // --- Phase 3: Submitted (stake sent) ---
     let node = runner.nodes.get_mut(node_id).unwrap();
@@ -2503,18 +2566,18 @@ async fn test_participation_status_lifecycle() {
         max_factor: 3 * 65536,
         submission_time: time_format::now(),
     });
-    assert_eq!(get_status(&runner), ParticipationStatus::Submitted);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Submitted);
 
     // --- Phase 4: Accepted (elector accepted the stake) ---
     let node = runner.nodes.get_mut(node_id).unwrap();
     node.stake_accepted = true;
     node.accepted_stake_amount = Some(10_000_000_000_000);
-    assert_eq!(get_status(&runner), ParticipationStatus::Accepted);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Accepted);
 
     // --- Phase 5: Elected (node appears in p36 / next validator set) ---
     let node = runner.nodes.get_mut(node_id).unwrap();
     node.is_next_validator = true;
-    assert_eq!(get_status(&runner), ParticipationStatus::Elected);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Elected);
 
     // --- Phase 6: Validating (p36 → p34, elections closed) ---
     // Node moves from next vset to current vset, elections are done.
@@ -2522,14 +2585,14 @@ async fn test_participation_status_lifecycle() {
     node.is_next_validator = false;
     node.is_validator = true;
     runner.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
-    assert_eq!(get_status(&runner), ParticipationStatus::Validating);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Validating);
 
     // --- Phase 7: Verify stale flags don't leak ---
     // stake_accepted is still true from phase 4, but elections are closed.
     // Must show Validating, NOT Accepted.
     let node = runner.nodes.get(node_id).unwrap();
     assert!(node.stake_accepted, "stake_accepted should still be true (stale)");
-    assert_eq!(get_status(&runner), ParticipationStatus::Validating);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Validating);
 
     // --- Phase 8: New elections start while validating ---
     // Node is still in p34, but new election cycle begins and node submits again.
@@ -2553,7 +2616,7 @@ async fn test_participation_status_lifecycle() {
         submission_time: time_format::now(),
     });
     // Should show Submitted (election activity), NOT Validating
-    assert_eq!(get_status(&runner), ParticipationStatus::Submitted);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Submitted);
 
     // --- Phase 9: Back to idle (not validating, no elections) ---
     let node = runner.nodes.get_mut(node_id).unwrap();
@@ -2561,5 +2624,190 @@ async fn test_participation_status_lifecycle() {
     node.participant = None;
     node.stake_submissions.clear();
     runner.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
-    assert_eq!(get_status(&runner), ParticipationStatus::Idle);
+    assert_eq!(participation_status(&runner, node_id).await, ParticipationStatus::Idle);
+}
+
+// =====================================================
+// TONCore nominator (two pools) tests
+// =====================================================
+
+#[tokio::test]
+async fn test_toncore_nominator_selects_free_pool() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    // pool[0] busy (state=2), pool[1] free (state=0)
+    setup_toncore_nominator_slot(p0, pool_address(), 2);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
+
+    // Provider returns pool[1] balance when asked for that address
+    let pool1_hex = hex::encode(POOL_ADDR_1);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool1_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    // TONCore nominator pair + split50: stake entire liquid balance of the active (free) pool.
+    let expected_stake = POOL_BALANCE - TONCORE_STORAGE_RESERVE - EXTRA_STORAGE_FEES;
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.participant.is_some());
+    let participant = node.participant.as_ref().unwrap();
+    // wallet_addr should be pool[1] (the free one), not pool[0]
+    assert_eq!(participant.wallet_addr, addr_bytes(&pool_address_1()));
+    assert_eq!(participant.stake, expected_stake);
+}
+
+#[tokio::test]
+async fn test_toncore_nominator_both_pools_busy_skips_elections() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot(p0, pool_address(), 2);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
+
+    harness
+        .provider_mock
+        .expect_account()
+        .returning(move |_address| Ok(fake_account(WALLET_BALANCE)));
+
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    // Both pools busy → router's address() returns "no one pool is ready".
+    // Runner aborts the whole tick by design so the next tick retries the
+    // address fetch; past_elections_cache_id must remain unchanged.
+    let err = result.expect_err("run() should abort when no pool is ready");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("pool address error"), "unexpected error: {}", msg);
+    assert!(msg.contains("no one pool is ready"), "unexpected error: {}", msg);
+    assert_eq!(runner.past_elections_cache_id, 0);
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(!node.stake_accepted);
+}
+
+#[tokio::test]
+async fn test_toncore_nominator_recover_stake_uses_cached_pool_address() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    let returned_for_stake_addr = 50_000_000_000_000u64;
+
+    // Elector returns active elections so run() proceeds to recover
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
+    harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
+    harness.elector_mock.expect_elections_info().returning(move || {
+        Ok(ElectionsInfo {
+            election_id: ELECTION_ID,
+            elect_close: ELECTION_ID - 300,
+            min_stake: MIN_STAKE,
+            total_stake: 0,
+            failed: false,
+            finished: false,
+            participants: vec![],
+        })
+    });
+    harness.elector_mock.expect_past_elections().returning(|| Ok(vec![]));
+    // `recover_stake` asks the elector once using `stake_addr()` (pool_addr_cache → primary pool).
+    harness
+        .elector_mock
+        .expect_compute_returned_stake()
+        .returning(move |_addr| Ok(returned_for_stake_addr));
+
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot(p0, pool_address(), 0);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
+
+    harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    harness.provider_mock.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    harness.provider_mock.expect_get_next_vset().returning(|| Ok(None));
+    harness.provider_mock.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    harness
+        .provider_mock
+        .expect_account()
+        .returning(move |_address| Ok(fake_account(WALLET_BALANCE)));
+    harness.provider_mock.expect_send_boc().returning(|_boc| Ok(()));
+    harness.provider_mock.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    harness.provider_mock.expect_config_param_17().returning(|| Ok(default_cfg17()));
+    harness.provider_mock.expect_shutdown().returning(|| Ok(()));
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert_eq!(node.last_recover_amount, returned_for_stake_addr);
+}
+
+#[tokio::test]
+async fn test_toncore_nominator_elections_finished_checks_active_pool_only() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    // Elections are finished with a participant from pool[1]
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
+    harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
+    let pool1_addr_bytes = addr_bytes(&pool_address_1());
+    harness.elector_mock.expect_elections_info().returning(move || {
+        Ok(ElectionsInfo {
+            election_id: ELECTION_ID,
+            elect_close: ELECTION_ID - 300,
+            min_stake: MIN_STAKE,
+            total_stake: 100_000_000_000_000,
+            failed: false,
+            finished: true,
+            participants: vec![Participant {
+                pub_key: PUB_KEY.to_vec(),
+                adnl_addr: ADNL_ADDR.to_vec(),
+                election_id: ELECTION_ID,
+                wallet_addr: pool1_addr_bytes.clone(),
+                stake: 50_000_000_000_000,
+                max_factor: 196608,
+                stake_message_boc: None,
+            }],
+        })
+    });
+    harness.elector_mock.expect_past_elections().returning(|| Ok(vec![]));
+    harness.elector_mock.expect_compute_returned_stake().returning(|_| Ok(0));
+
+    setup_wallet(&mut harness.wallet_mock);
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot(p0, pool_address(), 0);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
+
+    harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    harness.provider_mock.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    harness.provider_mock.expect_config_param_17().returning(|| Ok(default_cfg17()));
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    // Router now resolves a single active pool address; participant from non-active slot is not matched.
+    assert!(!node.stake_accepted);
+    assert_eq!(node.accepted_stake_amount, None);
 }

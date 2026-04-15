@@ -195,10 +195,10 @@ mod tests {
             unimplemented!()
         }
         fn pools(&self) -> Arc<HashMap<String, Arc<dyn NominatorWrapper>>> {
-            unimplemented!()
+            Arc::new(HashMap::new())
         }
         fn wallets(&self) -> Arc<HashMap<String, Arc<dyn TonWallet>>> {
-            unimplemented!()
+            Arc::new(HashMap::new())
         }
         fn rpc_client(&self) -> Arc<ClientJsonRpc> {
             unimplemented!()

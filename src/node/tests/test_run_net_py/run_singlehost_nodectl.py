@@ -619,7 +619,7 @@ class Bootstrap:
             self.log.warn("No 'opened wallet' in log yet; continuing")
 
         self.log.info("  Waiting for nominator pools to open (up to 300s)...")
-        if not self._wait_log("opened nominator pool: address=", 300):
+        if not self._wait_log("opened nominator pool(s):", 300):
             self.log.warn("No 'opened nominator pool' in log yet; continuing")
 
         self.log.info("  Waiting for all contracts to be deployed (up to 300s)...")
@@ -628,7 +628,15 @@ class Bootstrap:
 
         log_text     = self._nodectl_log.read_text()  # type: ignore[union-attr]
         wallet_addrs = sorted(set(re.findall(r"opened wallet: address=(\S+)", log_text)))
-        pool_addrs   = sorted(set(re.findall(r"opened nominator pool: address=(\S+)", log_text)))
+        pool_chunks = re.findall(r"opened nominator pool\(s\):\s*(.*)", log_text)
+        pool_addrs = sorted(
+            {
+                addr.strip()
+                for chunk in pool_chunks
+                for addr in chunk.split(",")
+                if addr.strip()
+            }
+        )
         self.log.info(f"  Wallets opened: {len(wallet_addrs)}, pools opened: {len(pool_addrs)}")
 
         for addr in pool_addrs:

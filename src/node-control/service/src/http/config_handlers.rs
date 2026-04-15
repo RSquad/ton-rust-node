@@ -413,7 +413,7 @@ pub async fn v1_wallets_handler(
             };
 
         let (address, account_state, balance) = if let Some(wallet) = wallet {
-            let addr = wallet.address();
+            let addr = wallet.address().await.map_err(|e| AppError::internal(e.to_string()))?;
             let addr_str = addr.to_string();
             match rpc_client.get_wallet_information(&addr).await {
                 Ok(info) => {
@@ -458,21 +458,21 @@ pub async fn v1_pools_handler(
 
     let mut views = Vec::new();
     for (name, pool_cfg) in &config.pools {
+        // If Pool is bound to a node — use pre-loaded pool instance.
+        //First, get the name of the node that is bound to the pool.
+        let bound_node = config
+            .bindings
+            .iter()
+            .find(|(_, b)| b.pool == Some(name.clone()))
+            .map(|(node, _)| node.clone());
         let (kind, address, balance, owner, addresses, validator_share) = match pool_cfg {
             PoolConfig::SNP { address, owner } => {
-                // If Pool is bound to a node — use pre-loaded pool instance.
-                //First, get the name of the node that is bound to the pool.
-                let bound_node = config
-                    .bindings
-                    .iter()
-                    .find(|(_, b)| b.pool == Some(name.clone()))
-                    .map(|(node, _)| node.clone());
                 let (addr, bal) = if let Some(n) = bound_node {
                     // Pool is bound to a node - get the pool instance from the cached pools.
                     if let Some(pool) = cached_pools.get(&n) {
-                        let addr = pool.address().to_string();
+                        let addr = pool.address().await.ok().map(|a| a.to_string());
                         let bal = pool.balance().await.ok();
-                        (Some(addr), bal)
+                        (addr, bal)
                     } else {
                         // For some reason, the pool is not in the cached pools - return None.
                         (None, None)
@@ -496,14 +496,21 @@ pub async fn v1_pools_handler(
                 };
                 ("SNP".to_string(), addr, bal, owner.clone(), None, None)
             }
-            PoolConfig::TONCore { addresses, validator_share } => (
-                "Core".to_string(),
-                None,
-                None,
-                None,
-                Some(addresses.to_vec()),
-                Some(*validator_share),
-            ),
+            PoolConfig::TONCore { pools } => {
+                let addresses: Vec<String> = pools
+                    .iter()
+                    .map(|slot| {
+                        slot.as_ref()
+                            .and_then(|s| s.address.clone())
+                            .unwrap_or_else(|| "<not deployed>".into())
+                    })
+                    .collect();
+                let validator_share = pools
+                    .iter()
+                    .flatten()
+                    .find_map(|s| s.params.as_ref().map(|p| p.validator_share as u64));
+                ("Core".to_string(), None, None, None, Some(addresses), validator_share)
+            }
         };
         views.push(PoolDto {
             name: name.clone(),
@@ -654,7 +661,7 @@ pub async fn v1_master_wallet_handler(
 
     let master_wallet = state.runtime_cfg.master_wallet();
     let rpc_client = state.runtime_cfg.rpc_client();
-    let addr = master_wallet.address();
+    let addr = master_wallet.address().await.map_err(|e| AppError::internal(e.to_string()))?;
     let addr_str = addr.to_string();
 
     let (address, account_state, balance, public_key) =

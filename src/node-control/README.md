@@ -38,7 +38,7 @@
 - **TON HTTP API** — retrieve blockchain data through TON HTTP API
 - **REST API Server** — HTTP API for monitoring, managing elections, and controlling tasks
 - **Automatic elections** — automatic participation in validator elections
-- **Pool support** — work through validator wallet or nominator pool (single-nominator)
+- **Pool support** — direct staking from the validator wallet, **Single Nominator Pool (SNP)**, or **TONCore nominator** (one or two on-chain pool contracts)
 - **Flexible stake policies** — minimum, fixed, or split50 stake strategies with per-node overrides
 - **Swagger UI** — interactive API documentation
 
@@ -47,7 +47,7 @@
 |   Feature   | Status | Comment |
 |-------------|------------|-------------|
 | Automatic elections | Done | - |
-| Nominator Pools support | Done | Single Nominator Pool only |
+| Nominator pools (SNP + TONCore) | Done | SNP via `config pool add`; TONCore via `config pool add core` |
 | Automatic Voting for proposals | Done | - |
 | REST API Server | Done | Includes Swagger UI |
 | REST API cli commands | Done | - |
@@ -278,28 +278,66 @@ nodectl config wallet send \
 
 #### `config pool`
 
-Manage nominator pools in the configuration file.
+Manage nominator pools in the configuration file. Pools are stored as tagged JSON: **`kind: "snp"`** or **`kind: "core"`**.
 
-##### `config pool add`
+- **`config pool add`** — **Single Nominator Pool (SNP)** only (`PoolConfig::SNP`: optional `address`, `owner`).
+- **`config pool add core`** — **TONCore nominator** (`PoolConfig::TONCore`): up to **two** logical slots (`pools[0]`, `pools[1]`) for even/odd validation rounds. Each slot is configured by a separate command call with explicit **`--even`** or **`--odd`**, and optional `address` and/or deploy `params` (`TonCoreInitParams`) for that slot.
 
-Add a Single Nominator Pool to the configuration. Pools can be added with an existing contract address (already deployed) or with an owner address (for future deployment).
+##### `config pool add` (SNP)
 
-| Flag | Short form | Description |
-|------|------------|-------------|
+| Flag | Short | Description |
+|------|-------|-------------|
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--address <ADDRESS>` | `-a` | Pool contract address (if already deployed, optional) |
-| `--owner <ADDRESS>` | `-o` | Owner address for deployment/verification (optional) |
+| `--address <ADDRESS>` | `-a` | Deployed pool address (raw or base64url) |
+| `--owner <ADDRESS>` | `-o` | Owner address (for deployment / verification) |
+
+At least one of `--address` or `--owner` is required.
 
 ```bash
-# Add a pool with a known address
-nodectl config pool add \
-  --name pool0 \
-  --address "-1:pool_contract_address"
+nodectl config pool add --name pool0 --address "-1:pool_contract_address"
+nodectl config pool add --name pool0 --owner "-1:owner_address"
+```
 
-# Add a pool with owner for future deployment
-nodectl config pool add \
+##### `config pool add core` (TONCore)
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--name <NAME>` | `-n` | Pool name (unique identifier) |
+| `--validator-share` | | Slot deploy: reward share in **basis points** (e.g. `1000` = 10%). Required when adding deploy params without an existing `--address`. |
+| `--max-nominators` | | Optional; default from contract defaults |
+| `--min-validator-stake` | | Optional; minimum validator stake in **TON** |
+| `--min-nominator-stake` | | Optional; minimum nominator stake in **TON** |
+| `--address` | | Existing pool address for selected slot |
+| `--even` | | Configure slot 0 (even rounds), required unless `--odd` is set |
+| `--odd` | | Configure slot 1 (odd rounds), required unless `--even` is set |
+
+At least one of `--address` or `--validator-share` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
+
+```bash
+# TONCore: configure slot 0 (even)
+nodectl config pool add core --name pool0 --validator-share 5000 --even
+
+# Configure both slots with explicit separate commands
+nodectl config pool add core \
   --name pool0 \
-  --owner "-1:owner_address"
+  --validator-share 5000 \
+  --min-validator-stake 10000 \
+  --even
+nodectl config pool add core \
+  --name pool0 \
+  --validator-share 5000 \
+  --min-validator-stake 10001 \
+  --odd
+
+# Configure existing deployed addresses per slot
+nodectl config pool add core \
+  --name pool0 \
+  --address "-1:..." \
+  --even
+nodectl config pool add core \
+  --name pool0 \
+  --address "-1:..." \
+  --odd
 ```
 
 ##### `config pool ls`
@@ -763,25 +801,35 @@ nodectl deploy wallet --config config.json --all --verbose
 
 #### `deploy pool`
 
-Deploy a Single Nominator Pool contract.
+Deploy a nominator pool contract. The pool type comes from the binding’s `pool` entry in the config (Single Nominator Pool, single-pool TONCore, or TONCore nominator with two pools).
 
 | Option | Short form | Description |
 |--------|------------|-------------|
 | `--config <FILE>` | `-c` | Path to the configuration file. Can also be set as an environment variable CONFIG_PATH |
-| `--node <NAME>` | | Node ID (the wallet of this node is used to deploy the pool) |
-| `--owner <ADDRESS>` | | Address of the pool owner |
-| `--amount <TON>` | | Amount of TON to transfer to the pool contract for deployment |
+| `--binding <NAME>` | `-b` | Binding name (resolves the validator wallet and pool from config) |
+| `--amount <TON>` | | Amount of TON to transfer for deployment |
+| `--owner <ADDRESS>` | | **SNP only:** pool owner address |
+| `--pool-even` | | **TONCore nominator only:** deploy the pool for even validation rounds (default if neither flag is set) |
+| `--pool-odd` | | **TONCore nominator only:** deploy the pool for odd validation rounds |
 | `--verbose` | | Print deployment progress |
 
 ```bash
+# Single Nominator Pool (requires --owner)
 nodectl deploy pool \
   --config config.json \
-  --node node0 \
+  --binding my-binding \
   --owner "-1:owner_address_here" \
   --amount 1.5
+
+# TONCore nominator: deploy the second pool (odd rounds)
+nodectl deploy pool \
+  --config config.json \
+  --binding my-binding \
+  --amount 1.5 \
+  --pool-odd
 ```
 
-The command calculates the pool address from the owner and validator wallet, sends a deploy message with the specified amount, and waits for the contract to become active. The result is printed as JSON with the pool address and deployment status.
+The command derives the pool address from the wallet and config, sends a deploy message with the specified amount, and waits for the contract to become active. The result is printed as JSON with the pool address and deployment status.
 
 > **Note**: The validator wallet must be in the `Active` state and have enough balance to cover the transfer amount. If the pool is already deployed, the command exits without sending a transaction.
 
@@ -1338,7 +1386,7 @@ Validator wallets for election submissions and TON transfers:
 
 #### `pools`
 
-Nominator pool configurations. Two pool types are supported:
+Nominator pool configurations. Pool `kind` is **`"snp"`** or **`"core"`**.
 
 **Single Nominator Pool (SNP):**
 
@@ -1346,11 +1394,13 @@ Nominator pool configurations. Two pool types are supported:
 - `address` — deployed pool contract address (optional)
 - `owner` — pool owner address (optional)
 
-**TONCore Pool:**
+**TONCore (`kind: "core"`):**
 
-- `kind` — `"core"`
-- `addresses` — array of exactly 2 pool addresses
-- `validator_share` — validator share percentage
+- `pools` — JSON array of **exactly two** elements: `pools[0]` and `pools[1]`. Each element is either `null` (slot unused) or an object:
+  - `address` — optional deployed pool contract address (raw / base64url string). When omitted but `params` is set, the address is derived from the validator and `params` (see `resolve_toncore_pool` / `toncore_pool_address_and_state` in the contracts crate). If `address` is set, it must match the derived address when `params` is present.
+  - `params` — optional `TonCoreInitParams`: `validator_share`, `max_nominators`, `min_validator_stake`, `min_nominator_stake` (nanotons on-chain). Omit fields to use defaults from `app_config` / serde.
+- A **single** on-chain pool is `pools: [ { ... }, null ]` (or `[null, { ... }]`). **Two** pools require **two** non-null entries with parameters and/or addresses you define — there is no implicit second pool and no automatic `min_validator_stake + 1` between slots.
+- **Behaviour:** with two slots, the service uses a **`TonCoreNominatorRouter`**. The election runner picks a **free** pool for staking (`get_pool_data()` / inner pools). Matching finished-election participants uses **both** pool addresses (`inner_pools`).
 
 #### `bindings`
 
@@ -1582,10 +1632,10 @@ nodectl config bind add \
   --wallet wallet0 \
   --pool pool0
 
-# Deploy the pool contract
+# Deploy the pool contract (binding must reference pool0)
 nodectl deploy pool \
   --config my-config.json \
-  --node node0 \
+  --binding my-binding \
   --owner "-1:owner_address" \
   --amount 1.5
 ```
@@ -1693,7 +1743,7 @@ nodectl deploy wallet --all --verbose
 # Deploy a Single Nominator Pool
 nodectl deploy pool \
   --config config.json \
-  --node node0 \
+  --binding my-binding \
   --owner "-1:owner_address" \
   --amount 1.5
 ```
