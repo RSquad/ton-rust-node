@@ -23,7 +23,7 @@ use mockall::mock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use ton_block::{
     BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, Number16, SliceData,
-    ValidatorSet,
+    ValidatorDescr, ValidatorSet,
     config_params::{ConfigParam16, ConfigParam17},
     read_single_root_boc,
 };
@@ -2810,4 +2810,73 @@ async fn test_toncore_nominator_elections_finished_checks_active_pool_only() {
     // Router now resolves a single active pool address; participant from non-active slot is not matched.
     assert!(!node.stake_accepted);
     assert_eq!(node.accepted_stake_amount, None);
+}
+
+// =====================================================
+// TEST: SnapshotCache::update_next_elections_range
+// =====================================================
+
+fn make_vset(utime_since: u32, utime_until: u32) -> ValidatorSet {
+    ValidatorSet::new(utime_since, utime_until, 1, vec![ValidatorDescr::default()])
+        .expect("validator set")
+}
+
+#[test]
+fn next_elections_range_before_window_opens_points_at_upcoming_cycle() {
+    let cfg15 = default_cfg15();
+    let now = time_format::now() as u32;
+    // Place utime_until far enough in the future that the upcoming cycle's
+    // elections window has not opened yet (i.e. now < utime_until - elections_start_before).
+    let utime_until = now + cfg15.elections_start_before + 3600;
+    let vset = make_vset(utime_until - cfg15.validators_elected_for, utime_until);
+    let mut cache = SnapshotCache { last_validator_set: Some(vset), ..Default::default() };
+
+    cache.update_next_elections_range(&cfg15);
+
+    let range = cache.next_elections_range.expect("range set");
+    assert_eq!(range.start, (utime_until - cfg15.elections_start_before) as u64);
+    assert_eq!(range.end, (utime_until - cfg15.elections_end_before) as u64);
+    assert_eq!(
+        range.end - range.start,
+        (cfg15.elections_start_before - cfg15.elections_end_before) as u64,
+    );
+}
+
+#[test]
+fn next_elections_range_inside_window_still_points_at_upcoming_cycle() {
+    let cfg15 = default_cfg15();
+    let now = time_format::now() as u32;
+    // Window currently open: now > utime_until - elections_start_before AND
+    // now < utime_until - elections_end_before. Pick utime_until = now + (end_before + 600).
+    let utime_until = now + cfg15.elections_end_before + 600;
+    let vset = make_vset(utime_until - cfg15.validators_elected_for, utime_until);
+    let mut cache = SnapshotCache { last_validator_set: Some(vset), ..Default::default() };
+
+    cache.update_next_elections_range(&cfg15);
+
+    let range = cache.next_elections_range.expect("range set");
+    assert_eq!(range.start, (utime_until - cfg15.elections_start_before) as u64);
+    assert_eq!(range.end, (utime_until - cfg15.elections_end_before) as u64);
+}
+
+#[test]
+fn next_elections_range_after_window_closed_advances_to_next_next_cycle() {
+    let cfg15 = default_cfg15();
+    let now = time_format::now() as u32;
+    // Upcoming cycle's elections already closed: now >= utime_until - elections_end_before.
+    // Pick utime_until = now + 60 so upcoming_elections_end = now - 540.
+    let utime_until = now + 60;
+    let vset = make_vset(utime_until - cfg15.validators_elected_for, utime_until);
+    let mut cache = SnapshotCache { last_validator_set: Some(vset), ..Default::default() };
+
+    cache.update_next_elections_range(&cfg15);
+
+    let range = cache.next_elections_range.expect("range set");
+    let next_cycle_id = utime_until + cfg15.validators_elected_for;
+    assert_eq!(range.start, (next_cycle_id - cfg15.elections_start_before) as u64);
+    assert_eq!(range.end, (next_cycle_id - cfg15.elections_end_before) as u64);
+    assert_eq!(
+        range.end - range.start,
+        (cfg15.elections_start_before - cfg15.elections_end_before) as u64,
+    );
 }
