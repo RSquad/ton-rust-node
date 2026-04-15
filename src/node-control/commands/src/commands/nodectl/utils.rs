@@ -278,12 +278,15 @@ pub async fn api_get(base_url: &str, path: &str, token: Option<&str>) -> anyhow:
 }
 
 /// Sends a POST request with a JSON body and returns the response body.
-pub async fn api_post<B: serde::Serialize>(
+pub async fn api_post<B>(
     base_url: &str,
     path: &str,
     token: Option<&str>,
     body: &B,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
     send_request(reqwest::Method::POST, base_url, path, token, Some(body)).await
 }
 
@@ -292,13 +295,16 @@ pub async fn api_delete(base_url: &str, path: &str, token: Option<&str>) -> anyh
     send_request(reqwest::Method::DELETE, base_url, path, token, None::<&()>).await
 }
 
-async fn send_request<B: serde::Serialize>(
+async fn send_request<B>(
     method: reqwest::Method,
     base_url: &str,
     path: &str,
     token: Option<&str>,
     body: Option<&B>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
     let url = format!("{}/{}", base_url.trim_end_matches('/'), path.trim_start_matches('/'));
     let client = reqwest::Client::new();
     let mut req = client.request(method, &url);

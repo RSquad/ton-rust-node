@@ -635,10 +635,11 @@ async fn extract_public_key(state: &AppState) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Mutation handlers (CRUD)
 //
-// Each handler validates input against the live config, applies the change via
-// `RuntimeConfigStore::update_with` (atomic Arc swap), then persists with
-// `save_to_file`. Validation errors map to 400, missing entities to 404,
-// I/O failures to 500. All routes are mounted behind `require_operator`.
+// Each handler validates input against the live config, then applies the
+// change via `RuntimeConfigStore::update_and_save`, which persists to
+// disk before swapping the in-memory snapshot (so a write failure leaves the
+// live state untouched). Validation errors map to 400, missing entities to
+// 404, I/O failures to 500. All routes are mounted behind `require_operator`.
 // ---------------------------------------------------------------------------
 
 #[utoipa::path(
@@ -680,11 +681,10 @@ pub async fn v1_nodes_add_handler(
     let name = req.name.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.nodes.insert(name, adnl_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
@@ -720,11 +720,10 @@ pub async fn v1_nodes_rm_handler(
     let target = name.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.nodes.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
@@ -770,11 +769,10 @@ pub async fn v1_wallets_add_handler(
     let name = req.name.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.wallets.insert(name, wallet_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
@@ -815,11 +813,10 @@ pub async fn v1_wallets_rm_handler(
     let target = name.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.wallets.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
@@ -868,11 +865,10 @@ pub async fn v1_pools_add_handler(
     let name = req.name.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.pools.insert(name, pool_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
@@ -911,11 +907,10 @@ pub async fn v1_pools_rm_handler(
     let target = name.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.pools.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
@@ -977,11 +972,10 @@ pub async fn v1_bindings_add_handler(
     let node = req.node.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.bindings.insert(node, binding);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.node } }))
 }
@@ -1021,11 +1015,10 @@ pub async fn v1_bindings_rm_handler(
     let target = node.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             cfg.bindings.remove(&target);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: node } }))
 }
