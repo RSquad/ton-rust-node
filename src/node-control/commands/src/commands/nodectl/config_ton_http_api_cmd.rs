@@ -25,10 +25,10 @@ pub enum TonHttpApiAction {
 }
 
 #[derive(clap::Args, Clone)]
-#[command(about = "Set ton-http-api url and optional api key")]
+#[command(about = "Set ton-http-api endpoint and optional api key")]
 pub struct TonHttpApiSetCmd {
-    #[arg(short = 'u', long = "url")]
-    url: String,
+    #[arg(short = 'e', long = "endpoint", help = "TON HTTP API endpoint")]
+    endpoint: String,
     #[arg(short = 'k', long = "api-key")]
     api_key: Option<String>,
 }
@@ -36,8 +36,8 @@ pub struct TonHttpApiSetCmd {
 #[derive(clap::Args, Clone)]
 #[command(about = "Add one or more failover endpoint URLs for ton-http-api")]
 pub struct TonHttpApiAddCmd {
-    #[arg(short = 'u', long = "url", required = true)]
-    urls: Vec<String>,
+    #[arg(short = 'e', long = "endpoint", required = true, help = "TON HTTP API endpoint")]
+    endpoints: Vec<String>,
     /// Per-endpoint API key applied to all URLs in this invocation.
     /// When omitted, the endpoints inherit the global api_key.
     #[arg(short = 'k', long = "api-key")]
@@ -87,7 +87,7 @@ impl TonHttpApiSetCmd {
     ) -> anyhow::Result<()> {
         let base_url = resolve_service_url(url, config_path)?;
         let body = TonHttpApiBody {
-            urls: vec![self.url.as_str()],
+            urls: vec![self.endpoint.as_str()],
             api_key: self.api_key.as_deref(),
             append: false,
         };
@@ -105,7 +105,7 @@ impl TonHttpApiAddCmd {
     ) -> anyhow::Result<()> {
         let base_url = resolve_service_url(url, config_path)?;
         let body = TonHttpApiBody {
-            urls: self.urls.iter().map(|s| s.as_str()).collect(),
+            urls: self.endpoints.iter().map(|s| s.as_str()).collect(),
             api_key: self.api_key.as_deref(),
             append: true,
         };
