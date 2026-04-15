@@ -470,7 +470,7 @@ class Bootstrap:
         # Set ton-http-api URL via REST API (moved from phase 2; service starts
         # with the default URL which matches the CI default).
         self.log.info("  config ton-http-api set...")
-        self._nctl("config", "ton-http-api", "set", "--url", self.cfg.http_api_url)
+        self._nctl("config", "ton-http-api", "set", "-e", self.cfg.http_api_url)
 
         # Patch global tick_interval — no CLI command exists for this field
         cfg_json = json.loads(self.paths.nodectl_config.read_text())
