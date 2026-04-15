@@ -65,7 +65,7 @@ impl TonCoreNominatorRouter {
             let Some(init_params) = slot else {
                 return Ok(None);
             };
-            let (addr, si) = toncore_pool_address_and_state(init_params, validator_address)?;
+            let (addr, si) = toncore_pool_address_and_state(&init_params, validator_address)?;
             Ok(Some(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
                 provider.clone(),
                 addr,

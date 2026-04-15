@@ -562,10 +562,7 @@ fn open_nominator_pool(
                                 .context(format!("invalid TONCore pool address: {addr_str}"))?;
                             let derived = NominatorPoolWrapperImpl::calculate_address(
                                 validator_addr,
-                                params.validator_share,
-                                params.max_nominators,
-                                params.min_validator_stake,
-                                params.min_nominator_stake,
+                                params,
                             )?;
                             anyhow::ensure!(
                                 explicit == derived,
@@ -577,7 +574,7 @@ fn open_nominator_pool(
                         Ok(Some(Arc::new(NominatorPoolWrapperImpl::from_init_data(
                             provider.clone(),
                             validator_addr,
-                            params.clone(),
+                            params,
                         )?) as Arc<dyn NominatorWrapper>))
                     }
                     (None, None) => {

@@ -63,7 +63,7 @@ fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Resul
 /// ```
 pub fn build_toncore_pool_state_init(
     validator_address: &MsgAddressInt,
-    params: TonCoreInitParams,
+    params: &TonCoreInitParams,
 ) -> anyhow::Result<StateInit> {
     let mut config = BuilderData::new();
     let validator_hash = validator_address.address().get_bytestring(0);
@@ -97,7 +97,7 @@ pub fn build_toncore_pool_state_init(
 
 /// Derive masterchain pool address and `StateInit` from deployment parameters.
 pub fn toncore_pool_address_and_state(
-    ton_core_init_params: TonCoreInitParams,
+    ton_core_init_params: &TonCoreInitParams,
     validator_address: &MsgAddressInt,
 ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
     let state_init = build_toncore_pool_state_init(validator_address, ton_core_init_params)?;
@@ -118,7 +118,7 @@ pub fn resolve_toncore_pool(
     pool_address: Option<&str>,
     params: TonCoreInitParams,
 ) -> anyhow::Result<ResolvedTonCorePool> {
-    let (address, state_init) = toncore_pool_address_and_state(params.clone(), validator_addr)?;
+    let (address, state_init) = toncore_pool_address_and_state(&params, validator_addr)?;
     if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
@@ -154,29 +154,18 @@ impl NominatorPoolWrapperImpl {
     pub fn from_init_data(
         provider: Arc<dyn ContractProvider>,
         validator_address: &MsgAddressInt,
-        init_params: TonCoreInitParams,
+        init_params: &TonCoreInitParams,
     ) -> anyhow::Result<Self> {
         let (pool_addr, state_init) =
-            toncore_pool_address_and_state(init_params, validator_address)?;
+            toncore_pool_address_and_state(&init_params, validator_address)?;
         Ok(Self { provider, pool_addr, state_init: Some(state_init) })
     }
 
     pub fn calculate_address(
         validator_address: &MsgAddressInt,
-        validator_reward_share: u16,
-        max_nominators_count: u16,
-        min_validator_stake: u64,
-        min_nominator_stake: u64,
+        params: &TonCoreInitParams,
     ) -> anyhow::Result<MsgAddressInt> {
-        toncore_pool_address_and_state(
-            TonCoreInitParams {
-                validator_share: validator_reward_share,
-                max_nominators: max_nominators_count,
-                min_validator_stake,
-                min_nominator_stake,
-            },
-            validator_address,
-        )
+        toncore_pool_address_and_state(&params, validator_address)
         .map(|(addr, _)| addr)
     }
 }
