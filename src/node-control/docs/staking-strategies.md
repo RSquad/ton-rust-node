@@ -72,10 +72,12 @@ On every tick after the initial submission, the strategy re-evaluates:
 
 ### Configuration
 
-| Parameter | Type | Description |
-|---|---|---|
-| `sleep_period` | float (0.0–1.0) | Fraction of election duration to wait before acting. |
-| `waiting_period` | float (0.0–1.0) | Max fraction of election duration to wait for participants. |
+The parameters below live under the `elections` section of `nodectl-config.json`.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `sleep_period_pct` | float (0.0–1.0) | `0.2` | Fraction of election duration to wait before acting. |
+| `waiting_period_pct` | float (0.0–1.0) | `0.4` | Max fraction of election duration to wait for participants. Must be ≥ `sleep_period_pct`. |
 
 ---
 
