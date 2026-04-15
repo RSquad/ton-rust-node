@@ -3,7 +3,7 @@
 One-button bootstrap for local singlehost TON + nodectl (extended scenario).
 
 Python companion to run_singlehost_nodectl.py: same phases 1–7 and 9–10, different pool
-topology and post-validation. Default logs go to *-nodectl2* filenames so runs do not
+topology and post-validation. Default logs use *-snp-toncore* filenames so runs do not
 overwrite the base script's singlehost-bootstrap.log.
 
 Scenario: 7 validators — 2× single-nominator (snp1, snp2) + 5× TONCore dual-slot pools
@@ -68,6 +68,25 @@ TONCORE_MIN_VALIDATOR_STAKE_EVEN_TON = 10_000.0
 TONCORE_MIN_VALIDATOR_STAKE_ODD_TON = 10_001.0
 
 
+def _validate_toncore_min_stakes_and_deposit(cfg: "Config") -> None:
+    """Fail fast when even/odd min stakes match or deposit is below the larger min stake."""
+    ev = TONCORE_MIN_VALIDATOR_STAKE_EVEN_TON
+    od = TONCORE_MIN_VALIDATOR_STAKE_ODD_TON
+    if ev == od:
+        raise ValueError(
+            "TONCore min_validator_stake for even and odd slots must differ "
+            f"(TONCORE_MIN_VALIDATOR_STAKE_EVEN_TON and _ODD_TON are both {ev}); "
+            "equal values would not yield two distinct TONCore pool addresses."
+        )
+    need = max(ev, od)
+    if cfg.core_validator_deposit < need:
+        raise ValueError(
+            f"CORE_VALIDATOR_DEPOSIT_TON ({cfg.core_validator_deposit}) must be >= "
+            f"max(min_validator_stake even, odd) ({need} TON). "
+            "Otherwise deposit-validator fails or leaves pools under their minimum."
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration & paths
 # ══════════════════════════════════════════════════════════════════════════════
@@ -89,7 +108,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
-        return cls(
+        cfg = cls(
             http_api_url      = os.environ.get("HTTP_API_URL", "http://127.0.0.1:3301"),
             node_cnt          = int(os.environ.get("NODE_CNT", str(SNP_NODE_COUNT + len(CORE_POOL_NAMES)))),
             master_topup      = os.environ.get("MASTER_TOPUP_TON", "1000"),
@@ -102,6 +121,8 @@ class Config:
             nobuild           = os.environ.get("NOBUILD", "0") in ("1", "true"),
             keep_on_success   = os.environ.get("KEEP_NODECTL_ON_SUCCESS", "1") not in ("0", "false"),
         )
+        _validate_toncore_min_stakes_and_deposit(cfg)
+        return cfg
 
 
 @dataclasses.dataclass
@@ -130,8 +151,8 @@ class Paths:
             nodectl_bin     = tmp_dir / "nodectl",
             nodectl_config  = tmp_dir / "nodectl-config.json",
             vault_file      = script_dir / "vault.json",
-            nodectl_log     = tmp_dir / _log_name("NODECTL_LOG", "nodectl-service-nodectl2.log"),
-            script_log      = script_dir / _log_name("SCRIPT_LOG", "singlehost-bootstrap-nodectl2.log"),
+            nodectl_log     = tmp_dir / _log_name("NODECTL_LOG", "nodectl-service-snp-toncore.log"),
+            script_log      = script_dir / _log_name("SCRIPT_LOG", "singlehost-bootstrap-snp-toncore.log"),
         )
 
 
@@ -1040,7 +1061,7 @@ class Bootstrap:
     ) -> None:
         self._phase(12, "Summary")
         rows = [
-            ("script",         "run_singlehost_nodectl2.py (2 SNP + 5 TONCore, split50)"),
+            ("script",         "run_singlehost_nodectl_snp_toncore.py (2 SNP + 5 TONCore, split50)"),
             ("nodectl pid",    str(self._proc.pid) if self._proc else "N/A"),
             ("nodectl log",    str(self._nodectl_log)),
             ("script log",     str(self.paths.script_log)),
@@ -1087,7 +1108,7 @@ def main() -> None:
         sys.exit(1)
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    log.info(f"=== {ts} run_singlehost_nodectl2.py started ===")
+    log.info(f"=== {ts} run_singlehost_nodectl_snp_toncore.py started ===")
     log.info(f"Script log: {paths.script_log}")
     log.info(
         f"Config: NODE_CNT={cfg.node_cnt}, HTTP_API_URL={cfg.http_api_url}, "

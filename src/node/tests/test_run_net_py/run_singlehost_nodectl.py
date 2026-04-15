@@ -90,7 +90,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
-        return cls(
+        cfg = cls(
             http_api_url      = os.environ.get("HTTP_API_URL", "http://127.0.0.1:3301"),
             node_cnt          = int(os.environ.get("NODE_CNT", "6")),
             master_topup      = os.environ.get("MASTER_TOPUP_TON", "1000"),
@@ -116,6 +116,27 @@ class Config:
                 "TONCORE_VALIDATOR_DEPOSIT_TON", str(DEFAULT_TONCORE_DEPOSIT_TON)
             )),
         )
+        cfg._validate_toncore_constraints()
+        return cfg
+
+    def _validate_toncore_constraints(self) -> None:
+        """Fail fast when TONCore env contradicts the docstring (two distinct pools + sufficient deposit)."""
+        if not self.has_toncore:
+            return
+        even = self.toncore_min_validator_stake_ton
+        odd = self.toncore_min_validator_stake_odd_ton
+        if even == odd:
+            raise ValueError(
+                "TONCORE_MIN_VALIDATOR_STAKE_TON and TONCORE_MIN_VALIDATOR_STAKE_ODD_TON must differ "
+                f"(both are {even}); two equal min stakes would not produce two distinct TONCore pools."
+            )
+        dep = self.toncore_validator_deposit_ton
+        need = max(even, odd)
+        if dep < need:
+            raise ValueError(
+                f"TONCORE_VALIDATOR_DEPOSIT_TON ({dep}) must be >= max(min stake even, odd) ({need} TON). "
+                "Otherwise deposit-validator will fail or leave the pool below its minimum."
+            )
 
 
 @dataclasses.dataclass
