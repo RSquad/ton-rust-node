@@ -129,7 +129,7 @@ mock! {
     #[async_trait::async_trait]
     impl contracts::SmartContract for ElectorWrapperImpl {
         async fn balance(&self) -> anyhow::Result<u64>;
-        async fn address(&self) -> MsgAddressInt;
+        async fn address(&self) -> anyhow::Result<MsgAddressInt>;
     }
 
     #[async_trait::async_trait]
@@ -150,7 +150,7 @@ mock! {
     #[async_trait::async_trait]
     impl contracts::SmartContract for TonWalletImpl {
         async fn balance(&self) -> anyhow::Result<u64>;
-        async fn address(&self) -> MsgAddressInt;
+        async fn address(&self) -> anyhow::Result<MsgAddressInt>;
     }
 
     #[async_trait::async_trait]
@@ -189,7 +189,7 @@ mock! {
     #[async_trait::async_trait]
     impl contracts::SmartContract for NominatorWrapperImpl {
         async fn balance(&self) -> anyhow::Result<u64>;
-        async fn address(&self) -> MsgAddressInt;
+        async fn address(&self) -> anyhow::Result<MsgAddressInt>;
     }
 
     #[async_trait::async_trait]
@@ -493,7 +493,7 @@ fn setup_default_elector(
     election_id: u64,
     returned_stake: u64,
 ) {
-    elector.expect_address().returning(|| elector_address());
+    elector.expect_address().returning(|| Ok(elector_address()));
 
     elector.expect_get_active_election_id().returning(move || Ok(election_id));
 
@@ -515,12 +515,12 @@ fn setup_default_elector(
 }
 
 fn setup_elector_no_elections(elector: &mut MockElectorWrapperImpl) {
-    elector.expect_address().returning(|| elector_address());
+    elector.expect_address().returning(|| Ok(elector_address()));
     elector.expect_get_active_election_id().returning(|| Ok(0));
 }
 
 fn setup_wallet(wallet: &mut MockTonWalletImpl) {
-    wallet.expect_address().returning(|| wallet_address());
+    wallet.expect_address().returning(|| Ok(wallet_address()));
     wallet.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
 }
 
@@ -546,9 +546,10 @@ fn setup_default_provider_without_account(
 }
 
 fn setup_pool(pool: &mut MockNominatorWrapperImpl) {
-    pool.expect_address().returning(|| pool_address());
+    pool.expect_address().returning(|| Ok(pool_address()));
     pool.expect_inner_pools().returning(|| vec![]);
     pool.expect_storage_reserve().returning(|| SNP_STORAGE_RESERVE);
+    pool.expect_pool_kind().returning(|| PoolKind::SNP);
 }
 
 fn pool_data_with_state(state: i32) -> PoolData {
@@ -560,9 +561,10 @@ fn setup_toncore_nominator_slot(
     addr: MsgAddressInt,
     state: i32,
 ) {
-    pool.expect_address().returning(move || addr.clone());
+    pool.expect_address().returning(move || Ok(addr.clone()));
     pool.expect_get_pool_data().returning(move || Ok(pool_data_with_state(state)));
     pool.expect_storage_reserve().returning(|| TONCORE_STORAGE_RESERVE);
+    pool.expect_pool_kind().returning(|| PoolKind::TONCore);
 }
 
 // =====================================================
@@ -695,7 +697,7 @@ async fn test_stake_already_accepted() {
 
     let wallet_addr = addr_bytes(&wallet_address());
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     let wallet_addr_clone = wallet_addr.clone();
@@ -1012,7 +1014,7 @@ async fn test_run_loop_tick_then_cancel() {
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cc = call_count.clone();
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(move || {
         let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 { Ok(ELECTION_ID) } else { Ok(0) }
@@ -1276,11 +1278,11 @@ async fn test_multiple_nodes_one_excluded() {
     );
 
     let mut wallet1 = MockTonWalletImpl::new();
-    wallet1.expect_address().returning(|| wallet_address());
+    wallet1.expect_address().returning(|| Ok(wallet_address()));
     wallet1.expect_message().returning(|_, _, _| Ok(dummy_cell()));
 
     let mut wallet2 = MockTonWalletImpl::new();
-    wallet2.expect_address().returning(|| MsgAddressInt::standard(-1, [0xCCu8; 32]));
+    wallet2.expect_address().returning(|| Ok(MsgAddressInt::standard(-1, [0xCCu8; 32])));
     wallet2.expect_message().returning(|_, _, _| Ok(dummy_cell()));
 
     let mut wallets: HashMap<String, Arc<dyn TonWallet>> = HashMap::new();
@@ -1337,7 +1339,7 @@ async fn test_elections_failed_still_processes_nodes() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     harness.elector_mock.expect_elections_info().returning(move || {
@@ -1384,7 +1386,7 @@ async fn test_elections_finished_node_not_in_participants() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     // Finished elections with a different participant
@@ -1580,7 +1582,7 @@ async fn test_build_elections_snapshot() {
 
     let wallet_addr = addr_bytes(&wallet_address());
 
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
 
     let wallet_addr_clone = wallet_addr.clone();
@@ -1906,7 +1908,7 @@ async fn test_withf_verify_stake_message_payload() {
 
     // -- wallet mock: verify dest, value, and payload body --
     let wallet = &mut harness.wallet_mock;
-    wallet.expect_address().returning(|| wallet_address());
+    wallet.expect_address().returning(|| Ok(wallet_address()));
 
     wallet
         .expect_message()
@@ -2009,7 +2011,7 @@ fn setup_adaptive_elector(
     participants: Vec<Participant>,
     past_elections_factory: impl Fn() -> Vec<PastElections> + Send + 'static,
 ) {
-    elector.expect_address().returning(|| elector_address());
+    elector.expect_address().returning(|| Ok(elector_address()));
     elector.expect_get_active_election_id().returning(move || Ok(election_id));
 
     let total_stake: u64 = participants.iter().map(|p| p.stake).sum();
@@ -2694,7 +2696,14 @@ async fn test_toncore_nominator_both_pools_busy_skips_elections() {
 
     let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
-    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+    // Both pools busy → router's address() returns "no one pool is ready".
+    // Runner aborts the whole tick by design so the next tick retries the
+    // address fetch; past_elections_cache_id must remain unchanged.
+    let err = result.expect_err("run() should abort when no pool is ready");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("pool address error"), "unexpected error: {}", msg);
+    assert!(msg.contains("no one pool is ready"), "unexpected error: {}", msg);
+    assert_eq!(runner.past_elections_cache_id, 0);
     let node = runner.nodes.get(node_id).unwrap();
     assert!(!node.stake_accepted);
 }
@@ -2707,7 +2716,7 @@ async fn test_toncore_nominator_recover_stake_uses_cached_pool_address() {
     let returned_for_stake_addr = 50_000_000_000_000u64;
 
     // Elector returns active elections so run() proceeds to recover
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
     harness.elector_mock.expect_elections_info().returning(move || {
         Ok(ElectionsInfo {
@@ -2761,7 +2770,7 @@ async fn test_toncore_nominator_elections_finished_checks_active_pool_only() {
     let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
     // Elections are finished with a participant from pool[1]
-    harness.elector_mock.expect_address().returning(|| elector_address());
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
     harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
     let pool1_addr_bytes = addr_bytes(&pool_address_1());
     harness.elector_mock.expect_elections_info().returning(move || {

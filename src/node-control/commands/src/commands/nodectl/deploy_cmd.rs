@@ -220,12 +220,10 @@ impl DeployWalletsCmd {
             }
 
             let res = res_details.get_mut(node_id).unwrap();
+            let wallet_addr = wallet.address().await?;
             if *balance < Self::MIN_BALANCE {
                 if self.verbose {
-                    println!(
-                        "Failed to deploy wallet {}, balance is too low",
-                        wallet.address().await
-                    );
+                    println!("Failed to deploy wallet {}, balance is too low", wallet_addr);
                 }
 
                 res.deployed = false;
@@ -234,7 +232,7 @@ impl DeployWalletsCmd {
             }
 
             if self.verbose {
-                println!("Deploy wallet {}...", wallet.address().await);
+                println!("Deploy wallet {}...", wallet_addr);
             }
 
             let msg_boc =
@@ -253,7 +251,7 @@ impl DeployWalletsCmd {
         for (wallet, node_id) in &wallets_to_wait {
             wait_for_deploy(
                 rpc_client.clone(),
-                &wallet.address().await,
+                &wallet.address().await?,
                 &cancellation_ctx,
                 self.verbose,
                 DEPLOY_TIMEOUT,

@@ -63,19 +63,16 @@ fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Resul
 /// ```
 pub fn build_toncore_pool_state_init(
     validator_address: &MsgAddressInt,
-    validator_reward_share: u16,
-    max_nominators_count: u16,
-    min_validator_stake: u64,
-    min_nominator_stake: u64,
+    params: TonCoreInitParams,
 ) -> anyhow::Result<StateInit> {
     let mut config = BuilderData::new();
     let validator_hash = validator_address.address().get_bytestring(0);
     anyhow::ensure!(validator_hash.len() == 32, "validator address must be 256 bits");
     config.append_raw(&validator_hash, 256)?;
-    config.append_raw(&validator_reward_share.to_be_bytes(), 16)?;
-    config.append_raw(&max_nominators_count.to_be_bytes(), 16)?;
-    Coins::new(min_validator_stake).write_to(&mut config)?;
-    Coins::new(min_nominator_stake).write_to(&mut config)?;
+    config.append_raw(&params.validator_share.to_be_bytes(), 16)?;
+    config.append_raw(&params.max_nominators.to_be_bytes(), 16)?;
+    Coins::new(params.min_validator_stake).write_to(&mut config)?;
+    Coins::new(params.min_nominator_stake).write_to(&mut config)?;
     let config_cell = config.into_cell()?;
 
     let mut data = BuilderData::new();
@@ -103,23 +100,14 @@ pub fn toncore_pool_address_and_state(
     ton_core_init_params: TonCoreInitParams,
     validator_address: &MsgAddressInt,
 ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
-    let state_init = build_toncore_pool_state_init(
-        validator_address,
-        ton_core_init_params.validator_share,
-        ton_core_init_params.max_nominators,
-        ton_core_init_params.min_validator_stake,
-        ton_core_init_params.min_nominator_stake,
-    )?;
+    let state_init = build_toncore_pool_state_init(validator_address, ton_core_init_params)?;
     let addr = toncore_pool_address_from_state_init(&state_init)?;
     Ok((addr, state_init))
 }
 
 /// Resolved pool address and `StateInit` for a TONCore config.
 pub struct ResolvedTonCorePool {
-    pub reward_share: u16,
-    pub max_nominators: u16,
-    pub min_validator_stake: u64,
-    pub min_nominator_stake: u64,
+    pub params: TonCoreInitParams,
     pub address: MsgAddressInt,
     pub state_init: StateInit,
 }
@@ -141,14 +129,7 @@ pub fn resolve_toncore_pool(
         );
     }
 
-    Ok(ResolvedTonCorePool {
-        reward_share: params.validator_share,
-        max_nominators: params.max_nominators,
-        min_validator_stake: params.min_validator_stake,
-        min_nominator_stake: params.min_nominator_stake,
-        address,
-        state_init,
-    })
+    Ok(ResolvedTonCorePool { params, address, state_init })
 }
 
 pub struct NominatorPoolWrapperImpl {
@@ -206,8 +187,8 @@ impl SmartContract for NominatorPoolWrapperImpl {
         self.provider.balance(&self.pool_addr).await
     }
 
-    async fn address(&self) -> MsgAddressInt {
-        self.pool_addr.clone()
+    async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+        Ok(self.pool_addr.clone())
     }
 }
 

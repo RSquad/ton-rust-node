@@ -304,7 +304,7 @@ impl TonWallet for WalletContract {
     async fn deploy_message(&self, value: u64, payload: Cell) -> anyhow::Result<Cell> {
         let state_init = self.build_state_init().await?;
         self.build_message(
-            self.address().await,
+            self.address().await?,
             value,
             payload,
             false,
@@ -367,7 +367,7 @@ impl TonWallet for WalletContract {
         };
 
         let mut message = Message::with_ext_in_header_and_body(
-            ExternalInboundMessageHeader::new(MsgAddressExt::AddrNone, self.address().await),
+            ExternalInboundMessageHeader::new(MsgAddressExt::AddrNone, self.address().await?),
             body_slice,
         );
 
@@ -385,8 +385,8 @@ impl TonWallet for WalletContract {
 
 #[async_trait::async_trait]
 impl SmartContract for WalletContract {
-    async fn address(&self) -> MsgAddressInt {
-        self.address.clone()
+    async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+        Ok(self.address.clone())
     }
     async fn balance(&self) -> anyhow::Result<u64> {
         self.provider.balance(&self.address).await

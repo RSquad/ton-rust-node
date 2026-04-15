@@ -34,8 +34,8 @@ impl SmartContract for ElectorWrapperImpl {
     async fn balance(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
-    async fn address(&self) -> MsgAddressInt {
-        MsgAddressInt::standard(-1, [0x33u8; 32])
+    async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+        Ok(MsgAddressInt::standard(-1, [0x33u8; 32]))
     }
 }
 

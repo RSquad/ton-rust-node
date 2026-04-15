@@ -434,7 +434,7 @@ async fn collect_pool_views(
                 });
             }
             PoolConfig::TONCore { pools } => {
-                let is_dual = pools[0].is_some() && pools[1].is_some();
+                let is_dual = pools.iter().all(|p| p.is_some());
                 let validator_share = pools
                     .iter()
                     .flatten()

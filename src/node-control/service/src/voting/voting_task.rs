@@ -218,7 +218,7 @@ impl VotingRunner {
             .map_err(|e| anyhow::anyhow!("sign error: {}", e))?;
 
         // Build the external message
-        let config_addr = self.config_contract.address().await;
+        let config_addr = self.config_contract.address().await?;
         let query_id = 0;
         let vote = config_contract::messages::signed_vote(query_id, &signing_data, &signature)?;
         let msg_cell = node

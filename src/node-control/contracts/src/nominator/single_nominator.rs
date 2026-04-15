@@ -87,8 +87,8 @@ impl SmartContract for NominatorWrapperImpl {
         self.provider.balance(&self.nominator_addr).await
     }
 
-    async fn address(&self) -> MsgAddressInt {
-        self.nominator_addr.clone()
+    async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+        Ok(self.nominator_addr.clone())
     }
 }
 
@@ -107,7 +107,10 @@ impl NominatorWrapper for NominatorWrapperImpl {
     }
 
     fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
-        vec![]
+        vec![
+            Arc::new(NominatorWrapperImpl::new(self.provider.clone(), self.nominator_addr.clone()))
+                as Arc<dyn NominatorWrapper>,
+        ]
     }
 
     async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {

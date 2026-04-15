@@ -167,8 +167,8 @@ impl RuntimeConfigStore {
         struct NoopWallet;
         #[async_trait::async_trait]
         impl SmartContract for NoopWallet {
-            async fn address(&self) -> MsgAddressInt {
-                MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap()
+            async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+                Ok(MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap())
             }
             async fn balance(&self) -> anyhow::Result<u64> {
                 Ok(0)
@@ -342,7 +342,7 @@ impl RuntimeConfigStore {
             .context("open master wallet")?;
         tracing::info!(
             "master wallet opened: address={}",
-            master_wallet.address().await.to_string()
+            master_wallet.address().await?.to_string()
         );
         Ok(master_wallet)
     }
@@ -363,19 +363,15 @@ impl RuntimeConfigStore {
                     .get(node_name)
                     .context(format!("validator wallet not found: {}", node_name))?
                     .address()
-                    .await;
+                    .await?;
                 let pool = open_nominator_pool(cfg, rpc_client.clone(), &validator_address)
                     .map_err(|e| {
                         anyhow::anyhow!("node [{}] open nominator pool error: {:#}", node_name, e)
                     })?;
                 let inner_pools = pool.inner_pools();
-                let mut addrs = vec![];
-                for p in inner_pools.into_iter() {
-                    addrs.push(p.address().await.to_string());
-                }
-                if addrs.is_empty() {
-                    // SNP/single-pool wrappers expose no inner pools; use the pool address itself.
-                    addrs.push(pool.address().await.to_string());
+                let mut addrs = Vec::with_capacity(inner_pools.len());
+                for p in inner_pools {
+                    addrs.push(p.address().await?.to_string());
                 }
                 tracing::info!("[{}] opened nominator pool(s): {}", node_name, addrs.join(", "));
                 map.insert(node_name.to_owned(), pool);
@@ -402,7 +398,7 @@ impl RuntimeConfigStore {
             tracing::info!(
                 "[{}] opened wallet: address={}",
                 node_name,
-                wallet.address().await.to_string()
+                wallet.address().await?.to_string()
             );
             map.insert(node_name.to_owned(), wallet);
         }
