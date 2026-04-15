@@ -165,8 +165,7 @@ impl NominatorPoolWrapperImpl {
         validator_address: &MsgAddressInt,
         params: &TonCoreInitParams,
     ) -> anyhow::Result<MsgAddressInt> {
-        toncore_pool_address_and_state(&params, validator_address)
-        .map(|(addr, _)| addr)
+        toncore_pool_address_and_state(&params, validator_address).map(|(addr, _)| addr)
     }
 }
 

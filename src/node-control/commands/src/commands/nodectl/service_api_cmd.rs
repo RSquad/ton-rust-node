@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::utils::normalize_base_url;
 use anyhow::Context;
 use colored::Colorize;
 use common::{
@@ -13,7 +14,6 @@ use common::{
     ton_utils::display_tons_from_str,
 };
 use std::{
-    borrow::Cow,
     collections::HashSet,
     io::{self, Read},
     path::Path,
@@ -188,10 +188,10 @@ pub struct StakePolicyCmd {
 impl ApiCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
         let base_url = if let Some(url) = self.url.as_deref() {
-            normalize_base_url(Cow::Borrowed(url))
+            normalize_base_url(url)
         } else {
             let app_cfg = AppConfig::load(Path::new(&self.config))?;
-            normalize_base_url(Cow::Owned(app_cfg.http.bind.clone()))
+            normalize_base_url(&app_cfg.http.bind)
         };
         let client = reqwest::Client::new();
         let token = self.token.as_deref();
@@ -254,11 +254,15 @@ impl ApiCmd {
                 send_post(&client, &url, &payload, token).await?;
             }
             ServiceAction::StakePolicy(cmd) => {
-                let url = join_url(&base_url, "/v1/stake_strategy");
+                let url = join_url(&base_url, "/v1/elections/settings");
                 let Some(policy) = cmd.to_policy() else {
                     anyhow::bail!("no policy specified");
                 };
-                let request = StakePolicyRequest { policy, node: cmd.node.clone() };
+                let request = ElectionsSettingsRequest {
+                    policy: Some(policy),
+                    node: cmd.node.clone(),
+                    ..Default::default()
+                };
                 send_post(&client, &url, &request, token).await?;
             }
             ServiceAction::Login(cmd) => {
@@ -350,12 +354,20 @@ fn filter_response_by_nodes(
     Ok(serde_json::to_string(&value).context("failed to re-serialize filtered response to JSON")?)
 }
 
-#[derive(Clone, serde::Serialize)]
-struct StakePolicyRequest {
-    policy: StakePolicy,
-    /// If set, the policy is applied as a per-node override.
+/// Client-side mirror of `ElectionsSettingsUpdateRequest` in `service::http::config_handlers`.
+/// Must stay in sync with the server-side definition.
+#[derive(Clone, Default, serde::Serialize)]
+struct ElectionsSettingsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<StakePolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tick_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_factor: Option<f32>,
 }
 
 impl StakePolicyCmd {
@@ -385,17 +397,6 @@ struct ElectionsTaskControlRequest {
 #[derive(Clone, serde::Serialize)]
 struct NodeListPayload {
     nodes: Vec<String>,
-}
-
-fn normalize_base_url(url: Cow<'_, str>) -> String {
-    let mut base = url.into_owned();
-    if base.starts_with("0.0.0.0") {
-        base = base.replacen("0.0.0.0", "127.0.0.1", 1);
-    }
-    if !base.starts_with("http://") && !base.starts_with("https://") {
-        base = format!("http://{}", base);
-    }
-    base
 }
 
 fn join_url(base: &str, path: &str) -> String {

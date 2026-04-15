@@ -110,12 +110,6 @@ pub fn warn_missing_secret(secret_name: &str) {
     );
 }
 
-pub fn warn_ton_api_unavailable(error: &anyhow::Error, note: &str) {
-    println!("\n{} {}", "[WARNING]".yellow().bold(), "Failed to connect to TON API".yellow(),);
-    println!("  {} {}", "Reason:".yellow().bold(), error.root_cause().to_string());
-    println!("  {} {}", "Note:".yellow().bold(), note.yellow().italic());
-}
-
 pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
     print!("{prompt} [y/N]: ");
     std::io::stdout().flush()?;
@@ -137,18 +131,6 @@ pub async fn load_config_vault(
     let vault = SecretVaultBuilder::from_env().await?;
 
     Ok((config, vault))
-}
-
-pub async fn check_ton_api_connection(rpc_client: &ClientJsonRpc) -> anyhow::Result<()> {
-    rpc_client.get_config_param(1).await.map(|_| ())
-}
-
-pub async fn try_create_rpc_client(config: &AppConfig) -> anyhow::Result<Arc<ClientJsonRpc>> {
-    let client = ClientJsonRpc::connect_many(
-        config.ton_http_api.resolved_endpoints(),
-        config.ton_http_api.api_key.clone(),
-    )?;
-    check_ton_api_connection(&client).await.map(|_| Arc::new(client))
 }
 
 pub async fn load_config_vault_rpc_client(
@@ -293,4 +275,175 @@ pub async fn wait_for_seqno_change(
         Ok(info.seqno != initial_seqno)
     })
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Service API client helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the config path or an error if not provided.
+pub fn require_config(config_path: Option<&str>) -> anyhow::Result<&Path> {
+    config_path.map(Path::new).ok_or_else(|| anyhow::anyhow!("config is required for this command"))
+}
+
+/// Resolves the base URL for the nodectl service API.
+/// Priority: `--url` flag, then `http.bind` from config file, then error.
+pub fn resolve_service_url(url: Option<&str>, config_path: Option<&str>) -> anyhow::Result<String> {
+    if let Some(u) = url {
+        return Ok(normalize_base_url(u));
+    }
+    if let Some(path) = config_path {
+        let path = Path::new(path);
+        if path.exists() {
+            let app_cfg = AppConfig::load(Path::new(path))?;
+            return Ok(normalize_base_url(&app_cfg.http.bind));
+        }
+    }
+    // Fallback to localhost:8080 if no URL or config path is provided.
+    Ok("http://127.0.0.1:8080".to_string())
+}
+
+pub(crate) fn normalize_base_url(url: &str) -> String {
+    let mut base = url.to_string();
+    let trimmed = base.trim_start_matches("http://").trim_start_matches("https://");
+    if trimmed.starts_with("0.0.0.0") {
+        base = base.replacen("0.0.0.0", "127.0.0.1", 1);
+    }
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        base = format!("http://{}", base);
+    }
+    base.trim_end_matches('/').to_string()
+}
+
+/// Sends a GET request to the service API and returns the response body.
+pub async fn api_get(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::GET, base_url, path, token, None::<&()>).await
+}
+
+/// Sends a POST request with a JSON body and returns the response body.
+pub async fn api_post<B>(
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &B,
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
+    send_request(reqwest::Method::POST, base_url, path, token, Some(body)).await
+}
+
+/// Sends a DELETE request and returns the response body.
+pub async fn api_delete(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::DELETE, base_url, path, token, None::<&()>).await
+}
+
+async fn send_request<B>(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&B>,
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), path.trim_start_matches('/'));
+    let client = reqwest::Client::new();
+    let mut req = client.request(method, &url);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let response = req.send().await.context(format!("failed to connect to {}", url))?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        // Try to extract `error.message` from the standard ApiErrorResponse.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(msg) =
+                v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        {
+            anyhow::bail!("{msg}");
+        }
+        anyhow::bail!("request failed: status={}, body={}", status, body);
+    }
+    Ok(body)
+}
+
+/// Best-effort check that returns `true` only if we could reach the local vault
+/// AND the secret is definitely absent. Any other outcome (no vault, lookup
+/// error) is treated as "unknown" and produces no warning.
+pub async fn vault_secret_missing(secret_name: &str) -> bool {
+    match SecretVaultBuilder::from_env().await {
+        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_base_url_adds_http_scheme_when_missing() {
+        assert_eq!(normalize_base_url("example.com:8080"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1:9000"), "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_http_scheme() {
+        assert_eq!(normalize_base_url("http://example.com:8080"), "http://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_https_scheme() {
+        assert_eq!(normalize_base_url("https://example.com:8080"), "https://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_bare_0_0_0_0_with_loopback() {
+        assert_eq!(normalize_base_url("0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_http_scheme() {
+        assert_eq!(normalize_base_url("http://0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_https_scheme() {
+        assert_eq!(normalize_base_url("https://0.0.0.0:8080"), "https://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_only_first_0_0_0_0_occurrence() {
+        assert_eq!(
+            normalize_base_url("http://0.0.0.0/redirect/0.0.0.0"),
+            "http://127.0.0.1/redirect/0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_base_url_leaves_non_0_0_0_0_host_unchanged() {
+        assert_eq!(normalize_base_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(normalize_base_url("http://10.0.0.0:8080"), "http://10.0.0.0:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_path() {
+        assert_eq!(
+            normalize_base_url("http://example.com:8080/api/v1"),
+            "http://example.com:8080/api/v1"
+        );
+        assert_eq!(normalize_base_url("example.com/path"), "http://example.com/path");
+    }
+
+    #[test]
+    fn test_normalize_base_url_trims_trailing_slash() {
+        assert_eq!(normalize_base_url("http://example.com:8080/"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1/"), "http://127.0.0.1");
+    }
 }

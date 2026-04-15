@@ -6,10 +6,11 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
+use crate::commands::nodectl::{
+    output_format::OutputFormat,
+    utils::{api_delete, api_get, api_post, resolve_service_url},
+};
 use colored::Colorize;
-use common::app_config::{AppConfig, BindingStatus, NodeBinding};
-use std::path::Path;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage node bindings in the configuration")]
@@ -54,50 +55,39 @@ pub struct BindLsCmd {
 }
 
 impl BindCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        config_path: Option<&str>,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<()> {
         match &self.action {
-            BindAction::Add(cmd) => cmd.run(path).await,
-            BindAction::Rm(cmd) => cmd.run(path).await,
-            BindAction::Ls(cmd) => cmd.run(path).await,
+            BindAction::Add(cmd) => cmd.run(url, token, config_path).await,
+            BindAction::Rm(cmd) => cmd.run(url, token, config_path).await,
+            BindAction::Ls(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
 
+#[derive(serde::Serialize)]
+struct BindingAddBody<'a> {
+    node: &'a str,
+    wallet: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool: Option<&'a str>,
+}
+
 impl BindAddCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        if !config.nodes.contains_key(&self.node) {
-            anyhow::bail!("Node '{}' not found in configuration", self.node);
-        }
-
-        if !config.wallets.contains_key(&self.wallet) {
-            anyhow::bail!("Wallet '{}' not found in configuration", self.wallet);
-        }
-
-        if let Some(pool_name) = &self.pool {
-            if !config.pools.contains_key(pool_name) {
-                anyhow::bail!("Pool '{}' not found in configuration", pool_name);
-            }
-            for (node_name, binding) in &config.bindings {
-                if binding.pool.as_deref() == Some(pool_name) && *node_name != self.node {
-                    anyhow::bail!(
-                        "Pool '{}' is already bound to node '{}'. A pool can only be bound to one node.",
-                        pool_name,
-                        node_name
-                    );
-                }
-            }
-        }
-
-        let binding = NodeBinding {
-            wallet: self.wallet.clone(),
-            pool: self.pool.clone(),
-            enable: false,
-            status: Default::default(),
-        };
-        config.bindings.insert(self.node.clone(), binding);
-        save_config(&config, path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body =
+            BindingAddBody { node: &self.node, wallet: &self.wallet, pool: self.pool.as_deref() };
+        api_post(&base_url, "/v1/bindings", token, &body).await?;
 
         let pool_info = self.pool.as_deref().map(|p| format!(", pool='{}'", p)).unwrap_or_default();
         println!(
@@ -112,32 +102,20 @@ impl BindAddCmd {
 }
 
 impl BindRmCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        let binding = config
-            .bindings
-            .get(&self.node)
-            .ok_or_else(|| anyhow::anyhow!("Binding for node '{}' not found", self.node))?;
-
-        if binding.status != BindingStatus::Idle {
-            anyhow::bail!(
-                "Cannot remove binding for node '{}': status is '{}', must be 'idle'. \
-                 Disable elections first and wait for stake recovery to complete.",
-                self.node,
-                binding.status
-            );
-        }
-
-        config.bindings.remove(&self.node);
-        save_config(&config, path)?;
-
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_delete(&base_url, &format!("/v1/bindings/{}", self.node), token).await?;
         println!("\n{} Binding {} removed\n", "OK".green().bold(), self.node);
         Ok(())
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct BindingView {
     node: String,
     wallet: String,
@@ -147,29 +125,24 @@ struct BindingView {
 }
 
 impl BindLsCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let config = AppConfig::load(path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = api_get(&base_url, "/v1/bindings", token).await?;
+        let resp: serde_json::Value = serde_json::from_str(&body)?;
+        let views: Vec<BindingView> = serde_json::from_value(resp["result"].clone())?;
 
-        if config.bindings.is_empty() {
+        if views.is_empty() {
             match self.format {
                 OutputFormat::Json => println!("[]"),
                 OutputFormat::Table => println!("\n{}\n", "No bindings configured".yellow()),
             }
             return Ok(());
         }
-
-        let mut views: Vec<BindingView> = config
-            .bindings
-            .into_iter()
-            .map(|(node, b)| BindingView {
-                node,
-                wallet: b.wallet,
-                pool: b.pool,
-                enable: b.enable,
-                status: b.status.to_string(),
-            })
-            .collect();
-        views.sort_by(|a, b| a.node.cmp(&b.node));
 
         match self.format {
             OutputFormat::Json => print_bindings_json(&views)?,

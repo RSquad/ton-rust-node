@@ -81,8 +81,10 @@ pub trait RuntimeConfig: Send + Sync {
     fn wallets(&self) -> Arc<HashMap<String, Arc<dyn TonWallet>>>;
     fn rpc_client(&self) -> Arc<ClientJsonRpc>;
     fn vault(&self) -> Option<Arc<SecretVault>>;
-    fn update_config(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()>;
-    fn save_to_file(&self);
+    /// Atomically applies the mutation and persists the resulting config.
+    /// Disk write happens before the in-memory swap, so a persistence failure
+    /// leaves the live runtime state unchanged.
+    fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()>;
 }
 
 impl RuntimeConfigStore {
@@ -229,6 +231,34 @@ impl RuntimeConfigStore {
         self.updated_at.load(Ordering::Relaxed)
     }
 
+    /// Resolves ADNL client configs for all configured nodes concurrently.
+    pub async fn node_adnl_configs(&self) -> HashMap<String, adnl::client::AdnlClientConfig> {
+        let config = self.get();
+        let vault = self.vault();
+
+        let mut set = tokio::task::JoinSet::new();
+        let mut sorted_nodes: Vec<_> =
+            config.nodes.iter().map(|(name, cfg)| (name.clone(), cfg.clone())).collect();
+        sorted_nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (node_id, cfg) in sorted_nodes {
+            let vault = vault.clone();
+            set.spawn(async move { (node_id, cfg.to_node_adnl_config(vault).await) });
+        }
+
+        set.join_all()
+            .await
+            .into_iter()
+            .filter_map(|(node_id, result)| match result {
+                Ok(config) => Some((node_id, config)),
+                Err(e) => {
+                    tracing::error!("node [{}] has wrong ADNL config: {}", node_id, e);
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Updates the config by cloning the current state, applying the mutation
     /// to its config, and atomically swapping in the new snapshot.
     pub fn update_with<F>(&self, f: F) -> anyhow::Result<()>
@@ -252,30 +282,62 @@ impl RuntimeConfigStore {
         Ok(())
     }
 
-    /// Save the current in-memory config to the config file if it has changed.
-    /// Only saves the `bindings` `enable` field and `elections` section.
-    pub fn save_to_file(&self) {
+    /// Serializes the given config and persists it to the config file if it
+    /// differs from the last write. Called from `update_and_save` so
+    /// the disk write happens before the in-memory swap.
+    fn save_to_file(&self, cfg: &AppConfig) -> anyhow::Result<()> {
         let path = Path::new(&self.config_path);
-        let config = self.get();
-        match serde_json::to_string_pretty(&*config) {
-            Ok(json) => {
-                let current_hash = Self::hash_bytes(&json.as_bytes());
-                let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
-                if Some(current_hash) == last_hash {
-                    return;
-                }
-                if let Err(e) = std::fs::write(path, &json) {
-                    tracing::error!("save config error: path='{}' error={}", path.display(), e);
-                } else {
-                    tracing::debug!("config saved to '{}'", path.display());
-                    // Update the file hash so we don't treat our own write as an external change.
-                    *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
-                }
-            }
-            Err(e) => {
-                tracing::error!("serialize config error: {}", e);
-            }
+        let json = serde_json::to_string_pretty(cfg)
+            .map_err(|e| anyhow::anyhow!("serialize config error: {e}"))?;
+        let current_hash = Self::hash_bytes(json.as_bytes());
+        let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
+        if Some(current_hash) == last_hash {
+            return Ok(());
         }
+        std::fs::write(path, &json).map_err(|e| {
+            anyhow::anyhow!("save config error: path='{}' error={e}", path.display())
+        })?;
+        tracing::debug!("config saved to '{}'", path.display());
+        // Update the file hash so we don't treat our own write as an external change.
+        *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
+        Ok(())
+    }
+
+    /// Atomically applies the mutation and persists the resulting config.
+    /// Disk write happens before the in-memory swap, so if persistence fails
+    /// the live runtime state is left unchanged (and the error is returned).
+    pub fn update_and_save<F>(&self, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut AppConfig),
+    {
+        let mut guard =
+            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+        let old = Arc::clone(&guard);
+        let mut cfg = (*old.config).clone();
+        f(&mut cfg);
+
+        // Persist first — if this fails, the in-memory state is not touched.
+        self.save_to_file(&cfg)?;
+
+        *guard = Arc::new(RuntimeState {
+            config: Arc::new(cfg),
+            vault: old.vault.clone(),
+            pools: Arc::clone(&old.pools),
+            wallets: Arc::clone(&old.wallets),
+            rpc_client: Arc::clone(&old.rpc_client),
+            master_wallet: Arc::clone(&old.master_wallet),
+        });
+        self.updated_at.store(time_format::now(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
+    /// from the current in-memory config. Does not read from disk.
+    ///
+    /// Use after REST mutations that change structural config (entities, endpoints).
+    pub async fn force_reload(&self) -> anyhow::Result<()> {
+        let config = (*self.get()).clone();
+        self.reload(config).await
     }
 
     /// Reload config from the file if it has changed externally.
@@ -439,16 +501,12 @@ impl RuntimeConfig for RuntimeConfigStore {
         state.vault.clone()
     }
 
-    fn update_config(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
-        self.update_with(f)
-    }
-
-    fn save_to_file(&self) {
-        RuntimeConfigStore::save_to_file(self)
+    fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
+        RuntimeConfigStore::update_and_save(self, f)
     }
 }
 
-async fn open_wallet(
+pub(crate) async fn open_wallet(
     wallet_config: &WalletConfig,
     rpc_client: Arc<ClientJsonRpc>,
     vault: Option<Arc<SecretVault>>,

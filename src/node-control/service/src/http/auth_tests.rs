@@ -16,7 +16,7 @@ use argon2::PasswordHasher;
 use axum::body::Body;
 use base64::Engine;
 use common::{
-    app_config::{AuthConfig, StakePolicy, UserEntry},
+    app_config::{AuthConfig, UserEntry},
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
@@ -123,6 +123,7 @@ async fn state_with_auth() -> AppState {
         jwt_auth: test_jwt_auth().await,
         user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        config_changed: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -135,6 +136,7 @@ async fn state_no_auth() -> AppState {
         jwt_auth: test_jwt_auth().await,
         user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        config_changed: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -339,8 +341,8 @@ async fn protected_route_valid_nominator_token_200() {
 async fn nominator_forbidden_on_operator_route() {
     let st = state_with_auth().await;
     let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
-    let body = StakePolicyRequest { policy: StakePolicy::Minimum, node: None };
-    let resp = app(st).oneshot(post_bearer("/v1/stake_strategy", &body, &tok)).await.unwrap();
+    let body = serde_json::json!({ "policy": "minimum" });
+    let resp = app(st).oneshot(post_bearer("/v1/elections/settings", &body, &tok)).await.unwrap();
     assert_eq!(resp.status(), 403);
 }
 
@@ -348,8 +350,8 @@ async fn nominator_forbidden_on_operator_route() {
 async fn operator_allowed_on_operator_route() {
     let st = state_with_auth().await;
     let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
-    let body = StakePolicyRequest { policy: StakePolicy::Fixed(100), node: None };
-    let resp = app(st).oneshot(post_bearer("/v1/stake_strategy", &body, &tok)).await.unwrap();
+    let body = serde_json::json!({ "policy": { "fixed": 100 } });
+    let resp = app(st).oneshot(post_bearer("/v1/elections/settings", &body, &tok)).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
 
@@ -395,8 +397,8 @@ async fn auth_disabled_all_routes_open() {
 #[tokio::test]
 async fn auth_disabled_operator_routes_open() {
     let st = state_no_auth().await;
-    let body = StakePolicyRequest { policy: StakePolicy::Fixed(100), node: None };
-    let resp = app(st).oneshot(post_json("/v1/stake_strategy", &body)).await.unwrap();
+    let body = serde_json::json!({ "policy": { "fixed": 100 } });
+    let resp = app(st).oneshot(post_json("/v1/elections/settings", &body)).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
 
