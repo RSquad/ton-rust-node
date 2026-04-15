@@ -269,7 +269,7 @@ pub(crate) fn normalize_base_url(url: &str) -> String {
     if !base.starts_with("http://") && !base.starts_with("https://") {
         base = format!("http://{}", base);
     }
-    base
+    base.trim_end_matches('/').to_string()
 }
 
 /// Sends a GET request to the service API and returns the response body.
@@ -396,5 +396,11 @@ mod tests {
             "http://example.com:8080/api/v1"
         );
         assert_eq!(normalize_base_url("example.com/path"), "http://example.com/path");
+    }
+
+    #[test]
+    fn test_normalize_base_url_trims_trailing_slash() {
+        assert_eq!(normalize_base_url("http://example.com:8080/"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1/"), "http://127.0.0.1");
     }
 }

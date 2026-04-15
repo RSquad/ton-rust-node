@@ -39,8 +39,9 @@ pub struct ConfigCmd {
         short = 'u',
         long = "url",
         value_hint = clap::ValueHint::Url,
-        help = "URL to the node control service API (takes precedence over --config; defaults to http://127.0.0.1:8080 if not --url and --config are provided)",
-        global = true
+        help = "URL to the node control service API (takes precedence over --config; defaults to http://127.0.0.1:8080 if not --url, --config, or NODECTL_URL environment variable are provided)",
+        env = "NODECTL_URL",
+        global = true,
     )]
     url: Option<String>,
 
