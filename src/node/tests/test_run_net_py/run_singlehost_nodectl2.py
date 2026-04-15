@@ -1113,7 +1113,8 @@ def main() -> None:
         sys.exit(1)
 
     os.environ["API_ENDPOINTS"] = cfg.http_api_url.rstrip("/") + "/"
-    os.environ["VAULT_URL"] = f"file://vault.json?master_key={secrets.token_hex(32)}"
+    vault_url = f"{paths.vault_file.resolve().as_uri()}?master_key={secrets.token_hex(32)}"
+    os.environ["VAULT_URL"] = vault_url
     log.info(f"VAULT_URL={os.environ['VAULT_URL']}")
 
     # All nodectl CLI invocations discover the config via this env var
