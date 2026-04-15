@@ -1158,7 +1158,7 @@ pub async fn v1_elections_settings_update_handler(
 
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             if let Some(elections) = &mut cfg.elections {
                 // Stake policy
                 if reset {
@@ -1182,7 +1182,6 @@ pub async fn v1_elections_settings_update_handler(
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     // Restart elections task so changes take effect immediately.
     let task = state.elections_task.clone();
@@ -1231,7 +1230,7 @@ pub async fn v1_ton_http_api_handler(
     let append = req.append;
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             if append {
                 let existing = cfg.ton_http_api.endpoints();
                 for url in &urls {
@@ -1251,7 +1250,6 @@ pub async fn v1_ton_http_api_handler(
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
     let endpoints = state.runtime_cfg.get().ton_http_api.endpoints();
@@ -1314,7 +1312,7 @@ pub async fn v1_log_set_handler(
 
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             let log = cfg.log.get_or_insert_with(LogConfig::default);
             if let Some(l) = level {
                 log.level = l;
@@ -1336,7 +1334,6 @@ pub async fn v1_log_set_handler(
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     let config = state.runtime_cfg.get();
     let log = config.log.as_ref().cloned().unwrap_or_default();

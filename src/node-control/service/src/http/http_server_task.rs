@@ -468,7 +468,7 @@ pub async fn v1_elections_exclude_handler(
     let to_exclude = req.nodes.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             for node_id in &to_exclude {
                 if let Some(binding) = cfg.bindings.get_mut(node_id) {
                     binding.enable = false;
@@ -476,7 +476,6 @@ pub async fn v1_elections_exclude_handler(
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     let task = state.elections_task.clone();
     tokio::spawn(async move {
@@ -520,7 +519,7 @@ pub async fn v1_elections_include_handler(
     let to_include = req.nodes.clone();
     state
         .runtime_cfg
-        .update_with(|cfg| {
+        .update_and_save(|cfg| {
             for node_id in &to_include {
                 if let Some(binding) = cfg.bindings.get_mut(node_id) {
                     binding.enable = true;
@@ -528,7 +527,6 @@ pub async fn v1_elections_include_handler(
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    state.runtime_cfg.save_to_file().map_err(|e| AppError::internal(e.to_string()))?;
 
     let task = state.elections_task.clone();
     tokio::spawn(async move {
