@@ -8,13 +8,24 @@
  */
 use super::http_server_task::{AppError, AppState};
 use crate::runtime_config::{RuntimeConfig, open_wallet};
-use common::app_config::{
-    BindingStatus, ElectionsConfig, KeyConfig, LogConfig, LogOutput, LogRotation, PoolConfig,
-    StakePolicy, WalletConfig,
+use adnl::common::Timeouts;
+use common::{
+    TonWalletVersion,
+    app_config::{
+        AdnlConfig, BindingStatus, ElectionsConfig, KeyConfig, LogConfig, LogOutput, LogRotation,
+        NodeBinding, PoolConfig, StakePolicy, TimeoutVariant, WalletConfig,
+    },
+    ton_utils::normalize_ton_address,
 };
 use control_client::client_adnl::ControlClientAdnl;
 use std::{collections::HashMap, str::FromStr};
 use ton_block::MsgAddressInt;
+
+/// `type_id` for ADNL public keys (Ed25519).
+const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
+
+/// Logical name reserved for the master wallet entry; cannot be used as a regular wallet name.
+const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
 
 // ---------------------------------------------------------------------------
 // DTOs
@@ -155,6 +166,56 @@ pub struct MasterWalletDto {
 pub struct MasterWalletResponse {
     pub ok: bool,
     pub result: MasterWalletDto,
+}
+
+// --- Mutation requests (CRUD) ---
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NodeAddRequest {
+    pub name: String,
+    pub control_server_endpoint: String,
+    /// Base64-encoded Ed25519 public key of the node's control server.
+    pub control_server_pubkey: String,
+    /// Vault secret name holding the ADNL client private key.
+    pub control_client_secret: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct WalletAddRequest {
+    pub name: String,
+    /// Vault secret name holding the wallet keypair.
+    pub secret: String,
+    /// Wallet version: V1R3, V3R2, V4R2 or V5R1 (case-insensitive).
+    pub version: String,
+    pub subwallet_id: u32,
+    pub workchain: i32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PoolAddRequest {
+    pub name: String,
+    /// Pool contract address (raw or base64url). At least one of `address`/`owner` is required.
+    pub address: Option<String>,
+    /// Owner address (raw or base64url). At least one of `address`/`owner` is required.
+    pub owner: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct BindingAddRequest {
+    pub node: String,
+    pub wallet: String,
+    pub pool: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct EntityRefDto {
+    pub name: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct EntityRefResponse {
+    pub ok: bool,
+    pub result: EntityRefDto,
 }
 
 // ---------------------------------------------------------------------------
@@ -569,4 +630,395 @@ async fn extract_public_key(state: &AppState) -> Option<String> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mutation handlers (CRUD)
+//
+// Each handler validates input against the live config, then applies the
+// change via `RuntimeConfigStore::update_and_save`, which persists to
+// disk before swapping the in-memory snapshot (so a write failure leaves the
+// live state untouched). Validation errors map to 400, missing entities to
+// 404, I/O failures to 500. All routes are mounted behind `require_operator`.
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/v1/nodes",
+    request_body = NodeAddRequest,
+    responses(
+        (status = 200, description = "Node added", body = EntityRefResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_nodes_add_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<NodeAddRequest>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let req = req.0;
+
+    if state.runtime_cfg.get().nodes.contains_key(&req.name) {
+        return Err(AppError::bad_request(format!("node '{}' already exists", req.name)));
+    }
+
+    let pub_key = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &req.control_server_pubkey,
+    )
+    .map_err(|_| AppError::bad_request("control_server_pubkey: invalid base64"))?;
+
+    let adnl_config = AdnlConfig {
+        server_address: req.control_server_endpoint,
+        server_key: KeyConfig::PublicKey { type_id: ADNL_PUBKEY_TYPE_ID, pub_key },
+        client_key: KeyConfig::VaultKey { name: req.control_client_secret },
+        timeouts: TimeoutVariant::Single(Timeouts::DEFAULT_TIMEOUT.as_secs()),
+    };
+
+    let name = req.name.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.nodes.insert(name, adnl_config);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/nodes/{name}",
+    params(("name" = String, Path, description = "Node name")),
+    responses(
+        (status = 200, description = "Node removed", body = EntityRefResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 404, description = "Node not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_nodes_rm_handler(
+    state: axum::extract::State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let cfg = state.runtime_cfg.get();
+    if !cfg.nodes.contains_key(&name) {
+        return Err(AppError::not_found(format!("node '{name}' not found")));
+    }
+    if cfg.bindings.contains_key(&name) {
+        return Err(AppError::bad_request(format!(
+            "cannot remove node '{name}': referenced by a binding"
+        )));
+    }
+    drop(cfg);
+
+    let target = name.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.nodes.remove(&target);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/wallets",
+    request_body = WalletAddRequest,
+    responses(
+        (status = 200, description = "Wallet added", body = EntityRefResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_wallets_add_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<WalletAddRequest>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let req = req.0;
+
+    if req.name == MASTER_WALLET_RESERVED_NAME {
+        return Err(AppError::bad_request(format!(
+            "'{MASTER_WALLET_RESERVED_NAME}' is a reserved name"
+        )));
+    }
+    if state.runtime_cfg.get().wallets.contains_key(&req.name) {
+        return Err(AppError::bad_request(format!("wallet '{}' already exists", req.name)));
+    }
+
+    let version = TonWalletVersion::from_str(&req.version)
+        .map_err(|_| AppError::bad_request(format!("invalid wallet version: '{}'", req.version)))?;
+
+    let wallet_config = WalletConfig {
+        key: KeyConfig::VaultKey { name: req.secret },
+        version,
+        subwallet_id: req.subwallet_id,
+        workchain: req.workchain,
+    };
+
+    let name = req.name.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.wallets.insert(name, wallet_config);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/wallets/{name}",
+    params(("name" = String, Path, description = "Wallet name")),
+    responses(
+        (status = 200, description = "Wallet removed", body = EntityRefResponse),
+        (status = 400, description = "Wallet is referenced or reserved", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 404, description = "Wallet not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_wallets_rm_handler(
+    state: axum::extract::State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    if name == MASTER_WALLET_RESERVED_NAME {
+        return Err(AppError::bad_request("the master wallet cannot be removed"));
+    }
+
+    let cfg = state.runtime_cfg.get();
+    if !cfg.wallets.contains_key(&name) {
+        return Err(AppError::not_found(format!("wallet '{name}' not found")));
+    }
+    if let Some((node, _)) = cfg.bindings.iter().find(|(_, b)| b.wallet == name) {
+        return Err(AppError::bad_request(format!(
+            "cannot remove wallet '{name}': referenced by binding for node '{node}'"
+        )));
+    }
+    drop(cfg);
+
+    let target = name.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.wallets.remove(&target);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/pools",
+    request_body = PoolAddRequest,
+    responses(
+        (status = 200, description = "Pool added", body = EntityRefResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_pools_add_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<PoolAddRequest>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let req = req.0;
+
+    if req.address.is_none() && req.owner.is_none() {
+        return Err(AppError::bad_request("at least one of 'address' or 'owner' is required"));
+    }
+    if state.runtime_cfg.get().pools.contains_key(&req.name) {
+        return Err(AppError::bad_request(format!("pool '{}' already exists", req.name)));
+    }
+
+    let address = req
+        .address
+        .as_deref()
+        .map(|a| normalize_ton_address(a, "address"))
+        .transpose()
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    let owner = req
+        .owner
+        .as_deref()
+        .map(|o| normalize_ton_address(o, "owner"))
+        .transpose()
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+
+    let pool_config = PoolConfig::SNP { address, owner };
+
+    let name = req.name.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.pools.insert(name, pool_config);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/pools/{name}",
+    params(("name" = String, Path, description = "Pool name")),
+    responses(
+        (status = 200, description = "Pool removed", body = EntityRefResponse),
+        (status = 400, description = "Pool is referenced by a binding", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 404, description = "Pool not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_pools_rm_handler(
+    state: axum::extract::State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let cfg = state.runtime_cfg.get();
+    if !cfg.pools.contains_key(&name) {
+        return Err(AppError::not_found(format!("pool '{name}' not found")));
+    }
+    if let Some((node, _)) =
+        cfg.bindings.iter().find(|(_, b)| b.pool.as_deref() == Some(name.as_str()))
+    {
+        return Err(AppError::bad_request(format!(
+            "cannot remove pool '{name}': referenced by binding for node '{node}'"
+        )));
+    }
+    drop(cfg);
+
+    let target = name.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.pools.remove(&target);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/bindings",
+    request_body = BindingAddRequest,
+    responses(
+        (status = 200, description = "Binding added", body = EntityRefResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_bindings_add_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<BindingAddRequest>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let req = req.0;
+
+    let cfg = state.runtime_cfg.get();
+    if cfg.bindings.contains_key(&req.node) {
+        return Err(AppError::bad_request(format!(
+            "binding for node '{}' already exists",
+            req.node
+        )));
+    }
+    if !cfg.nodes.contains_key(&req.node) {
+        return Err(AppError::bad_request(format!("node '{}' not found", req.node)));
+    }
+    if !cfg.wallets.contains_key(&req.wallet) {
+        return Err(AppError::bad_request(format!("wallet '{}' not found", req.wallet)));
+    }
+    if let Some(pool_name) = &req.pool {
+        if !cfg.pools.contains_key(pool_name) {
+            return Err(AppError::bad_request(format!("pool '{pool_name}' not found")));
+        }
+        // A pool may be bound to at most one node.
+        if let Some((other_node, _)) =
+            cfg.bindings.iter().find(|(_, b)| b.pool.as_deref() == Some(pool_name))
+        {
+            return Err(AppError::bad_request(format!(
+                "pool '{pool_name}' is already bound to node '{other_node}'"
+            )));
+        }
+    }
+    drop(cfg);
+
+    let binding = NodeBinding {
+        wallet: req.wallet,
+        pool: req.pool,
+        enable: false,
+        status: BindingStatus::default(),
+    };
+
+    let node = req.node.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.bindings.insert(node, binding);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.node } }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/bindings/{node}",
+    params(("node" = String, Path, description = "Bound node name")),
+    responses(
+        (status = 200, description = "Binding removed", body = EntityRefResponse),
+        (status = 400, description = "Binding is not idle", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 404, description = "Binding not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_bindings_rm_handler(
+    state: axum::extract::State<AppState>,
+    axum::extract::Path(node): axum::extract::Path<String>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let cfg = state.runtime_cfg.get();
+    let binding = cfg
+        .bindings
+        .get(&node)
+        .ok_or_else(|| AppError::not_found(format!("binding for node '{node}' not found")))?;
+    if binding.status != BindingStatus::Idle {
+        return Err(AppError::bad_request(format!(
+            "cannot remove binding for node '{node}': status is '{}', must be 'idle'. \
+             Disable elections first and wait for stake recovery to complete.",
+            binding.status
+        )));
+    }
+    drop(cfg);
+
+    let target = node.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.bindings.remove(&target);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: node } }))
 }

@@ -55,17 +55,18 @@ pub async fn run_with_config(
     let store = Arc::new(SnapshotStore::new());
 
     // Status callback: when the elections runner detects binding status changes,
-    // update the runtime config and save to file.
+    // atomically update the runtime config and persist it to file.
     let cfg = runtime_cfg.clone();
     let on_status_change: BindingStatusCallback = Arc::new(move |statuses| {
-        let _ = cfg.update_with(|app_cfg| {
+        if let Err(e) = cfg.update_and_save(|app_cfg| {
             for (node_id, new_status) in &statuses {
                 if let Some(binding) = app_cfg.bindings.get_mut(node_id) {
                     binding.status = *new_status;
                 }
             }
-        });
-        cfg.save_to_file();
+        }) {
+            tracing::error!("failed to persist binding status: {e:#}");
+        }
     });
 
     let mut tasks = HashMap::new();

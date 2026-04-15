@@ -260,9 +260,10 @@ pub fn resolve_service_url(url: Option<&str>, config_path: Option<&str>) -> anyh
     Ok("http://127.0.0.1:8080".to_string())
 }
 
-fn normalize_base_url(url: &str) -> String {
+pub(crate) fn normalize_base_url(url: &str) -> String {
     let mut base = url.to_string();
-    if base.starts_with("0.0.0.0") {
+    let trimmed = base.trim_start_matches("http://").trim_start_matches("https://");
+    if trimmed.starts_with("0.0.0.0") {
         base = base.replacen("0.0.0.0", "127.0.0.1", 1);
     }
     if !base.starts_with("http://") && !base.starts_with("https://") {
@@ -273,17 +274,117 @@ fn normalize_base_url(url: &str) -> String {
 
 /// Sends a GET request to the service API and returns the response body.
 pub async fn api_get(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::GET, base_url, path, token, None::<&()>).await
+}
+
+/// Sends a POST request with a JSON body and returns the response body.
+pub async fn api_post<B>(
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &B,
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
+    send_request(reqwest::Method::POST, base_url, path, token, Some(body)).await
+}
+
+/// Sends a DELETE request and returns the response body.
+pub async fn api_delete(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::DELETE, base_url, path, token, None::<&()>).await
+}
+
+async fn send_request<B>(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&B>,
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
     let url = format!("{}/{}", base_url.trim_end_matches('/'), path.trim_start_matches('/'));
     let client = reqwest::Client::new();
-    let mut req = client.get(&url);
+    let mut req = client.request(method, &url);
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    if let Some(b) = body {
+        req = req.json(b);
     }
     let response = req.send().await.context(format!("failed to connect to {}", url))?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
+        // Try to extract `error.message` from the standard ApiErrorResponse.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(msg) =
+                v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        {
+            anyhow::bail!("{msg}");
+        }
         anyhow::bail!("request failed: status={}, body={}", status, body);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_base_url_adds_http_scheme_when_missing() {
+        assert_eq!(normalize_base_url("example.com:8080"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1:9000"), "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_http_scheme() {
+        assert_eq!(normalize_base_url("http://example.com:8080"), "http://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_https_scheme() {
+        assert_eq!(normalize_base_url("https://example.com:8080"), "https://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_bare_0_0_0_0_with_loopback() {
+        assert_eq!(normalize_base_url("0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_http_scheme() {
+        assert_eq!(normalize_base_url("http://0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_https_scheme() {
+        assert_eq!(normalize_base_url("https://0.0.0.0:8080"), "https://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_only_first_0_0_0_0_occurrence() {
+        assert_eq!(
+            normalize_base_url("http://0.0.0.0/redirect/0.0.0.0"),
+            "http://127.0.0.1/redirect/0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_base_url_leaves_non_0_0_0_0_host_unchanged() {
+        assert_eq!(normalize_base_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(normalize_base_url("http://10.0.0.0:8080"), "http://10.0.0.0:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_path() {
+        assert_eq!(
+            normalize_base_url("http://example.com:8080/api/v1"),
+            "http://example.com:8080/api/v1"
+        );
+        assert_eq!(normalize_base_url("example.com/path"), "http://example.com/path");
+    }
 }

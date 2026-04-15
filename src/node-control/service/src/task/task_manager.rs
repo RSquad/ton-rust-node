@@ -206,10 +206,12 @@ mod tests {
         fn vault(&self) -> Option<Arc<SecretVault>> {
             unimplemented!()
         }
-        fn update_config(&self, _f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
+        fn update_and_save(
+            &self,
+            _f: Box<dyn FnOnce(&mut AppConfig) + Send>,
+        ) -> anyhow::Result<()> {
             unimplemented!()
         }
-        fn save_to_file(&self) {}
     }
 
     fn runtime_config() -> Arc<dyn RuntimeConfig> {

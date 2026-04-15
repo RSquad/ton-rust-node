@@ -149,7 +149,8 @@ impl LogLsCmd {
                 println!("{}", serde_json::to_string_pretty(result)?);
             }
             OutputFormat::Table => {
-                let log = serde_json::from_value::<LogConfig>(result.clone()).unwrap_or_default();
+                let log = serde_json::from_value::<LogConfig>(result.clone())
+                    .map_err(|e| anyhow::anyhow!("failed to parse log config: {e}"))?;
                 print_log_table(&log);
             }
         }

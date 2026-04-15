@@ -163,6 +163,26 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
         .route("/v1/elections/include", axum::routing::post(v1_elections_include_handler))
         .route("/v1/stake_strategy", axum::routing::post(v1_stake_strategy_handler))
         .route("/v1/task/elections", axum::routing::post(v1_task_elections_handler))
+        .route("/v1/nodes", axum::routing::post(super::config_handlers::v1_nodes_add_handler))
+        .route(
+            "/v1/nodes/{name}",
+            axum::routing::delete(super::config_handlers::v1_nodes_rm_handler),
+        )
+        .route("/v1/wallets", axum::routing::post(super::config_handlers::v1_wallets_add_handler))
+        .route(
+            "/v1/wallets/{name}",
+            axum::routing::delete(super::config_handlers::v1_wallets_rm_handler),
+        )
+        .route("/v1/pools", axum::routing::post(super::config_handlers::v1_pools_add_handler))
+        .route(
+            "/v1/pools/{name}",
+            axum::routing::delete(super::config_handlers::v1_pools_rm_handler),
+        )
+        .route("/v1/bindings", axum::routing::post(super::config_handlers::v1_bindings_add_handler))
+        .route(
+            "/v1/bindings/{node}",
+            axum::routing::delete(super::config_handlers::v1_bindings_rm_handler),
+        )
         .route("/auth/users", axum::routing::get(list_users_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -219,15 +239,14 @@ impl AppError {
         }
     }
 
-    #[allow(dead_code)]
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::NOT_FOUND,
             body: ApiErrorBody { code: 404, message: message.into() },
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             body: ApiErrorBody { code: 500, message: message.into() },
@@ -870,9 +889,17 @@ impl utoipa::Modify for BearerAuthAddon {
         v1_task_elections_handler,
         // It won't compile without full names
         super::config_handlers::v1_nodes_handler,
+        super::config_handlers::v1_nodes_add_handler,
+        super::config_handlers::v1_nodes_rm_handler,
         super::config_handlers::v1_wallets_handler,
+        super::config_handlers::v1_wallets_add_handler,
+        super::config_handlers::v1_wallets_rm_handler,
         super::config_handlers::v1_pools_handler,
+        super::config_handlers::v1_pools_add_handler,
+        super::config_handlers::v1_pools_rm_handler,
         super::config_handlers::v1_bindings_handler,
+        super::config_handlers::v1_bindings_add_handler,
+        super::config_handlers::v1_bindings_rm_handler,
         super::config_handlers::v1_elections_settings_handler,
         super::config_handlers::v1_log_handler,
         super::config_handlers::v1_master_wallet_handler,
@@ -909,6 +936,12 @@ impl utoipa::Modify for BearerAuthAddon {
         PoolsResponse,
         BindingDto,
         BindingsResponse,
+        super::config_handlers::NodeAddRequest,
+        super::config_handlers::WalletAddRequest,
+        super::config_handlers::PoolAddRequest,
+        super::config_handlers::BindingAddRequest,
+        super::config_handlers::EntityRefDto,
+        super::config_handlers::EntityRefResponse,
         BindingElectionStatusDto,
         ElectionsSettingsDto,
         ElectionsSettingsResponse,

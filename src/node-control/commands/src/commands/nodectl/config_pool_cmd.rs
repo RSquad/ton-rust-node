@@ -8,14 +8,11 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_get, require_config, resolve_service_url, save_config},
+    utils::{api_delete, api_get, api_post, resolve_service_url},
 };
 use colored::{ColoredString, Colorize};
-use common::{
-    app_config::{AppConfig, PoolConfig},
-    ton_utils::display_tons,
-};
-use std::{path::Path, str::FromStr};
+use common::ton_utils::display_tons;
+use std::str::FromStr;
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt};
 
 #[derive(clap::Args, Clone)]
@@ -76,48 +73,42 @@ impl PoolCmd {
         token: Option<&str>,
     ) -> anyhow::Result<()> {
         match &self.action {
-            PoolAction::Add(cmd) => cmd.run(require_config(config_path)?).await,
+            PoolAction::Add(cmd) => cmd.run(url, token, config_path).await,
             PoolAction::Ls(cmd) => cmd.run(url, token, config_path).await,
-            PoolAction::Rm(cmd) => cmd.run(require_config(config_path)?).await,
+            PoolAction::Rm(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
 
+#[derive(serde::Serialize)]
+struct PoolAddBody<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<&'a str>,
+}
+
 impl PoolAddCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if self.address.is_none() && self.owner.is_none() {
-            anyhow::bail!("At least one of --address or --owner must be specified");
-        }
-
-        let normalized_address = self
-            .address
-            .as_deref()
-            .map(|addr| normalize_ton_address(addr, "address"))
-            .transpose()?;
-        let normalized_owner =
-            self.owner.as_deref().map(|owner| normalize_ton_address(owner, "owner")).transpose()?;
-
-        let mut config = AppConfig::load(path)?;
-
-        if config.pools.contains_key(&self.name) {
-            anyhow::bail!(
-                "Pool '{}' already exists. Remove it first or use a different name.",
-                self.name
-            );
-        }
-
-        let pool_config = PoolConfig::SNP {
-            address: normalized_address.clone(),
-            owner: normalized_owner.clone(),
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = PoolAddBody {
+            name: &self.name,
+            address: self.address.as_deref(),
+            owner: self.owner.as_deref(),
         };
-        config.pools.insert(self.name.clone(), pool_config);
-        save_config(&config, path)?;
+        api_post(&base_url, "/v1/pools", token, &body).await?;
 
-        let info = match (&normalized_address, &normalized_owner) {
+        let info = match (&self.address, &self.owner) {
             (Some(a), Some(o)) => format!("address='{}', owner='{}'", a, o),
             (Some(a), None) => format!("address='{}'", a),
             (None, Some(o)) => format!("owner='{}' (address will be calculated on bind)", o),
-            _ => unreachable!(),
+            (None, None) => String::new(),
         };
         println!("\n{} Pool '{}' added ({})\n", "OK".green().bold(), self.name, info);
         Ok(())
@@ -219,125 +210,16 @@ fn print_pools_table(views: &[PoolView]) {
     println!();
 }
 
-fn normalize_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<String> {
-    let trimmed = addr.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("--{flag_name} must not be empty");
-    }
-    MsgAddressInt::from_str(trimmed).map_err(|_| {
-        anyhow::anyhow!(
-            "invalid TON address for --{flag_name}: '{trimmed}'. Expected format: raw address or base64url"
-        )
-    })?;
-    Ok(trimmed.to_string())
-}
-
-#[cfg(test)]
-fn validate_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<()> {
-    normalize_ton_address(addr, flag_name).map(|_| ())
-}
-
 impl PoolRmCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        if !config.pools.contains_key(&self.name) {
-            anyhow::bail!("Pool '{}' not found in configuration", self.name);
-        }
-
-        for (node_name, binding) in &config.bindings {
-            if binding.pool.as_deref() == Some(&self.name) {
-                anyhow::bail!(
-                    "Cannot remove pool '{}': referenced by binding for node '{}'",
-                    self.name,
-                    node_name
-                );
-            }
-        }
-
-        config.pools.remove(&self.name);
-        save_config(&config, path)?;
-
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_delete(&base_url, &format!("/v1/pools/{}", self.name), token).await?;
         println!("\n{} Pool '{}' removed\n", "OK".green().bold(), self.name);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE};
-
-    #[test]
-    fn test_validate_ton_address_valid_raw() {
-        assert!(
-            validate_ton_address(
-                "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb",
-                "owner",
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_validate_ton_address_valid_masterchain() {
-        assert!(
-            validate_ton_address(
-                "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea",
-                "address",
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_validate_ton_address_valid_base64url() {
-        // Round-trip: raw -> MsgAddressInt -> base64url -> validate
-        let raw = "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb";
-        let addr = MsgAddressInt::from_str(raw).unwrap();
-        let base64url = addr.to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE).unwrap();
-        assert!(validate_ton_address(&base64url, "owner").is_ok());
-    }
-
-    #[test]
-    fn test_validate_ton_address_empty() {
-        let err = validate_ton_address("", "owner").unwrap_err();
-        assert!(err.to_string().contains("must not be empty"));
-    }
-
-    #[test]
-    fn test_validate_ton_address_whitespace() {
-        let err = validate_ton_address("   ", "owner").unwrap_err();
-        assert!(err.to_string().contains("must not be empty"));
-    }
-
-    #[test]
-    fn test_validate_ton_address_invalid() {
-        let err = validate_ton_address("not-an-address", "owner").unwrap_err();
-        assert!(err.to_string().contains("invalid TON address"));
-    }
-
-    #[test]
-    fn test_validate_ton_address_valid_with_surrounding_spaces() {
-        assert!(
-            validate_ton_address(
-                "  0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb  ",
-                "owner",
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_normalize_ton_address_trims_surrounding_spaces() {
-        let normalized = normalize_ton_address(
-            "  0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb  ",
-            "owner",
-        )
-        .unwrap();
-        assert_eq!(
-            normalized,
-            "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb"
-        );
     }
 }
