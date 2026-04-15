@@ -11,16 +11,13 @@ use crate::commands::nodectl::{
     utils::{
         SEND_TIMEOUT, api_delete, api_get, api_post, confirm, get_wallet_config,
         load_config_vault_rpc_client, make_wallet, require_config,
-        resolve_pool_address_from_config, resolve_service_url, save_config,
-        toncore_pool_slot_from_cli_flags, wait_for_seqno_change, wallet_info,
+        resolve_pool_address_from_config, resolve_service_url, toncore_pool_slot_from_cli_flags,
+        wait_for_seqno_change, wallet_info,
     },
 };
 use colored::{ColoredString, Colorize};
 use common::{
-    app_config::{
-        AppConfig, DEFAULT_TONCORE_MAX_NOMINATORS, DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
-        DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, PoolConfig, TonCoreInitParams, TonCorePoolConfig,
-    },
+    app_config::PoolConfig,
     task_cancellation::CancellationCtx,
     ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
@@ -195,10 +192,10 @@ impl PoolCmd {
         token: Option<&str>,
     ) -> anyhow::Result<()> {
         match &self.action {
-            // SNP add: REST. Core add: local config file (no REST endpoint yet).
+            // Both SNP and Core add go through REST.
             PoolAction::Add(cmd) => match &cmd.action {
                 Some(PoolAddAction::Snp(cmd)) => cmd.run(url, token, config_path).await,
-                Some(PoolAddAction::Core(cmd)) => cmd.run(require_config(config_path)?).await,
+                Some(PoolAddAction::Core(cmd)) => cmd.run(url, token, config_path).await,
                 None => cmd.snp.run(url, token, config_path).await,
             },
             PoolAction::Ls(cmd) => cmd.run(url, token, config_path).await,
@@ -254,60 +251,55 @@ impl PoolAddCmd {
     }
 }
 
+/// Wire body for `POST /v1/pools/core`. Mirrors `service::PoolAddCoreRequest`
+/// — duplicated rather than shared to keep the CLI free of a service-crate
+/// dependency.
+#[derive(serde::Serialize)]
+struct PoolAddCoreBody<'a> {
+    name: &'a str,
+    slot: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validator_share: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_nominators: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_validator_stake: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_nominator_stake: Option<u64>,
+}
+
 impl PoolAddCoreCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
         if self.address.is_none() && self.validator_share.is_none() {
             anyhow::bail!("At least one of --address or --validator-share must be specified");
         }
 
-        let slot = if self.odd { 1usize } else { 0usize };
-        let slot_name = if slot == 0 { "even" } else { "odd" };
+        let slot_name = if self.odd { "odd" } else { "even" };
 
-        let mut config = AppConfig::load(path)?;
-
+        // Validate locally so the user gets the standard "invalid TON address"
+        // message instead of a 400 from the server.
         let address =
             self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
 
-        let params = self.validator_share.map(|vs| TonCoreInitParams {
-            validator_share: vs,
-            max_nominators: self.max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
-            min_validator_stake: self
-                .min_validator_stake
-                .map(tons_f64_to_nanotons)
-                .unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE),
-            min_nominator_stake: self
-                .min_nominator_stake
-                .map(tons_f64_to_nanotons)
-                .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
-        });
-
-        match config.pools.get_mut(&self.name) {
-            Some(PoolConfig::TONCore { pools }) => {
-                if pools[slot].is_some() {
-                    anyhow::bail!(
-                        "TONCore pool '{}' slot '{}' is already configured. Remove pool first or use another name.",
-                        self.name,
-                        slot_name
-                    );
-                }
-                pools[slot] =
-                    Some(TonCorePoolConfig { address: address.clone(), params: params.clone() });
-            }
-            Some(PoolConfig::SNP { .. }) => {
-                anyhow::bail!(
-                    "Pool '{}' already exists and is SNP. Remove it first or use another name.",
-                    self.name
-                );
-            }
-            None => {
-                let mut pools: [Option<TonCorePoolConfig>; 2] = [None, None];
-                pools[slot] =
-                    Some(TonCorePoolConfig { address: address.clone(), params: params.clone() });
-                config.pools.insert(self.name.clone(), PoolConfig::TONCore { pools });
-            }
-        }
-
-        save_config(&config, path)?;
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = PoolAddCoreBody {
+            name: &self.name,
+            slot: slot_name,
+            address: address.as_deref(),
+            validator_share: self.validator_share,
+            max_nominators: self.max_nominators,
+            // CLI flags accept TON (f64) — convert to nanotons for the API.
+            min_validator_stake: self.min_validator_stake.map(tons_f64_to_nanotons),
+            min_nominator_stake: self.min_nominator_stake.map(tons_f64_to_nanotons),
+        };
+        api_post(&base_url, "/v1/pools/core", token, &body).await?;
 
         let mut info_parts = Vec::new();
         if let Some(vs) = self.validator_share {

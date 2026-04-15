@@ -83,6 +83,15 @@ fn get(uri: &str) -> axum::http::Request<Body> {
     axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
+fn post_json(uri: &str, body: &impl serde::Serialize) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn pools_empty() {
     let st = state_with_pools(HashMap::new()).await;
@@ -206,4 +215,195 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
         assert!(slot.get("balance").is_none());
         assert!(slot["address"].is_string());
     }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/pools/core
+// ---------------------------------------------------------------------------
+
+fn core_add_body(name: &str, slot: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "slot": slot,
+        "validator_share": 4000u16,
+    })
+}
+
+#[tokio::test]
+async fn pools_add_core_creates_new_pool_with_one_slot() {
+    let st = state_with_pools(HashMap::new()).await;
+    let resp = routes(false, st.clone())
+        .oneshot(post_json("/v1/pools/core", &core_add_body("core1", "even")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v = json(resp).await;
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["name"], "core1");
+
+    // Live config now has a TONCore pool with only the even slot populated.
+    let cfg = st.runtime_cfg.get();
+    let pool = cfg.pools.get("core1").expect("pool inserted");
+    match pool {
+        PoolConfig::TONCore { pools } => {
+            assert!(pools[0].is_some(), "even slot must be present");
+            assert!(pools[1].is_none(), "odd slot must remain empty");
+            let params = pools[0].as_ref().unwrap().params.as_ref().unwrap();
+            assert_eq!(params.validator_share, 4000);
+        }
+        _ => panic!("expected TONCore pool"),
+    }
+}
+
+#[tokio::test]
+async fn pools_add_core_adds_second_slot_to_existing_pool() {
+    let mut pools = HashMap::new();
+    pools.insert(
+        "core1".to_string(),
+        PoolConfig::TONCore {
+            pools: [
+                Some(TonCorePoolConfig {
+                    address: None,
+                    params: Some(TonCoreInitParams {
+                        validator_share: 4000,
+                        max_nominators: 40,
+                        min_validator_stake: 10_000_000_000_000,
+                        min_nominator_stake: 10_000_000_000_000,
+                    }),
+                }),
+                None,
+            ],
+        },
+    );
+    let st = state_with_pools(pools).await;
+
+    let resp = routes(false, st.clone())
+        .oneshot(post_json("/v1/pools/core", &core_add_body("core1", "odd")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let cfg = st.runtime_cfg.get();
+    match cfg.pools.get("core1").unwrap() {
+        PoolConfig::TONCore { pools } => {
+            assert!(pools[0].is_some(), "even slot preserved");
+            assert!(pools[1].is_some(), "odd slot added");
+        }
+        _ => panic!("expected TONCore pool"),
+    }
+}
+
+#[tokio::test]
+async fn pools_add_core_rejects_existing_snp_pool() {
+    let mut pools = HashMap::new();
+    pools.insert("name1".to_string(), PoolConfig::SNP { address: None, owner: None });
+    let st = state_with_pools(pools).await;
+
+    let resp = routes(false, st)
+        .oneshot(post_json("/v1/pools/core", &core_add_body("name1", "even")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("SNP"));
+}
+
+#[tokio::test]
+async fn pools_add_core_rejects_already_configured_slot() {
+    let mut pools = HashMap::new();
+    pools.insert(
+        "core1".to_string(),
+        PoolConfig::TONCore {
+            pools: [Some(TonCorePoolConfig { address: None, params: None }), None],
+        },
+    );
+    let st = state_with_pools(pools).await;
+
+    let resp = routes(false, st)
+        .oneshot(post_json("/v1/pools/core", &core_add_body("core1", "even")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("already configured"));
+}
+
+#[tokio::test]
+async fn pools_add_core_rejects_missing_address_and_share() {
+    let st = state_with_pools(HashMap::new()).await;
+    // Body has neither `address` nor `validator_share` — must 400.
+    let body = serde_json::json!({ "name": "core1", "slot": "even" });
+    let resp = routes(false, st).oneshot(post_json("/v1/pools/core", &body)).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn pools_add_core_rejects_invalid_slot() {
+    let st = state_with_pools(HashMap::new()).await;
+    let resp = routes(false, st)
+        .oneshot(post_json("/v1/pools/core", &core_add_body("core1", "middle")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("slot"));
+}
+
+#[tokio::test]
+async fn pools_add_core_rejects_validator_share_above_100_pct() {
+    let st = state_with_pools(HashMap::new()).await;
+    // 10001 bp = 100.01% — must be rejected.
+    let body = serde_json::json!({
+        "name": "core1",
+        "slot": "even",
+        "validator_share": 10_001u16,
+    });
+    let resp = routes(false, st).oneshot(post_json("/v1/pools/core", &body)).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn pools_add_core_accepts_validator_share_at_100_pct() {
+    // Boundary check: 10000 bp = exactly 100% — must be accepted.
+    let st = state_with_pools(HashMap::new()).await;
+    let body = serde_json::json!({
+        "name": "core1",
+        "slot": "even",
+        "validator_share": 10_000u16,
+    });
+    let resp = routes(false, st).oneshot(post_json("/v1/pools/core", &body)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn pools_add_core_rejects_sibling_params_without_validator_share() {
+    // Supplying max_nominators / min_*_stake without validator_share would
+    // silently discard them (no TonCoreInitParams gets built). Must 400 so
+    // the user knows their input was ignored.
+    let st = state_with_pools(HashMap::new()).await;
+    let body = serde_json::json!({
+        "name": "core1",
+        "slot": "even",
+        "address": "-1:0000000000000000000000000000000000000000000000000000000000000001",
+        "max_nominators": 50u16,
+    });
+    let resp = routes(false, st).oneshot(post_json("/v1/pools/core", &body)).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("validator_share"));
+}
+
+#[tokio::test]
+async fn pools_add_core_rejects_max_nominators_zero() {
+    let st = state_with_pools(HashMap::new()).await;
+    let body = serde_json::json!({
+        "name": "core1",
+        "slot": "even",
+        "validator_share": 4000u16,
+        "max_nominators": 0u16,
+    });
+    let resp = routes(false, st).oneshot(post_json("/v1/pools/core", &body)).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("max_nominators"));
 }

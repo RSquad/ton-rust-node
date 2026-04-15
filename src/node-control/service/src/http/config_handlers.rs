@@ -12,8 +12,10 @@ use adnl::common::Timeouts;
 use common::{
     TonWalletVersion,
     app_config::{
-        AdnlConfig, BindingStatus, ElectionsConfig, EndpointEntry, KeyConfig, LogConfig, LogOutput,
-        LogRotation, NodeBinding, PoolConfig, StakePolicy, TimeoutVariant, WalletConfig,
+        AdnlConfig, BindingStatus, DEFAULT_TONCORE_MAX_NOMINATORS,
+        DEFAULT_TONCORE_MIN_NOMINATOR_STAKE, DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, ElectionsConfig,
+        EndpointEntry, KeyConfig, LogConfig, LogOutput, LogRotation, NodeBinding, PoolConfig,
+        StakePolicy, TimeoutVariant, TonCoreInitParams, TonCorePoolConfig, WalletConfig,
     },
     ton_utils::{extract_max_factor, normalize_ton_address},
 };
@@ -243,6 +245,7 @@ pub struct WalletAddRequest {
     pub workchain: i32,
 }
 
+/// Request body for `POST /v1/pools` (SNP pools only).
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PoolAddRequest {
     pub name: String,
@@ -250,6 +253,38 @@ pub struct PoolAddRequest {
     pub address: Option<String>,
     /// Owner address (raw or base64url). At least one of `address`/`owner` is required.
     pub owner: Option<String>,
+}
+
+/// Request body for `POST /v1/pools/core` — add a TONCore nominator pool slot.
+///
+/// One TONCore pool has up to two slots (even/odd validation rounds). Calling
+/// this with a new `name` creates a fresh TONCore pool with the specified
+/// slot; calling it again with the same `name` and the other `slot` adds
+/// the second slot to the existing pool. Re-adding an already-configured
+/// slot is rejected, as is targeting a name already used by an SNP pool.
+///
+/// At least one of `address` (existing on-chain pool) or `validator_share`
+/// (deploy parameters) must be supplied.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PoolAddCoreRequest {
+    pub name: String,
+    /// Slot identifier: `"even"` (slot 0) or `"odd"` (slot 1).
+    pub slot: String,
+    /// Existing pool contract address (raw or base64url).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Validator reward share in basis points (1 bp = 0.01%; e.g. 4000 = 40%).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validator_share: Option<u16>,
+    /// Maximum nominators (default: [`DEFAULT_TONCORE_MAX_NOMINATORS`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_nominators: Option<u16>,
+    /// Minimum validator stake in nanotons (default: [`DEFAULT_TONCORE_MIN_VALIDATOR_STAKE`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_validator_stake: Option<u64>,
+    /// Minimum nominator stake in nanotons (default: [`DEFAULT_TONCORE_MIN_NOMINATOR_STAKE`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_nominator_stake: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -607,13 +642,13 @@ pub async fn v1_pools_handler(
 /// Fetch on-chain data for a single TONCore pool slot.
 ///
 /// Resolution order for the contract address:
-/// 1) the cached wrapper (exists only if pool is bound to a node)
-/// 2) the address from config
-/// 3) no address (treated as not deployed).
-/// When an address is available we hit the RPC for state+balance and
-/// — only when the account is active — call `get_pool_data()` for on-chain
-/// pool parameters.
-/// RPC failures are encoded into the slot DTO so a single
+///   1. the cached wrapper (exists only if pool is bound to a node);
+///   2. the address from config;
+///   3. no address (treated as not deployed).
+///
+/// When an address is available we hit the RPC for state+balance and — only
+/// when the account is active — call `get_pool_data()` for on-chain pool
+/// parameters. RPC failures are encoded into the slot DTO so a single
 /// unreachable slot does not break the whole `/v1/pools` response.
 async fn fetch_toncore_slot_dto(
     rpc_client: Arc<ClientJsonRpc>,
@@ -1084,6 +1119,135 @@ pub async fn v1_pools_add_handler(
         .runtime_cfg
         .update_and_save(|cfg| {
             cfg.pools.insert(name, pool_config);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/pools/core",
+    request_body = PoolAddCoreRequest,
+    responses(
+        (status = 200, description = "TONCore pool slot added", body = EntityRefResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_pools_add_core_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<PoolAddCoreRequest>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let req = req.0;
+
+    let slot_idx = match req.slot.as_str() {
+        "even" => 0usize,
+        "odd" => 1usize,
+        other => {
+            return Err(AppError::bad_request(format!(
+                "invalid slot '{other}': must be 'even' or 'odd'"
+            )));
+        }
+    };
+
+    if req.address.is_none() && req.validator_share.is_none() {
+        return Err(AppError::bad_request(
+            "at least one of 'address' or 'validator_share' is required",
+        ));
+    }
+
+    // Sibling deploy-params only take effect when validator_share is also
+    // supplied (without it we never construct TonCoreInitParams).
+    if req.validator_share.is_none()
+        && (req.max_nominators.is_some()
+            || req.min_validator_stake.is_some()
+            || req.min_nominator_stake.is_some())
+    {
+        return Err(AppError::bad_request(
+            "max_nominators / min_validator_stake / min_nominator_stake \
+             require 'validator_share' to be set",
+        ));
+    }
+
+    if let Some(vs) = req.validator_share {
+        // basis points: 1 bp = 0.01%;
+        // >100% is mathematically nonsense.
+        if !(0..=10_000).contains(&vs) {
+            return Err(AppError::bad_request(format!(
+                "validator_share must be in 0..=10000 basis points (got {vs})"
+            )));
+        }
+    }
+    if let Some(mn) = req.max_nominators {
+        if mn == 0 {
+            return Err(AppError::bad_request("max_nominators must be > 0"));
+        }
+    }
+
+    let address = req
+        .address
+        .as_deref()
+        .map(|a| normalize_ton_address(a, "address"))
+        .transpose()
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+
+    // Build init params only when validator_share is supplied — without it
+    // we can't derive the deployment state, so we treat the slot as
+    // "address-only" (matches the CLI behaviour).
+    let params = req.validator_share.map(|vs| TonCoreInitParams {
+        validator_share: vs,
+        max_nominators: req.max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
+        min_validator_stake: req.min_validator_stake.unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE),
+        min_nominator_stake: req.min_nominator_stake.unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
+    });
+
+    // Pre-validate against the live config so we don't half-mutate state on
+    // a failure inside `update_and_save`.
+    {
+        let cfg = state.runtime_cfg.get();
+        match cfg.pools.get(&req.name) {
+            Some(PoolConfig::SNP { .. }) => {
+                return Err(AppError::bad_request(format!(
+                    "pool '{}' already exists and is SNP; remove it first or use another name",
+                    req.name
+                )));
+            }
+            Some(PoolConfig::TONCore { pools }) => {
+                if pools[slot_idx].is_some() {
+                    return Err(AppError::bad_request(format!(
+                        "TONCore pool '{}' slot '{}' is already configured",
+                        req.name, req.slot
+                    )));
+                }
+            }
+            None => {}
+        }
+    }
+
+    let name = req.name.clone();
+    let slot_cfg = TonCorePoolConfig { address, params };
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            match cfg.pools.get_mut(&name) {
+                Some(PoolConfig::TONCore { pools }) => {
+                    pools[slot_idx] = Some(slot_cfg);
+                }
+                Some(PoolConfig::SNP { .. }) => {
+                    // Pre-validated above; race-narrow window only — leave
+                    // the existing entry untouched.
+                }
+                None => {
+                    let mut pools: [Option<TonCorePoolConfig>; 2] = [None, None];
+                    pools[slot_idx] = Some(slot_cfg);
+                    cfg.pools.insert(name, PoolConfig::TONCore { pools });
+                }
+            }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();

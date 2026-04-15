@@ -188,6 +188,10 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
         )
         .route("/v1/pools", axum::routing::post(super::config_handlers::v1_pools_add_handler))
         .route(
+            "/v1/pools/core",
+            axum::routing::post(super::config_handlers::v1_pools_add_core_handler),
+        )
+        .route(
             "/v1/pools/{name}",
             axum::routing::delete(super::config_handlers::v1_pools_rm_handler),
         )
@@ -839,6 +843,7 @@ impl utoipa::Modify for BearerAuthAddon {
         super::config_handlers::v1_wallets_rm_handler,
         super::config_handlers::v1_pools_handler,
         super::config_handlers::v1_pools_add_handler,
+        super::config_handlers::v1_pools_add_core_handler,
         super::config_handlers::v1_pools_rm_handler,
         super::config_handlers::v1_bindings_handler,
         super::config_handlers::v1_bindings_add_handler,
@@ -883,6 +888,7 @@ impl utoipa::Modify for BearerAuthAddon {
         super::config_handlers::NodeAddRequest,
         super::config_handlers::WalletAddRequest,
         super::config_handlers::PoolAddRequest,
+        super::config_handlers::PoolAddCoreRequest,
         super::config_handlers::BindingAddRequest,
         super::config_handlers::EntityRefDto,
         super::config_handlers::EntityRefResponse,
