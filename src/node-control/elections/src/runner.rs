@@ -56,6 +56,15 @@ const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 const WALLET_COMPUTE_FEE: u64 = 200_000_000;
 /// Storage reserve kept in the validator wallet when staking directly (no nominator pool).
 const WALLET_STORAGE_RESERVE: u64 = 1_000_000_000;
+/// Extra storage fees reservation to correctly calculate free pool balance:
+/// it's a storage fees accumulated between two stake operations.
+/// It's an approximation to avoid error when staking all available funds.
+/// The line from single-nominator contract:
+/// ```ignore
+/// throw_unless(ERROR::INSUFFICIENT_BALANCE, stake_amount <= my_balance - msg_value - MIN_TON_FOR_STORAGE);
+/// ```
+/// where `my_balance` is already decreased by storage fees which we want to cover.
+const EXTRA_STORAGE_FEES: u64 = 5_000_000;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 
@@ -137,7 +146,7 @@ impl Node {
                 .pool_addr_cache
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("pool address not found"))?;
-            let reserve = pool.storage_reserve();
+            let reserve = pool.storage_reserve() + EXTRA_STORAGE_FEES;
             return self
                 .api
                 .account(&addr.to_string())

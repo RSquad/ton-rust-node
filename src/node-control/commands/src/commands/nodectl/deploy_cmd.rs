@@ -17,7 +17,7 @@ use common::{
     task_cancellation::CancellationCtx,
     ton_utils::{nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
-use contracts::{NominatorWrapperImpl, TonWallet, resolve_toncore_pool};
+use contracts::{SingleNominatorWrapper, TonWallet, resolve_toncore_pool};
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, sync::Arc};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
@@ -396,7 +396,7 @@ impl DeployPoolCmd {
                     ))
                 })?;
                 let (pool_address, state_init) =
-                    NominatorWrapperImpl::calculate_address_and_state(-1, owner, &wallet_address)
+                    SingleNominatorWrapper::calculate_address_and_state(-1, owner, &wallet_address)
                         .map_err(set_err)?;
                 vec![(pool_address, state_init)]
             }

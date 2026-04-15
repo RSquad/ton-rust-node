@@ -12,7 +12,7 @@
 
 use super::{
     NominatorRoles, NominatorWrapper, PoolData, PoolKind, TONCORE_STORAGE_RESERVE,
-    ton_core_nominator::{NominatorPoolWrapperImpl, toncore_pool_address_and_state},
+    ton_core_nominator::{TonCoreNominatorWrapper, toncore_pool_address_and_state},
 };
 use crate::{ContractProvider, SmartContract};
 use anyhow::Context;
@@ -49,7 +49,7 @@ impl TonCoreNominatorRouter {
     pub fn new(provider: Arc<dyn ContractProvider>, pools: [Option<MsgAddressInt>; 2]) -> Self {
         let pools: [Option<Arc<dyn NominatorWrapper>>; 2] = pools.map(|addr| {
             addr.map(|addr| {
-                Arc::new(NominatorPoolWrapperImpl::new(provider.clone(), addr))
+                Arc::new(TonCoreNominatorWrapper::new(provider.clone(), addr))
                     as Arc<dyn NominatorWrapper>
             })
         });
@@ -66,7 +66,7 @@ impl TonCoreNominatorRouter {
                 return Ok(None);
             };
             let (addr, si) = toncore_pool_address_and_state(&init_params, validator_address)?;
-            Ok(Some(Arc::new(NominatorPoolWrapperImpl::new_with_state_init(
+            Ok(Some(Arc::new(TonCoreNominatorWrapper::new_with_state_init(
                 provider.clone(),
                 addr,
                 si,

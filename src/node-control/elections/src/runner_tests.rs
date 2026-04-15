@@ -184,16 +184,16 @@ mock! {
 // ---- Mock: NominatorWrapper ----
 
 mock! {
-    NominatorWrapperImpl {}
+    SingleNominatorWrapper {}
 
     #[async_trait::async_trait]
-    impl contracts::SmartContract for NominatorWrapperImpl {
+    impl contracts::SmartContract for SingleNominatorWrapper {
         async fn balance(&self) -> anyhow::Result<u64>;
         async fn address(&self) -> anyhow::Result<MsgAddressInt>;
     }
 
     #[async_trait::async_trait]
-    impl NominatorWrapper for NominatorWrapperImpl {
+    impl NominatorWrapper for SingleNominatorWrapper {
         async fn get_roles(&self) -> anyhow::Result<NominatorRoles>;
         async fn get_pool_data(&self) -> anyhow::Result<PoolData>;
         fn state_init(&self) -> Option<ton_block::StateInit>;
@@ -350,8 +350,8 @@ struct TestHarness {
     elector_mock: MockElectorWrapperImpl,
     provider_mock: MockElectionsProviderImpl,
     wallet_mock: MockTonWalletImpl,
-    pool_mock: Option<MockNominatorWrapperImpl>,
-    toncore_nominator_mocks: Option<(MockNominatorWrapperImpl, MockNominatorWrapperImpl)>,
+    pool_mock: Option<MockSingleNominatorWrapper>,
+    toncore_nominator_mocks: Option<(MockSingleNominatorWrapper, MockSingleNominatorWrapper)>,
     elections_config: ElectionsConfig,
     bindings: HashMap<String, NodeBinding>,
 }
@@ -377,13 +377,13 @@ impl TestHarness {
     }
 
     fn with_pool(mut self) -> Self {
-        self.pool_mock = Some(MockNominatorWrapperImpl::new());
+        self.pool_mock = Some(MockSingleNominatorWrapper::new());
         self
     }
 
     fn with_toncore_nominator_pair(mut self) -> Self {
         self.toncore_nominator_mocks =
-            Some((MockNominatorWrapperImpl::new(), MockNominatorWrapperImpl::new()));
+            Some((MockSingleNominatorWrapper::new(), MockSingleNominatorWrapper::new()));
         self
     }
 
@@ -545,7 +545,7 @@ fn setup_default_provider_without_account(
     provider.expect_shutdown().returning(|| Ok(()));
 }
 
-fn setup_pool(pool: &mut MockNominatorWrapperImpl) {
+fn setup_pool(pool: &mut MockSingleNominatorWrapper) {
     pool.expect_address().returning(|| Ok(pool_address()));
     pool.expect_inner_pools().returning(|| vec![]);
     pool.expect_storage_reserve().returning(|| SNP_STORAGE_RESERVE);
@@ -557,7 +557,7 @@ fn pool_data_with_state(state: i32) -> PoolData {
 }
 
 fn setup_toncore_nominator_slot(
-    pool: &mut MockNominatorWrapperImpl,
+    pool: &mut MockSingleNominatorWrapper,
     addr: MsgAddressInt,
     state: i32,
 ) {
@@ -580,7 +580,7 @@ async fn test_participate_new_key_no_pool() {
     setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
     setup_wallet(&mut harness.wallet_mock);
     let expected_stake =
-        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - SNP_STORAGE_RESERVE) / 2;
+        (WALLET_BALANCE - (ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE) - WALLET_STORAGE_RESERVE) / 2;
     // validate the election bid payload
     harness
         .wallet_mock
@@ -621,7 +621,7 @@ async fn test_participate_new_key_with_pool() {
     setup_wallet(&mut harness.wallet_mock);
     setup_pool(harness.pool_mock.as_mut().unwrap());
 
-    let expected_stake = (POOL_BALANCE - SNP_STORAGE_RESERVE) / 2;
+    let expected_stake = (POOL_BALANCE - SNP_STORAGE_RESERVE - EXTRA_STORAGE_FEES) / 2;
     // validate the election bid payload
     harness
         .wallet_mock
@@ -1558,11 +1558,8 @@ async fn test_split50_stake_calculation() {
     assert!(node.participant.is_some());
     let p = node.participant.as_ref().unwrap();
 
-    // With Split50: stake = max(total_balance / 2, min_stake)
-    // total_balance = frozen_stake(0) + pool_free_balance + elections_stake(0)
-    // pool_free_balance = WALLET_BALANCE - gas_fee - SNP_STORAGE_RESERVE
     let gas_fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
-    let pool_free_balance = WALLET_BALANCE - gas_fee - SNP_STORAGE_RESERVE;
+    let pool_free_balance = WALLET_BALANCE - gas_fee - WALLET_STORAGE_RESERVE;
     let expected = (pool_free_balance / 2).max(MIN_STAKE);
     assert_eq!(
         p.stake, expected,
@@ -2222,7 +2219,7 @@ async fn test_adaptive_topup_three_ticks() {
     let wallet_addr = addr_bytes(&wallet_address());
 
     let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
-    let pool_free_balance = wallet_balance - fee - SNP_STORAGE_RESERVE;
+    let pool_free_balance = wallet_balance - fee - WALLET_STORAGE_RESERVE;
     let initial_stake = pool_free_balance / 2; // stake half on tick 1
 
     // --- Helper: build participants with given stakes ---
@@ -2426,7 +2423,7 @@ async fn test_adaptive_topup_three_ticks() {
     // Remaining wallet ≈ 50k, current_stake ≈ 50k in elector.
     // total ≈ 100k, half ≈ 50k < min_eff (~60k) → stake all remaining.
     let remaining_balance = wallet_balance - initial_stake - fee;
-    let pool_free_tick3 = remaining_balance - fee - SNP_STORAGE_RESERVE;
+    let pool_free_tick3 = remaining_balance - fee - WALLET_STORAGE_RESERVE;
     assert!(
         tick3_stake > tick2_stake,
         "tick 3: stake should increase via top-up: tick2={}, tick3={}",
@@ -2660,7 +2657,7 @@ async fn test_toncore_nominator_selects_free_pool() {
     setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
 
     // TONCore nominator pair + split50: stake entire liquid balance of the active (free) pool.
-    let expected_stake = POOL_BALANCE - TONCORE_STORAGE_RESERVE;
+    let expected_stake = POOL_BALANCE - TONCORE_STORAGE_RESERVE - EXTRA_STORAGE_FEES;
     harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
 
     let mut runner = harness.build(node_id).await;

@@ -14,7 +14,7 @@ use common::{
     ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
-use contracts::{NominatorWrapperImpl, WalletContract, contract_provider, resolve_toncore_pool};
+use contracts::{SingleNominatorWrapper, WalletContract, contract_provider, resolve_toncore_pool};
 use secrets_vault::{
     errors::error::VaultError, types::secret::Secret, vault::SecretVault,
     vault_builder::SecretVaultBuilder,
@@ -65,7 +65,7 @@ pub fn resolve_pool_address_from_config(
             (None, Some(owner)) => {
                 let owner_addr =
                     owner.parse::<MsgAddressInt>().context("invalid pool owner address")?;
-                NominatorWrapperImpl::calculate_address(-1, &owner_addr, validator_addr)
+                SingleNominatorWrapper::calculate_address(-1, &owner_addr, validator_addr)
             }
             (None, None) => anyhow::bail!("Pool has neither address nor owner configured"),
         },

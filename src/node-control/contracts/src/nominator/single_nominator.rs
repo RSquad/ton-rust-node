@@ -23,13 +23,13 @@ pub const NOMINATOR_POOL_WORKCHAIN: i32 = -1;
 /// Implementation of the single-nominator contract wrapper
 ///
 /// See: https://github.com/ton-blockchain/single-nominator
-pub struct NominatorWrapperImpl {
+pub struct SingleNominatorWrapper {
     provider: Arc<dyn ContractProvider>,
     nominator_addr: MsgAddressInt,
     state_init: Option<StateInit>,
 }
 
-impl NominatorWrapperImpl {
+impl SingleNominatorWrapper {
     pub fn new(provider: Arc<dyn ContractProvider>, nominator_addr: MsgAddressInt) -> Self {
         Self { provider, nominator_addr, state_init: None }
     }
@@ -82,7 +82,7 @@ impl NominatorWrapperImpl {
 }
 
 #[async_trait::async_trait]
-impl SmartContract for NominatorWrapperImpl {
+impl SmartContract for SingleNominatorWrapper {
     async fn balance(&self) -> anyhow::Result<u64> {
         self.provider.balance(&self.nominator_addr).await
     }
@@ -93,7 +93,7 @@ impl SmartContract for NominatorWrapperImpl {
 }
 
 #[async_trait::async_trait]
-impl NominatorWrapper for NominatorWrapperImpl {
+impl NominatorWrapper for SingleNominatorWrapper {
     fn pool_kind(&self) -> PoolKind {
         PoolKind::SNP
     }
@@ -108,7 +108,7 @@ impl NominatorWrapper for NominatorWrapperImpl {
 
     fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
         // Preserve state_init so contracts_task deploy sends code+data, not a plain transfer.
-        vec![Arc::new(NominatorWrapperImpl {
+        vec![Arc::new(SingleNominatorWrapper {
             provider: self.provider.clone(),
             nominator_addr: self.nominator_addr.clone(),
             state_init: self.state_init.clone(),
@@ -192,7 +192,7 @@ mod tests {
     use ton_block::MsgAddressInt;
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
-    fn open_nominator() -> Option<NominatorWrapperImpl> {
+    fn open_nominator() -> Option<SingleNominatorWrapper> {
         let nominator_addr =
             MsgAddressInt::from_str("kf-d42Dwn_dzfdwlV_aEeX7WWnJ-bBU_eZp6CfKoMb4vQ3t0")
                 .expect("Failed to parse nominator address");
@@ -205,7 +205,7 @@ mod tests {
         };
 
         let client = ClientJsonRpc::connect(url, None).expect("Failed to connect to Ton network");
-        Some(NominatorWrapperImpl::new(contract_provider!(Arc::new(client)), nominator_addr))
+        Some(SingleNominatorWrapper::new(contract_provider!(Arc::new(client)), nominator_addr))
     }
 
     #[tokio::test]

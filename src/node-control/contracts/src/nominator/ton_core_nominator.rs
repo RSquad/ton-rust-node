@@ -14,8 +14,7 @@ use crate::{
 };
 use anyhow::Context;
 use common::app_config::{
-    DEFAULT_TONCORE_MAX_NOMINATORS, DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
-    DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, TonCoreInitParams,
+    TonCoreInitParams,
 };
 use std::sync::Arc;
 use ton_block::{
@@ -30,21 +29,6 @@ const CODE: &str = "b5ee9c7201023a010009c2000114ff00f4a413f4bcf2c80b010201620203
 
 /// Pool is always deployed in the masterchain.
 pub const POOL_WORKCHAIN: i32 = -1;
-
-/// Resolve deploy parameters for address derivation and `StateInit`
-/// (defaults from [`common::app_config`]).
-#[must_use]
-pub fn resolve_deploy_pool_params(
-    max_nominators: Option<u16>,
-    min_validator_stake: Option<u64>,
-    min_nominator_stake: Option<u64>,
-) -> (u16, u64, u64) {
-    (
-        max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
-        min_validator_stake.unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE),
-        min_nominator_stake.unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
-    )
-}
 
 fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Result<MsgAddressInt> {
     let cell = state_init.write_to_new_cell()?.into_cell()?;
@@ -61,7 +45,7 @@ fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Resul
 /// stake_at:32 saved_validator_set_hash:256 validator_set_changes_count:8
 /// validator_set_change_time:32 stake_held_for:32 config_proposal_votings:dict
 /// ```
-pub fn build_toncore_pool_state_init(
+fn build_toncore_pool_state_init(
     validator_address: &MsgAddressInt,
     params: &TonCoreInitParams,
 ) -> anyhow::Result<StateInit> {
@@ -96,7 +80,7 @@ pub fn build_toncore_pool_state_init(
 }
 
 /// Derive masterchain pool address and `StateInit` from deployment parameters.
-pub fn toncore_pool_address_and_state(
+pub(crate) fn toncore_pool_address_and_state(
     ton_core_init_params: &TonCoreInitParams,
     validator_address: &MsgAddressInt,
 ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
@@ -132,13 +116,13 @@ pub fn resolve_toncore_pool(
     Ok(ResolvedTonCorePool { params, address, state_init })
 }
 
-pub struct NominatorPoolWrapperImpl {
+pub struct TonCoreNominatorWrapper {
     provider: Arc<dyn ContractProvider>,
     pool_addr: MsgAddressInt,
     state_init: Option<StateInit>,
 }
 
-impl NominatorPoolWrapperImpl {
+impl TonCoreNominatorWrapper {
     pub fn new(provider: Arc<dyn ContractProvider>, pool_addr: MsgAddressInt) -> Self {
         Self { provider, pool_addr, state_init: None }
     }
@@ -170,7 +154,7 @@ impl NominatorPoolWrapperImpl {
 }
 
 #[async_trait::async_trait]
-impl SmartContract for NominatorPoolWrapperImpl {
+impl SmartContract for TonCoreNominatorWrapper {
     async fn balance(&self) -> anyhow::Result<u64> {
         self.provider.balance(&self.pool_addr).await
     }
@@ -181,7 +165,7 @@ impl SmartContract for NominatorPoolWrapperImpl {
 }
 
 #[async_trait::async_trait]
-impl NominatorWrapper for NominatorPoolWrapperImpl {
+impl NominatorWrapper for TonCoreNominatorWrapper {
     fn pool_kind(&self) -> PoolKind {
         PoolKind::TONCore
     }
@@ -268,7 +252,7 @@ mod tests {
     use ton_block::MsgAddressInt;
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
-    fn open_pool() -> Option<NominatorPoolWrapperImpl> {
+    fn open_pool() -> Option<TonCoreNominatorWrapper> {
         let pool_addr = MsgAddressInt::from_str("kf-d42Dwn_dzfdwlV_aEeX7WWnJ-bBU_eZp6CfKoMb4vQ3t0")
             .expect("Failed to parse pool address");
         let url = match std::env::var("TON_HTTP_API_URL") {
@@ -280,7 +264,7 @@ mod tests {
         };
 
         let client = ClientJsonRpc::connect(url, None).expect("Failed to connect to TON network");
-        Some(NominatorPoolWrapperImpl::new(contract_provider!(Arc::new(client)), pool_addr))
+        Some(TonCoreNominatorWrapper::new(contract_provider!(Arc::new(client)), pool_addr))
     }
 
     #[tokio::test]

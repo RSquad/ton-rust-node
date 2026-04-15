@@ -14,7 +14,7 @@ use common::{
     vault_signer::VaultSigner,
 };
 use contracts::{
-    NominatorPoolWrapperImpl, NominatorWrapper, NominatorWrapperImpl, TonCoreNominatorRouter,
+    TonCoreNominatorWrapper, NominatorWrapper, SingleNominatorWrapper, TonCoreNominatorRouter,
     TonWallet, WalletContract, contract_provider,
 };
 use secrets_vault::{
@@ -563,14 +563,14 @@ fn open_nominator_pool(
                         .context(format!("invalid pool address: {}", address))?;
                     let owner_addr = MsgAddressInt::from_str(owner)
                         .context(format!("invalid pool owner address: {}", owner))?;
-                    let pool = NominatorWrapperImpl::from_init_data(
+                    let pool = SingleNominatorWrapper::from_init_data(
                         contract_provider!(rpc_client.clone()),
                         &owner_addr,
                         validator_addr,
                         -1,
                     )?;
                     let calculated_addr =
-                        NominatorWrapperImpl::calculate_address(-1, &owner_addr, validator_addr)?;
+                        SingleNominatorWrapper::calculate_address(-1, &owner_addr, validator_addr)?;
                     if calculated_addr != addr {
                         anyhow::bail!(
                             "calculated pool address does not match the defined address: defined={}, calculated={}",
@@ -583,7 +583,7 @@ fn open_nominator_pool(
                 (None, Some(owner)) => {
                     let owner_addr = MsgAddressInt::from_str(owner)
                         .context(format!("invalid pool owner address: {}", owner))?;
-                    NominatorWrapperImpl::from_init_data(
+                    SingleNominatorWrapper::from_init_data(
                         contract_provider!(rpc_client.clone()),
                         &owner_addr,
                         validator_addr,
@@ -593,7 +593,7 @@ fn open_nominator_pool(
                 (Some(address), None) => {
                     let addr = MsgAddressInt::from_str(address)
                         .context(format!("invalid pool address: {}", address))?;
-                    NominatorWrapperImpl::new(contract_provider!(rpc_client.clone()), addr)
+                    SingleNominatorWrapper::new(contract_provider!(rpc_client.clone()), addr)
                 }
                 (None, None) => {
                     anyhow::bail!("pool has neither address nor owner configured");
@@ -611,14 +611,14 @@ fn open_nominator_pool(
                     (Some(addr_str), None) => {
                         let addr = MsgAddressInt::from_str(addr_str)
                             .context(format!("invalid TONCore pool address: {addr_str}"))?;
-                        Ok(Some(Arc::new(NominatorPoolWrapperImpl::new(provider.clone(), addr))
+                        Ok(Some(Arc::new(TonCoreNominatorWrapper::new(provider.clone(), addr))
                             as Arc<dyn NominatorWrapper>))
                     }
                     (_, Some(params)) => {
                         if let Some(addr_str) = &cfg.address {
                             let explicit = MsgAddressInt::from_str(addr_str)
                                 .context(format!("invalid TONCore pool address: {addr_str}"))?;
-                            let derived = NominatorPoolWrapperImpl::calculate_address(
+                            let derived = TonCoreNominatorWrapper::calculate_address(
                                 validator_addr,
                                 params,
                             )?;
@@ -629,7 +629,7 @@ fn open_nominator_pool(
                                 derived
                             );
                         }
-                        Ok(Some(Arc::new(NominatorPoolWrapperImpl::from_init_data(
+                        Ok(Some(Arc::new(TonCoreNominatorWrapper::from_init_data(
                             provider.clone(),
                             validator_addr,
                             params,
