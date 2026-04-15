@@ -1934,6 +1934,8 @@ When a pool is present in the binding configuration:
 
 Each binding resolves its effective stake policy by checking for a per-node override first (`policy_overrides`); if none is set, the default `policy` is used. This allows running nodes with different stake strategies under a single configuration.
 
+> **TONCore nominator caveat.** `Split50` and `AdaptiveSplit50` are ignored on bindings backed by a TONCore nominator — the two pools stake in different rounds, so there is nothing to split. The runner stakes the full liquid balance of the selected pool instead (still floored at `min_stake`). Use `Fixed` or `Minimum` if you need to cap per-round exposure on TONCore.
+
 ### Logging
 
 Configure logging output and level in the config file (`log` section). Override the log level temporarily via environment variable:
