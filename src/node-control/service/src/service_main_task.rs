@@ -105,11 +105,14 @@ pub async fn run_with_config(
         let _ = tasks.get("voting").expect("voting task").enable().await;
     }
 
+    let config_changed = Arc::new(tokio::sync::Notify::new());
+
     let http_task_handle = tokio::spawn(http_server_task::run(
         cancellation_ctx.clone(),
         store.clone(),
         runtime_cfg.clone(),
         tasks.clone(),
+        config_changed.clone(),
     ));
 
     let max_wait = std::time::Duration::from_secs(10);
@@ -121,10 +124,27 @@ pub async fn run_with_config(
 
         tokio::select! {
             _ = &mut timeout => {
-                // Reload config from file if changed
+                // Reload config from file if changed externally
                 if runtime_cfg.reload_from_file().await {
                     for task in tasks.values() {
                         let _ = task.restart().await;
+                    }
+                }
+            }
+            _ = config_changed.notified() => {
+                // REST mutation changed structural config — rebuild caches.
+                // Only restart tasks if caches are consistent; otherwise tasks
+                // keep running against the previous caches.
+                match runtime_cfg.force_reload().await {
+                    Ok(()) => {
+                        for task in tasks.values() {
+                            let _ = task.restart().await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "cache rebuild after config mutation failed; skipping task restart: {e:#}"
+                        );
                     }
                 }
             }

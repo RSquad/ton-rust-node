@@ -330,6 +330,15 @@ impl RuntimeConfigStore {
         Ok(())
     }
 
+    /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
+    /// from the current in-memory config. Does not read from disk.
+    ///
+    /// Use after REST mutations that change structural config (entities, endpoints).
+    pub async fn force_reload(&self) -> anyhow::Result<()> {
+        let config = (*self.get()).clone();
+        self.reload(config).await
+    }
+
     /// Reload config from the file if it has changed externally.
     pub async fn reload_from_file(&self) -> bool {
         let current_hash = Self::hash_file(&Path::new(&self.config_path));

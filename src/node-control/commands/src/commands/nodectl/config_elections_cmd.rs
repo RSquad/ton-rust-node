@@ -8,17 +8,14 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{
-        api_get, fetch_network_max_factor, require_config, resolve_service_url, save_config,
-        try_create_rpc_client,
-    },
+    utils::{api_get, api_post, resolve_service_url},
 };
 use colored::Colorize;
 use common::{
-    app_config::{AppConfig, BindingStatus, ElectionsConfig, StakePolicy},
+    app_config::{BindingStatus, StakePolicy},
     ton_utils::tons_f64_to_nanotons,
 };
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage elections configuration")]
@@ -104,11 +101,11 @@ impl ElectionsCfgCmd {
     ) -> anyhow::Result<()> {
         match &self.action {
             ElectionsAction::Show(cmd) => cmd.run(url, token, config_path).await,
-            ElectionsAction::StakePolicy(cmd) => cmd.run(require_config(config_path)?).await,
-            ElectionsAction::TickInterval(cmd) => cmd.run(require_config(config_path)?).await,
-            ElectionsAction::MaxFactor(cmd) => cmd.run(require_config(config_path)?).await,
-            ElectionsAction::Enable(cmd) => cmd.run(require_config(config_path)?).await,
-            ElectionsAction::Disable(cmd) => cmd.run(require_config(config_path)?).await,
+            ElectionsAction::StakePolicy(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::TickInterval(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::MaxFactor(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::Enable(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::Disable(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
@@ -189,27 +186,43 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
     println!();
 }
 
+/// Shared body for `POST /v1/elections/settings` — all fields optional.
+#[derive(Default, serde::Serialize)]
+struct ElectionsSettingsBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<StakePolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tick_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_factor: Option<f32>,
+}
+
+const ELECTIONS_SETTINGS_PATH: &str = "/v1/elections/settings";
+
 impl StakePolicySetCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
 
         if self.reset {
-            let node_id = self
-                .node
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("--reset requires --node <NODE>"))?;
-            config
-                .elections
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?
-                .policy_overrides
-                .remove(node_id);
-            save_config(&config, path)?;
+            let body = ElectionsSettingsBody {
+                node: self.node.clone(),
+                reset: true,
+                ..Default::default()
+            };
+            api_post(&base_url, ELECTIONS_SETTINGS_PATH, token, &body).await?;
             println!(
-                "{} Per-node override for '{}' removed. Default policy: {}",
+                "{} Per-node override for '{}' removed",
                 "OK".green().bold(),
-                node_id,
-                config.elections.as_ref().map(|e| e.policy.to_string()).unwrap_or_default()
+                self.node.as_deref().unwrap_or("?"),
             );
             return Ok(());
         }
@@ -228,20 +241,12 @@ impl StakePolicySetCmd {
             );
         };
 
-        if let Some(elections) = &mut config.elections {
-            if let Some(node_id) = &self.node {
-                elections.policy_overrides.insert(node_id.clone(), policy.clone());
-            } else {
-                elections.policy = policy.clone();
-            }
-        } else if self.node.is_some() {
-            anyhow::bail!("Elections are not configured. Set a default policy first.");
-        } else {
-            config.elections =
-                Some(ElectionsConfig { policy: policy.clone(), ..Default::default() });
-        }
-
-        save_config(&config, path)?;
+        let body = ElectionsSettingsBody {
+            policy: Some(policy.clone()),
+            node: self.node.clone(),
+            ..Default::default()
+        };
+        api_post(&base_url, ELECTIONS_SETTINGS_PATH, token, &body).await?;
 
         let scope = match &self.node {
             Some(n) => format!("node '{}'", n),
@@ -253,67 +258,80 @@ impl StakePolicySetCmd {
 }
 
 impl TickIntervalCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-        config
-            .elections
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?
-            .tick_interval = self.seconds;
-        save_config(&config, path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_post(
+            &base_url,
+            ELECTIONS_SETTINGS_PATH,
+            token,
+            &ElectionsSettingsBody { tick_interval: Some(self.seconds), ..Default::default() },
+        )
+        .await?;
         println!("{} Tick interval set to {} seconds", "OK".green().bold(), self.seconds);
         Ok(())
     }
 }
 
 impl MaxFactorCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-        config.elections.as_ref().ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?;
-
-        let rpc_client = try_create_rpc_client(&config).await?;
-        let network_max_factor = fetch_network_max_factor(&rpc_client).await?;
-        let elections = config
-            .elections
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Elections are not configured"))?;
-        elections.max_factor = self.value;
-        elections.validate(Some(network_max_factor))?;
-        save_config(&config, path)?;
-        println!("{} Max factor set to {}", "OK".green().bold(), self.value);
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let resp = api_post(
+            &base_url,
+            ELECTIONS_SETTINGS_PATH,
+            token,
+            &ElectionsSettingsBody { max_factor: Some(self.value), ..Default::default() },
+        )
+        .await?;
+        let parsed: serde_json::Value = serde_json::from_str(&resp)?;
+        let max_factor = parsed["result"]["max_factor"].as_f64();
+        match max_factor {
+            Some(v) => println!("{} Max factor set to {v}", "OK".green().bold()),
+            None => println!("{} Max factor set to {}", "OK".green().bold(), self.value),
+        }
         Ok(())
     }
 }
 
-impl EnableCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
+#[derive(serde::Serialize)]
+struct NodeListBody<'a> {
+    nodes: &'a [String],
+}
 
-        for node_id in &self.nodes {
-            let binding = config
-                .bindings
-                .get_mut(node_id)
-                .ok_or_else(|| anyhow::anyhow!("Binding for node '{}' not found", node_id))?;
-            binding.enable = true;
-        }
-        save_config(&config, path)?;
+impl EnableCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_post(&base_url, "/v1/elections/include", token, &NodeListBody { nodes: &self.nodes })
+            .await?;
         println!("{} Elections enabled for: {}", "OK".green().bold(), self.nodes.join(", "));
         Ok(())
     }
 }
 
 impl DisableCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        for node_id in &self.nodes {
-            let binding = config
-                .bindings
-                .get_mut(node_id)
-                .ok_or_else(|| anyhow::anyhow!("Binding for node '{}' not found", node_id))?;
-            binding.enable = false;
-        }
-        save_config(&config, path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_post(&base_url, "/v1/elections/exclude", token, &NodeListBody { nodes: &self.nodes })
+            .await?;
         println!("{} Elections disabled for: {}", "OK".green().bold(), self.nodes.join(", "));
         Ok(())
     }

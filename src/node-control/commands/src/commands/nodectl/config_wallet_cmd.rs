@@ -11,7 +11,7 @@ use crate::commands::nodectl::{
     utils::{
         SEND_TIMEOUT, api_delete, api_get, api_post, fetch_network_max_factor, get_wallet_config,
         load_config_vault_rpc_client, make_wallet, require_config, resolve_service_url,
-        wait_for_seqno_change, wallet_info, warn_missing_secret,
+        vault_secret_missing, wait_for_seqno_change, wallet_info, warn_missing_secret,
     },
 };
 use anyhow::Context;
@@ -28,7 +28,6 @@ use contracts::{
     nominator,
 };
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
-use secrets_vault::vault_builder::SecretVaultBuilder;
 use std::{io::Write, path::Path};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
@@ -182,14 +181,6 @@ impl WalletAddCmd {
         }
         println!("\n{} Wallet '{}' added\n", "OK".green().bold(), self.name);
         Ok(())
-    }
-}
-
-/// Best-effort vault check; returns true only if vault is reachable and the secret is absent.
-async fn vault_secret_missing(secret_name: &str) -> bool {
-    match SecretVaultBuilder::from_env().await {
-        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
-        Err(_) => false,
     }
 }
 

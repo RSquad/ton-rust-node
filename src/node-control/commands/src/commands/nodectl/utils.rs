@@ -269,7 +269,7 @@ pub(crate) fn normalize_base_url(url: &str) -> String {
     if !base.starts_with("http://") && !base.starts_with("https://") {
         base = format!("http://{}", base);
     }
-    base
+    base.trim_end_matches('/').to_string()
 }
 
 /// Sends a GET request to the service API and returns the response body.
@@ -330,6 +330,16 @@ where
     Ok(body)
 }
 
+/// Best-effort check that returns `true` only if we could reach the local vault
+/// AND the secret is definitely absent. Any other outcome (no vault, lookup
+/// error) is treated as "unknown" and produces no warning.
+pub async fn vault_secret_missing(secret_name: &str) -> bool {
+    match SecretVaultBuilder::from_env().await {
+        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +396,11 @@ mod tests {
             "http://example.com:8080/api/v1"
         );
         assert_eq!(normalize_base_url("example.com/path"), "http://example.com/path");
+    }
+
+    #[test]
+    fn test_normalize_base_url_trims_trailing_slash() {
+        assert_eq!(normalize_base_url("http://example.com:8080/"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1/"), "http://127.0.0.1");
     }
 }
