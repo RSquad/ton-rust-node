@@ -452,7 +452,7 @@ impl ElectionRunner {
                 );
             }
             // Cache pool address for each node:
-            // for TONCore pool getting address is a network RPC call, 
+            // for TONCore pool getting address is a network RPC call,
             //for SNP pool - its a simple getter.
             for (node_id, node) in self.nodes.iter_mut() {
                 node.pool_addr_cache = if let Some(p) = &node.pool {
@@ -1033,7 +1033,7 @@ impl ElectionRunner {
         }
 
         // IMPORTANT: split50/AdaptiveSplit50 policy is supported only for SNP nominator pools.
-        // Details: TONCore nominator has two different pools, each pool stakes in its own round, 
+        // Details: TONCore nominator has two different pools, each pool stakes in its own round,
         // they cannot stake in same round, so split50/AdaptiveSplit50 cannot be used; instead stake the full
         // liquid balance of the selected pool (still >= min_stake).
         if matches!(&node.stake_policy, StakePolicy::Split50 | StakePolicy::AdaptiveSplit50)

@@ -458,15 +458,15 @@ pub async fn v1_pools_handler(
 
     let mut views = Vec::new();
     for (name, pool_cfg) in &config.pools {
+        // If Pool is bound to a node — use pre-loaded pool instance.
+        //First, get the name of the node that is bound to the pool.
+        let bound_node = config
+            .bindings
+            .iter()
+            .find(|(_, b)| b.pool == Some(name.clone()))
+            .map(|(node, _)| node.clone());
         let (kind, address, balance, owner, addresses, validator_share) = match pool_cfg {
             PoolConfig::SNP { address, owner } => {
-                // If Pool is bound to a node — use pre-loaded pool instance.
-                //First, get the name of the node that is bound to the pool.
-                let bound_node = config
-                    .bindings
-                    .iter()
-                    .find(|(_, b)| b.pool == Some(name.clone()))
-                    .map(|(node, _)| node.clone());
                 let (addr, bal) = if let Some(n) = bound_node {
                     // Pool is bound to a node - get the pool instance from the cached pools.
                     if let Some(pool) = cached_pools.get(&n) {
