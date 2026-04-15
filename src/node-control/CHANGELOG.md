@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **master_wallet duplication / deletion** — reserved the logical name `master_wallet` so it cannot collide with a regular wallet entry.
+- **next elections range in `/v1/elections` response** - fixed calculation of next elections range in `/v1/elections` response.
 
 ## [0.3.0] - 2026-03-24
 
