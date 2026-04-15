@@ -215,20 +215,27 @@ struct SnapshotCache {
 impl SnapshotCache {
     fn update_next_elections_range(&mut self, cfg15: &ConfigParam15) {
         if let Some(vset) = &self.last_validator_set {
-            let next_elections_start = if time_format::now()
-                > vset.utime_until().saturating_sub(cfg15.elections_start_before) as u64
-            {
-                vset.utime_until().saturating_add(cfg15.elections_start_before)
+            let now = time_format::now();
+            let elections_start_before = cfg15.elections_start_before as u64;
+            let elections_end_before = cfg15.elections_end_before as u64;
+            let validators_elected_for = cfg15.validators_elected_for as u64;
+            // utime_until of the current validator set == election_id of the next cycle.
+            let current_cycle_end = vset.utime_until() as u64;
+            let upcoming_elections_end = current_cycle_end.saturating_sub(elections_end_before);
+            // If the upcoming cycle's elections window has already closed, advance to the
+            // cycle after that.
+            let next_cycle_election_id = if now >= upcoming_elections_end {
+                current_cycle_end.saturating_add(validators_elected_for)
             } else {
-                vset.utime_since().saturating_add(cfg15.elections_start_before)
+                current_cycle_end
             };
-            let next_elections_end = next_elections_start
-                .saturating_add(cfg15.elections_start_before + cfg15.elections_end_before);
+            let start = next_cycle_election_id.saturating_sub(elections_start_before);
+            let end = next_cycle_election_id.saturating_sub(elections_end_before);
             self.next_elections_range = Some(TimeRange {
-                start: next_elections_start as u64,
-                start_utc: time_format::format_ts(next_elections_start as u64),
-                end: next_elections_end as u64,
-                end_utc: time_format::format_ts(next_elections_end as u64),
+                start,
+                start_utc: time_format::format_ts(start),
+                end,
+                end_utc: time_format::format_ts(end),
             });
         }
     }
