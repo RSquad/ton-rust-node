@@ -122,7 +122,8 @@ struct Node {
 }
 
 impl Node {
-    /// Raw address bytes used for elector queries (pool cache when available, else wallet).
+    /// Get theaddress from which the stake will be sent to elector: pool or wallet.
+    /// Note: only raw address bytes are returned (without workchain ID).
     async fn stake_addr(&self) -> anyhow::Result<Vec<u8>> {
         Ok(match &self.pool_addr_cache {
             Some(addr) => addr.address().storage().to_vec(),
@@ -450,8 +451,9 @@ impl ElectionRunner {
                     nanotons_to_tons_f64(prev)
                 );
             }
-            // Cache pool address for each node: for ton core pool its a
-            // network RPC call, for SNP pool its a cached address.
+            // Cache pool address for each node:
+            // for TONCore pool getting address is a network RPC call, 
+            //for SNP pool - its a simple getter.
             for (node_id, node) in self.nodes.iter_mut() {
                 node.pool_addr_cache = if let Some(p) = &node.pool {
                     Some(
@@ -1030,12 +1032,14 @@ impl ElectionRunner {
             );
         }
 
-        // TONCore nominator: two pools alternate rounds — reserve is the *other* pool.
-        // Split50/AdaptiveSplit50 would halve (frozen + pool + elections) and under-stake the
-        // active pool; instead stake the full liquid balance of the selected pool (still >= min_stake).
+        // IMPORTANT: split50/AdaptiveSplit50 policy is supported only for SNP nominator pools.
+        // Details: TONCore nominator has two different pools, each pool stakes in its own round, 
+        // they cannot stake in same round, so split50/AdaptiveSplit50 cannot be used; instead stake the full
+        // liquid balance of the selected pool (still >= min_stake).
         if matches!(&node.stake_policy, StakePolicy::Split50 | StakePolicy::AdaptiveSplit50)
             && node.pool.as_ref().is_some_and(|p| p.pool_kind() == PoolKind::TONCore)
         {
+            // TONCore nominator: stake the full liquid balance of the selected pool.
             if pool_free_balance < min_stake {
                 anyhow::bail!(
                     "not enough funds: pool_available={} TON, min_stake={} TON",
@@ -1045,7 +1049,7 @@ impl ElectionRunner {
             }
 
             tracing::info!(
-                "node [{}] {}: ton core nominator pool: always stake all available balance",
+                "node [{}] {}: strategy is ignored for TONCore nominator: stake all available balance",
                 node.stake_policy.to_string(),
                 node_id
             );

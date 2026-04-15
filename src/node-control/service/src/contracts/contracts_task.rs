@@ -265,9 +265,7 @@ impl ContractsMonitor {
     async fn ensure_pools_deployed(&self, seqno: &mut i64) -> anyhow::Result<bool> {
         let mut all_deployed = true;
         for (node_id, pool_binding) in self.pools.iter() {
-            let inner = pool_binding.inner_pools();
-            let pools = if inner.is_empty() { vec![pool_binding.clone()] } else { inner };
-            for pool in pools {
+            for pool in pool_binding.inner_pools() {
                 match self.deploy_pool(node_id, pool, *seqno).await {
                     Ok(true) => (),
                     Ok(false) => {
@@ -439,7 +437,6 @@ impl ContractsMonitor {
         {
             for pool in pool_binding.inner_pools() {
                 let pool_addr = pool.address().await?;
-
                 let pool_data = match pool.get_pool_data().await {
                     Ok(d) => d,
                     Err(e) => {
