@@ -10,8 +10,8 @@ use super::{
     config_handlers::{
         BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
         ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
-        NodeDto, NodesResponse, PoolDto, PoolsResponse, WalletDto, WalletsResponse,
-        v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
+        NodeDto, NodesResponse, PoolDto, PoolsResponse, TonCorePoolSlotDto, WalletDto,
+        WalletsResponse, v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
         v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_wallets_handler,
     },
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
@@ -877,6 +877,7 @@ impl utoipa::Modify for BearerAuthAddon {
         WalletsResponse,
         PoolDto,
         PoolsResponse,
+        TonCorePoolSlotDto,
         BindingDto,
         BindingsResponse,
         super::config_handlers::NodeAddRequest,
