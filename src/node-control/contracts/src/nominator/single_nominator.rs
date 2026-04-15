@@ -107,10 +107,12 @@ impl NominatorWrapper for NominatorWrapperImpl {
     }
 
     fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
-        vec![
-            Arc::new(NominatorWrapperImpl::new(self.provider.clone(), self.nominator_addr.clone()))
-                as Arc<dyn NominatorWrapper>,
-        ]
+        // Preserve state_init so contracts_task deploy sends code+data, not a plain transfer.
+        vec![Arc::new(NominatorWrapperImpl {
+            provider: self.provider.clone(),
+            nominator_addr: self.nominator_addr.clone(),
+            state_init: self.state_init.clone(),
+        }) as Arc<dyn NominatorWrapper>]
     }
 
     async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {
