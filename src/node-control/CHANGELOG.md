@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-16
+
+### Added
+
+- **TONCore Nominator Pool support** — new pool kind `"core"` with two logical slots (`pools[0]`/`pools[1]`) for even/odd validation rounds. CLI: `config pool add core --even|--odd`, `config pool deposit-validator`, `config pool withdraw-validator`. Runtime routes stakes to the free pool via a dual-pool router and matches stake recovery across both inner pool addresses.
+- **Adaptive staking strategy (`adaptive_split50`)** — emulates the Elector's selection algorithm to estimate the minimum effective stake for the current round, then splits half when the remaining half is still competitive and stakes all otherwise. Adds `sleep_period_pct` / `waiting_period_pct` to the `elections` config. See `docs/staking-strategies.md`.
+- **Centralised config management through REST API** — all `config` mutations (entity CRUD, settings, logging, TON HTTP API) now flow through JWT-authenticated REST endpoints on the running service, with the CLI acting as a thin client. New endpoints:
+  - `POST|DELETE /v1/nodes`, `POST|DELETE /v1/wallets`, `POST|DELETE /v1/pools`, `POST|DELETE /v1/bindings`
+  - `POST /v1/elections/settings` (unified stake policy, per-node overrides, `tick_interval`, `max_factor`)
+  - `POST /v1/ton-http-api` (with `append` flag for failover endpoints)
+  - `POST /v1/log`
+  - `GET /v1/elections/settings`, `GET /v1/nodes`, `GET /v1/wallets`, `GET /v1/pools`, `GET /v1/bindings`, `GET /v1/log`, `GET /v1/master-wallet`
+- **Voting CLI (`nodectl vote`)** — `ls`, `inspect`, `add`, `rm` subcommands to view on-chain config proposals and manage the voting task's tracked-proposals list.
+- **Reserved `master_wallet` name** — `config wallet add` rejects the reserved name `master_wallet`, and `config wallet rm master_wallet` fails immediately with a clear error instead of attempting to mutate the master wallet slot.
+
+### Changed
+
+- **`max_factor` upper bound read from the network** — instead of the hardcoded `3.0`, nodectl now reads the limit from masterchain config param 17 (`max_stake_factor`).
+- **Unified elections settings endpoint** — `POST /v1/elections/settings` replaces the removed `/v1/stake_strategy`, `/v1/elections/tick-interval`, and `/v1/elections/max-factor`. Accepts any combination of `policy`, `node`, `reset`, `tick_interval`, `max_factor` in one request.
+- **Unified TON HTTP API endpoint** — `POST /v1/ton-http-api` replaces the separate `set`/`add` endpoints; pass `append: true` to keep existing URLs.
+
+### Breaking Changes
+
+- **Removed `POST /v1/stake_strategy`** — use `POST /v1/elections/settings` with `{"policy": ...}`.
+- **Removed `config stake-policy` top-level alias** — use `config elections stake-policy`.
+- **`config ton-http-api set --url` → `--endpoint`** — the flag was renamed (short form `-e`) to disambiguate from the root `--url` service-URL flag introduced for REST client commands. Update any scripts invoking `nodectl config ton-http-api --url ...`.
+- **Configuration mutations require a running service** — `config {node,wallet,pool,bind,elections,log,ton-http-api,master-wallet}` subcommands are now REST clients and need the service to be running with an operator user. Only `config generate` still writes to disk directly.
+
+### Fixed
+
+- **master_wallet duplication / deletion** — reserved the logical name `master_wallet` so it cannot collide with a regular wallet entry.
+- **next elections range in `/v1/elections` response** - fixed calculation of next elections range in `/v1/elections` response.
+
 ## [0.3.0] - 2026-03-24
 
 ### Added
