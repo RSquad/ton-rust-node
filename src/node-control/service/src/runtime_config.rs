@@ -271,22 +271,26 @@ impl RuntimeConfigStore {
     where
         F: FnOnce(&mut AppConfig),
     {
-        let _op = self.config_op.blocking_lock();
-        let mut guard =
-            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
-        let old = Arc::clone(&guard);
-        let mut cfg = (*old.config).clone();
-        f(&mut cfg);
-        *guard = Arc::new(RuntimeState {
-            config: Arc::new(cfg),
-            vault: old.vault.clone(),
-            pools: Arc::clone(&old.pools),
-            wallets: Arc::clone(&old.wallets),
-            rpc_client: Arc::clone(&old.rpc_client),
-            master_wallet: Arc::clone(&old.master_wallet),
-        });
-        self.updated_at.store(time_format::now(), Ordering::Relaxed);
-        Ok(())
+        // `config_op` is a tokio mutex; `blocking_lock` panics on runtime worker threads
+        // (e.g. axum handlers). `block_in_place` moves the task off the worker so blocking is safe.
+        tokio::task::block_in_place(|| {
+            let _op = self.config_op.blocking_lock();
+            let mut guard =
+                self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+            let old = Arc::clone(&guard);
+            let mut cfg = (*old.config).clone();
+            f(&mut cfg);
+            *guard = Arc::new(RuntimeState {
+                config: Arc::new(cfg),
+                vault: old.vault.clone(),
+                pools: Arc::clone(&old.pools),
+                wallets: Arc::clone(&old.wallets),
+                rpc_client: Arc::clone(&old.rpc_client),
+                master_wallet: Arc::clone(&old.master_wallet),
+            });
+            self.updated_at.store(time_format::now(), Ordering::Relaxed);
+            Ok(())
+        })
     }
 
     /// Serializes the given config and persists it to the config file if it
@@ -317,26 +321,28 @@ impl RuntimeConfigStore {
     where
         F: FnOnce(&mut AppConfig),
     {
-        let _op = self.config_op.blocking_lock();
-        let mut guard =
-            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
-        let old = Arc::clone(&guard);
-        let mut cfg = (*old.config).clone();
-        f(&mut cfg);
+        tokio::task::block_in_place(|| {
+            let _op = self.config_op.blocking_lock();
+            let mut guard =
+                self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+            let old = Arc::clone(&guard);
+            let mut cfg = (*old.config).clone();
+            f(&mut cfg);
 
-        // Persist first — if this fails, the in-memory state is not touched.
-        self.save_to_file(&cfg)?;
+            // Persist first — if this fails, the in-memory state is not touched.
+            self.save_to_file(&cfg)?;
 
-        *guard = Arc::new(RuntimeState {
-            config: Arc::new(cfg),
-            vault: old.vault.clone(),
-            pools: Arc::clone(&old.pools),
-            wallets: Arc::clone(&old.wallets),
-            rpc_client: Arc::clone(&old.rpc_client),
-            master_wallet: Arc::clone(&old.master_wallet),
-        });
-        self.updated_at.store(time_format::now(), Ordering::Relaxed);
-        Ok(())
+            *guard = Arc::new(RuntimeState {
+                config: Arc::new(cfg),
+                vault: old.vault.clone(),
+                pools: Arc::clone(&old.pools),
+                wallets: Arc::clone(&old.wallets),
+                rpc_client: Arc::clone(&old.rpc_client),
+                master_wallet: Arc::clone(&old.master_wallet),
+            });
+            self.updated_at.store(time_format::now(), Ordering::Relaxed);
+            Ok(())
+        })
     }
 
     /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
