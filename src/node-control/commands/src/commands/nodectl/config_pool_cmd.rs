@@ -281,6 +281,12 @@ impl PoolAddCoreCmd {
             anyhow::bail!("At least one of --address or --validator-share must be specified");
         }
 
+        if let Some(vs) = self.validator_share {
+            if !(0..=10_000).contains(&vs) {
+                anyhow::bail!("validator_share must be in 0..=10000 basis points (got {vs})");
+            }
+        }
+
         let slot_name = if self.odd { "odd" } else { "even" };
 
         // Validate locally so the user gets the standard "invalid TON address"

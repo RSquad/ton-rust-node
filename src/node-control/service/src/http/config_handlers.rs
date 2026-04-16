@@ -123,6 +123,7 @@ pub struct PoolDto {
     /// `"SNP"` or `"Core"` — selects which of the field groups below applies.
     pub kind: String,
     /// SNP only: on-chain balance in nanotons. Always `None` for TONCore.
+    /// For TONCore, see `slots` field instead.
     pub balance: Option<u64>,
     /// SNP only: pool contract address. Always `None` for TONCore (see `slots`).
     pub address: Option<String>,
@@ -659,8 +660,9 @@ async fn fetch_toncore_slot_dto(
     let slot_name = if slot_idx == 0 { "even" } else { "odd" };
     let address = match &cached {
         Some(w) => w.address().await.ok(),
-        None => config_address.as_deref().and_then(|a| MsgAddressInt::from_str(a).ok()),
-    };
+        _ => None,
+    }
+    .or_else(|| config_address.as_deref().and_then(|a| MsgAddressInt::from_str(a).ok()));
     let address_str = address.as_ref().map(|a| a.to_string()).or_else(|| config_address.clone());
 
     let Some(addr) = address else {
@@ -692,16 +694,26 @@ async fn fetch_toncore_slot_dto(
             Arc::new(TonCoreNominatorWrapper::new(contract_provider!(rpc_client.clone()), addr))
                 as Arc<dyn NominatorWrapper>
         });
-        if let Ok(d) = wrapper.get_pool_data().await {
-            dto.validator_share = Some(d.pool_config.validator_reward_share);
-            dto.max_nominators = Some(d.pool_config.max_nominators_count);
-            dto.min_validator_stake = Some(d.pool_config.min_validator_stake);
-            dto.min_nominator_stake = Some(d.pool_config.nominator_stake_threshold);
-            dto.nominators_count = Some(d.nominators_count);
-            dto.stake_amount_sent = Some(d.stake_amount_sent);
-            dto.validator_amount = Some(d.validator_amount);
-            dto.pool_state = Some(d.state);
-            dto.last_election_id = Some(d.stake_at);
+        match wrapper.get_pool_data().await {
+            Ok(d) => {
+                dto.validator_share = Some(d.pool_config.validator_reward_share);
+                dto.max_nominators = Some(d.pool_config.max_nominators_count);
+                dto.min_validator_stake = Some(d.pool_config.min_validator_stake);
+                dto.min_nominator_stake = Some(d.pool_config.nominator_stake_threshold);
+                dto.nominators_count = Some(d.nominators_count);
+                dto.stake_amount_sent = Some(d.stake_amount_sent);
+                dto.validator_amount = Some(d.validator_amount);
+                dto.pool_state = Some(d.state);
+                dto.last_election_id = Some(d.stake_at);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slot = slot_name,
+                    address = dto.address.as_deref().unwrap_or("-"),
+                    error = %e,
+                    "get_pool_data failed on active account — on-chain fields will be empty",
+                );
+            }
         }
     }
 
@@ -1131,7 +1143,7 @@ pub async fn v1_pools_add_handler(
     path = "/v1/pools/core",
     request_body = PoolAddCoreRequest,
     responses(
-        (status = 200, description = "TONCore pool slot added", body = EntityRefResponse),
+        (status = 201, description = "TONCore pool slot added", body = EntityRefResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 401, description = "Not authenticated", body = ApiErrorResponse),
         (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
@@ -1184,8 +1196,11 @@ pub async fn v1_pools_add_core_handler(
         }
     }
     if let Some(mn) = req.max_nominators {
-        if mn == 0 {
-            return Err(AppError::bad_request("max_nominators must be > 0"));
+        if !(1..=DEFAULT_TONCORE_MAX_NOMINATORS).contains(&mn) {
+            return Err(AppError::bad_request(format!(
+                "max_nominators must be in 1..={} (got {mn})",
+                DEFAULT_TONCORE_MAX_NOMINATORS
+            )));
         }
     }
 
