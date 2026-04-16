@@ -337,6 +337,7 @@ impl RuntimeConfigStore {
     /// Use after REST mutations that change structural config (entities, endpoints).
     pub async fn force_reload(&self) -> anyhow::Result<()> {
         let config = (*self.get()).clone();
+        tracing::info!("force reloading is triggered");
         self.reload(config).await
     }
 
