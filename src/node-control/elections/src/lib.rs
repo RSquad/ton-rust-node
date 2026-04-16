@@ -6,21 +6,6 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-
-use common::app_config::AppConfig;
-use contracts::{NominatorWrapper, TonWallet};
-use std::{collections::HashMap, sync::Arc};
-
-/// Live `AppConfig` + wallet/pool caches from the service runtime (see `election_task::run`).
-pub type RuntimeSnapshotFn = Arc<
-    dyn Fn() -> (
-            Arc<AppConfig>,
-            Arc<HashMap<String, Arc<dyn TonWallet>>>,
-            Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
-        ) + Send
-        + Sync,
->;
-
 pub(crate) mod adaptive_strategy;
 pub mod election_emulator;
 pub mod election_task;

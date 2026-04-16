@@ -7,15 +7,16 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    RuntimeSnapshotFn,
     providers::{DefaultElectionsProvider, ElectionsProvider},
     runner::ElectionRunner,
 };
 use anyhow::Context;
 use common::{
-    app_config::BindingStatus, snapshot::SnapshotStore, task_cancellation::CancellationCtx,
+    app_config::{AppConfig, BindingStatus},
+    snapshot::SnapshotStore,
+    task_cancellation::CancellationCtx,
 };
-use contracts::{ElectorWrapperImpl, contract_provider};
+use contracts::{ElectorWrapperImpl, NominatorWrapper, TonWallet, contract_provider};
 use secrets_vault::vault::SecretVault;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
@@ -25,38 +26,14 @@ pub type BindingStatusCallback = Arc<dyn Fn(HashMap<String, BindingStatus>) + Se
 
 pub async fn run(
     cancellation_ctx: CancellationCtx,
-    snapshot: RuntimeSnapshotFn,
+    app_config: Arc<AppConfig>,
     rpc_client: Arc<ClientJsonRpc>,
+    wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
+    pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
     store: Arc<SnapshotStore>,
     vault: Option<Arc<SecretVault>>,
     on_status_change: Option<BindingStatusCallback>,
 ) -> anyhow::Result<()> {
-    const WALLET_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
-
-    let wait_deadline = std::time::Instant::now() + WALLET_WAIT_TIMEOUT;
-    let (app_config, wallets, pools) = loop {
-        let (app_config, wallets, pools) = snapshot();
-        let missing: Vec<String> =
-            app_config.nodes.keys().filter(|nid| !wallets.contains_key(*nid)).cloned().collect();
-        if missing.is_empty() {
-            break (app_config, wallets, pools);
-        }
-        if std::time::Instant::now() > wait_deadline {
-            anyhow::bail!(
-                "elections: timed out after {:?} waiting for validator wallets (missing: {:?})",
-                WALLET_WAIT_TIMEOUT,
-                missing
-            );
-        }
-        tracing::info!(
-            "elections: waiting for validator wallets (missing {:?}, have {} of {})...",
-            missing,
-            wallets.len(),
-            app_config.nodes.len()
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    };
-
     let Some(config) = app_config.elections.as_ref() else {
         anyhow::bail!("elections config is empty");
     };
@@ -100,15 +77,8 @@ pub async fn run(
 
     let elector = Arc::new(ElectorWrapperImpl::new(contract_provider!(rpc_client)));
 
-    let mut runner = ElectionRunner::new(
-        config,
-        &app_config.bindings,
-        elector,
-        providers,
-        wallets,
-        pools,
-        Some(snapshot.clone()),
-    );
+    let mut runner =
+        ElectionRunner::new(config, &app_config.bindings, elector, providers, wallets, pools);
     runner
         .run_loop(
             Duration::from_secs(config.tick_interval),

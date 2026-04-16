@@ -481,10 +481,9 @@ pub async fn v1_elections_exclude_handler(
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
 
-    let task = state.elections_task.clone();
-    tokio::spawn(async move {
-        let _ = task.restart().await;
-    });
+    // Rebuild wallets/pools from updated bindings (`update_and_save` only swaps config)
+    // and restart tasks — same pattern as other config mutation handlers.
+    state.config_changed.notify_one();
 
     let excluded: Vec<String> = state
         .runtime_cfg
@@ -532,10 +531,7 @@ pub async fn v1_elections_include_handler(
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
 
-    let task = state.elections_task.clone();
-    tokio::spawn(async move {
-        let _ = task.restart().await;
-    });
+    state.config_changed.notify_one();
 
     let excluded: Vec<String> = state
         .runtime_cfg

@@ -11,7 +11,7 @@ pub mod task_manager;
 
 use crate::{runtime_config::RuntimeConfig, task, task::task_manager::ServiceTask};
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
-use elections::{RuntimeSnapshotFn, election_task::BindingStatusCallback};
+use elections::election_task::BindingStatusCallback;
 use std::sync::Arc;
 
 task!(VotingTask, crate::voting::voting_task::run {
@@ -51,13 +51,12 @@ impl ServiceTask for ElectionsTask {
         cancellation_ctx: CancellationCtx,
         _app_config: Arc<AppConfig>,
     ) -> anyhow::Result<()> {
-        let runtime = self.runtime_cfg.clone();
-        let snapshot: RuntimeSnapshotFn =
-            Arc::new(move || (runtime.get(), runtime.wallets(), runtime.pools()));
         elections::election_task::run(
             cancellation_ctx,
-            snapshot,
+            self.runtime_cfg.get(),
             self.runtime_cfg.rpc_client(),
+            self.runtime_cfg.wallets(),
+            self.runtime_cfg.pools(),
             self.store.clone(),
             self.runtime_cfg.vault(),
             self.on_status_change.clone(),
