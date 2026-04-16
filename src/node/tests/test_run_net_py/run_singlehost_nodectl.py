@@ -342,7 +342,8 @@ class Bootstrap:
         seq_before = self._seqno()
         self._bun_topup(master_addr, self.cfg.master_topup)
         self._wait_chain_after_topup(seq_before, max_wait=120)
-        self._wait_master_wallet_funded(master_addr, min_ton=2.0, timeout=240)
+        min_ton = float(self.cfg.master_topup)
+        self._wait_master_wallet_funded(master_addr, min_ton=min_ton, timeout=240)
 
     def _participant_count(self) -> int:
         try:
