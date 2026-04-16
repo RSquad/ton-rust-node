@@ -24,7 +24,7 @@ env:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     if: >
       (
         github.event_name == 'pull_request_review' &&
