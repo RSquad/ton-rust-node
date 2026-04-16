@@ -11,16 +11,13 @@ use crate::commands::nodectl::{
     utils::{
         SEND_TIMEOUT, api_delete, api_get, api_post, confirm, get_wallet_config,
         load_config_vault_rpc_client, make_wallet, require_config,
-        resolve_pool_address_from_config, resolve_service_url, save_config,
-        toncore_pool_slot_from_cli_flags, wait_for_seqno_change, wallet_info,
+        resolve_pool_address_from_config, resolve_service_url, toncore_pool_slot_from_cli_flags,
+        wait_for_seqno_change, wallet_info,
     },
 };
 use colored::{ColoredString, Colorize};
 use common::{
-    app_config::{
-        AppConfig, DEFAULT_TONCORE_MAX_NOMINATORS, DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
-        DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, PoolConfig, TonCoreInitParams, TonCorePoolConfig,
-    },
+    app_config::PoolConfig,
     task_cancellation::CancellationCtx,
     ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
@@ -195,10 +192,10 @@ impl PoolCmd {
         token: Option<&str>,
     ) -> anyhow::Result<()> {
         match &self.action {
-            // SNP add: REST. Core add: local config file (no REST endpoint yet).
+            // Both SNP and Core add go through REST.
             PoolAction::Add(cmd) => match &cmd.action {
                 Some(PoolAddAction::Snp(cmd)) => cmd.run(url, token, config_path).await,
-                Some(PoolAddAction::Core(cmd)) => cmd.run(require_config(config_path)?).await,
+                Some(PoolAddAction::Core(cmd)) => cmd.run(url, token, config_path).await,
                 None => cmd.snp.run(url, token, config_path).await,
             },
             PoolAction::Ls(cmd) => cmd.run(url, token, config_path).await,
@@ -254,60 +251,61 @@ impl PoolAddCmd {
     }
 }
 
+/// Wire body for `POST /v1/pools/core`. Mirrors `service::PoolAddCoreRequest`
+/// — duplicated rather than shared to keep the CLI free of a service-crate
+/// dependency.
+#[derive(serde::Serialize)]
+struct PoolAddCoreBody<'a> {
+    name: &'a str,
+    slot: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validator_share: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_nominators: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_validator_stake: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_nominator_stake: Option<u64>,
+}
+
 impl PoolAddCoreCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
         if self.address.is_none() && self.validator_share.is_none() {
             anyhow::bail!("At least one of --address or --validator-share must be specified");
         }
 
-        let slot = if self.odd { 1usize } else { 0usize };
-        let slot_name = if slot == 0 { "even" } else { "odd" };
-
-        let mut config = AppConfig::load(path)?;
-
-        let address =
-            self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
-
-        let params = self.validator_share.map(|vs| TonCoreInitParams {
-            validator_share: vs,
-            max_nominators: self.max_nominators.unwrap_or(DEFAULT_TONCORE_MAX_NOMINATORS),
-            min_validator_stake: self
-                .min_validator_stake
-                .map(tons_f64_to_nanotons)
-                .unwrap_or(DEFAULT_TONCORE_MIN_VALIDATOR_STAKE),
-            min_nominator_stake: self
-                .min_nominator_stake
-                .map(tons_f64_to_nanotons)
-                .unwrap_or(DEFAULT_TONCORE_MIN_NOMINATOR_STAKE),
-        });
-
-        match config.pools.get_mut(&self.name) {
-            Some(PoolConfig::TONCore { pools }) => {
-                if pools[slot].is_some() {
-                    anyhow::bail!(
-                        "TONCore pool '{}' slot '{}' is already configured. Remove pool first or use another name.",
-                        self.name,
-                        slot_name
-                    );
-                }
-                pools[slot] =
-                    Some(TonCorePoolConfig { address: address.clone(), params: params.clone() });
-            }
-            Some(PoolConfig::SNP { .. }) => {
-                anyhow::bail!(
-                    "Pool '{}' already exists and is SNP. Remove it first or use another name.",
-                    self.name
-                );
-            }
-            None => {
-                let mut pools: [Option<TonCorePoolConfig>; 2] = [None, None];
-                pools[slot] =
-                    Some(TonCorePoolConfig { address: address.clone(), params: params.clone() });
-                config.pools.insert(self.name.clone(), PoolConfig::TONCore { pools });
+        if let Some(vs) = self.validator_share {
+            if !(0..=10_000).contains(&vs) {
+                anyhow::bail!("validator_share must be in 0..=10000 basis points (got {vs})");
             }
         }
 
-        save_config(&config, path)?;
+        let slot_name = if self.odd { "odd" } else { "even" };
+
+        // Validate locally so the user gets the standard "invalid TON address"
+        // message instead of a 400 from the server.
+        let address =
+            self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
+
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = PoolAddCoreBody {
+            name: &self.name,
+            slot: slot_name,
+            address: address.as_deref(),
+            validator_share: self.validator_share,
+            max_nominators: self.max_nominators,
+            // CLI flags accept TON (f64) — convert to nanotons for the API.
+            min_validator_stake: self.min_validator_stake.map(tons_f64_to_nanotons),
+            min_nominator_stake: self.min_nominator_stake.map(tons_f64_to_nanotons),
+        };
+        api_post(&base_url, "/v1/pools/core", token, &body).await?;
 
         let mut info_parts = Vec::new();
         if let Some(vs) = self.validator_share {
@@ -335,10 +333,39 @@ struct PoolView {
     balance: Option<u64>,
     address: Option<String>,
     owner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    addresses: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    validator_share: Option<u64>,
+    /// Per-slot data for TONCore pools; absent for SNP pools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slots: Option<Vec<TonCorePoolSlotView>>,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TonCorePoolSlotView {
+    /// "even" (slot 0) or "odd" (slot 1)
+    slot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
+    /// Account state: "active", "uninit", "frozen", "not deployed", or "error".
+    state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    balance: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validator_share: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_nominators: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_validator_stake: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_nominator_stake: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nominators_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stake_amount_sent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validator_amount: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_state: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_election_id: Option<u32>,
 }
 
 impl PoolLsCmd {
@@ -385,42 +412,118 @@ fn display_ton_address(addr: Option<&str>) -> ColoredString {
 }
 
 fn print_pools_table(views: &[PoolView]) {
-    println!("\n{} {} ({})\n", "OK".green().bold(), "Pools:".green(), views.len());
+    let snp: Vec<&PoolView> = views.iter().filter(|v| v.kind == "SNP").collect();
+    let core: Vec<&PoolView> = views.iter().filter(|v| v.kind == "Core").collect();
+
+    if !snp.is_empty() {
+        print_snp_table(&snp);
+    }
+    if !core.is_empty() {
+        print_toncore_table(&core);
+    }
+}
+
+fn print_snp_table(views: &[&PoolView]) {
+    println!("\n{} {} ({})\n", "OK".green().bold(), "SNP pools:".green(), views.len());
     println!(
-        "  {:<15} {:<6} {:<14} {:<50} {}",
+        "  {:<15} {:<14} {:<50} {}",
         "Name".cyan().bold(),
-        "Kind".cyan().bold(),
         "Balance".cyan().bold(),
         "Address".cyan().bold(),
-        "Owner / share".cyan().bold(),
+        "Owner".cyan().bold(),
     );
-    println!("  {}", "─".repeat(137).dimmed());
+    println!("  {}", "─".repeat(130).dimmed());
 
     for v in views {
-        match v.kind.as_str() {
-            "SNP" => {
-                let display_addr = display_ton_address(v.address.as_deref());
-                let display_owner = display_ton_address(v.owner.as_deref());
-                let display_balance =
-                    v.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
+        let display_addr = display_ton_address(v.address.as_deref());
+        let display_owner = display_ton_address(v.owner.as_deref());
+        let display_balance =
+            v.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
+        println!("  {:<15} {:<14} {:<50} {}", v.name, display_balance, display_addr, display_owner,);
+    }
+    println!();
+}
 
-                println!(
-                    "  {:<15} {:<6} {:<14} {:<50} {}",
-                    v.name, "SNP", display_balance, display_addr, display_owner,
-                );
-            }
-            "Core" => {
-                let addrs = v.addresses.as_deref().map(|a| a.join(", ")).unwrap_or_default();
-                let share = v.validator_share.map(|s| format!("{s} bp")).unwrap_or_default();
-                println!(
-                    "  {:<15} {:<6} {:<14} {:<50} share={}",
-                    v.name, "Core", "-", addrs, share,
-                );
-            }
-            _ => {}
+fn print_toncore_table(views: &[&PoolView]) {
+    let total_slots: usize = views.iter().filter_map(|v| v.slots.as_ref()).map(|s| s.len()).sum();
+    println!(
+        "\n{} {} ({} pools, {} slots)\n",
+        "OK".green().bold(),
+        "TONCore pools:".green(),
+        views.len(),
+        total_slots,
+    );
+    println!(
+        "  {:<15} {:<5} {:<14} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+        "Name".cyan().bold(),
+        "Slot".cyan().bold(),
+        "State".cyan().bold(),
+        "Balance".cyan().bold(),
+        "Noms".cyan().bold(),
+        "Share".cyan().bold(),
+        "Min val.stake".cyan().bold(),
+        "Min nom.stake".cyan().bold(),
+        "Address".cyan().bold(),
+    );
+    println!("  {}", "─".repeat(160).dimmed());
+
+    for v in views {
+        let Some(slots) = v.slots.as_ref() else { continue };
+        if slots.is_empty() {
+            // Pool exists in config but no slots configured at all — surface this.
+            println!("  {:<15} {}", v.name, "(no slots configured)".dimmed());
+            continue;
+        }
+        for s in slots {
+            let display_addr = display_ton_address(s.address.as_deref());
+            let display_state = display_state(&s.state);
+            let display_balance =
+                s.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
+            let noms = match (s.nominators_count, s.max_nominators) {
+                (Some(n), Some(m)) => format!("{n}/{m}"),
+                (Some(n), None) => format!("{n}"),
+                _ => "-".to_string(),
+            };
+            // `validator_share` is stored on-chain in basis points (1 bp = 0.01%);
+            // convert to a percentage for display (e.g. 4000 bp → "40.00%").
+            let share = s
+                .validator_share
+                .map(|sh| format!("{:.2}%", sh as f64 / 100.0))
+                .unwrap_or_else(|| "-".to_string());
+            let min_val = s
+                .min_validator_stake
+                .map(|b| display_tons(b).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let min_nom = s
+                .min_nominator_stake
+                .map(|b| display_tons(b).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:<15} {:<5} {:<14} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+                v.name,
+                s.slot,
+                display_state,
+                display_balance,
+                noms,
+                share,
+                min_val,
+                min_nom,
+                display_addr,
+            );
         }
     }
     println!();
+}
+
+fn display_state(state: &str) -> ColoredString {
+    match state {
+        "active" => "active".green(),
+        "uninit" => "uninit".yellow(),
+        "frozen" => "frozen".red(),
+        "not deployed" => "not deployed".yellow(),
+        "error" => "error".red(),
+        other => other.normal(),
+    }
 }
 
 fn normalize_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<String> {
@@ -721,5 +824,110 @@ mod tests {
             normalized,
             "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb"
         );
+    }
+
+    // ---- PoolView serde / table rendering ----
+
+    fn snp_view() -> PoolView {
+        PoolView {
+            name: "snp1".into(),
+            kind: "SNP".into(),
+            balance: Some(123_000_000_000),
+            address: Some(
+                "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
+            ),
+            owner: Some(
+                "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
+            ),
+            slots: None,
+        }
+    }
+
+    fn core_view_two_slots() -> PoolView {
+        PoolView {
+            name: "core1".into(),
+            kind: "Core".into(),
+            balance: None,
+            address: None,
+            owner: None,
+            slots: Some(vec![
+                TonCorePoolSlotView {
+                    slot: "even".into(),
+                    address: Some(
+                        "-1:0000000000000000000000000000000000000000000000000000000000000001"
+                            .into(),
+                    ),
+                    state: "active".into(),
+                    balance: Some(50_000_000_000),
+                    validator_share: Some(4000),
+                    max_nominators: Some(40),
+                    min_validator_stake: Some(10_000_000_000_000),
+                    min_nominator_stake: Some(10_000_000_000_000),
+                    nominators_count: Some(3),
+                    stake_amount_sent: Some(0),
+                    validator_amount: Some(0),
+                    pool_state: Some(0),
+                    last_election_id: Some(1_700_000_000),
+                },
+                TonCorePoolSlotView {
+                    slot: "odd".into(),
+                    address: None,
+                    state: "not deployed".into(),
+                    ..Default::default()
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn pool_view_snp_json_no_slots_field() {
+        // Round-trip: PoolView → JSON → PoolView. The SNP view must serialize
+        // without a `slots` field so the API contract for SNP stays stable.
+        let view = snp_view();
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["kind"], "SNP");
+        assert!(json.get("slots").is_none(), "SNP must not emit slots field");
+        let back: PoolView = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, "SNP");
+        assert!(back.slots.is_none());
+    }
+
+    #[test]
+    fn pool_view_toncore_json_round_trip() {
+        let view = core_view_two_slots();
+        let json = serde_json::to_value(&view).unwrap();
+        let slots = json["slots"].as_array().expect("slots present");
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0]["slot"], "even");
+        assert_eq!(slots[0]["validator_share"], 4000);
+        assert_eq!(slots[1]["slot"], "odd");
+        assert_eq!(slots[1]["state"], "not deployed");
+        // Optional fields on the not-deployed slot must be omitted, not null.
+        assert!(slots[1].get("balance").is_none());
+        assert!(slots[1].get("validator_share").is_none());
+
+        let back: PoolView = serde_json::from_value(json).unwrap();
+        let back_slots = back.slots.as_ref().unwrap();
+        assert_eq!(back_slots[0].nominators_count, Some(3));
+        assert_eq!(back_slots[1].state, "not deployed");
+    }
+
+    #[test]
+    fn print_pools_table_handles_mixed_kinds_without_panic() {
+        // Smoke test: rendering must not panic on the new two-table layout
+        // when both an SNP pool and a TONCore pool with mixed slots are
+        // present. Validates the column-formatting code paths for every slot
+        // state we care about.
+        let views = vec![snp_view(), core_view_two_slots()];
+        print_pools_table(&views);
+    }
+
+    #[test]
+    fn print_pools_table_skips_empty_sections() {
+        // Only TONCore configured → SNP renderer must be skipped (no panic,
+        // no "SNP pools (0)" header).
+        print_pools_table(&[core_view_two_slots()]);
+        // Only SNP configured → TONCore renderer is skipped.
+        print_pools_table(&[snp_view()]);
     }
 }

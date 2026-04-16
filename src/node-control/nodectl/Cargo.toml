@@ -2,7 +2,7 @@
 build = '../../common/build/build.rs'
 name = "nodectl"
 description = "Tool for managing Rust TON node"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = 'GPL-3.0'
 
