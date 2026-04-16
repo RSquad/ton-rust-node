@@ -181,6 +181,8 @@ impl Node {
 
 pub(crate) struct ElectionRunner {
     nodes: HashMap<String, Node>,
+    /// When set, each tick re-reads `binding.enable` / `status` from the live runtime config.
+    runtime_snapshot: Option<crate::RuntimeSnapshotFn>,
     elector: Arc<dyn ElectorWrapper>,
     default_max_factor: f32,
     default_stake_policy: StakePolicy,
@@ -266,6 +268,7 @@ impl ElectionRunner {
         providers: HashMap<String, Box<dyn ElectionsProvider>>,
         wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
         pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
+        runtime_snapshot: Option<crate::RuntimeSnapshotFn>,
     ) -> Self {
         let mut nodes = HashMap::new();
         for (node_id, provider) in providers {
@@ -309,6 +312,7 @@ impl ElectionRunner {
             default_max_factor: elections_config.max_factor,
             default_stake_policy: elections_config.policy.clone(),
             nodes,
+            runtime_snapshot,
             elector,
             snapshot_cache: SnapshotCache::default(),
             past_elections: vec![],
@@ -333,6 +337,22 @@ impl ElectionRunner {
             tokio::select! {
                 _ = interval.tick() => {
                     tracing::info!("TICK");
+
+                    if let Some(snapshot) = &self.runtime_snapshot {
+                        let (cfg, _, _) = snapshot();
+                        for (node_id, node) in self.nodes.iter_mut() {
+                            match cfg.bindings.get(node_id) {
+                                Some(b) => {
+                                    node.excluded = !b.enable;
+                                    node.binding_status = b.status;
+                                }
+                                None => {
+                                    node.excluded = true;
+                                    node.binding_status = BindingStatus::Idle;
+                                }
+                            }
+                        }
+                    }
 
                     // Clear per-node last_error at the start of the tick (best-effort).
                     for node in self.nodes.values_mut() {
