@@ -10,8 +10,8 @@ use super::{
     config_handlers::{
         BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
         ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
-        NodeDto, NodesResponse, PoolDto, PoolsResponse, WalletDto, WalletsResponse,
-        v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
+        NodeDto, NodesResponse, PoolDto, PoolsResponse, TonCorePoolSlotDto, WalletDto,
+        WalletsResponse, v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
         v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_wallets_handler,
     },
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
@@ -187,6 +187,10 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
             axum::routing::delete(super::config_handlers::v1_wallets_rm_handler),
         )
         .route("/v1/pools", axum::routing::post(super::config_handlers::v1_pools_add_handler))
+        .route(
+            "/v1/pools/core",
+            axum::routing::post(super::config_handlers::v1_pools_add_core_handler),
+        )
         .route(
             "/v1/pools/{name}",
             axum::routing::delete(super::config_handlers::v1_pools_rm_handler),
@@ -839,6 +843,7 @@ impl utoipa::Modify for BearerAuthAddon {
         super::config_handlers::v1_wallets_rm_handler,
         super::config_handlers::v1_pools_handler,
         super::config_handlers::v1_pools_add_handler,
+        super::config_handlers::v1_pools_add_core_handler,
         super::config_handlers::v1_pools_rm_handler,
         super::config_handlers::v1_bindings_handler,
         super::config_handlers::v1_bindings_add_handler,
@@ -877,11 +882,13 @@ impl utoipa::Modify for BearerAuthAddon {
         WalletsResponse,
         PoolDto,
         PoolsResponse,
+        TonCorePoolSlotDto,
         BindingDto,
         BindingsResponse,
         super::config_handlers::NodeAddRequest,
         super::config_handlers::WalletAddRequest,
         super::config_handlers::PoolAddRequest,
+        super::config_handlers::PoolAddCoreRequest,
         super::config_handlers::BindingAddRequest,
         super::config_handlers::EntityRefDto,
         super::config_handlers::EntityRefResponse,

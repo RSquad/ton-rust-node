@@ -20,6 +20,7 @@
   - [Service Command](#service-command)
   - [Service API Commands](#service-api-commands)
   - [TON HTTP API](#ton-http-api)
+  - [Voting Commands](#voting-commands)
 - [REST API Endpoints](#rest-api-endpoints)
 - [Configuration](#configuration)
   - [Config Structure](#config-structure)
@@ -127,7 +128,7 @@ RUST_LOG=debug nodectl ...
 
 ### Configuration Commands
 
-Commands for managing nodectl configuration files. All `config` subcommands accept a global `--config` (`-c`) flag to specify the configuration file path (default: `nodectl-config.json`). This can also be set via the `CONFIG_PATH` environment variable.
+Commands for managing nodectl configuration. **All `config` subcommands except `config generate` are REST clients that require a running nodectl service** — they talk to the daemon over the HTTP API. The service URL is resolved (in order) from `--url` / `-u` (or the `NODECTL_URL` env var), or from `http.bind` inside `--config` (default `nodectl-config.json`, env `CONFIG_PATH`). Protected endpoints require an `operator` JWT token passed via `--token` (or the `NODECTL_API_TOKEN` env var) — see the [Authentication Commands](#authentication-commands) section for how to obtain one.
 
 #### `config generate`
 
@@ -278,10 +279,11 @@ nodectl config wallet send \
 
 #### `config pool`
 
-Manage nominator pools in the configuration file. Pools are stored as tagged JSON: **`kind: "snp"`** or **`kind: "core"`**.
+Manage nominator pools in the configuration. Pools are stored as tagged JSON: **`kind: "snp"`** or **`kind: "core"`**. Both add variants, `ls`, and `rm` flow through the REST API on the running service.
 
 - **`config pool add`** — **Single Nominator Pool (SNP)** only (`PoolConfig::SNP`: optional `address`, `owner`).
 - **`config pool add core`** — **TONCore nominator** (`PoolConfig::TONCore`): up to **two** logical slots (`pools[0]`, `pools[1]`) for even/odd validation rounds. Each slot is configured by a separate command call with explicit **`--even`** or **`--odd`**, and optional `address` and/or deploy `params` (`TonCoreInitParams`) for that slot.
+- **`config pool deposit-validator` / `withdraw-validator`** — TONCore-only validator deposit/withdrawal flows that build and send the on-chain message through a configured wallet (require vault access; not a REST client).
 
 ##### `config pool add` (SNP)
 
@@ -362,6 +364,30 @@ Remove a pool from the configuration.
 nodectl config pool rm --name pool0
 ```
 
+##### `config pool deposit-validator` (TONCore only)
+
+Deposit validator funds into a TONCore nominator pool. Builds and sends the on-chain deposit message through the binding's configured wallet.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--binding <NAME>` | `-b` | Binding name (resolves wallet and pool) |
+| `--amount <TON>` | `-a` | Amount in TON to deposit |
+| `--pool-even` | | Use the pool for even validation rounds (default if neither flag is set) |
+| `--pool-odd` | | Use the pool for odd validation rounds |
+| `--yes` | | Skip the interactive confirmation prompt |
+
+```bash
+nodectl config pool deposit-validator --binding node0 --amount 10000 --pool-even
+```
+
+##### `config pool withdraw-validator` (TONCore only)
+
+Withdraw validator funds from a TONCore nominator pool. Same flags as `deposit-validator`.
+
+```bash
+nodectl config pool withdraw-validator --binding node0 --amount 5000 --pool-odd
+```
+
 ---
 
 #### `config bind`
@@ -421,21 +447,40 @@ Configure the TON HTTP API connection settings.
 
 ##### `config ton-http-api set`
 
-Set the TON HTTP API URL and optional API key.
+Replace the TON HTTP API endpoint list with a single URL and optional API key.
 
 | Flag | Short form | Description |
 |------|------------|-------------|
-| `--url <URL>` | `-u` | TON HTTP API URL |
+| `--endpoint <URL>` | `-e` | TON HTTP API endpoint URL |
 | `--api-key <KEY>` | `-k` | API key (optional) |
 
 ```bash
-# Set TON HTTP API URL
-nodectl config ton-http-api set --url "https://toncenter.com/api/v2/jsonRpc"
+# Set a single TON HTTP API endpoint
+nodectl config ton-http-api set --endpoint "https://toncenter.com/api/v2/jsonRpc"
 
-# Set with API key
+# Set endpoint with API key
 nodectl config ton-http-api set \
-  --url "https://toncenter.com/api/v2/jsonRpc" \
+  --endpoint "https://toncenter.com/api/v2/jsonRpc" \
   --api-key "your-api-key"
+```
+
+##### `config ton-http-api add`
+
+Append one or more failover endpoints (existing endpoints are preserved; duplicates are skipped).
+
+| Flag | Short form | Description |
+|------|------------|-------------|
+| `--endpoint <URL>` | `-e` | TON HTTP API endpoint URL (repeat to add more than one) |
+| `--api-key <KEY>` | `-k` | Per-endpoint API key applied to every URL in this invocation (optional; falls back to the global key) |
+
+```bash
+# Add a single failover endpoint
+nodectl config ton-http-api add --endpoint "https://backup.example/api/v2/jsonRpc"
+
+# Add multiple failover endpoints in one invocation
+nodectl config ton-http-api add \
+  --endpoint "https://backup1.example/api/v2/jsonRpc" \
+  --endpoint "https://backup2.example/api/v2/jsonRpc"
 ```
 
 ---
@@ -525,6 +570,7 @@ Set the default or per-node stake policy in the elections configuration.
 | `--fixed <AMOUNT>` | | Fixed stake amount in TON |
 | `--split50` | | Use 50% of available balance |
 | `--minimum` | | Use minimum required stake |
+| `--adaptive-split50` | | Adaptive: split half when above Elector's minimum effective stake, otherwise stake all (see [Staking Strategies](./docs/staking-strategies.md)) |
 | `--node <NAME>` | `-n` | Apply policy only to this node (override). Omit to set the default policy. |
 | `--reset` | | Remove a per-node policy override (requires `--node`) |
 
@@ -534,6 +580,9 @@ nodectl config elections stake-policy --minimum
 
 # Set fixed stake (1000 TON)
 nodectl config elections stake-policy --fixed 1000
+
+# Set adaptive split50
+nodectl config elections stake-policy --adaptive-split50
 
 # Override policy for a specific node
 nodectl config elections stake-policy --node node0 --fixed 500
@@ -588,37 +637,6 @@ Disable elections participation for one or more bindings.
 
 ```bash
 nodectl config elections disable node0
-```
-
----
-
-#### `config stake-policy`
-
-Shortcut for `config elections stake-policy`. Set the stake policy in the configuration file. By default the policy applies to **all nodes**. Use `--node` to set a per-node override that takes precedence over the default.
-
-| Flag | Short form | Description |
-|------|------------|-------------|
-| `--fixed <AMOUNT>` | | Fixed stake amount in TON |
-| `--split50` | | Use 50% of available balance |
-| `--minimum` | | Use minimum required stake |
-| `--node <NAME>` | `-n` | Apply policy only to this node (per-node override). Omit to set the default policy for all nodes. |
-| `--reset` | | Remove a per-node policy override (requires `--node`) |
-
-```bash
-# Set minimum stake policy (default for all nodes)
-nodectl config stake-policy --minimum
-
-# Set fixed stake (1000 TON)
-nodectl config stake-policy --fixed 1000
-
-# Set split50 policy
-nodectl config stake-policy --split50
-
-# Override policy for a specific node
-nodectl config stake-policy --node node0 --fixed 500
-
-# Remove a per-node override (node falls back to default policy)
-nodectl config stake-policy --node node0 --reset
 ```
 
 ---
@@ -955,13 +973,14 @@ nodectl api task elections restart
 
 ##### `api stake-policy`
 
-Set the stake policy for elections on a running service. Use `--node` to set a per-node override instead of changing the default policy.
+Set the stake policy for elections on a running service. Use `--node` to set a per-node override instead of changing the default policy. This command is a shortcut for `POST /v1/elections/settings`.
 
 | Flag | Short form | Description |
 |------|------------|-------------|
 | `--fixed <AMOUNT>` | | Fixed stake amount (in nanoTON) |
 | `--split50` | | Use 50% of available balance |
 | `--minimum` | | Use minimum required stake |
+| `--adaptive-split50` | | Adaptive: split half when above Elector's minimum effective stake, otherwise stake all |
 | `--node <NAME>` | `-n` | Apply policy only to this node (per-node override). Omit to set the default policy. |
 
 ```bash
@@ -973,6 +992,9 @@ nodectl api stake-policy --fixed 1000000000000
 
 # Set split50 policy
 nodectl api stake-policy --split50
+
+# Set adaptive split50
+nodectl api stake-policy --adaptive-split50
 
 # Override policy for a specific node
 nodectl api stake-policy --node node0 --fixed 500000000000
@@ -995,6 +1017,51 @@ Get a configuration parameter from the blockchain (via TON HTTP API).
 
 ```bash
 nodectl config-param -c config.json 34
+```
+
+---
+
+### Voting Commands
+
+On-chain config proposal voting. `nodectl vote ls` / `inspect` hit the Config contract via TON HTTP API. `nodectl vote add` / `rm` manage the local `voting.proposals` list used by the voting task — they write directly to the config file and do **not** require a running service.
+
+#### `vote ls`
+
+List active config proposals on-chain. Proposals already tracked by the voting task are marked with `*`.
+
+| Flag | Description |
+|------|-------------|
+| `--format <FORMAT>` | `table` (default) or `json` |
+
+```bash
+nodectl vote ls
+```
+
+#### `vote inspect`
+
+Show full details (expires-in, voters, weight remaining, param cell BOC, param hash) for a proposal by hex hash.
+
+```bash
+nodectl vote inspect <HEX_HASH>
+nodectl vote inspect <HEX_HASH> --format json
+```
+
+#### `vote add`
+
+Add a proposal to the voting task's tracked list. Pass `--hash <HEX_HASH>` or invoke interactively to pick one from the list of active proposals.
+
+```bash
+nodectl vote add --hash <HEX_HASH>
+nodectl vote add   # interactive
+```
+
+#### `vote rm`
+
+Remove a proposal from the voting task's tracked list.
+
+```bash
+nodectl vote rm --hash <HEX_HASH>
+nodectl vote rm    # interactive
 ```
 
 ---
@@ -1025,17 +1092,46 @@ The HTTP server is configured in the `http` section of the config:
 
 ### Endpoints
 
+All endpoints return `{ "ok": true, ... }` on success and `{ "ok": false, "error": { "code": <http>, "message": "..." } }` on failure. `200` indicates success; `400`, `401`, `403`, `404`, `429`, `500` are used as documented.
+
+Role columns use the following shorthand: **P** = public (no token), **N** = `nominator` or `operator`, **O** = `operator` only.
+
+| Method | Path | Role | Summary |
+|--------|------|------|---------|
+| GET | `/health` | P | Health check |
+| GET | `/openapi.json` | P | OpenAPI spec |
+| GET | `/swagger`, `/swagger-ui` | P | Swagger UI (when `enable_swagger` is `true`) |
+| POST | `/auth/login` | P | Exchange username/password for a JWT |
+| GET | `/auth/me` | N | Identity of the authenticated user |
+| GET | `/auth/users` | O | List users |
+| GET | `/v1/elections` | N | Current elections snapshot |
+| POST | `/v1/elections/exclude` | O | Disable elections for given bindings |
+| POST | `/v1/elections/include` | O | Enable elections for given bindings |
+| GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, per-binding status) |
+| POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor) |
+| GET | `/v1/validators` | N | Validators snapshot for controlled nodes |
+| POST | `/v1/task/elections` | O | Enable / disable / restart the elections background task |
+| GET | `/v1/nodes` | N | List configured nodes with control-server status |
+| POST | `/v1/nodes` | O | Add a node |
+| DELETE | `/v1/nodes/{name}` | O | Remove a node |
+| GET | `/v1/wallets` | N | List configured wallets with on-chain state |
+| POST | `/v1/wallets` | O | Add a wallet |
+| DELETE | `/v1/wallets/{name}` | O | Remove a wallet |
+| GET | `/v1/pools` | N | List configured pools with live balances |
+| POST | `/v1/pools` | O | Add a pool (SNP or TONCore) |
+| DELETE | `/v1/pools/{name}` | O | Remove a pool |
+| GET | `/v1/bindings` | N | List node bindings |
+| POST | `/v1/bindings` | O | Add a binding |
+| DELETE | `/v1/bindings/{node}` | O | Remove a binding (requires `idle` status) |
+| GET | `/v1/log` | N | Current log configuration |
+| POST | `/v1/log` | O | Update log settings |
+| POST | `/v1/ton-http-api` | O | Replace or append TON HTTP API endpoints |
+| GET | `/v1/master-wallet` | N | Master wallet address, balance, version |
+
 #### `GET /health`
 
-Health check endpoint.
-
-**Response:**
-
 ```json
-{
-  "ok": true,
-  "result": "OK"
-}
+{ "ok": true, "result": "OK" }
 ```
 
 ---
@@ -1047,10 +1143,7 @@ Authenticate and obtain a JWT token. Rate-limited: 5 failed attempts per 60s win
 **Request:**
 
 ```json
-{
-  "username": "admin",
-  "password": "secret"
-}
+{ "username": "admin", "password": "secret" }
 ```
 
 **Response:**
@@ -1068,25 +1161,17 @@ Authenticate and obtain a JWT token. Rate-limited: 5 failed attempts per 60s win
 
 #### `GET /auth/me`
 
-Return the identity of the authenticated user. Requires: `nominator` or `operator` role.
-
-**Response:**
+Return the identity of the authenticated user.
 
 ```json
-{
-  "ok": true,
-  "username": "admin",
-  "role": "operator"
-}
+{ "ok": true, "username": "admin", "role": "operator" }
 ```
 
 ---
 
 #### `GET /auth/users`
 
-List all users. Requires: `operator` role.
-
-**Response:**
+List all users.
 
 ```json
 {
@@ -1102,37 +1187,51 @@ List all users. Requires: `operator` role.
 
 #### `GET /v1/elections`
 
-Get current elections snapshot. Requires: `nominator` or `operator` role.
+Current elections snapshot. Pass `?include_participants=true` to include the full participants list (omitted by default to keep the response small).
 
 **Response:**
 
 ```json
 {
   "ok": true,
+  "status": "active",
   "result": {
     "election_id": 1734523200,
     "elect_close": 1734522300,
-    "min_stake": 300000000000000,
-    "total_stake": 15000000000000000,
-    "participants": [...],
+    "elect_close_utc": "2024-12-18 10:45:00",
+    "finished": false,
     "failed": false,
-    "finished": false
-  }
+    "participants_count": 42,
+    "min_stake": "300000000000000",
+    "participant_min_stake": "400000000000000",
+    "participant_max_stake": "1200000000000000",
+    "participants": []
+  },
+  "next_elections": {
+    "start": 1734530000,
+    "start_utc": "2024-12-18 12:00:00",
+    "end": 1734616400,
+    "end_utc": "2024-12-19 12:00:00"
+  },
+  "our_participants": []
 }
 ```
+
+- `status` is one of `closed`, `active`, `finished`, `failed`, `postponed`.
+- `result` is `null` when no snapshot has been collected yet.
+- Stake fields (`min_stake`, `participant_*`, per-participant `stake`) are **strings** of nanotons (decimal).
+- `our_participants[]` lists each controlled node's participation lifecycle (`status`: `idle → participating → submitted → accepted → elected → validating`) and stake submission history.
 
 ---
 
 #### `POST /v1/elections/exclude`
 
-Exclude nodes from elections participation.
+Disable elections for the given bindings (sets `enable: false`). Triggers an elections task restart.
 
 **Request:**
 
 ```json
-{
-  "nodes": ["node0", "node1"]
-}
+{ "nodes": ["node0", "node1"] }
 ```
 
 **Response:**
@@ -1151,15 +1250,17 @@ Exclude nodes from elections participation.
 
 #### `POST /v1/elections/include`
 
-Include nodes back into elections participation.
-
-**Request:**
+Enable elections for the given bindings (sets `enable: true`). Same response shape as `/exclude` — `excluded` lists bindings that remain disabled.
 
 ```json
-{
-  "nodes": ["node0"]
-}
+{ "nodes": ["node0"] }
 ```
+
+---
+
+#### `GET /v1/elections/settings`
+
+Return the effective elections configuration plus per-binding status.
 
 **Response:**
 
@@ -1167,8 +1268,71 @@ Include nodes back into elections participation.
 {
   "ok": true,
   "result": {
-    "excluded": ["node1"],
-    "updated_at": 1734523200
+    "stake_policy": "split50",
+    "policy_overrides": { "node0": { "fixed": 500000000000 } },
+    "max_factor": 3.0,
+    "tick_interval": 40,
+    "bindings": [
+      {
+        "name": "node0",
+        "enable": true,
+        "status": "validating",
+        "stake_policy": { "fixed": 500000000000 }
+      }
+    ]
+  }
+}
+```
+
+---
+
+#### `POST /v1/elections/settings`
+
+Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1/stake_strategy`, `POST /v1/elections/tick-interval`, and `POST /v1/elections/max-factor`. At least one field must be set.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `policy` | `StakePolicy` | Stake policy to set; ignored when `reset` is `true` |
+| `node` | `string` | Target node for a per-node override (omit for the default policy) |
+| `reset` | `bool` | Remove a per-node override (requires `node`) |
+| `tick_interval` | `u64` | Elections tick interval in seconds |
+| `max_factor` | `f32` | Validated against masterchain config param 17 |
+
+`StakePolicy` is `"minimum"`, `"split50"`, `"adaptive_split50"`, or `{ "fixed": <nanotons> }`.
+
+**Example — update policy + tick interval + max factor in one call:**
+
+```json
+{
+  "policy": "adaptive_split50",
+  "tick_interval": 60,
+  "max_factor": 2.5
+}
+```
+
+**Per-node override:**
+
+```json
+{ "policy": { "fixed": 500000000000 }, "node": "node0" }
+```
+
+**Reset a per-node override:**
+
+```json
+{ "reset": true, "node": "node0" }
+```
+
+**Response** — returns the new settings (same shape as `GET` but without `bindings`):
+
+```json
+{
+  "ok": true,
+  "result": {
+    "stake_policy": "adaptive_split50",
+    "policy_overrides": {},
+    "max_factor": 2.5,
+    "tick_interval": 60,
+    "bindings": []
   }
 }
 ```
@@ -1177,7 +1341,7 @@ Include nodes back into elections participation.
 
 #### `GET /v1/validators`
 
-Get current validators snapshot.
+Validators snapshot for controlled nodes only.
 
 **Response:**
 
@@ -1185,73 +1349,31 @@ Get current validators snapshot.
 {
   "ok": true,
   "result": {
-    "validators": [...],
-    "utime_since": 1734400000,
-    "utime_until": 1734486400
-  }
-}
-```
-
----
-
-#### `POST /v1/stake_strategy`
-
-Set the stake policy for elections. Optionally include a `node` field to apply the policy as a per-node override instead of changing the default.
-
-**Request (default policy — minimum stake):**
-
-```json
-{
-  "policy": "minimum"
-}
-```
-
-**Request (default policy — fixed stake):**
-
-```json
-{
-  "policy": { "fixed": 1000000000000 }
-}
-```
-
-**Request (default policy — split50):**
-
-```json
-{
-  "policy": "split50"
-}
-```
-
-**Request (per-node override):**
-
-```json
-{
-  "policy": { "fixed": 500000000000 },
-  "node": "node0"
-}
-```
-
-**Response:**
-
-```json
-{
-  "ok": true,
-  "result": {
-    "policy": "minimum",
-    "applied_at": 1734523200
-  }
-}
-```
-
-**Response (per-node override):**
-
-```json
-{
-  "ok": true,
-  "result": {
-    "policy": { "fixed": 500000000000 },
-    "node": "node0",
-    "applied_at": 1734523200
+    "controlled_nodes": [
+      {
+        "node_id": "node0",
+        "is_validator": true,
+        "validator_index": 42,
+        "weight": 1000,
+        "wallet_addr": "-1:...",
+        "stake": "25000000000000",
+        "stake_accepted": true,
+        "key_election_id": 1734400000,
+        "key_expires_at_utc": "2024-12-19 08:00:00",
+        "is_key_active": true,
+        "key_id": "<base64>",
+        "pubkey": "<base64>",
+        "adnl": "<base64>",
+        "binding_status": "validating"
+      }
+    ],
+    "default_stake_policy": "split50",
+    "validation_range": {
+      "start": 1734400000,
+      "start_utc": "2024-12-17 08:00:00",
+      "end": 1734486400,
+      "end_utc": "2024-12-18 08:00:00"
+    }
   }
 }
 ```
@@ -1265,10 +1387,10 @@ Control the elections background task.
 **Request:**
 
 ```json
-{
-  "action": "enable" | "disable" | "restart"
-}
+{ "action": "enable" }
 ```
+
+`action` is `enable`, `disable`, or `restart`.
 
 **Response:**
 
@@ -1279,6 +1401,240 @@ Control the elections background task.
     "enabled": true,
     "status": "running",
     "updated_at": 1734523200
+  }
+}
+```
+
+`status` is `running` or `stopped`.
+
+---
+
+#### `GET /v1/nodes`
+
+List configured nodes with a concurrent ADNL connectivity probe (5s timeout).
+
+```json
+{
+  "ok": true,
+  "result": [
+    {
+      "name": "node0",
+      "control_server_endpoint": "192.168.1.100:50000",
+      "control_server_pubkey": "<base64>",
+      "control_client_secret": "node0-adnl-key",
+      "status": "ok"
+    }
+  ]
+}
+```
+
+`status` is `ok`, `unknown`, or an error message (e.g. `timeout`, connection failure).
+
+#### `POST /v1/nodes`
+
+Add a node.
+
+**Request:**
+
+```json
+{
+  "name": "node0",
+  "control_server_endpoint": "192.168.1.100:50000",
+  "control_server_pubkey": "<base64>",
+  "control_client_secret": "node0-adnl-key"
+}
+```
+
+**Response:**
+
+```json
+{ "ok": true, "result": { "name": "node0" } }
+```
+
+#### `DELETE /v1/nodes/{name}`
+
+Remove a node. `400` if a binding still references it.
+
+```json
+{ "ok": true, "result": { "name": "node0" } }
+```
+
+---
+
+#### `GET /v1/wallets`
+
+List configured wallets (including the `master_wallet` slot when present) with live on-chain state. Addresses are bounceable URL-safe base64.
+
+```json
+{
+  "ok": true,
+  "result": [
+    {
+      "name": "wallet0",
+      "secret": "wallet0-key",
+      "version": "V3R2",
+      "state": "active",
+      "balance": 1200000000000,
+      "address": "EQ..."
+    }
+  ]
+}
+```
+
+`state` / `balance` are `null` when the TON HTTP API is unreachable.
+
+#### `POST /v1/wallets`
+
+```json
+{
+  "name": "wallet0",
+  "secret": "wallet0-key",
+  "version": "V3R2",
+  "subwallet_id": 42,
+  "workchain": -1
+}
+```
+
+`400` if the name is `master_wallet` (reserved) or already exists.
+
+#### `DELETE /v1/wallets/{name}`
+
+Remove a wallet. Refuses to delete `master_wallet`; `400` if referenced by a binding.
+
+---
+
+#### `GET /v1/pools`
+
+List configured pools with live balances and, for TONCore, per-slot addresses and validator share.
+
+```json
+{
+  "ok": true,
+  "result": [
+    {
+      "name": "pool0",
+      "kind": "SNP",
+      "balance": 900000000000,
+      "address": "EQ...",
+      "owner": "EQ..."
+    },
+    {
+      "name": "pool1",
+      "kind": "Core",
+      "balance": null,
+      "address": null,
+      "owner": null,
+      "addresses": ["EQ...", "<not deployed>"],
+      "validator_share": 5000
+    }
+  ]
+}
+```
+
+#### `POST /v1/pools`
+
+Add a pool (SNP or TONCore). At least one of `address` / `owner` is required for SNP; TONCore requires `kind: "core"` plus a `slot` (`even` / `odd`) and either `address` or `params` (`validator_share`, `max_nominators`, `min_validator_stake`, `min_nominator_stake`).
+
+**SNP example:**
+
+```json
+{ "name": "pool0", "owner": "EQ..." }
+```
+
+#### `DELETE /v1/pools/{name}`
+
+`400` if a binding still references the pool.
+
+---
+
+#### `GET /v1/bindings`
+
+```json
+{
+  "ok": true,
+  "result": [
+    { "node": "node0", "wallet": "wallet0", "pool": "pool0", "enable": true, "status": "validating" }
+  ]
+}
+```
+
+#### `POST /v1/bindings`
+
+```json
+{ "node": "node0", "wallet": "wallet0", "pool": "pool0" }
+```
+
+The node and wallet must already exist. A pool may be bound to at most one node.
+
+#### `DELETE /v1/bindings/{node}`
+
+Requires the binding to be in `idle` status. If it is `participating`, `draining`, or `validating`, disable elections first and wait for stake recovery.
+
+---
+
+#### `GET /v1/log`
+
+```json
+{
+  "ok": true,
+  "result": {
+    "level": "INFO",
+    "path": "./logs/nodectl.log",
+    "rotation": "daily",
+    "output": "all",
+    "max_size_mb": 50,
+    "max_files": 10
+  }
+}
+```
+
+#### `POST /v1/log`
+
+At least one field must be set. Setting `output` to `file` / `all` requires an existing `path` (either previously configured or provided in the same request).
+
+```json
+{ "level": "debug", "output": "all", "path": "/var/log/nodectl/service.log" }
+```
+
+---
+
+#### `POST /v1/ton-http-api`
+
+Replace or append TON HTTP API endpoints.
+
+**Request:**
+
+```json
+{
+  "urls": ["https://toncenter.com/api/v2/jsonRpc"],
+  "api_key": "your-api-key",
+  "append": false
+}
+```
+
+When `append` is `true`, the URLs are added after existing ones (duplicates skipped) and `api_key` applies to the newly added entries; when `false` (default), the list is fully replaced.
+
+**Response:**
+
+```json
+{ "ok": true, "result": { "endpoints": ["https://toncenter.com/api/v2/jsonRpc"] } }
+```
+
+---
+
+#### `GET /v1/master-wallet`
+
+```json
+{
+  "ok": true,
+  "result": {
+    "address": "EQ...",
+    "balance": 25000000000,
+    "state": "active",
+    "version": "V3R2",
+    "subwallet_id": 42,
+    "secret": "master-wallet-secret",
+    "public_key": "<base64>"
   }
 }
 ```
@@ -1324,13 +1680,16 @@ Configuration is specified in JSON format.
     }
   },
   "ton_http_api": {
-    "url": "http://127.0.0.1:3301/",
-    "api_key": "<OPTIONAL_API_KEY>" | null
+    "urls": [
+      "http://127.0.0.1:3301/",
+      { "url": "https://backup.example/api/v2/jsonRpc", "api_key": "<PER_ENDPOINT_KEY>" }
+    ],
+    "api_key": "<OPTIONAL_GLOBAL_KEY>" | null
   },
   "http": {
     "bind": "0.0.0.0:8080",
     "enable_swagger": true,
-    "api_key": null
+    "auth": { /* see http.auth below; omit or set to null to disable auth */ }
   },
   // optional
   "master_wallet": {
@@ -1341,10 +1700,12 @@ Configuration is specified in JSON format.
   },
   // optional
   "elections": {
-    "policy": "split50" | "minimum" | { "fixed": 1000000000000 },
-    "policy_overrides": { "<node_name>": "minimum" | { "fixed": <amount> } | "split50" },
+    "policy": "split50" | "minimum" | "adaptive_split50" | { "fixed": 1000000000000 },
+    "policy_overrides": { "<node_name>": "minimum" | { "fixed": <amount> } | "split50" | "adaptive_split50" },
     "max_factor": 3.0,
-    "tick_interval": 40
+    "tick_interval": 40,
+    "sleep_period_pct": 0.2,
+    "waiting_period_pct": 0.4
   },
   // optional
   "voting": {
@@ -1415,8 +1776,10 @@ Bindings link nodes to wallets and pools for elections participation:
 
 TON HTTP API configuration:
 
-- `url` — JSON-RPC endpoint URL (default: `http://127.0.0.1:3301/`)
-- `api_key` — API key (optional)
+- `urls` — ordered list of JSON-RPC endpoints. Each entry is either a plain URL string (uses the global `api_key`) or an object `{ "url": "...", "api_key": "..." }` with its own key. The first entry is the primary endpoint; the rest are used for failover. Default: `["http://127.0.0.1:3301/"]`.
+- `api_key` — global API key used for entries that don't specify their own (optional)
+
+> **Backward compatibility:** the legacy single-URL field `url` is still accepted on load and transparently migrated into the head of `urls` on the next save.
 
 #### `http`
 
@@ -1424,7 +1787,7 @@ HTTP REST API server configuration:
 
 - `bind` — address and port to bind (default: `0.0.0.0:8080`)
 - `enable_swagger` — enable Swagger UI at `/swagger` (default: `true`)
-- `auth` — JWT authentication configuration (see below)
+- `auth` — JWT authentication configuration (see below). Omit or set to `null` to disable authentication.
 
 #### `http.auth`
 
@@ -1451,10 +1814,13 @@ Automatic elections task configuration:
 - `policy` — default stake policy (applies to all nodes unless overridden):
   - `"split50"` — splits all available funds into two equal stakes (default)
   - `"minimum"` — use minimum required stake
+  - `"adaptive_split50"` — adaptive: splits half when above the Elector's estimated minimum effective stake for the current round, otherwise stakes all. See [Staking Strategies](./docs/staking-strategies.md).
   - `{ "fixed": <amount> }` — fixed stake amount in nanoTON
 - `policy_overrides` — per-node stake policy overrides (node name -> policy). When a node has an entry here, it takes precedence over the default `policy`. Example: `{ "node0": { "fixed": 500000000000 } }`
 - `max_factor` — maximum stake factor (default `3.0` in generated configs). Valid values lie in `[1.0, network_max_factor]`, where **`network_max_factor` comes from masterchain config param 17** (`max_stake_factor`); the CLI and stake command validate against the live network when TON HTTP API is available
 - `tick_interval` — interval between election checks in seconds (default: `40`)
+- `sleep_period_pct` — AdaptiveSplit50 minimum wait as a fraction of election duration. Default `0.2`. Must be in `[0.0, 1.0]` and ≤ `waiting_period_pct`.
+- `waiting_period_pct` — AdaptiveSplit50 maximum wait for enough participants as a fraction of election duration. Default `0.4`. Must be in `[0.0, 1.0]` and ≥ `sleep_period_pct`.
 
 #### `voting` (optional)
 
@@ -1563,9 +1929,12 @@ When a pool is present in the binding configuration:
 
 - `Split50` — split total available funds into two equal parts (default)
 - `Minimum` — minimum stake for election participation
+- `AdaptiveSplit50` — split half when above the Elector's estimated minimum effective stake, otherwise stake all (see [Staking Strategies](./docs/staking-strategies.md))
 - `Fixed(amount)` — fixed amount in nanoTON
 
 Each binding resolves its effective stake policy by checking for a per-node override first (`policy_overrides`); if none is set, the default `policy` is used. This allows running nodes with different stake strategies under a single configuration.
+
+> **TONCore nominator caveat.** `Split50` and `AdaptiveSplit50` are ignored on bindings backed by a TONCore nominator — the two pools stake in different rounds, so there is nothing to split. The runner stakes the full liquid balance of the selected pool instead (still floored at `min_stake`). Use `Fixed` or `Minimum` if you need to cap per-round exposure on TONCore.
 
 ### Logging
 
@@ -1612,7 +1981,7 @@ nodectl config bind add \
 
 # Set TON HTTP API
 nodectl config ton-http-api set \
-  --url "https://toncenter.com/api/v2/jsonRpc"
+  --endpoint "https://toncenter.com/api/v2/jsonRpc"
 
 # Enable elections for the binding
 nodectl config elections enable node0
@@ -1658,14 +2027,17 @@ nodectl config log set --level debug --output file --path /var/log/nodectl/node.
 # View elections configuration
 nodectl config elections show
 
-# Set default stake policy in config
-nodectl config stake-policy --minimum
+# Set default stake policy
+nodectl config elections stake-policy --minimum
+
+# Set adaptive split50
+nodectl config elections stake-policy --adaptive-split50
 
 # Override policy for a specific node
-nodectl config stake-policy --node node0 --fixed 500
+nodectl config elections stake-policy --node node0 --fixed 500
 
 # Remove a per-node override
-nodectl config stake-policy --node node0 --reset
+nodectl config elections stake-policy --node node0 --reset
 
 # Set elections tick interval
 nodectl config elections tick-interval 60
@@ -1763,7 +2135,7 @@ nodectl config wallet send \
 `nodectl config wallet stake` sends an election stake through a nominator pool. Use it to participate in elections manually.
 
 ```bash
-nodectl config wallet stake -b <BINDING> -a <AMOUNT> [-m <MAX_FACTOR>]
+nodectl config wallet stake -b <BINDING> -a <AMOUNT> [-m <MAX_FACTOR>] [--pool-even | --pool-odd]
 ```
 
 | Flag | Long | Required | Default | Description |
@@ -1771,6 +2143,8 @@ nodectl config wallet stake -b <BINDING> -a <AMOUNT> [-m <MAX_FACTOR>]
 | `-b` | `--binding` | Yes | — | Binding name (node-wallet-pool triple) |
 | `-a` | `--amount` | Yes | — | Stake amount in TON |
 | `-m` | `--max-factor` | No | `3.0` | Max factor: from `1.0` up to the network limit (**config param 17**), validated against the chain |
+|      | `--pool-even` | No | (default if neither flag is set) | TONCore only: use the pool for even validation rounds |
+|      | `--pool-odd` | No | — | TONCore only: use the pool for odd validation rounds |
 
 Example:
 
@@ -1836,6 +2210,9 @@ nodectl api stake-policy --fixed 1000000000000
 # Use 50% of available balance
 nodectl api stake-policy --split50
 
+# Use adaptive split50
+nodectl api stake-policy --adaptive-split50
+
 # Override policy for a specific node
 nodectl api stake-policy --node node0 --fixed 500000000000
 ```
@@ -1866,16 +2243,34 @@ curl -X POST http://127.0.0.1:8080/v1/elections/exclude \
   -d '{"nodes": ["node0"]}'
 
 # Set default stake policy
-curl -X POST http://127.0.0.1:8080/v1/stake_strategy \
+curl -X POST http://127.0.0.1:8080/v1/elections/settings \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"policy": "minimum"}'
 
 # Set per-node policy override
-curl -X POST http://127.0.0.1:8080/v1/stake_strategy \
+curl -X POST http://127.0.0.1:8080/v1/elections/settings \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"policy": {"fixed": 500000000000}, "node": "node0"}'
+
+# Update elections tick interval and max factor in one call
+curl -X POST http://127.0.0.1:8080/v1/elections/settings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"tick_interval": 60, "max_factor": 2.5}'
+
+# Replace TON HTTP API endpoint list
+curl -X POST http://127.0.0.1:8080/v1/ton-http-api \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"urls": ["https://toncenter.com/api/v2/jsonRpc"]}'
+
+# Add a wallet
+curl -X POST http://127.0.0.1:8080/v1/wallets \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"name": "wallet0", "secret": "wallet0-key", "version": "V3R2", "subwallet_id": 42, "workchain": -1}'
 
 # Control elections task
 curl -X POST http://127.0.0.1:8080/v1/task/elections \
