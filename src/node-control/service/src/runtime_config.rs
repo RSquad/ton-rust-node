@@ -39,6 +39,8 @@ pub struct RuntimeConfigStore {
     state: RwLock<Arc<RuntimeState>>,
     /// Unix timestamp of the last config mutation (seconds).
     updated_at: AtomicU64,
+    /// Serializes slow full `reload` with `update_and_save` / `update_with` so they never interleave.
+    config_op: tokio::sync::Mutex<()>,
     /// Path to the config file on disk, used for save/reload.
     config_path: String,
     /// Hash of the last config file content we loaded, to detect external changes.
@@ -115,6 +117,7 @@ impl RuntimeConfigStore {
                 master_wallet,
             })),
             updated_at: AtomicU64::new(time_format::now()),
+            config_op: tokio::sync::Mutex::new(()),
             config_path,
             last_file_hash: Mutex::new(hash),
         })
@@ -140,7 +143,9 @@ impl RuntimeConfigStore {
             rpc_client,
             master_wallet,
         });
-        *self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))? = new_state;
+        let mut guard =
+            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+        *guard = new_state;
         self.updated_at.store(time_format::now(), Ordering::Relaxed);
         Ok(())
     }
@@ -222,6 +227,7 @@ impl RuntimeConfigStore {
                 rpc_client,
             })),
             updated_at: AtomicU64::new(time_format::now()),
+            config_op: tokio::sync::Mutex::new(()),
             config_path: "noop".to_string(),
             last_file_hash: Mutex::new(None),
         }
@@ -265,6 +271,7 @@ impl RuntimeConfigStore {
     where
         F: FnOnce(&mut AppConfig),
     {
+        let _op = self.config_op.blocking_lock();
         let mut guard =
             self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
         let old = Arc::clone(&guard);
@@ -310,6 +317,7 @@ impl RuntimeConfigStore {
     where
         F: FnOnce(&mut AppConfig),
     {
+        let _op = self.config_op.blocking_lock();
         let mut guard =
             self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
         let old = Arc::clone(&guard);
@@ -336,6 +344,7 @@ impl RuntimeConfigStore {
     ///
     /// Use after REST mutations that change structural config (entities, endpoints).
     pub async fn force_reload(&self) -> anyhow::Result<()> {
+        let _op = self.config_op.lock().await;
         let config = (*self.get()).clone();
         self.reload(config).await
     }
@@ -349,19 +358,23 @@ impl RuntimeConfigStore {
         }
 
         tracing::info!("config changed, reloading from '{}'", self.config_path);
-        match AppConfig::load(Path::new(&self.config_path)) {
-            Ok(file_cfg) => match self.reload(file_cfg).await {
-                Ok(()) => {
-                    *self.last_file_hash.lock().expect("last_file_hash lock") = current_hash;
-                    true
-                }
-                Err(e) => {
-                    tracing::error!("reload config error: {:#}", e);
-                    false
-                }
-            },
+        let path = Path::new(&self.config_path);
+        let _op = self.config_op.lock().await;
+        let file_cfg = match AppConfig::load(path) {
+            Ok(c) => c,
             Err(e) => {
                 tracing::error!("reload config error: path='{}' error={:#}", self.config_path, e);
+                return false;
+            }
+        };
+        let hash_now = Self::hash_file(path);
+        match self.reload(file_cfg).await {
+            Ok(()) => {
+                *self.last_file_hash.lock().expect("last_file_hash lock") = hash_now;
+                true
+            }
+            Err(e) => {
+                tracing::error!("reload config error: {:#}", e);
                 false
             }
         }

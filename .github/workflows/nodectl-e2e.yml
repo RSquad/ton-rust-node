@@ -70,8 +70,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nodectl-e2e-logs
-          retention-days: 90
+          retention-days: 7
           if-no-files-found: warn
           path: |
-            src/node/tests/test_run_net_py/tmp/*.log
-            src/node/tests/test_run_net_py/singlehost-bootstrap.log
+            src/node/tests/test_run_net_py/tmp/nodectl-config.json
+            src/node/tests/test_run_net_py/tmp/nodectl-service.log
