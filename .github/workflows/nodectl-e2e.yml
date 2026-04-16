@@ -24,7 +24,7 @@ env:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     if: >
       (
         github.event_name == 'pull_request_review' &&
@@ -65,11 +65,13 @@ jobs:
           MASTER_WALLET_KEY: ${{ secrets.MASTER_WALLET_KEY }}
         run: bash node/tests/test_run_net_py/test_nodectl_ci.sh
 
-      - name: Upload logs on failure
-        if: failure()
+      - name: Upload e2e logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nodectl-e2e-logs
+          retention-days: 90
+          if-no-files-found: warn
           path: |
-            src/node/tests/test_run_net_py/tmp/nodectl-service.log
-            src/node/tests/test_run_net_py/tmp/singlehost-bootstrap.log
+            src/node/tests/test_run_net_py/tmp/*.log
+            src/node/tests/test_run_net_py/singlehost-bootstrap.log
