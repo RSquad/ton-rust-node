@@ -65,6 +65,8 @@ from typing import Optional
 ELECTOR_ADDR    = "-1:3333333333333333333333333333333333333333333333333333333333333333"
 WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2", "V4R2"]
 
+_STRIP_ANSI_CSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 # ── Scenario presets ──────────────────────────────────────────────────────────
 # SCENARIO selects a preset; individual env vars override any preset value.
 SCENARIOS: dict[str, dict] = {
@@ -101,6 +103,7 @@ SCENARIOS: dict[str, dict] = {
 
 @dataclasses.dataclass
 class Config:
+    print_sensitive:                     bool = True
     scenario:                            str  = "default"
     http_api_url:                        str  = "http://127.0.0.1:3301"
     node_cnt:                            int  = 6
@@ -147,6 +150,7 @@ class Config:
             raise ValueError(f"Unknown SCENARIO={scenario!r}; valid: {', '.join(SCENARIOS)}")
 
         cfg = cls(
+            print_sensitive                 = os.environ.get("PRINT_SENSITIVE", "1") in ("1", "true"),
             scenario                        = scenario,
             http_api_url                    = os.environ.get("HTTP_API_URL", "http://127.0.0.1:3301"),
             node_cnt                        = int(os.environ.get("NODE_CNT", str(d["node_cnt"]))),
@@ -508,6 +512,7 @@ class Bootstrap:
     @staticmethod
     def _parse_node_pool_map(log_text: str) -> dict[str, list[str]]:
         """Parse `[nodeN] opened nominator pool(s): addr1, addr2` lines."""
+        log_text = _STRIP_ANSI_CSI.sub("", log_text)
         out: dict[str, list[str]] = {}
         for line in log_text.splitlines():
             m = re.search(r"\[([^\]]+)\]\s+opened nominator pool\(s\):\s*(.*)$", line)
@@ -540,6 +545,8 @@ class Bootstrap:
         )
         os.environ["NODECTL_API_TOKEN"] = json.loads(result.stdout)["token"]
         self.log.info("  Logged in and exported NODECTL_API_TOKEN")
+        if self.cfg.print_sensitive:
+            self.log.info(f"NODECTL_API_TOKEN={os.environ['NODECTL_API_TOKEN']}")
 
     def _node_console(self, i: int) -> dict:
         path = self.paths.tmp_dir / f"node_{i}" / "console.json"
@@ -1240,10 +1247,10 @@ def main() -> None:
         sys.exit(1)
 
     os.environ["API_ENDPOINTS"] = cfg.http_api_url.rstrip("/") + "/"
-    vault_url = f"{paths.vault_file.resolve().as_uri()}?master_key={secrets.token_hex(32)}"
+    vault_url = f"file://vault.json?master_key={secrets.token_hex(32)}"
     os.environ["VAULT_URL"] = vault_url
-    redacted = re.sub(r"(master_key=)[^&]+", r"\1<redacted>", vault_url)
-    log.info(f"VAULT_URL={redacted}")
+    if cfg.print_sensitive:
+        log.info(f"VAULT_URL={vault_url}")
 
     # All nodectl CLI invocations discover the config via this env var
     os.environ["CONFIG_PATH"] = str(paths.nodectl_config)
