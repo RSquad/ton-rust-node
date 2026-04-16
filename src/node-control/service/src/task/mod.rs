@@ -52,13 +52,8 @@ impl ServiceTask for ElectionsTask {
         _app_config: Arc<AppConfig>,
     ) -> anyhow::Result<()> {
         let runtime = self.runtime_cfg.clone();
-        let snapshot: RuntimeSnapshotFn = Arc::new(move || {
-            (
-                runtime.get(),
-                runtime.wallets(),
-                runtime.pools(),
-            )
-        });
+        let snapshot: RuntimeSnapshotFn =
+            Arc::new(move || (runtime.get(), runtime.wallets(), runtime.pools()));
         elections::election_task::run(
             cancellation_ctx,
             snapshot,

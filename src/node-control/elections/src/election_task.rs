@@ -7,15 +7,13 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    RuntimeSnapshotFn,
     providers::{DefaultElectionsProvider, ElectionsProvider},
     runner::ElectionRunner,
-    RuntimeSnapshotFn,
 };
 use anyhow::Context;
 use common::{
-    app_config::BindingStatus,
-    snapshot::SnapshotStore,
-    task_cancellation::CancellationCtx,
+    app_config::BindingStatus, snapshot::SnapshotStore, task_cancellation::CancellationCtx,
 };
 use contracts::{ElectorWrapperImpl, contract_provider};
 use secrets_vault::vault::SecretVault;
@@ -38,12 +36,8 @@ pub async fn run(
     let wait_deadline = std::time::Instant::now() + WALLET_WAIT_TIMEOUT;
     let (app_config, wallets, pools) = loop {
         let (app_config, wallets, pools) = snapshot();
-        let missing: Vec<String> = app_config
-            .nodes
-            .keys()
-            .filter(|nid| !wallets.contains_key(*nid))
-            .cloned()
-            .collect();
+        let missing: Vec<String> =
+            app_config.nodes.keys().filter(|nid| !wallets.contains_key(*nid)).cloned().collect();
         if missing.is_empty() {
             break (app_config, wallets, pools);
         }

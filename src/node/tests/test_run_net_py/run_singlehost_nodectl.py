@@ -12,10 +12,10 @@ Phases:
   5.  Wait for HTTP API to become available
   6.  Generate all vault secrets (keys) before the service starts
   7.  Start nodectl service in background
-  8.  Set up auth, complete nodectl config via CLI (wallets, master prefund+wait on-chain,
-      nodes, tick intervals, pools, bindings, enable elections)
-  9.  Install bun dependencies (no-op if already done in phase 8)
-  10. Top up master wallet if balance still below target (usually skipped)
+  8.  Set up auth, complete nodectl config via CLI (wallets, nodes,
+      tick intervals, pools, bindings, enable elections)
+  9.  Install bun dependencies
+  10. Top up master wallet
   11. Wait for validator wallets/pools to open, top them up
   12. Wait for election participants
   13. Validate REST API: compare nodectl stake data with on-chain elector data
@@ -44,7 +44,6 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -267,84 +266,6 @@ class Bootstrap:
         except Exception:
             return None
 
-    def _account_balance_nanotons(self, address: str) -> Optional[int]:
-        """Return account balance in nanotons via ton-http-api jsonRPC, or None on failure."""
-        addr = address.strip()
-        try:
-            r = self._json_rpc("getAddressInformation", {"address": addr})
-            if r.get("ok") is False:
-                return None
-            res = r.get("result")
-            if not isinstance(res, dict):
-                return None
-            b = res.get("balance")
-            if b is None:
-                return None
-            s = str(b).strip().replace(" ", "").replace("_", "")
-            return int(s, 10)
-        except (TypeError, ValueError, KeyError, urllib.error.HTTPError, urllib.error.URLError):
-            return None
-        except Exception:
-            return None
-
-    def _wait_chain_after_topup(self, seq_before: Optional[int], max_wait: int = 120) -> None:
-        """Wait until masterchain advances so getAddressInformation reflects the top-up."""
-        self.log.info(
-            f"  Waiting for masterchain to advance after top-up (baseline seqno={seq_before}, "
-            f"up to {max_wait}s)..."
-        )
-        if seq_before is None:
-            self.log.warn("  No baseline seqno; sleeping 15s so the top-up can land in a block")
-            time.sleep(15)
-            return
-        deadline = time.time() + max_wait
-        while time.time() < deadline:
-            seq = self._seqno()
-            if seq is not None and seq > seq_before:
-                self.log.info(f"  Masterchain seqno advanced {seq_before} → {seq}")
-                time.sleep(3)
-                return
-            time.sleep(2)
-        self.log.warn(
-            f"  Seqno did not advance within {max_wait}s (current={self._seqno()}); "
-            "sleeping 10s and continuing — balance check may still succeed"
-        )
-        time.sleep(10)
-
-    def _wait_master_wallet_funded(self, master_addr: str, min_ton: float, timeout: int = 240) -> None:
-        """Poll getAddressInformation until balance is enough (nanotons)."""
-        need = int(min_ton * 1_000_000_000)
-        self.log.info(f"  Waiting for master on-chain balance ≥ {min_ton:g} TON ({timeout}s)...")
-        last_bal: Optional[int] = None
-        for _ in range(timeout):
-            bal = self._account_balance_nanotons(master_addr)
-            last_bal = bal if bal is not None else last_bal
-            if bal is not None and bal >= need:
-                self.log.info(f"  Master funded: {bal / 1e9:.4f} TON")
-                return
-            time.sleep(1)
-        hint = (
-            f" last_balance_read={last_bal}"
-            if last_bal is not None
-            else " getAddressInformation returned no usable balance"
-        )
-        self._fail(
-            f"Master wallet {master_addr} still below {min_ton:g} TON after {timeout}s.{hint}"
-        )
-
-    def _prefund_master_after_resolve(self, master_addr: str) -> None:
-        """Top up master and wait on-chain before long config reloads (avoids contracts racing zero balance)."""
-        self._ensure_bun_deps()
-        self.log.info(
-            f"  Prefunding master ({self.cfg.master_topup} TON) before adding nodes/pools "
-            "(contracts task needs on-chain balance during config hot-reload)..."
-        )
-        seq_before = self._seqno()
-        self._bun_topup(master_addr, self.cfg.master_topup)
-        self._wait_chain_after_topup(seq_before, max_wait=120)
-        min_ton = float(self.cfg.master_topup)
-        self._wait_master_wallet_funded(master_addr, min_ton=min_ton, timeout=240)
-
     def _participant_count(self) -> int:
         try:
             r = self._json_rpc("runGetMethod", {
@@ -379,7 +300,7 @@ class Bootstrap:
     def _bun_topup(self, address: str, amount: str) -> None:
         subprocess.run(["bun", "run", "topup", address, amount],
                        cwd=self.paths.load_net_dir, check=True,
-                       stdin=subprocess.DEVNULL, timeout=120)
+                       stdin=subprocess.DEVNULL, timeout=30)
 
     def _setup_auth(self) -> None:
         """Create API user and obtain JWT token."""
@@ -559,7 +480,6 @@ class Bootstrap:
 
         self._add_wallets()
         master_addr = self._resolve_master_wallet()
-        self._prefund_master_after_resolve(master_addr)
         self._add_nodes()
         self._configure_elections(master_addr)
 
@@ -681,17 +601,8 @@ class Bootstrap:
     # ── Phase 10: Top up master wallet ────────────────────────────────────────
 
     def phase10_topup_master(self, master_addr: str) -> None:
-        """Extra top-up if prefund in phase 8 was insufficient (usually a no-op)."""
-        target = int(float(self.cfg.master_topup) * 1_000_000_000)
-        bal = self._account_balance_nanotons(master_addr)
-        if bal is not None and bal >= int(target * 0.95):
-            self._phase(10, "Master wallet already at target balance; skipping duplicate top-up")
-            return
         self._phase(10, f"Topping up master wallet ({self.cfg.master_topup} TON)...")
-        seq_before = self._seqno()
         self._bun_topup(master_addr, self.cfg.master_topup)
-        self._wait_chain_after_topup(seq_before, max_wait=120)
-        self._wait_master_wallet_funded(master_addr, min_ton=2.0, timeout=240)
 
     # ── Phase 11: Wait for wallets/pools, top them up ────────────────────────
 

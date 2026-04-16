@@ -1,5 +1,0 @@
-[INFO]  === 2026-04-15 21:12:00 UTC run_singlehost_nodectl2.py started ===
-[INFO]  Script log: /Users/marina/GolandProjects/ton-rust-node/src/node/tests/test_run_net_py/singlehost-bootstrap-nodectl2.log
-[INFO]  Config: NODE_CNT=7, HTTP_API_URL=http://127.0.0.1:3301, CORE_VALIDATOR_DEPOSIT_TON=50000, OBSERVE_ROUNDS=4, OBSERVE_INTERVAL_SEC=20
-[INFO]  VAULT_URL=file://vault.json?master_key=8e648c2192d8497e800b1cc3a2792bc4465dca4f98ee4c241a32cdbfe9e4f3a4
-[INFO]  [1/12] Building nodectl...
