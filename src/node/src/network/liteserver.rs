@@ -73,11 +73,11 @@ use ton_api::{
     AnyBoxedSerialize, Constructor, IntoBoxed, TLObject,
 };
 use ton_block::{
-    error, fail, read_single_root_boc, write_boc, write_boc_multi, Account, AccountId,
-    AccountIdPrefixFull, Block, BlockError, BlockIdExt, BocWriter, BuilderData, Cell,
-    Deserializable, HashmapAugType, HashmapType, IBitstring, MerkleProof, MsgAddrStd,
-    MsgAddressInt, Result, Serializable, ShardIdent, ShardStateUnsplit, SliceData, Transaction,
-    UInt256, UsageTree, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID,
+    error, fail, find_leaf, read_single_root_boc, write_boc, write_boc_multi, Account, AccountId,
+    AccountIdPrefixFull, Block, BlockError, BlockIdExt, BlockInfo, BocWriter, BuilderData, Cell,
+    CurrencyCollection, Deserializable, HashmapAugType, HashmapType, IBitstring, MerkleProof,
+    MsgAddrStd, MsgAddressInt, Result, Serializable, ShardIdent, ShardStateUnsplit, SliceData,
+    Transaction, Transactions, UInt256, UsageTree, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID,
 };
 use ton_vm::{smart_contract_info::convert_stack, stack::StackItem};
 
@@ -402,14 +402,46 @@ async fn resolve_account_state(
     .await?
 }
 
-fn create_state_proof(block_root: &Cell) -> Result<MerkleProof> {
-    let usage_tree = UsageTree::with_params(block_root.clone(), true);
-    let block = Block::construct_from_cell(usage_tree.root_cell())?;
+fn visit_block_info(block: &Block) -> Result<BlockInfo> {
     let info = block.read_info()?;
     let _prev = info.read_prev_ref()?;
     let _vprev = info.read_prev_vert_ref()?;
     let _mc_ref = info.read_master_ref()?;
     let _su = block.read_state_update()?;
+    Ok(info)
+}
+
+/// Find nearest transaction cell using directed dict traversal (no full deserialization).
+/// Returns (lt, transaction_cell) or None if no matching entry found.
+fn find_nearest_tx_cell(
+    transactions: &Transactions,
+    lt: u64,
+    forward: bool,
+) -> Result<Option<(u64, Cell)>> {
+    let root = match transactions.data() {
+        Some(r) => r.clone(),
+        None => return Ok(None),
+    };
+    let key = lt.write_to_bitstring()?;
+    let mut path = BuilderData::new();
+    let next_index = if forward { 0 } else { 1 };
+    let result =
+        find_leaf::<Transactions>(root, &mut path, 64, key, next_index, false, false, &mut 0usize)?;
+    match result {
+        Some(mut slice) => {
+            let found_lt = u64::construct_from_cell(path.into_cell()?)?;
+            CurrencyCollection::skip(&mut slice)?;
+            let tx_cell = slice.reference(0)?;
+            Ok(Some((found_lt, tx_cell)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn create_state_proof(block_root: &Cell) -> Result<MerkleProof> {
+    let usage_tree = UsageTree::with_params(block_root.clone(), true);
+    let block = Block::construct_from_cell(usage_tree.root_cell())?;
+    let _info = visit_block_info(&block)?;
     MerkleProof::create_by_usage_tree(block_root, &usage_tree)
 }
 
@@ -1608,7 +1640,7 @@ impl LiteServerQuerySubscriber {
             let usage = UsageTree::with_params(root.clone(), true);
             let blk = Block::construct_from_cell(usage.root_cell())?;
 
-            let info = blk.read_info()?;
+            let info = visit_block_info(&blk)?;
             let lt_u = lt as u64;
             if lt_u < info.start_lt() || lt_u > info.end_lt() {
                 fail!(
@@ -2007,53 +2039,72 @@ impl LiteServerQuerySubscriber {
 
         tokio::task::spawn_blocking(move || {
             let root = read_single_root_boc(&raw)?;
-            let usage = UsageTree::with_params(root.clone(), true);
+            let usage = UsageTree::with_params(root.clone(), false);
             let block = Block::construct_from_cell(usage.root_cell())?;
+            let _info = visit_block_info(&block)?;
             let extra = block.read_extra()?;
             let acc_blocks = extra.read_account_blocks()?;
 
-            let mut all_txs: Vec<(TransactionId3, Cell)> = Vec::new();
-            acc_blocks.iterate_with_keys(|mut acc_id, acc_block| {
-                let acc_id = acc_id.get_next_hash()?;
-                acc_block.transactions().iterate_slices_with_keys(|lt, slice| {
-                    let tr_cell = slice.reference(0)?;
-                    let tid = TransactionId3 { account: acc_id.clone(), lt: lt as i64 };
-                    all_txs.push((tid, tr_cell));
-                    Ok(true)
-                })
-            })?;
+            let reverse = mode & REVERSE_ORDER != 0;
+            let forward = !reverse;
+            let need = count as usize;
+            let boundary_lt: u64 = if reverse { u64::MAX } else { 0 };
 
-            all_txs.sort_by(|a, b| a.0.lt.cmp(&b.0.lt));
-            if mode & REVERSE_ORDER != 0 {
-                all_txs.reverse();
-            }
-
-            if mode & AFTER_PRESENT != 0 {
+            // Determine starting point
+            let (mut cur_addr, mut cur_lt): (AccountId, u64) = if mode & AFTER_PRESENT != 0 {
                 let after_id =
                     after.ok_or_else(|| error!("AFTER_PRESENT flag is set but `after` is None"))?;
+                (AccountId::from(&after_id.account), after_id.lt as u64)
+            } else if reverse {
+                (AccountId::from([0xFF; 32]), u64::MAX)
+            } else {
+                (AccountId::from([0x00; 32]), 0u64)
+            };
 
-                if !after_id.account.is_zero() {
-                    if let Some(idx) = all_txs.iter().position(|(tid, _)| {
-                        tid.account == after_id.account && tid.lt == after_id.lt
-                    }) {
-                        all_txs.drain(..=idx);
+            let mut result_txs: Vec<(UInt256, u64, Cell)> = Vec::new();
+            let mut allow_same = true;
+            let mut incomplete = true;
+
+            while result_txs.len() < need {
+                // Find nearest account block via directed traversal
+                let (acc_id, acc_block) =
+                    match acc_blocks.find_leaf(&cur_addr, forward, allow_same, false)? {
+                        Some(pair) => pair,
+                        None => {
+                            incomplete = false;
+                            break;
+                        }
+                    };
+
+                allow_same = false;
+
+                // If moved to a different account, reset transaction lt to boundary
+                if acc_id != cur_addr {
+                    cur_lt = boundary_lt;
+                }
+                cur_addr = acc_id;
+
+                let acc_uint = cur_addr.clone().get_next_hash()?;
+
+                // Traverse transactions in this account using directed lookup
+                let transactions = acc_block.transactions();
+                loop {
+                    if result_txs.len() >= need {
+                        break;
                     }
-                } else {
-                    if mode & REVERSE_ORDER != 0 {
-                        all_txs.retain(|(tid, _)| tid.lt < after_id.lt);
-                    } else {
-                        all_txs.retain(|(tid, _)| tid.lt > after_id.lt);
+
+                    match find_nearest_tx_cell(transactions, cur_lt, forward)? {
+                        Some((lt, tx_cell)) => {
+                            result_txs.push((acc_uint.clone(), lt, tx_cell));
+                            cur_lt = lt;
+                        }
+                        None => {
+                            cur_lt = boundary_lt;
+                            break;
+                        }
                     }
                 }
             }
-            let need = count as usize;
-            let mut slice = all_txs;
-            let incomplete = if slice.len() > need {
-                slice.truncate(need);
-                true
-            } else {
-                false
-            };
 
             let proof_bytes = if mode & WANT_PROOF != 0 {
                 MerkleProof::create_by_usage_tree(&root, &usage)?.write_to_bytes()?
@@ -2061,14 +2112,14 @@ impl LiteServerQuerySubscriber {
                 Vec::new()
             };
 
-            let ids: Vec<TransactionId> = slice
+            let ids: Vec<TransactionId> = result_txs
                 .iter()
-                .map(|(t3, cell)| {
+                .map(|(account, lt, cell)| {
                     let flags = TID_ACCOUNT | TID_LT | TID_HASH;
                     TransactionId {
                         mode: flags,
-                        account: Some(t3.account.clone()),
-                        lt: Some(t3.lt),
+                        account: Some(account.clone()),
+                        lt: Some(*lt as i64),
                         hash: Some(cell.repr_hash()),
                         metadata: None,
                     }
@@ -2076,7 +2127,7 @@ impl LiteServerQuerySubscriber {
                 .collect();
 
             if ext {
-                let tx_roots: Vec<Cell> = slice.iter().map(|(_, c)| c.clone()).collect();
+                let tx_roots: Vec<Cell> = result_txs.iter().map(|(_, _, c)| c.clone()).collect();
                 let tx_boc = write_boc_multi(tx_roots)?;
                 Ok(BlockTransactionsExt {
                     id,
