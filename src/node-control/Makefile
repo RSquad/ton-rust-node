@@ -38,8 +38,7 @@ $(CONFIG_IDS):
 
 SINGLEHOST_DIR  ?= ../node/tests/test_run_net_py
 NOBUILD         ?= 0
-NODE_CNT        ?= 6
-PARTICIPANTS_WAIT ?= 600
+SCENARIO        ?= default
 
 # File target: rebuilt only when requirements.txt changes (or venv is missing).
 # Calling `make singlehost-venv` installs deps; subsequent calls are instant.
@@ -52,8 +51,7 @@ singlehost-venv: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
 test-e2e: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
 	cd $(SINGLEHOST_DIR) && \
 	  NOBUILD=$(NOBUILD) \
-	  NODE_CNT=$(NODE_CNT) \
-	  PARTICIPANTS_WAIT_SECONDS=$(PARTICIPANTS_WAIT) \
+	  SCENARIO=$(SCENARIO) \
 	  .venv/bin/python3 run_singlehost_nodectl.py
 
 stop-e2e:
