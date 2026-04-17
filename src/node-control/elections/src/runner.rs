@@ -1056,21 +1056,12 @@ impl ElectionRunner {
         if matches!(&node.stake_policy, StakePolicy::Split50 | StakePolicy::AdaptiveSplit50)
             && node.pool.as_ref().is_some_and(|p| p.pool_kind() == PoolKind::TONCore)
         {
-            // TONCore nominator: stake the full liquid balance of the selected pool.
-            if pool_free_balance < min_stake {
-                anyhow::bail!(
-                    "not enough funds: pool_available={} TON, min_stake={} TON",
-                    pool_free_balance as f64 / 1_000_000_000.0,
-                    min_stake as f64 / 1_000_000_000.0
-                );
-            }
-
             tracing::info!(
-                "node [{}] {}: strategy is ignored for TONCore nominator: stake all available balance",
+                "node [{}] {}: TONCore nominator — use total_balance (frozen + pool + elections_stake)",
                 node.stake_policy.to_string(),
                 node_id
             );
-            return Ok(pool_free_balance);
+            return Ok(total_balance);
         }
 
         match &node.stake_policy {
