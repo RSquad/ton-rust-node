@@ -1114,7 +1114,8 @@ class Bootstrap:
 
         for it in range(max_iters):
             data = self._fetch_nodectl_elections()
-            eid_raw = (data or {}).get("election_id")
+            r = (data or {}).get("result")
+            eid_raw = r.get("election_id") if isinstance(r, dict) else None
             eid = int(eid_raw) if eid_raw is not None else None
             status = (data or {}).get("status")
             elector_n = self._participant_count()

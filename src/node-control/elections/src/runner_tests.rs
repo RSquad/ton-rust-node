@@ -1125,7 +1125,7 @@ async fn test_recover_with_past_elections_frozen() {
         frozen_map.insert(
             PUB_KEY,
             FrozenParticipant {
-                wallet_addr: [0xAAu8; 32],
+                wallet_addr: POOL_ADDR,
                 weight: 123456789123456789,
                 stake: frozen_stake,
                 banned: false,

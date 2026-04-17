@@ -1007,6 +1007,7 @@ impl ElectionRunner {
         let min_stake = configs.elections_info.min_stake;
         tracing::info!("node [{}] calc stake", node_id);
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
+        let stake_addr = node.stake_addr().await?;
         let mut frozen_stake = 0;
         // Calculate frozen stake from past elections
         for election in ctx.past_elections {
@@ -1014,8 +1015,17 @@ impl ElectionRunner {
             if let Some(entry) = validator_entry {
                 let mut pubkey_array = [0u8; 32];
                 pubkey_array.copy_from_slice(&entry.public_key);
-                frozen_stake +=
-                    election.frozen_map.get(&pubkey_array).map(|frozen| frozen.stake).unwrap_or(0);
+                frozen_stake += election
+                    .frozen_map
+                    .get(&pubkey_array)
+                    .map(|frozen| {
+                        if frozen.wallet_addr.as_slice() == stake_addr.as_slice() {
+                            frozen.stake
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0);
             }
         }
 
