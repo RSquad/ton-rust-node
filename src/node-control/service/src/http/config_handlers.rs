@@ -1371,10 +1371,13 @@ pub async fn v1_bindings_add_handler(
     state
         .runtime_cfg
         .update_and_save(|cfg| {
-            cfg.bindings.insert(node, binding);
+            cfg.bindings.insert(node.clone(), binding);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
+    tracing::info!("http: binding added: {node}");
+    let bindings = state.runtime_cfg.get().bindings.keys().cloned().collect::<Vec<_>>().join(", ");
+    tracing::info!("http: bindings: {bindings}");
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.node } }))
 }

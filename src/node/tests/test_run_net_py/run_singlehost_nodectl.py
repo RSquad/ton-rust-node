@@ -562,12 +562,12 @@ class Bootstrap:
             self._nctl("config", "bind", "add",
                        "-n", f"node{i}", "-w", f"wallet{i}", "-p", f"pool{i}")
 
+        self._nctl("config", "bind", "ls")
+
         self.log.info("  Enabling elections...")
         self._nctl("config", "elections", "enable",
                    *[f"node{i}" for i in range(1, self.cfg.node_cnt + 1)])
         
-        # wait for the config hot-reload
-        time.sleep(10)
         self._nctl("config", "bind", "ls")
 
     # ── Phase 7: Start nodectl service ────────────────────────────────────────

@@ -297,7 +297,9 @@ impl RuntimeConfigStore {
         std::fs::write(path, &json).map_err(|e| {
             anyhow::anyhow!("save config error: path='{}' error={e}", path.display())
         })?;
-        tracing::debug!("config saved to '{}'", path.display());
+        tracing::info!("config saved to '{}'", path.display());
+        let bindings = cfg.bindings.keys().cloned().collect::<Vec<_>>().join(", ");
+        tracing::info!("config bindings saved: {bindings}");
         // Update the file hash so we don't treat our own write as an external change.
         *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
         Ok(())
@@ -337,8 +339,10 @@ impl RuntimeConfigStore {
     /// Use after REST mutations that change structural config (entities, endpoints).
     pub async fn force_reload(&self) -> anyhow::Result<()> {
         let config = (*self.get()).clone();
-        tracing::info!("force reloading is triggered");
-        self.reload(config).await
+        tracing::info!("force reload: start");
+        let res = self.reload(config).await?;
+        tracing::info!("force reload: end");
+        Ok(res)
     }
 
     /// Reload config from the file if it has changed externally.
