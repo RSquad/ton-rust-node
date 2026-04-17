@@ -478,6 +478,8 @@ class Bootstrap:
         self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
         self.log.info("  global tick_interval → 20")
 
+        time.sleep(10)
+
         self._add_wallets()
         master_addr = self._resolve_master_wallet()
         self._add_nodes()

@@ -121,6 +121,8 @@ impl RuntimeConfigStore {
     }
 
     async fn reload(&self, new_config: AppConfig) -> anyhow::Result<()> {
+        let wallets = new_config.wallets.keys().cloned().collect::<Vec<_>>().join(", ");
+        tracing::info!("config reload: wallets: {wallets}");
         let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
         let rpc_client = Self::load_rpc_client(&new_config).await?;
         if let Some(elections) = new_config.elections.as_ref() {
@@ -300,6 +302,8 @@ impl RuntimeConfigStore {
         tracing::info!("config saved to '{}'", path.display());
         let bindings = cfg.bindings.keys().cloned().collect::<Vec<_>>().join(", ");
         tracing::info!("config bindings saved: {bindings}");
+        let wallets = cfg.wallets.keys().cloned().collect::<Vec<_>>().join(", ");
+        tracing::info!("config wallets saved: {wallets}");
         // Update the file hash so we don't treat our own write as an external change.
         *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
         Ok(())

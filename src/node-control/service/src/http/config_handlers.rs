@@ -1035,7 +1035,9 @@ pub async fn v1_wallets_add_handler(
             cfg.wallets.insert(name, wallet_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
+    let wallets = state.runtime_cfg.get().wallets.keys().cloned().collect::<Vec<_>>().join(", ");
     state.config_changed.notify_one();
+    tracing::info!("http: wallets: {wallets}");
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
