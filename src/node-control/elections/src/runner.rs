@@ -1190,17 +1190,12 @@ impl ElectionRunner {
     }
 
     async fn build_validators_snapshot(&mut self) -> ValidatorsSnapshot {
-        let current_election_id =
-            self.snapshot_cache.last_elections.as_ref().map(|snapshot| snapshot.election_id);
-
         let mut node_ids = self.nodes.keys().cloned().collect::<Vec<String>>();
         node_ids.sort();
 
         let mut controlled_nodes = Vec::new();
         for node_id in node_ids {
             let node = self.nodes.get_mut(&node_id).expect("node not found");
-            let current_cycle_key =
-                current_election_id.and_then(|election_id| node.validator_config.find(election_id));
 
             let (validator_entry, is_next_validator) = find_validator_entries(
                 node,
@@ -1220,72 +1215,51 @@ impl ElectionRunner {
             node.is_validator = is_validator;
             node.is_next_validator = is_next_validator;
 
-            let participant = node.participant.as_ref();
             let wallet_addr = node.wallet.address().await.ok().map(|a| a.to_string());
             let pool_addr = node.pool_addr_cache.as_ref().map(|a| a.to_string());
-            let pubkey = validator_entry
+            let pubkey = validator_entry.as_ref().map(|(_, entry, ..)| {
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    entry.public_key.as_bytes(),
+                )
+            });
+            let adnl = validator_entry
                 .as_ref()
-                .map(|(_, entry)| {
-                    base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        entry.public_key.as_bytes(),
-                    )
+                .and_then(|(_, entry, ..)| {
+                    entry.adnl_addr.as_ref().map(|x| x.as_slice().as_slice())
                 })
-                .or_else(|| {
-                    participant.map(|p| {
-                        base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            p.pub_key.as_slice(),
-                        )
-                    })
-                });
-            let adnl = current_cycle_key
-                .as_ref()
-                .and_then(|entry| entry.adnl_addr())
-                .as_deref()
-                .or_else(|| {
-                    validator_entry.as_ref().and_then(|(_, entry)| {
-                        entry.adnl_addr.as_ref().map(|x| x.as_slice().as_slice())
-                    })
-                })
-                .or_else(|| participant.map(|p| p.adnl_addr.as_slice()))
                 .map(|x| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, x));
-            let key_id = current_cycle_key
-                .as_ref()
-                .map(|entry| {
-                    base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &entry.key_id,
-                    )
-                })
-                .or_else(|| {
-                    if node.key_id.is_empty() {
-                        None
-                    } else {
-                        Some(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &node.key_id,
-                        ))
-                    }
-                });
+            let key_id = validator_entry.as_ref().map(|(.., matched_entry)| {
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &matched_entry.key_id,
+                )
+            });
             let (key_election_id, key_expires_at, key_expires_at_utc, is_key_active) =
-                current_cycle_key
+                validator_entry
                     .as_ref()
-                    .map(|entry| {
-                        let expires = entry.expired_at;
+                    .map(|(_, _, matched_election_id, matched_entry)| {
+                        let expires = matched_entry.expired_at;
                         let now = time_format::now();
                         (
-                            current_election_id,
+                            Some(*matched_election_id),
                             Some(expires),
                             Some(time_format::format_ts(expires)),
                             Some(expires > now),
                         )
                     })
                     .unwrap_or((None, None, None, None));
-            let stake = participant.map(|p| nanotons_to_dec_string(p.stake));
+            let stake = validator_entry.as_ref().and_then(|(_, vd, ..)| {
+                let mut pubkey = [0u8; 32];
+                pubkey.copy_from_slice(vd.public_key.as_slice());
+                self.past_elections
+                    .iter()
+                    .find_map(|pe| pe.frozen_map.get(&pubkey))
+                    .map(|frozen| nanotons_to_dec_string(frozen.stake))
+            });
 
-            let validator_index = validator_entry.as_ref().map(|(idx, _)| *idx);
-            let weight = validator_entry.as_ref().map(|(_, entry)| entry.weight);
+            let validator_index = validator_entry.as_ref().map(|(idx, ..)| *idx);
+            let weight = validator_entry.as_ref().map(|(_, entry, ..)| entry.weight);
 
             // Compute and update binding status
             let is_participating = node.participant.is_some();
@@ -1517,13 +1491,13 @@ async fn find_validator_entries(
     node: &mut Node,
     current_vset: Option<&ValidatorSet>,
     next_vset: Option<&ValidatorSet>,
-) -> anyhow::Result<(Option<(u16, ValidatorDescr)>, bool)> {
+) -> anyhow::Result<(Option<(u16, ValidatorDescr, u64, ValidatorEntry)>, bool)> {
     let config = &node.validator_config;
 
     let mut election_ids = config.keys.keys().cloned().collect::<Vec<_>>();
     election_ids.sort();
 
-    let mut current_entry: Option<(u16, ValidatorDescr)> = None;
+    let mut current_entry: Option<(u16, ValidatorDescr, u64, ValidatorEntry)> = None;
     let mut is_in_next = false;
 
     for election_id in &election_ids[election_ids.len().saturating_sub(3)..] {
@@ -1541,7 +1515,8 @@ async fn find_validator_entries(
             && let Some(idx) =
                 vset.list().iter().position(|item| item.public_key.as_slice() == &key)
         {
-            current_entry = Some((u16::try_from(idx)?, vset.list()[idx].clone()));
+            current_entry =
+                Some((u16::try_from(idx)?, vset.list()[idx].clone(), *election_id, entry.clone()));
         }
 
         if !is_in_next
