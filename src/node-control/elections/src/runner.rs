@@ -1057,7 +1057,7 @@ impl ElectionRunner {
             && node.pool.as_ref().is_some_and(|p| p.pool_kind() == PoolKind::TONCore)
         {
             tracing::info!(
-                "node [{}] {}: TONCore nominator — use total_balance (frozen + pool + elections_stake)",
+                "node [{}] {}: TONCore nominator - ignore, stake all",
                 node.stake_policy.to_string(),
                 node_id
             );
