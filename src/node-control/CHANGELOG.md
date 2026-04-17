@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **master_wallet duplication / deletion** — reserved the logical name `master_wallet` so it cannot collide with a regular wallet entry.
 - **next elections range in `/v1/elections` response** - fixed calculation of next elections range in `/v1/elections` response.
+- **validator snapshot sourced from elections data instead of current vset** — `adnl`, `pubkey`, `key_id`, `key_election_id`, `key_expires_at`, and `stake` in `/v1/validators` were pulled from the pending election bid rather than the active validator set (p34) and `past_elections` frozen map, showing stale values when a node was validating and bidding for the next round simultaneously.
 
 ## [0.3.0] - 2026-03-24
 
