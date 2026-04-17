@@ -1058,8 +1058,8 @@ impl ElectionRunner {
         {
             tracing::info!(
                 "node [{}] {}: TONCore nominator - ignore, stake all",
-                node.stake_policy.to_string(),
-                node_id
+                node_id,
+                node.stake_policy.to_string()
             );
             return Ok(total_balance);
         }
