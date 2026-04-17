@@ -120,27 +120,28 @@ impl RuntimeConfigStore {
         })
     }
 
-    async fn reload(&self, new_config: AppConfig) -> anyhow::Result<()> {
+    async fn reload_state(&self) -> anyhow::Result<()> {
+        let cfg = self.get();
         let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
-        let rpc_client = Self::load_rpc_client(&new_config).await?;
-        if let Some(elections) = new_config.elections.as_ref() {
+        let rpc_client = Self::load_rpc_client(&cfg).await?;
+        if let Some(elections) = cfg.elections.as_ref() {
             Self::validate_max_factor(&rpc_client, elections).await?;
         }
         let master_wallet =
-            Self::load_master_wallet(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
-        let wallets =
-            Self::load_wallets(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
-        let pools = Self::load_pools(&new_config, rpc_client.clone(), &wallets).await?;
+            Self::load_master_wallet(&cfg, rpc_client.clone(), Some(vault.clone())).await?;
+        let wallets = Self::load_wallets(&cfg, rpc_client.clone(), Some(vault.clone())).await?;
+        let pools = Self::load_pools(&cfg, rpc_client.clone(), &wallets).await?;
 
-        let new_state = Arc::new(RuntimeState {
-            config: Arc::new(new_config),
+        let mut guard =
+            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+        *guard = Arc::new(RuntimeState {
+            config: guard.config.clone(),
             vault: Some(vault),
             pools,
             wallets,
             rpc_client,
             master_wallet,
         });
-        *self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))? = new_state;
         self.updated_at.store(time_format::now(), Ordering::Relaxed);
         Ok(())
     }
@@ -336,8 +337,18 @@ impl RuntimeConfigStore {
     ///
     /// Use after REST mutations that change structural config (entities, endpoints).
     pub async fn force_reload(&self) -> anyhow::Result<()> {
-        let config = (*self.get()).clone();
-        self.reload(config).await
+        self.reload_state().await?;
+        Ok(())
+    }
+
+    /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
+    /// from the given config. Does not read from disk.
+    ///
+    /// Use after config file has changed externally.
+    pub async fn reload(&self, config: AppConfig) -> anyhow::Result<()> {
+        let _ = self.update_with(|cfg| *cfg = config)?;
+        self.reload_state().await?;
+        Ok(())
     }
 
     /// Reload config from the file if it has changed externally.
