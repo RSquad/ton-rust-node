@@ -22,8 +22,8 @@ use contracts::{
 use mockall::mock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use ton_block::{
-    BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, Number16, SliceData,
-    ValidatorDescr, ValidatorSet,
+    BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, Number16, SigPubKey,
+    SliceData, UInt256, ValidatorDescr, ValidatorSet,
     config_params::{ConfigParam16, ConfigParam17},
     read_single_root_boc,
 };
@@ -1850,10 +1850,12 @@ async fn test_publish_snapshot_validators() {
     let node_snapshot = &validators.controlled_nodes[0];
     assert_eq!(node_snapshot.node_id, node_id);
     assert!(node_snapshot.wallet_addr.is_some());
-    assert!(node_snapshot.pubkey.is_some());
-    assert!(node_snapshot.adnl.is_some());
-    assert!(node_snapshot.key_id.is_some());
-    assert!(node_snapshot.stake.is_some());
+    // Node is not in the validator set, so vset-derived fields are None.
+    assert!(node_snapshot.pubkey.is_none());
+    assert!(node_snapshot.adnl.is_none());
+    assert!(node_snapshot.key_id.is_none());
+    assert!(node_snapshot.key_election_id.is_none());
+    assert!(node_snapshot.stake.is_none());
     assert!(!node_snapshot.is_validator, "not in vset");
 }
 
@@ -2959,4 +2961,154 @@ fn next_elections_range_after_window_closed_advances_to_next_next_cycle() {
         range.end - range.start,
         (cfg15.elections_start_before - cfg15.elections_end_before) as u64,
     );
+}
+
+// =====================================================
+// TEST: validator snapshot sources fields from vset
+// =====================================================
+
+const ADNL_VSET: [u8; 32] = [0x05u8; 32];
+const FROZEN_STAKE: u64 = 30_000_000_000_000; // 30 000 TON
+
+/// Build a ValidatorSet containing one validator with the given pubkey and ADNL.
+fn make_vset_with_validator(
+    utime_since: u32,
+    utime_until: u32,
+    pubkey: &[u8; 32],
+    adnl: &[u8; 32],
+) -> ValidatorSet {
+    let vd = ValidatorDescr::with_params(
+        SigPubKey::with_bytes(*pubkey),
+        100,
+        Some(UInt256::from(*adnl)),
+    );
+    ValidatorSet::new(utime_since, utime_until, 1, vec![vd]).expect("validator set")
+}
+
+#[tokio::test]
+async fn test_validator_snapshot_uses_vset_data() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+
+    // Elector: minimal (no active elections needed for snapshot).
+    setup_elector_no_elections(&mut harness.elector_mock);
+
+    // Provider: return validator_config with an existing key entry for ELECTION_ID.
+    harness.provider_mock.expect_validator_config().returning(|| {
+        let mut keys = HashMap::new();
+        keys.insert(
+            ELECTION_ID,
+            crate::providers::ValidatorEntry {
+                key_id: KEY_ID.to_vec(),
+                public_key: vec![],
+                adnl_addrs: vec![(ADNL_ADDR.to_vec(), ELECTION_ID + 7200)],
+                expired_at: ELECTION_ID + 7200,
+            },
+        );
+        Ok(ValidatorConfig { keys })
+    });
+    harness.provider_mock.expect_export_public_key().returning(|_| Ok(PUB_KEY.to_vec()));
+    harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    harness.provider_mock.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("skip")));
+    harness.provider_mock.expect_get_next_vset().returning(|| Ok(None));
+    harness.provider_mock.expect_shutdown().returning(|| Ok(()));
+
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id).await;
+    runner.refresh_validator_configs().await;
+
+    // Inject a validator set containing our node with a DIFFERENT adnl than the elections one.
+    let vset = make_vset_with_validator(
+        ELECTION_ID as u32,
+        ELECTION_ID as u32 + 3600,
+        &PUB_KEY,
+        &ADNL_VSET,
+    );
+    runner.snapshot_cache.last_validator_set = Some(vset);
+
+    // Inject past_elections with frozen stake for our pubkey.
+    let mut frozen_map = HashMap::new();
+    frozen_map.insert(
+        PUB_KEY,
+        FrozenParticipant {
+            wallet_addr: [0xAA; 32],
+            weight: 100,
+            stake: FROZEN_STAKE,
+            banned: false,
+        },
+    );
+    runner.past_elections = vec![PastElections {
+        election_id: ELECTION_ID,
+        unfreeze_at: ELECTION_ID + 7200,
+        stake_held: 7200,
+        vset_hash: vec![0; 32],
+        frozen_map,
+        total_stake: FROZEN_STAKE,
+        bonuses: 0,
+    }];
+
+    let store = Arc::new(SnapshotStore::new());
+    runner.publish_snapshot(&store).await;
+
+    let snapshot = store.get();
+    let node_snapshot = &snapshot.validators.controlled_nodes[0];
+
+    assert!(node_snapshot.is_validator, "should be in vset");
+    assert_eq!(node_snapshot.validator_index, Some(0));
+
+    // pubkey and adnl come from vset, NOT from elections data.
+    assert_eq!(
+        node_snapshot.pubkey,
+        Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &PUB_KEY)),
+    );
+    assert_eq!(
+        node_snapshot.adnl,
+        Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ADNL_VSET)),
+        "adnl must come from vset, not elections"
+    );
+
+    // key_id should come from the vset-matched config entry (KEY_ID).
+    assert_eq!(
+        node_snapshot.key_id,
+        Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &KEY_ID)),
+    );
+    assert_eq!(node_snapshot.key_election_id, Some(ELECTION_ID));
+
+    // stake comes from frozen_map, not participant.
+    assert_eq!(
+        node_snapshot.stake,
+        Some(nanotons_to_dec_string(FROZEN_STAKE)),
+        "stake must come from past_elections frozen_map"
+    );
+}
+
+#[tokio::test]
+async fn test_validator_snapshot_none_when_not_in_vset() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id).await;
+    let _ = runner.run().await;
+
+    // No vset injected — node is NOT a validator.
+    let store = Arc::new(SnapshotStore::new());
+    runner.publish_snapshot(&store).await;
+
+    let snapshot = store.get();
+    let node_snapshot = &snapshot.validators.controlled_nodes[0];
+
+    assert!(!node_snapshot.is_validator, "not in vset");
+    assert!(node_snapshot.pubkey.is_none(), "pubkey must be None when not in vset");
+    assert!(node_snapshot.adnl.is_none(), "adnl must be None when not in vset");
+    assert!(node_snapshot.key_id.is_none(), "key_id must be None when not in vset");
+    assert!(
+        node_snapshot.key_election_id.is_none(),
+        "key_election_id must be None when not in vset"
+    );
+    assert!(node_snapshot.stake.is_none(), "stake must be None when not in vset");
 }
