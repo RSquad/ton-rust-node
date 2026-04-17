@@ -32,9 +32,10 @@ use ton_block::{
 
 const POOL_ADDR: [u8; 32] = [0xBBu8; 32];
 const POOL_ADDR_1: [u8; 32] = [0xCCu8; 32];
+const WALLET_ADDR: [u8; 32] = [0xAAu8; 32];
 
 fn wallet_address() -> MsgAddressInt {
-    MsgAddressInt::standard(-1, [0xAAu8; 32])
+    MsgAddressInt::standard(-1, WALLET_ADDR)
 }
 
 fn pool_address() -> MsgAddressInt {
@@ -1125,7 +1126,7 @@ async fn test_recover_with_past_elections_frozen() {
         frozen_map.insert(
             PUB_KEY,
             FrozenParticipant {
-                wallet_addr: [0xAAu8; 32],
+                wallet_addr: WALLET_ADDR,
                 weight: 123456789123456789,
                 stake: frozen_stake,
                 banned: false,
@@ -2670,6 +2671,85 @@ async fn test_toncore_nominator_selects_free_pool() {
     // wallet_addr should be pool[1] (the free one), not pool[0]
     assert_eq!(participant.wallet_addr, addr_bytes(&pool_address_1()));
     assert_eq!(participant.stake, expected_stake);
+}
+
+#[tokio::test]
+async fn test_toncore_frozen_stake_ignored_when_wallet_addr_mismatches_stake_target() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+    let past_election_id = ELECTION_ID - 3600;
+    let misleading_frozen_stake: u64 = 500_000_000_000_000;
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    harness.elector_mock.expect_past_elections().returning(move || {
+        let mut frozen_map = HashMap::new();
+        frozen_map.insert(
+            PUB_KEY,
+            FrozenParticipant {
+                wallet_addr: POOL_ADDR,
+                weight: 1,
+                stake: misleading_frozen_stake,
+                banned: false,
+            },
+        );
+        Ok(vec![PastElections {
+            election_id: past_election_id,
+            unfreeze_at: ELECTION_ID + 3600,
+            stake_held: 7200,
+            vset_hash: vec![0u8; 32],
+            frozen_map,
+            total_stake: misleading_frozen_stake,
+            bonuses: 0,
+        }])
+    });
+
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot(p0, pool_address(), 2);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
+
+    let pool1_hex = hex::encode(POOL_ADDR_1);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool1_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let expected_stake = POOL_BALANCE - TONCORE_STORAGE_RESERVE - EXTRA_STORAGE_FEES;
+
+    let mut runner = harness.build(node_id).await;
+    {
+        let node = runner.nodes.get_mut(node_id).unwrap();
+        let mut keys = HashMap::new();
+        keys.insert(
+            past_election_id,
+            ValidatorEntry {
+                key_id: KEY_ID.to_vec(),
+                public_key: vec![],
+                adnl_addrs: vec![(ADNL_ADDR.to_vec(), past_election_id + 7200)],
+                expired_at: past_election_id + 7200,
+            },
+        );
+        node.validator_config = ValidatorConfig { keys };
+    }
+
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.participant.is_some());
+    let participant = node.participant.as_ref().unwrap();
+    assert_eq!(participant.wallet_addr, addr_bytes(&pool_address_1()));
+    assert_eq!(
+        participant.stake, expected_stake,
+        "frozen entry tied to the other TONCore pool must not inflate calc_stake"
+    );
 }
 
 #[tokio::test]
