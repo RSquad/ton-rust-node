@@ -1035,9 +1035,7 @@ pub async fn v1_wallets_add_handler(
             cfg.wallets.insert(name, wallet_config);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
-    let wallets = state.runtime_cfg.get().wallets.keys().cloned().collect::<Vec<_>>().join(", ");
     state.config_changed.notify_one();
-    tracing::info!("http: wallets: {wallets}");
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
@@ -1373,13 +1371,10 @@ pub async fn v1_bindings_add_handler(
     state
         .runtime_cfg
         .update_and_save(|cfg| {
-            cfg.bindings.insert(node.clone(), binding);
+            cfg.bindings.insert(node, binding);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
-    tracing::info!("http: binding added: {node}");
-    let bindings = state.runtime_cfg.get().bindings.keys().cloned().collect::<Vec<_>>().join(", ");
-    tracing::info!("http: bindings: {bindings}");
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.node } }))
 }

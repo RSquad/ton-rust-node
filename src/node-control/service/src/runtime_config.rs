@@ -121,19 +121,16 @@ impl RuntimeConfigStore {
     }
 
     async fn reload_state(&self) -> anyhow::Result<()> {
-        let new_config = self.get();
-        let wallets = new_config.wallets.keys().cloned().collect::<Vec<_>>().join(", ");
-        tracing::info!("config reload: wallets: {wallets}");
+        let cfg = self.get();
         let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
-        let rpc_client = Self::load_rpc_client(&new_config).await?;
-        if let Some(elections) = new_config.elections.as_ref() {
+        let rpc_client = Self::load_rpc_client(&cfg).await?;
+        if let Some(elections) = cfg.elections.as_ref() {
             Self::validate_max_factor(&rpc_client, elections).await?;
         }
         let master_wallet =
-            Self::load_master_wallet(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
-        let wallets =
-            Self::load_wallets(&new_config, rpc_client.clone(), Some(vault.clone())).await?;
-        let pools = Self::load_pools(&new_config, rpc_client.clone(), &wallets).await?;
+            Self::load_master_wallet(&cfg, rpc_client.clone(), Some(vault.clone())).await?;
+        let wallets = Self::load_wallets(&cfg, rpc_client.clone(), Some(vault.clone())).await?;
+        let pools = Self::load_pools(&cfg, rpc_client.clone(), &wallets).await?;
 
         let mut guard =
             self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
@@ -301,11 +298,7 @@ impl RuntimeConfigStore {
         std::fs::write(path, &json).map_err(|e| {
             anyhow::anyhow!("save config error: path='{}' error={e}", path.display())
         })?;
-        tracing::info!("config saved to '{}'", path.display());
-        let bindings = cfg.bindings.keys().cloned().collect::<Vec<_>>().join(", ");
-        tracing::info!("config bindings saved: {bindings}");
-        let wallets = cfg.wallets.keys().cloned().collect::<Vec<_>>().join(", ");
-        tracing::info!("config wallets saved: {wallets}");
+        tracing::debug!("config saved to '{}'", path.display());
         // Update the file hash so we don't treat our own write as an external change.
         *self.last_file_hash.lock().expect("last_file_hash lock") = Some(current_hash);
         Ok(())
@@ -348,6 +341,10 @@ impl RuntimeConfigStore {
         Ok(())
     }
 
+    /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
+    /// from the given config. Does not read from disk.
+    ///
+    /// Use after config file has changed externally.
     pub async fn reload(&self, config: AppConfig) -> anyhow::Result<()> {
         let _ = self.update_with(|cfg| *cfg = config)?;
         self.reload_state().await?;
