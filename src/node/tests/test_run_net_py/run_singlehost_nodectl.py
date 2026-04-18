@@ -40,6 +40,12 @@ Optional env vars:
   TONCORE_MIN_VALIDATOR_STAKE_TON / TONCORE_MIN_VALIDATOR_STAKE_ODD_TON (must differ),
   TONCORE_VALIDATOR_DEPOSIT_TON (per-slot deposit-validator amount in TON),
   BUN_TOPUP_TIMEOUT_SECONDS
+  TONCORE_NOMINATOR_LOAD (default 1 for SCENARIO=snp-toncore) — after validator deposit + pool top-up,
+    run bun add-nominators-to-pool (default 40× min stake TON; pool.fc op=0 action=100, wc=0 nominators) on one TONCore pool; after 1 election
+    transition in phase 14, run withdraw-nominators-from-pool (action 119). Set to 0 to skip.
+  TONCORE_NOMINATOR_STAKE_TON, TONCORE_NOMINATOR_COUNT, TONCORE_NOMINATOR_WITHDRAW_TON,
+  TONCORE_NOMINATOR_LOAD_NODE (e.g. node3), TONCORE_NOMINATOR_POOL_SLOT (0=first pool addr for that node),
+  TONCORE_NOMINATOR_LOAD_TIMEOUT_SECONDS
 """
 
 from __future__ import annotations
@@ -123,6 +129,13 @@ class Config:
     toncore_min_validator_stake_odd_ton: int  = 100_001
     toncore_validator_deposit_ton:       int  = 100_100
     wallet_versions:                     list = dataclasses.field(default_factory=lambda: list(WALLET_VERSIONS))
+    # TONCore multi-nominator load test (snp-toncore + bun scripts; see module docstring)
+    toncore_nominator_load:              bool = True
+    toncore_nominator_stake_ton:         str  = "10001"
+    toncore_nominator_count:             int  = 40
+    toncore_nominator_withdraw_ton:      str  = "0.2"
+    toncore_nominator_pool_slot:         int  = 0
+    toncore_nominator_load_node:         str  = ""  # empty → node{first_core_node}
 
     @property
     def snp_count(self) -> int:
@@ -142,6 +155,15 @@ class Config:
     def total_phases(self) -> int:
         return 15 if self.observe_rounds > 0 else 14
 
+    @property
+    def toncore_nominator_scenario_enabled(self) -> bool:
+        """SNP + TONCore + elections load: extra nominators on one TONCore pool (snp-toncore only)."""
+        return (
+            self.scenario == "snp-toncore"
+            and self.toncore_nominator_load
+            and self.has_toncore
+        )
+
     @classmethod
     def from_env(cls) -> Config:
         scenario = os.environ.get("SCENARIO", "default")
@@ -149,6 +171,13 @@ class Config:
         if d is None:
             raise ValueError(f"Unknown SCENARIO={scenario!r}; valid: {', '.join(SCENARIOS)}")
 
+        def _env_bool(key: str, default: bool) -> bool:
+            v = os.environ.get(key)
+            if v is None:
+                return default
+            return v.strip().lower() in ("1", "true", "yes")
+
+        nom_load_default = scenario == "snp-toncore"
         cfg = cls(
             print_sensitive                 = os.environ.get("PRINT_SENSITIVE", "1") in ("1", "true"),
             scenario                        = scenario,
@@ -180,6 +209,12 @@ class Config:
             toncore_validator_deposit_ton   = int(os.environ.get(
                 "TONCORE_VALIDATOR_DEPOSIT_TON", str(d["toncore_validator_deposit_ton"])
             )),
+            toncore_nominator_load          = _env_bool("TONCORE_NOMINATOR_LOAD", nom_load_default),
+            toncore_nominator_stake_ton     = os.environ.get("TONCORE_NOMINATOR_STAKE_TON", "10001"),
+            toncore_nominator_count         = int(os.environ.get("TONCORE_NOMINATOR_COUNT", "40")),
+            toncore_nominator_withdraw_ton  = os.environ.get("TONCORE_NOMINATOR_WITHDRAW_TON", "0.2"),
+            toncore_nominator_pool_slot     = int(os.environ.get("TONCORE_NOMINATOR_POOL_SLOT", "0")),
+            toncore_nominator_load_node     = os.environ.get("TONCORE_NOMINATOR_LOAD_NODE", "").strip(),
         )
         cfg._validate()
         return cfg
@@ -207,6 +242,8 @@ class Config:
                 f"TONCORE_VALIDATOR_DEPOSIT_TON ({dep}) must be >= max(min stake even, odd) ({need} TON). "
                 "Otherwise deposit-validator will fail or leave the pool below its minimum."
             )
+        if self.toncore_nominator_count < 1 or self.toncore_nominator_count > 40:
+            raise ValueError(f"TONCORE_NOMINATOR_COUNT must be 1..40, got {self.toncore_nominator_count}")
 
 
 @dataclasses.dataclass
@@ -289,6 +326,8 @@ class Bootstrap:
         self._proc:           Optional[subprocess.Popen] = None
         self._nodectl_log:    Optional[Path]             = None
         self._service_log_fh: Optional[object]           = None
+        self._toncore_nominator_pool_addr: Optional[str] = None
+        self._toncore_nominator_withdraw_done: bool = False
 
     # ── Orchestration ─────────────────────────────────────────────────────────
 
@@ -494,6 +533,67 @@ class Bootstrap:
         subprocess.run(["bun", "run", "topup", address, amount],
                        cwd=self.paths.load_net_dir, check=True,
                        stdin=subprocess.DEVNULL, timeout=timeout)
+
+    def _toncore_nominator_pool_address(self, node_pool_map: dict[str, list[str]]) -> Optional[str]:
+        """Pick one TONCore pool raw address (even/odd slot) for multi-nominator bun scripts."""
+        node = self.cfg.toncore_nominator_load_node or f"node{self.cfg.first_core_node}"
+        addrs = node_pool_map.get(node, [])
+        slot = self.cfg.toncore_nominator_pool_slot
+        if slot < 0 or slot >= len(addrs):
+            self.log.warn(
+                f"  TONCore nominator load: no pool address for {node!r} slot {slot} "
+                f"(have {len(addrs)} address(es): {addrs!r})"
+            )
+            return None
+        return addrs[slot]
+
+    def _run_toncore_nominator_stakes(self, pool_addr: str) -> None:
+        """40 (or N) nominators deposit via test_load_net bun script (op=0 action=100, basechain wallets)."""
+        timeout_raw = os.environ.get("TONCORE_NOMINATOR_LOAD_TIMEOUT_SECONDS", "7200")
+        try:
+            timeout = int(timeout_raw)
+        except ValueError:
+            timeout = 7200
+        c, s = self.cfg.toncore_nominator_count, self.cfg.toncore_nominator_stake_ton
+        self.log.info(
+            f"  TONCore nominator load: add-nominators-to-pool → {pool_addr} "
+            f"({c}× {s} TON, op=0/'d')..."
+        )
+        subprocess.run(
+            [
+                "bun", "run", "add-nominators-to-pool", "--",
+                pool_addr, s, str(c),
+            ],
+            cwd=self.paths.load_net_dir,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            env={**os.environ},
+        )
+
+    def _run_toncore_nominator_withdraw(self, pool_addr: str) -> None:
+        """Request withdraw after one election round (opcode 0, action 119)."""
+        timeout_raw = os.environ.get("TONCORE_NOMINATOR_LOAD_TIMEOUT_SECONDS", "7200")
+        try:
+            timeout = int(timeout_raw)
+        except ValueError:
+            timeout = 7200
+        c, w = self.cfg.toncore_nominator_count, self.cfg.toncore_nominator_withdraw_ton
+        self.log.info(
+            f"  TONCore nominator load: withdraw-nominators-from-pool → {pool_addr} "
+            f"({c}× msg value {w} TON, action=119)..."
+        )
+        subprocess.run(
+            [
+                "bun", "run", "withdraw-nominators-from-pool", "--",
+                pool_addr, w, str(c), "119",
+            ],
+            cwd=self.paths.load_net_dir,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            env={**os.environ},
+        )
 
     def _wallet_address_from_config(self, wallet_name: str) -> str:
         """Resolve raw workchain address for a named wallet via nodectl JSON."""
@@ -923,7 +1023,7 @@ class Bootstrap:
                 self.log.info(f"    {node}: {len(addrs)} pool(s) — {', '.join(addrs)}")
 
         if self.cfg.has_toncore:
-            self._toncore_deposit_all()
+            self._toncore_deposit_all(node_pool_map)
 
         for addr in pool_addrs:
             self.log.info(f"  Top up pool {addr} ({self.cfg.pool_topup} TON)")
@@ -933,7 +1033,7 @@ class Bootstrap:
 
         return wallet_addrs, pool_addrs
 
-    def _toncore_deposit_all(self) -> None:
+    def _toncore_deposit_all(self, node_pool_map: dict[str, list[str]]) -> None:
         """Fund TONCore validator wallets, then deposit-validator even + odd for each core node."""
         first = self.cfg.first_core_node
         last  = self.cfg.node_cnt
@@ -969,6 +1069,13 @@ class Bootstrap:
                 self._nctl("config", "pool", "deposit-validator",
                            "-b", bname, "-a", dep_s, f"--pool-{slot}", "--yes", timeout=180)
                 time.sleep(2)
+
+        if self.cfg.toncore_nominator_scenario_enabled and node_pool_map:
+            nominator_pool = self._toncore_nominator_pool_address(node_pool_map)
+            if nominator_pool:
+                self._toncore_nominator_pool_addr = nominator_pool
+                self._run_toncore_nominator_stakes(nominator_pool)
+                time.sleep(20)
 
     # ── Phase 12: Wait for election participants ──────────────────────────────
 
@@ -1126,6 +1233,14 @@ class Bootstrap:
                     f"  --- Election transition #{transitions}: id {last_eid} → {eid} "
                     f"(elector participants={elector_n}, api_status={status}) ---"
                 )
+                if (
+                    self._toncore_nominator_pool_addr
+                    and self.cfg.toncore_nominator_scenario_enabled
+                    and not self._toncore_nominator_withdraw_done
+                    and transitions >= 1
+                ):
+                    self._run_toncore_nominator_withdraw(self._toncore_nominator_pool_addr)
+                    self._toncore_nominator_withdraw_done = True
 
             if isinstance(eid, int):
                 last_eid = eid
@@ -1224,6 +1339,12 @@ def main() -> None:
         )
     if cfg.stake_policy:
         log.info(f"  STAKE_POLICY={cfg.stake_policy}")
+    if cfg.toncore_nominator_scenario_enabled:
+        log.info(
+            f"  TONCore nominator load: {cfg.toncore_nominator_count}× "
+            f"{cfg.toncore_nominator_stake_ton} TON stake (op=0 action=100, wc=0 nominators), "
+            f"then withdraw after 1 election transition (action=119, msg {cfg.toncore_nominator_withdraw_ton} TON)"
+        )
 
     bootstrap = Bootstrap(cfg, paths, log)
 
