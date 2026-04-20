@@ -8,7 +8,10 @@
  */
 use control_client::client_api::Account as ControlClientAccount;
 use std::collections::HashMap;
-use ton_block::{ValidatorSet, config_params::ConfigParam15};
+use ton_block::{
+    ValidatorSet,
+    config_params::{ConfigParam15, ConfigParam16, ConfigParam17},
+};
 
 fn serialize_hex<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -94,5 +97,29 @@ pub trait ElectionsProvider: Send + Sync {
     async fn account(&mut self, address: &str) -> anyhow::Result<Account>;
     async fn export_public_key(&mut self, key_id: &[u8]) -> anyhow::Result<Vec<u8>>;
     async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet>;
+    async fn config_param_16(&mut self) -> anyhow::Result<ConfigParam16> {
+        anyhow::bail!("config_param_16 not implemented")
+    }
+    async fn config_param_17(&mut self) -> anyhow::Result<ConfigParam17> {
+        anyhow::bail!("config_param_17 not implemented")
+    }
     async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>>;
+
+    /// Generate a new ADNL key on the validator node and register it as an ADNL address.
+    /// Returns the key_id (32-byte hash) which becomes the ADNL address.
+    async fn generate_adnl_addr(&mut self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("generate_adnl_addr not implemented")
+    }
+
+    /// Attach an existing ADNL address to a validator permanent key for the given election cycle.
+    /// The ADNL key must already exist on the node (created by `generate_adnl_addr`).
+    async fn register_adnl_addr(
+        &mut self,
+        adnl_key_id: Vec<u8>,
+        perm_key_id: Vec<u8>,
+        until: u64,
+    ) -> anyhow::Result<()> {
+        let _ = (adnl_key_id, perm_key_id, until);
+        anyhow::bail!("register_adnl_addr not implemented")
+    }
 }

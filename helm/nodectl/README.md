@@ -35,14 +35,14 @@ nodectl uses four independent lists connected by bindings:
 |--------|---------|
 | **Nodes** | ADNL connections to validator Control Servers |
 | **Wallets** | Validator wallets for signing transactions |
-| **Pools** | Single Nominator Pool contracts |
+| **Pools** | Single Nominator Pool (SNP) contracts and/or **TONCore** nominator pool pairs (even + odd slots) |
 | **Bindings** | Map each node to a wallet and optionally a pool |
 
 A binding ties everything together: node `node0` uses wallet `wallet0` and pool `pool0`. This decoupled model allows flexible mapping — wallets and pools are reusable, named independently from nodes.
 
 ### Single Nominator Pool (SNP)
 
-nodectl currently supports **only** Single Nominator Pool contracts for staking. The SNP contract address is deterministic:
+For SNP staking, the contract address is deterministic:
 
 ```
 address = hash(snp_code + owner_address + validator_wallet_address)
@@ -51,6 +51,10 @@ address = hash(snp_code + owner_address + validator_wallet_address)
 This means **each node must have its own wallet**. If two nodes share a wallet (= same validator address), their pools get the same address, which breaks election participation. Always create one wallet per node.
 
 When you add a pool with just the owner address (no explicit contract address), nodectl computes the SNP address automatically on startup from the owner and the bound validator wallet.
+
+### TONCore nominator pool
+
+nodectl also supports **TONCore** nominator pools: each logical pool name has an **`even`** and an **`odd`** slot (separate contracts). A single slot participates in **one of two consecutive** validation rounds; to cover **every** round with TONCore you normally configure **both** slots. Validators must run **`deposit-validator`** so **validator stake** (TON from the **binding’s validator wallet**) is locked in each slot, at least up to that slot’s **`min-validator-stake`**. Stake policies **Split50 / AdaptiveSplit50** behave differently than on SNP for TONCore — nodectl uses the **full liquid balance** of the **active** slot’s pool for the stake calculation (see [setup.md — TONCore nominator pools](docs/setup.md#toncore-nominator-pools)).
 
 ### Auto-deploy
 

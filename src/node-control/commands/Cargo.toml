@@ -1,6 +1,6 @@
 [package]
 name = "commands"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = 'GPL-3.0'
 
@@ -12,6 +12,7 @@ clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"
 base64 = "0.22.1"
 colored = "2.0"
+hex = "0.4"
 reqwest = { version = "0.12.24", default-features = false, features = [
     "json",
     "rustls-tls",

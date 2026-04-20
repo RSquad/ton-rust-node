@@ -9,16 +9,17 @@
 use anyhow::Context;
 use colored::Colorize;
 use common::{
-    app_config::{AppConfig, WalletConfig},
+    app_config::{AppConfig, PoolConfig, WalletConfig},
     task_cancellation::CancellationCtx,
+    ton_utils::extract_max_factor,
     vault_signer::VaultSigner,
 };
-use contracts::{WalletContract, contract_provider};
+use contracts::{SingleNominatorWrapper, WalletContract, contract_provider, resolve_toncore_pool};
 use secrets_vault::{
     errors::error::VaultError, types::secret::Secret, vault::SecretVault,
     vault_builder::SecretVaultBuilder,
 };
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{collections::HashMap, fs, io::Write, path::Path, sync::Arc};
 use ton_block::MsgAddressInt;
 use ton_http_api_client::v2::{
     client_json_rpc::ClientJsonRpc,
@@ -28,6 +29,72 @@ use ton_http_api_client::v2::{
 const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2);
 pub const SEND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+
+/// Logical name for the master wallet in CLI, `get_wallet_config`, and `config wallet ls`.
+pub const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
+
+/// `max_stake_factor` from masterchain config param 17 as a float multiplier (e.g. `3.0`).
+pub async fn fetch_network_max_factor(rpc_client: &ClientJsonRpc) -> anyhow::Result<f32> {
+    extract_max_factor(rpc_client.get_config_param(17).await?)
+}
+
+/// TONCore nominator (two pools): slot index from `--pool-even` / `--pool-odd` (`0` = even round, `1` = odd).
+#[inline]
+pub fn toncore_pool_slot_from_cli_flags(pool_even: bool, pool_odd: bool) -> usize {
+    match (pool_even, pool_odd) {
+        (_, true) => 1,
+        (true, false) | (false, false) => 0,
+    }
+}
+
+/// Resolve the on-chain pool address from config, validator wallet address, and pool slot index.
+///
+/// Handles SNP (address or derived from owner), single TONCore, and dual-pool TONCore.
+/// `pool_slot` is `0` for even rounds (or SNP) and `1` for odd rounds (`--pool-odd`).
+pub fn resolve_pool_address_from_config(
+    pool_cfg: &PoolConfig,
+    validator_addr: &MsgAddressInt,
+    pool_slot: usize,
+) -> anyhow::Result<MsgAddressInt> {
+    match pool_cfg {
+        PoolConfig::SNP { .. } if pool_slot != 0 => {
+            anyhow::bail!("--pool-odd is not applicable for SNP pools");
+        }
+        PoolConfig::SNP { address, owner } => match (address, owner) {
+            (Some(addr), _) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
+            (None, Some(owner)) => {
+                let owner_addr =
+                    owner.parse::<MsgAddressInt>().context("invalid pool owner address")?;
+                SingleNominatorWrapper::calculate_address(-1, &owner_addr, validator_addr)
+            }
+            (None, None) => anyhow::bail!("Pool has neither address nor owner configured"),
+        },
+        PoolConfig::TONCore { pools } => {
+            if pool_slot > 1 {
+                anyhow::bail!("TONCore pool slot must be 0 (even) or 1 (odd)");
+            }
+            if pool_slot == 1 && pools[1].is_none() {
+                anyhow::bail!(
+                    "--pool-odd is only valid for TONCore nominator with two pool slots configured"
+                );
+            }
+            let slot = pools[pool_slot].as_ref().ok_or_else(|| {
+                anyhow::anyhow!("TONCore pool slot {} is not configured", pool_slot)
+            })?;
+            match (&slot.address, &slot.params) {
+                (Some(addr), None) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
+                (addr, Some(params)) => {
+                    let resolved =
+                        resolve_toncore_pool(validator_addr, addr.as_deref(), params.clone())?;
+                    Ok(resolved.address)
+                }
+                (None, None) => {
+                    anyhow::bail!("TONCore pool slot {} has neither address nor params", pool_slot)
+                }
+            }
+        }
+    }
+}
 
 pub fn warn_missing_secret(secret_name: &str) {
     println!("\n{} {}", "[WARNING]".yellow().bold(), "Vault secret is missing".yellow(),);
@@ -43,10 +110,12 @@ pub fn warn_missing_secret(secret_name: &str) {
     );
 }
 
-pub fn warn_ton_api_unavailable(error: &anyhow::Error, note: &str) {
-    println!("\n{} {}", "[WARNING]".yellow().bold(), "Failed to connect to TON API".yellow(),);
-    println!("  {} {}", "Reason:".yellow().bold(), error.root_cause().to_string());
-    println!("  {} {}", "Note:".yellow().bold(), note.yellow().italic());
+pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
+    print!("{prompt} [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 pub fn save_config(config: &AppConfig, path: &Path) -> anyhow::Result<()> {
@@ -62,18 +131,6 @@ pub async fn load_config_vault(
     let vault = SecretVaultBuilder::from_env().await?;
 
     Ok((config, vault))
-}
-
-pub async fn check_ton_api_connection(rpc_client: &ClientJsonRpc) -> anyhow::Result<()> {
-    rpc_client.get_config_param(1).await.map(|_| ())
-}
-
-pub async fn try_create_rpc_client(config: &AppConfig) -> anyhow::Result<Arc<ClientJsonRpc>> {
-    let client = ClientJsonRpc::connect_many(
-        config.ton_http_api.resolved_endpoints(),
-        config.ton_http_api.api_key.clone(),
-    )?;
-    check_ton_api_connection(&client).await.map(|_| Arc::new(client))
 }
 
 pub async fn load_config_vault_rpc_client(
@@ -136,7 +193,8 @@ pub fn get_wallet_config<'a>(
     wallets: &'a HashMap<String, WalletConfig>,
     master_wallet: Option<&'a WalletConfig>,
 ) -> anyhow::Result<&'a WalletConfig> {
-    let config = if name == "master_wallet" { master_wallet } else { wallets.get(name) };
+    let config =
+        if name == MASTER_WALLET_RESERVED_NAME { master_wallet } else { wallets.get(name) };
     config.ok_or_else(|| anyhow::anyhow!("Wallet not found '{}'", name))
 }
 
@@ -217,4 +275,175 @@ pub async fn wait_for_seqno_change(
         Ok(info.seqno != initial_seqno)
     })
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Service API client helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the config path or an error if not provided.
+pub fn require_config(config_path: Option<&str>) -> anyhow::Result<&Path> {
+    config_path.map(Path::new).ok_or_else(|| anyhow::anyhow!("config is required for this command"))
+}
+
+/// Resolves the base URL for the nodectl service API.
+/// Priority: `--url` flag, then `http.bind` from config file, then error.
+pub fn resolve_service_url(url: Option<&str>, config_path: Option<&str>) -> anyhow::Result<String> {
+    if let Some(u) = url {
+        return Ok(normalize_base_url(u));
+    }
+    if let Some(path) = config_path {
+        let path = Path::new(path);
+        if path.exists() {
+            let app_cfg = AppConfig::load(Path::new(path))?;
+            return Ok(normalize_base_url(&app_cfg.http.bind));
+        }
+    }
+    // Fallback to localhost:8080 if no URL or config path is provided.
+    Ok("http://127.0.0.1:8080".to_string())
+}
+
+pub(crate) fn normalize_base_url(url: &str) -> String {
+    let mut base = url.to_string();
+    let trimmed = base.trim_start_matches("http://").trim_start_matches("https://");
+    if trimmed.starts_with("0.0.0.0") {
+        base = base.replacen("0.0.0.0", "127.0.0.1", 1);
+    }
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        base = format!("http://{}", base);
+    }
+    base.trim_end_matches('/').to_string()
+}
+
+/// Sends a GET request to the service API and returns the response body.
+pub async fn api_get(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::GET, base_url, path, token, None::<&()>).await
+}
+
+/// Sends a POST request with a JSON body and returns the response body.
+pub async fn api_post<B>(
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &B,
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
+    send_request(reqwest::Method::POST, base_url, path, token, Some(body)).await
+}
+
+/// Sends a DELETE request and returns the response body.
+pub async fn api_delete(base_url: &str, path: &str, token: Option<&str>) -> anyhow::Result<String> {
+    send_request(reqwest::Method::DELETE, base_url, path, token, None::<&()>).await
+}
+
+async fn send_request<B>(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&B>,
+) -> anyhow::Result<String>
+where
+    B: serde::Serialize,
+{
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), path.trim_start_matches('/'));
+    let client = reqwest::Client::new();
+    let mut req = client.request(method, &url);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let response = req.send().await.context(format!("failed to connect to {}", url))?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        // Try to extract `error.message` from the standard ApiErrorResponse.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(msg) =
+                v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        {
+            anyhow::bail!("{msg}");
+        }
+        anyhow::bail!("request failed: status={}, body={}", status, body);
+    }
+    Ok(body)
+}
+
+/// Best-effort check that returns `true` only if we could reach the local vault
+/// AND the secret is definitely absent. Any other outcome (no vault, lookup
+/// error) is treated as "unknown" and produces no warning.
+pub async fn vault_secret_missing(secret_name: &str) -> bool {
+    match SecretVaultBuilder::from_env().await {
+        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_base_url_adds_http_scheme_when_missing() {
+        assert_eq!(normalize_base_url("example.com:8080"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1:9000"), "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_http_scheme() {
+        assert_eq!(normalize_base_url("http://example.com:8080"), "http://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_existing_https_scheme() {
+        assert_eq!(normalize_base_url("https://example.com:8080"), "https://example.com:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_bare_0_0_0_0_with_loopback() {
+        assert_eq!(normalize_base_url("0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_http_scheme() {
+        assert_eq!(normalize_base_url("http://0.0.0.0:8080"), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_0_0_0_0_with_https_scheme() {
+        assert_eq!(normalize_base_url("https://0.0.0.0:8080"), "https://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_replaces_only_first_0_0_0_0_occurrence() {
+        assert_eq!(
+            normalize_base_url("http://0.0.0.0/redirect/0.0.0.0"),
+            "http://127.0.0.1/redirect/0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_base_url_leaves_non_0_0_0_0_host_unchanged() {
+        assert_eq!(normalize_base_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(normalize_base_url("http://10.0.0.0:8080"), "http://10.0.0.0:8080");
+    }
+
+    #[test]
+    fn test_normalize_base_url_preserves_path() {
+        assert_eq!(
+            normalize_base_url("http://example.com:8080/api/v1"),
+            "http://example.com:8080/api/v1"
+        );
+        assert_eq!(normalize_base_url("example.com/path"), "http://example.com/path");
+    }
+
+    #[test]
+    fn test_normalize_base_url_trims_trailing_slash() {
+        assert_eq!(normalize_base_url("http://example.com:8080/"), "http://example.com:8080");
+        assert_eq!(normalize_base_url("127.0.0.1/"), "http://127.0.0.1");
+    }
 }

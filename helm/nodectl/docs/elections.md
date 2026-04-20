@@ -134,7 +134,7 @@ nodectl config stake-policy --reset --node node0
 
 ## Single Nominator Pool
 
-nodectl supports Single Nominator Pool (SNP) contracts for staking. When a pool is configured for a node (via bindings), transactions are sent to the pool contract instead of directly to the Elector.
+nodectl supports **Single Nominator Pool (SNP)** and **TONCore** nominator pools for staking. When a pool is configured for a node (via bindings), transactions are sent to the pool contract instead of directly to the Elector.
 
 ### Configuration
 
@@ -171,6 +171,10 @@ When you specify only the `owner` (no `address`), nodectl computes the pool addr
 
 Because the SNP address depends on both the owner and the validator wallet address, nodes that share a wallet produce the same pool address. This prevents them from participating in elections independently. **Always use one wallet per node** when using SNP.
 
+## TONCore nominator pool
+
+TONCore uses **even** and **odd** slots (two contracts per logical pool name). **`deposit-validator`** moves **validator stake** from the **binding’s wallet** into the chosen slot (see [setup.md — TONCore nominator pools](setup.md#toncore-nominator-pools)). Stake policies **Split50 / AdaptiveSplit50** behave differently than on SNP (full liquid balance of the active slot’s pool).
+
 ---
 
 ## Auto-deploy
@@ -181,7 +185,7 @@ The `contracts_task` runs alongside the elections task and automatically deploys
 |------|--------|------|
 | 1 | Deploy master wallet | balance >= 1 TON |
 | 2 | Deploy each validator wallet | 1 TON + 0.1 TON gas per wallet |
-| 3 | Deploy each SNP pool | 1 TON + 0.1 TON gas per pool |
+| 3 | Deploy each configured pool (SNP and TONCore slots) | 1 TON + 0.1 TON gas per pool deployment |
 | 4 | Top up wallets below 5 TON | 10 TON per top-up |
 
 The master wallet key is auto-generated in vault on first start. You only need to fund the master wallet address — deployment is automatic.

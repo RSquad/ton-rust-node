@@ -7,14 +7,30 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::SmartContract;
+use std::sync::Arc;
 use ton_block::{MsgAddressInt, StateInit};
 
-/// Trait for interacting with single-nominator smart contract
+/// Minimum TON to keep in an SNP pool (or validator wallet for direct staking) for storage.
+/// Matches the `MIN_TONS_FOR_STORAGE` constant in the single-nominator contract (~1 TON).
+pub const SNP_STORAGE_RESERVE: u64 = 1_000_000_000;
+/// Minimum TON to keep in a TONCore nominator pool for storage.
+/// Matches `MIN_TONS_FOR_STORAGE` in pool.fc (10 TON).
+pub const TONCORE_STORAGE_RESERVE: u64 = 10_000_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    SNP,
+    TONCore,
+}
+
+/// Trait for interacting with single-nominator or TONCore nominator pool contracts.
 ///
 /// Based on https://github.com/ton-blockchain/single-nominator
 ///
-/// The single-nominator contract provides secure validation for TON blockchain
-/// by separating the owner role (cold wallet) from the validator role (hot wallet).
+/// TONCore nominator with two pools uses [`crate::nominator::TonCoreNominatorRouter`], which
+/// implements this trait. Use [`inner_pools`](NominatorWrapper::inner_pools) to iterate the
+/// physical pool contracts (deploy, RPC). SNP returns `[self]`; single TONCore returns an empty
+/// vec (the pool itself is the only physical contract).
 #[async_trait::async_trait]
 pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Get the owner and validator addresses stored in the contract
@@ -25,6 +41,19 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     fn state_init(&self) -> Option<StateInit> {
         None
     }
+    /// Physical sub-pool contracts for deploy and RPC.
+    ///
+    /// Returns the two on-chain [`NominatorWrapper`] contracts for a
+    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter),
+    /// [`SingleNominatorWrapper`](crate::nominator::SingleNominatorWrapper) returns
+    /// a single-element vec containing a wrapper for the same pool (preserves state_init
+    /// for deploy).
+    fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>>;
+    /// Minimum nanotons that must remain in the staking account after a stake withdrawal
+    /// (contract storage reserve). SNP = [`SNP_STORAGE_RESERVE`]; TONCore = [`TONCORE_STORAGE_RESERVE`].
+    fn storage_reserve(&self) -> u64;
+    /// Pool type for routing/optimization decisions.
+    fn pool_kind(&self) -> PoolKind;
 }
 
 /// Roles stored in the single nominator contract
@@ -42,7 +71,8 @@ pub struct PoolConfig {
     pub validator_reward_share: u16,
     pub max_nominators_count: u16,
     pub min_validator_stake: u64,
-    pub max_nominators_stake: u64,
+    /// SNP: max nominator stake; TONCore: min nominator stake.
+    pub nominator_stake_threshold: u64,
 }
 /// Pool data returned by get_pool_data()
 #[derive(Debug, Clone, Default, PartialEq)]

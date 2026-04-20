@@ -834,6 +834,24 @@ def build_global_config(zerostate_info: str):
 
     print(" done")
 
+def add_control_client_key_to_nodes(pub_key_b64: str):
+    """Add a shared control client public key to every node's control_server.clients.list."""
+    global run_fullnode, nodes_count
+    print("Adding shared control client public key to all nodes...", end="")
+    for n in range(0 if run_fullnode else 1, nodes_count + 1):
+        node_cfg_path = build_node_work_path(n) / "config.json"
+        if not node_cfg_path.exists():
+            print(f"\n  Warning: config.json not found for node {n}, skipping", end="")
+            continue
+        with open(node_cfg_path) as f:
+            cfg = json.load(f)
+        clients_list = cfg.get("control_server", {}).get("clients", {}).get("list", [])
+        clients_list.append({"type_id": 1209251014, "pub_key": pub_key_b64})
+        cfg.setdefault("control_server", {}).setdefault("clients", {})["list"] = clients_list
+        with open(node_cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    print(" done")
+
 
 def build_nodectl_config(root_path):
     global run_fullnode, nodes_count, common_config_path
@@ -904,6 +922,13 @@ def main():
              "Nodes bind QUIC on adnl_port+2000 but the auto-derive fallback is adnl_port+1000, "
              "so QUIC connections only work if advertised addresses are used. Implies --quic.",
     )
+    parser.add_argument(
+        "--control-client-public-key",
+        type=str,
+        default=None,
+        metavar="BASE64",
+        help="Base64 public key to add to every node's control_server.clients.list",
+    )
     args = parser.parse_args()
 
     # --quic_custom_port implies --quic
@@ -962,6 +987,9 @@ def main():
             )
             if n != 0:
                 validator_pub_keys.append(vk)
+
+        if args.control_client_public_key:
+            add_control_client_key_to_nodes(args.control_client_public_key)
 
         build_nodectl_config(test_root_path)
 

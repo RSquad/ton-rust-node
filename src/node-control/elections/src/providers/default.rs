@@ -16,10 +16,16 @@ use control_client::{
         AddAdnlAddressRq, AddValidatorAdnlAddrRq, AddValidatorPermKeyRq, AddValidatorTempKeyRq,
         ClientAPI, SignRq,
     },
-    config_params::{parse_config_param_15, parse_config_param_34, parse_config_param_36},
+    config_params::{
+        parse_config_param_15, parse_config_param_16, parse_config_param_17, parse_config_param_34,
+        parse_config_param_36,
+    },
 };
 use std::collections::HashMap;
-use ton_block::{ConfigParam15, ValidatorSet};
+use ton_block::{
+    ConfigParam15, ValidatorSet,
+    config_params::{ConfigParam16, ConfigParam17},
+};
 
 pub struct DefaultElectionsProvider {
     client: ControlClientAdnl,
@@ -129,6 +135,14 @@ impl ElectionsProvider for DefaultElectionsProvider {
         let bytes = self.client.get_config_param(34).await?;
         parse_config_param_34(&bytes)
     }
+    async fn config_param_16(&mut self) -> anyhow::Result<ConfigParam16> {
+        let bytes = self.client.get_config_param(16).await?;
+        parse_config_param_16(&bytes)
+    }
+    async fn config_param_17(&mut self) -> anyhow::Result<ConfigParam17> {
+        let bytes = self.client.get_config_param(17).await?;
+        parse_config_param_17(&bytes)
+    }
     async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>> {
         match self.client.get_config_param(36).await {
             Ok(bytes) => Ok(Some(parse_config_param_36(&bytes)?)),
@@ -137,5 +151,28 @@ impl ElectionsProvider for DefaultElectionsProvider {
                 Ok(None)
             }
         }
+    }
+    async fn generate_adnl_addr(&mut self) -> anyhow::Result<Vec<u8>> {
+        let key_id = self.client.generate_key_pair().await?;
+        self.client
+            .add_adnl_address(&AddAdnlAddressRq { key_hash: key_id.clone(), category: 0 })
+            .await
+            .context("add_adnl_address")?;
+        Ok(key_id)
+    }
+    async fn register_adnl_addr(
+        &mut self,
+        adnl_key_id: Vec<u8>,
+        validator_key_id: Vec<u8>,
+        until: u64,
+    ) -> anyhow::Result<()> {
+        self.client
+            .add_validator_adnl_addr(&AddValidatorAdnlAddrRq {
+                perm_key_hash: validator_key_id,
+                key_hash: adnl_key_id,
+                expire_at: until as i32,
+            })
+            .await
+            .context("add_validator_adnl_addr")
     }
 }

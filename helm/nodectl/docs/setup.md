@@ -9,6 +9,7 @@ Step-by-step guide for deploying nodectl and configuring it to manage TON valida
 - [Prerequisites](#prerequisites)
 - [Step 1: Deploy the chart](#step-1-deploy-the-chart)
 - [Step 2: Configure](#step-2-configure)
+  - [TONCore nominator pools](#toncore-nominator-pools)
 - [Step 3: Set up keys](#step-3-set-up-keys)
 - [Step 4: Restart the service](#step-4-restart-the-service)
 - [Step 5: Fund and verify](#step-5-fund-and-verify)
@@ -138,9 +139,13 @@ nodectl config wallet add -n wallet2 -s wallet-key-2
 | `-i` | Subwallet ID | `42` |
 | `-w` | Workchain | `-1` |
 
-> **Why one wallet per node?** The SNP contract address is computed from `owner_address + validator_wallet_address`. If two nodes share a wallet, they produce the same pool address and cannot participate in elections independently. See [Key concepts](../README.md#single-nominator-pool-snp).
+> **Why one wallet per node?** The SNP contract address is computed from `owner_address + validator_wallet_address`. If two nodes share a wallet, they produce the same pool address and cannot participate in elections independently. See [Key concepts](../README.md#single-nominator-pool-snp). TONCore pools use a different model — see [TONCore nominator pools](#toncore-nominator-pools).
 
 ### Add pools
+
+nodectl supports **Single Nominator Pool (SNP)** contracts and **TONCore** nominator pool pairs. SNP is covered first; for TONCore, see [TONCore nominator pools](#toncore-nominator-pools).
+
+#### Single Nominator Pool (SNP)
 
 Add Single Nominator Pools with the owner address. The pool contract address is computed automatically on startup:
 
@@ -157,6 +162,56 @@ If the pool contract is already deployed, pass its address instead:
 ```bash
 nodectl config pool add -n pool0 -a "-1:<POOL_CONTRACT_ADDRESS>"
 ```
+
+#### TONCore nominator pools
+
+A **TONCore** configuration is a **pair of slots** — **`even`** and **`odd`** — under one pool name (for example `core0`). Each slot maps to a **different** on-chain pool contract and participates in **different** validation rounds: with a **single** slot you can validate in **one of two consecutive rounds** only. **SNP**, by contrast, uses one pool contract and can participate every round from that pool.
+
+**If you must validate in every round with TONCore**, add **both** slots for the same logical pool name (`--even` and `--odd`). Bind the node once to that pool name; nodectl keeps both addresses for the pair.
+
+Register the two slots (example — adjust shares and minima to your network and economics):
+
+```bash
+nodectl config pool add core -n core0 --even \
+  --validator-share 1000 \
+  --min-validator-stake 10000 \
+  --min-nominator-stake 10000
+
+nodectl config pool add core -n core0 --odd \
+  --validator-share 1000 \
+  --min-validator-stake 10001 \
+  --min-nominator-stake 10000
+```
+
+> **Distinct slot addresses:** the **even** and **odd** contracts must get **different** on-chain addresses. The derived address is a function of the validator wallet plus the slot’s **init parameters**; identical params on both slots yield the **same** address. A common pattern is to change **`min-validator-stake` by one unit** (TON) between slots (this example uses **`10000` vs `10001`**). If you omit **`--min-validator-stake`** on both commands, both slots get the service default (**`100_000` TON**) and you still **must** change another field (e.g. **`--validator-share`**) so the two slots differ. You can vary any numeric deploy field as long as the resulting init data differs.
+
+| Flag | Meaning |
+|------|---------|
+| `--even` / `--odd` | Which validation-round slot this contract covers (required; pick exactly one per command). |
+| `--validator-share` | Validator reward share in **basis points** (e.g. `1000` = 10%). |
+| `--min-validator-stake` | Minimum validator stake locked in the pool, **TON**. If omitted, the nodectl service applies **`100_000` TON**. |
+| `--min-nominator-stake` | Minimum stake per nominator, **TON**. If omitted, the nodectl service applies **`10_000` TON**. |
+
+For production-style TONCore deployments, operators often set **minimum stake per nominator** around **10,000 TON** on the pool (`--min-nominator-stake 10000`). That is **independent** of the **validator stake**: each **`deposit-validator`** must still send at least that slot’s **`min-validator-stake`** into the pool.
+
+**Which account pays:** `deposit-validator` debits **the validator wallet from the binding** (`-b` resolves the binding → the configured **wallet**, not the master wallet and not nominator funds in the pool). Fund that wallet on-chain first; it must cover **`-a` plus gas** (nodectl checks balance before sending).
+
+After the binding exists and the validator wallet is funded, run:
+
+```bash
+nodectl config pool deposit-validator -b node0 -a 10000 --pool-even --yes
+nodectl config pool deposit-validator -b node0 -a 10001 --pool-odd --yes
+```
+
+| Item | Description |
+|------|-------------|
+| `-b` | Binding name (same as the node name in `config bind add -n …`). Used to find the **validator wallet** and pool. |
+| `-a` | **Validator stake** in **TON**, sent from the binding’s wallet into the pool slot; must be **≥** that slot’s `min-validator-stake` from the pool config. |
+| `--pool-even` / `--pool-odd` | Which TONCore slot receives the deposit (default if omitted: even). |
+
+> **`deposit-validator` is executed by the CLI with local vault + RPC** (not via the REST API yet). Run it from the pod shell where `CONFIG_PATH` and `VAULT_URL` are set.
+
+**Stake policy note (Split50 / AdaptiveSplit50):** Those policies are aimed at **SNP**. For **TONCore**, nodectl **does not** apply the “stake half the balance” rule to the pool the same way: for TONCore it **stakes the full free (liquid) balance** of the **active slot’s** pool for the round (still subject to network minimum stake). If you configure Split50 while using TONCore, expect **whole-pool liquid balance** on the active slot to be considered for the stake amount, not “half of the pool” like a classic SNP Split50.
 
 ### Add bindings
 
@@ -331,7 +386,7 @@ The `contracts_task` automatically:
 
 1. Deploys the master wallet contract
 2. Deploys each validator wallet (sends 1 TON from master)
-3. Deploys each SNP pool contract (sends 1 TON from master)
+3. Deploys each configured pool contract — SNP pools and TONCore even/odd slots (sends 1 TON from master per pool deployment)
 
 Look for: `all contracts are ready` — all wallets and pools are deployed.
 

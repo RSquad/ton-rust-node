@@ -6,7 +6,11 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry};
+use crate::{
+    adaptive_strategy,
+    election_emulator::ParticipantStake,
+    providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry},
+};
 use anyhow::Context as _;
 use common::{
     app_config::{BindingStatus, ElectionsConfig, NodeBinding, StakePolicy},
@@ -17,10 +21,13 @@ use common::{
     },
     task_cancellation::CancellationCtx,
     time_format,
-    ton_utils::nanotons_to_dec_string,
+    ton_utils::{
+        MAX_STAKE_FACTOR_SCALE, display_tons, max_stake_factor_raw_to_multiplier,
+        nanotons_to_dec_string, nanotons_to_tons_f64,
+    },
 };
 use contracts::{
-    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, TonWallet,
+    ElectionsInfo, ElectorWrapper, NominatorWrapper, Participant, PoolKind, TonWallet,
     elector::PastElections, nominator,
 };
 use std::{
@@ -29,7 +36,9 @@ use std::{
     time::Duration,
 };
 use ton_block::{
-    Cell, ConfigParam15, MsgAddressInt, UnixTime, ValidatorDescr, ValidatorSet, write_boc,
+    Cell, ConfigParam15, MsgAddressInt, UnixTime, ValidatorDescr, ValidatorSet,
+    config_params::{ConfigParam16, ConfigParam17},
+    write_boc,
 };
 
 #[cfg(test)]
@@ -45,8 +54,17 @@ const RECOVER_FEE: u64 = 200_000_000;
 const NPOOL_COMPUTE_FEE: u64 = 200_000_000;
 /// Gas fee consumed by validator wallet
 const WALLET_COMPUTE_FEE: u64 = 200_000_000;
-/// Reserved minimum balance on the wallet (or pool) balance for stake calculations
-const MIN_NANOTON_FOR_STORAGE: u64 = 1_000_000_000;
+/// Storage reserve kept in the validator wallet when staking directly (no nominator pool).
+const WALLET_STORAGE_RESERVE: u64 = 1_000_000_000;
+/// Extra storage fees reservation to correctly calculate free pool balance:
+/// it's a storage fees accumulated between two stake operations.
+/// It's an approximation to avoid error when staking all available funds.
+/// The line from single-nominator contract:
+/// ```ignore
+/// throw_unless(ERROR::INSUFFICIENT_BALANCE, stake_amount <= my_balance - msg_value - MIN_TON_FOR_STORAGE);
+/// ```
+/// where `my_balance` is already decreased by storage fees which we want to cover.
+const EXTRA_STORAGE_FEES: u64 = 5_000_000;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 
@@ -84,13 +102,16 @@ struct Node {
     /// Computed in build_validators_snapshot, used by build_our_participants_snapshot.
     is_next_validator: bool,
     wallet: Arc<dyn TonWallet>,
-    /// Nominator pool instance. Optional.
+    /// Nominator pool for this node (`TonCoreNominatorRouter` when TONCore nominator, two pools). `None` = direct staking.
     pool: Option<Arc<dyn NominatorWrapper>>,
-    /// Address to which to send commands: stake & recover.
-    /// It can be an elector address or a nominator pool address.
-    elections_address: MsgAddressInt,
+    /// Cached address of the pool contract (`pool.address()`), refreshed when election ID changes.
+    /// `None` when there is no pool (direct staking).
+    pool_addr_cache: Option<MsgAddressInt>,
     /// Last error observed for this node during the current/previous tick (stringified).
     last_error: Option<String>,
+    /// Pre-generated static ADNL address (32-byte key hash).
+    /// When set, this address is re-registered each election instead of generating a fresh one.
+    static_adnl_addr: Option<Vec<u8>>,
     /// Excluded from elections (enable = false).
     excluded: bool,
     /// Effective stake policy for this node.
@@ -104,19 +125,32 @@ struct Node {
 }
 
 impl Node {
-    fn wallet_addr(&self) -> Vec<u8> {
-        self.pool
-            .as_ref()
-            .map(|p| p.address())
-            .unwrap_or_else(|| self.wallet.address())
-            .address()
-            .clone()
-            .storage()
-            .to_vec()
+    /// Get theaddress from which the stake will be sent to elector: pool or wallet.
+    /// Note: only raw address bytes are returned (without workchain ID).
+    async fn stake_addr(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(match &self.pool_addr_cache {
+            Some(addr) => addr.address().storage().to_vec(),
+            None => self.wallet.address().await?.address().storage().to_vec(),
+        })
     }
-    fn elections_addr(&self) -> MsgAddressInt {
-        self.elections_address.clone()
+
+    /// Resolve the ADNL address for this election cycle.
+    /// If a static ADNL is configured, re-register it with the validator key.
+    /// Otherwise, generate a fresh ephemeral ADNL address.
+    async fn resolve_adnl_addr(
+        &mut self,
+        perm_key_id: Vec<u8>,
+        until: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        match &self.static_adnl_addr {
+            Some(key_id) => {
+                self.api.register_adnl_addr(key_id.clone(), perm_key_id, until).await?;
+                Ok(key_id.clone())
+            }
+            None => self.api.new_adnl_addr(perm_key_id, until).await,
+        }
     }
+
     fn reset_participation(&mut self) {
         self.participant = None;
         self.submission_time = None;
@@ -124,20 +158,32 @@ impl Node {
         self.accepted_stake_amount = None;
         self.stake_submissions.clear();
     }
+
+    /// Minimum balance left on the staking target (pool contract or wallet) when computing
+    /// spendable stake liquidity.
     async fn stake_balance(&mut self, gas_fee: u64) -> anyhow::Result<u64> {
-        match self.pool.as_ref() {
-            Some(pool) => self.api.account(&pool.address().to_string()).await.map(|x| x.balance()),
-            None => self
+        if let Some(pool) = self.pool.as_ref() {
+            let addr = self
+                .pool_addr_cache
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("pool address not found"))?;
+            let reserve = pool.storage_reserve() + EXTRA_STORAGE_FEES;
+            return self
                 .api
-                .account(&self.wallet.address().to_string())
+                .account(&addr.to_string())
                 .await
-                .map(|x| x.balance().saturating_sub(gas_fee)),
+                .map(|x| x.balance().saturating_sub(reserve));
         }
-        .map(|b| b.saturating_sub(MIN_NANOTON_FOR_STORAGE))
+        self.api
+            .account(&self.wallet.address().await?.to_string())
+            .await
+            .map(|x| x.balance().saturating_sub(gas_fee).saturating_sub(WALLET_STORAGE_RESERVE))
     }
+
     async fn wallet_balance(&mut self) -> anyhow::Result<u64> {
-        self.api.account(&self.wallet.address().to_string()).await.map(|x| x.balance())
+        self.api.account(&self.wallet.address().await?.to_string()).await.map(|x| x.balance())
     }
+
     async fn find_election_key(&mut self, election_id: u64) -> Option<ValidatorEntry> {
         let mut validator_entry = self.validator_config.find(election_id);
         if let Some(entry) = validator_entry.as_mut() {
@@ -159,8 +205,17 @@ pub(crate) struct ElectionRunner {
     default_max_factor: f32,
     default_stake_policy: StakePolicy,
     past_elections: Vec<PastElections>,
+    /// Election ID for which `past_elections` and `cached_prev_min_eff` were fetched.
+    /// Used to avoid redundant RPC calls within the same election round.
+    past_elections_cache_id: u64,
+    /// Cached prev_min_eff_stake computed from past_elections.
+    cached_prev_min_eff: Option<u64>,
     // Snapshot cache updated during tick execution and published to SnapshotStore in run_loop().
     snapshot_cache: SnapshotCache,
+    /// AdaptiveSplit50: minimum wait fraction of election duration.
+    sleep_pct: f64,
+    /// AdaptiveSplit50: maximum wait fraction of election duration.
+    waiting_pct: f64,
 }
 
 #[derive(Default)]
@@ -180,23 +235,47 @@ struct SnapshotCache {
 impl SnapshotCache {
     fn update_next_elections_range(&mut self, cfg15: &ConfigParam15) {
         if let Some(vset) = &self.last_validator_set {
-            let next_elections_start = if time_format::now()
-                > vset.utime_until().saturating_sub(cfg15.elections_start_before) as u64
-            {
-                vset.utime_until().saturating_add(cfg15.elections_start_before)
+            let now = time_format::now();
+            let elections_start_before = cfg15.elections_start_before as u64;
+            let elections_end_before = cfg15.elections_end_before as u64;
+            let validators_elected_for = cfg15.validators_elected_for as u64;
+            // utime_until of the current validator set == election_id of the next cycle.
+            let current_cycle_end = vset.utime_until() as u64;
+            let upcoming_elections_end = current_cycle_end.saturating_sub(elections_end_before);
+            // If the upcoming cycle's elections window has already closed, advance to the
+            // cycle after that.
+            let next_cycle_election_id = if now >= upcoming_elections_end {
+                current_cycle_end.saturating_add(validators_elected_for)
             } else {
-                vset.utime_since().saturating_add(cfg15.elections_start_before)
+                current_cycle_end
             };
-            let next_elections_end = next_elections_start
-                .saturating_add(cfg15.elections_start_before + cfg15.elections_end_before);
+            let start = next_cycle_election_id.saturating_sub(elections_start_before);
+            let end = next_cycle_election_id.saturating_sub(elections_end_before);
             self.next_elections_range = Some(TimeRange {
-                start: next_elections_start as u64,
-                start_utc: time_format::format_ts(next_elections_start as u64),
-                end: next_elections_end as u64,
-                end_utc: time_format::format_ts(next_elections_end as u64),
+                start,
+                start_utc: time_format::format_ts(start),
+                end,
+                end_utc: time_format::format_ts(end),
             });
         }
     }
+}
+
+struct ConfigParams<'a> {
+    elections_info: &'a ElectionsInfo,
+    cfg15: &'a ConfigParam15,
+    cfg16: &'a ConfigParam16,
+    cfg17: &'a ConfigParam17,
+}
+
+/// Context needed by [`ElectionRunner::calc_stake`].
+/// Built from individual `ElectionRunner` fields to avoid borrow conflicts.
+struct StakeContext<'a> {
+    past_elections: &'a [PastElections],
+    our_max_factor: u32,
+    sleep_pct: f64,
+    waiting_pct: f64,
+    prev_min_eff_stake: Option<u64>,
 }
 
 impl ElectionRunner {
@@ -208,55 +287,63 @@ impl ElectionRunner {
         wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
         pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
     ) -> Self {
+        let mut nodes = HashMap::new();
+        for (node_id, provider) in providers {
+            let wallet = match wallets.get(&node_id) {
+                Some(wallet) => wallet.clone(),
+                None => {
+                    tracing::error!("node [{}] skipped: wallet not found", node_id);
+                    continue;
+                }
+            };
+            let node_pools = pools.get(&node_id).cloned();
+            let binding = bindings.get(&node_id);
+            let excluded = !binding.map(|b| b.enable).unwrap_or(false);
+            let binding_status = binding.map(|b| b.status).unwrap_or(BindingStatus::Idle);
+            let stake_policy = elections_config.stake_policy(&node_id).clone();
+            let static_adnl = elections_config.static_adnls.get(&node_id).and_then(|b64| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .map_err(|e| {
+                        tracing::error!("node [{}] invalid static_adnl base64: {}", node_id, e);
+                    })
+                    .ok()
+            });
+            nodes.insert(
+                node_id,
+                Node {
+                    api: provider,
+                    wallet,
+                    pool: node_pools,
+                    pool_addr_cache: None,
+                    static_adnl_addr: static_adnl,
+                    excluded,
+                    stake_policy,
+                    key_id: vec![],
+                    participant: None,
+                    submission_time: None,
+                    stake_accepted: false,
+                    accepted_stake_amount: None,
+                    stake_submissions: Vec::new(),
+                    is_validator: false,
+                    is_next_validator: false,
+                    last_error: None,
+                    validator_config: ValidatorConfig::new(),
+                    binding_status,
+                    last_recover_amount: 0,
+                },
+            );
+        }
         Self {
             default_max_factor: elections_config.max_factor,
             default_stake_policy: elections_config.policy.clone(),
-            nodes: providers
-                .into_iter()
-                .filter_map(|(node_id, provider)| {
-                    let wallet = match wallets.get(&node_id) {
-                        Some(wallet) => wallet.clone(),
-                        None => {
-                            tracing::error!("node [{}] skipped: wallet not found", node_id);
-                            return None;
-                        }
-                    };
-                    let pool = pools.get(&node_id).map(|p| p.clone());
-                    let binding = bindings.get(&node_id);
-                    let excluded = !binding.map(|b| b.enable).unwrap_or(false);
-                    let binding_status = binding.map(|b| b.status).unwrap_or(BindingStatus::Idle);
-                    let stake_policy = elections_config.stake_policy(&node_id).clone();
-                    Some((
-                        node_id,
-                        Node {
-                            api: provider,
-                            elections_address: pool
-                                .as_ref()
-                                .map(|p| p.address())
-                                .unwrap_or_else(|| elector.address()),
-                            wallet,
-                            pool,
-                            excluded,
-                            stake_policy,
-                            key_id: vec![],
-                            participant: None,
-                            submission_time: None,
-                            stake_accepted: false,
-                            accepted_stake_amount: None,
-                            stake_submissions: Vec::new(),
-                            is_validator: false,
-                            is_next_validator: false,
-                            last_error: None,
-                            validator_config: ValidatorConfig::new(),
-                            binding_status,
-                            last_recover_amount: 0,
-                        },
-                    ))
-                })
-                .collect::<HashMap<String, Node>>(),
+            nodes,
             elector,
             snapshot_cache: SnapshotCache::default(),
             past_elections: vec![],
+            past_elections_cache_id: 0,
+            cached_prev_min_eff: None,
+            sleep_pct: elections_config.sleep_period_pct,
+            waiting_pct: elections_config.waiting_period_pct,
         }
     }
 
@@ -349,7 +436,11 @@ impl ElectionRunner {
             elections_info.participants.len()
         );
 
-        self.build_elections_snapshot(election_id, &cfg15, &elections_info);
+        // Config param 17: effective `max_factor` in snapshot; 16/17: participation (e.g. AdaptiveSplit50).
+        let cfg16 = self.fetch_config_param_16().await?;
+        let cfg17 = self.fetch_config_param_17().await?;
+
+        self.build_elections_snapshot(election_id, &cfg15, &elections_info, &cfg17).await;
 
         if elections_info.finished {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Finished;
@@ -359,8 +450,10 @@ impl ElectionRunner {
                 // Reset previous state; only mark as accepted if present in current participants
                 node.stake_accepted = false;
                 node.accepted_stake_amount = None;
+
+                let staking_addr = node.stake_addr().await?;
                 if let Some(p) =
-                    elections_info.participants.iter().find(|p| p.wallet_addr == node.wallet_addr())
+                    elections_info.participants.iter().find(|p| p.wallet_addr == staking_addr)
                 {
                     node.stake_accepted = true;
                     node.accepted_stake_amount = Some(p.stake);
@@ -379,9 +472,49 @@ impl ElectionRunner {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Postponed;
         }
 
-        self.past_elections = self.elector.past_elections().await.context("past_elections")?;
+        let mut skip_tick_nodes = vec![];
+        // Fetch past_elections only when election_id changes (cache across ticks).
+        if self.past_elections_cache_id != election_id {
+            self.past_elections = self.elector.past_elections().await.context("past_elections")?;
+            self.cached_prev_min_eff = self
+                .past_elections
+                .first()
+                .and_then(|pe| pe.frozen_map.values().min_by_key(|f| f.stake).map(|f| f.stake));
+
+            if let Some(prev) = self.cached_prev_min_eff {
+                tracing::info!(
+                    "prev_min_eff_stake from past elections: {} TON",
+                    nanotons_to_tons_f64(prev)
+                );
+            }
+            // Cache pool address for each node:
+            // for TONCore pool getting address is a network RPC call,
+            //for SNP pool - its a simple getter.
+            for (node_id, node) in self.nodes.iter_mut() {
+                node.pool_addr_cache = if let Some(p) = &node.pool {
+                    match p.address().await {
+                        Ok(addr) => Some(addr),
+                        Err(e) => {
+                            tracing::error!("node [{}] pool address error: {}", node_id, e);
+                            skip_tick_nodes.push(node_id.clone());
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            // Apply new election id only if all data was requested successfully.
+            self.past_elections_cache_id = election_id;
+        }
+
         // walk through the nodes and try to participate in the elections
-        let mut nodes = self.nodes.keys().cloned().collect::<Vec<String>>();
+        let mut nodes = self
+            .nodes
+            .keys()
+            .cloned()
+            .filter(|id| !skip_tick_nodes.contains(id))
+            .collect::<Vec<String>>();
         nodes.sort();
         for node_id in nodes {
             tracing::info!("node [{}] recover stake", node_id);
@@ -389,7 +522,9 @@ impl ElectionRunner {
             let recover_amount = match self.recover_stake(&node_id).await {
                 Ok(amount) => amount,
                 Err(e) => {
-                    self.nodes.get_mut(&node_id).map(|node| node.last_error = Some(e.to_string()));
+                    if let Some(node) = self.nodes.get_mut(&node_id) {
+                        node.last_error = Some(e.to_string());
+                    }
                     tracing::error!("node [{}] recover stake error: {}", node_id, e);
                     continue;
                 }
@@ -408,25 +543,43 @@ impl ElectionRunner {
             }
 
             tracing::info!("node [{}] participate in elections: id={}", node_id, election_id);
-            if let Err(e) = self.participate(&node_id, election_id, &elections_info, &cfg15).await {
-                self.nodes.get_mut(&node_id).map(|node| node.last_error = Some(format!("{:#}", e)));
+            let config_params = ConfigParams {
+                elections_info: &elections_info,
+                cfg15: &cfg15,
+                cfg16: &cfg16,
+                cfg17: &cfg17,
+            };
+            if let Err(e) = self.participate(&node_id, election_id, &config_params).await {
+                if let Some(node) = self.nodes.get_mut(&node_id) {
+                    node.last_error = Some(format!("{:#}", e));
+                }
                 tracing::error!("node [{}] participate error: {:#}", node_id, e);
             }
         }
         Ok(())
     }
 
-    fn build_elections_snapshot(
+    async fn build_elections_snapshot(
         &mut self,
         election_id: u64,
         cfg15: &ConfigParam15,
         elections_info: &ElectionsInfo,
+        cfg17: &ConfigParam17,
     ) {
-        self.snapshot_cache.last_max_factor = Some(self.calc_max_factor());
+        self.snapshot_cache.last_max_factor = Some(self.calc_max_factor(cfg17.max_stake_factor).1);
 
-        // It can be a validator wallet or nominator pool address.
-        let wallet_addrs: HashSet<Vec<u8>> =
-            self.nodes.values().map(|node| node.wallet_addr()).collect();
+        // Include the selected staking target (pool_addr_cache) or wallet fallback.
+        let mut wallet_addrs: HashSet<Vec<u8>> = HashSet::new();
+        for node in self.nodes.values() {
+            match node.stake_addr().await {
+                Ok(addr) => {
+                    let _ = wallet_addrs.insert(addr);
+                }
+                Err(e) => {
+                    tracing::error!("stake addr error: {:#}", e);
+                }
+            }
+        }
 
         let participants = Self::build_participants_snapshot(elections_info, &wallet_addrs);
         let participant_min_stake =
@@ -477,30 +630,109 @@ impl ElectionRunner {
         &mut self,
         node_id: &str,
         election_id: u64,
-        elections_info: &ElectionsInfo,
-        cfg15: &ConfigParam15,
+        params: &ConfigParams<'_>,
     ) -> anyhow::Result<()> {
-        let max_factor = (self.calc_max_factor() * 65536.0) as u32;
-        let mut node = self.nodes.get_mut(node_id).expect("node not found");
+        let configured_raw = self.configured_max_factor_raw();
+        let (max_factor, _) = self.calc_max_factor(params.cfg17.max_stake_factor);
+        if max_factor != configured_raw {
+            tracing::warn!(
+                "max_factor clamped: configured={}, used={} (network limit from cfg17)",
+                max_stake_factor_raw_to_multiplier(configured_raw),
+                max_stake_factor_raw_to_multiplier(max_factor),
+            );
+        }
+        let stake_ctx = StakeContext {
+            past_elections: &self.past_elections,
+            our_max_factor: max_factor,
+            sleep_pct: self.sleep_pct,
+            waiting_pct: self.waiting_pct,
+            prev_min_eff_stake: self.cached_prev_min_eff,
+        };
+        let node = self.nodes.get_mut(node_id).expect("node not found");
+
+        // Resolve target once per tick:
+        // if pool address is cached use it, otherwise fallback to elector.
+        let elector_addr = self.elector.address().await?;
+        // address to which the wallet will send stake request: pool or elector
+        let to_addr = node.pool_addr_cache.as_ref().cloned().unwrap_or(elector_addr);
+        // address from which the stake will be sent to elector: wallet or pool
+        let from_addr = node.stake_addr().await?;
         // Find validator key for current elections in the validator config
         let validator_key = node.find_election_key(election_id).await;
         // Find participant in the elections info by validator public key
         let participant = validator_key.as_ref().and_then(|entry| {
-            elections_info
+            params
+                .elections_info
                 .participants
                 .iter()
                 .find(|p| p.pub_key == entry.public_key)
-                .map(|p| p.clone())
+                .cloned()
         });
-        let stake = Self::calc_stake(
-            &mut node,
-            &node_id,
-            &self.past_elections,
-            participant.as_ref().map(|p| p.stake).unwrap_or(0),
-            elections_info.min_stake,
-        )
-        .await
-        .context("stake calculation error")?;
+
+        // Refresh participant if missing or stale (different election cycle)
+        let needs_refresh = match node.participant.as_ref() {
+            Some(existing) => existing.election_id != election_id,
+            None => true,
+        };
+        if needs_refresh {
+            node.stake_accepted = false;
+            node.accepted_stake_amount = None;
+            node.submission_time = None;
+            node.stake_submissions.clear();
+            node.participant = match (participant.as_ref(), validator_key.as_ref()) {
+                (Some(p), _) => Some(p.clone()),
+                (None, Some(v)) => {
+                    let adnl_addr = v
+                        .adnl_addr()
+                        .ok_or_else(|| anyhow::anyhow!("validator has no adnl address"))?;
+                    if adnl_addr.is_empty() {
+                        anyhow::bail!("validator adnl address is empty");
+                    }
+                    if v.public_key.is_empty() {
+                        anyhow::bail!("validator public key is empty");
+                    }
+                    Some(Participant {
+                        stake_message_boc: None,
+                        pub_key: v.public_key.clone(),
+                        adnl_addr,
+                        election_id,
+                        wallet_addr: from_addr.clone(),
+                        stake: 0,
+                        max_factor,
+                    })
+                }
+                (None, None) => None,
+            };
+            node.key_id =
+                validator_key.as_ref().map(|entry| entry.key_id.clone()).unwrap_or_default();
+        }
+        // If the elector already has our stake, mark it accepted early
+        // so that `calc_stake` uses the correct current_stake (not 0).
+        if let Some(participant) = participant.as_ref() {
+            tracing::info!(
+                "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
+                node_id,
+                display_tons(participant.stake),
+                hex::encode(&participant.wallet_addr),
+                hex::encode(participant.pub_key.as_slice()),
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    participant.adnl_addr.as_slice(),
+                ),
+                participant.election_id
+            );
+            node.stake_accepted = true;
+            node.accepted_stake_amount = Some(participant.stake);
+        }
+        let elections_stake = participant.as_ref().map(|p| p.stake).unwrap_or(0);
+        let stake = Self::calc_stake(node, node_id, elections_stake, params, &stake_ctx)
+            .await
+            .context("stake calculation error")?;
+
+        if stake == 0 {
+            tracing::info!("node [{}] skipping elections this tick (stake=0)", node_id);
+            return Ok(());
+        }
 
         tracing::info!(
             "node [{}] max_factor={}, stake={} TON, strategy={}",
@@ -512,14 +744,13 @@ impl ElectionRunner {
 
         match validator_key {
             None => {
-                node.reset_participation();
                 tracing::warn!(
                     "node [{}] validator key not found: election_id={}",
                     node_id,
                     election_id
                 );
                 let key_expired_at =
-                    election_id + cfg15.validators_elected_for as u64 + EXPIRED_LAG;
+                    election_id + params.cfg15.validators_elected_for as u64 + EXPIRED_LAG;
                 let (key_id, pub_key) = node
                     .api
                     .new_validator_key(election_id, key_expired_at)
@@ -535,13 +766,17 @@ impl ElectionRunner {
                     key_expired_at
                 );
                 let adnl_addr = node
-                    .api
-                    .new_adnl_addr(key_id.clone(), key_expired_at)
+                    .resolve_adnl_addr(key_id.clone(), key_expired_at)
                     .await
-                    .map_err(|e| anyhow::anyhow!("new adnl address error: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("adnl address error: {}", e))?;
                 tracing::info!(
-                    "node [{}] generate new adnl address: {}",
+                    "node [{}] {} adnl address: {}",
                     node_id,
+                    if node.static_adnl_addr.is_some() {
+                        "registered static"
+                    } else {
+                        "generated new"
+                    },
                     base64::Engine::encode(
                         &base64::engine::general_purpose::STANDARD,
                         adnl_addr.as_slice()
@@ -552,12 +787,12 @@ impl ElectionRunner {
                     pub_key,
                     adnl_addr,
                     election_id,
-                    wallet_addr: node.wallet_addr(),
+                    wallet_addr: from_addr.clone(),
                     stake,
                     max_factor,
                 });
                 node.key_id = key_id;
-                Self::send_stake(node_id, node, stake).await?;
+                Self::send_stake(node_id, node, stake, to_addr).await?;
                 Ok(())
             }
             Some(entry) => {
@@ -573,53 +808,26 @@ impl ElectionRunner {
                     hex::encode(entry.public_key.as_slice())
                 );
                 match participant {
-                    Some(participant) => {
-                        tracing::info!(
-                            "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
-                            node_id,
-                            participant.stake as f64 / 1_000_000_000.0,
-                            hex::encode(&participant.wallet_addr),
-                            hex::encode(participant.pub_key.as_slice()),
-                            base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                participant.adnl_addr.as_slice(),
-                            ),
-                            participant.election_id
-                        );
-                        node.participant = Some(participant.clone());
-                        node.stake_accepted = true;
-                        node.accepted_stake_amount = Some(participant.stake);
+                    Some(_) => {
+                        if matches!(node.stake_policy, StakePolicy::AdaptiveSplit50) && stake > 0 {
+                            let old_stake = node.participant.as_ref().map(|p| p.stake).unwrap_or(0);
+                            tracing::info!(
+                                "node [{}] adaptive_split50: top-up {} TON → {} TON (delta={} TON)",
+                                node_id,
+                                nanotons_to_tons_f64(old_stake),
+                                nanotons_to_tons_f64(old_stake + stake),
+                                nanotons_to_tons_f64(stake),
+                            );
+                            Self::send_stake(node_id, node, stake, to_addr).await?;
+                            node.participant.as_mut().map(|p| p.stake += stake);
+                        }
                     }
                     None => {
                         tracing::warn!("node [{}] stake not found in elector", node_id);
-                        // Refresh participant if missing or stale (different election cycle)
-                        let needs_refresh = match node.participant.as_ref() {
-                            Some(existing) => existing.election_id != election_id,
-                            None => true,
-                        };
-                        if needs_refresh {
-                            // Reset participation-related state for the new election cycle
-                            node.stake_accepted = false;
-                            node.accepted_stake_amount = None;
-                            node.submission_time = None;
-                            node.stake_submissions.clear();
-                            node.participant = Some(Participant {
-                                stake_message_boc: None,
-                                adnl_addr: entry
-                                    .adnl_addr()
-                                    .ok_or_else(|| anyhow::anyhow!("no adnl address"))?,
-                                pub_key: entry.public_key,
-                                election_id,
-                                wallet_addr: node.wallet_addr(),
-                                stake,
-                                max_factor,
-                            });
-                            node.key_id = entry.key_id;
-                        }
                         if let Some(p) = node.participant.as_mut() {
                             p.stake = stake;
                         }
-                        Self::send_stake(node_id, node, stake).await?;
+                        Self::send_stake(node_id, node, stake, to_addr).await?;
                     }
                 }
                 Ok(())
@@ -627,10 +835,14 @@ impl ElectionRunner {
         }
     }
 
-    async fn send_stake(node_id: &str, node: &mut Node, stake: u64) -> anyhow::Result<()> {
+    async fn send_stake(
+        node_id: &str,
+        node: &mut Node,
+        stake: u64,
+        to_addr: MsgAddressInt,
+    ) -> anyhow::Result<()> {
         tracing::info!("node [{}] build stake message", node_id);
-        let payload = Self::build_new_stake_payload(node_id, node).await?;
-        // For simplicity we always assume that the node has nominator pool.
+        let payload = Self::build_new_stake_payload(node_id, node, stake).await?;
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
         let stake_balance = node.stake_balance(fee).await?;
         if stake_balance < stake {
@@ -649,11 +861,8 @@ impl ElectionRunner {
             );
         }
 
-        // if node has nominator pool, the wallet should send only gas fee,
-        // otherwise the wallet should send stake + gas fee
         let send_value = node.pool.as_ref().map(|_| fee).unwrap_or(stake + fee);
-        let msg_boc =
-            write_boc(&node.wallet.message(node.elections_addr(), send_value, payload).await?)?;
+        let msg_boc = write_boc(&node.wallet.message(to_addr, send_value, payload).await?)?;
         tracing::debug!("wallet external message: boc={}", hex::encode(&msg_boc));
         tracing::info!("node [{}] send stake", node_id);
         node.api.send_boc(&msg_boc).await?;
@@ -671,7 +880,11 @@ impl ElectionRunner {
         Ok(())
     }
 
-    async fn build_new_stake_payload(node_id: &str, node: &mut Node) -> anyhow::Result<Cell> {
+    async fn build_new_stake_payload(
+        node_id: &str,
+        node: &mut Node,
+        stake: u64,
+    ) -> anyhow::Result<Cell> {
         let Some(participant) = &mut node.participant else {
             anyhow::bail!("node [{}] no participant info", node_id);
         };
@@ -680,16 +893,13 @@ impl ElectionRunner {
             node_id,
             participant.election_id,
             participant.max_factor,
-            participant.stake as f64 / 1_000_000_000.0,
+            stake as f64 / 1_000_000_000.0,
             hex::encode(participant.pub_key.as_slice()),
             base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 participant.adnl_addr.as_slice()
             )
         );
-        if !(1.0..=3.0).contains(&(participant.max_factor as f32 / 65536.0)) {
-            anyhow::bail!("<max-factor> must be a real number 1..3");
-        }
         // todo: move to ElectorWrapper
         // validator-elect-req.fif
         let mut data = 0x654C5074u32.to_be_bytes().to_vec();
@@ -701,7 +911,7 @@ impl ElectionRunner {
         let signature = node.api.sign(node.key_id.clone(), data).await?;
         let body = nominator::new_stake(&nominator::NewStakeParams {
             query_id: UnixTime::now(),
-            stake_amount: participant.stake,
+            stake_amount: stake,
             validator_pubkey: participant.pub_key.as_slice(),
             stake_at: participant.election_id as u32,
             max_factor: participant.max_factor,
@@ -721,7 +931,8 @@ impl ElectionRunner {
 
     async fn recover_stake(&mut self, node_id: &str) -> anyhow::Result<u64> {
         let node = self.nodes.get_mut(node_id).expect("node not found");
-        let amount = self.elector.compute_returned_stake(&node.wallet_addr()).await?;
+
+        let amount = self.elector.compute_returned_stake(&node.stake_addr().await?).await?;
         node.last_recover_amount = amount;
         if amount > 0 {
             tracing::info!(
@@ -739,14 +950,12 @@ impl ElectionRunner {
                     wallet_balance as f64 / 1_000_000_000.0
                 );
             }
+            let elector_addr = self.elector.address().await?;
+            let to_addr = node.pool_addr_cache.as_ref().cloned().unwrap_or(elector_addr);
             let msg_boc = write_boc(
                 &node
                     .wallet
-                    .message(
-                        node.elections_addr(),
-                        RECOVER_FEE,
-                        Self::build_recover_stake_payload().await?,
-                    )
+                    .message(to_addr, RECOVER_FEE, Self::build_recover_stake_payload().await?)
                     .await?,
             )?;
             node.api.send_boc(&msg_boc).await?;
@@ -777,6 +986,30 @@ impl ElectionRunner {
         anyhow::bail!("get election parameters: all nodes failed");
     }
 
+    async fn fetch_config_param_16(&mut self) -> anyhow::Result<ConfigParam16> {
+        for (node_id, node) in self.nodes.iter_mut() {
+            match node.api.config_param_16().await {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => {
+                    tracing::warn!("node [{}] get config param 16 error: {:#}", node_id, e)
+                }
+            }
+        }
+        anyhow::bail!("get config param 16: all nodes failed");
+    }
+
+    async fn fetch_config_param_17(&mut self) -> anyhow::Result<ConfigParam17> {
+        for (node_id, node) in self.nodes.iter_mut() {
+            match node.api.config_param_17().await {
+                Ok(cfg) => return Ok(cfg),
+                Err(e) => {
+                    tracing::warn!("node [{}] get config param 17 error: {:#}", node_id, e)
+                }
+            }
+        }
+        anyhow::bail!("get config param 17: all nodes failed");
+    }
+
     fn print_election_cycle(cfg15: &ConfigParam15, election_id: u64) {
         let validation_start =
             time_format::format_ts(election_id - cfg15.validators_elected_for as u64);
@@ -788,37 +1021,59 @@ impl ElectionRunner {
         tracing::info!("elections: start={}, end={}", elections_start, elections_end);
     }
 
-    fn calc_max_factor(&self) -> f32 {
-        self.default_max_factor
+    #[inline]
+    fn configured_max_factor_raw(&self) -> u32 {
+        (self.default_max_factor * MAX_STAKE_FACTOR_SCALE) as u32
+    }
+
+    /// Resolves elector `max_factor`: fixed-point `raw` for the Elector and `multiplier` for logs/UI.
+    ///
+    /// Applies configured `default_max_factor` and clamps to the chain cap
+    /// (`network_max_stake_factor_raw` from masterchain config param 17), in fixed-point
+    /// `[65536, network_max_stake_factor_raw]` (see [`MAX_STAKE_FACTOR_SCALE`]).
+    fn calc_max_factor(&self, network_max_stake_factor_raw: u32) -> (u32, f32) {
+        let configured_raw = self.configured_max_factor_raw();
+        let raw = configured_raw.clamp(MAX_STAKE_FACTOR_SCALE as u32, network_max_stake_factor_raw);
+        (raw, max_stake_factor_raw_to_multiplier(raw))
     }
 
     /// Calculate stake for a node according to the stake policy.
     async fn calc_stake(
         node: &mut Node,
         node_id: &str,
-        past_elections: &[PastElections],
-        elections_stake: u64, // stake sent to the elections but not yet accepted by the elector
-        min_stake: u64,
+        elections_stake: u64,
+        configs: &ConfigParams<'_>,
+        ctx: &StakeContext<'_>,
     ) -> anyhow::Result<u64> {
+        let min_stake = configs.elections_info.min_stake;
         tracing::info!("node [{}] calc stake", node_id);
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
+        let stake_addr = node.stake_addr().await?;
         let mut frozen_stake = 0;
         // Calculate frozen stake from past elections
-        for election in past_elections {
+        for election in ctx.past_elections {
             let validator_entry = node.find_election_key(election.election_id).await;
-            // If validator key is found in the past election, add frozen stake to the total
             if let Some(entry) = validator_entry {
                 let mut pubkey_array = [0u8; 32];
                 pubkey_array.copy_from_slice(&entry.public_key);
-                // Fetch frozen stake from the past election by validator public key
-                frozen_stake +=
-                    election.frozen_map.get(&pubkey_array).map(|frozen| frozen.stake).unwrap_or(0);
+                frozen_stake += election
+                    .frozen_map
+                    .get(&pubkey_array)
+                    .map(|frozen| {
+                        if frozen.wallet_addr.as_slice() == stake_addr.as_slice() {
+                            frozen.stake
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0);
             }
         }
 
         // Get pool free balance
         let pool_free_balance = node.stake_balance(fee).await?;
-        let total_balance = frozen_stake + pool_free_balance + elections_stake;
+        let total_balance =
+            frozen_stake.saturating_add(pool_free_balance).saturating_add(elections_stake);
         tracing::info!(
             "node [{}] frozen_stake={} TON, pool_balance={} TON, elections_stake={} TON, total_balance={} TON",
             node_id,
@@ -834,7 +1089,64 @@ impl ElectionRunner {
                 min_stake as f64 / 1_000_000_000.0
             );
         }
-        node.stake_policy.calculate_stake(min_stake, total_balance)
+
+        // IMPORTANT: split50/AdaptiveSplit50 policy is supported only for SNP nominator pools.
+        // Details: TONCore nominator has two different pools, each pool stakes in its own round,
+        // they cannot stake in same round, so split50/AdaptiveSplit50 cannot be used; instead stake the full
+        // liquid balance of the selected pool (still >= min_stake).
+        if matches!(&node.stake_policy, StakePolicy::Split50 | StakePolicy::AdaptiveSplit50)
+            && node.pool.as_ref().is_some_and(|p| p.pool_kind() == PoolKind::TONCore)
+        {
+            tracing::info!(
+                "node [{}] {}: TONCore nominator - ignore, stake all",
+                node_id,
+                node.stake_policy.to_string()
+            );
+            return Ok(total_balance);
+        }
+
+        match &node.stake_policy {
+            StakePolicy::AdaptiveSplit50 => {
+                if !adaptive_strategy::is_adaptive_split50_ready(
+                    node_id,
+                    configs.elections_info,
+                    configs.cfg15.elections_start_before,
+                    configs.cfg15.elections_end_before,
+                    configs.cfg16,
+                    ctx.sleep_pct,
+                    ctx.waiting_pct,
+                ) {
+                    return Ok(0);
+                }
+                let current_stake = if node.stake_accepted { elections_stake } else { 0 };
+                let stakes: Vec<_> = configs
+                    .elections_info
+                    .participants
+                    .iter()
+                    .filter(|p| {
+                        p.pub_key.as_slice()
+                            != node
+                                .participant
+                                .as_ref()
+                                .map(|p| p.pub_key.as_slice())
+                                .unwrap_or_default()
+                    })
+                    .map(|p| ParticipantStake { stake: p.stake, max_factor: p.max_factor })
+                    .collect();
+                adaptive_strategy::calc_adaptive_stake(
+                    node_id,
+                    total_balance,
+                    pool_free_balance,
+                    current_stake,
+                    ctx.our_max_factor,
+                    stakes,
+                    configs.cfg16,
+                    configs.cfg17,
+                    ctx.prev_min_eff_stake,
+                )
+            }
+            other => other.calculate_stake(min_stake, total_balance),
+        }
     }
 
     fn build_participants_snapshot(
@@ -920,17 +1232,12 @@ impl ElectionRunner {
     }
 
     async fn build_validators_snapshot(&mut self) -> ValidatorsSnapshot {
-        let current_election_id =
-            self.snapshot_cache.last_elections.as_ref().map(|snapshot| snapshot.election_id);
-
         let mut node_ids = self.nodes.keys().cloned().collect::<Vec<String>>();
-        node_ids.sort_by(|a, b| a.cmp(b));
+        node_ids.sort();
 
         let mut controlled_nodes = Vec::new();
         for node_id in node_ids {
             let node = self.nodes.get_mut(&node_id).expect("node not found");
-            let current_cycle_key =
-                current_election_id.and_then(|election_id| node.validator_config.find(election_id));
 
             let (validator_entry, is_next_validator) = find_validator_entries(
                 node,
@@ -950,72 +1257,51 @@ impl ElectionRunner {
             node.is_validator = is_validator;
             node.is_next_validator = is_next_validator;
 
-            let participant = node.participant.as_ref();
-            let wallet_addr = Some(node.wallet.address().to_string());
-            let pool_addr = node.pool.as_ref().map(|p| p.address().to_string());
-            let pubkey = validator_entry
+            let wallet_addr = node.wallet.address().await.ok().map(|a| a.to_string());
+            let pool_addr = node.pool_addr_cache.as_ref().map(|a| a.to_string());
+            let pubkey = validator_entry.as_ref().map(|(_, entry, ..)| {
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    entry.public_key.as_bytes(),
+                )
+            });
+            let adnl = validator_entry
                 .as_ref()
-                .map(|(_, entry)| {
-                    base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        entry.public_key.as_bytes(),
-                    )
+                .and_then(|(_, entry, ..)| {
+                    entry.adnl_addr.as_ref().map(|x| x.as_slice().as_slice())
                 })
-                .or_else(|| {
-                    participant.map(|p| {
-                        base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            p.pub_key.as_slice(),
-                        )
-                    })
-                });
-            let adnl = current_cycle_key
-                .as_ref()
-                .and_then(|entry| entry.adnl_addr())
-                .as_deref()
-                .or_else(|| {
-                    validator_entry.as_ref().and_then(|(_, entry)| {
-                        entry.adnl_addr.as_ref().map(|x| x.as_slice().as_slice())
-                    })
-                })
-                .or_else(|| participant.map(|p| p.adnl_addr.as_slice()))
                 .map(|x| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, x));
-            let key_id = current_cycle_key
-                .as_ref()
-                .map(|entry| {
-                    base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &entry.key_id,
-                    )
-                })
-                .or_else(|| {
-                    if node.key_id.is_empty() {
-                        None
-                    } else {
-                        Some(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &node.key_id,
-                        ))
-                    }
-                });
+            let key_id = validator_entry.as_ref().map(|(.., matched_entry)| {
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &matched_entry.key_id,
+                )
+            });
             let (key_election_id, key_expires_at, key_expires_at_utc, is_key_active) =
-                current_cycle_key
+                validator_entry
                     .as_ref()
-                    .map(|entry| {
-                        let expires = entry.expired_at;
+                    .map(|(_, _, matched_election_id, matched_entry)| {
+                        let expires = matched_entry.expired_at;
                         let now = time_format::now();
                         (
-                            current_election_id,
+                            Some(*matched_election_id),
                             Some(expires),
                             Some(time_format::format_ts(expires)),
                             Some(expires > now),
                         )
                     })
                     .unwrap_or((None, None, None, None));
-            let stake = participant.map(|p| nanotons_to_dec_string(p.stake));
+            let stake = validator_entry.as_ref().and_then(|(_, vd, ..)| {
+                let mut pubkey = [0u8; 32];
+                pubkey.copy_from_slice(vd.public_key.as_slice());
+                self.past_elections
+                    .iter()
+                    .find_map(|pe| pe.frozen_map.get(&pubkey))
+                    .map(|frozen| nanotons_to_dec_string(frozen.stake))
+            });
 
-            let validator_index = validator_entry.as_ref().map(|(idx, _)| *idx);
-            let weight = validator_entry.as_ref().map(|(_, entry)| entry.weight);
+            let validator_index = validator_entry.as_ref().map(|(idx, ..)| *idx);
+            let weight = validator_entry.as_ref().map(|(_, entry, ..)| entry.weight);
 
             // Compute and update binding status
             let is_participating = node.participant.is_some();
@@ -1071,7 +1357,7 @@ impl ElectionRunner {
         }
     }
 
-    fn build_our_participants_snapshot(&self) -> Vec<OurElectionParticipant> {
+    async fn build_our_participants_snapshot(&self) -> Vec<OurElectionParticipant> {
         let elections_snapshot = self.snapshot_cache.last_elections.as_ref();
 
         // Build ranked list of participants by stake (descending) for position calculation
@@ -1095,8 +1381,8 @@ impl ElectionRunner {
         for node_id in node_ids {
             let node = self.nodes.get(&node_id).expect("node not found");
             let participant = node.participant.as_ref();
-            let wallet_addr = Some(node.wallet.address().to_string());
-            let pool_addr = node.pool.as_ref().map(|p| p.address().to_string());
+            let wallet_addr = node.wallet.address().await.ok().map(|a| a.to_string());
+            let pool_addr = node.pool_addr_cache.as_ref().map(|a| a.to_string());
 
             let pubkey = participant.map(|p| {
                 base64::Engine::encode(
@@ -1130,7 +1416,13 @@ impl ElectionRunner {
                 })
                 .collect();
 
-            let fallback_sender_addr = format!("-1:{}", hex::encode(node.wallet_addr()));
+            let staking_addrs: Vec<String> = match node.stake_addr().await {
+                Ok(addr) => vec![format!("-1:{}", hex::encode(addr))],
+                Err(e) => {
+                    tracing::error!("stake addr error: {:#}", e);
+                    vec![]
+                }
+            };
             let accepted_stake = if node.stake_accepted {
                 node.accepted_stake_amount.map(nanotons_to_dec_string).or_else(|| {
                     node.stake_submissions.last().map(|s| nanotons_to_dec_string(s.stake))
@@ -1139,10 +1431,10 @@ impl ElectionRunner {
                 None
             };
 
-            // Find position in ranked list (1-based)
+            // Find position in ranked list (1-based); for TONCore nominator pair check both addresses.
             let position = ranked_participants
                 .iter()
-                .position(|p| p.sender_addr == fallback_sender_addr)
+                .position(|p| staking_addrs.contains(&p.sender_addr))
                 .map(|pos| (pos + 1) as u32);
 
             let elections_running = matches!(
@@ -1189,7 +1481,7 @@ impl ElectionRunner {
         let elections_status = self.snapshot_cache.last_elections_status.clone();
         let next_elections_range = self.snapshot_cache.next_elections_range.clone();
         let validators = self.build_validators_snapshot().await;
-        let our_participants = self.build_our_participants_snapshot();
+        let our_participants = self.build_our_participants_snapshot().await;
         store.update_with(|s| {
             s.elections = elections;
             s.elections_status = elections_status;
@@ -1227,10 +1519,10 @@ impl ElectionRunner {
         let last_binding_statuses = &mut self.snapshot_cache.last_binding_statuses;
         for (node_id, node) in self.nodes.iter() {
             let last_status = last_binding_statuses
-                .insert(node_id.clone(), node.binding_status.clone())
+                .insert(node_id.clone(), node.binding_status)
                 .unwrap_or(BindingStatus::Idle);
             if node.binding_status != last_status {
-                changes.insert(node_id.clone(), node.binding_status.clone());
+                changes.insert(node_id.clone(), node.binding_status);
             }
         }
         changes
@@ -1241,13 +1533,13 @@ async fn find_validator_entries(
     node: &mut Node,
     current_vset: Option<&ValidatorSet>,
     next_vset: Option<&ValidatorSet>,
-) -> anyhow::Result<(Option<(u16, ValidatorDescr)>, bool)> {
+) -> anyhow::Result<(Option<(u16, ValidatorDescr, u64, ValidatorEntry)>, bool)> {
     let config = &node.validator_config;
 
     let mut election_ids = config.keys.keys().cloned().collect::<Vec<_>>();
     election_ids.sort();
 
-    let mut current_entry: Option<(u16, ValidatorDescr)> = None;
+    let mut current_entry: Option<(u16, ValidatorDescr, u64, ValidatorEntry)> = None;
     let mut is_in_next = false;
 
     for election_id in &election_ids[election_ids.len().saturating_sub(3)..] {
@@ -1260,22 +1552,20 @@ async fn find_validator_entries(
         let mut key = [0u8; 32];
         key.copy_from_slice(&public_key);
 
-        if current_entry.is_none() {
-            if let Some(vset) = current_vset {
-                if let Some(idx) =
-                    vset.list().iter().position(|item| item.public_key.as_slice() == &key)
-                {
-                    current_entry = Some((u16::try_from(idx)?, vset.list()[idx].clone()));
-                }
-            }
+        if current_entry.is_none()
+            && let Some(vset) = current_vset
+            && let Some(idx) =
+                vset.list().iter().position(|item| item.public_key.as_slice() == &key)
+        {
+            current_entry =
+                Some((u16::try_from(idx)?, vset.list()[idx].clone(), *election_id, entry.clone()));
         }
 
-        if !is_in_next {
-            if let Some(vset) = next_vset {
-                if vset.list().iter().any(|item| item.public_key.as_slice() == &key) {
-                    is_in_next = true;
-                }
-            }
+        if !is_in_next
+            && let Some(vset) = next_vset
+            && vset.list().iter().any(|item| item.public_key.as_slice() == &key)
+        {
+            is_in_next = true;
         }
 
         if current_entry.is_some() && is_in_next {
