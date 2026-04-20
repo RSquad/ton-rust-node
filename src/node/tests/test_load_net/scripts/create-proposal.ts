@@ -37,16 +37,16 @@ export async function run(provider: NetworkProvider) {
 
     for (const [name, param] of Object.entries(params)) {
         const id = parseInt(name.slice(1));
-        const queryId = (now << 32) | id;
+        const queryId = (BigInt(now) << 32n) | BigInt(id);
         console.log(`param ${id} is ${criticals.has(id) ? 'critical' : 'not critical'}`);
 
-        const params = (criticals.has(id) ? criticalParamsCell : nonCriticalParamsCell).beginParse();
-        params.loadUint(8);
-        params.loadUint(8);
-        params.loadUint(8);
-        params.loadUint(8);
-        params.loadUint(8);
-        const minStoreSec = params.loadUint(32);
+        const slice = (criticals.has(id) ? criticalParamsCell : nonCriticalParamsCell).beginParse();
+        slice.loadUint(8);
+        slice.loadUint(8);
+        slice.loadUint(8);
+        slice.loadUint(8);
+        slice.loadUint(8);
+        const minStoreSec = slice.loadUint(32);
         console.log(`minStoreSec: ${minStoreSec}`);
         const expiresAt = now + parseInt(process.env.EXPIRES_IN_SECS ?? (await ui.input('Expires in seconds:')));
         console.log(`creating proposal for param ${name}...`);

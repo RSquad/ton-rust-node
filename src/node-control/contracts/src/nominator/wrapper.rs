@@ -44,9 +44,10 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Physical sub-pool contracts for deploy and RPC.
     ///
     /// Returns the two on-chain [`NominatorWrapper`] contracts for a
-    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter), `[self]` for
-    /// [`SingleNominatorWrapper`](crate::nominator::SingleNominatorWrapper) (preserves state_init
-    /// for deploy), or an empty `Vec` for a single TONCore pool.
+    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter), 
+    /// [`SingleNominatorWrapper`](crate::nominator::SingleNominatorWrapper) returns 
+    /// a single-element vec containing a wrapper for the same pool (preserves state_init
+    /// for deploy).
     fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>>;
     /// Minimum nanotons that must remain in the staking account after a stake withdrawal
     /// (contract storage reserve). SNP = [`SNP_STORAGE_RESERVE`]; TONCore = [`TONCORE_STORAGE_RESERVE`].
