@@ -98,7 +98,10 @@ pub struct PoolAddCoreCmd {
     #[arg(long = "max-nominators", help = "Max nominators (default: 40)")]
     max_nominators: Option<u16>,
 
-    #[arg(long = "min-validator-stake", help = "Minimum validator stake in TON (default: 10 000)")]
+    #[arg(
+        long = "min-validator-stake",
+        help = "Minimum validator stake in TON (server default when omitted: 100 000)"
+    )]
     min_validator_stake: Option<f64>,
 
     #[arg(long = "min-nominator-stake", help = "Minimum nominator stake in TON (default: 10 000)")]
