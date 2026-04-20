@@ -44,8 +44,8 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Physical sub-pool contracts for deploy and RPC.
     ///
     /// Returns the two on-chain [`NominatorWrapper`] contracts for a
-    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter), 
-    /// [`SingleNominatorWrapper`](crate::nominator::SingleNominatorWrapper) returns 
+    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter),
+    /// [`SingleNominatorWrapper`](crate::nominator::SingleNominatorWrapper) returns
     /// a single-element vec containing a wrapper for the same pool (preserves state_init
     /// for deploy).
     fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>>;
