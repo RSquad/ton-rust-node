@@ -1743,7 +1743,8 @@ Configuration is specified in JSON format.
     "max_factor": 3.0,
     "tick_interval": 40,
     "sleep_period_pct": 0.2,
-    "waiting_period_pct": 0.4
+    "waiting_period_pct": 0.4,
+    "static_adnls": { "<node_name>": "<base64_adnl_key_hash>" }
   },
   // optional
   "voting": {
@@ -1859,6 +1860,7 @@ Automatic elections task configuration:
 - `tick_interval` — interval between election checks in seconds (default: `40`)
 - `sleep_period_pct` — AdaptiveSplit50 minimum wait as a fraction of election duration. Default `0.2`. Must be in `[0.0, 1.0]` and ≤ `waiting_period_pct`.
 - `waiting_period_pct` — AdaptiveSplit50 maximum wait for enough participants as a fraction of election duration. Default `0.4`. Must be in `[0.0, 1.0]` and ≥ `sleep_period_pct`.
+- `static_adnls` — pre-generated persistent ADNL addresses keyed by node name (base64-encoded). When a node has an entry here, the runner reuses this ADNL address each election cycle instead of generating a fresh one. Managed via `config elections static-adnl` or `POST /v1/elections/static-adnl`. Example: `{ "node0": "oRvD1E5F..." }`
 
 #### `voting` (optional)
 
