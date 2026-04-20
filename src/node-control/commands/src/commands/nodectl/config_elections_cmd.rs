@@ -161,6 +161,8 @@ struct BindingElectionView {
     enable: bool,
     status: BindingStatus,
     stake_policy: StakePolicy,
+    #[serde(default)]
+    static_adnl: Option<String>,
 }
 
 fn print_elections_settings_table(view: &ElectionsSettingsView) {
@@ -177,19 +179,42 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
     }
 
     if !view.bindings.is_empty() {
+        let has_static_adnl = view.bindings.iter().any(|b| b.static_adnl.is_some());
         println!("\n  {}", "Bindings:".cyan().bold());
-        println!(
-            "    {:<20} {:<12} {:<16} {}",
-            "Node".cyan(),
-            "Enable".cyan(),
-            "Status".cyan(),
-            "Stake Policy".cyan(),
-        );
-        println!("    {}", "─".repeat(70).dimmed());
+        if has_static_adnl {
+            println!(
+                "    {:<20} {:<12} {:<16} {:<20} {}",
+                "Node".cyan(),
+                "Enable".cyan(),
+                "Status".cyan(),
+                "Stake Policy".cyan(),
+                "Static ADNL".cyan(),
+            );
+        } else {
+            println!(
+                "    {:<20} {:<12} {:<16} {}",
+                "Node".cyan(),
+                "Enable".cyan(),
+                "Status".cyan(),
+                "Stake Policy".cyan(),
+            );
+        }
+        println!("    {}", "─".repeat(if has_static_adnl { 100 } else { 70 }).dimmed());
         for b in &view.bindings {
             let enable_str =
                 if b.enable { "yes".green().to_string() } else { "no".red().to_string() };
-            println!("    {:<20} {:<21} {:<16} {}", b.name, enable_str, b.status, b.stake_policy,);
+            if has_static_adnl {
+                let adnl = b.static_adnl.as_deref().unwrap_or("—");
+                println!(
+                    "    {:<20} {:<21} {:<16} {:<20} {}",
+                    b.name, enable_str, b.status, b.stake_policy, adnl,
+                );
+            } else {
+                println!(
+                    "    {:<20} {:<21} {:<16} {}",
+                    b.name, enable_str, b.status, b.stake_policy,
+                );
+            }
         }
     }
     println!();

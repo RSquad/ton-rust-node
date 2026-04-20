@@ -167,6 +167,8 @@ pub struct BindingElectionStatusDto {
     pub enable: bool,
     pub status: BindingStatus,
     pub stake_policy: StakePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_adnl: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -813,6 +815,7 @@ fn build_binding_election_status(
             enable: b.enable,
             status: b.status,
             stake_policy: elections.stake_policy(name).clone(),
+            static_adnl: elections.static_adnls.get(name).cloned(),
         })
         .collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
