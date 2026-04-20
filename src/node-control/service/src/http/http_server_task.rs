@@ -10,9 +10,10 @@ use super::{
     config_handlers::{
         BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
         ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
-        NodeDto, NodesResponse, PoolDto, PoolsResponse, TonCorePoolSlotDto, WalletDto,
-        WalletsResponse, v1_bindings_handler, v1_elections_settings_handler, v1_log_handler,
-        v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_wallets_handler,
+        NodeDto, NodesResponse, PoolDto, PoolsResponse, StaticAdnlDto, StaticAdnlResponse,
+        TonCorePoolSlotDto, WalletDto, WalletsResponse, v1_bindings_handler,
+        v1_elections_settings_handler, v1_log_handler, v1_master_wallet_handler, v1_nodes_handler,
+        v1_pools_handler, v1_wallets_handler,
     },
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
@@ -174,6 +175,10 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
         .route(
             "/v1/elections/settings",
             axum::routing::post(super::config_handlers::v1_elections_settings_update_handler),
+        )
+        .route(
+            "/v1/elections/static-adnl",
+            axum::routing::post(super::config_handlers::v1_elections_static_adnl_handler),
         )
         .route("/v1/task/elections", axum::routing::post(v1_task_elections_handler))
         .route("/v1/nodes", axum::routing::post(super::config_handlers::v1_nodes_add_handler))
@@ -834,6 +839,7 @@ impl utoipa::Modify for BearerAuthAddon {
         v1_validators_handler,
         v1_task_elections_handler,
         super::config_handlers::v1_elections_settings_update_handler,
+        super::config_handlers::v1_elections_static_adnl_handler,
         // It won't compile without full names
         super::config_handlers::v1_nodes_handler,
         super::config_handlers::v1_nodes_add_handler,
@@ -893,6 +899,9 @@ impl utoipa::Modify for BearerAuthAddon {
         super::config_handlers::EntityRefDto,
         super::config_handlers::EntityRefResponse,
         super::config_handlers::OkResponse,
+        super::config_handlers::StaticAdnlRequest,
+        StaticAdnlDto,
+        StaticAdnlResponse,
         super::config_handlers::TonHttpApiRequest,
         super::config_handlers::TonHttpApiResult,
         super::config_handlers::TonHttpApiResponse,

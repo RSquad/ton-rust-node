@@ -538,6 +538,11 @@ pub struct ElectionsConfig {
     /// If min_validators is not reached within this period, proceed without waiting.
     #[serde(default = "default_waiting_pct")]
     pub waiting_period_pct: f64,
+    /// Pre-generated ADNL addresses, keyed by node name (base64-encoded).
+    /// When a node has an entry here, the runner attaches this existing ADNL address
+    /// to the validator key each election instead of generating a fresh one.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub static_adnls: HashMap<String, String>,
 }
 
 impl ElectionsConfig {
@@ -587,6 +592,7 @@ impl Default for ElectionsConfig {
             tick_interval: default_tick_interval(),
             sleep_period_pct: default_sleep_pct(),
             waiting_period_pct: default_waiting_pct(),
+            static_adnls: HashMap::new(),
         }
     }
 }

@@ -38,6 +38,8 @@ pub enum ElectionsAction {
     Enable(EnableCmd),
     /// Disable elections for binding(s)
     Disable(DisableCmd),
+    /// Generate and assign a persistent ADNL address for a node
+    StaticAdnl(StaticAdnlCmd),
 }
 
 #[derive(clap::Args, Clone)]
@@ -92,6 +94,12 @@ pub struct DisableCmd {
     nodes: Vec<String>,
 }
 
+#[derive(clap::Args, Clone)]
+pub struct StaticAdnlCmd {
+    #[arg(short = 'n', long = "node", required = true, help = "Node name")]
+    node: String,
+}
+
 impl ElectionsCfgCmd {
     pub async fn run(
         &self,
@@ -106,6 +114,7 @@ impl ElectionsCfgCmd {
             ElectionsAction::MaxFactor(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Enable(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Disable(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::StaticAdnl(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
@@ -152,6 +161,8 @@ struct BindingElectionView {
     enable: bool,
     status: BindingStatus,
     stake_policy: StakePolicy,
+    #[serde(default)]
+    static_adnl: Option<String>,
 }
 
 fn print_elections_settings_table(view: &ElectionsSettingsView) {
@@ -168,19 +179,42 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
     }
 
     if !view.bindings.is_empty() {
+        let has_static_adnl = view.bindings.iter().any(|b| b.static_adnl.is_some());
         println!("\n  {}", "Bindings:".cyan().bold());
-        println!(
-            "    {:<20} {:<12} {:<16} {}",
-            "Node".cyan(),
-            "Enable".cyan(),
-            "Status".cyan(),
-            "Stake Policy".cyan(),
-        );
-        println!("    {}", "─".repeat(70).dimmed());
+        if has_static_adnl {
+            println!(
+                "    {:<20} {:<12} {:<16} {:<20} {}",
+                "Node".cyan(),
+                "Enable".cyan(),
+                "Status".cyan(),
+                "Stake Policy".cyan(),
+                "Static ADNL".cyan(),
+            );
+        } else {
+            println!(
+                "    {:<20} {:<12} {:<16} {}",
+                "Node".cyan(),
+                "Enable".cyan(),
+                "Status".cyan(),
+                "Stake Policy".cyan(),
+            );
+        }
+        println!("    {}", "─".repeat(if has_static_adnl { 100 } else { 70 }).dimmed());
         for b in &view.bindings {
             let enable_str =
                 if b.enable { "yes".green().to_string() } else { "no".red().to_string() };
-            println!("    {:<20} {:<21} {:<16} {}", b.name, enable_str, b.status, b.stake_policy,);
+            if has_static_adnl {
+                let adnl = b.static_adnl.as_deref().unwrap_or("—");
+                println!(
+                    "    {:<20} {:<21} {:<16} {:<20} {}",
+                    b.name, enable_str, b.status, b.stake_policy, adnl,
+                );
+            } else {
+                println!(
+                    "    {:<20} {:<21} {:<16} {}",
+                    b.name, enable_str, b.status, b.stake_policy,
+                );
+            }
         }
     }
     println!();
@@ -333,6 +367,33 @@ impl DisableCmd {
         api_post(&base_url, "/v1/elections/exclude", token, &NodeListBody { nodes: &self.nodes })
             .await?;
         println!("{} Elections disabled for: {}", "OK".green().bold(), self.nodes.join(", "));
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StaticAdnlBody<'a> {
+    node: &'a str,
+}
+
+impl StaticAdnlCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let resp = api_post(
+            &base_url,
+            "/v1/elections/static-adnl",
+            token,
+            &StaticAdnlBody { node: &self.node },
+        )
+        .await?;
+        let parsed: serde_json::Value = serde_json::from_str(&resp)?;
+        let adnl_addr = parsed["result"]["adnl_addr"].as_str().unwrap_or("unknown");
+        println!("{} Static ADNL address for '{}': {}", "OK".green().bold(), self.node, adnl_addr);
         Ok(())
     }
 }
