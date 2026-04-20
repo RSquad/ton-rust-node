@@ -109,6 +109,9 @@ struct Node {
     pool_addr_cache: Option<MsgAddressInt>,
     /// Last error observed for this node during the current/previous tick (stringified).
     last_error: Option<String>,
+    /// Pre-generated static ADNL address (32-byte key hash).
+    /// When set, this address is re-registered each election instead of generating a fresh one.
+    static_adnl_addr: Option<Vec<u8>>,
     /// Excluded from elections (enable = false).
     excluded: bool,
     /// Effective stake policy for this node.
@@ -129,6 +132,23 @@ impl Node {
             Some(addr) => addr.address().storage().to_vec(),
             None => self.wallet.address().await?.address().storage().to_vec(),
         })
+    }
+
+    /// Resolve the ADNL address for this election cycle.
+    /// If a static ADNL is configured, re-register it with the validator key.
+    /// Otherwise, generate a fresh ephemeral ADNL address.
+    async fn resolve_adnl_addr(
+        &mut self,
+        perm_key_id: Vec<u8>,
+        until: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        match &self.static_adnl_addr {
+            Some(key_id) => {
+                self.api.register_adnl_addr(key_id.clone(), perm_key_id, until).await?;
+                Ok(key_id.clone())
+            }
+            None => self.api.new_adnl_addr(perm_key_id, until).await,
+        }
     }
 
     fn reset_participation(&mut self) {
@@ -281,6 +301,13 @@ impl ElectionRunner {
             let excluded = !binding.map(|b| b.enable).unwrap_or(false);
             let binding_status = binding.map(|b| b.status).unwrap_or(BindingStatus::Idle);
             let stake_policy = elections_config.stake_policy(&node_id).clone();
+            let static_adnl = elections_config.static_adnls.get(&node_id).and_then(|b64| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .map_err(|e| {
+                        tracing::error!("node [{}] invalid static_adnl base64: {}", node_id, e);
+                    })
+                    .ok()
+            });
             nodes.insert(
                 node_id,
                 Node {
@@ -288,6 +315,7 @@ impl ElectionRunner {
                     wallet,
                     pool: node_pools,
                     pool_addr_cache: None,
+                    static_adnl_addr: static_adnl,
                     excluded,
                     stake_policy,
                     key_id: vec![],
@@ -738,13 +766,17 @@ impl ElectionRunner {
                     key_expired_at
                 );
                 let adnl_addr = node
-                    .api
-                    .new_adnl_addr(key_id.clone(), key_expired_at)
+                    .resolve_adnl_addr(key_id.clone(), key_expired_at)
                     .await
-                    .map_err(|e| anyhow::anyhow!("new adnl address error: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("adnl address error: {}", e))?;
                 tracing::info!(
-                    "node [{}] generate new adnl address: {}",
+                    "node [{}] {} adnl address: {}",
                     node_id,
+                    if node.static_adnl_addr.is_some() {
+                        "registered static"
+                    } else {
+                        "generated new"
+                    },
                     base64::Engine::encode(
                         &base64::engine::general_purpose::STANDARD,
                         adnl_addr.as_slice()

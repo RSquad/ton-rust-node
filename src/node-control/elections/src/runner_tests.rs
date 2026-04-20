@@ -119,6 +119,13 @@ mock! {
         async fn config_param_16(&mut self) -> anyhow::Result<ton_block::config_params::ConfigParam16>;
         async fn config_param_17(&mut self) -> anyhow::Result<ton_block::config_params::ConfigParam17>;
         async fn get_next_vset(&mut self) -> anyhow::Result<Option<ValidatorSet>>;
+        async fn generate_adnl_addr(&mut self) -> anyhow::Result<Vec<u8>>;
+        async fn register_adnl_addr(
+            &mut self,
+            adnl_key_id: Vec<u8>,
+            perm_key_id: Vec<u8>,
+            until: u64,
+        ) -> anyhow::Result<()>;
     }
 }
 
@@ -372,6 +379,7 @@ impl TestHarness {
                 tick_interval: 10,
                 sleep_period_pct: 0.0,
                 waiting_period_pct: 0.3,
+                static_adnls: HashMap::new(),
             },
             bindings: HashMap::new(),
         }
@@ -1256,6 +1264,7 @@ async fn test_multiple_nodes_one_excluded() {
         tick_interval: 10,
         sleep_period_pct: 0.0,
         waiting_period_pct: 0.3,
+        static_adnls: HashMap::new(),
     };
 
     let mut bindings = HashMap::new();
@@ -1693,6 +1702,7 @@ async fn test_node_without_wallet_skipped() {
         tick_interval: 10,
         sleep_period_pct: 0.0,
         waiting_period_pct: 0.3,
+        static_adnls: HashMap::new(),
     };
 
     let mut bindings = HashMap::new();
@@ -3108,4 +3118,62 @@ async fn test_validator_snapshot_none_when_not_in_vset() {
         "key_election_id must be None when not in vset"
     );
     assert!(node_snapshot.stake.is_none(), "stake must be None when not in vset");
+}
+
+// =====================================================
+// TEST: static ADNL — register_adnl_addr is called
+// =====================================================
+
+#[tokio::test]
+async fn test_static_adnl_uses_register_instead_of_new() {
+    let node_id = "node-1";
+    let static_adnl = [0xAA_u8; 32];
+    let static_adnl_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &static_adnl);
+
+    let mut harness = TestHarness::new();
+    harness.elections_config.static_adnls.insert(node_id.to_string(), static_adnl_b64);
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+
+    // Setup provider WITHOUT new_adnl_addr — it must NOT be called.
+    // Instead, register_adnl_addr must be called.
+    harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    harness.provider_mock.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    harness.provider_mock.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    harness.provider_mock.expect_get_next_vset().returning(|| Ok(None));
+    harness
+        .provider_mock
+        .expect_new_validator_key()
+        .returning(|_since, _until| Ok((KEY_ID.to_vec(), PUB_KEY.to_vec())));
+    harness.provider_mock.expect_export_public_key().returning(|_key_id| Ok(PUB_KEY.to_vec()));
+    harness.provider_mock.expect_sign().returning(|_key, _data| Ok(SIGNATURE.to_vec()));
+    harness.provider_mock.expect_account().returning(move |_addr| Ok(fake_account(WALLET_BALANCE)));
+    harness.provider_mock.expect_send_boc().returning(|_boc| Ok(()));
+    harness.provider_mock.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    harness.provider_mock.expect_config_param_17().returning(|| Ok(default_cfg17()));
+    harness.provider_mock.expect_shutdown().returning(|| Ok(()));
+
+    // register_adnl_addr: expect exactly 1 call with the static ADNL key_id
+    let expected_adnl = static_adnl.to_vec();
+    harness
+        .provider_mock
+        .expect_register_adnl_addr()
+        .withf(move |adnl_key_id, _perm_key_id, _until| adnl_key_id == expected_adnl.as_slice())
+        .times(1)
+        .returning(|_adnl, _perm, _until| Ok(()));
+
+    // new_adnl_addr must NOT be called (no expectation = panics if called)
+
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.participant.is_some(), "participant should be set");
+    let participant = node.participant.as_ref().unwrap();
+    assert_eq!(participant.adnl_addr, static_adnl.to_vec(), "ADNL must be the static one");
 }
