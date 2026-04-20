@@ -32,21 +32,23 @@ export async function run(provider: NetworkProvider) {
     const criticals = cell10.beginParse().loadDictDirect(Dictionary.Keys.Uint(32), Dictionary.Values.Uint(0));
     console.log("get voting params...");
     const param11 = (await getConfig(11)).beginParse();
-    param11.loadRef();
-    const param11s = param11.loadRef().beginParse();
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    const minStoreSec = param11s.loadUint(32);
-    console.log(`minStoreSec (for critical params only): ${minStoreSec}`);
-
-    const expiresAt = now + parseInt(process.env.EXPIRES_IN_SECS ?? (await ui.input('Expires in seconds:')));
+    const nonCriticalParams = param11.loadRef().beginParse();
+    const criticalParams = param11.loadRef().beginParse();
 
     for (const [name, param] of Object.entries(params)) {
         const id = parseInt(name.slice(1));
         const queryId = (now << 32) | id;
+        console.log(`param ${id} is ${criticals.has(id) ? 'critical' : 'not critical'}`);
+
+        const params = criticals.has(id) ? criticalParams : nonCriticalParams;
+        params.loadUint(8);
+        params.loadUint(8);
+        params.loadUint(8);
+        params.loadUint(8);
+        params.loadUint(8);
+        const minStoreSec = params.loadUint(32);
+        console.log(`minStoreSec: ${minStoreSec}`);
+        const expiresAt = now + parseInt(process.env.EXPIRES_IN_SECS ?? (await ui.input('Expires in seconds:')));
         console.log(`creating proposal for param ${name}...`);
         console.log(`param: ${JSON.stringify(param, null, 2)}`);
         let paramCell = (() => {
@@ -181,8 +183,9 @@ async function getConfig(id: number): Promise<Cell> {
     try {
         const idx = process.argv.findIndex(arg => arg == '--custom');
         const url = idx !== -1 ? process.argv[idx + 1] : 'http://127.0.0.1:3301';
-        const baseUrl = url.endsWith("jsonRPC") ? url.slice(0, -6) : url;
+        const baseUrl = url.endsWith("jsonRPC") ? url.slice(0, -7) : url;
         const normalizedUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+        console.log(`getting config ${id} from ${normalizedUrl}`);
         const result = await fetch(`${normalizedUrl}getConfigParam?config_id=${id}`, {
             method: 'GET',
             headers: {
