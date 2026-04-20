@@ -454,14 +454,14 @@ fn print_toncore_table(views: &[&PoolView]) {
         total_slots,
     );
     println!(
-        "  {:<15} {:<5} {:<14} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+        "  {:<15} {:<5} {:<10} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
         "Name".cyan().bold(),
         "Slot".cyan().bold(),
         "State".cyan().bold(),
         "Balance".cyan().bold(),
         "Noms".cyan().bold(),
         "Share".cyan().bold(),
-        "Min val.stake".cyan().bold(),
+        "Validator".cyan().bold(),
         "Min nom.stake".cyan().bold(),
         "Address".cyan().bold(),
     );
@@ -476,7 +476,7 @@ fn print_toncore_table(views: &[&PoolView]) {
         }
         for s in slots {
             let display_addr = display_ton_address(s.address.as_deref());
-            let display_state = display_state(&s.state);
+            let display_state = display_state(&s.pool_state.unwrap_or(-1));
             let display_balance =
                 s.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
             let noms = match (s.nominators_count, s.max_nominators) {
@@ -490,8 +490,8 @@ fn print_toncore_table(views: &[&PoolView]) {
                 .validator_share
                 .map(|sh| format!("{:.2}%", sh as f64 / 100.0))
                 .unwrap_or_else(|| "-".to_string());
-            let min_val = s
-                .min_validator_stake
+            let validator_amount = s
+                .validator_amount
                 .map(|b| display_tons(b).to_string())
                 .unwrap_or_else(|| "-".to_string());
             let min_nom = s
@@ -499,14 +499,14 @@ fn print_toncore_table(views: &[&PoolView]) {
                 .map(|b| display_tons(b).to_string())
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {:<15} {:<5} {:<14} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+                "  {:<15} {:<5} {:<10} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
                 v.name,
                 s.slot,
                 display_state,
                 display_balance,
                 noms,
                 share,
-                min_val,
+                validator_amount,
                 min_nom,
                 display_addr,
             );
@@ -515,14 +515,13 @@ fn print_toncore_table(views: &[&PoolView]) {
     println!();
 }
 
-fn display_state(state: &str) -> ColoredString {
+fn display_state(state: &i32) -> ColoredString {
     match state {
-        "active" => "active".green(),
-        "uninit" => "uninit".yellow(),
-        "frozen" => "frozen".red(),
-        "not deployed" => "not deployed".yellow(),
-        "error" => "error".red(),
-        other => other.normal(),
+        -1 => "error".red(),
+        0 => "idle".cyan(),
+        1 => "staking".green(),
+        2 => "staking".green(),
+        _ => "unknown".red(),
     }
 }
 
