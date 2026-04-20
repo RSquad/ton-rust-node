@@ -29,8 +29,8 @@ pub enum PoolKind {
 ///
 /// TONCore nominator with two pools uses [`crate::nominator::TonCoreNominatorRouter`], which
 /// implements this trait. Use [`inner_pools`](NominatorWrapper::inner_pools) to iterate the
-/// physical pool contracts (deploy, RPC). For single pools `inner_pools` returns an empty vec —
-/// the pool itself is the only physical contract.
+/// physical pool contracts (deploy, RPC). SNP returns `[self]`; single TONCore returns an empty
+/// vec (the pool itself is the only physical contract).
 #[async_trait::async_trait]
 pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Get the owner and validator addresses stored in the contract
@@ -41,12 +41,12 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     fn state_init(&self) -> Option<StateInit> {
         None
     }
-    /// Physical sub-pool contracts (TONCore pair only).
+    /// Physical sub-pool contracts for deploy and RPC.
     ///
     /// Returns the two on-chain [`NominatorWrapper`] contracts for a
-    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter), or an empty `Vec`
-    /// for every other pool type (SNP, single TONCore). When the result is empty the pool itself
-    /// is the single physical contract.
+    /// [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter), `[self]` for
+    /// [`SingleNominatorWrapper`](crate::nominator::SingleNominatorWrapper) (preserves state_init
+    /// for deploy), or an empty `Vec` for a single TONCore pool.
     fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>>;
     /// Minimum nanotons that must remain in the staking account after a stake withdrawal
     /// (contract storage reserve). SNP = [`SNP_STORAGE_RESERVE`]; TONCore = [`TONCORE_STORAGE_RESERVE`].
