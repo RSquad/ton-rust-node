@@ -183,14 +183,14 @@ nodectl config pool add core -n core0 --odd \
   --min-nominator-stake 10000
 ```
 
-> **Distinct slot addresses:** the **even** and **odd** contracts must get **different** on-chain addresses. That requires the deploy parameters for the two slots to **not be identical** where the address is derived — a common pattern is to change **`min-validator-stake` by one unit** (TON) between slots (here `10000` vs `10001`). You can vary another numeric field instead, as long as the resulting init data differs.
+> **Distinct slot addresses:** the **even** and **odd** contracts must get **different** on-chain addresses. The derived address is a function of the validator wallet plus the slot’s **init parameters**; identical params on both slots yield the **same** address. A common pattern is to change **`min-validator-stake` by one unit** (TON) between slots (this example uses **`10000` vs `10001`**). If you omit **`--min-validator-stake`** on both commands, both slots get the service default (**`100_000` TON**) and you still **must** change another field (e.g. **`--validator-share`**) so the two slots differ. You can vary any numeric deploy field as long as the resulting init data differs.
 
 | Flag | Meaning |
 |------|---------|
 | `--even` / `--odd` | Which validation-round slot this contract covers (required; pick exactly one per command). |
 | `--validator-share` | Validator reward share in **basis points** (e.g. `1000` = 10%). |
-| `--min-validator-stake` | Minimum validator stake locked in the pool, **TON** (CLI default if omitted: `10000`). |
-| `--min-nominator-stake` | Minimum stake per nominator, **TON** (CLI default if omitted: `10000`). |
+| `--min-validator-stake` | Minimum validator stake locked in the pool, **TON**. If omitted, the nodectl service applies **`100_000` TON**. |
+| `--min-nominator-stake` | Minimum stake per nominator, **TON**. If omitted, the nodectl service applies **`10_000` TON**. |
 
 For production-style TONCore deployments, operators often set **minimum stake per nominator** around **10,000 TON** on the pool (`--min-nominator-stake 10000`). That is **independent** of the **validator stake**: each **`deposit-validator`** must still send at least that slot’s **`min-validator-stake`** into the pool.
 
