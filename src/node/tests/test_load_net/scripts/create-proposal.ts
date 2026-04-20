@@ -32,15 +32,15 @@ export async function run(provider: NetworkProvider) {
     const criticals = cell10.beginParse().loadDictDirect(Dictionary.Keys.Uint(32), Dictionary.Values.Uint(0));
     console.log("get voting params...");
     const param11 = (await getConfig(11)).beginParse();
-    const nonCriticalParams = param11.loadRef().beginParse();
-    const criticalParams = param11.loadRef().beginParse();
+    const nonCriticalParamsCell = param11.loadRef();
+    const criticalParamsCell = param11.loadRef();
 
     for (const [name, param] of Object.entries(params)) {
         const id = parseInt(name.slice(1));
         const queryId = (now << 32) | id;
         console.log(`param ${id} is ${criticals.has(id) ? 'critical' : 'not critical'}`);
 
-        const params = criticals.has(id) ? criticalParams : nonCriticalParams;
+        const params = (criticals.has(id) ? criticalParamsCell : nonCriticalParamsCell).beginParse();
         params.loadUint(8);
         params.loadUint(8);
         params.loadUint(8);
@@ -179,12 +179,16 @@ async function proposalStoragePrice(
     return result.stack.readBigNumber();
 }
 
+function getBaseUrl(): string {
+    const idx = process.argv.findIndex(arg => arg == '--custom');
+    const url = idx !== -1 ? process.argv[idx + 1] : 'http://127.0.0.1:3301';
+    const baseUrl = url.endsWith("jsonRPC") ? url.slice(0, -7) : url;
+    return baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+}
+
 async function getConfig(id: number): Promise<Cell> {
     try {
-        const idx = process.argv.findIndex(arg => arg == '--custom');
-        const url = idx !== -1 ? process.argv[idx + 1] : 'http://127.0.0.1:3301';
-        const baseUrl = url.endsWith("jsonRPC") ? url.slice(0, -7) : url;
-        const normalizedUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+        const normalizedUrl = getBaseUrl();
         console.log(`getting config ${id} from ${normalizedUrl}`);
         const result = await fetch(`${normalizedUrl}getConfigParam?config_id=${id}`, {
             method: 'GET',
@@ -204,7 +208,7 @@ async function getConfig(id: number): Promise<Cell> {
 }
 
 async function getTransactions(address: Address, limit: number, lt: number, hash: string) {
-    const result = await fetch(`http://127.0.0.1:3301/jsonRPC`, {
+    const result = await fetch(`${getBaseUrl()}jsonRPC`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
