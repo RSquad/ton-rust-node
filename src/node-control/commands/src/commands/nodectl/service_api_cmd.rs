@@ -6,17 +6,13 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::utils::normalize_base_url;
+use crate::commands::nodectl::utils::resolve_service_url;
 use anyhow::Context;
 use colored::Colorize;
-use common::{
-    app_config::{AppConfig, StakePolicy},
-    ton_utils::display_tons_from_str,
-};
+use common::{app_config::StakePolicy, ton_utils::display_tons_from_str};
 use std::{
     collections::HashSet,
     io::{self, Read},
-    path::Path,
 };
 
 #[derive(clap::Args, Clone)]
@@ -27,7 +23,8 @@ pub struct ApiCmd {
         short = 'u',
         long = "url",
         value_hint = clap::ValueHint::Url,
-        help = "URL to the node control service API (takes precedence over --config)",
+        help = "URL to the node control service API (takes precedence over --config; defaults to http://127.0.0.1:8080 if not --url, --config, or NODECTL_URL environment variable are provided)",
+        env = "NODECTL_URL",
         global = true,
     )]
     pub url: Option<String>,
@@ -50,7 +47,7 @@ pub struct ApiCmd {
         env = "CONFIG_PATH",
         global = true
     )]
-    config: String,
+    config: Option<String>,
 
     #[command(subcommand)]
     action: ServiceAction,
@@ -187,12 +184,7 @@ pub struct StakePolicyCmd {
 
 impl ApiCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
-        let base_url = if let Some(url) = self.url.as_deref() {
-            normalize_base_url(url)
-        } else {
-            let app_cfg = AppConfig::load(Path::new(&self.config))?;
-            normalize_base_url(&app_cfg.http.bind)
-        };
+        let base_url = resolve_service_url(self.url.as_deref(), self.config.as_deref())?;
         let client = reqwest::Client::new();
         let token = self.token.as_deref();
 

@@ -444,6 +444,7 @@ impl ElectionRunner {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Postponed;
         }
 
+        let mut skip_tick_nodes = vec![];
         // Fetch past_elections only when election_id changes (cache across ticks).
         if self.past_elections_cache_id != election_id {
             self.past_elections = self.elector.past_elections().await.context("past_elections")?;
@@ -463,11 +464,14 @@ impl ElectionRunner {
             //for SNP pool - its a simple getter.
             for (node_id, node) in self.nodes.iter_mut() {
                 node.pool_addr_cache = if let Some(p) = &node.pool {
-                    Some(
-                        p.address()
-                            .await
-                            .with_context(|| format!("node [{}]: pool address error", node_id))?,
-                    )
+                    match p.address().await {
+                        Ok(addr) => Some(addr),
+                        Err(e) => {
+                            tracing::error!("node [{}] pool address error: {}", node_id, e);
+                            skip_tick_nodes.push(node_id.clone());
+                            None
+                        }
+                    }
                 } else {
                     None
                 }
@@ -477,7 +481,12 @@ impl ElectionRunner {
         }
 
         // walk through the nodes and try to participate in the elections
-        let mut nodes = self.nodes.keys().cloned().collect::<Vec<String>>();
+        let mut nodes = self
+            .nodes
+            .keys()
+            .cloned()
+            .filter(|id| !skip_tick_nodes.contains(id))
+            .collect::<Vec<String>>();
         nodes.sort();
         for node_id in nodes {
             tracing::info!("node [{}] recover stake", node_id);
@@ -1058,8 +1067,8 @@ impl ElectionRunner {
         {
             tracing::info!(
                 "node [{}] {}: TONCore nominator - ignore, stake all",
-                node.stake_policy.to_string(),
-                node_id
+                node_id,
+                node.stake_policy.to_string()
             );
             return Ok(total_balance);
         }

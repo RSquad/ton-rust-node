@@ -11,6 +11,8 @@
         "deploy:pools": "bun scripts/nodectl-deploy-pools.ts",
         "topup:pools": "bun scripts/nodectl-topup-pools.ts",
         "topup": "bun scripts/topup.ts",
+        "add-nominators-to-pool": "bun scripts/add-nominators-to-pool.ts",
+        "withdraw-nominators-from-pool": "bun scripts/withdraw-nominators-from-pool.ts",
         "proposals:create": "bun blueprint run create-proposal --custom http://127.0.0.1:80/jsonRPC --mnemonic",
         "proposals:list": "bun blueprint run list-proposals --custom http://127.0.0.1:80/jsonRPC --mnemonic"
     },
