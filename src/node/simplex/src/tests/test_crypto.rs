@@ -240,9 +240,7 @@ fn test_compute_candidate_id_hash_with_block_id() {
 */
 
 use crate::{
-    simplex_state::{
-        FinalizeVote, NotarizeFallbackVote, NotarizeVote, SkipFallbackVote, SkipVote, Vote,
-    },
+    simplex_state::{FinalizeVote, NotarizeVote, SkipVote, Vote},
     utils::{
         extract_vote, sign_vote, tl_unsigned_to_vote, verify_vote_signature, vote_to_tl_unsigned,
     },
@@ -304,35 +302,6 @@ fn test_skip_vote_roundtrip() {
     let vote_back = tl_unsigned_to_vote(&tl_unsigned).unwrap();
 
     assert_eq!(vote, vote_back);
-}
-
-/// Test NotarizeFallbackVote conversion returns error
-///
-/// Note: C++ protocol doesn't support fallback votes in TL format.
-#[test]
-fn test_notarize_fallback_vote_roundtrip() {
-    let block_hash = UInt256::from([7u8; 32]);
-
-    let vote = Vote::NotarizeFallback(NotarizeFallbackVote {
-        slot: SlotIndex::new(45),
-        block_hash: block_hash.clone(),
-    });
-
-    // Fallback votes are not supported in C++ TL format - should return error
-    let result = vote_to_tl_unsigned(&vote);
-    assert!(result.is_err(), "NotarizeFallback should not be supported in TL");
-}
-
-/// Test SkipFallbackVote conversion returns error
-///
-/// Note: C++ protocol doesn't support fallback votes in TL format.
-#[test]
-fn test_skip_fallback_vote_roundtrip() {
-    let vote = Vote::SkipFallback(SkipFallbackVote { slot: SlotIndex::new(60) });
-
-    // Fallback votes are not supported in C++ TL format - should return error
-    let result = vote_to_tl_unsigned(&vote);
-    assert!(result.is_err(), "SkipFallback should not be supported in TL");
 }
 
 /// Test vote signing and verification

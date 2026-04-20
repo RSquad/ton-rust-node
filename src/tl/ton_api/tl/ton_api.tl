@@ -69,6 +69,7 @@ adnl.address.udp6 ip:int128 port:int = adnl.Address;
 
 adnl.address.tunnel to:int256 pubkey:PublicKey = adnl.Address;
 adnl.address.reverse = adnl.Address;
+adnl.address.quic ip:int port:int = adnl.Address;
 
 adnl.addressList addrs:(vector adnl.Address) version:int reinit_date:int priority:int expire_at:int = adnl.AddressList;
 
@@ -269,11 +270,11 @@ overlay.broadcastFecShort src:PublicKey certificate:overlay.Certificate broadcas
 overlay.broadcastNotFound = overlay.Broadcast;
 overlay.broadcastStream data:overlay.broadcast trace:(vector int256) = overlay.Broadcast;
 
-overlay.broadcastTwostepSimple flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data:bytes signature:bytes = overlay.Broadcast;
-overlay.broadcastTwostepFec flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data_hash:int256 data_size:int seqno:int part:bytes signature:bytes = overlay.Broadcast;
-overlay.broadcastTwostep.id flags:int date:int src:int256 src_adnl_id:int256 data_hash:int256 part_size:int = overlay.broadcastTwostep.Id;
+overlay.broadcastTwostepSimple flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data:bytes extra:bytes signature:bytes = overlay.Broadcast;
+overlay.broadcastTwostepFec flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data_hash:int256 data_size:int seqno:int part:bytes extra:bytes signature:bytes = overlay.Broadcast;
+overlay.broadcastTwostep.id flags:int date:int src:int256 src_adnl_id:int256 data_hash:int256 data_size:int part_size:int extra:bytes = overlay.broadcastTwostep.Id;
 overlay.broadcastTwostepSimple.toSign id:int256 data:bytes = overlay.broadcastTwostepSimple.ToSign;
-overlay.broadcastTwostepFec.toSign id:int256 data_size:int seqno:int part:bytes = overlay.broadcastTwostepFec.ToSign;
+overlay.broadcastTwostepFec.toSign id:int256 seqno:int part:bytes = overlay.broadcastTwostepFec.ToSign;
 
 ---functions---
 
@@ -1091,6 +1092,8 @@ consensus.candidateHashDataEmpty block:tonNode.blockIdExt parent:consensus.candi
 consensus.block slot:int parent:consensus.CandidateParent candidate:bytes signature:bytes = consensus.CandidateData;
 consensus.empty slot:int parent:consensus.CandidateId block:tonNode.blockIdExt signature:bytes = consensus.CandidateData;
 
+consensus.broadcastExtra slot:int = consensus.BroadcastExtra;
+
 // Simplex consensus votes
 consensus.requestError = consensus.RequestError;
 
@@ -1129,6 +1132,10 @@ consensus.simplex.db.candidateResolver.candidateInfo leader_id:int candidate_has
 // Candidate resolver: notarization certificate cache
 consensus.simplex.db.key.candidateResolver.notarCert candidateId:consensus.candidateId = consensus.simplex.db.key.candidateResolver.NotarCert;
 consensus.simplex.db.candidateResolver.notarCert notar:consensus.simplex.voteSignatureSet = consensus.simplex.db.candidateResolver.NotarCert;
+
+// Candidate resolver: full candidate payload (serialized CandidateData bytes)
+// Reference: C++ candidate-resolver.cpp store_candidate() / try_load_candidate_data_from_db()
+consensus.simplex.db.key.candidate candidateId:consensus.candidateId = consensus.simplex.db.key.Candidate;
 
 ---functions---
 consensus.simplex.requestCandidate id:consensus.CandidateId want_candidate:Bool want_notar:Bool = consensus.simplex.CandidateAndCert;

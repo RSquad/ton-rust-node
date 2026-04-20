@@ -14,21 +14,18 @@ use crate::{
 };
 use std::{borrow::Cow, mem};
 use ton_api::{
-    ton::{
-        smc::runresult::RunResult,
-        tvm::{
-            stackentry::{
-                StackEntryCell, StackEntryList, StackEntryNumber, StackEntrySlice, StackEntryTuple,
-            },
-            StackEntry,
+    ton::tvm::{
+        stackentry::{
+            StackEntryCell, StackEntryList, StackEntryNumber, StackEntrySlice, StackEntryTuple,
         },
+        StackEntry,
     },
     IntoBoxed,
 };
 use ton_block::{
-    error, fail, read_single_root_boc, write_boc, Cell, ConfigParams, CurrencyCollection,
+    error, fail, read_single_root_boc, write_boc, Account, Cell, ConfigParams, CurrencyCollection,
     Deserializable, ExtBlkRef, HashmapAugType, KeyExtBlkRef, Message, OldMcBlocksInfo, Result,
-    Serializable, Sha256, ShardAccount, ShardStateUnsplit, SliceData, UInt256, UnixTime,
+    Serializable, Sha256, ShardStateUnsplit, SliceData, UInt256, UnixTime,
 };
 
 /*
@@ -74,9 +71,26 @@ pub struct SmartContractInfo {
     pub precompiled_gas_usage: u64,
 }
 
+pub struct SmcMethodResult {
+    pub exit_code: i32,
+    pub gas_used: i64,
+    pub stack: Vec<StackItem>,
+    pub smc_info: SmartContractInfo,
+}
+
+impl SmcMethodResult {
+    pub fn into_run_result(self) -> Result<ton_api::ton::smc::runresult::RunResult> {
+        Ok(ton_api::ton::smc::runresult::RunResult {
+            gas_used: self.gas_used,
+            stack: convert_stack(&self.stack)?,
+            exit_code: self.exit_code,
+        })
+    }
+}
+
 impl SmartContractInfo {
     pub fn with_params(
-        shard_account: Option<&ShardAccount>,
+        account: Option<&Account>,
         message_root: Option<Cell>,
         mc_state_root: Option<Cell>, // state root could be virtualized
     ) -> Result<Self> {
@@ -101,14 +115,14 @@ impl SmartContractInfo {
             smci.unix_time = mc_state.gen_time() + 1;
             smci.config_params = extra.config;
         }
-        if let Some(shard_account) = shard_account {
-            let account = shard_account.read_account()?;
+        if let Some(account) = account {
             if let Some(addr) = account.get_addr() {
                 smci.myself = addr.write_to_bitstring()?;
             }
             if let Some(balance) = account.balance() {
                 smci.balance = balance.clone();
             }
+            smci.mycode = account.get_code().unwrap_or_default();
             smci.due_payment = account.due_payment().map_or(0, |g| g.as_u128());
         }
         if let Some(message_root) = message_root {
@@ -272,7 +286,7 @@ impl SmartContractInfo {
                 tuple.push(StackItem::boolean(int.bounce));
                 tuple.push(StackItem::boolean(int.bounced));
                 tuple.push(StackItem::slice(int.src.write_to_bitstring().unwrap_or_default()));
-                tuple.push(StackItem::int(0));
+                tuple.push(StackItem::int(int.fwd_fee().as_u128()));
                 tuple.push(StackItem::int(int.created_lt));
                 tuple.push(StackItem::int(int.created_at));
                 tuple.push(StackItem::int(int.value.coins.as_u128()));
@@ -488,16 +502,20 @@ pub fn convert_ton_stack(items: &[StackEntry]) -> Result<Vec<StackItem>> {
 }
 
 pub fn run_smc_method(
-    shard_account: &ShardAccount,
+    account: &Account,
     mc_state_cell: Cell,
     method_id: u32,
     stack: Vec<StackEntry>,
-) -> Result<RunResult> {
-    let account = shard_account.read_account()?;
+    gen_utime: u32,
+    gen_lt: u64,
+) -> Result<SmcMethodResult> {
     let code = account.get_code().ok_or_else(|| error!("Account has no code"))?;
     let data = account.get_data().unwrap_or_default();
-    let smc_info =
-        SmartContractInfo::with_params(Some(shard_account), None, Some(mc_state_cell.clone()))?;
+    let mut smc_info =
+        SmartContractInfo::with_params(Some(account), None, Some(mc_state_cell.clone()))?;
+    smc_info.unix_time = gen_utime;
+    smc_info.block_lt = gen_lt;
+    smc_info.trans_lt = gen_lt;
 
     let mut storage = convert_ton_stack(&stack)?;
     storage.push(StackItem::int(method_id));
@@ -534,8 +552,7 @@ pub fn run_smc_method(
     log::debug!("run_smc_method: result_stack_depth={}\n", stack.len());
     log::debug!("run_smc_method: result_stack dump: [ {} ]\n", render_stack(&stack));
 
-    let stack = convert_stack(&stack)?;
-    Ok(RunResult { gas_used: vm.gas_used(), stack, exit_code })
+    Ok(SmcMethodResult { exit_code, gas_used: vm.gas_used(), stack, smc_info })
 }
 
 #[cfg(test)]

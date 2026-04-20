@@ -558,12 +558,12 @@ pub trait HashmapType {
     fn hashmap_setref_with_mode(
         &mut self,
         key: SliceData,
-        value: &Cell,
+        value: Cell,
         gas_consumer: &mut dyn GasConsumer,
         mode: u8,
     ) -> Leaf {
         let mut builder = BuilderData::default();
-        builder.checked_append_reference(value.clone())?;
+        builder.checked_append_reference(value)?;
         self.hashmap_set_with_mode(key, &builder, gas_consumer, mode)
     }
 

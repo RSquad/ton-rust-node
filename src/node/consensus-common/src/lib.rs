@@ -116,18 +116,6 @@ pub type ValidatorBlockCandidateDecisionCallback =
 pub type ValidatorBlockCandidateCallback =
     Box<dyn FnOnce(Result<ValidatorBlockCandidatePtr>) + Send>;
 
-/// Result of a committed candidate proof download.
-/// Carries the block signatures from the on-chain proof, sufficient
-/// to reconstruct the FinalCert for SimplexState injection.
-#[derive(Clone, Debug)]
-pub struct CommittedBlockProof {
-    pub block_id: BlockIdExt,
-    pub signatures: BlockSignaturesVariant,
-}
-
-/// Callback for SessionListener::get_committed_candidate
-pub type CommittedBlockProofCallback = Box<dyn FnOnce(Result<CommittedBlockProof>) + Send>;
-
 /// Pointer to async request
 pub type AsyncRequestPtr = Arc<dyn AsyncRequest + Send + Sync>;
 
@@ -510,9 +498,9 @@ pub trait AsyncKeyValueStorage: Send + Sync {
 // Session Statistics
 // ============================================================================
 
-/// Session statistics for a committed block
+/// Session statistics reported alongside validator-session block-acceptance callbacks.
 ///
-/// Passed to on_block_committed callback to report session health metrics.
+/// For Simplex these stats are currently also reused for finalized delivery.
 #[derive(Debug, Clone, Default)]
 pub struct SessionStats {
     /// Total number of errors during this session
@@ -616,12 +604,13 @@ pub trait ConsensusOverlay: Send + Sync {
         v2: bool,
     );
 
-    /// Send broadcast
+    /// Send broadcast with optional extra metadata (e.g. consensus.broadcastExtra for slot info)
     fn send_broadcast_fec_ex(
         &self,
         sender_id: &PublicKeyHash,
         send_as: &PublicKeyHash,
         payload: BlockPayloadPtr,
+        extra: Option<Vec<u8>>,
     );
 
     /// Implementation specific
@@ -643,7 +632,7 @@ pub enum OverlayTransportType {
 
 impl OverlayTransportType {
     pub fn allow_tcp(&self) -> bool {
-        matches!(self, Self::CatchainTcp | Self::Simplex)
+        matches!(self, Self::CatchainTcp)
     }
 
     pub fn use_quic(&self) -> bool {
@@ -984,7 +973,9 @@ pub trait SessionListener: Send + Sync {
 
     /// New block is committed
     ///
-    /// Called when a block has been finalized by the consensus.
+    /// Called for sequential block acceptance callbacks.
+    /// Catchain uses this directly; Simplex now delivers finalized blocks via
+    /// `on_block_finalized` and must not rely on this callback.
     /// The `signatures` parameter contains the block signatures in variant format
     /// (either Ordinary for catchain-based consensus or Simplex for simplex consensus).
     #[allow(clippy::too_many_arguments)]
@@ -1012,15 +1003,32 @@ pub trait SessionListener: Send + Sync {
         callback: ValidatorBlockCandidateCallback,
     );
 
-    /// Download committed block proof from full-node storage/network.
+    /// A block has been finalized (FinalCert observed) and is ready for
+    /// validator-side acceptance.
     ///
-    /// Called by SessionProcessor when WaitingForFinalCert for an MC block
-    /// whose seqno == expected_seqno. The implementor (ValidatorGroup) fetches
-    /// the block proof via EngineOperations and returns BlockSignaturesVariant.
+    /// Called immediately when a finalization certificate is collected for a
+    /// slot, regardless of whether predecessors have been committed yet.
+    /// This is the Simplex finalized-delivery counterpart to `on_block_committed`.
     ///
-    /// Replaces the Rust-only requestCandidate2 path with a mechanism
-    /// compatible with both Rust and C++ validators.
-    fn get_committed_candidate(&self, block_id: BlockIdExt, callback: CommittedBlockProofCallback);
+    /// `block_id` carries the full `BlockIdExt` (shard, seqno, root_hash,
+    /// file_hash) so `ValidatorGroup` can derive the block identity without
+    /// relying on sequential `prev_block_ids` tracking.
+    ///
+    /// Has a default no-op implementation for backward compatibility with
+    /// legacy listeners that do not participate in finalized delivery.
+    #[allow(unused_variables)]
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
+        source_info: BlockSourceInfo,
+        root_hash: BlockHash,
+        file_hash: BlockHash,
+        data: BlockPayloadPtr,
+        signatures: BlockSignaturesVariant,
+        approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+    ) {
+        // Default no-op for backward compatibility with legacy listeners.
+    }
 }
 
 // ============================================================================
@@ -1032,6 +1040,18 @@ pub trait SessionListener: Send + Sync {
 /// This is the common interface for all consensus session implementations
 /// (both catchain-based validator-session and simplex).
 pub trait Session: fmt::Display + Send + Sync {
+    /// Signal the session to begin active consensus processing.
+    ///
+    /// For Simplex sessions, `initial_block_seqno` is the expected seqno of
+    /// the first block to be produced (derived from prev_block_ids).  The
+    /// session overlay is created at `create()` time so it can warm up
+    /// connections to peers.  The FSM timeout clock only starts after
+    /// `start()` is called, preventing premature skip-votes on an
+    /// unconnected overlay.
+    ///
+    /// For Catchain sessions, the parameter is ignored (no-op).
+    fn start(&self, initial_block_seqno: u32);
+
     /// Stop the session (blocks until all threads have stopped)
     /// Database is preserved for potential restart/recovery.
     fn stop(&self);

@@ -17,8 +17,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use ton_block::{
-    deserialize_out_action_slices, error, fail, unpack_out_action_slices, AccStatusChange, Account,
-    AccountId, AccountStatus, AddSub, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
+    error, fail, unpack_out_action_slices, AccStatusChange, Account, AccountId, AccountStatus,
+    AddSub, BlockError, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
     CurrencyCollection, Deserializable, ExceptionCode, GasLimitsPrices, GetRepresentationHash,
     GlobalCapabilities, HashmapE, HashmapFilterResult, IBitstring, Mask, Message, MsgAddressInt,
     NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, OutAction, Result,
@@ -147,6 +147,7 @@ pub trait TransactionExecutor {
     /// If account does not exist - phase skipped.
     /// Calculates storage fees and substracts them from account balance.
     /// If account balance becomes negative after that, then account is frozen.
+    /// is_special - flag indicating that account is in list of special smart contracts, for which storage fees are not applied
     fn storage_phase(
         &self,
         acc: &mut Account,
@@ -159,23 +160,12 @@ pub trait TransactionExecutor {
         if tr.now() < acc.last_paid() {
             fail!("transaction timestamp must be greater then account timestamp")
         }
-
-        if is_special {
-            log::debug!(target: "executor", "Special account: AccStatusChange::Unchanged");
-            return Ok(TrStoragePhase::with_params(
-                Coins::zero(),
-                acc.due_payment().cloned(),
-                AccStatusChange::Unchanged,
-            ));
-        }
+        let original_due_payment = acc.due_payment().cloned();
         let mut fee = match acc.storage_info() {
-            Some(storage_info) => {
+            Some(storage_info) if !is_special => {
                 self.config().calc_storage_fees(storage_info, is_masterchain, tr.now())?
             }
-            None => {
-                log::debug!(target: "executor", "Account::None");
-                return Ok(Default::default());
-            }
+            _ => Default::default(),
         };
         if let Some(due_payment) = acc.due_payment() {
             fee.add(due_payment)?;
@@ -192,6 +182,15 @@ pub trait TransactionExecutor {
             let storage_fees_collected = std::mem::take(&mut acc_balance.coins);
             tr.add_fee_coins(&storage_fees_collected)?;
             fee.sub(&storage_fees_collected)?;
+            if is_special {
+                log::debug!(target: "executor", "special account, due payment {fee} still active");
+                acc.set_due_payment(original_due_payment);
+                return Ok(TrStoragePhase::with_params(
+                    storage_fees_collected,
+                    Some(fee),
+                    AccStatusChange::Unchanged,
+                ));
+            }
             let need_freeze = acc.is_active()
                 && fee > self.config().get_gas_config(is_masterchain).freeze_due_limit;
             let need_delete = (acc.is_uninit() || acc.is_frozen())
@@ -565,30 +564,43 @@ pub trait TransactionExecutor {
         }
         let limits = self.config().size_limits_config();
 
-        let parsed_actions = match deserialize_out_action_slices(action_slices) {
-            Ok(actions) => actions,
-            Err((i, err)) => {
-                log::debug!(
-                    target: "executor",
-                    "invalid action {} found while preprocessing action list: {}",
-                    i,
-                    err
-                );
-                phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
-                if i != 0 {
-                    phase.result_arg = Some(i as i32);
+        let mut parsed_actions = Vec::with_capacity(action_slices.len());
+        for (i, mut slice) in action_slices.into_iter().enumerate() {
+            match OutAction::construct_from(&mut slice) {
+                Ok(action) => parsed_actions.push(Some(action)),
+                Err(err) => {
+                    if let Some(BlockError::OutActionError(_, mode)) = err.downcast_ref() {
+                        if mode.bit(SENDMSG_IGNORE_ERROR) {
+                            phase.skipped_actions += 1;
+                            parsed_actions.push(None);
+                            continue;
+                        } else if mode.bit(SENDMSG_BOUNCE_IF_FAIL) {
+                            bounce = true;
+                        }
+                    };
+                    log::debug!(
+                        target: "executor",
+                        "invalid action {i} found while preprocessing action list: {err}"
+                    );
+                    phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
+                    if i != 0 {
+                        phase.result_arg = Some(i as i32);
+                    }
+                    return finish_action_phase_with_fine(
+                        tr,
+                        phase,
+                        Some(msg_remaining_balance),
+                        acc_balance,
+                        bounce,
+                    );
                 }
-                return finish_action_phase_with_fine(
-                    tr,
-                    phase,
-                    Some(msg_remaining_balance),
-                    acc_balance,
-                    bounce,
-                );
             }
-        };
+        }
 
         for (i, action) in parsed_actions.into_iter().enumerate() {
+            let Some(action) = action else {
+                continue;
+            };
             log::debug!(target: "executor", "\nAction #{}\nType: {}\nInitial balance: {}",
                 i,
                 action_type(&action),
@@ -1268,8 +1280,8 @@ fn outmsg_action_handler(
     let (force_body_to_ref, body) = match msg.body() {
         None => (false, None),
         Some(body) => {
-            let b = body.clone().into_builder().unwrap_or_default();
-            (b.references_used() >= 2, Some(b))
+            let b = body.clone().into_cell().unwrap_or_default();
+            (b.references_count() >= 2, Some(b))
         }
     };
     let (force_init_to_ref, init) = match msg.state_init() {
@@ -1305,7 +1317,7 @@ fn outmsg_action_handler(
         };
         let mut sstat = StorageUsageCalc::with_limits(max_cells, limits.max_msg_bits as u64);
         if let Some(body) = &body {
-            sstat.append_builder(body, body_to_ref, &mut 0).map_err(|err| {
+            sstat.append_cell(body, body_to_ref, &mut 0).map_err(|err| {
                 log::error!(target: "executor", "cannot calc msg storage used for body: {err}");
                 RESULT_CODE_UNKNOWN_OR_INVALID_ACTION
             })?;

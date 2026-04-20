@@ -90,7 +90,7 @@ impl MockEngine {
         Ok(Self {
             db,
             now: Arc::new(AtomicU32::new(now)),
-            ext_messages: Arc::new(MessagesPool::new(now, None)),
+            ext_messages: Arc::new(MessagesPool::new(now, None).0),
             #[cfg(feature = "telemetry")]
             engine_telemetry: telemetry,
             #[cfg(feature = "telemetry")]

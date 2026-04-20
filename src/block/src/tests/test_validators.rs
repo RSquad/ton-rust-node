@@ -213,16 +213,3 @@ fn test_isolate_mc_validators() {
         }
     }
 }
-
-#[test]
-fn test_validator_shard_stat() {
-    // std::env::set_var("RUST_BACKTRACE", "full");
-    for len in 0..1024 {
-        println!("len = {}", len);
-        let mut stat = ValidatorsStat::default();
-        for i in 0..len {
-            stat.values.push(i as u16);
-        }
-        write_read_and_assert(stat.clone());
-    }
-}

@@ -103,7 +103,7 @@ fn test_create_ext_message() {
 #[test]
 fn test_message_keeper() {
     let m = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
-    let mk = MessageKeeper::new(Arc::new(m));
+    let mk = MessageKeeper::new(Arc::new(m), Default::default()).unwrap();
 
     assert!(mk.check_active(10000));
 
@@ -133,7 +133,7 @@ fn test_message_keeper() {
 #[test]
 fn test_message_keeper_multithread() {
     let m = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
-    let mk = Arc::new(MessageKeeper::new(Arc::new(m)));
+    let mk = Arc::new(MessageKeeper::new(Arc::new(m), Default::default()).unwrap());
 
     let mut hs = vec![];
     for _ in 0..50 {
@@ -173,11 +173,15 @@ fn test_message_keeper_multithread() {
 }
 
 fn create_external_message(dst_shard: u8, salt: Vec<u8>) -> Arc<Message> {
+    create_external_message_to([dst_shard; 32], salt)
+}
+
+fn create_external_message_to(dst_account: [u8; 32], salt: Vec<u8>) -> Arc<Message> {
     let mut hdr = ExternalInboundMessageHeader::default();
     let length_in_bits = salt.len() * 8;
     let address = SliceData::from_raw(salt, length_in_bits);
     hdr.src = MsgAddressExt::with_extern(address).unwrap();
-    hdr.dst = MsgAddressInt::with_standart(None, 0, [dst_shard; 32].into()).unwrap();
+    hdr.dst = MsgAddressInt::with_standart(None, 0, dst_account.into()).unwrap();
     hdr.import_fee = 10u64.into();
     Arc::new(Message::with_ext_in_header(hdr))
 }
@@ -185,7 +189,7 @@ fn create_external_message(dst_shard: u8, salt: Vec<u8>) -> Arc<Message> {
 #[test]
 fn test_messages_pool() {
     //init_log_without_config(log::LevelFilter::Trace, None);
-    let mp = Arc::new(MessagesPool::new(0, None));
+    let mp = Arc::new(MessagesPool::new(0, None).0);
 
     // create 3 messages, 2 of them are with the prefix 0x01 and one with 0x22
     let m = create_external_message(1, vec![1]);
@@ -298,7 +302,7 @@ async fn check_messages(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ext_messages_multi_threads() {
     const M: usize = 50;
-    let mp = Arc::new(MessagesPool::new(0, None));
+    let mp = Arc::new(MessagesPool::new(0, None).0);
 
     // total 8 prefixes by 50 messages in each
     for prefix in [0, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0] {
@@ -332,7 +336,7 @@ async fn test_ext_messages_multi_threads() {
 #[test]
 fn test_external_messages_maximum_queue_length() {
     let maximum_queue_length = 10;
-    let mp = Arc::new(MessagesPool::new(0, Some(maximum_queue_length)));
+    let mp = Arc::new(MessagesPool::new(0, Some(maximum_queue_length)).0);
     for i in 0..maximum_queue_length {
         let m = create_external_message(0, vec![i as u8]);
         let id = m.hash().unwrap();
@@ -347,12 +351,15 @@ fn test_external_messages_maximum_queue_length() {
 fn test_external_messages_big_load() {
     let now = UnixTime::now() as u32 - MESSAGE_LIFETIME - 1;
     let limit = 100; // milliseconds
-    let mp = Arc::new(MessagesPool::new(now, None));
+    let mp = Arc::new(MessagesPool::new(now, None).0);
     let rate_per_second = 30_000;
     let queue_seconds = min(MESSAGE_LIFETIME, 100);
     for i in 0..queue_seconds {
         for j in 0..rate_per_second {
-            let m = create_external_message(0, (i * rate_per_second + j).to_be_bytes().to_vec());
+            let idx = i * rate_per_second + j;
+            let mut dst = [0u8; 32];
+            dst[..4].copy_from_slice(&idx.to_be_bytes());
+            let m = create_external_message_to(dst, idx.to_be_bytes().to_vec());
             let id = m.hash().unwrap();
             mp.new_message(&id, m, now + i).unwrap();
         }
@@ -369,6 +376,9 @@ fn test_external_messages_big_load() {
         (count, n)
     };
     println!("count = {}, time = {:?}", count, n);
-    assert_eq!(0, count);
+    // With newest-first iteration, non-expired messages are found quickly.
+    // The pool contains messages from ~502 to ~601 seconds ago;
+    // those within MESSAGE_LIFETIME (600s) are valid and returned.
+    assert!(count <= 100);
     assert!((n as u64) < limit * 3);
 }

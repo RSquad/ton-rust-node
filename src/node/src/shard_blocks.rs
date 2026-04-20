@@ -259,7 +259,11 @@ impl ShardBlocksPool {
         }
 
         if last_mc_seq_no != mc_seqno {
-            log::debug!("get_shard_blocks: Given last_mc_seq_no {} is not actual", last_mc_seq_no);
+            log::debug!(
+                "get_shard_blocks: Given last_mc_seq_no {} is not actual {}",
+                last_mc_seq_no,
+                mc_seqno
+            );
             fail!("Given last_mc_seq_no {} is not actual {}", last_mc_seq_no, mc_seqno);
         } else {
             let mut returned_list = string_builder::Builder::default();
@@ -340,6 +344,7 @@ async fn resend_top_shard_blocks(engine: &dyn EngineOperations) -> Result<()> {
             Err(e) => {
                 if actual_last_mc_seqno != mc_state.block_id().seq_no {
                     log::trace!("resend_top_shard_blocks: goto next attempt");
+                    futures_timer::Delay::new(Duration::from_millis(100)).await;
                     continue;
                 }
                 fail!("resend_top_shard_blocks: {:?}", e);

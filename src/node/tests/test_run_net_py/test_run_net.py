@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 import argparse
-import os
-import subprocess
-import shutil
-import json
-import yaml
-import time
-from pathlib import Path
 import base64
 import hashlib
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
 
+import yaml
 
 node_proc_name: str
 rust_proc_suffix: str
@@ -164,7 +164,12 @@ def print_current_branches():
         print(f"Current C++ branch: {current_branch_cpp}")
 
 
-def run_command(cmd: list[str], cwd: Path | None = None, check: bool = True, capture_output: bool = True):
+def run_command(
+    cmd: list[str],
+    cwd: Path | None = None,
+    check: bool = True,
+    capture_output: bool = True,
+):
     try:
         result = subprocess.run(
             cmd,
@@ -253,7 +258,10 @@ def build_node_work_path(node_index: int) -> Path:
     return work_dirs_path / f"node_{node_index}"
 
 
-def prepare_default_config(node_index: int, config_blank: str, log_config_blank: str):
+def prepare_default_config(
+    node_index: int, config_blank: str, log_config_blank: str,
+    use_quic: bool = False, quic_port_offset: int = 1000,
+):
     node_work_path = build_node_work_path(node_index)
     node_work_path.mkdir(parents=True, exist_ok=True)
 
@@ -276,7 +284,11 @@ def prepare_default_config(node_index: int, config_blank: str, log_config_blank:
     config["log_config_name"] = str(node_work_path / "log_cfg.yml")
     config["ton_global_config_name"] = str(common_config_path / "global_config.json")
     config["internal_db_path"] = str(node_work_path)
-    config["ip_address"] = f"{ip_address}:{main_port_base + node_index}"
+    adnl_port = main_port_base + node_index
+    config["ip_address"] = f"{ip_address}:{adnl_port}"
+    if use_quic:
+        quic_port = adnl_port + quic_port_offset
+        config["ip_address_quic"] = f"{ip_address}:{quic_port}"
     config["control_server_port"] = control_port_base + node_index
     config["lite_server_port"] = liteserver_port_base + node_index
     config["json_rpc_server"] = {"address": f"0.0.0.0:{jsonrpc_port_base + node_index}"}
@@ -312,6 +324,11 @@ def run_cpp_node(
     stderr_path = logs_path / f"output_{node_index}.log"
     working_dir = build_node_work_path(node_index)
     node_bin_path = bins_path / (node_proc_name + "_" + cpp_proc_suffix)
+    if not node_bin_path.exists():
+        raise FileNotFoundError(
+            f"C++ binary not found at {node_bin_path}. "
+            f"Either build it or copy it to {bins_path}/ before running with cpp_nodes_count > 0."
+        )
     if start_new_session:
         print(f"Starting C++ node {node_index}...")
     with stdout_path.open("w") as out_log, stderr_path.open("w") as err_log:
@@ -401,14 +418,18 @@ def export_validator_pubkey(
 
 
 def prepare_node(
-    node_index: int, config_blank: str, log_config_blank: str
+    node_index: int, config_blank: str, log_config_blank: str,
+    use_quic: bool = False, quic_port_offset: int = 1000,
 ) -> str | None:
 
     # Prepare console key
     keygen_result = run_command([str(bins_path / "crypto"), "gen", "key"], cwd=bins_path)
     console_key_json = json.loads(keygen_result.stdout)
 
-    prepare_default_config(node_index, config_blank, log_config_blank)
+    prepare_default_config(
+        node_index, config_blank, log_config_blank,
+        use_quic=use_quic, quic_port_offset=quic_port_offset,
+    )
 
     #  Run node
     console_public = {"type_id": 1209251014, "pub_key": console_key_json["pubkey"]}
@@ -436,9 +457,10 @@ def prepare_node(
 
         # Build full console config
         console_config_path = node_work_path / "console.json"
-        with open(console_part_config_path) as f, open(
-            console_config_path, "w"
-        ) as fout:
+        with (
+            open(console_part_config_path) as f,
+            open(console_config_path, "w") as fout,
+        ):
             c = json.load(f)
             c["client_key"] = {"type_id": 1209251014, "pvt_key": console_key_json["secret"]}
             console_full_config = {"config": c, "wallet_id": "", "max_factor": 3}
@@ -480,6 +502,7 @@ def prepare_node(
 
     return validator_pubkey_hex
 
+
 def extract_keys_from_rust_config(rust_config: dict):
     dht_pvt_key = None
     fullnode_pvt_key = None
@@ -495,7 +518,7 @@ def extract_keys_from_rust_config(rust_config: dict):
     return dht_pvt_key, fullnode_pvt_key
 
 
-def transform_configs_for_cpp(node_index: int):
+def transform_configs_for_cpp(node_index: int, use_quic: bool = False, quic_port_offset: int = 1000):
     print(f"Transforming configs for C++ node {node_index}...", end="")
 
     node_work_path = build_node_work_path(node_index)
@@ -613,6 +636,20 @@ def transform_configs_for_cpp(node_index: int):
     add_to_cpp_keyring(node_index, console_srv_secret_b64, base64.b64decode(console_srv_id))
     add_to_cpp_keyring(node_index, liteserver_pvt_key, base64.b64decode(liteserver_key_id_b64))
 
+    # add QUIC address if enabled
+    if use_quic:
+        import ipaddress
+        adnl_port = main_port_base + node_index
+        quic_port = adnl_port + quic_port_offset
+        ip_int = int(ipaddress.IPv4Address(ip_address))
+        cpp_config.setdefault("addrs", []).append({
+            "@type": "engine.quicAddr",
+            "ip": ip_int,
+            "port": quic_port,
+            "categories": [0, 1, 2, 3],
+            "priority_categories": [],
+        })
+
     # save modified cpp config
     with open(node_work_path / "config.json", "w") as f:
         json.dump(cpp_config, f, indent=2)
@@ -671,6 +708,7 @@ def build_zerostate(
     validator_pub_key_hex: list[str],
     simplex_mc: bool = False,
     simplex_config: dict = None,
+    use_quic: bool = False,
 ) -> str:
     print("Building zerostate...", end="")
     zerostate = json.loads(zerostate_blank)
@@ -695,35 +733,38 @@ def build_zerostate(
     zerostate["master"]["config"]["p34"]["list"] = validators
 
     # Add ConfigParam 30 (NewConsensusConfigAll) for simplex if enabled
-    if simplex_mc and simplex_config:
+    if simplex_config:
         # Simplex (C++/Rust) allows equal `gen_utime` only starting from global_version >= 13.
         # Our default zerostate template uses version=11, which forces strict `prev + 1` and
         # makes fast single-host nets drift into the future, triggering validation rejects.
         #
         # Keep behavior C++-compatible by bumping version to at least 13 when simplex is enabled.
-        #TODO: LK: enable after change block version to 13
-        #zerostate["master"]["config"]["p8"]["version"] = max(
-        #    int(zerostate["master"]["config"]["p8"].get("version", 0)),
-        #    13,
-        #)
+        zerostate["master"]["config"]["p8"]["version"] = max(
+            int(zerostate["master"]["config"]["p8"].get("version", 0)),
+            13,
+        )
 
         p30 = {}
+        simplex_entry = {
+            "target_rate_ms": simplex_config.get("target_rate_ms", 500),
+            "slots_per_leader_window": simplex_config.get("slots_per_leader_window", 4),
+            "first_block_timeout_ms": simplex_config.get(
+                "first_block_timeout_ms", 1000
+            ),
+            "max_leader_window_desync": simplex_config.get(
+                "max_leader_window_desync", 2
+            ),
+        }
+        if use_quic:
+            simplex_entry["use_quic"] = 1
         # MC simplex config (enabled when --simplex-mc is specified)
-        p30["mc"] = {
-            "target_rate_ms": simplex_config.get("target_rate_ms", 500),
-            "slots_per_leader_window": simplex_config.get("slots_per_leader_window", 4),
-            "first_block_timeout_ms": simplex_config.get("first_block_timeout_ms", 1000),
-            "max_leader_window_desync": simplex_config.get("max_leader_window_desync", 2),
-        }
+        if simplex_mc:
+            p30["mc"] = dict(simplex_entry)
         # Shard simplex config (always enabled when simplex is used)
-        p30["shard"] = {
-            "target_rate_ms": simplex_config.get("target_rate_ms", 500),
-            "slots_per_leader_window": simplex_config.get("slots_per_leader_window", 4),
-            "first_block_timeout_ms": simplex_config.get("first_block_timeout_ms", 1000),
-            "max_leader_window_desync": simplex_config.get("max_leader_window_desync", 2),
-        }
+        p30["shard"] = dict(simplex_entry)
         zerostate["master"]["config"]["p30"] = p30
-        print(f" [simplex enabled: mc={simplex_mc}]", end="")
+        quic_str = ", quic=true" if use_quic else ""
+        print(f" [simplex enabled: mc={simplex_mc}{quic_str}]", end="")
 
     zs_json_path = common_config_path / "zerostate.json"
     with zs_json_path.open("w") as fout:
@@ -823,15 +864,17 @@ def build_nodectl_config(root_path):
             c = json.load(f)
             node_control_servers["node" + str(n)] = c["config"]
             node_control_servers["node" + str(n)]["timeouts"] = 5
-    with open(root_path / "nodectl_blank.json") as f, open(
-        common_config_path / "nodectl-local.json", "w"
-    ) as fout:
+    with (
+        open(root_path / "nodectl_blank.json") as f,
+        open(common_config_path / "nodectl-local.json", "w") as fout,
+    ):
         c = json.load(f)
         # New nodectl config expects `nodes`.
         c["nodes"] = node_control_servers
         c["nodes_adnl"] = node_control_servers
         json.dump(c, fout, indent=2)
     print(" done")
+
 
 def main():
 
@@ -853,14 +896,31 @@ def main():
     )
     parser.add_argument("--stop", action="store_true", help="Only kill nodes and exit")
     parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Kill, build, generate configs and zerostate, but do not start nodes",
+    )
+    parser.add_argument(
         "--simplex",
         action="store_true",
-        help="Build with simplex feature enabled",
+        help="Enable simplex consensus config in zerostate (ConfigParam 30)",
     )
     parser.add_argument(
         "--simplex-mc",
         action="store_true",
         help="Enable simplex consensus for masterchain (implies --simplex)",
+    )
+    parser.add_argument(
+        "--quic",
+        action="store_true",
+        help="Enable QUIC overlay transport in ConfigParam 30 (use_quic flag). Implies --simplex.",
+    )
+    parser.add_argument(
+        "--quic_custom_port",
+        action="store_true",
+        help="Use QUIC port offset 2000 (instead of 1000) to verify DHT announces. "
+             "Nodes bind QUIC on adnl_port+2000 but the auto-derive fallback is adnl_port+1000, "
+             "so QUIC connections only work if advertised addresses are used. Implies --quic.",
     )
     parser.add_argument(
         "--control-client-public-key",
@@ -871,15 +931,21 @@ def main():
     )
     args = parser.parse_args()
 
+    # --quic_custom_port implies --quic
+    if args.quic_custom_port:
+        args.quic = True
+    # --quic implies --simplex
+    if args.quic:
+        args.simplex = True
     # --simplex-mc implies --simplex
     if args.simplex_mc:
         args.simplex = True
     if args.start is None:
         args.start = False
-    run_net = not args.stop and not args.start and not args.restart
-    stop = run_net or args.stop or args.restart
-    build = not args.nobuild and run_net or args.restart
-    gen_configs = run_net
+    run_net = not args.stop and not args.start and not args.restart and not args.prepare
+    stop = run_net or args.stop or args.restart or args.prepare
+    build = not args.nobuild and (run_net or args.restart or args.prepare)
+    gen_configs = run_net or args.prepare
     start = run_net or args.start or args.restart
 
     # Init script config
@@ -897,11 +963,9 @@ def main():
         cleanup()
 
     if build:
-        # Build with simplex feature if --simplex is specified
-        build_features = ["simplex"] if args.simplex else []
-        build_rust(build_features)  # always build rust because we need tools etc.
-        if cpp_nodes_count > 0:
-            build_cpp()
+        build_rust([])  # always build rust because we need tools etc.
+        #if cpp_nodes_count > 0:
+        #    build_cpp()
 
     test_root_path = Path(__file__).parent
 
@@ -915,8 +979,12 @@ def main():
             test_root_path / "global_config_blank.json",
             common_config_path / "global_config.json",
         )
+        quic_port_offset = 2000 if args.quic_custom_port else 1000
         for n in range(0 if run_fullnode else 1, nodes_count + 1):
-            vk = prepare_node(n, node_config_blank, log_config_blank)
+            vk = prepare_node(
+                n, node_config_blank, log_config_blank,
+                use_quic=args.quic, quic_port_offset=quic_port_offset,
+            )
             if n != 0:
                 validator_pub_keys.append(vk)
 
@@ -945,13 +1013,18 @@ def main():
                 print(f"Created default simplex config: {simplex_config_path}")
 
         # Build zerostate
-        zerostate_name = "zerostate_blank_elections.json" if args.elections else "zerostate_blank.json"
+        zerostate_name = (
+            "zerostate_blank_elections.json"
+            if args.elections
+            else "zerostate_blank.json"
+        )
         zerostate_blank = Path(test_root_path / zerostate_name).read_text()
         zerostate_info = build_zerostate(
             zerostate_blank,
             validator_pub_keys,
             simplex_mc=args.simplex_mc,
             simplex_config=simplex_config,
+            use_quic=args.quic,
         )
 
         # Build global config
@@ -959,7 +1032,9 @@ def main():
 
         # Transform configs for C++ nodes
         for node_index in range(rust_nodes_count + 1, nodes_count + 1):
-            transform_configs_for_cpp(node_index)
+            transform_configs_for_cpp(
+                node_index, use_quic=args.quic, quic_port_offset=quic_port_offset,
+            )
 
     if start:
         # Start nodes

@@ -11,11 +11,12 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
+    cell_db::CellByHashStorageAdapter,
     db::{
         rocksdb::{RocksDb, RocksDbTable},
         DbKey,
     },
-    dynamic_boc_rc_db::{AsyncCellsStorageAdapter, CellByHashStorageAdapter, DynamicBocDb},
+    dynamic_boc_rc_db::{AsyncCellsStorageAdapter, DynamicBocDb},
     error::StorageError,
     traits::Serializable,
     StorageAlloc, TARGET,
@@ -112,6 +113,14 @@ pub struct CellsDbConfig {
     pub prefill_cells_counters: bool,
     pub cells_cache_size_bytes: u64,
     pub counters_cache_size_bytes: u64,
+    #[serde(default = "CellsDbConfig::default_cells_lru_cache_capacity")]
+    pub cells_lru_cache_capacity: usize,
+}
+
+impl CellsDbConfig {
+    fn default_cells_lru_cache_capacity() -> usize {
+        5_000_000
+    }
 }
 
 impl Default for CellsDbConfig {
@@ -119,8 +128,9 @@ impl Default for CellsDbConfig {
         Self {
             states_db_queue_len: 1000,
             prefill_cells_counters: false,
-            cells_cache_size_bytes: 4_000_000_000,
-            counters_cache_size_bytes: 4_000_000_000,
+            cells_cache_size_bytes: 500_000_000,
+            counters_cache_size_bytes: 500_000_000,
+            cells_lru_cache_capacity: Self::default_cells_lru_cache_capacity(),
         }
     }
 }
@@ -480,7 +490,11 @@ impl ShardStateDb {
         root: Option<&Cell>,
         max_inmemory_cells: usize,
     ) -> Result<impl CellsStorage> {
-        CellByHashStorageAdapter::new(self.dynamic_boc_db.clone(), root, max_inmemory_cells)
+        CellByHashStorageAdapter::new(
+            self.dynamic_boc_db.cell_db().clone(),
+            root,
+            max_inmemory_cells,
+        )
     }
 
     pub fn create_fast_cell_storage(
@@ -491,7 +505,7 @@ impl ShardStateDb {
     }
 
     pub fn cells_factory(&self) -> Result<Arc<dyn CellsFactory>> {
-        Ok(self.dynamic_boc_db.clone() as Arc<dyn CellsFactory>)
+        Ok(self.dynamic_boc_db.cells_factory())
     }
 
     pub fn enumerate_ids(

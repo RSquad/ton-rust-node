@@ -56,7 +56,8 @@ use ton_block::{
 #[path = "./test_utils.rs"]
 mod test_utils;
 use test_utils::{
-    find_overlay_peer, get_adnl_config, init_compatibility_test, init_test, TestContext,
+    find_overlay_peer, get_adnl_config, init_compatibility_test, init_test, init_test_log,
+    TestContext,
 };
 
 const KEY_TAG_DHT: usize = 1;
@@ -97,6 +98,9 @@ pub fn build_dht_node_info_ex(
     Ok(node)
 }
 */
+
+/// Base port for test_broadcast nodes (range 4210..4219, does not overlap with other tests).
+const BROADCAST_TEST_BASE_PORT: u16 = 4210;
 
 fn init_overlay_simple_compatibility_test(
     local_ip_template: &str,
@@ -298,7 +302,7 @@ fn test_random_peers(ctx_test: &TestContext) {
                 AddressSearchContext::with_params(key.id(), DhtSearchPolicy::FastSearch(5))
                     .unwrap();
             match ctx_test.dht.find_address(&mut ctx_search).await {
-                Ok(Some((ip, _))) => println!("IP {}", ip),
+                Ok(Some((ip, _, _))) => println!("IP {}", ip),
                 Ok(None) => println!("Address not found"),
                 Err(err) => println!("Error {}", err),
             }
@@ -370,7 +374,7 @@ fn test_overlay_broadcast_receive(ctx_test: &TestContext) {
                     let mut ctx_search =
                         AddressSearchContext::with_params(key_id, DhtSearchPolicy::FastSearch(5))
                             .unwrap();
-                    if let Ok(Some((ip, _))) = ctx_test.dht.find_address(&mut ctx_search).await {
+                    if let Ok(Some((ip, _, _))) = ctx_test.dht.find_address(&mut ctx_search).await {
                         println!("RECEIVED new overlay node {}", key_id);
                         ctx_test.overlay.add_public_peer(&ip, &node, &ctx_test.overlay_id).unwrap();
                         known_nodes.insert(key_id.clone());
@@ -667,7 +671,9 @@ fn run_propagation(
                             .await
                     }
                     Protocol::TwostepSimple | Protocol::TwostepFec => {
-                        node_send.broadcast_two_step(&overlay_id_send, &data, None, 0).await
+                        node_send
+                            .broadcast_twostep(&overlay_id_send, &data, None, 0, Vec::new())
+                            .await
                     }
                 }
                 .unwrap();
@@ -677,7 +683,7 @@ fn run_propagation(
                     "Broadcasting {}->{} packets by {adnl_id_send}/{}, step {j}\n",
                     info.packets,
                     info.send_to,
-                    adnl.ip_address(),
+                    adnl.ip_address_adnl(),
                 );
                 bcast_totally.fetch_add(1, Ordering::Relaxed);
             }
@@ -815,21 +821,21 @@ fn test_broadcast(
     test: impl Fn(&[LocalNode], &[Arc<Vec<Arc<KeyId>>>], Protocol) -> RunResult,
     protocol: Protocol,
 ) {
-    const FIRST_PORT: usize = 4181;
+    let min_neighbours = match protocol {
+        Protocol::StreamSimple | Protocol::TwostepFec => return, /* Not ready yet */
+        //Protocol::TwostepFec => 4,
+        Protocol::TwostepSimple => 3,
+        _ => 1,
+    };
 
     init_test();
     let mut nodes = Vec::new();
     for i in 0..n {
-        let ip = format!("127.0.0.1:{}", FIRST_PORT + i);
+        let port = BROADCAST_TEST_BASE_PORT + i as u16;
+        let ip = format!("127.0.0.1:{port}");
         nodes.push(init_local_node(ip, 100 / n as u8));
     }
 
-    let min_neighbours = match protocol {
-        Protocol::StreamSimple => return, /* Not ready yet */
-        Protocol::TwostepFec => 4,
-        Protocol::TwostepSimple => 3,
-        _ => 1,
-    };
     let mut neighbours = Vec::new();
     for i in 0..n {
         let overlay_id = &nodes[i].overlay_id;
@@ -975,7 +981,7 @@ fn test_overlay_ping() {
                     AddressSearchContext::with_params(key.id(), DhtSearchPolicy::FastSearch(5))
                         .unwrap();
                 match ctx_test.dht.find_address(&mut ctx_search).await {
-                    Ok(Some((ip, _))) => {
+                    Ok(Some((ip, _, _))) => {
                         println!("IP {}", ip);
                         let node = node.into_boxed();
                         let node_encoded = base64_encode(&serialize_boxed(&node).unwrap());
@@ -1239,6 +1245,7 @@ fn test_stop() {
             params,
             &ctx_test.adnl.key_by_tag(KEY_TAG_OVERLAY).unwrap(),
             &Vec::new(),
+            false,
         )
         .unwrap();
     assert!(added);
@@ -1453,7 +1460,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
     const SLAVE3: &str = "127.0.0.1:4206";
     const SLAVE4: &str = "127.0.0.1:4207";
 
-    crate::test_utils::init_test_log();
+    init_test_log();
 
     let mut peers = Vec::new();
 
@@ -1621,7 +1628,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
 fn test_overlay_raptorq() {
     use rand::{seq::SliceRandom, SeedableRng};
 
-    fn run(symbol: Option<u16>) {
+    fn run(symbol: Option<u32>) {
         let seed: u64 = rand::random();
         println!("test_overlay_raptorq seed: {seed}");
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -1771,4 +1778,95 @@ fn test_overlay_raptorq() {
     run(None);
     println!("--- symbol=Some(771) (alignment=1) ---");
     run(Some(771));
+}
+
+/// Test that RaptorQ encode/decode works with symbol_size > 65535 (u16 limit).
+/// This matches the C++ behaviour where symbol_size is size_t.
+/// Simulates TwostepFec for 800KB data with 10 parties:
+///   k = (10*2-2)/3 = 6, part_size = ceil(819200/6) = 136534
+#[test]
+fn test_raptorq_large_symbol_size() {
+    use adnl::{RaptorqDecoder, RaptorqEncoder};
+    use rand::Rng;
+
+    const DATA_SIZE: usize = 800 * 1024;
+
+    for num_parties in [5u32, 10, 20] {
+        let k = ((num_parties as usize) * 2 - 2) / 3;
+        let part_size = (DATA_SIZE + k - 1) / k;
+
+        println!(
+            "--- parties={num_parties}, k={k}, part_size={part_size} (>65535: {}) ---",
+            part_size > 65535
+        );
+
+        // Generate random data
+        let mut rng = rand::thread_rng();
+        let data: Vec<u8> = (0..DATA_SIZE).map(|_| rng.gen()).collect();
+
+        // Encode with large symbol_size
+        let mut encoder = RaptorqEncoder::with_data(&data, Some(part_size as u32));
+        let params = encoder.params().clone();
+        println!(
+            "  params: data_size={}, symbol_size={}, symbols_count={}",
+            params.data_size, params.symbol_size, params.symbols_count
+        );
+        assert_eq!(params.data_size, DATA_SIZE as i32);
+        assert_eq!(params.symbol_size, part_size as i32);
+
+        // Collect source + repair symbols
+        let source_count = params.symbols_count as usize;
+        let mut packets: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut seqno = 0u32;
+        for _ in 0..(source_count * 3 / 2) {
+            let chunk = encoder.encode(&mut seqno).unwrap();
+            packets.push((seqno, chunk));
+            seqno += 1;
+        }
+        assert!(
+            packets.len() >= source_count,
+            "Not enough packets generated: {} < {source_count}",
+            packets.len()
+        );
+
+        // Decode using exactly source_count symbols (minimum required)
+        let mut decoder = RaptorqDecoder::with_params(params.clone())
+            .expect("decoder creation must succeed for large symbol_size");
+
+        let mut decoded = None;
+        for (seq, chunk) in packets.iter().take(source_count + 2) {
+            if let Some(result) = decoder.decode(*seq, chunk) {
+                decoded = Some(result);
+                break;
+            }
+        }
+
+        let result = decoded.expect("decode must succeed");
+        assert_eq!(result.len(), DATA_SIZE, "decoded size mismatch");
+        assert_eq!(result, data, "decoded data mismatch");
+        println!("  OK: encode/decode verified for symbol_size={part_size}");
+    }
+}
+
+/// Verify that the RaptorQ encoder produces valid FEC symbols for large
+/// part_size values (>65535) that match the C++ TwostepFec behaviour.
+#[test]
+fn test_twostep_fec_encoder_large_symbols() {
+    let data = vec![0x42u8; 800 * 1024];
+    for neighbours in [5u32, 10, 20] {
+        let k = ((neighbours as usize) * 2 - 2) / 3;
+        let part_size = (data.len() + k - 1) / k;
+
+        let mut encoder = RaptorqEncoder::with_data(&data, Some(part_size as u32));
+        let params = encoder.params().clone();
+        assert_eq!(params.data_size, data.len() as i32);
+        assert_eq!(params.symbol_size, part_size as i32);
+
+        // Generate one symbol per neighbour (like broadcast-twostep.cpp)
+        let mut seqno = 0u32;
+        for _ in 0..neighbours {
+            let chunk = encoder.encode(&mut seqno).unwrap();
+            assert_eq!(chunk.len(), part_size, "symbol size mismatch");
+        }
+    }
 }

@@ -116,6 +116,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             log::debug!(target: "executor", "Account is frozen, hash = {:x}", hash);
         }
         let mut acc_balance = account.balance().cloned().unwrap_or_default();
+        let mut original_acc_balance = acc_balance.clone();
         let is_special = self.config.is_special_account(is_masterchain, &account_id)?;
         let account_address = MsgAddressInt::with_params(wc_id, account_id.clone())?;
 
@@ -178,6 +179,20 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             tr.add_fee_coins(&in_fwd_fee)?;
         }
 
+        if let Some(burning_cfg) = self.config.burning_config() {
+            if is_masterchain
+                && !msg_balance.coins.is_zero()
+                && burning_cfg.blackhole_addr.as_ref() == Some(&account_id)
+            {
+                let burned = std::mem::take(&mut msg_balance.coins);
+                log::debug!(
+                    target: "executor",
+                    "Burning {burned} nanocoins for blackhole account {account_id:x}",
+                );
+                tr.set_blackhole_burned(burned);
+            }
+        }
+
         if description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
                 Ok(credit_ph) => Some(credit_ph),
@@ -214,8 +229,10 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
 
         log::debug!(target: "executor",
             "storage_phase: {}", if description.storage_ph.is_some() {"present"} else {"none"});
-        let mut original_acc_balance = account.balance().cloned().unwrap_or_default();
-        original_acc_balance.sub(tr.total_fees())?;
+        if !original_acc_balance.sub(tr.total_fees())? {
+            original_acc_balance.coins = Default::default();
+            debug_assert!(tr.total_fees().other.is_empty());
+        }
 
         if !description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
@@ -248,6 +265,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             in_msg: Some(in_msg.clone()),
             incoming_value: msg_balance.clone(),
             storage_fees_collected,
+            due_payment: account.due_payment().map_or(0, Coins::as_u128),
             config_params,
             prev_blocks_info: params.prev_blocks_info.clone(),
             ..Default::default()

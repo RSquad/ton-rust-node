@@ -27,6 +27,7 @@ checksum = "aae1277d39aeec15cb388266ecc24b11c80469deae6067e17a1a7aa9e5c1f234"
 name = "adnl"
 version = "0.11.38"
 dependencies = [
+ "adnl",
  "anyhow",
  "async-trait",
  "chrono",
@@ -246,9 +247,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.8.2"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f3647c145568cec02c42054e07bdf9a5a698e15b466fb2341bfc393cd24aa5"
+checksum = "a07d1f37ff60921c83bdfc7407723bdefe89b44b98a9b772f225c8f9d67141a6"
 dependencies = [
  "rustversion",
 ]
@@ -915,6 +916,28 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "utoipa",
+]
+
+[[package]]
+name = "compat_test"
+version = "0.1.0"
+dependencies = [
+ "adnl",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "env_logger",
+ "hex",
+ "log",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "ton_api",
+ "ton_block",
 ]
 
 [[package]]
@@ -2685,9 +2708,9 @@ dependencies = [
 
 [[package]]
 name = "itoa"
-version = "1.0.17"
+version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jiff"
@@ -3224,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.3.0"
+version = "0.5.1"
 dependencies = [
  "adnl",
  "ahash",
@@ -3266,6 +3289,7 @@ dependencies = [
  "parking_lot",
  "pretty_assertions",
  "rand 0.8.5",
+ "rayon",
  "regex",
  "reqwest",
  "secrets-vault",
@@ -3279,6 +3303,7 @@ dependencies = [
  "storage",
  "stream-cancel",
  "string-builder",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -4582,9 +4607,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.9"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5009,7 +5034,7 @@ dependencies = [
 
 [[package]]
 name = "simplex"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "adnl",
  "anyhow",
@@ -5143,9 +5168,11 @@ dependencies = [
  "serde",
  "serde_cbor",
  "serde_derive",
+ "serde_json",
  "smallvec",
  "strum",
  "strum_macros",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -5543,6 +5570,17 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
+dependencies = [
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

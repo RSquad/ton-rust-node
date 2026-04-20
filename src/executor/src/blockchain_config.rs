@@ -10,9 +10,10 @@
  */
 use num::BigInt;
 use ton_block::{
-    fail, AccountId, Coins, ConfigParam18, ConfigParams, FundamentalSmcAddresses, GasLimitsPrices,
-    GlobalCapabilities, Mask, MsgAddressInt, MsgForwardPrices, Result, SizeLimitsConfig,
-    StorageInfo, StoragePrices, UInt256, SUPPORTED_VERSION,
+    fail, AccountId, BurningConfig, Coins, ConfigParam18, ConfigParamEnum, ConfigParams,
+    FundamentalSmcAddresses, GasLimitsPrices, GlobalCapabilities, Mask, MsgAddressInt,
+    MsgForwardPrices, Result, SizeLimitsConfig, StorageInfo, StoragePrices, UInt256,
+    SUPPORTED_VERSION,
 };
 
 pub(crate) trait DefaultConfig {
@@ -147,6 +148,7 @@ pub struct BlockchainConfig {
     fwd_prices_mc: MsgForwardPrices,
     fwd_prices_wc: MsgForwardPrices,
     storage_prices: AccStoragePrices,
+    burning_cfg: Option<BurningConfig>,
     special_contracts: FundamentalSmcAddresses,
     limits: SizeLimitsConfig,
     capabilities: u64,
@@ -164,6 +166,7 @@ impl Default for BlockchainConfig {
             fwd_prices_mc: MsgForwardPrices::default_mc(),
             fwd_prices_wc: MsgForwardPrices::default_wc(),
             storage_prices: AccStoragePrices::default(),
+            burning_cfg: None,
             special_contracts: Self::get_default_special_contracts(),
             limits: Default::default(),
             raw_config: Self::get_defult_raw_config(),
@@ -206,12 +209,17 @@ impl BlockchainConfig {
         log::debug!(
             "Creating BlockchainConfig: capabilities={capabilities:#x}, block_version={global_version}"
         );
+        let burning_cfg = match config.config(5)? {
+            Some(ConfigParamEnum::ConfigParam5(burning_cfg)) => Some(burning_cfg),
+            _ => None,
+        };
         Ok(BlockchainConfig {
             gas_prices_mc: config.gas_prices(true)?,
             gas_prices_wc: config.gas_prices(false)?,
             fwd_prices_mc: config.fwd_prices(true)?,
             fwd_prices_wc: config.fwd_prices(false)?,
             storage_prices: AccStoragePrices::with_config(&config.storage_prices()?)?,
+            burning_cfg,
             limits: config.size_limits_config()?,
             special_contracts: config.fundamental_smc_addr()?,
             capabilities,
@@ -219,6 +227,10 @@ impl BlockchainConfig {
             raw_config: config,
             deferring_enabled: capabilities.bit(GlobalCapabilities::CapDeferMessages as u64),
         })
+    }
+
+    pub fn global_version(&self) -> u32 {
+        self.global_version
     }
 
     /// Get `MsgForwardPrices` for message forward fee calculation
@@ -232,6 +244,10 @@ impl BlockchainConfig {
 
     pub fn size_limits_config(&self) -> &SizeLimitsConfig {
         &self.limits
+    }
+
+    pub fn burning_config(&self) -> Option<&BurningConfig> {
+        self.burning_cfg.as_ref()
     }
 
     /// Calculate gas fee for account

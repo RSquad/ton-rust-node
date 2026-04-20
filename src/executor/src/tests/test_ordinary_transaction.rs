@@ -27,7 +27,7 @@ use ton_block::{
         AccStatusChange, TrActionPhase, TrComputePhase, TrComputePhaseVm, TrCreditPhase,
         TrStoragePhase, Transaction, TransactionDescr,
     },
-    AccountId, AccountStatus, AnycastInfo, BouncedByPhase, BuilderData, Cell, Coins,
+    AccountId, AccountStatus, AnycastInfo, BouncedByPhase, BuilderData, BurningConfig, Cell, Coins,
     ComputeSkipReason, ConfigParam8, ConfigParamEnum, ConfigParams, CurrencyCollection,
     Deserializable, ExceptionCode, GetRepresentationHash, GlobalVersion, IBitstring,
     InternalMessageHeader, MerkleProof, NewBounceBody, NewBounceComputePhaseInfo,
@@ -4066,4 +4066,181 @@ fn test_new_bounce() {
             .into_cell()
             .unwrap()
     );
+}
+
+#[test]
+fn test_masterchain_blackhole_burns_inbound_value() {
+    let acc_id = AccountId::from([0x44; 32]);
+    let code = compile_code_to_cell("ACCEPT").unwrap();
+    let start_balance = 200_000_000;
+    let msg_value = 14_200_000;
+    let msg = create_int_msg_workchain(
+        -1,
+        SENDER_ACCOUNT.clone(),
+        acc_id.clone(),
+        msg_value,
+        false,
+        PREV_BLOCK_LT,
+    );
+    let params = execute_params_none();
+
+    let mut raw_config = BLOCKCHAIN_CONFIG.raw_config().clone();
+    raw_config
+        .set_config(ConfigParamEnum::ConfigParam5(BurningConfig {
+            blackhole_addr: None,
+            fee_burn_num: 0,
+            fee_burn_denom: 1,
+        }))
+        .unwrap();
+    let regular_config = BlockchainConfig::with_config(raw_config.clone()).unwrap();
+
+    raw_config
+        .set_config(ConfigParamEnum::ConfigParam5(BurningConfig {
+            blackhole_addr: Some(acc_id.clone()),
+            fee_burn_num: 0,
+            fee_burn_denom: 1,
+        }))
+        .unwrap();
+    let blackhole_config = BlockchainConfig::with_config(raw_config).unwrap();
+
+    let mut regular_acc = create_test_account_workchain(
+        start_balance,
+        -1,
+        acc_id.clone(),
+        code.clone(),
+        Cell::default(),
+    );
+    let regular_before = regular_acc.clone();
+    let regular_tr =
+        try_replay_transaction(&mut regular_acc, Some(&msg), regular_config, &params).unwrap();
+    check_account_and_transaction_balances(&regular_before, &regular_acc, &msg, Some(&regular_tr));
+
+    let mut blackhole_acc =
+        create_test_account_workchain(start_balance, -1, acc_id.clone(), code, Cell::default());
+    let blackhole_before = blackhole_acc.clone();
+    let blackhole_tr =
+        try_replay_transaction(&mut blackhole_acc, Some(&msg), blackhole_config, &params).unwrap();
+    check_account_and_transaction_balances(
+        &blackhole_before,
+        &blackhole_acc,
+        &msg,
+        Some(&blackhole_tr),
+    );
+
+    assert_eq!(*regular_tr.blackhole_burned(), Coins::default());
+    assert_eq!(*blackhole_tr.blackhole_burned(), msg_value);
+    assert_eq!(
+        regular_acc.balance().unwrap().coins.as_u128()
+            - blackhole_acc.balance().unwrap().coins.as_u128(),
+        msg_value as u128
+            - (regular_tr.total_fees().coins.as_u128() - blackhole_tr.total_fees().coins.as_u128())
+    );
+
+    let TransactionDescr::Ordinary(regular_descr) = regular_tr.read_description().unwrap() else {
+        panic!("ordinary description expected");
+    };
+    let TransactionDescr::Ordinary(blackhole_descr) = blackhole_tr.read_description().unwrap()
+    else {
+        panic!("ordinary description expected");
+    };
+    assert_eq!(regular_descr.credit_ph.unwrap().credit, CurrencyCollection::with_coins(msg_value));
+    assert_eq!(blackhole_descr.credit_ph.unwrap().credit, CurrencyCollection::default());
+}
+
+#[test]
+fn special_account_due_payment_fully_covered() {
+    // Special active account with due_payment > 0 and sufficient balance.
+    // C++ collects due_payment from balance and clears it.
+    let code = compile_code_to_cell("ACCEPT").unwrap();
+    let acc_id = THIRD_ACCOUNT.clone();
+
+    let start_balance = 1_000_000_000u64;
+    let due = 100_000_000u64;
+    let msg_income = 14_200_000u64;
+
+    let mut acc = create_test_account(start_balance, acc_id.clone(), code, Cell::default());
+    acc.set_due_payment(Some(due.into()));
+    let addr = acc.get_addr().unwrap();
+    assert!(BLOCKCHAIN_CONFIG.is_special_account(addr.is_masterchain(), addr.address()).unwrap());
+
+    let msg = create_int_msg(THIRD_ACCOUNT.clone(), acc_id, msg_income, true, BLOCK_LT - 2);
+    let params = execute_params(BLOCK_LT + 1);
+    let trans = execute_with_params(
+        SIMPLE_MC_STATE.to_owned(),
+        Some(msg.serialize().unwrap()),
+        &mut acc,
+        &params,
+    )
+    .unwrap();
+
+    let storage = get_tr_descr(&trans).storage_ph.unwrap();
+    assert_eq!(storage.storage_fees_collected, Coins::from(due));
+    assert_eq!(storage.storage_fees_due, None);
+    assert_eq!(storage.status_change, AccStatusChange::Unchanged);
+    assert_eq!(acc.due_payment(), None);
+    assert_eq!(acc.last_paid(), 0);
+}
+
+#[test]
+fn special_account_due_payment_partial() {
+    // Special active account where balance < due_payment.
+    // C++ collects the full balance but keeps the ORIGINAL due_payment on the account
+    // (Transaction::due_payment is never updated for special in the partial path).
+    let code = compile_code_to_cell("ACCEPT").unwrap();
+    let acc_id = THIRD_ACCOUNT.clone();
+
+    let start_balance = 50_000_000u64;
+    let due = 100_000_000u64;
+    let msg_income = 14_200_000u64;
+
+    let mut acc = create_test_account(start_balance, acc_id.clone(), code, Cell::default());
+    acc.set_due_payment(Some(due.into()));
+
+    let msg = create_int_msg(THIRD_ACCOUNT.clone(), acc_id, msg_income, true, BLOCK_LT - 2);
+    let params = execute_params(BLOCK_LT + 1);
+    let trans = execute_with_params(
+        SIMPLE_MC_STATE.to_owned(),
+        Some(msg.serialize().unwrap()),
+        &mut acc,
+        &params,
+    )
+    .unwrap();
+
+    let storage = get_tr_descr(&trans).storage_ph.unwrap();
+    assert_eq!(storage.storage_fees_collected, Coins::from(start_balance));
+    assert_eq!(storage.storage_fees_due, Some(Coins::from(due - start_balance)));
+    assert_eq!(storage.status_change, AccStatusChange::Unchanged);
+    assert_eq!(acc.due_payment(), Some(&Coins::from(due)));
+    assert_eq!(acc.last_paid(), 0);
+}
+
+#[test]
+fn special_account_due_payment_zero_balance() {
+    // Special active account with due_payment > 0 and balance = 0.
+    // Nothing to collect, due_payment stays at original.
+    let code = compile_code_to_cell("ACCEPT").unwrap();
+    let acc_id = THIRD_ACCOUNT.clone();
+
+    let due = 100_000_000u64;
+    let msg_income = 14_200_000u64;
+
+    let mut acc = create_test_account(0u64, acc_id.clone(), code, Cell::default());
+    acc.set_due_payment(Some(due.into()));
+
+    let msg = create_int_msg(THIRD_ACCOUNT.clone(), acc_id, msg_income, true, BLOCK_LT - 2);
+    let params = execute_params(BLOCK_LT + 1);
+    let trans = execute_with_params(
+        SIMPLE_MC_STATE.to_owned(),
+        Some(msg.serialize().unwrap()),
+        &mut acc,
+        &params,
+    )
+    .unwrap();
+
+    let storage = get_tr_descr(&trans).storage_ph.unwrap();
+    assert_eq!(storage.storage_fees_collected, Coins::zero());
+    assert_eq!(storage.storage_fees_due, Some(Coins::from(due)));
+    assert_eq!(storage.status_change, AccStatusChange::Unchanged);
+    assert_eq!(acc.due_payment(), Some(&Coins::from(due)));
+    assert_eq!(acc.last_paid(), 0);
 }

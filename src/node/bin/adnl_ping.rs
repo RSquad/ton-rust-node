@@ -58,7 +58,7 @@ fn ping(
     let local_key = adnl.key_by_tag(KEY_TAG)?;
     let other_key =
         Arc::new(Ed25519KeyOption::from_public_key((&base64_decode(pub_key)?[..]).try_into()?));
-    let other_id = adnl.add_peer(local_key.id(), &ip, &other_key)?;
+    let other_id = adnl.add_peer(local_key.id(), &ip, None, &other_key)?;
     let other_id =
         if let Some(other_id) = other_id { other_id } else { fail!("Cannot add peer to ADNL") };
 

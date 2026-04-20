@@ -1211,6 +1211,39 @@ fn test_block_proof_serialize_deserialize_roundtrip_ordinary() {
 }
 
 #[test]
+fn test_serialize_new_consensus_config_all_includes_new_timing_fields() {
+    use ton_block::{NewConsensusConfigAll, NoncriticalParams, SimplexConfig};
+
+    let cfg = NewConsensusConfigAll {
+        mc: Some(SimplexConfig {
+            use_quic: true,
+            slots_per_leader_window: 4,
+            noncritical_params: NoncriticalParams {
+                min_block_interval_ms: 111,
+                no_empty_blocks_on_error_timeout_ms: 21_000,
+                ..Default::default()
+            },
+        }),
+        shard: Some(SimplexConfig {
+            use_quic: false,
+            slots_per_leader_window: 8,
+            noncritical_params: NoncriticalParams {
+                min_block_interval_ms: 222,
+                no_empty_blocks_on_error_timeout_ms: 22_000,
+                ..Default::default()
+            },
+        }),
+    };
+
+    let json = serialize_new_consensus_config_all(&cfg).unwrap();
+
+    assert_eq!(json["mc"]["min_block_interval_ms"], 111);
+    assert_eq!(json["mc"]["no_empty_blocks_on_error_timeout_ms"], 21_000);
+    assert_eq!(json["shard"]["min_block_interval_ms"], 222);
+    assert_eq!(json["shard"]["no_empty_blocks_on_error_timeout_ms"], 22_000);
+}
+
+#[test]
 fn test_db_serialize_block_proof_simplex() {
     use ton_block::{
         BlockProof, BlockSignaturesPure, BlockSignaturesSimplex, BlockSignaturesVariant,

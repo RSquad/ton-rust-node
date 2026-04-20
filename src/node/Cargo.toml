@@ -3,7 +3,7 @@ build = '../common/build/build.rs'
 edition = '2021'
 license = 'GPL-3.0'
 name = 'node'
-version = '0.3.0'
+version = '0.5.1'
 
 [[bin]]
 name = 'adnl_resolve'
@@ -36,6 +36,10 @@ path = 'bin/print.rs'
 [[bin]]
 name = 'zerostate'
 path = 'bin/zerostate.rs'
+
+[[bin]]
+name = 'archive_import'
+path = 'bin/archive_import.rs'
 
 [[bin]]
 name = 'hardfork'
@@ -73,6 +77,7 @@ num_cpus = '1.13'
 openssl = '0.10'
 parking_lot = '0.12'
 rand = '0.8'
+rayon = '1'
 regex = '1.10'
 serde = '1.0'
 serde_derive = '1.0'
@@ -110,6 +115,7 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tempfile = '3'
 difference = '2.0'
 external-ip = '6.0'
 http-body-util = "0.1"
@@ -122,10 +128,9 @@ default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key']
 cell_counter = ['ton_block/cell_counter']
 ci_run = []
 export_key = ['catchain/export_key', 'ton_block/export_key']
+mirrornet = ['ton_block/mirrornet']
 only_sorted_clean = []
-simplex = []
 telemetry = ['adnl/telemetry', 'storage/telemetry']
 trace_alloc = []
 trace_alloc_detail = ['trace_alloc']
 xp25 = ['ton_block/xp25', 'adnl/xp25']
-mirrornet = ['ton_block/mirrornet']

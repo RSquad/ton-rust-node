@@ -6,9 +6,6 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-// TODO: Remove allow(dead_code) when misbehavior detection is integrated into simplex_state.rs
-#![allow(dead_code)]
-
 //! Misbehavior detection and proof collection for Simplex consensus.
 //!
 //! This module provides types for collecting cryptographic proofs of validator
@@ -106,10 +103,6 @@ pub enum VoteDescriptor {
     Notarize(UInt256),
     /// Finalize vote with block hash
     Finalize(UInt256),
-    /// Notarize fallback vote with block hash
-    NotarizeFallback(UInt256),
-    /// Skip fallback vote (no hash)
-    SkipFallback,
 }
 
 impl VoteDescriptor {
@@ -119,27 +112,6 @@ impl VoteDescriptor {
             Self::Skip => "skip".to_string(),
             Self::Notarize(hash) => format!("notarize:{}", &hash.to_hex_string()[..8]),
             Self::Finalize(hash) => format!("finalize:{}", &hash.to_hex_string()[..8]),
-            Self::NotarizeFallback(hash) => format!("notar-fb:{}", &hash.to_hex_string()[..8]),
-            Self::SkipFallback => "skip-fb".to_string(),
-        }
-    }
-
-    /// Get the vote type name (without hash)
-    pub fn vote_type(&self) -> &'static str {
-        match self {
-            Self::Skip => "skip",
-            Self::Notarize(_) => "notarize",
-            Self::Finalize(_) => "finalize",
-            Self::NotarizeFallback(_) => "notar-fallback",
-            Self::SkipFallback => "skip-fallback",
-        }
-    }
-
-    /// Get the hash if this vote references a block
-    pub fn hash(&self) -> Option<&UInt256> {
-        match self {
-            Self::Skip | Self::SkipFallback => None,
-            Self::Notarize(h) | Self::Finalize(h) | Self::NotarizeFallback(h) => Some(h),
         }
     }
 }
@@ -190,21 +162,6 @@ pub enum ConflictReason {
     /// Validator sent both Finalize and Skip for the same slot.
     /// C++: `finalize_.has_value() && skip_.has_value()`
     FinalizeAfterSkip,
-
-    /// Validator sent both Notarize and Skip for the same slot (no fallback context).
-    NotarizeAfterSkip,
-
-    /// Validator sent Finalize after already sending NotarFallback.
-    FinalizeAfterNotarFallback,
-
-    /// Validator sent Finalize after already sending SkipFallback.
-    FinalizeAfterSkipFallback,
-
-    /// Validator sent NotarFallback after already sending Finalize.
-    NotarFallbackAfterFinalize,
-
-    /// Validator sent SkipFallback after already sending Finalize.
-    SkipFallbackAfterFinalize,
 }
 
 /// Report of misbehavior with validator identity and slot context.
@@ -280,18 +237,21 @@ impl VoteResult {
 
     /// Returns true if the vote was a duplicate
     #[inline]
+    #[cfg(test)]
     pub fn is_duplicate(&self) -> bool {
         matches!(self, Self::Duplicate)
     }
 
     /// Returns true if the vote was rejected due to misbehavior
     #[inline]
+    #[cfg(test)]
     pub fn is_misbehavior(&self) -> bool {
         matches!(self, Self::Misbehavior(_))
     }
 
     /// Returns the misbehavior proof if this is a misbehavior result
     #[inline]
+    #[cfg(test)]
     pub fn misbehavior_proof(&self) -> Option<&MisbehaviorProof> {
         match self {
             Self::Misbehavior(proof) => Some(proof),
@@ -303,6 +263,7 @@ impl VoteResult {
     ///
     /// Compatibility method for tests migrating from `Result<()>`.
     #[inline]
+    #[cfg(test)]
     pub fn is_ok(&self) -> bool {
         matches!(self, Self::Applied | Self::Duplicate)
     }
@@ -311,6 +272,7 @@ impl VoteResult {
     ///
     /// Compatibility method for tests migrating from `Result<()>`.
     #[inline]
+    #[cfg(test)]
     pub fn is_err(&self) -> bool {
         matches!(self, Self::Misbehavior(_) | Self::Rejected(_))
     }
@@ -320,6 +282,7 @@ impl VoteResult {
     /// Accepts `Applied`, `Duplicate`, and `SlotAlreadyFinalized` as success.
     /// For use in tests only. Production code should match on variants.
     #[track_caller]
+    #[cfg(test)]
     pub fn unwrap(self) {
         match self {
             Self::Applied | Self::Duplicate | Self::SlotAlreadyFinalized => {}
@@ -335,6 +298,7 @@ impl VoteResult {
     /// Accepts `Applied`, `Duplicate`, and `SlotAlreadyFinalized` as success.
     /// For use in tests only. Production code should match on variants.
     #[track_caller]
+    #[cfg(test)]
     pub fn expect(self, msg: &str) {
         match self {
             Self::Applied | Self::Duplicate | Self::SlotAlreadyFinalized => {}
@@ -425,6 +389,7 @@ impl MisbehaviorProof {
     }
 
     /// Returns the validator index who misbehaved.
+    #[cfg(test)]
     pub fn validator_idx(&self) -> ValidatorIndex {
         match self {
             Self::ConflictingVotes { validator_idx, .. } => *validator_idx,
@@ -433,6 +398,7 @@ impl MisbehaviorProof {
     }
 
     /// Returns a human-readable description of the misbehavior type.
+    #[cfg(test)]
     pub fn description(&self) -> &'static str {
         match self {
             Self::ConflictingVotes { .. } => "conflicting votes for same slot",
@@ -441,17 +407,12 @@ impl MisbehaviorProof {
     }
 
     /// Returns the size of the proof data in bytes.
+    #[cfg(test)]
     pub fn size_bytes(&self) -> usize {
         match self {
             Self::ConflictingVotes { vote1, vote2, .. } => vote1.len() + vote2.len(),
             Self::ConflictingVoteTypes { vote1, vote2, .. } => vote1.len() + vote2.len(),
         }
-    }
-
-    /// Format a hash as the full hex string.
-    #[inline]
-    pub fn format_hash(hash: &UInt256) -> String {
-        hash.to_hex_string()
     }
 
     /// Format a hash as a short hex prefix (8 characters) for logging.
@@ -461,6 +422,7 @@ impl MisbehaviorProof {
     }
 
     /// Get the first hash for ConflictingVotes (returns None for other variants).
+    #[cfg(test)]
     pub fn hash1(&self) -> Option<&UInt256> {
         match self {
             Self::ConflictingVotes { hash1, .. } => Some(hash1),
@@ -469,6 +431,7 @@ impl MisbehaviorProof {
     }
 
     /// Get the second hash for ConflictingVotes (returns None for other variants).
+    #[cfg(test)]
     pub fn hash2(&self) -> Option<&UInt256> {
         match self {
             Self::ConflictingVotes { hash2, .. } => Some(hash2),
@@ -477,6 +440,7 @@ impl MisbehaviorProof {
     }
 
     /// Get the existing vote descriptor for ConflictingVoteTypes (returns None for other variants).
+    #[cfg(test)]
     pub fn existing_vote(&self) -> Option<&VoteDescriptor> {
         match self {
             Self::ConflictingVoteTypes { existing_vote, .. } => Some(existing_vote),
@@ -485,6 +449,7 @@ impl MisbehaviorProof {
     }
 
     /// Get the new vote descriptor for ConflictingVoteTypes (returns None for other variants).
+    #[cfg(test)]
     pub fn new_vote(&self) -> Option<&VoteDescriptor> {
         match self {
             Self::ConflictingVoteTypes { new_vote, .. } => Some(new_vote),
@@ -499,11 +464,6 @@ impl ConflictReason {
         match self {
             Self::NotarizeFinalizeHashMismatch => "notarize and finalize for different blocks",
             Self::FinalizeAfterSkip => "finalize after skip",
-            Self::NotarizeAfterSkip => "notarize after skip",
-            Self::FinalizeAfterNotarFallback => "finalize after notar-fallback",
-            Self::FinalizeAfterSkipFallback => "finalize after skip-fallback",
-            Self::NotarFallbackAfterFinalize => "notar-fallback after finalize",
-            Self::SkipFallbackAfterFinalize => "skip-fallback after finalize",
         }
     }
 }
@@ -511,15 +471,25 @@ impl ConflictReason {
 impl Display for MisbehaviorProof {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ConflictingVotes { slot, validator_idx, vote_type, hash1, hash2, .. } => {
+            Self::ConflictingVotes {
+                slot,
+                validator_idx,
+                vote_type,
+                hash1,
+                hash2,
+                vote1,
+                vote2,
+            } => {
                 write!(
                     f,
-                    "conflicting {} votes from v{:03} at slot {}: {} vs {}",
+                    "conflicting {} votes from v{:03} at slot {}: {} vs {} (raw={}+{} bytes)",
                     vote_type,
                     validator_idx.value(),
                     slot.value(),
                     Self::format_hash_short(hash1),
-                    Self::format_hash_short(hash2)
+                    Self::format_hash_short(hash2),
+                    vote1.len(),
+                    vote2.len()
                 )
             }
             Self::ConflictingVoteTypes {
@@ -527,17 +497,20 @@ impl Display for MisbehaviorProof {
                 validator_idx,
                 existing_vote,
                 new_vote,
+                vote1,
+                vote2,
                 reason,
-                ..
             } => {
                 write!(
                     f,
-                    "{} from v{:03} at slot {}: existing={}, new={}",
+                    "{} from v{:03} at slot {}: existing={}, new={} (raw={}+{} bytes)",
                     reason,
                     validator_idx.value(),
                     slot.value(),
                     existing_vote,
-                    new_vote
+                    new_vote,
+                    vote1.len(),
+                    vote2.len()
                 )
             }
         }

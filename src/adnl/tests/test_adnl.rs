@@ -432,7 +432,8 @@ fn run_adnl_session(mode: SendMode, ip1: &str, ip2: &str) {
             let peer1 = node2
                 .add_peer(
                     node2.key_by_tag(KEY_TAG).unwrap().id(),
-                    node1.ip_address(),
+                    node1.ip_address_adnl(),
+                    None,
                     &node1.key_by_tag(KEY_TAG).unwrap(),
                 )
                 .unwrap()
@@ -440,7 +441,8 @@ fn run_adnl_session(mode: SendMode, ip1: &str, ip2: &str) {
             let peer2 = node1
                 .add_peer(
                     node1.key_by_tag(KEY_TAG).unwrap().id(),
-                    node2.ip_address(),
+                    node2.ip_address_adnl(),
+                    None,
                     &node2.key_by_tag(KEY_TAG).unwrap(),
                 )
                 .unwrap()

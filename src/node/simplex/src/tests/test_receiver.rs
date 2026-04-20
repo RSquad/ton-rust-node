@@ -11,9 +11,9 @@
 //! Tests receiver communication with multiple instances using in-process overlay.
 //! Similar structure to `test_consensus.rs` and `catchain/tests/test_catchain_network.rs`
 //!
-//! Note: This test was moved from `tests/test_receiver.rs` to internal tests
-//! as part of CODE-2 (receiver privatization). The test now uses `crate::`
-//! imports to access internal types like `Receiver`, `ReceiverListener`, etc.
+//! Note: This test was moved from `tests/test_receiver.rs` to internal tests.
+//! It now uses `crate::` imports to access internal types like `Receiver`,
+//! `ReceiverListener`, etc.
 
 use crate::{
     receiver::{Receiver, ReceiverListener, ReceiverListenerPtr},
@@ -53,7 +53,7 @@ use ton_api::{
     },
     IntoBoxed,
 };
-use ton_block::{sha256_digest, BlockIdExt, Ed25519KeyOption, Error, ShardIdent, UInt256};
+use ton_block::{error, sha256_digest, BlockIdExt, Ed25519KeyOption, Error, ShardIdent, UInt256};
 
 include!("../../../../common/src/info.rs");
 
@@ -112,6 +112,10 @@ struct ReceiverStats {
     active_weight_updates: AtomicU32,
     /// Last active weight value
     last_active_weight: AtomicU64,
+    /// Number of standstill trigger notifications received
+    standstill_triggers: AtomicU32,
+    /// Latest standstill trigger notifications
+    standstill_notifications: Mutex<Vec<crate::receiver::StandstillTriggerNotification>>,
     /// Receiver index for logging
     receiver_idx: u32,
 }
@@ -125,6 +129,8 @@ impl ReceiverStats {
             received_certificates: Mutex::new(Vec::new()),
             active_weight_updates: AtomicU32::new(0),
             last_active_weight: AtomicU64::new(0),
+            standstill_triggers: AtomicU32::new(0),
+            standstill_notifications: Mutex::new(Vec::new()),
             receiver_idx,
         }
     }
@@ -171,7 +177,12 @@ impl ReceiverListener for TestReceiverListener {
         );
     }
 
-    fn on_activity(&self, active_weight: ValidatorWeight, _last_activity: Vec<Option<SystemTime>>) {
+    fn on_activity(
+        &self,
+        active_weight: ValidatorWeight,
+        _last_activity: Vec<Option<SystemTime>>,
+        _snapshot: crate::receiver::ReceiverActivitySnapshot,
+    ) {
         self.stats.active_weight_updates.fetch_add(1, Ordering::Relaxed);
         self.stats.last_active_weight.store(active_weight, Ordering::Relaxed);
         log::trace!(
@@ -179,6 +190,11 @@ impl ReceiverListener for TestReceiverListener {
             self.stats.receiver_idx,
             active_weight
         );
+    }
+
+    fn on_standstill_trigger(&self, notification: crate::receiver::StandstillTriggerNotification) {
+        self.stats.standstill_triggers.fetch_add(1, Ordering::Relaxed);
+        self.stats.standstill_notifications.lock().unwrap().push(notification);
     }
 
     fn on_certificate(&self, source_idx: u32, certificate: CertificateBoxed) {
@@ -192,6 +208,21 @@ impl ReceiverListener for TestReceiverListener {
             count,
             certificate
         );
+    }
+
+    fn on_candidate_query_fallback(
+        &self,
+        _slot: crate::block::SlotIndex,
+        _block_hash: UInt256,
+        _want_candidate: bool,
+        _want_notar: bool,
+        response_callback: consensus_common::QueryResponseCallback,
+    ) {
+        log::trace!(
+            "Receiver {} candidate_query_fallback: no-op (test mock)",
+            self.stats.receiver_idx
+        );
+        response_callback(Err(error!("Not implemented in test mock")));
     }
 }
 
@@ -230,6 +261,7 @@ impl ReceiverInstance {
         // Use masterchain shard and default size limits for tests
         let shard = ShardIdent::masterchain();
         let max_candidate_size = 8 << 20; // 8 MB
+        let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
         let panicked_flag = Arc::new(AtomicBool::new(false));
 
         let health_counters = Arc::new(crate::receiver::ReceiverHealthCounters::new());
@@ -237,13 +269,20 @@ impl ReceiverInstance {
             session_id.clone(),
             &shard,
             max_candidate_size,
+            max_candidate_query_answer_size,
+            0,
             nodes,
             &private_key,
             overlay_manager,
             listener_weak,
             Duration::from_secs(10), // standstill_timeout
+            50 << 17,                // standstill_max_egress_bytes_per_s
+            1,                       // slots_per_leader_window
+            250,                     // max_leader_window_desync
             panicked_flag,
+            false,
             health_counters,
+            crate::receiver::CandidateResolveConfig::default(),
         )?;
 
         Ok(Self { idx, receiver, stats, _listener: listener, private_key, session_id })
@@ -461,7 +500,7 @@ fn run_receiver_test<F>(
 
     // Generate session ID
     let mut rng = rand::thread_rng();
-    let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
+    let session_id: UInt256 = UInt256::from(rng.r#gen::<[u8; 32]>());
 
     log::info!("Session ID: {}", session_id.to_hex_string());
 
@@ -655,6 +694,7 @@ fn test_receiver_candidate_resolver() {
     // Use masterchain shard and default size limits
     let shard = ShardIdent::masterchain();
     let max_candidate_size = 8 << 20; // 8 MB
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
 
     // === Step 1: Create receiver 0 and broadcast a candidate ===
     log::info!("Step 1: Creating receiver 0 and broadcasting candidate...");
@@ -667,13 +707,20 @@ fn test_receiver_candidate_resolver() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_secs(10),
+        50 << 17,
+        1,
+        250,
         panicked_flag0,
+        false,
         health_counters0,
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 0");
 
@@ -727,6 +774,9 @@ fn test_receiver_candidate_resolver() {
 
     // Send the broadcast (will be cached in receiver 0's resolver cache)
     receiver0.send_block_broadcast(slot, candidate_hash.clone(), broadcast);
+    // requestCandidate currently asks for both candidate+notar. Seed notar in
+    // resolver cache so late joiners can complete merged CandidateAndCert.
+    receiver0.cache_notarization_cert(slot, candidate_hash.clone(), vec![0xAA, 0xBB, 0xCC]);
     log::info!(
         "Receiver 0 broadcast candidate for slot {} with hash {}",
         slot,
@@ -751,13 +801,20 @@ fn test_receiver_candidate_resolver() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_secs(10),
+        50 << 17,
+        1,
+        250,
         panicked_flag1,
+        false,
         health_counters1,
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 1");
 
@@ -769,13 +826,20 @@ fn test_receiver_candidate_resolver() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[2],
         overlay_manager.clone(),
         Arc::downgrade(&listener2_arc),
         Duration::from_secs(10),
+        50 << 17,
+        1,
+        250,
         panicked_flag2,
+        false,
         health_counters2,
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 2");
 
@@ -825,7 +889,166 @@ fn test_receiver_candidate_resolver() {
         r2_broadcasts
     );
 
-    println!("✓ Candidate resolver test passed: late-joining receivers successfully retrieved missed candidate");
+    println!(
+        "✓ Candidate resolver test passed: late-joining receivers successfully retrieved missed candidate"
+    );
+}
+
+/// Test that candidate resolver works with a large candidate payload (~1 MB)
+/// that exercises the +1MB RLDP response budget (C++ PR #2195 parity).
+///
+/// Scenario:
+/// 1. Receiver 0 broadcasts a ~1 MB candidate
+/// 2. Receiver 1 joins late and requests the candidate via the resolver
+/// 3. Assert receiver 1 receives the full large candidate
+#[test]
+fn test_receiver_candidate_resolver_large_payload() {
+    let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Trace).try_init();
+
+    let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
+    let session_id = UInt256::rand();
+
+    let keys: Vec<_> =
+        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let nodes: Vec<SessionNode> = keys
+        .iter()
+        .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
+        .collect();
+
+    let shard = ShardIdent::masterchain();
+    let max_candidate_size = 8 << 20; // 8 MB (validation guard)
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
+
+    // === Step 1: Create receiver 0 and broadcast a ~1 MB candidate ===
+    log::info!("Step 1: Creating receiver 0 and broadcasting large candidate...");
+
+    let (listener0, stats0) = TestReceiverListener::create(0);
+    let listener0_arc: Arc<dyn ReceiverListener + Send + Sync> = listener0.clone();
+    let receiver0 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[0],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener0_arc),
+        Duration::from_secs(10),
+        50 << 17,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 0");
+
+    thread::sleep(Duration::from_millis(500));
+
+    // Build a ~1 MB block payload
+    let slot = 7u32;
+    let block_data = vec![0xABu8; 1 << 20]; // 1 MiB of data
+    let collated_data: Vec<u8> = vec![];
+    let root_hash = UInt256::from_slice(&sha256_digest(&block_data));
+    let file_hash = UInt256::from_slice(&sha256_digest(&block_data));
+    let collated_file_hash = UInt256::from_slice(&sha256_digest(&collated_data));
+
+    let tl_inner = TlCandidate {
+        src: UInt256::default(),
+        round: slot as i32,
+        root_hash: root_hash.clone(),
+        data: block_data.clone().into(),
+        collated_data: collated_data.clone().into(),
+    };
+    let candidate_bytes = consensus_common::serialize_tl_boxed_object!(&tl_inner.into_boxed());
+
+    let block_id = BlockIdExt {
+        shard_id: shard.clone(),
+        seq_no: slot,
+        root_hash: root_hash.clone(),
+        file_hash: file_hash.clone(),
+    };
+
+    let candidate_hash = crate::utils::compute_candidate_id_hash_u32(
+        slot,
+        Some(&block_id),
+        Some(&collated_file_hash),
+        None,
+    );
+
+    let signature = crate::utils::sign_candidate_u32(&session_id, slot, &candidate_hash, &keys[0])
+        .expect("Failed to sign candidate");
+
+    let broadcast = CandidateData::Consensus_Block(CandidateDataBlock {
+        slot: slot as i32,
+        candidate: candidate_bytes.into(),
+        parent: CandidateParent::Consensus_CandidateWithoutParents,
+        signature: signature.into(),
+    });
+
+    receiver0.send_block_broadcast(slot, candidate_hash.clone(), broadcast);
+    // requestCandidate currently asks for both candidate+notar. Seed notar in
+    // resolver cache so late joiners can complete merged CandidateAndCert.
+    receiver0.cache_notarization_cert(slot, candidate_hash.clone(), vec![0xAA, 0xBB, 0xCC]);
+    thread::sleep(Duration::from_millis(500));
+
+    // === Step 2: Create receiver 1 (late joiner) ===
+    log::info!("Step 2: Creating late-joining receiver 1...");
+    thread::sleep(Duration::from_secs(4));
+
+    let (listener1, stats1) = TestReceiverListener::create(1);
+    let listener1_arc: Arc<dyn ReceiverListener + Send + Sync> = listener1.clone();
+    let receiver1 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[1],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener1_arc),
+        Duration::from_secs(10),
+        50 << 17,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 1");
+
+    thread::sleep(Duration::from_millis(1000));
+
+    // === Step 3: Receiver 1 requests the large candidate ===
+    log::info!("Step 3: Receiver 1 requesting large candidate via resolver...");
+    receiver1.request_candidate(slot, candidate_hash.clone());
+
+    log::info!("Waiting for large candidate resolver request to complete...");
+    thread::sleep(Duration::from_secs(10));
+
+    // === Step 4: Assert receiver 1 received the candidate ===
+    let r0_broadcasts = stats0.broadcasts_received.load(Ordering::Relaxed);
+    let r1_broadcasts = stats1.broadcasts_received.load(Ordering::Relaxed);
+    log::info!("Receiver 0: broadcasts_received = {}", r0_broadcasts);
+    log::info!("Receiver 1: broadcasts_received = {}", r1_broadcasts);
+
+    receiver0.stop();
+    receiver1.stop();
+    thread::sleep(Duration::from_millis(500));
+
+    assert!(
+        r1_broadcasts >= 1,
+        "Receiver 1 should have received the large candidate (~1 MB) via resolver, got {}",
+        r1_broadcasts
+    );
+
+    println!(
+        "✓ Large candidate resolver test passed: ~1 MB candidate successfully retrieved via RLDP path"
+    );
 }
 
 // ============================================================================
@@ -870,8 +1093,6 @@ fn certificate_slot(cert: &CertificateBoxed) -> u32 {
         crate::simplex_state::Vote::Notarize(v) => v.slot.value(),
         crate::simplex_state::Vote::Finalize(v) => v.slot.value(),
         crate::simplex_state::Vote::Skip(v) => v.slot.value(),
-        crate::simplex_state::Vote::NotarizeFallback(v) => v.slot.value(),
-        crate::simplex_state::Vote::SkipFallback(v) => v.slot.value(),
     }
 }
 
@@ -902,6 +1123,7 @@ fn test_receiver_send_certificate_and_standstill_rebroadcasts_cached_certificate
 
     let shard = ShardIdent::masterchain();
     let max_candidate_size = 8 << 20;
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
 
     // Create receivers with short standstill timeout to simulate retransmission
     let (listener0, _stats0) = TestReceiverListener::create(0);
@@ -910,13 +1132,20 @@ fn test_receiver_send_certificate_and_standstill_rebroadcasts_cached_certificate
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_millis(200),
+        50 << 17,
+        1,
+        250,
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 0");
 
@@ -926,13 +1155,20 @@ fn test_receiver_send_certificate_and_standstill_rebroadcasts_cached_certificate
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_millis(200),
+        50 << 17,
+        1,
+        250,
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 1");
 
@@ -1002,6 +1238,7 @@ fn test_receiver_standstill_rebroadcasts_cached_local_votes() {
 
     let shard = ShardIdent::masterchain();
     let max_candidate_size = 8 << 20;
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
 
     // Create receivers with short standstill timeout to simulate retransmission
     let (listener0, _stats0) = TestReceiverListener::create(0);
@@ -1010,13 +1247,20 @@ fn test_receiver_standstill_rebroadcasts_cached_local_votes() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_millis(200),
+        50 << 17,
+        1,
+        250,
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 0");
 
@@ -1026,13 +1270,20 @@ fn test_receiver_standstill_rebroadcasts_cached_local_votes() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_millis(200),
+        50 << 17,
+        1,
+        250,
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 1");
 
@@ -1065,6 +1316,319 @@ fn test_receiver_standstill_rebroadcasts_cached_local_votes() {
 }
 
 #[test]
+fn test_receiver_standstill_replay_respects_egress_budget() {
+    let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Trace).try_init();
+
+    let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
+    let session_id = UInt256::rand();
+
+    let keys: Vec<_> =
+        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let nodes: Vec<SessionNode> = keys
+        .iter()
+        .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
+        .collect();
+
+    let cert = make_skip_certificate(5);
+    let cert_bytes = serialize_boxed(&cert).expect("serialize cert");
+    let low_egress_budget = (cert_bytes.len() as u32).max(1); // bytes/sec
+
+    let shard = ShardIdent::masterchain();
+    let max_candidate_size = 8 << 20;
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
+
+    let (listener0, _stats0) = TestReceiverListener::create(0);
+    let listener0_arc: Arc<dyn ReceiverListener + Send + Sync> = listener0.clone();
+    let receiver0 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[0],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener0_arc),
+        Duration::from_millis(200),
+        low_egress_budget,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 0");
+
+    let (listener1, stats1) = TestReceiverListener::create(1);
+    let listener1_arc: Arc<dyn ReceiverListener + Send + Sync> = listener1.clone();
+    let receiver1 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[1],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener1_arc),
+        Duration::from_millis(200),
+        low_egress_budget,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 1");
+
+    thread::sleep(Duration::from_millis(500));
+
+    // Cache one cert for standstill replay.
+    receiver0.cache_standstill_certificate(
+        5,
+        crate::receiver::StandstillCertificateType::Skip,
+        cert_bytes,
+    );
+    receiver0.set_standstill_slots(0, 10);
+    receiver0.reschedule_standstill();
+
+    // Budget is intentionally low: replay should not burst immediately.
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        stats1.certificates_received.load(Ordering::Relaxed),
+        0,
+        "standstill replay should be paced by egress budget, not sent in the first 500ms"
+    );
+
+    wait_until(Duration::from_secs(8), || {
+        stats1.certificates_received.load(Ordering::Relaxed) >= 1
+    });
+
+    receiver0.stop();
+    receiver1.stop();
+    thread::sleep(Duration::from_millis(200));
+}
+
+#[test]
+fn test_receiver_standstill_rebuilds_pending_queue_from_fresh_state() {
+    let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Trace).try_init();
+
+    let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
+    let session_id = UInt256::rand();
+
+    let keys: Vec<_> =
+        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let nodes: Vec<SessionNode> = keys
+        .iter()
+        .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
+        .collect();
+
+    let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote {
+        slot: crate::block::SlotIndex::new(3),
+    });
+    let tl_vote = crate::utils::sign_vote(&vote, &session_id, &keys[0]).expect("sign_vote failed");
+    let vote_bytes = serialize_boxed(&tl_vote).expect("serialize vote");
+    let signed_vote = match tl_vote {
+        TlVoteBoxed::Consensus_Simplex_Vote(inner) => inner,
+    };
+
+    let cert = make_skip_certificate(3);
+    let cert_bytes = serialize_boxed(&cert).expect("serialize cert");
+    let low_egress_budget = (vote_bytes.len().max(cert_bytes.len()) as u32).max(1);
+
+    let shard = ShardIdent::masterchain();
+    let max_candidate_size = 8 << 20;
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
+
+    let (listener0, stats0) = TestReceiverListener::create(0);
+    let listener0_arc: Arc<dyn ReceiverListener + Send + Sync> = listener0.clone();
+    let receiver0 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[0],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener0_arc),
+        Duration::from_millis(200),
+        low_egress_budget,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 0");
+
+    let (listener1, stats1) = TestReceiverListener::create(1);
+    let listener1_arc: Arc<dyn ReceiverListener + Send + Sync> = listener1.clone();
+    let receiver1 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[1],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener1_arc),
+        Duration::from_millis(200),
+        low_egress_budget,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 1");
+
+    thread::sleep(Duration::from_millis(500));
+
+    receiver0.cache_our_vote_for_standstill(signed_vote);
+    receiver0.set_standstill_slots(0, 10);
+    receiver0.reschedule_standstill();
+
+    wait_until(Duration::from_secs(2), || stats0.standstill_triggers.load(Ordering::Relaxed) >= 1);
+
+    assert_eq!(
+        stats1.votes_received.load(Ordering::Relaxed),
+        0,
+        "low egress budget should keep the first standstill snapshot pending"
+    );
+    assert_eq!(
+        stats1.certificates_received.load(Ordering::Relaxed),
+        0,
+        "no certificate should be replayed before the snapshot is refreshed"
+    );
+
+    receiver0.cache_standstill_certificate(
+        3,
+        crate::receiver::StandstillCertificateType::Skip,
+        cert_bytes,
+    );
+
+    wait_until(Duration::from_secs(3), || stats0.standstill_triggers.load(Ordering::Relaxed) >= 2);
+    wait_until(Duration::from_secs(6), || {
+        stats1.certificates_received.load(Ordering::Relaxed) >= 1
+    });
+
+    receiver0.stop();
+    receiver1.stop();
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        stats1.votes_received.load(Ordering::Relaxed),
+        0,
+        "fresh standstill snapshot must drop the stale queued vote once a matching cert is cached"
+    );
+    assert!(
+        stats1.certificates_received.load(Ordering::Relaxed) >= 1,
+        "expected the refreshed standstill snapshot to replay the new certificate"
+    );
+}
+
+#[test]
+fn test_receiver_standstill_cache_deduplicates_equivalent_local_votes() {
+    let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Trace).try_init();
+
+    let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
+    let session_id = UInt256::rand();
+
+    let keys: Vec<_> =
+        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let nodes: Vec<SessionNode> = keys
+        .iter()
+        .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
+        .collect();
+
+    let shard = ShardIdent::masterchain();
+    let max_candidate_size = 8 << 20;
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
+
+    let (listener0, _stats0) = TestReceiverListener::create(0);
+    let listener0_arc: Arc<dyn ReceiverListener + Send + Sync> = listener0.clone();
+    let receiver0 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[0],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener0_arc),
+        Duration::from_millis(600),
+        50 << 17,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 0");
+
+    let (listener1, stats1) = TestReceiverListener::create(1);
+    let listener1_arc: Arc<dyn ReceiverListener + Send + Sync> = listener1.clone();
+    let receiver1 = crate::receiver::ReceiverWrapper::create(
+        session_id.clone(),
+        &shard,
+        max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
+        &nodes,
+        &keys[1],
+        overlay_manager.clone(),
+        Arc::downgrade(&listener1_arc),
+        Duration::from_millis(600),
+        50 << 17,
+        1,
+        250,
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
+    )
+    .expect("Failed to create receiver 1");
+
+    thread::sleep(Duration::from_millis(500));
+
+    let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote {
+        slot: crate::block::SlotIndex::new(7),
+    });
+    let tl_vote = crate::utils::sign_vote(&vote, &session_id, &keys[0]).expect("sign_vote failed");
+    let signed = match tl_vote {
+        TlVoteBoxed::Consensus_Simplex_Vote(inner) => inner,
+    };
+
+    // Cache the same signed vote twice (restart-restored + local overlap).
+    receiver0.cache_our_vote_for_standstill(signed.clone());
+    receiver0.cache_our_vote_for_standstill(signed);
+
+    receiver0.set_standstill_slots(0, 10);
+    receiver0.reschedule_standstill();
+
+    wait_until(Duration::from_secs(2), || stats1.votes_received.load(Ordering::Relaxed) >= 1);
+    thread::sleep(Duration::from_millis(150));
+
+    receiver0.stop();
+    receiver1.stop();
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        stats1.votes_received.load(Ordering::Relaxed),
+        1,
+        "equivalent local votes should be replayed once during standstill"
+    );
+}
+
+#[test]
 fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
     let _ = env_logger::Builder::new().filter_level(log::LevelFilter::Trace).try_init();
 
@@ -1080,6 +1644,7 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
 
     let shard = ShardIdent::masterchain();
     let max_candidate_size = 8 << 20;
+    let max_candidate_query_answer_size: u64 = max_candidate_size as u64 + (1 << 20);
 
     let (listener0, _stats0) = TestReceiverListener::create(0);
     let listener0_arc: Arc<dyn ReceiverListener + Send + Sync> = listener0.clone();
@@ -1087,13 +1652,20 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[0],
         overlay_manager.clone(),
         Arc::downgrade(&listener0_arc),
         Duration::from_millis(200),
+        50 << 17,
+        1,
+        250,
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 0");
 
@@ -1103,13 +1675,20 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
         session_id.clone(),
         &shard,
         max_candidate_size,
+        max_candidate_query_answer_size,
+        0,
         &nodes,
         &keys[1],
         overlay_manager.clone(),
         Arc::downgrade(&listener1_arc),
         Duration::from_millis(200),
+        50 << 17,
+        1,
+        250,
         Arc::new(AtomicBool::new(false)),
+        false,
         Arc::new(crate::receiver::ReceiverHealthCounters::new()),
+        crate::receiver::CandidateResolveConfig::default(),
     )
     .expect("Failed to create receiver 1");
 

@@ -63,9 +63,8 @@ pub extern "C" fn transaction_emulator_create(
     vm_log_verbosity: u32,
 ) -> *mut c_void {
     init_log_without_config(None, log_level_from_verbosity(vm_log_verbosity), None);
-    match deserialize_boc(config_params_boc) {
-        Ok(config_params_root) => {
-            let config_params = ConfigParams::with_root(config_params_root);
+    match deserialize_boc(config_params_boc).and_then(ConfigParams::with_root) {
+        Ok(config_params) => {
             let emulator = Box::new(Emulator::new(config_params));
             Box::into_raw(emulator) as *mut c_void
         }
@@ -176,9 +175,8 @@ pub extern "C" fn transaction_emulator_set_config(
         log::error!("Received null pointer for transaction_emulator");
         return;
     }
-    match deserialize_boc(config_params_boc) {
-        Ok(config_params_root) => {
-            let config_params = ConfigParams::with_root(config_params_root);
+    match deserialize_boc(config_params_boc).and_then(ConfigParams::with_root) {
+        Ok(config_params) => {
             let transaction_emulator = unsafe { &mut *(transaction_emulator as *mut Emulator) };
             transaction_emulator.config_params = config_params;
         }
@@ -235,12 +233,11 @@ pub extern "C" fn transaction_emulator_set_prev_blocks_info(
             match SliceData::load_cell(info_cell).and_then(|mut slice| read_stack_item(&mut slice))
             {
                 Ok(info) => {
-                    if info.is_tuple() {
-                        transaction_emulator.prev_blocks_info = PrevBlocksInfo::Tuple(info);
+                    transaction_emulator.prev_blocks_info = if info.is_tuple() {
+                        PrevBlocksInfo::Tuple(info)
                     } else {
-                        transaction_emulator.prev_blocks_info =
-                            PrevBlocksInfo::Tuple(StackItem::tuple(Vec::new()));
-                    }
+                        PrevBlocksInfo::Tuple(StackItem::tuple(Vec::new()))
+                    };
                 }
                 Err(err) => {
                     log::error!("Failed to parse info_cell: {err}");
@@ -455,6 +452,7 @@ impl Emulator {
         let config = BlockchainConfig::with_config(self.config_params.clone())
             .inspect_err(|err| log::error!("Failed to create BlockchainConfig: {err}"))?;
 
+        let dict_hash_min_cells = config.size_limits_config().acc_state_cells_for_storage_dict;
         let executor: Box<dyn TransactionExecutor> = if in_msg_cell.is_some() {
             Box::new(OrdinaryTransactionExecutor::new(config))
         } else {
@@ -482,6 +480,7 @@ impl Emulator {
         let elapsed_time = now.elapsed().as_micros() as i64;
         let result = match result {
             Ok(mut transaction) => {
+                account.update_storage_stat(dict_hash_min_cells).unwrap();
                 transaction.set_prev_trans_lt(shard_acc.last_trans_lt());
                 transaction.set_prev_trans_hash(shard_acc.last_trans_hash().clone());
                 let old_hash = shard_acc.account_hash();

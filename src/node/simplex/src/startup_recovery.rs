@@ -27,17 +27,15 @@
 //! │     - vote replay (Phase 6.6 order)                             │
 //! │     - set finalized boundary + apply local flags                │
 //! │     - restore receiver caches                                   │
-//! │     - recommit to ValidatorGroup                                │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Key Components
 //!
-//! - [`RestartRoundAction`]: Action to take for each round during restart replay
 //! - [`SessionStartupRecoveryListener`]: Object-safe trait for recovery operations
 //! - [`SessionStartupRecoveryProcessor`]: Coordinator that loads bootstrap and drives recovery
 //!
-//! See [`RESTART-RECOMMIT-PLAN.md`] for detailed design documentation.
+//! See the startup recovery section in crate-level docs for design details.
 
 use crate::{
     block::{RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
@@ -49,32 +47,21 @@ use crate::{
     session_description::SessionDescription,
     simplex_state::Vote,
     utils::extract_vote_and_signature,
-    BlockHash, PublicKey, RawVoteData, RestartRecommitStrategy, SessionId,
+    RawVoteData, SessionId,
 };
-use consensus_common::ValidatorBlockCandidatePtr;
 use std::{
-    collections::HashMap,
-    sync::{
-        mpsc::{channel, RecvTimeoutError},
-        Arc,
-    },
-    time::Duration,
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 use ton_api::{
     deserialize_boxed, serialize_boxed,
-    ton::{
-        consensus::{
-            candidatedata::{Block as CandidateDataBlock, Empty as CandidateDataEmpty},
-            candidateid::CandidateId,
-            candidateparent::CandidateParent,
-            simplex::Vote as TlVoteBoxed,
-            CandidateData, CandidateHashData, CandidateParent as CandidateParentBoxed,
-        },
-        validator_session::candidate::Candidate,
+    ton::consensus::{
+        candidatedata::Empty as CandidateDataEmpty, candidateid::CandidateId,
+        simplex::Vote as TlVoteBoxed, CandidateData, CandidateHashData,
     },
     IntoBoxed,
 };
-use ton_block::{error, fail, BlockIdExt, Result, UInt256};
+use ton_block::{error, BlockIdExt, Result, UInt256};
 
 /*
     Constants
@@ -92,46 +79,6 @@ pub(crate) type CandidateHash = UInt256;
 
 /// Signature bytes (Ed25519 signature)
 pub(crate) type SignatureBytes = Vec<u8>;
-
-/*
-    RestartRoundAction - action for each round during restart replay
-*/
-
-/// Action to take for each round during restart replay to ValidatorGroup.
-///
-/// Built by `SessionStartupRecoveryProcessor::build_restart_recommit_actions()`
-/// based on `RestartRecommitStrategy` and finalized block records from bootstrap.
-#[derive(Debug, Clone)]
-pub(crate) enum RestartRoundAction {
-    /// Replay this finalized record through the commit path.
-    ///
-    /// Non-empty records fetch approved candidate payload and emit
-    /// `on_block_committed`. Empty records are replayed as internal cursor
-    /// progress only (no `on_block_skipped` callbacks in roundless mode).
-    Commit {
-        /// Slot index
-        slot: SlotIndex,
-        /// Block ID with seqno
-        block_id: BlockIdExt,
-        /// Leader validator index
-        leader_idx: ValidatorIndex,
-        /// Root hash for candidate lookup
-        root_hash: BlockHash,
-        /// File hash for candidate lookup
-        file_hash: BlockHash,
-        /// Collated data hash for candidate lookup
-        collated_data_hash: BlockHash,
-        /// Candidate hash for certificate lookup
-        candidate_hash: CandidateHash,
-        /// Pre-serialized CandidateHashData bytes (for BlockSignaturesVariant::Simplex)
-        candidate_hash_data_bytes: Vec<u8>,
-        /// Whether this finalized record is an empty block.
-        ///
-        /// Empty records are still part of deterministic replay ordering, but
-        /// they do not emit `on_block_committed` callbacks.
-        is_empty: bool,
-    },
-}
 
 /*
     SessionStartupRecoveryListener - object-safe trait for recovery operations
@@ -200,7 +147,7 @@ pub(crate) trait SessionStartupRecoveryListener {
 
     /// Restore kept `BroadcastVote` events to the front of the queue.
     ///
-    /// Called after recommit replay so votes are broadcast on first `check_all()`.
+    /// Called after startup cache restoration so votes are broadcast on first `check_all()`.
     fn recovery_restore_startup_votes(&mut self, votes: Vec<Vote>);
 
     // ========================================================================
@@ -209,7 +156,7 @@ pub(crate) trait SessionStartupRecoveryListener {
 
     /// Seed the current round counter from finalized block count.
     ///
-    /// CERT-1 equivalent: After restart, `current_round` should reflect the number
+    /// After restart, `current_round` should reflect the number
     /// of finalized blocks so the first new block uses the correct round number.
     ///
     /// Reference: C++ publishes `BlockFinalized(last, true)` after loading finalized
@@ -236,18 +183,18 @@ pub(crate) trait SessionStartupRecoveryListener {
     /// * `block_hash` - The hash of the finalized block
     fn recovery_seed_finalized_block(&mut self, slot: SlotIndex, block_hash: CandidateHash);
 
-    /// Seed ALL finalized blocks into received_candidates for parent resolution.
+    /// Seed ALL finalized blocks into `received_candidates` for restart-side parent/tip lookups.
     ///
     /// After restart, `received_candidates` is empty, but collation/validation require
     /// parent `BlockIdExt` to be resolvable. This seeds all finalized blocks so their
-    /// Block idExt can be looked up during parent resolution.
+    /// `BlockIdExt` can be looked up after restart without waiting for new bodies.
     ///
     /// # Arguments
     ///
     /// * `finalized_blocks` - All finalized blocks from bootstrap
     fn recovery_seed_received_candidates(&mut self, finalized_blocks: &[FinalizedBlockRecord]);
 
-    /// Seed a candidate into `received_candidates` for parent resolution.
+    /// Seed a candidate into `received_candidates` for restart-side parent/tip lookups.
     ///
     /// After restart, collation uses the FSM progress cursor (`first_non_progressed_slot`)
     /// and can require a notarized (but not finalized) parent candidate's `BlockIdExt`.
@@ -266,7 +213,7 @@ pub(crate) trait SessionStartupRecoveryListener {
         candidate_hash_data_bytes: Vec<u8>,
     );
 
-    /// Notify about last finalized block after restart (Phase 6.5a / CERT-1).
+    /// Notify about last finalized block after restart (Phase 6.5a).
     ///
     /// C++ equivalent: `consensus.cpp::load_from_db()` publishes
     /// `BlockFinalized(last_known_finalized_block, true)` after loading.
@@ -323,9 +270,8 @@ pub(crate) trait SessionStartupRecoveryListener {
     /// Seed notarization certificate into simplex_state.
     ///
     /// Used during restart to populate simplex_state.slot_votes with parsed
-    /// notar certs so that `get_notarize_signatures` can find them during recommit.
-    /// This is separate from `recovery_cache_notarization_cert` which only caches
-    /// raw bytes in receiver for network queries.
+    /// notar certs. This is separate from `recovery_cache_notarization_cert`
+    /// which only caches raw bytes in receiver for network queries.
     fn recovery_seed_notarize_certificate(
         &mut self,
         slot: SlotIndex,
@@ -343,43 +289,6 @@ pub(crate) trait SessionStartupRecoveryListener {
     /// This is intentionally separate from `recovery_restore_startup_votes`: it restores
     /// historical state from DB, whereas startup votes are freshly generated on restart.
     fn recovery_restore_receiver_standstill_cache(&mut self, votes: &[VoteRecord]);
-
-    // ========================================================================
-    // Approved candidate fetch (delegated to SessionListener by SessionProcessor)
-    // ========================================================================
-
-    /// Request approved candidate from validator storage.
-    ///
-    /// This delegates to `SessionListener::get_approved_candidate` internally.
-    /// The coordinator uses this to fetch candidate payloads for recommit.
-    ///
-    /// Note: This is a non-blocking request; the callback is invoked when ready.
-    fn recovery_notify_get_approved_candidate(
-        &self,
-        source: PublicKey,
-        root_hash: BlockHash,
-        file_hash: BlockHash,
-        collated_data_hash: BlockHash,
-        callback: Box<dyn FnOnce(Result<ValidatorBlockCandidatePtr>) + Send>,
-    );
-
-    // ========================================================================
-    // Recommit replay (applies existing notify paths internally)
-    // ========================================================================
-
-    /// Apply restart recommit actions using existing notify paths.
-    ///
-    /// Full replay in roundless mode is commit-path only:
-    /// - non-empty records emit `notify_block_committed()`
-    /// - empty records advance internal replay cursors only
-    ///
-    /// The `get_candidate` closure is used to fetch candidate payloads for
-    /// non-empty records.
-    fn recovery_apply_restart_recommit_actions(
-        &mut self,
-        actions: &[RestartRoundAction],
-        get_candidate: &mut dyn FnMut(&RestartRoundAction) -> Result<ValidatorBlockCandidatePtr>,
-    ) -> Result<()>;
 }
 
 /*
@@ -391,20 +300,16 @@ pub(crate) trait SessionStartupRecoveryListener {
 /// Extracted to simplify testing and reduce coupling.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionStartupRecoveryOptions {
-    /// Strategy for replaying finalized blocks
-    pub restart_recommit_strategy: RestartRecommitStrategy,
-    /// Initial block seqno (for seqno matching during recommit)
+    /// Initial block seqno passed by session start; kept for future policy hooks.
+    #[allow(dead_code)] // Reserved for future restart policies.
     pub initial_block_seqno: u32,
 }
 
 impl SessionStartupRecoveryOptions {
     /// Create from SessionOptions and initial_block_seqno
     #[allow(dead_code)] // Available for future use
-    pub fn new(
-        restart_recommit_strategy: RestartRecommitStrategy,
-        initial_block_seqno: u32,
-    ) -> Self {
-        Self { restart_recommit_strategy, initial_block_seqno }
+    pub fn new(initial_block_seqno: u32) -> Self {
+        Self { initial_block_seqno }
     }
 }
 
@@ -417,7 +322,7 @@ impl SessionStartupRecoveryOptions {
 /// Coordinates the startup recovery stage:
 /// 1. Loads bootstrap from DB (in constructor, cancellable)
 /// 2. Computes recovery identity (self_idx, validator keys)
-/// 3. Builds restore/recommit plans
+/// 3. Builds restore plans
 /// 4. Drives recovery through `SessionStartupRecoveryListener`
 ///
 /// Dropped before entering the main processing loop.
@@ -426,10 +331,7 @@ pub(crate) struct SessionStartupRecoveryProcessor {
     session_id: SessionId,
 
     /// Session description (for leader key lookup during candidate reconstruction)
-    description: Arc<SessionDescription>,
-
-    /// Recovery options (strategy, initial seqno)
-    options: SessionStartupRecoveryOptions,
+    _description: Arc<SessionDescription>,
 
     /// Self validator index (cached from description)
     self_idx: ValidatorIndex,
@@ -457,7 +359,7 @@ impl SessionStartupRecoveryProcessor {
     pub fn new(
         session_id: SessionId,
         description: Arc<SessionDescription>,
-        options: SessionStartupRecoveryOptions,
+        _options: SessionStartupRecoveryOptions,
         bootstrap: Bootstrap,
     ) -> Self {
         let self_idx = description.get_self_idx();
@@ -475,8 +377,7 @@ impl SessionStartupRecoveryProcessor {
 
         Self {
             session_id,
-            description,
-            options,
+            _description: description,
             self_idx,
             bootstrap: Some(bootstrap),
             candidate_info_map,
@@ -514,8 +415,7 @@ impl SessionStartupRecoveryProcessor {
     /// 2. Generates restart skip votes
     /// 3. Drains startup events (keeps BroadcastVote only)
     /// 4. Restores receiver caches (notar certs, candidate bytes)
-    /// 5. Builds and applies restart recommit actions
-    /// 6. Restores kept votes
+    /// 5. Restores kept votes
     ///
     /// After this method returns, the processor is consumed and can be dropped.
     ///
@@ -560,8 +460,8 @@ impl SessionStartupRecoveryProcessor {
             self.session_id.to_hex_string()
         );
 
-        // Split bootstrap into session and receiver parts
-        let (session_boot, receiver_boot) = bootstrap.split();
+        // Split bootstrap into session, receiver, and candidate payload parts
+        let (session_boot, receiver_boot, candidate_payloads) = bootstrap.split();
 
         // Step 1: Replay ALL votes (global pass - restores weights, certificates)
         log::debug!(
@@ -611,12 +511,11 @@ impl SessionStartupRecoveryProcessor {
             kept_votes.len()
         );
 
-        // Step 6: Seed current_round for restart replay
+        // Step 6: Seed current_round compatibility hook.
         //
-        // Startup recommit actions (step 11) replay historical rounds to ValidatorGroup.
-        // To keep round accounting consistent (and avoid double-counting), we start the
-        // replay from round 0 and let step 11 advance `current_round` as it applies
-        // skip/commit actions.
+        // Simplex now restores finalized state directly without historical recommit,
+        // so this remains a compatibility callback for the recovery pipeline. The
+        // slot-based SessionProcessor currently treats it as a no-op.
         log::debug!(
             target: LOG_TARGET,
             "Session {}: step 6/12 - seeding current_round=0 (finalized_blocks={})",
@@ -652,13 +551,13 @@ impl SessionStartupRecoveryProcessor {
         );
         self.restore_notar_cert_cache(listener, &receiver_boot.notar_certs)?;
 
-        // Step 9b: Seed notarized candidates into received_candidates for parent resolution
+        // Step 9b: Seed notarized candidates into `received_candidates` for post-restart lookups.
         //
         // This ensures post-restart collation can resolve `BlockIdExt` for notarized parents
         // without relying on `requestCandidate` (which may be impossible in single-node tests).
         log::debug!(
             target: LOG_TARGET,
-            "Session {}: step 9b/12 - seeding {} candidate infos into received_candidates for parent resolution",
+            "Session {}: step 9b/12 - seeding {} candidate infos into received_candidates for post-restart parent/tip lookups",
             self.session_id.to_hex_string(),
             self.candidate_info_map.len()
         );
@@ -670,7 +569,11 @@ impl SessionStartupRecoveryProcessor {
             "Session {}: step 10/12 - restoring candidate bytes cache",
             self.session_id.to_hex_string()
         );
-        self.restore_candidate_cache(listener, &session_boot.finalized_blocks)?;
+        self.restore_candidate_cache(
+            listener,
+            &session_boot.finalized_blocks,
+            &candidate_payloads,
+        )?;
 
         // Step 10b: Rebuild receiver standstill caches (votes + cert bundles + last_final_cert)
         //
@@ -687,32 +590,23 @@ impl SessionStartupRecoveryProcessor {
         );
         listener.recovery_restore_receiver_standstill_cache(&session_boot.votes);
 
-        // Step 11: Build and apply restart recommit actions
+        // Step 11: Restore kept votes
         log::debug!(
             target: LOG_TARGET,
-            "Session {}: step 11/12 - applying restart recommit actions (strategy={:?})",
-            self.session_id.to_hex_string(),
-            self.options.restart_recommit_strategy
-        );
-        self.apply_restart_recommit(listener, &session_boot.finalized_blocks)?;
-
-        // Step 12: Restore kept votes
-        log::debug!(
-            target: LOG_TARGET,
-            "Session {}: step 12/12 - restoring {} kept votes",
+            "Session {}: step 11/12 - restoring {} kept votes",
             self.session_id.to_hex_string(),
             kept_votes.len()
         );
         listener.recovery_restore_startup_votes(kept_votes);
 
-        // Step 13: Finalize parent chain setup
-        // IMPORTANT: This must happen AFTER step 12 (kept votes restoration) because
+        // Step 12: Finalize parent chain setup
+        // IMPORTANT: This must happen AFTER step 11 (kept votes restoration) because
         // the kept votes may finalize additional slots, advancing first_non_finalized_slot.
         // We need to set available_base for the CURRENT first_non_finalized_slot, not the
         // one from the DB (which was outdated).
         log::debug!(
             target: LOG_TARGET,
-            "Session {}: step 13/13 - finalizing parent chain setup",
+            "Session {}: step 12/12 - finalizing parent chain setup",
             self.session_id.to_hex_string()
         );
         listener.recovery_finalize_parent_chain();
@@ -726,7 +620,7 @@ impl SessionStartupRecoveryProcessor {
         Ok(())
     }
 
-    /// Seed notarized candidates into `received_candidates` for parent resolution.
+    /// Seed notarized candidates into `received_candidates` for post-restart parent/tip lookups.
     ///
     /// Uses `candidate_info_map` to reconstruct minimal metadata (BlockIdExt + parent id + hash data bytes)
     /// for candidates that have a stored NotarCert record.
@@ -940,7 +834,7 @@ impl SessionStartupRecoveryProcessor {
     ///
     /// This does two things:
     /// 1. Cache raw bytes in receiver for network queries (`requestCandidate(want_notar=true)`)
-    /// 2. Parse and seed into simplex_state for restart recommit (`get_notarize_signatures`)
+    /// 2. Parse and seed into simplex_state for restored certificate state
     fn restore_notar_cert_cache(
         &self,
         listener: &mut dyn SessionStartupRecoveryListener,
@@ -957,7 +851,7 @@ impl SessionStartupRecoveryProcessor {
                 cert.notar_cert_bytes.to_vec(),
             );
 
-            // 2. Parse and seed into simplex_state for recommit
+            // 2. Parse and seed into simplex_state for restored certificate state
             match crate::certificate::NotarCert::from_tl_bytes_for_candidate(
                 &cert.notar_cert_bytes,
                 cert.candidate_id.slot,
@@ -1038,19 +932,19 @@ impl SessionStartupRecoveryProcessor {
         );
     }
 
-    /// Notify about the last finalized block (Phase 6.5a / CERT-1).
+    /// Notify about the last finalized block (Phase 6.5a).
     ///
     /// C++ equivalent: `consensus.cpp::load_from_db()` publishes
     /// `BlockFinalized(last_known_finalized_block, true)` after loading.
     ///
     /// This notification seeds ALL finalized blocks into `received_candidates`
-    /// for parent resolution, then notifies about the last finalized block.
+    /// for restart-side parent/tip lookups, then notifies about the last finalized block.
     fn notify_last_finalized_block(
         &self,
         listener: &mut dyn SessionStartupRecoveryListener,
         finalized_blocks: &[FinalizedBlockRecord],
     ) {
-        // First, seed ALL finalized blocks into received_candidates for parent resolution
+        // First, seed ALL finalized blocks into `received_candidates` for restart-side lookups.
         listener.recovery_seed_received_candidates(finalized_blocks);
 
         // Find the last block with is_final=true
@@ -1065,7 +959,7 @@ impl SessionStartupRecoveryProcessor {
 
                 log::info!(
                     target: LOG_TARGET,
-                    "Session {}: CERT-1 notifying last finalized block: slot={}, seqno={}, hash={}",
+                    "Session {}: notifying last finalized block on restart: slot={}, seqno={}, hash={}",
                     self.session_id.to_hex_string(),
                     slot.value(),
                     seqno,
@@ -1077,7 +971,7 @@ impl SessionStartupRecoveryProcessor {
             None => {
                 log::debug!(
                     target: LOG_TARGET,
-                    "Session {}: no is_final=true block found, skipping CERT-1 notification",
+                    "Session {}: no is_final=true block found, skipping last-finalized-cert notification",
                     self.session_id.to_hex_string()
                 );
             }
@@ -1089,38 +983,46 @@ impl SessionStartupRecoveryProcessor {
     /// For each finalized block, reconstructs the CandidateData bytes and caches
     /// them so `requestCandidate(want_candidate=true)` queries can be answered.
     ///
-    /// Reference: C++ candidate-resolver.cpp loads candidate bytes from DB or
-    /// fetches via `get_approved_candidate` when needed.
+    /// Reference: C++ candidate-resolver.cpp loads full candidate bytes from its
+    /// own consensus DB. The Rust implementation only reconstructs empty blocks
+    /// from metadata; non-empty blocks are skipped and will be resolved via peer
+    /// overlay when requested.
     ///
     /// # Empty vs Non-empty blocks
     ///
     /// - **Empty blocks**: Reconstruct `CandidateData::Consensus_Empty` from FinalizedBlockRecord
     ///   (block_id, parent info, signature from leader)
-    /// - **Non-empty blocks**: Fetch approved candidate via `recovery_notify_get_approved_candidate`,
-    ///   then reconstruct `CandidateData::Consensus_Block`
+    /// - **Non-empty blocks**: Skipped (will be served from in-memory cache during
+    ///   normal operation, or peers will query other validators)
     fn restore_candidate_cache(
         &self,
         listener: &mut dyn SessionStartupRecoveryListener,
         finalized_blocks: &[FinalizedBlockRecord],
+        candidate_payloads: &[(RawCandidateId, Vec<u8>)],
     ) -> Result<()> {
-        if finalized_blocks.is_empty() {
-            log::debug!(
-                target: LOG_TARGET,
-                "Session {}: no finalized blocks, skipping candidate cache restore",
-                self.session_id.to_hex_string()
-            );
-            return Ok(());
-        }
-
-        let mut restored = 0u32;
+        let mut restored_empty = 0u32;
+        let mut restored_payload = 0u32;
         let mut skipped = 0u32;
         let mut errors = 0u32;
 
+        // 1. Restore from persisted candidate payloads (both empty and non-empty).
+        //    C++ parity: CandidateResolver loads full candidate bytes from DB.
+        let payload_ids: HashSet<_> = candidate_payloads.iter().map(|(id, _)| id.clone()).collect();
+        for (id, bytes) in candidate_payloads {
+            listener.recovery_cache_candidate_bytes(id.slot, id.hash.clone(), bytes.clone());
+            restored_payload += 1;
+        }
+
+        // 2. For finalized empty blocks not already covered by payloads,
+        //    reconstruct from metadata (backward-compat for DBs without payloads).
         for block in finalized_blocks {
             let slot = block.candidate_id.slot;
             let candidate_hash = &block.candidate_id.hash;
 
-            // Look up candidate info for this block
+            if payload_ids.contains(&block.candidate_id) {
+                continue;
+            }
+
             let candidate_info = match self.candidate_info_map.get(candidate_hash) {
                 Some(info) => info,
                 None => {
@@ -1135,13 +1037,15 @@ impl SessionStartupRecoveryProcessor {
                 }
             };
 
-            // Determine if this is an empty block by checking candidate_hash_data variant
-            // Empty blocks use candidateHashDataEmpty, non-empty use candidateHashDataOrdinary
             let is_empty =
                 Self::is_empty_block_candidate_hash_data(&candidate_info.candidate_hash_data);
 
-            let candidate_data_bytes = if is_empty {
-                // Reconstruct empty block CandidateData
+            if !is_empty {
+                skipped += 1;
+                continue;
+            }
+
+            let candidate_data_bytes =
                 match self.reconstruct_empty_candidate_data(block, candidate_info) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -1155,147 +1059,23 @@ impl SessionStartupRecoveryProcessor {
                         errors += 1;
                         continue;
                     }
-                }
-            } else {
-                // Non-empty blocks: fetch via blocking channel and reconstruct
-                let leader_idx = ValidatorIndex(candidate_info.leader_idx);
-                let source = self.description.get_source_public_key(leader_idx).clone();
-
-                // Extract hashes from candidate_hash_data for fetch
-                let (root_hash, file_hash, collated_data_hash) =
-                    match Self::extract_hashes_from_candidate_hash_data(
-                        &candidate_info.candidate_hash_data,
-                    ) {
-                        Some(hashes) => hashes,
-                        None => {
-                            log::warn!(
-                                target: LOG_TARGET,
-                                "Session {}: failed to extract hashes from candidate hash data for slot={}",
-                                self.session_id.to_hex_string(),
-                                slot.value()
-                            );
-                            errors += 1;
-                            continue;
-                        }
-                    };
-
-                // Create one-shot channel for blocking fetch
-                let (tx, rx) = channel();
-
-                log::debug!(
-                    target: LOG_TARGET,
-                    "Session {}: fetching non-empty candidate for slot={}, root_hash={}",
-                    self.session_id.to_hex_string(),
-                    slot.value(),
-                    root_hash.to_hex_string()
-                );
-
-                // Request candidate via listener callback
-                listener.recovery_notify_get_approved_candidate(
-                    source,
-                    root_hash.clone(),
-                    file_hash.clone(),
-                    collated_data_hash.clone(),
-                    Box::new(move |result| {
-                        let _ = tx.send(result);
-                    }),
-                );
-
-                // Block waiting for result with timeout
-                const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
-
-                let fetch_result = match rx.recv_timeout(FETCH_TIMEOUT) {
-                    Ok(Ok(candidate)) => {
-                        log::debug!(
-                            target: LOG_TARGET,
-                            "Session {}: fetched non-empty candidate for slot={}",
-                            self.session_id.to_hex_string(),
-                            slot.value()
-                        );
-                        // Build validator_session.Candidate TL bytes from stored block data + collated data.
-                        //
-                        // IMPORTANT: CandidateData::Consensus_Block.candidate must contain serialized
-                        // `validator_session.candidate::Candidate` bytes (C++ RawCandidate::serialize()).
-                        // The approved candidate storage returns raw block data + collated_data, NOT TL candidate bytes.
-                        let candidate_seqno = block.block_id.seq_no() as i32;
-                        let tl_vs_candidate = Candidate {
-                            src: UInt256::default(),
-                            round: candidate_seqno,
-                            root_hash: root_hash.clone(),
-                            data: candidate.data.data().to_vec(),
-                            collated_data: candidate.collated_data.data().to_vec(),
-                        };
-                        let vs_candidate_bytes = consensus_common::serialize_tl_boxed_object!(
-                            &tl_vs_candidate.into_boxed()
-                        );
-
-                        self.reconstruct_block_candidate_data(
-                            block,
-                            candidate_info,
-                            vs_candidate_bytes,
-                        )
-                    }
-                    Ok(Err(e)) => {
-                        log::warn!(
-                            target: LOG_TARGET,
-                            "Session {}: candidate fetch failed for slot={}: {}",
-                            self.session_id.to_hex_string(),
-                            slot.value(),
-                            e
-                        );
-                        Err(e)
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        log::warn!(
-                            target: LOG_TARGET,
-                            "Session {}: candidate fetch TIMEOUT for slot={} ({}s)",
-                            self.session_id.to_hex_string(),
-                            slot.value(),
-                            FETCH_TIMEOUT.as_secs()
-                        );
-                        Err(error!("candidate fetch timeout for slot {}", slot.value()))
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        log::error!(
-                            target: LOG_TARGET,
-                            "Session {}: candidate fetch channel disconnected for slot={}",
-                            self.session_id.to_hex_string(),
-                            slot.value()
-                        );
-                        Err(error!("candidate fetch channel disconnected"))
-                    }
                 };
 
-                match fetch_result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        log::warn!(
-                            target: LOG_TARGET,
-                            "Session {}: failed to reconstruct block candidate for slot={}: {}",
-                            self.session_id.to_hex_string(),
-                            slot.value(),
-                            e
-                        );
-                        errors += 1;
-                        continue;
-                    }
-                }
-            };
-
-            // Cache the reconstructed candidate bytes
             listener.recovery_cache_candidate_bytes(
                 slot,
                 candidate_hash.clone(),
                 candidate_data_bytes,
             );
-            restored += 1;
+            restored_empty += 1;
         }
 
         log::info!(
             target: LOG_TARGET,
-            "Session {}: restored {} candidate bytes to cache ({} skipped, {} errors)",
+            "Session {}: restored candidate cache: {} from payload DB, {} empty reconstructed, \
+            {} skipped, {} errors",
             self.session_id.to_hex_string(),
-            restored,
+            restored_payload,
+            restored_empty,
             skipped,
             errors
         );
@@ -1397,309 +1177,6 @@ impl SessionStartupRecoveryProcessor {
         }
     }
 
-    /// Reconstruct CandidateData::Consensus_Block bytes for a non-empty block.
-    ///
-    /// Reference: C++ RawCandidate::serialize() for block variant
-    fn reconstruct_block_candidate_data(
-        &self,
-        block: &FinalizedBlockRecord,
-        candidate_info: &CandidateInfoRecord,
-        candidate_bytes: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        let slot = block.candidate_id.slot;
-
-        // Get parent info from candidate_hash_data
-        let parent_opt =
-            Self::extract_parent_id_from_ordinary_hash_data(&candidate_info.candidate_hash_data)?;
-
-        // Build TL parent structure
-        let tl_parent = match parent_opt {
-            Some((parent_slot, parent_hash)) => CandidateParent {
-                id: CandidateId { slot: parent_slot.value() as i32, hash: parent_hash }
-                    .into_boxed(),
-            }
-            .into_boxed(),
-            None => CandidateParentBoxed::Consensus_CandidateWithoutParents,
-        };
-
-        // Use signature from candidate_info (leader's original signature)
-        let signature = candidate_info.signature.clone();
-
-        // Build the TL Block structure
-        let tl_block = CandidateDataBlock {
-            slot: slot.value() as i32,
-            candidate: candidate_bytes.into(),
-            parent: tl_parent,
-            signature,
-        };
-
-        // Wrap in CandidateData enum and serialize
-        let tl_candidate_data = CandidateData::Consensus_Block(tl_block);
-        let bytes = serialize_boxed(&tl_candidate_data)
-            .map_err(|e| error!("Failed to serialize block CandidateData: {}", e))?;
-
-        log::trace!(
-            target: LOG_TARGET,
-            "Session {}: reconstructed block candidate data for slot={}, size={}",
-            self.session_id.to_hex_string(),
-            slot.value(),
-            bytes.len()
-        );
-
-        Ok(bytes)
-    }
-
-    /// Build and apply restart recommit actions.
-    fn apply_restart_recommit(
-        &self,
-        listener: &mut dyn SessionStartupRecoveryListener,
-        finalized_blocks: &[FinalizedBlockRecord],
-    ) -> Result<()> {
-        // Build recommit actions based on strategy
-        let actions = self.build_restart_recommit_actions(finalized_blocks)?;
-
-        if actions.is_empty() {
-            log::info!(
-                target: LOG_TARGET,
-                "Session {}: no recommit actions to apply",
-                self.session_id.to_hex_string()
-            );
-            return Ok(());
-        }
-
-        log::info!(
-            target: LOG_TARGET,
-            "Session {}: applying {} recommit actions (strategy={:?})",
-            self.session_id.to_hex_string(),
-            actions.len(),
-            self.options.restart_recommit_strategy
-        );
-
-        // Pre-fetch candidates for non-empty replay actions.
-        // We do this before calling recovery_apply_restart_recommit_actions to avoid borrow conflicts
-        let mut prefetched: HashMap<SlotIndex, Result<ValidatorBlockCandidatePtr>> = HashMap::new();
-
-        for action in &actions {
-            let RestartRoundAction::Commit {
-                slot,
-                leader_idx,
-                root_hash,
-                file_hash,
-                collated_data_hash,
-                is_empty,
-                ..
-            } = action;
-
-            if *is_empty {
-                continue;
-            }
-
-            let source = self.description.get_source_public_key(*leader_idx).clone();
-
-            // Create one-shot channel for blocking fetch
-            let (tx, rx) = channel();
-
-            log::debug!(
-                target: LOG_TARGET,
-                "Session {}: fetching candidate for slot={}, root_hash={}",
-                self.session_id.to_hex_string(),
-                slot.value(),
-                root_hash.to_hex_string()
-            );
-
-            // Request candidate via listener callback
-            listener.recovery_notify_get_approved_candidate(
-                source,
-                root_hash.clone(),
-                file_hash.clone(),
-                collated_data_hash.clone(),
-                Box::new(move |result| {
-                    // Send result through channel (ignore send error if receiver dropped)
-                    let _ = tx.send(result);
-                }),
-            );
-
-            // Block waiting for result with timeout
-            // Use a generous timeout (30s) for validator storage fetch
-            const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
-
-            let result = match rx.recv_timeout(FETCH_TIMEOUT) {
-                Ok(Ok(candidate)) => {
-                    log::debug!(
-                        target: LOG_TARGET,
-                        "Session {}: fetched candidate for slot={}",
-                        self.session_id.to_hex_string(),
-                        slot.value()
-                    );
-                    Ok(candidate)
-                }
-                Ok(Err(e)) => {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "Session {}: candidate fetch failed for slot={}: {}",
-                        self.session_id.to_hex_string(),
-                        slot.value(),
-                        e
-                    );
-                    Err(e)
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "Session {}: candidate fetch TIMEOUT for slot={} ({}s)",
-                        self.session_id.to_hex_string(),
-                        slot.value(),
-                        FETCH_TIMEOUT.as_secs()
-                    );
-                    Err(error!("candidate fetch timeout for slot {}", slot.value()))
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    log::error!(
-                        target: LOG_TARGET,
-                        "Session {}: candidate fetch channel disconnected for slot={}",
-                        self.session_id.to_hex_string(),
-                        slot.value()
-                    );
-                    Err(error!("candidate fetch channel disconnected"))
-                }
-            };
-
-            prefetched.insert(*slot, result);
-        }
-
-        // Apply actions through listener using prefetched candidates
-        listener.recovery_apply_restart_recommit_actions(&actions, &mut |action| {
-            let RestartRoundAction::Commit { slot, is_empty, .. } = action;
-            if *is_empty {
-                fail!("fetch called for empty replay action at slot {}", slot.value());
-            }
-
-            // Look up prefetched candidate
-            match prefetched.remove(slot) {
-                Some(Ok(candidate)) => Ok(candidate),
-                Some(Err(e)) => Err(error!("prefetch failed: {}", e)),
-                None => Err(error!("no prefetched candidate for slot {}", slot.value())),
-            }
-        })?;
-
-        Ok(())
-    }
-
-    /// Build restart recommit actions based on strategy.
-    pub fn build_restart_recommit_actions(
-        &self,
-        finalized_blocks: &[FinalizedBlockRecord],
-    ) -> Result<Vec<RestartRoundAction>> {
-        match self.options.restart_recommit_strategy {
-            RestartRecommitStrategy::FullReplay => self.build_full_replay_actions(finalized_blocks),
-            RestartRecommitStrategy::FirstCommitAfterFinalized => {
-                // C++-like mode: restore state only, no historical replay callbacks.
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    /// Build full replay actions (all finalized blocks in order).
-    fn build_full_replay_actions(
-        &self,
-        finalized_blocks: &[FinalizedBlockRecord],
-    ) -> Result<Vec<RestartRoundAction>> {
-        let mut actions = Vec::with_capacity(finalized_blocks.len());
-        let mut expected_parent: Option<RawCandidateId> = None;
-        let mut last_slot: Option<SlotIndex> = None;
-        let mut last_committed_seqno = self.options.initial_block_seqno.checked_sub(1);
-
-        for block in finalized_blocks {
-            let slot = block.candidate_id.slot;
-            let candidate_hash = block.candidate_id.hash.clone();
-            let block_seqno = block.block_id.seq_no();
-
-            if let Some(prev_slot) = last_slot {
-                if slot.value() <= prev_slot.value() {
-                    fail!(
-                        "full replay requires strict slot monotonicity: prev_slot={}, slot={}",
-                        prev_slot.value(),
-                        slot.value()
-                    );
-                }
-            }
-
-            if block.parent != expected_parent {
-                fail!(
-                    "full replay chain discontinuity at slot {}: expected parent {:?}, actual {:?}",
-                    slot.value(),
-                    expected_parent,
-                    block.parent
-                );
-            }
-
-            // Look up candidate info
-            let candidate_info = self.candidate_info_map.get(&candidate_hash).ok_or_else(|| {
-                error!(
-                    "missing candidate info for replay slot {} hash {}",
-                    slot.value(),
-                    candidate_hash.to_hex_string()
-                )
-            })?;
-            let is_empty =
-                Self::is_empty_block_candidate_hash_data(&candidate_info.candidate_hash_data);
-
-            let expected_seqno = match (is_empty, last_committed_seqno) {
-                (false, Some(prev)) => prev.saturating_add(1),
-                (false, None) => self.options.initial_block_seqno,
-                (true, Some(prev)) => prev,
-                (true, None) => {
-                    fail!("full replay cannot start from empty block at slot {}", slot.value());
-                }
-            };
-
-            if block_seqno != expected_seqno {
-                fail!(
-                    "full replay seqno mismatch at slot {}: expected {}, actual {}, is_empty={}",
-                    slot.value(),
-                    expected_seqno,
-                    block_seqno,
-                    is_empty
-                );
-            }
-
-            // Extract block_id and collated_data_hash from CandidateHashData
-            let (root_hash, file_hash, collated_data_hash) =
-                Self::extract_hashes_from_candidate_hash_data(&candidate_info.candidate_hash_data)
-                    .ok_or_else(|| {
-                        error!(
-                            "failed to extract hashes from candidate hash data for replay slot {}",
-                            slot.value()
-                        )
-                    })?;
-
-            // Serialize CandidateHashData to bytes
-            let candidate_hash_data_bytes =
-                Self::serialize_candidate_hash_data(&candidate_info.candidate_hash_data);
-
-            // Build commit action
-            actions.push(RestartRoundAction::Commit {
-                slot,
-                block_id: block.block_id.clone(),
-                leader_idx: ValidatorIndex(candidate_info.leader_idx),
-                root_hash,
-                file_hash,
-                collated_data_hash,
-                candidate_hash,
-                candidate_hash_data_bytes,
-                is_empty,
-            });
-
-            if !is_empty {
-                last_committed_seqno = Some(block_seqno);
-            }
-            last_slot = Some(slot);
-            expected_parent = Some(block.candidate_id.clone());
-        }
-
-        Ok(actions)
-    }
-
     /// Deserialize a vote record into (Vote, SignatureBytes).
     fn deserialize_vote_record(vote_record: &VoteRecord) -> Option<(Vote, SignatureBytes)> {
         let msg = match deserialize_boxed(vote_record.data.as_slice()) {
@@ -1730,32 +1207,5 @@ impl SessionStartupRecoveryProcessor {
                 None
             }
         }
-    }
-
-    /// Extract root_hash, file_hash, and collated_data_hash from CandidateHashData.
-    fn extract_hashes_from_candidate_hash_data(
-        data: &CandidateHashData,
-    ) -> Option<(BlockHash, BlockHash, BlockHash)> {
-        match data {
-            CandidateHashData::Consensus_CandidateHashDataOrdinary(ordinary) => {
-                let root_hash = UInt256::from_slice(ordinary.block.root_hash.as_slice());
-                let file_hash = UInt256::from_slice(ordinary.block.file_hash.as_slice());
-                let collated_data_hash =
-                    UInt256::from_slice(ordinary.collated_file_hash.as_slice());
-                Some((root_hash, file_hash, collated_data_hash))
-            }
-            CandidateHashData::Consensus_CandidateHashDataEmpty(empty) => {
-                // Empty blocks don't have collated_data_hash
-                let root_hash = UInt256::from_slice(empty.block.root_hash.as_slice());
-                let file_hash = UInt256::from_slice(empty.block.file_hash.as_slice());
-                let collated_data_hash = UInt256::default();
-                Some((root_hash, file_hash, collated_data_hash))
-            }
-        }
-    }
-
-    /// Serialize CandidateHashData to TL bytes.
-    fn serialize_candidate_hash_data(data: &CandidateHashData) -> Vec<u8> {
-        serialize_boxed(data).map(|v| v.into()).unwrap_or_default()
     }
 }

@@ -253,7 +253,7 @@ fn run_overlay_test(manager: ConsensusOverlayManagerPtr) -> Result<()> {
             }
         }
         // Send a broadcast. This will be received by all, including the sender.
-        overlays[i].send_broadcast_fec_ex(&node_ids[i], &node_ids[i], make_payload());
+        overlays[i].send_broadcast_fec_ex(&node_ids[i], &node_ids[i], make_payload(), None);
     }
 
     // Wait for all broadcasts to be delivered, with a timeout, instead of a fixed sleep
@@ -470,7 +470,7 @@ fn run_overlay_performance_test(manager: ConsensusOverlayManagerPtr) -> Result<(
                     );
                     queries_sent += 1;
                 }
-                overlays[i].send_broadcast_fec_ex(&node_ids[i], &node_ids[i], make_payload());
+                overlays[i].send_broadcast_fec_ex(&node_ids[i], &node_ids[i], make_payload(), None);
                 broadcasts_sent += 1;
                 thread::sleep(SLEEP_TIME);
             }

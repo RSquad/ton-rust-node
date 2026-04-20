@@ -454,8 +454,13 @@ async fn run_get_method(p: RunGetMethodParams, ctx: Ctx) -> JsonResult {
         UIntOrStr::Int(i) => i,
     };
     let mc_state_cell = acc_ctx.mc_state_root_cell();
+    let gen_utime = acc_ctx.acc_state.state().state()?.gen_time();
+    let gen_lt = acc_ctx.acc_state.state().state()?.gen_lt();
+    let account = acc_ctx.shard_account.read_account()?;
     let stack = p.stack.into_iter().map(|e| e.into()).collect();
-    let result = ton_vm::run_smc_method(&acc_ctx.shard_account, mc_state_cell, method_id, stack)?;
+    let result =
+        ton_vm::run_smc_method(&account, mc_state_cell, method_id, stack, gen_utime, gen_lt)?
+            .into_run_result()?;
     let stack = serialize_stack(result.stack)?;
 
     Ok(serde_json::json!({
@@ -1431,6 +1436,8 @@ struct GetTokenDataParams {
 async fn get_token_data(p: GetTokenDataParams, ctx: Ctx) -> JsonResult {
     let acc_ctx = AccountContext::with_address(&ctx, &p.address, None).await?;
     let mc_state_cell = acc_ctx.mc_state_root_cell();
+    let gen_utime = acc_ctx.acc_state.state().state()?.gen_time();
+    let gen_lt = acc_ctx.acc_state.state().state()?.gen_lt();
     let is_testnet = ctx.is_testnet().await;
 
     const TYPES_METHODS: [(&str, &str); 4] = [
@@ -1440,6 +1447,7 @@ async fn get_token_data(p: GetTokenDataParams, ctx: Ctx) -> JsonResult {
         ("nft_item", "get_nft_data"),
     ];
 
+    let account = acc_ctx.shard_account.read_account()?;
     let mut contract_type: Option<&str> = None;
     let mut stack: Option<Vec<StackEntry>> = None;
 
@@ -1447,13 +1455,15 @@ async fn get_token_data(p: GetTokenDataParams, ctx: Ctx) -> JsonResult {
         let method_id = ton_method_id(&method_name);
 
         let res = ton_vm::run_smc_method(
-            &acc_ctx.shard_account,
+            &account,
             mc_state_cell.clone(),
             method_id,
             Vec::<StackEntry>::new(),
+            gen_utime,
+            gen_lt,
         );
 
-        let Ok(res) = res else {
+        let Ok(res) = res.and_then(|r| r.into_run_result()) else {
             continue;
         };
 

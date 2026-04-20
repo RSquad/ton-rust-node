@@ -51,7 +51,7 @@ fn test_merkle_update() {
     let new_cell = acc.serialize().unwrap();
     assert_ne!(old_cell, new_cell);
     let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
-    let updated_cell = mupd.apply_for(&old_cell).unwrap();
+    let (updated_cell, _) = mupd.apply_for(&old_cell).unwrap();
     assert_eq!(new_cell, updated_cell);
 }
 
@@ -72,7 +72,7 @@ fn test_merkle_update_serialization() {
     let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
     let mupd_bytes = write_boc(&mupd.serialize().unwrap()).unwrap();
     let mupd2 = MerkleUpdate::construct_from_bytes(&mupd_bytes).unwrap();
-    let updated_cell = mupd2.apply_for(&old_cell).unwrap();
+    let (updated_cell, _) = mupd2.apply_for(&old_cell).unwrap();
     assert_eq!(new_cell, updated_cell);
 }
 
@@ -81,7 +81,7 @@ fn test_empty_merkle_update() {
     let ss = ShardState::default();
     let cell = ss.serialize().unwrap();
     let mupd = MerkleUpdate::create(&cell, &cell).unwrap();
-    let cell2 = mupd.apply_for(&cell).unwrap();
+    let (cell2, _) = mupd.apply_for(&cell).unwrap();
     assert_eq!(cell, cell2);
 }
 
@@ -91,7 +91,7 @@ fn test_empty_merkle_update2() {
     let cell1 = ss.serialize().unwrap();
     let cell2 = Cell::default();
     let mupd = MerkleUpdate::create(&cell1, &cell2).unwrap();
-    let cell3 = mupd.apply_for(&cell1).unwrap();
+    let (cell3, _) = mupd.apply_for(&cell1).unwrap();
     assert_eq!(cell2, cell3);
 }
 
@@ -100,7 +100,7 @@ fn test_merkle_update_for_other_bags() {
     let cell1 = BuilderData::with_raw(vec![1, 2, 3, 0x80], 4).unwrap().into_cell().unwrap();
     let cell2 = BuilderData::with_raw(vec![5, 6, 7, 0x80], 4).unwrap().into_cell().unwrap();
     let mupd = MerkleUpdate::create(&cell1, &cell2).unwrap();
-    let cell3 = mupd.apply_for(&cell1).unwrap();
+    let (cell3, _) = mupd.apply_for(&cell1).unwrap();
     assert_eq!(cell2, cell3);
 }
 
@@ -166,7 +166,7 @@ fn test_merkle_update3() {
     let root2 = root2.into_cell().unwrap();
 
     let mupd = MerkleUpdate::create(&root1, &root2).unwrap();
-    let root3 = mupd.apply_for(&root1).unwrap();
+    let (root3, _) = mupd.apply_for(&root1).unwrap();
 
     assert_eq!(root2, root3);
 }
@@ -180,13 +180,14 @@ fn check_one_mu(index: u64) {
     let (new_shard_state, _new_ss_len) = ss_from_file(&format!("{}{}", PATH_TO_SS, index));
 
     // apply update from block and compare result with new state
-    let updated_shard_state = block.read_state_update().unwrap().apply_for(&shard_state).unwrap();
+    let (updated_shard_state, _) =
+        block.read_state_update().unwrap().apply_for(&shard_state).unwrap();
     assert_eq!(new_shard_state.repr_hash(), updated_shard_state.repr_hash());
 
     // calculate own mu, apply it and compare result with new state
     let mu = MerkleUpdate::create(&shard_state, &new_shard_state).unwrap();
 
-    let updated_shard_state_2 = mu.apply_for(&shard_state).unwrap();
+    let (updated_shard_state_2, _) = mu.apply_for(&shard_state).unwrap();
     assert_eq!(new_shard_state.repr_hash(), updated_shard_state_2.repr_hash());
 }
 
@@ -236,7 +237,7 @@ fn test_merkle_update_create_fast() {
             MerkleUpdate::create_fast(&shard_state, &new_shard_state, |h| usage_tree.contains(h))
                 .unwrap();
 
-        let updated_shard_state_2 = mu.apply_for(&shard_state).unwrap();
+        let (updated_shard_state_2, _) = mu.apply_for(&shard_state).unwrap();
         assert_eq!(new_shard_state.repr_hash(), updated_shard_state_2.repr_hash());
     }
 }
@@ -284,7 +285,7 @@ fn merkle_update_apply_benchmark() {
                 let now = Instant::now();
 
                 for update in updates {
-                    ss = update.apply_for(&ss).unwrap();
+                    ss = update.apply_for(&ss).unwrap().0;
                 }
 
                 print!("{} ", now.elapsed().as_millis());
@@ -332,7 +333,7 @@ fn test_merkle_update4() {
     }
 
     let mupd = MerkleUpdate::create_fast(&root1, &root2, |h| usage_tree.contains(h)).unwrap();
-    let root3 = mupd.apply_for(&root1).unwrap();
+    let (root3, _) = mupd.apply_for(&root1).unwrap();
 
     assert_eq!(root2, root3);
 }
@@ -446,7 +447,7 @@ fn test_merkle_update5() {
         )
         .unwrap();
 
-        let new_proof_2 = update.apply_for(&old_proof).unwrap();
+        let (new_proof_2, _) = update.apply_for(&old_proof).unwrap();
         assert_eq!(new_proof, new_proof_2);
     }
 }
