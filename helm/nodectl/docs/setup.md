@@ -183,6 +183,8 @@ nodectl config pool add core -n core0 --odd \
   --min-nominator-stake 10000
 ```
 
+> **Distinct slot addresses:** the **even** and **odd** contracts must get **different** on-chain addresses. That requires the deploy parameters for the two slots to **not be identical** where the address is derived — a common pattern is to change **`min-validator-stake` by one unit** (TON) between slots (here `10000` vs `10001`). You can vary another numeric field instead, as long as the resulting init data differs.
+
 | Flag | Meaning |
 |------|---------|
 | `--even` / `--odd` | Which validation-round slot this contract covers (required; pick exactly one per command). |
@@ -190,9 +192,11 @@ nodectl config pool add core -n core0 --odd \
 | `--min-validator-stake` | Minimum validator stake locked in the pool, **TON** (CLI default if omitted: `10000`). |
 | `--min-nominator-stake` | Minimum stake per nominator, **TON** (CLI default if omitted: `10000`). |
 
-For production-style TONCore deployments it is common to set **minimum stake per nominator** on the order of **10,000 TON** (`--min-nominator-stake 10000`) and size **validator deposits** so each deposit is **not less than** the slot’s **`min-validator-stake`**.
+For production-style TONCore deployments, operators often set **minimum stake per nominator** around **10,000 TON** on the pool (`--min-nominator-stake 10000`). That is **independent** of the **validator stake**: each **`deposit-validator`** must still send at least that slot’s **`min-validator-stake`** into the pool.
 
-**Validator stake (second difference vs an SNP-only setup):** TONCore requires a **validator deposit** inside the pool (`deposit-validator` message). After the binding exists and the validator wallet is funded on-chain, run:
+**Which account pays:** `deposit-validator` debits **the validator wallet from the binding** (`-b` resolves the binding → the configured **wallet**, not the master wallet and not nominator funds in the pool). Fund that wallet on-chain first; it must cover **`-a` plus gas** (nodectl checks balance before sending).
+
+After the binding exists and the validator wallet is funded, run:
 
 ```bash
 nodectl config pool deposit-validator -b node0 -a 10000 --pool-even --yes
@@ -201,8 +205,8 @@ nodectl config pool deposit-validator -b node0 -a 10001 --pool-odd --yes
 
 | Item | Description |
 |------|-------------|
-| `-b` | Binding name (same as the node name in `config bind add -n …`). |
-| `-a` | Amount in **TON**; must be **≥** that slot’s `min-validator-stake` from the pool config. |
+| `-b` | Binding name (same as the node name in `config bind add -n …`). Used to find the **validator wallet** and pool. |
+| `-a` | **Validator stake** in **TON**, sent from the binding’s wallet into the pool slot; must be **≥** that slot’s `min-validator-stake` from the pool config. |
 | `--pool-even` / `--pool-odd` | Which TONCore slot receives the deposit (default if omitted: even). |
 
 > **`deposit-validator` is executed by the CLI with local vault + RPC** (not via the REST API yet). Run it from the pod shell where `CONFIG_PATH` and `VAULT_URL` are set.
@@ -382,7 +386,7 @@ The `contracts_task` automatically:
 
 1. Deploys the master wallet contract
 2. Deploys each validator wallet (sends 1 TON from master)
-3. Deploys each configured pool contract — SNP pools and TONCore even/odd slots (sends 1 TON from master per deployment as implemented by `contracts_task`)
+3. Deploys each configured pool contract — SNP pools and TONCore even/odd slots (sends 1 TON from master per pool deployment)
 
 Look for: `all contracts are ready` — all wallets and pools are deployed.
 

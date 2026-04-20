@@ -54,7 +54,7 @@ When you add a pool with just the owner address (no explicit contract address), 
 
 ### TONCore nominator pool
 
-nodectl also supports **TONCore** nominator pools: each logical pool name has an **`even`** and an **`odd`** slot (separate contracts). A single slot participates in **one of two consecutive** validation rounds; to cover **every** round with TONCore you normally configure **both** slots. Validators must **`deposit-validator`** funds into each slot up to at least that slot’s **`min-validator-stake`**. Stake policies **Split50 / AdaptiveSplit50** behave differently than on SNP for TONCore — nodectl uses the **full liquid balance** of the **active** slot’s pool for the stake calculation (see [setup.md — TONCore nominator pools](docs/setup.md#toncore-nominator-pools)).
+nodectl also supports **TONCore** nominator pools: each logical pool name has an **`even`** and an **`odd`** slot (separate contracts). A single slot participates in **one of two consecutive** validation rounds; to cover **every** round with TONCore you normally configure **both** slots. Validators must run **`deposit-validator`** so **validator stake** (TON from the **binding’s validator wallet**) is locked in each slot, at least up to that slot’s **`min-validator-stake`**. Stake policies **Split50 / AdaptiveSplit50** behave differently than on SNP for TONCore — nodectl uses the **full liquid balance** of the **active** slot’s pool for the stake calculation (see [setup.md — TONCore nominator pools](docs/setup.md#toncore-nominator-pools)).
 
 ### Auto-deploy
 

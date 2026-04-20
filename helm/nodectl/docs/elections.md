@@ -173,7 +173,7 @@ Because the SNP address depends on both the owner and the validator wallet addre
 
 ## TONCore nominator pool
 
-TONCore uses **even** and **odd** slots (two contracts per logical pool name), validator **`deposit-validator`** stakes, and different stake-policy behaviour than SNP for **Split50 / AdaptiveSplit50** (full liquid balance of the active slot’s pool). See [setup.md — TONCore nominator pools](setup.md#toncore-nominator-pools).
+TONCore uses **even** and **odd** slots (two contracts per logical pool name). **`deposit-validator`** moves **validator stake** from the **binding’s wallet** into the chosen slot (see [setup.md — TONCore nominator pools](setup.md#toncore-nominator-pools)). Stake policies **Split50 / AdaptiveSplit50** behave differently than on SNP (full liquid balance of the active slot’s pool).
 
 ---
 
