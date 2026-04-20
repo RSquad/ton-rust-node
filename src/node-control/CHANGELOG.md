@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `POST /v1/ton-http-api` (with `append` flag for failover endpoints)
   - `POST /v1/log`
   - `GET /v1/elections/settings`, `GET /v1/nodes`, `GET /v1/wallets`, `GET /v1/pools`, `GET /v1/bindings`, `GET /v1/log`, `GET /v1/master-wallet`
+- **Persistent ADNL address across elections** — validators can now keep the same ADNL address across election cycles instead of generating a fresh one each time. New `elections.static_adnls` config map stores pre-generated ADNL key hashes per node (base64). New `POST /v1/elections/static-adnl` endpoint and `nodectl config elections static-adnl --node <name>` CLI command generate the key on the validator node and save it to config. The election runner re-registers the stored address each cycle via `add_validator_adnl_addr`.
 - **Voting CLI (`nodectl vote`)** — `ls`, `inspect`, `add`, `rm` subcommands to view on-chain config proposals and manage the voting task's tracked-proposals list.
 - **Reserved `master_wallet` name** — `config wallet add` rejects the reserved name `master_wallet`, and `config wallet rm master_wallet` fails immediately with a clear error instead of attempting to mutate the master wallet slot.
 

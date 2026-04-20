@@ -639,6 +639,18 @@ Disable elections participation for one or more bindings.
 nodectl config elections disable node0
 ```
 
+##### `config elections static-adnl`
+
+Generate a persistent ADNL address for a node and save it to the `elections.static_adnls` config. The ADNL key is created on the validator node via its control server. Once set, the election runner reuses this address every cycle instead of generating a fresh one.
+
+| Flag | Short form | Description |
+|------|------------|-------------|
+| `--node <NAME>` | `-n` | Node name (must exist in `nodes`) |
+
+```bash
+nodectl config elections static-adnl --node node0
+```
+
 ---
 
 ### Key Management Commands
@@ -1109,6 +1121,7 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | POST | `/v1/elections/include` | O | Enable elections for given bindings |
 | GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, per-binding status) |
 | POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor) |
+| POST | `/v1/elections/static-adnl` | O | Generate and assign a persistent ADNL address for a node |
 | GET | `/v1/validators` | N | Validators snapshot for controlled nodes |
 | POST | `/v1/task/elections` | O | Enable / disable / restart the elections background task |
 | GET | `/v1/nodes` | N | List configured nodes with control-server status |
@@ -1336,6 +1349,31 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
   }
 }
 ```
+
+---
+
+#### `POST /v1/elections/static-adnl`
+
+Generate a persistent ADNL address on the validator node and save it to the `elections.static_adnls` config map. The election runner will reuse this address every cycle instead of generating a fresh ephemeral one.
+
+**Request:**
+
+```json
+{ "node": "node0" }
+```
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "result": {
+    "adnl_addr": "<base64>"
+  }
+}
+```
+
+Calling this endpoint again for the same node generates a **new** key and overwrites the previous one.
 
 ---
 
