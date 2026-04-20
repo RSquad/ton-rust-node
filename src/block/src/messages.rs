@@ -1701,6 +1701,11 @@ impl Message {
         Ok(())
     }
 
+    pub fn normalized_hash(&self) -> Result<UInt256> {
+        let normalized = self.clone().normalize_external_inbound()?;
+        GetRepresentationHash::hash(&normalized)
+    }
+
     // The method reads only root cell from given boc and message header from the cell.
     // It doesn't check boc & message correctness and integrity!
     pub fn read_header_fast(data: &[u8]) -> Result<CommonMsgInfo> {

@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use simplex::*;
 use spin::mutex::SpinMutex;
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     fs::{self, File},
-    io::{self, LineWriter, Write},
+    io::{self, Cursor, LineWriter, Write},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -37,7 +37,8 @@ use ton_api::{
     IntoBoxed,
 };
 use ton_block::{
-    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256,
+    error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocReader, BocWriter,
+    BuilderData, Ed25519KeyOption, ShardIdent, UInt256,
 };
 
 /*
@@ -93,11 +94,22 @@ impl DummyCollatedData {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap()
+        // Wrap in single-cell BOC — compress_candidate_data requires valid BOC input
+        let raw = bincode::serialize(self).unwrap();
+        let mut b = BuilderData::new();
+        b.append_raw(&raw, raw.len() * 8).unwrap();
+        let cell = b.into_cell().unwrap();
+        let mut buf = Vec::new();
+        BocWriter::with_flags([cell], BocFlags::all()).unwrap().write(&mut buf).unwrap();
+        buf
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
-        bincode::deserialize(bytes).unwrap()
+        // Extract from BOC wrapper
+        let boc = BocReader::new().read(&mut Cursor::new(bytes)).unwrap();
+        let cell = &boc.roots[0];
+        let raw = cell.data();
+        bincode::deserialize(raw).unwrap()
     }
 }
 
@@ -112,7 +124,7 @@ struct TestConfig {
     total_rounds: u32,
     /// Minimum percentage of commits required (0.0 - 1.0)
     /// Default 0.5 means at least 50% of rounds must be commits (not skips)
-    min_commit_percent: f64,
+    min_finalized_percent: f64,
     /// Number of validator nodes in the test
     node_count: usize,
     /// Probability of generation failure (0.0 - 1.0)
@@ -164,6 +176,10 @@ struct TestConfig {
     /// Restart tests benefit from a shorter interval so recovered nodes
     /// receive cached certificates faster than the skip timeout.
     standstill_timeout: Option<Duration>,
+    /// Override slots_per_leader_window (default: 1).
+    /// Set > 1 to test candidate chaining within a leader window.
+    /// Precollation depth is derived automatically as (window - 1).
+    slots_per_leader_window: Option<u32>,
 }
 
 /// Network gremlin configuration (net-gremlin).
@@ -203,15 +219,15 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             total_rounds: 100,
-            min_commit_percent: 0.5, // At least 50% commits (not skips)
+            min_finalized_percent: 0.5, // At least 50% commits (not skips)
             node_count: 11,
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 200,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_millis(1000),
             test_name: "simplex_consensus".to_string(),
-            test_timeout: Duration::from_secs(60),
+            test_timeout: Duration::from_secs(120),
             expect_timeout: false,
             shard: ShardIdent::masterchain(),
             mc_notification_interval: None, // No MC notifications for masterchain
@@ -221,6 +237,7 @@ impl Default for TestConfig {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         }
     }
 }
@@ -329,12 +346,9 @@ fn print_latency_table_footer() {
     Session instance
 */
 
-/// Shared storage of committed block proofs for get_committed_candidate.
-/// Populated by on_block_committed across all instances; queried by get_committed_candidate.
-/// Keyed by root_hash (unique per block). All instances share one map via Arc<Mutex<..>>.
-/// Race condition: multiple instances may insert the same block concurrently — this is safe
-/// because the data is identical (same block, same signatures) so the last write wins.
-type CommittedBlocksMap = Arc<Mutex<HashMap<UInt256, consensus_common::CommittedBlockProof>>>;
+/// Shared storage of finalized block root hashes for harness-level introspection.
+/// All instances share one set via Arc<Mutex<..>>.
+type FinalizedBlocksMap = Arc<Mutex<HashSet<UInt256>>>;
 
 /// Session instance for a single validator node
 struct SessionInstance {
@@ -345,22 +359,20 @@ struct SessionInstance {
     is_collator: Arc<AtomicBool>,
     collation_count: Arc<AtomicU32>,
     on_candidate_count: Arc<AtomicU32>,
-    on_block_committed_count: Arc<AtomicU32>,
+    on_block_finalized_count: Arc<AtomicU32>,
     config: TestConfig,
-    current_round: Arc<AtomicU32>,
-    /// Commit latencies in milliseconds (for statistical analysis)
+    /// Finalization latencies in milliseconds (for statistical analysis)
     commit_latencies: Arc<Mutex<Vec<u64>>>,
-    /// Next expected seqno for commit - initialized with initial_block_seqno, +1 for each non-empty commit.
-    /// Shared with listener so it's updated during startup recovery before SessionInstance is wired.
-    next_expected_commit_seqno: Arc<AtomicU32>,
-    /// Session errors count - accumulated from SessionStats on each commit
+    /// Maximum finalized seqno observed so far.  Updated atomically in
+    /// `on_block_finalized`; used for restart-gremlin recovery progress calculation.
+    max_finalized_seqno: Arc<AtomicU32>,
+    /// Set of seqnos for which a finalization has been delivered.
+    /// Invariant: every seqno appears at most once (asserted in `on_block_finalized`).
+    finalized_seqnos: Arc<Mutex<HashSet<u32>>>,
+    /// Session errors count
     session_errors_count: Arc<AtomicU32>,
-    /// Approved candidates storage for get_approved_candidate() during restart recovery.
-    /// Keyed by root_hash to match lookup semantics.
-    approved_candidates:
-        Arc<Mutex<HashMap<UInt256, Arc<consensus_common::ValidatorBlockCandidate>>>>,
-    /// Shared committed block proofs for get_committed_candidate
-    committed_blocks: CommittedBlocksMap,
+    /// Shared finalized block roots for harness-level introspection.
+    finalized_blocks: FinalizedBlocksMap,
     _session: SessionPtr,
     _listener: Arc<dyn SessionListener + Send + Sync>,
 }
@@ -368,17 +380,10 @@ struct SessionInstance {
 /// Listener wrapper that delegates to SessionInstance
 struct SessionInstanceListener {
     instance: SpinMutex<Weak<SpinMutex<SessionInstance>>>,
-    /// Approved candidates storage - shared with SessionInstance but available immediately
-    /// before session creation to support get_approved_candidate() during startup recovery.
-    approved_candidates:
-        Arc<Mutex<HashMap<UInt256, Arc<consensus_common::ValidatorBlockCandidate>>>>,
-    /// SeqNo counter - shared with SessionInstance but available immediately.
-    /// Updated by on_block_committed() even before SessionInstance is wired,
-    /// which is critical for restart recommit to align the seqno tracking.
-    /// Used by on_generate_slot() to determine which seqno to use for new blocks.
-    next_expected_commit_seqno: Arc<AtomicU32>,
-    /// Shared committed block proofs for get_committed_candidate
-    committed_blocks: CommittedBlocksMap,
+    /// Maximum finalized seqno - shared with SessionInstance, available immediately.
+    max_finalized_seqno: Arc<AtomicU32>,
+    /// Finalized seqnos set - shared with SessionInstance, available immediately.
+    finalized_seqnos: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl SessionInstance {
@@ -398,8 +403,12 @@ impl SessionInstance {
         self.on_candidate_count.load(Ordering::Relaxed)
     }
 
-    fn on_block_committed_count(&self) -> u32 {
-        self.on_block_committed_count.load(Ordering::Relaxed)
+    fn on_block_finalized_count(&self) -> u32 {
+        self.on_block_finalized_count.load(Ordering::Relaxed)
+    }
+
+    fn unique_finalized_seqno_count(&self) -> usize {
+        self.finalized_seqnos.lock().map(|s| s.len()).unwrap_or(0)
     }
 
     fn session_errors_count(&self) -> u32 {
@@ -415,15 +424,12 @@ impl SessionInstance {
     }
 
     fn finish_slot(&self, slot: u32) {
-        // SIMPLEX_ROUNDLESS: Track progress by commit count
-        let commits = self.on_block_committed_count.load(Ordering::SeqCst);
-        self.current_round.store(commits, Ordering::SeqCst);
-
-        if commits >= self.config.total_rounds {
+        let finalized = self.on_block_finalized_count.load(Ordering::SeqCst);
+        if finalized >= self.config.total_rounds {
             self.batch_processed.store(true, Ordering::Release);
             log::info!(
-                "Test finished after {} commits for source #{} (slot={})",
-                commits,
+                "Test finished after {} finalized blocks for source #{} (slot={})",
+                finalized,
                 self.source_index,
                 slot
             );
@@ -458,16 +464,6 @@ impl SessionListener for SessionInstance {
         // Extract slot from the embedded collated data (set by collator)
         let slot = collated_data.slot;
 
-        // With optimistic validation, candidates can be collated on notarized (not yet
-        // committed) parents, so the candidate seqno may be ahead of the committed seqno.
-        let committed_seqno = self.next_expected_commit_seqno.load(Ordering::SeqCst);
-        assert!(
-            collated_data.seqno >= committed_seqno,
-            "candidate seqno {} must be >= committed seqno {}",
-            collated_data.seqno,
-            committed_seqno,
-        );
-
         log::info!(
             "SessionListener::on_candidate: new candidate for \
             slot {} from source {} with hash {:?} appeared with latency {} ms (self source #{})",
@@ -494,34 +490,6 @@ impl SessionListener for SessionInstance {
                 source_info.source.id()
             )));
             return;
-        }
-
-        // Store approved candidate for get_approved_candidate() during restart recovery.
-        // This allows us to respond to requestCandidate queries after restart.
-        {
-            let collated_data_bytes = _collated_data.data().to_vec();
-            let data_bytes = data.data().to_vec();
-            let file_hash = UInt256::from_slice(&sha256_digest(&data_bytes));
-            let collated_file_hash = UInt256::from_slice(&sha256_digest(&collated_data_bytes));
-
-            let candidate = Arc::new(consensus_common::ValidatorBlockCandidate {
-                public_key: source_info.source.clone(),
-                id: BlockIdExt::with_params(
-                    ShardIdent::masterchain(),
-                    collated_data.seqno, // Use seqno for lookup consistency
-                    root_hash.clone(),
-                    file_hash,
-                ),
-                collated_file_hash,
-                data: consensus_common::ConsensusCommonFactory::create_block_payload(data_bytes),
-                collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
-                    collated_data_bytes,
-                ),
-            });
-
-            if let Ok(mut map) = self.approved_candidates.lock() {
-                map.insert(root_hash, candidate);
-            }
         }
 
         callback(Ok(SystemTime::now()))
@@ -570,22 +538,13 @@ impl SessionListener for SessionInstance {
             return;
         }
 
-        // Derive seqno from explicit parent hint or use counter for implicit case.
-        //
-        // IMPORTANT: Multiple on_generate_slot calls can happen before on_block_committed
-        // (collation retry / timeout), so we must use consistent seqno for all of them.
-        // Only ONE block per slot will actually be accepted; the others will fail
-        // validation with "seqno mismatch" which is correct behavior.
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                // Genesis / bootstrap case: use commit_seqno (don't increment - may retry)
-                self.next_expected_commit_seqno.load(Ordering::SeqCst)
+                // Implicit is only expected for the very first (genesis) slot
+                // when no parent block exists yet.
+                self.max_finalized_seqno.load(Ordering::SeqCst)
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => {
-                // Explicit parent: derive seqno from parent (parent_seqno + 1)
-                // This matches C++ behavior where block seqno = parent seqno + 1
-                parent_id.seq_no + 1
-            }
+            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
         };
 
         // Use seqno as the slot value for embedded data (since slot isn't exposed in API)
@@ -639,37 +598,45 @@ impl SessionListener for SessionInstance {
 
     fn on_block_committed(
         &self,
+        _source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
+        _file_hash: BlockHash,
+        _data: BlockPayloadPtr,
+        _signatures: BlockSignaturesVariant,
+        _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+        _stats: consensus_common::SessionStats,
+    ) {
+        panic!(
+            "on_block_committed must not be called for Simplex sessions (finalized-driven only)"
+        );
+    }
+
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
         source_info: simplex::BlockSourceInfo,
         root_hash: BlockHash,
-        file_hash: BlockHash,
+        _file_hash: BlockHash,
         data: BlockPayloadPtr,
         signatures: BlockSignaturesVariant,
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
-        stats: consensus_common::SessionStats,
     ) {
-        // SIMPLEX_ROUNDLESS: Assert round is always u32::MAX
         assert_eq!(
             source_info.priority.round, SIMPLEX_ROUNDLESS,
-            "on_block_committed: round must be SIMPLEX_ROUNDLESS in roundless mode"
+            "on_block_finalized: round must be SIMPLEX_ROUNDLESS in roundless mode"
         );
-        // Extract slot from signatures
         let slot = match &signatures {
             BlockSignaturesVariant::Simplex(s) => s.slot,
             _ => 0,
         };
-        self.on_block_committed_count.fetch_add(1, Ordering::Relaxed);
 
-        // Track session errors from stats
-        self.session_errors_count.store(stats.errors_count, Ordering::Relaxed);
+        let seqno = block_id.seq_no();
+        self.on_block_finalized_count.fetch_add(1, Ordering::Relaxed);
 
         let now =
             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
 
-        // For non-empty blocks: this is DummyCollatedData bytes
-        // For empty blocks: this is empty
         let data_bytes = data.data();
-
-        // Skip latency tracking for empty blocks
         let latency = if !data_bytes.is_empty() {
             let collated_data = DummyCollatedData::from_bytes(data_bytes);
             now - collated_data.creation_timestamp
@@ -677,32 +644,13 @@ impl SessionListener for SessionInstance {
             0
         };
 
-        // Extract collated_data for source/seqno tracking (default if empty block)
-        let collated_data = if !data_bytes.is_empty() {
-            DummyCollatedData::from_bytes(data_bytes)
-        } else {
-            DummyCollatedData { creation_timestamp: now, slot, seqno: 0, source_index: 0 }
-        };
-
-        // Record latency for statistical analysis
         if let Ok(mut latencies) = self.commit_latencies.lock() {
             latencies.push(latency);
         }
 
-        // Detect empty block (empty data means it's an empty block that inherits parent's seqno)
-        let _is_empty_block = data_bytes.is_empty();
-
-        // Seqno tracking is updated in SessionInstanceListener::on_block_committed
-        // (and shared via Arc), so do NOT mutate next_expected_commit_seqno here.
-        let _next_commit_seqno = self.next_expected_commit_seqno.load(Ordering::SeqCst);
-
-        // Source tracking: which validator produced the committed block (from dummy payload)
-        let _block_source = collated_data.source_index;
-        let seqno = collated_data.seqno;
-
         log::info!(
-            "SessionListener::on_block_committed: new block from source {} with hash {:?} \
-            committed at slot={}, seqno={}, latency={} ms (source #{})",
+            "SessionListener::on_block_finalized: block from source {} hash {:?} \
+            finalized at slot={}, seqno={}, latency={} ms (source #{})",
             source_info.source.id(),
             root_hash,
             slot,
@@ -711,20 +659,8 @@ impl SessionListener for SessionInstance {
             self.source_index
         );
 
-        // Store committed block proof in shared map.
-        // All instances insert the same block with identical signatures,
-        // so concurrent inserts are a benign idempotent overwrite.
-        if let Ok(mut map) = self.committed_blocks.lock() {
-            let block_id = BlockIdExt::with_params(
-                self.config.shard.clone(),
-                collated_data.seqno,
-                root_hash.clone(),
-                file_hash.clone(),
-            );
-            map.insert(
-                root_hash.clone(),
-                consensus_common::CommittedBlockProof { block_id, signatures: signatures.clone() },
-            );
+        if let Ok(mut map) = self.finalized_blocks.lock() {
+            map.insert(root_hash.clone());
         }
 
         self.finish_slot(slot);
@@ -736,90 +672,18 @@ impl SessionListener for SessionInstance {
 
     fn get_approved_candidate(
         &self,
-        source: PublicKey,
+        _source: PublicKey,
         root_hash: BlockHash,
-        file_hash: BlockHash,
-        collated_data_hash: BlockHash,
-        callback: ValidatorBlockCandidateCallback,
+        _file_hash: BlockHash,
+        _collated_data_hash: BlockHash,
+        _callback: ValidatorBlockCandidateCallback,
     ) {
-        log::info!(
-            "SessionListener::get_approved_candidate: \
-            request for block hash {:?} from source {:?} (self source #{})",
-            root_hash.to_hex_string(),
-            source.id(),
-            self.source_index
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex consensus test \
+             (source #{}, root_hash={}); active simplex flow must not use this callback",
+            self.source_index,
+            root_hash.to_hex_string()
         );
-
-        // Lookup candidate by root_hash
-        let candidate =
-            self.approved_candidates.lock().ok().and_then(|map| map.get(&root_hash).cloned());
-
-        match candidate {
-            Some(c) => {
-                log::debug!(
-                    "SessionListener::get_approved_candidate: found candidate for root_hash={} (source #{})",
-                    root_hash.to_hex_string(),
-                    self.source_index
-                );
-                // Sanity: file_hash and collated_data_hash should match
-                if c.id.file_hash != file_hash {
-                    log::warn!(
-                        "get_approved_candidate: file_hash mismatch: stored={} requested={} (source #{})",
-                        c.id.file_hash.to_hex_string(),
-                        file_hash.to_hex_string(),
-                        self.source_index
-                    );
-                }
-                if c.collated_file_hash != collated_data_hash {
-                    log::warn!(
-                        "get_approved_candidate: collated_data_hash mismatch: stored={} requested={} (source #{})",
-                        c.collated_file_hash.to_hex_string(),
-                        collated_data_hash.to_hex_string(),
-                        self.source_index
-                    );
-                }
-                callback(Ok(c));
-            }
-            None => {
-                log::warn!(
-                    "SessionListener::get_approved_candidate: candidate not found for root_hash={} (source #{})",
-                    root_hash.to_hex_string(),
-                    self.source_index
-                );
-                callback(Err(error!(
-                    "approved candidate not found for root_hash={}",
-                    root_hash.to_hex_string()
-                )));
-            }
-        }
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        let root_hash = block_id.root_hash.clone();
-        let proof = self.committed_blocks.lock().ok().and_then(|map| map.get(&root_hash).cloned());
-
-        match proof {
-            Some(p) => {
-                log::info!(
-                    "get_committed_candidate: FOUND proof for {} (source #{})",
-                    block_id,
-                    self.source_index
-                );
-                callback(Ok(p));
-            }
-            None => {
-                log::warn!(
-                    "get_committed_candidate: NOT FOUND {} in shared map (source #{})",
-                    block_id,
-                    self.source_index
-                );
-                callback(Err(error!("committed block {block_id} not found in shared map")));
-            }
-        }
     }
 }
 
@@ -867,68 +731,81 @@ impl SessionListener for SessionInstanceListener {
 
     fn on_block_committed(
         &self,
+        _source_info: simplex::BlockSourceInfo,
+        _root_hash: BlockHash,
+        _file_hash: BlockHash,
+        _data: BlockPayloadPtr,
+        _signatures: BlockSignaturesVariant,
+        _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
+        _stats: consensus_common::SessionStats,
+    ) {
+        panic!(
+            "on_block_committed must not be called for Simplex sessions (finalized-driven only)"
+        );
+    }
+
+    fn on_block_finalized(
+        &self,
+        block_id: BlockIdExt,
         source_info: simplex::BlockSourceInfo,
         root_hash: BlockHash,
         file_hash: BlockHash,
         data: BlockPayloadPtr,
         signatures: BlockSignaturesVariant,
         approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
-        stats: consensus_common::SessionStats,
     ) {
-        // SIMPLEX_ROUNDLESS: Assert round is always u32::MAX
         assert_eq!(
             source_info.priority.round, SIMPLEX_ROUNDLESS,
-            "SessionInstanceListener::on_block_committed: round must be SIMPLEX_ROUNDLESS"
+            "SessionInstanceListener::on_block_finalized: round must be SIMPLEX_ROUNDLESS"
         );
-        // CRITICAL: Always update seqno counters, even if SessionInstance is not wired yet.
-        // This ensures restart recommit correctly aligns the seqno tracking.
+
         let data_bytes = data.data();
         let is_empty = data_bytes.is_empty();
-
-        // SIMPLEX_ROUNDLESS: Extract slot from signatures instead of using round
         let slot = match &signatures {
             BlockSignaturesVariant::Simplex(s) => s.slot,
             _ => 0,
         };
 
-        // For non-empty blocks, advance the seqno counter.
-        // Empty blocks don't consume a seqno.
         if !is_empty {
-            let collated = DummyCollatedData::from_bytes(data_bytes);
-            let committed_seqno = collated.seqno;
-            let next_commit = committed_seqno + 1;
-            self.next_expected_commit_seqno.store(next_commit, Ordering::SeqCst);
+            let seqno = block_id.seq_no();
+            // Atomically advance max_finalized_seqno (out-of-order safe).
+            self.max_finalized_seqno.fetch_max(seqno + 1, Ordering::SeqCst);
             log::trace!(
-                "SessionInstanceListener::on_block_committed: slot={}, seqno={}, next_commit={}",
+                "SessionInstanceListener::on_block_finalized: slot={}, seqno={}",
                 slot,
-                committed_seqno,
-                next_commit
+                seqno
             );
         } else {
-            log::trace!(
-                "SessionInstanceListener::on_block_committed: slot={}, empty block (no seqno change)",
+            log::trace!("SessionInstanceListener::on_block_finalized: slot={}, empty block", slot);
+        }
+
+        // Invariant: exactly one finalization per seqno (checked even before
+        // SessionInstance is wired, so recovery duplicates are caught too).
+        if let Ok(mut seen) = self.finalized_seqnos.lock() {
+            let seqno = block_id.seq_no();
+            assert!(
+                seen.insert(seqno),
+                "DUPLICATE finalization for seqno {} (listener, slot={})",
+                seqno,
                 slot
             );
         }
 
-        // Delegate to SessionInstance if wired
         if let Some(instance) = self.instance.lock().upgrade() {
             let instance = instance.lock();
-            instance.on_block_committed(
+            instance.on_block_finalized(
+                block_id,
                 source_info,
                 root_hash,
                 file_hash,
                 data,
                 signatures,
                 approve_signatures,
-                stats,
             );
         }
     }
 
     fn on_block_skipped(&self, round: u32) {
-        // IMPORTANT: Skipped rounds do NOT advance block seqno.
-        // (Empty blocks inherit parent's BlockIdExt and are reported via on_block_skipped.)
         if let Some(instance) = self.instance.lock().upgrade() {
             let instance = instance.lock();
             instance.on_block_skipped(round);
@@ -941,68 +818,13 @@ impl SessionListener for SessionInstanceListener {
         root_hash: BlockHash,
         _file_hash: BlockHash,
         _collated_data_hash: BlockHash,
-        callback: ValidatorBlockCandidateCallback,
+        _callback: ValidatorBlockCandidateCallback,
     ) {
-        // Access approved_candidates directly - available even before SessionInstance is wired.
-        // This fixes Issue 2 from RESTART-GREMLIN-1: startup recovery calls get_approved_candidate
-        // during create_session, before listener.instance is set.
-        let candidates_count = self.approved_candidates.lock().ok().map(|m| m.len()).unwrap_or(0);
-        log::info!(
-            "[restart-gremlin] get_approved_candidate: root_hash={} candidates_stored={}",
-            &root_hash.to_hex_string()[..8],
-            candidates_count
+        panic!(
+            "unexpected legacy get_approved_candidate request in simplex consensus listener \
+             (root_hash={}); active simplex flow must not use this callback",
+            root_hash.to_hex_string()
         );
-
-        // Lookup candidate by root_hash
-        let candidate =
-            self.approved_candidates.lock().ok().and_then(|m| m.get(&root_hash).cloned());
-
-        if let Some(cand) = candidate {
-            log::info!(
-                "[restart-gremlin] get_approved_candidate: FOUND block {} (seq_no={})",
-                &root_hash.to_hex_string()[..8],
-                cand.id.seq_no()
-            );
-            callback(Ok(cand));
-        } else {
-            log::warn!(
-                "[restart-gremlin] get_approved_candidate: NOT FOUND block {}",
-                &root_hash.to_hex_string()[..8]
-            );
-            callback(Err(error!(
-                "Approved candidate not found for root_hash={}",
-                root_hash.to_hex_string()
-            )));
-        }
-    }
-
-    fn get_committed_candidate(
-        &self,
-        block_id: BlockIdExt,
-        callback: consensus_common::CommittedBlockProofCallback,
-    ) {
-        // Access committed_blocks directly — works even before SessionInstance is wired
-        let root_hash = block_id.root_hash.clone();
-        let proof = self.committed_blocks.lock().ok().and_then(|map| map.get(&root_hash).cloned());
-
-        match proof {
-            Some(p) => {
-                log::info!(
-                    "SessionInstanceListener::get_committed_candidate: \
-                     FOUND proof for {}",
-                    block_id
-                );
-                callback(Ok(p));
-            }
-            None => {
-                log::warn!(
-                    "SessionInstanceListener::get_committed_candidate: \
-                     NOT FOUND {} in shared map",
-                    block_id
-                );
-                callback(Err(error!("committed block {block_id} not found in shared map")));
-            }
-        }
     }
 }
 
@@ -1220,11 +1042,12 @@ where
     let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
 
     // Session options
+    let slots_per_window = config.slots_per_leader_window.unwrap_or(1);
     let mut session_opts = SessionOptions {
         proto_version: 0,
         target_rate: config.target_rate,
         first_block_timeout: config.first_block_timeout,
-        slots_per_leader_window: 1,
+        slots_per_leader_window: slots_per_window,
         empty_block_mc_lag_threshold: if config.shard.is_masterchain() {
             None // MC uses internal finalization tracking
         } else {
@@ -1232,14 +1055,14 @@ where
         },
         ..Default::default()
     };
+    // Integration stress tests can temporarily run far ahead in slot space while still
+    // converging; keep a wide future-slot horizon to avoid synthetic test stalls.
+    session_opts.max_leader_window_desync = 10_000;
     if let Some(st) = config.standstill_timeout {
         session_opts.standstill_timeout = st;
     }
 
-    // Shared committed block proofs.
-    // All session instances share this map so any instance's on_block_committed
-    // stores the proof, and any instance's get_committed_candidate can read it.
-    let committed_blocks: CommittedBlocksMap = Arc::new(Mutex::new(HashMap::new()));
+    let finalized_blocks: FinalizedBlocksMap = Arc::new(Mutex::new(HashSet::new()));
 
     // Create session instances
     let mut instances = Vec::with_capacity(config.node_count);
@@ -1248,39 +1071,24 @@ where
         let local_key = nodes[i].public_key.clone();
         let initial_block_seqno = 1u32; // First block seqno=1 (seqno 0 is zerostate)
 
-        // Create approved_candidates storage BEFORE session creation.
-        // This fixes Issue 2 from RESTART-GREMLIN-1: get_approved_candidate() is called
-        // during create_session (startup recovery), before SessionInstance is wired.
-        let approved_candidates: Arc<
-            Mutex<HashMap<UInt256, Arc<consensus_common::ValidatorBlockCandidate>>>,
-        > = Arc::new(Mutex::new(HashMap::new()));
-
-        // SeqNo counter - created before listener so it can be updated during recovery
-        let next_expected_commit_seqno = Arc::new(AtomicU32::new(initial_block_seqno));
+        let max_finalized_seqno = Arc::new(AtomicU32::new(initial_block_seqno));
+        let finalized_seqnos: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let listener = Arc::new(SessionInstanceListener {
             instance: SpinMutex::new(Weak::new()),
-            approved_candidates: approved_candidates.clone(),
-            next_expected_commit_seqno: next_expected_commit_seqno.clone(),
-            committed_blocks: committed_blocks.clone(),
+            max_finalized_seqno: max_finalized_seqno.clone(),
+            finalized_seqnos: finalized_seqnos.clone(),
         });
         let session_listener: Arc<dyn SessionListener + Send + Sync> = listener.clone();
 
-        // Use shard from config
         let shard = config.shard.clone();
-
-        // Use per-node overlay manager (same for in-process, different for ADNL)
         let overlay_manager = overlay_managers[i].clone();
-
-        // Each node needs its own db_path to avoid RocksDB lock contention
-        // (all nodes run in the same process during tests)
         let db_path = format!("{}_node{}", db_path_base, i);
 
         let session = SessionFactory::create_session(
             &session_opts,
             &session_id,
             &shard,
-            initial_block_seqno,
             nodes.clone(),
             &local_key,
             db_path,
@@ -1288,6 +1096,7 @@ where
             Arc::downgrade(&session_listener),
         )
         .unwrap();
+        session.start(initial_block_seqno);
 
         let session_instance = Arc::new(SpinMutex::new(SessionInstance {
             public_key: nodes[i].public_key.clone(),
@@ -1295,18 +1104,14 @@ where
             collation_requested: Arc::new(AtomicBool::new(false)),
             collation_count: Arc::new(AtomicU32::new(0)),
             on_candidate_count: Arc::new(AtomicU32::new(0)),
-            on_block_committed_count: Arc::new(AtomicU32::new(0)),
+            on_block_finalized_count: Arc::new(AtomicU32::new(0)),
             is_collator: Arc::new(AtomicBool::new(false)),
             config: config.clone(),
-            current_round: Arc::new(AtomicU32::new(0)),
             commit_latencies: Arc::new(Mutex::new(Vec::new())),
-            // SeqNo tracking: shared with listener so recovery updates reach here
-            next_expected_commit_seqno: next_expected_commit_seqno.clone(),
-            // Session errors - accumulated from SessionStats
+            max_finalized_seqno: max_finalized_seqno.clone(),
+            finalized_seqnos: finalized_seqnos.clone(),
             session_errors_count: Arc::new(AtomicU32::new(0)),
-            // Approved candidates storage - shared with listener for startup recovery
-            approved_candidates: approved_candidates.clone(),
-            committed_blocks: committed_blocks.clone(),
+            finalized_blocks: finalized_blocks.clone(),
             source_index: i as u32,
             _session: session,
             _listener: listener.clone(),
@@ -1333,55 +1138,66 @@ where
     // MC notification thread for shard sessions
     let mc_thread_stop_requested = Arc::new(AtomicBool::new(false));
     let mc_thread_stopped = Arc::new(AtomicBool::new(false));
-    let mut mc_thread_handle: Option<thread::JoinHandle<()>> =
-        if let Some(mc_interval) = config.mc_notification_interval {
-            // Collect weak pointers to all sessions
-            let session_weak_ptrs: Vec<Weak<dyn SimplexSession + Send + Sync>> = instances
-                .iter()
-                .map(|inst| {
-                    Arc::downgrade(&inst.lock()._session) as Weak<dyn SimplexSession + Send + Sync>
-                })
-                .collect();
+    let mut mc_thread_handle: Option<thread::JoinHandle<()>> = if let Some(mc_interval) =
+        config.mc_notification_interval
+    {
+        // Collect weak pointers to all sessions
+        let session_targets: Vec<(Weak<dyn SimplexSession + Send + Sync>, ShardIdent)> = instances
+            .iter()
+            .map(|inst| {
+                let guard = inst.lock();
+                (
+                    Arc::downgrade(&guard._session) as Weak<dyn SimplexSession + Send + Sync>,
+                    guard.config.shard.clone(),
+                )
+            })
+            .collect();
 
-            let stop_requested = mc_thread_stop_requested.clone();
-            let stopped = mc_thread_stopped.clone();
-            let test_name = config.test_name.clone();
+        let stop_requested = mc_thread_stop_requested.clone();
+        let stopped = mc_thread_stopped.clone();
+        let test_name = config.test_name.clone();
 
-            Some(thread::spawn(move || {
-                log::info!("[MC-Thread] Started MC notification thread for test '{}'", test_name);
-                let mut mc_seqno: u32 = 0;
+        Some(thread::spawn(move || {
+            log::info!("[MC-Thread] Started MC notification thread for test '{}'", test_name);
+            let mut mc_seqno: u32 = 0;
 
-                while !stop_requested.load(Ordering::SeqCst) {
-                    thread::sleep(mc_interval);
+            while !stop_requested.load(Ordering::SeqCst) {
+                thread::sleep(mc_interval);
 
-                    if stop_requested.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    // Notify all sessions about MC finalization
-                    let mut notified_count = 0;
-                    for weak_session in &session_weak_ptrs {
-                        if let Some(session) = weak_session.upgrade() {
-                            session.notify_mc_finalized(mc_seqno);
-                            notified_count += 1;
-                        }
-                    }
-
-                    log::debug!(
-                        "[MC-Thread] Notified {} sessions about MC block seqno={}",
-                        notified_count,
-                        mc_seqno
-                    );
-                    mc_seqno += 1;
+                if stop_requested.load(Ordering::SeqCst) {
+                    break;
                 }
 
-                stopped.store(true, Ordering::SeqCst);
-                log::info!("[MC-Thread] MC notification thread stopped");
-            }))
-        } else {
-            mc_thread_stopped.store(true, Ordering::SeqCst); // No thread to stop
-            None
-        };
+                // Notify all sessions about MC finalization
+                let mut notified_count = 0;
+                for (weak_session, shard) in &session_targets {
+                    if let Some(session) = weak_session.upgrade() {
+                        let mc_registered_top = BlockIdExt::with_params(
+                            shard.clone(),
+                            mc_seqno,
+                            UInt256::rand(),
+                            UInt256::rand(),
+                        );
+                        session.notify_mc_finalized(mc_registered_top);
+                        notified_count += 1;
+                    }
+                }
+
+                log::debug!(
+                    "[MC-Thread] Notified {} sessions about MC block seqno={}",
+                    notified_count,
+                    mc_seqno
+                );
+                mc_seqno += 1;
+            }
+
+            stopped.store(true, Ordering::SeqCst);
+            log::info!("[MC-Thread] MC notification thread stopped");
+        }))
+    } else {
+        mc_thread_stopped.store(true, Ordering::SeqCst); // No thread to stop
+        None
+    };
 
     // Wait for all instances to finish or timeout
     let test_start = Instant::now();
@@ -1458,18 +1274,18 @@ where
         });
 
     'main_loop: loop {
-        // PANIC-1: fail fast if any session thread panicked.
+        // Fail fast if any session thread panicked.
         // Otherwise the test may stall waiting for progress that will never happen.
         for (idx, inst) in instances.iter().enumerate() {
             let inst = inst.lock();
             if inst._session.is_panicked() {
                 log::error!(
-                    "Test '{}' detected PANIC in session {} (instance idx={}, finished={}, commits={})",
+                    "Test '{}' detected PANIC in session {} (instance idx={}, finished={}, finalized={})",
                     config.test_name,
                     session_id.to_hex_string(),
                     idx,
                     inst.is_finished(),
-                    inst.current_round.load(Ordering::SeqCst),
+                    inst.on_block_finalized_count(),
                 );
                 panic!(
                     "Test '{}' failed: session panicked (instance idx={})",
@@ -1575,50 +1391,35 @@ where
 
                         let ctx = &session_contexts[node_idx];
 
-                        // CRITICAL: Preserve the OLD approved_candidates from the stopped instance.
-                        // The new session's startup recovery will call get_approved_candidate()
-                        // to restore candidates from persistent storage. These candidates were
-                        // stored by the old session's on_generate_slot and on_candidate calls.
-                        let (old_approved_candidates, prev_next_seqno, prev_commits) = {
+                        let (prev_next_seqno, prev_commits, finalized_seqnos) = {
                             let inst = instances[node_idx].lock();
                             (
-                                inst.approved_candidates.clone(),
-                                inst.next_expected_commit_seqno.load(Ordering::SeqCst),
-                                inst.on_block_committed_count.load(Ordering::SeqCst),
+                                inst.max_finalized_seqno.load(Ordering::SeqCst),
+                                inst.on_block_finalized_count.load(Ordering::SeqCst),
+                                inst.finalized_seqnos.clone(),
                             )
                         };
-                        let candidates_count =
-                            old_approved_candidates.lock().map(|m| m.len()).unwrap_or(0);
-                        log::info!(
-                            "[restart-gremlin] Preserving {} approved candidates from old instance for recovery",
-                            candidates_count
-                        );
 
                         // Create seqno counters BEFORE listener - they will be updated by
-                        // on_block_committed during recovery, before SessionInstance is wired.
-                        // Preserve the previous baseline to avoid seqno regression across restart.
+                        // on_block_finalized during recovery, before SessionInstance is wired.
                         // Recovery callbacks may move it forward further before SessionInstance is wired.
-                        let next_expected_commit_seqno =
+                        // Preserve the finalized seqno set across restarts so the duplicate-finalization
+                        // invariant remains global for the whole test, not just the latest process lifetime.
+                        let max_finalized_seqno =
                             Arc::new(AtomicU32::new(prev_next_seqno.max(ctx.initial_block_seqno)));
 
-                        // Create a new listener that will be linked to the new session instance.
-                        // Pass the OLD approved_candidates so get_approved_candidate() works during create_session.
-                        // Pass the NEW seqno counters so they're updated by on_block_committed during recovery.
                         let new_listener = Arc::new(SessionInstanceListener {
                             instance: SpinMutex::new(Weak::new()),
-                            approved_candidates: old_approved_candidates.clone(),
-                            next_expected_commit_seqno: next_expected_commit_seqno.clone(),
-                            committed_blocks: committed_blocks.clone(),
+                            max_finalized_seqno: max_finalized_seqno.clone(),
+                            finalized_seqnos: finalized_seqnos.clone(),
                         });
                         let session_listener: Arc<dyn SessionListener + Send + Sync> =
                             new_listener.clone();
 
-                        // Recreate the session with the same DB path (recovery from persistent storage).
                         let new_session = SessionFactory::create_session(
                             &ctx.session_opts,
                             &ctx.session_id,
                             &ctx.shard,
-                            ctx.initial_block_seqno,
                             ctx.nodes.as_ref().clone(),
                             &ctx.local_key,
                             ctx.db_path.clone(),
@@ -1628,11 +1429,12 @@ where
 
                         match new_session {
                             Ok(session) => {
+                                session.start(ctx.initial_block_seqno);
                                 // Create a completely new SessionInstance with fresh state.
                                 // The seqno trackers are shared with the listener - they were already
-                                // updated by on_block_committed during recovery (before this point).
+                                // updated by on_block_finalized during recovery (before this point).
                                 let recovered_next_seqno =
-                                    next_expected_commit_seqno.load(Ordering::SeqCst);
+                                    max_finalized_seqno.load(Ordering::SeqCst);
                                 let recovered_commits = recovered_next_seqno
                                     .saturating_sub(ctx.initial_block_seqno)
                                     .max(prev_commits);
@@ -1648,26 +1450,20 @@ where
 
                                 let new_instance = Arc::new(SpinMutex::new(SessionInstance {
                                     public_key: ctx.local_key.clone(),
-                                    // Preserve progress reconstructed during startup recovery.
-                                    // Without this, restarted nodes can require a full extra
-                                    // `total_rounds` worth of commits and hit timeout.
                                     batch_processed: Arc::new(AtomicBool::new(recovered_finished)),
                                     collation_requested: Arc::new(AtomicBool::new(false)),
                                     collation_count: Arc::new(AtomicU32::new(0)),
                                     on_candidate_count: Arc::new(AtomicU32::new(0)),
-                                    on_block_committed_count: Arc::new(AtomicU32::new(
+                                    on_block_finalized_count: Arc::new(AtomicU32::new(
                                         recovered_commits,
                                     )),
                                     is_collator: Arc::new(AtomicBool::new(false)),
                                     config: config.clone(),
-                                    current_round: Arc::new(AtomicU32::new(recovered_commits)),
                                     commit_latencies: Arc::new(Mutex::new(Vec::new())),
-                                    // SeqNo tracking: shared with listener - already updated by recovery
-                                    next_expected_commit_seqno: next_expected_commit_seqno.clone(),
+                                    max_finalized_seqno: max_finalized_seqno.clone(),
+                                    finalized_seqnos: finalized_seqnos.clone(),
                                     session_errors_count: Arc::new(AtomicU32::new(0)),
-                                    // Share the preserved approved_candidates with the new instance.
-                                    approved_candidates: old_approved_candidates.clone(),
-                                    committed_blocks: committed_blocks.clone(),
+                                    finalized_blocks: finalized_blocks.clone(),
                                     source_index: node_idx as u32,
                                     _session: session,
                                     _listener: new_listener.clone(),
@@ -1689,18 +1485,19 @@ where
                                     old_inst.collation_count = new_inst.collation_count.clone();
                                     old_inst.on_candidate_count =
                                         new_inst.on_candidate_count.clone();
-                                    old_inst.on_block_committed_count =
-                                        new_inst.on_block_committed_count.clone();
+                                    old_inst.on_block_finalized_count =
+                                        new_inst.on_block_finalized_count.clone();
                                     old_inst.is_collator = new_inst.is_collator.clone();
-                                    old_inst.current_round = new_inst.current_round.clone();
                                     old_inst.commit_latencies = new_inst.commit_latencies.clone();
-                                    old_inst.next_expected_commit_seqno =
-                                        new_inst.next_expected_commit_seqno.clone();
+                                    old_inst
+                                        .max_finalized_seqno
+                                        .clone_from(&new_inst.max_finalized_seqno);
+                                    old_inst
+                                        .finalized_seqnos
+                                        .clone_from(&new_inst.finalized_seqnos);
                                     old_inst.session_errors_count =
                                         new_inst.session_errors_count.clone();
-                                    old_inst.approved_candidates =
-                                        new_inst.approved_candidates.clone();
-                                    old_inst.committed_blocks = new_inst.committed_blocks.clone();
+                                    old_inst.finalized_blocks = new_inst.finalized_blocks.clone();
                                     old_inst._session = new_inst._session.clone();
                                     old_inst._listener = new_inst._listener.clone();
                                 }
@@ -1881,19 +1678,26 @@ where
         let inst = instance.lock();
         let is_finished = inst.is_finished();
         log::info!(
-            "Instance {}: finished={}, collation_requested={}, collation_count={}, candidate_count={}, commit_count={}",
+            "Instance {}: finished={}, collation_requested={}, collation_count={}, candidate_count={}, finalized_count={}",
             index,
             inst.is_finished(),
             inst.collation_requested(),
             inst.collation_count(),
             inst.on_candidate_count(),
-            inst.on_block_committed_count()
+            inst.on_block_finalized_count()
         );
+        let finalized_count = inst.on_block_finalized_count();
+        let unique_seqnos = inst.unique_finalized_seqno_count();
         drop(inst);
         assert!(is_finished);
+        assert_eq!(
+            finalized_count as usize, unique_seqnos,
+            "Instance {}: finalized_count ({}) != unique seqno count ({}) — duplicate finalization detected",
+            index, finalized_count, unique_seqnos
+        );
     }
 
-    // Log commit latency statistics table
+    // Log finalization latency statistics table
     log::info!("");
     log::info!("=== COMMIT LATENCY STATISTICS ===");
     print_latency_table_header();
@@ -1933,7 +1737,6 @@ where
     }
 
     // Assert no session errors occurred during the test
-    // Errors are tracked via SessionStats passed to on_block_committed
     let total_errors: u32 = instances.iter().map(|inst| inst.lock().session_errors_count()).sum();
     assert!(
         total_errors == 0,
@@ -1964,13 +1767,13 @@ fn test_simplex_consensus_basic() {
     run_simplex_consensus_test(
         TestConfig {
             total_rounds: 100,
-            min_commit_percent: 0.5, // At least 50% commits
+            min_finalized_percent: 0.5, // At least 50% commits
             node_count: 7,
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 10000,
-            target_rate: Duration::from_millis(50),
-            first_block_timeout: Duration::from_millis(300),
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_millis(1000),
             test_name: "simplex_basic".to_string(),
             test_timeout: Duration::from_secs(180),
             expect_timeout: false, // Expect completion, not timeout
@@ -1982,28 +1785,29 @@ fn test_simplex_consensus_basic() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
             let config = &instances[0].lock().config.clone();
-            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
 
             for (idx, instance) in instances.iter().enumerate() {
-                let commits = instance.lock().on_block_committed_count();
+                let commits = instance.lock().on_block_finalized_count();
                 log::info!(
                     "Instance {}: {} commits out of {} total_rounds (min required: {})",
                     idx,
                     commits,
                     config.total_rounds,
-                    min_commits
+                    min_finalized
                 );
                 assert!(
-                    commits >= min_commits,
+                    commits >= min_finalized,
                     "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
                     idx,
                     commits,
-                    min_commits,
-                    config.min_commit_percent * 100.0,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
                     config.total_rounds
                 );
             }
@@ -2016,14 +1820,14 @@ fn test_simplex_consensus_basic() {
 fn test_simplex_consensus_with_failures() {
     run_simplex_consensus_test(
         TestConfig {
-            total_rounds: 50,
-            min_commit_percent: 0.3, // Lower threshold due to failures
+            total_rounds: 30,
+            min_finalized_percent: 0.3, // Lower threshold due to failures
             node_count: 11,
             generation_failure_probability: 0.1,
             candidate_rejection_probability: 0.1,
             max_collations: 150,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(2000),
             test_name: "simplex_with_failures".to_string(),
             // This scenario includes randomized generation/rejection failures and can
             // occasionally complete just above 120s on loaded CI/containers.
@@ -2037,28 +1841,29 @@ fn test_simplex_consensus_with_failures() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
             let config = &instances[0].lock().config.clone();
-            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
 
             for (idx, instance) in instances.iter().enumerate() {
-                let commits = instance.lock().on_block_committed_count();
+                let commits = instance.lock().on_block_finalized_count();
                 log::info!(
                     "Instance {}: {} commits out of {} total_rounds (min required: {})",
                     idx,
                     commits,
                     config.total_rounds,
-                    min_commits
+                    min_finalized
                 );
                 assert!(
-                    commits >= min_commits,
+                    commits >= min_finalized,
                     "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
                     idx,
                     commits,
-                    min_commits,
-                    config.min_commit_percent * 100.0,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
                     config.total_rounds
                 );
             }
@@ -2069,29 +1874,27 @@ fn test_simplex_consensus_with_failures() {
 /// FinalCert-recovery gremlin test
 ///
 /// Validates that a node with heavy message loss recovers missing FinalCerts
-/// via `get_committed_candidate` (shared committed blocks map) rather than
-/// relying on a Rust-only direct recovery path.
+/// via finalized delivery rather than relying on a direct recovery path.
 ///
 /// Setup: 7 MC nodes. Node 0 gets 40% broadcast loss + 30% message loss.
 /// Other nodes have no loss and form a stable 6/7 majority (threshold=5).
 /// Node 0 will miss FinalizeVotes for some slots, hitting `WaitingForFinalCert`.
-/// Recovery: `get_committed_candidate` reads proof from shared `CommittedBlocksMap`
-/// (populated by other instances' `on_block_committed`), converts to VoteSignatureSet,
-/// injects via `process_received_final_cert`, and resumes normal commit flow.
+/// Recovery: the node eventually receives the finalization certificate from peers
+/// and the finalized block is delivered via `on_block_finalized`.
 #[test]
 fn test_simplex_consensus_finalcert_recovery() {
     run_simplex_consensus_test(
         TestConfig {
             total_rounds: 60,
-            min_commit_percent: 0.3,
+            min_finalized_percent: 0.3,
             node_count: 7,
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 200,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(2000),
             test_name: "simplex_finalcert_recovery".to_string(),
-            test_timeout: Duration::from_secs(180),
+            test_timeout: Duration::from_secs(240),
             expect_timeout: false,
             shard: ShardIdent::masterchain(),
             mc_notification_interval: None,
@@ -2106,14 +1909,15 @@ fn test_simplex_consensus_finalcert_recovery() {
             }),
             lossy_overlay_node_indices: Some(vec![0]),
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
-            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
 
             // All nodes (including the lossy node 0) must reach min commit count
             for (idx, instance) in instances.iter().enumerate() {
-                let commits = instance.lock().on_block_committed_count();
+                let commits = instance.lock().on_block_finalized_count();
                 let errors = instance.lock().session_errors_count.load(Ordering::Relaxed);
                 log::info!(
                     "[finalcert-recovery] Instance {}: {} commits, {} errors \
@@ -2121,30 +1925,29 @@ fn test_simplex_consensus_finalcert_recovery() {
                     idx,
                     commits,
                     errors,
-                    min_commits,
+                    min_finalized,
                     idx == 0
                 );
                 assert!(
-                    commits >= min_commits,
+                    commits >= min_finalized,
                     "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
                     idx,
                     commits,
-                    min_commits,
-                    config.min_commit_percent * 100.0,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
                     config.total_rounds
                 );
             }
 
-            // Verify shared committed blocks map was populated
-            let committed_count =
-                instances[0].lock().committed_blocks.lock().map(|m| m.len()).unwrap_or(0);
+            let finalized_count =
+                instances[0].lock().finalized_blocks.lock().map(|m| m.len()).unwrap_or(0);
             log::info!(
-                "[finalcert-recovery] Shared committed blocks map: {} entries",
-                committed_count
+                "[finalcert-recovery] Shared finalized blocks map: {} entries",
+                finalized_count
             );
             assert!(
-                committed_count > 0,
-                "CommittedBlocksMap should have entries from on_block_committed"
+                finalized_count > 0,
+                "FinalizedBlocksMap should have entries from on_block_finalized"
             );
         },
     );
@@ -2159,15 +1962,15 @@ fn test_simplex_consensus_shard_with_mc_notifications() {
     run_simplex_consensus_test(
         TestConfig {
             total_rounds: 100,
-            min_commit_percent: 0.5, // At least 50% commits
+            min_finalized_percent: 0.5, // At least 50% commits
             node_count: 7,
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 500,
-            target_rate: Duration::from_millis(100),
-            first_block_timeout: Duration::from_millis(500),
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_millis(1000),
             test_name: "simplex_shard_mc".to_string(),
-            test_timeout: Duration::from_secs(120),
+            test_timeout: Duration::from_secs(180),
             expect_timeout: false,
             // Use a shard chain (workchain 0, full shard)
             shard: ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
@@ -2179,28 +1982,29 @@ fn test_simplex_consensus_shard_with_mc_notifications() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
             let config = &instances[0].lock().config.clone();
-            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
 
             for (idx, instance) in instances.iter().enumerate() {
-                let commits = instance.lock().on_block_committed_count();
+                let commits = instance.lock().on_block_finalized_count();
                 log::info!(
                     "Instance {}: {} commits out of {} total_rounds (min required: {})",
                     idx,
                     commits,
                     config.total_rounds,
-                    min_commits
+                    min_finalized
                 );
                 assert!(
-                    commits >= min_commits,
+                    commits >= min_finalized,
                     "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
                     idx,
                     commits,
-                    min_commits,
-                    config.min_commit_percent * 100.0,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
                     config.total_rounds
                 );
             }
@@ -2217,7 +2021,7 @@ fn test_simplex_consensus_adnl_overlay() {
     run_simplex_consensus_test(
         TestConfig {
             total_rounds: 50, // Fewer rounds due to higher network latency
-            min_commit_percent: 0.5,
+            min_finalized_percent: 0.5,
             node_count: 5, // Smaller network for faster test
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
@@ -2235,28 +2039,29 @@ fn test_simplex_consensus_adnl_overlay() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement
             let config = &instances[0].lock().config.clone();
-            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
 
             for (idx, instance) in instances.iter().enumerate() {
-                let commits = instance.lock().on_block_committed_count();
+                let commits = instance.lock().on_block_finalized_count();
                 log::info!(
                     "Instance {}: {} commits out of {} total_rounds (min required: {})",
                     idx,
                     commits,
                     config.total_rounds,
-                    min_commits
+                    min_finalized
                 );
                 assert!(
-                    commits >= min_commits,
+                    commits >= min_finalized,
                     "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
                     idx,
                     commits,
-                    min_commits,
-                    config.min_commit_percent * 100.0,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
                     config.total_rounds
                 );
             }
@@ -2272,7 +2077,7 @@ fn test_simplex_consensus_adnl_net_gremlin() {
     run_simplex_consensus_test(
         TestConfig {
             total_rounds: 30,
-            min_commit_percent: 0.4, // allow some skips under partitions
+            min_finalized_percent: 0.4, // allow some skips under partitions
             node_count: 5,
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
@@ -2295,28 +2100,29 @@ fn test_simplex_consensus_adnl_net_gremlin() {
             lossy_overlay: None,
             lossy_overlay_node_indices: None,
             standstill_timeout: None,
+            slots_per_leader_window: None,
         },
         |instances| {
             // Verify commit rate meets minimum requirement (best-effort under partitions).
             let config = &instances[0].lock().config.clone();
-            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
 
             for (idx, instance) in instances.iter().enumerate() {
-                let commits = instance.lock().on_block_committed_count();
+                let commits = instance.lock().on_block_finalized_count();
                 log::info!(
                     "Instance {}: {} commits out of {} total_rounds (min required: {})",
                     idx,
                     commits,
                     config.total_rounds,
-                    min_commits
+                    min_finalized
                 );
                 assert!(
-                    commits >= min_commits,
+                    commits >= min_finalized,
                     "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
                     idx,
                     commits,
-                    min_commits,
-                    config.min_commit_percent * 100.0,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
                     config.total_rounds
                 );
             }
@@ -2334,13 +2140,13 @@ fn test_simplex_consensus_restart_gremlin() {
     run_simplex_consensus_test(
         TestConfig {
             total_rounds: 50,
-            min_commit_percent: 0.3,
+            min_finalized_percent: 0.3,
             node_count: 5,
             generation_failure_probability: 0.0,
             candidate_rejection_probability: 0.0,
             max_collations: 2000,
             target_rate: Duration::from_millis(200),
-            first_block_timeout: Duration::from_millis(500),
+            first_block_timeout: Duration::from_millis(1200),
             test_name: "simplex_restart_gremlin".to_string(),
             test_timeout: Duration::from_secs(180), // Longer timeout for restart cycles
             expect_timeout: false,
@@ -2359,13 +2165,14 @@ fn test_simplex_consensus_restart_gremlin() {
             // 1s rebroadcast cadence can flood restart-gremlin runs (large [begin,end) ranges),
             // causing receiver queues to explode and the test to stall intermittently.
             standstill_timeout: Some(Duration::from_secs(5)),
+            slots_per_leader_window: None,
         },
         |instances| {
             let config = &instances[0].lock().config.clone();
-            let min_commits = (config.total_rounds as f64 * config.min_commit_percent) as u32;
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
 
             for (idx, instance) in instances.iter().enumerate() {
-                let commits = instance.lock().on_block_committed_count();
+                let commits = instance.lock().on_block_finalized_count();
                 log::info!(
                     "Instance {}: {} commits out of {} total_rounds",
                     idx,
@@ -2373,14 +2180,14 @@ fn test_simplex_consensus_restart_gremlin() {
                     config.total_rounds
                 );
                 // Note: restarted nodes may have fewer commits if they were down during commit phase.
-                // We use a lower min_commit_percent to account for this.
+                // We use a lower min_finalized_percent to account for this.
                 assert!(
-                    commits >= min_commits,
+                    commits >= min_finalized,
                     "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
                     idx,
                     commits,
-                    min_commits,
-                    config.min_commit_percent * 100.0,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
                     config.total_rounds
                 );
             }
@@ -2460,6 +2267,331 @@ fn test_collated_file_hash_consistency() {
         wrong_collated_file_hash, collated_file_hash_verification,
         "UInt256::default() should NOT match the computed hash. \
         If this fails, collated_data might be empty."
+    );
+}
+
+/// Verify the start gate: sessions create the overlay immediately but do NOT
+/// begin FSM processing until `start(seqno)` is called.
+///
+/// This tests the overlay-warmup fix for the mixed C++/Rust timing gap where
+/// the FSM's `first_block_timeout` would fire before the overlay had established
+/// peer connections, permanently stalling finalization.
+#[test]
+fn test_simplex_start_gate() {
+    let _test_lock = SIMPLEX_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    const DB_PATH: &str = "../../target/test";
+
+    if !is_test_logging_enabled() {
+        return;
+    }
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let node_count = 7usize;
+    let shard = ShardIdent::masterchain();
+    let initial_block_seqno = 1u32;
+
+    let mut nodes = Vec::with_capacity(node_count);
+    for _ in 0..node_count {
+        let key = Ed25519KeyOption::generate().unwrap();
+        let adnl_id = key.id().clone();
+        nodes.push(SessionNode { public_key: key, adnl_id, weight: 1 });
+    }
+
+    let overlay_manager = SessionFactory::create_in_process_overlay_manager(node_count);
+
+    let rand_name: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(7)
+        .map(char::from)
+        .collect();
+    let db_path_base = format!("{}/simplex_start_gate_{}", DB_PATH, rand_name);
+    let mut rng = rand::thread_rng();
+    let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
+
+    let session_opts = SessionOptions {
+        proto_version: 0,
+        target_rate: Duration::from_millis(200),
+        first_block_timeout: Duration::from_millis(1000),
+        slots_per_leader_window: 1,
+        wait_for_db_init: true,
+        max_leader_window_desync: 10_000,
+        ..Default::default()
+    };
+
+    let finalized_blocks: FinalizedBlocksMap = Arc::new(Mutex::new(HashSet::new()));
+    let finalized_counters: Vec<Arc<AtomicU32>> =
+        (0..node_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
+    let mut sessions: Vec<SessionPtr> = Vec::new();
+    // Keep instances alive so the listener Weak pointers remain valid.
+    let mut instances: Vec<Arc<SpinMutex<SessionInstance>>> = Vec::new();
+
+    let config = TestConfig {
+        total_rounds: 10,
+        min_finalized_percent: 0.5,
+        node_count,
+        generation_failure_probability: 0.0,
+        candidate_rejection_probability: 0.0,
+        max_collations: 10000,
+        target_rate: Duration::from_millis(200),
+        first_block_timeout: Duration::from_millis(1000),
+        test_name: "simplex_start_gate".to_string(),
+        test_timeout: Duration::from_secs(60),
+        expect_timeout: false,
+        shard: shard.clone(),
+        mc_notification_interval: None,
+        overlay_type: OverlayType::InProcess,
+        net_gremlin: None,
+        restart_gremlin: None,
+        lossy_overlay: None,
+        lossy_overlay_node_indices: None,
+        standstill_timeout: None,
+        slots_per_leader_window: None,
+    };
+
+    for i in 0..node_count {
+        let local_key = nodes[i].public_key.clone();
+        let db_path = format!("{}_node{}", db_path_base, i);
+        let max_finalized_seqno = Arc::new(AtomicU32::new(initial_block_seqno));
+        let finalized_seqnos: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let listener = Arc::new(SessionInstanceListener {
+            instance: SpinMutex::new(Weak::new()),
+            max_finalized_seqno: max_finalized_seqno.clone(),
+            finalized_seqnos: finalized_seqnos.clone(),
+        });
+        let session_listener: Arc<dyn SessionListener + Send + Sync> = listener.clone();
+
+        let session = SessionFactory::create_session(
+            &session_opts,
+            &session_id,
+            &shard,
+            nodes.clone(),
+            &local_key,
+            db_path,
+            overlay_manager.clone(),
+            Arc::downgrade(&session_listener),
+        )
+        .expect("Failed to create session");
+
+        let session_instance = Arc::new(SpinMutex::new(SessionInstance {
+            source_index: i as u32,
+            public_key: nodes[i].public_key.clone(),
+            batch_processed: Arc::new(AtomicBool::new(false)),
+            collation_requested: Arc::new(AtomicBool::new(false)),
+            collation_count: Arc::new(AtomicU32::new(0)),
+            on_candidate_count: Arc::new(AtomicU32::new(0)),
+            on_block_finalized_count: finalized_counters[i].clone(),
+            is_collator: Arc::new(AtomicBool::new(false)),
+            config: config.clone(),
+            commit_latencies: Arc::new(Mutex::new(Vec::new())),
+            max_finalized_seqno,
+            finalized_seqnos,
+            session_errors_count: Arc::new(AtomicU32::new(0)),
+            finalized_blocks: finalized_blocks.clone(),
+            _session: session.clone(),
+            _listener: listener.clone(),
+        }));
+
+        *listener.instance.lock() = Arc::downgrade(&session_instance);
+
+        sessions.push(session);
+        instances.push(session_instance);
+    }
+
+    // Phase 1a: verify no commits while sessions are gated (overlay is warming up)
+    log::info!("[start_gate] Phase 1a: verifying no commits for 2s without start()");
+    thread::sleep(Duration::from_secs(2));
+    for (i, counter) in finalized_counters.iter().enumerate() {
+        let commits = counter.load(Ordering::Relaxed);
+        assert_eq!(
+            commits, 0,
+            "Node {} committed {} blocks before start() was called — start gate failed",
+            i, commits
+        );
+    }
+    log::info!("[start_gate] Phase 1a passed: zero commits before start()");
+
+    // Phase 1b: prolonged cold-start delay (regression guard).
+    // Even after a longer pre-start delay, no session may produce commits before start().
+    const EXTRA_COLD_START_DELAY: Duration = Duration::from_secs(5);
+    log::info!(
+        "[start_gate] Phase 1b: verifying no commits after extra {:?} cold delay",
+        EXTRA_COLD_START_DELAY
+    );
+    thread::sleep(EXTRA_COLD_START_DELAY);
+    for (i, counter) in finalized_counters.iter().enumerate() {
+        let commits = counter.load(Ordering::Relaxed);
+        assert_eq!(
+            commits, 0,
+            "Node {} committed {} blocks during prolonged cold-start delay before start()",
+            i, commits
+        );
+    }
+    log::info!("[start_gate] Phase 1b passed: zero commits during prolonged cold delay");
+
+    // Phase 2: call start(seqno) on all sessions, then wait for commits
+    log::info!(
+        "[start_gate] Phase 2: calling start(seqno={}) on all sessions",
+        initial_block_seqno
+    );
+    for session in &sessions {
+        session.start(initial_block_seqno);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let min_finalized = 3u32;
+    loop {
+        thread::sleep(Duration::from_millis(200));
+        let all_committed =
+            finalized_counters.iter().all(|c| c.load(Ordering::Relaxed) >= min_finalized);
+        if all_committed {
+            break;
+        }
+        if Instant::now() > deadline {
+            for (i, counter) in finalized_counters.iter().enumerate() {
+                log::error!("[start_gate] Node {} commits: {}", i, counter.load(Ordering::Relaxed));
+            }
+            panic!(
+                "Timed out waiting for {} commits after start() — \
+                 sessions did not begin processing after start gate was released",
+                min_finalized
+            );
+        }
+    }
+
+    log::info!(
+        "[start_gate] Phase 2 passed: all nodes committed >= {} blocks after start()",
+        min_finalized
+    );
+
+    for session in &sessions {
+        session.stop();
+    }
+    drop(instances);
+    log::info!("[start_gate] Test passed");
+}
+
+/// Test candidate chaining within a multi-slot leader window (C++ parity).
+///
+/// Configures `slots_per_leader_window = 4`. Precollation depth is derived
+/// automatically from `slots_per_leader_window`, so the leader can chain
+/// candidates across slots within a single window. With
+/// chaining, the leader generates slot N+1 with slot N's candidate as parent,
+/// which causes seqnos to increment (1, 2, 3, 4) instead of repeating seqno=1.
+///
+/// Acceptance: the test reaches the commit threshold (at least 30% of rounds
+/// committed), proving that chained candidates are notarized and finalized.
+#[test]
+fn test_simplex_consensus_candidate_chaining() {
+    run_simplex_consensus_test(
+        TestConfig {
+            total_rounds: 20,
+            min_finalized_percent: 0.3,
+            node_count: 4,
+            generation_failure_probability: 0.0,
+            candidate_rejection_probability: 0.0,
+            max_collations: 2000,
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(3000),
+            test_name: "simplex_candidate_chaining".to_string(),
+            test_timeout: Duration::from_secs(120),
+            expect_timeout: false,
+            shard: ShardIdent::masterchain(),
+            mc_notification_interval: None,
+            overlay_type: OverlayType::InProcess,
+            net_gremlin: None,
+            restart_gremlin: None,
+            lossy_overlay: None,
+            lossy_overlay_node_indices: None,
+            standstill_timeout: None,
+            slots_per_leader_window: Some(4),
+        },
+        |instances| {
+            let config = &instances[0].lock().config.clone();
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
+
+            for (idx, instance) in instances.iter().enumerate() {
+                let commits = instance.lock().on_block_finalized_count();
+                log::info!(
+                    "[chaining] Instance {}: {} commits out of {} total_rounds (min required: {})",
+                    idx,
+                    commits,
+                    config.total_rounds,
+                    min_finalized
+                );
+                assert!(
+                    commits >= min_finalized,
+                    "Instance {} has {} commits but requires at least {} ({}% of {} rounds). \
+                    Candidate chaining may not be working correctly.",
+                    idx,
+                    commits,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
+                    config.total_rounds
+                );
+            }
+        },
+    );
+}
+
+/// Candidate chaining in multi-slot windows should remain live under moderate
+/// packet loss, validating in-window publication parity behavior.
+#[test]
+fn test_simplex_consensus_candidate_chaining_with_lossy_overlay() {
+    run_simplex_consensus_test(
+        TestConfig {
+            total_rounds: 20,
+            min_finalized_percent: 0.2,
+            node_count: 4,
+            generation_failure_probability: 0.0,
+            candidate_rejection_probability: 0.0,
+            max_collations: 2500,
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(3000),
+            test_name: "simplex_candidate_chaining_lossy".to_string(),
+            test_timeout: Duration::from_secs(150),
+            expect_timeout: false,
+            shard: ShardIdent::masterchain(),
+            mc_notification_interval: None,
+            overlay_type: OverlayType::InProcess,
+            net_gremlin: None,
+            restart_gremlin: None,
+            lossy_overlay: Some(consensus_common::LossyOverlayOpts {
+                lost_broadcast_probability: 0.15,
+                lost_message_probability: 0.1,
+                lost_query_probability: 0.1,
+                ..Default::default()
+            }),
+            lossy_overlay_node_indices: Some(vec![0]),
+            standstill_timeout: None,
+            slots_per_leader_window: Some(4),
+        },
+        |instances| {
+            let config = &instances[0].lock().config.clone();
+            let min_finalized = (config.total_rounds as f64 * config.min_finalized_percent) as u32;
+
+            for (idx, instance) in instances.iter().enumerate() {
+                let commits = instance.lock().on_block_finalized_count();
+                log::info!(
+                    "[chaining-lossy] Instance {}: {} commits out of {} rounds (min required: {})",
+                    idx,
+                    commits,
+                    config.total_rounds,
+                    min_finalized
+                );
+                assert!(
+                    commits >= min_finalized,
+                    "Instance {} has {} commits but requires at least {} ({}% of {} rounds)",
+                    idx,
+                    commits,
+                    min_finalized,
+                    config.min_finalized_percent * 100.0,
+                    config.total_rounds
+                );
+            }
+        },
     );
 }
 

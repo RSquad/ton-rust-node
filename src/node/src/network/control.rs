@@ -309,6 +309,7 @@ impl ControlQuerySubscriber {
             Engine::SYNC_STATUS_START_BOOT => "start_boot".to_string(),
             Engine::SYNC_STATUS_LOAD_STATES => "load_states".to_string(),
             Engine::SYNC_STATUS_FINISH_BOOT => "finish_boot".to_string(),
+            Engine::SYNC_STATUS_SYNC_ARCHIVES => "synchronization_by_archives".to_string(),
             Engine::SYNC_STATUS_SYNC_BLOCKS => "synchronization_by_blocks".to_string(),
             Engine::SYNC_STATUS_FINISH_SYNC => "synchronization_finished".to_string(),
             Engine::SYNC_STATUS_CHECKING_DB => "checking_db".to_string(),

@@ -8,11 +8,10 @@
  */
 //! Simplex restart and recovery unit tests
 //!
-//! Tests for startup recovery, restart recommit, and related functionality.
+//! Tests for startup recovery and related functionality.
 //!
 //! ## Test Categories
 //!
-//! - `RestartRecommitStrategy` defaults
 //! - `SessionStartupRecoveryOptions` construction
 //! - Future: `SessionStartupRecoveryProcessor` tests with mock listener
 
@@ -26,20 +25,13 @@ use crate::{
     session_description::SessionDescription,
     simplex_state::{NotarizeVote, Vote},
     startup_recovery::{
-        RestartRoundAction, SessionStartupRecoveryListener, SessionStartupRecoveryOptions,
+        SessionStartupRecoveryListener, SessionStartupRecoveryOptions,
         SessionStartupRecoveryProcessor,
     },
     utils::sign_vote,
-    RawBuffer, RestartRecommitStrategy, SessionId, SessionNode, SessionOptions,
+    SessionId, SessionNode, SessionOptions,
 };
-use consensus_common::ConsensusCommonFactory;
-use std::{
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-    time::SystemTime,
-};
+use std::{sync::Arc, time::SystemTime};
 use ton_api::{
     deserialize_boxed, serialize_boxed,
     ton::{
@@ -49,32 +41,19 @@ use ton_api::{
             candidateparent::CandidateParent as TlCandidateParent,
             CandidateData, CandidateHashData, CandidateId as CandidateIdBoxed, CandidateParent,
         },
-        validator_session::{
-            candidate::Candidate as TlCandidate, Candidate as ValidatorSessionCandidate,
-        },
+        validator_session::candidate::Candidate as TlCandidate,
     },
     IntoBoxed,
 };
-use ton_block::{error, sha256_digest, BlockIdExt, Ed25519KeyOption, Result, ShardIdent, UInt256};
-
-#[test]
-fn test_restart_recommit_strategy_default() {
-    assert_eq!(RestartRecommitStrategy::default(), RestartRecommitStrategy::FullReplay);
-}
+use ton_block::{
+    sha256_digest, BlockIdExt, BocFlags, BocWriter, BuilderData, Ed25519KeyOption, ShardIdent,
+    UInt256,
+};
 
 #[test]
 fn test_session_startup_recovery_options_new() {
-    let opts =
-        SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FirstCommitAfterFinalized, 100);
-    assert_eq!(opts.restart_recommit_strategy, RestartRecommitStrategy::FirstCommitAfterFinalized);
+    let opts = SessionStartupRecoveryOptions::new(100);
     assert_eq!(opts.initial_block_seqno, 100);
-}
-
-#[test]
-fn test_session_startup_recovery_options_default_strategy() {
-    let opts = SessionStartupRecoveryOptions::new(RestartRecommitStrategy::default(), 1);
-    assert_eq!(opts.restart_recommit_strategy, RestartRecommitStrategy::FullReplay);
-    assert_eq!(opts.initial_block_seqno, 1);
 }
 
 // ============================================================================
@@ -121,7 +100,7 @@ fn create_test_desc_with_validators(count: usize, local_idx: usize) -> Arc<Sessi
 }
 
 // ============================================================================
-// Restart recommit action building
+// Startup recovery helpers
 // ============================================================================
 
 fn make_candidate_id(slot: u32, hash_byte: u8) -> RawCandidateId {
@@ -137,18 +116,6 @@ fn make_block_id(seqno: u32) -> BlockIdExt {
         root_hash: UInt256::default(),
         file_hash: UInt256::default(),
     }
-}
-
-fn make_candidate_hash_data(
-    root_hash: UInt256,
-    file_hash: UInt256,
-    collated_file_hash: UInt256,
-) -> CandidateHashData {
-    CandidateHashData::Consensus_CandidateHashDataOrdinary(CandidateHashDataOrdinary {
-        block: BlockIdExt { shard_id: ShardIdent::masterchain(), seq_no: 0, root_hash, file_hash },
-        collated_file_hash: collated_file_hash.into(),
-        parent: CandidateParent::Consensus_CandidateWithoutParents,
-    })
 }
 
 fn make_candidate_hash_data_with_parent(
@@ -186,6 +153,16 @@ fn make_candidate_hash_data_empty(
     })
 }
 
+/// Create valid BOC bytes from raw data (for tests that need valid BOC input).
+fn make_test_boc(data: &[u8], flags: BocFlags) -> Vec<u8> {
+    let mut b = BuilderData::new();
+    b.append_raw(data, data.len() * 8).unwrap();
+    let cell = b.into_cell().unwrap();
+    let mut buf = Vec::new();
+    BocWriter::with_flags([cell], flags).unwrap().write(&mut buf).unwrap();
+    buf
+}
+
 fn make_validator_session_candidate_bytes(
     round: i32,
     root_hash: UInt256,
@@ -196,321 +173,6 @@ fn make_validator_session_candidate_bytes(
         TlCandidate { src: UInt256::default(), round, root_hash, data, collated_data };
 
     consensus_common::serialize_tl_boxed_object!(&tl_candidate.into_boxed())
-}
-
-#[test]
-fn test_restart_recommit_strategy_first_commit_after_finalized_builds_no_actions() {
-    let session_id = SessionId::default();
-    let options =
-        SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FirstCommitAfterFinalized, 100);
-
-    let bootstrap = Bootstrap::default(); // contents unused for this strategy
-    let desc = create_test_desc();
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-
-    let finalized_blocks = vec![
-        FinalizedBlockRecord {
-            candidate_id: make_candidate_id(1, 0xA1),
-            block_id: make_block_id(100),
-            parent: None,
-            is_final: true,
-        },
-        FinalizedBlockRecord {
-            candidate_id: make_candidate_id(2, 0xA2),
-            block_id: make_block_id(101),
-            parent: None,
-            is_final: true,
-        },
-    ];
-
-    let actions = proc.build_restart_recommit_actions(&finalized_blocks).expect("build actions");
-    assert!(actions.is_empty(), "FirstCommitAfterFinalized should not replay history");
-}
-
-#[test]
-fn test_restart_recommit_strategy_full_replay_builds_commit_actions_for_sequential_seqno() {
-    let session_id = SessionId::default();
-    let options = SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FullReplay, 100);
-
-    let c1 = make_candidate_id(1, 0xA1);
-    let c2 = make_candidate_id(2, 0xA2);
-    let c3 = make_candidate_id(3, 0xA3);
-
-    let finalized_blocks = vec![
-        FinalizedBlockRecord {
-            candidate_id: c1.clone(),
-            block_id: make_block_id(100),
-            parent: None,
-            is_final: true,
-        },
-        FinalizedBlockRecord {
-            candidate_id: c2.clone(),
-            block_id: make_block_id(101),
-            parent: Some(c1.clone()),
-            is_final: true,
-        },
-        FinalizedBlockRecord {
-            candidate_id: c3.clone(),
-            block_id: make_block_id(102),
-            parent: Some(c2.clone()),
-            is_final: true,
-        },
-    ];
-
-    let candidate_infos = vec![
-        CandidateInfoRecord {
-            candidate_id: c1.clone(),
-            leader_idx: 1,
-            candidate_hash_data: make_candidate_hash_data(
-                UInt256::from([1u8; 32]),
-                UInt256::from([2u8; 32]),
-                UInt256::from([3u8; 32]),
-            ),
-            signature: RawBuffer::default(),
-        },
-        CandidateInfoRecord {
-            candidate_id: c2.clone(),
-            leader_idx: 2,
-            candidate_hash_data: make_candidate_hash_data(
-                UInt256::from([4u8; 32]),
-                UInt256::from([5u8; 32]),
-                UInt256::from([6u8; 32]),
-            ),
-            signature: RawBuffer::default(),
-        },
-        CandidateInfoRecord {
-            candidate_id: c3.clone(),
-            leader_idx: 3,
-            candidate_hash_data: make_candidate_hash_data(
-                UInt256::from([7u8; 32]),
-                UInt256::from([8u8; 32]),
-                UInt256::from([9u8; 32]),
-            ),
-            signature: RawBuffer::default(),
-        },
-    ];
-
-    let bootstrap = Bootstrap { candidate_infos, ..Bootstrap::default() };
-    let desc = create_test_desc();
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-
-    let actions = proc.build_restart_recommit_actions(&finalized_blocks).expect("build actions");
-    assert_eq!(actions.len(), 3);
-
-    // All actions should be Commit in slot order
-    for (i, action) in actions.iter().enumerate() {
-        let expected_slot = SlotIndex::new((i + 1) as u32);
-        match action {
-            RestartRoundAction::Commit { slot, block_id, leader_idx, is_empty, .. } => {
-                assert_eq!(*slot, expected_slot);
-                assert_eq!(block_id.seq_no(), 100 + i as u32);
-                assert_eq!(leader_idx.value(), (i + 1) as u32);
-                assert!(!is_empty);
-            }
-        }
-    }
-}
-
-#[test]
-fn test_restart_recommit_full_replay_replays_empty_record_without_skip_action() {
-    let session_id = SessionId::default();
-    let options = SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FullReplay, 10);
-
-    let c1 = make_candidate_id(1, 0xA1);
-    let c2 = make_candidate_id(2, 0xA2);
-    let c3 = make_candidate_id(3, 0xA3);
-    let b1 = make_block_id(10);
-    let b2 = make_block_id(10); // empty record keeps parent seqno
-    let b3 = make_block_id(11);
-
-    let finalized_blocks = vec![
-        FinalizedBlockRecord {
-            candidate_id: c1.clone(),
-            block_id: b1.clone(),
-            parent: None,
-            is_final: true,
-        },
-        FinalizedBlockRecord {
-            candidate_id: c2.clone(),
-            block_id: b2.clone(),
-            parent: Some(c1.clone()),
-            is_final: true,
-        },
-        FinalizedBlockRecord {
-            candidate_id: c3.clone(),
-            block_id: b3.clone(),
-            parent: Some(c2.clone()),
-            is_final: true,
-        },
-    ];
-
-    let bootstrap = Bootstrap {
-        candidate_infos: vec![
-            CandidateInfoRecord {
-                candidate_id: c1.clone(),
-                leader_idx: 0,
-                candidate_hash_data: make_candidate_hash_data_with_parent(
-                    b1,
-                    UInt256::from([0x11; 32]),
-                    None,
-                ),
-                signature: RawBuffer::default(),
-            },
-            CandidateInfoRecord {
-                candidate_id: c2.clone(),
-                leader_idx: 0,
-                candidate_hash_data: make_candidate_hash_data_empty(b2, c1.clone()),
-                signature: RawBuffer::default(),
-            },
-            CandidateInfoRecord {
-                candidate_id: c3.clone(),
-                leader_idx: 0,
-                candidate_hash_data: make_candidate_hash_data_with_parent(
-                    b3,
-                    UInt256::from([0x33; 32]),
-                    Some(c2.clone()),
-                ),
-                signature: RawBuffer::default(),
-            },
-        ],
-        ..Bootstrap::default()
-    };
-
-    let desc = create_test_desc();
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-    let actions = proc.build_restart_recommit_actions(&finalized_blocks).expect("build actions");
-    assert_eq!(actions.len(), 3);
-
-    match &actions[0] {
-        RestartRoundAction::Commit { slot, block_id, is_empty, .. } => {
-            assert_eq!(*slot, SlotIndex::new(1));
-            assert_eq!(block_id.seq_no(), 10);
-            assert!(!is_empty);
-        }
-    }
-    match &actions[1] {
-        RestartRoundAction::Commit { slot, block_id, is_empty, .. } => {
-            assert_eq!(*slot, SlotIndex::new(2));
-            assert_eq!(block_id.seq_no(), 10);
-            assert!(*is_empty);
-        }
-    }
-    match &actions[2] {
-        RestartRoundAction::Commit { slot, block_id, is_empty, .. } => {
-            assert_eq!(*slot, SlotIndex::new(3));
-            assert_eq!(block_id.seq_no(), 11);
-            assert!(!is_empty);
-        }
-    }
-}
-
-#[test]
-fn test_restart_recommit_full_replay_fails_on_missing_candidate_info() {
-    let session_id = SessionId::default();
-    let options = SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FullReplay, 1);
-
-    let c1 = make_candidate_id(1, 0xA1);
-    let finalized_blocks = vec![FinalizedBlockRecord {
-        candidate_id: c1,
-        block_id: make_block_id(1),
-        parent: None,
-        is_final: true,
-    }];
-
-    let bootstrap = Bootstrap::default(); // no candidate_infos
-    let desc = create_test_desc();
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-
-    let err = proc.build_restart_recommit_actions(&finalized_blocks).expect_err("must fail");
-    assert!(err.to_string().contains("missing candidate info"), "unexpected error: {}", err);
-}
-
-#[test]
-fn test_restart_recommit_full_replay_fails_on_seqno_mismatch_ahead() {
-    let session_id = SessionId::default();
-    let options = SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FullReplay, 10);
-
-    let c1 = make_candidate_id(1, 0xA1);
-    let finalized_blocks = vec![FinalizedBlockRecord {
-        candidate_id: c1.clone(),
-        block_id: make_block_id(12), // expected 10
-        parent: None,
-        is_final: true,
-    }];
-
-    let bootstrap = Bootstrap {
-        candidate_infos: vec![CandidateInfoRecord {
-            candidate_id: c1,
-            leader_idx: 0,
-            candidate_hash_data: make_candidate_hash_data(
-                UInt256::default(),
-                UInt256::default(),
-                UInt256::default(),
-            ),
-            signature: RawBuffer::default(),
-        }],
-        ..Bootstrap::default()
-    };
-    let desc = create_test_desc();
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-
-    let err = proc.build_restart_recommit_actions(&finalized_blocks).expect_err("must fail");
-    assert!(err.to_string().contains("seqno mismatch"), "unexpected error: {}", err);
-}
-
-#[test]
-fn test_restart_recommit_full_replay_fails_on_parent_chain_discontinuity() {
-    let session_id = SessionId::default();
-    let options = SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FullReplay, 1);
-
-    let c1 = make_candidate_id(1, 0xA1);
-    let c2 = make_candidate_id(2, 0xA2);
-    let wrong_parent = make_candidate_id(99, 0xFF);
-    let finalized_blocks = vec![
-        FinalizedBlockRecord {
-            candidate_id: c1.clone(),
-            block_id: make_block_id(1),
-            parent: None,
-            is_final: true,
-        },
-        FinalizedBlockRecord {
-            candidate_id: c2.clone(),
-            block_id: make_block_id(2),
-            parent: Some(wrong_parent),
-            is_final: true,
-        },
-    ];
-
-    let bootstrap = Bootstrap {
-        candidate_infos: vec![
-            CandidateInfoRecord {
-                candidate_id: c1,
-                leader_idx: 0,
-                candidate_hash_data: make_candidate_hash_data(
-                    UInt256::default(),
-                    UInt256::default(),
-                    UInt256::default(),
-                ),
-                signature: RawBuffer::default(),
-            },
-            CandidateInfoRecord {
-                candidate_id: c2,
-                leader_idx: 0,
-                candidate_hash_data: make_candidate_hash_data(
-                    UInt256::default(),
-                    UInt256::default(),
-                    UInt256::default(),
-                ),
-                signature: RawBuffer::default(),
-            },
-        ],
-        ..Bootstrap::default()
-    };
-    let desc = create_test_desc();
-    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
-
-    let err = proc.build_restart_recommit_actions(&finalized_blocks).expect_err("must fail");
-    assert!(err.to_string().contains("chain discontinuity"), "unexpected error: {}", err);
 }
 
 // ============================================================================
@@ -527,12 +189,12 @@ enum RecoveryCall {
     DrainStartupEvents,
     SeedCurrentRound,
     SeedFinalizedBlock,
+    SeedReceivedCandidates,
     NotifyLastFinalized,
     CacheNotarCert,
     CacheCandidateBytes,
     RestoreStandstillCache,
     RestoreStartupVotes,
-    ApplyRestartRecommitActions,
 }
 
 #[derive(Default)]
@@ -549,9 +211,9 @@ struct MockRecoveryListener {
     restored_standstill_cache_votes_len: Option<usize>,
     drained_votes: Vec<Vote>,
     restored_votes: Vec<Vote>,
-    recommit_called: bool,
     seeded_current_round: Option<u32>,
     seeded_finalized_blocks: Vec<(SlotIndex, UInt256)>,
+    seeded_received_candidates: Vec<FinalizedBlockRecord>,
     last_finalized_notification: Option<(SlotIndex, UInt256, u32)>,
 }
 
@@ -616,8 +278,9 @@ impl SessionStartupRecoveryListener for MockRecoveryListener {
         self.seeded_finalized_blocks.push((slot, block_hash));
     }
 
-    fn recovery_seed_received_candidates(&mut self, _finalized_blocks: &[FinalizedBlockRecord]) {
-        // Mock: no-op, received_candidates not tracked in tests
+    fn recovery_seed_received_candidates(&mut self, finalized_blocks: &[FinalizedBlockRecord]) {
+        self.call_log.push(RecoveryCall::SeedReceivedCandidates);
+        self.seeded_received_candidates = finalized_blocks.to_vec();
     }
 
     fn recovery_seed_candidate_for_parent_resolution(
@@ -674,30 +337,6 @@ impl SessionStartupRecoveryListener for MockRecoveryListener {
         self.call_log.push(RecoveryCall::CacheCandidateBytes);
         self.cached_candidates.push((slot, candidate_hash, candidate_data_bytes));
     }
-
-    fn recovery_notify_get_approved_candidate(
-        &self,
-        _source: crate::PublicKey,
-        _root_hash: crate::BlockHash,
-        _file_hash: crate::BlockHash,
-        _collated_data_hash: crate::BlockHash,
-        _callback: Box<dyn FnOnce(Result<consensus_common::ValidatorBlockCandidatePtr>) + Send>,
-    ) {
-        panic!("unexpected recovery_notify_get_approved_candidate call in this test");
-    }
-
-    fn recovery_apply_restart_recommit_actions(
-        &mut self,
-        _actions: &[RestartRoundAction],
-        _get_candidate: &mut dyn FnMut(
-            &RestartRoundAction,
-        )
-            -> Result<consensus_common::ValidatorBlockCandidatePtr>,
-    ) -> Result<()> {
-        self.call_log.push(RecoveryCall::ApplyRestartRecommitActions);
-        self.recommit_called = true;
-        Ok(())
-    }
 }
 
 fn make_vote_record(
@@ -709,14 +348,13 @@ fn make_vote_record(
     let tl_vote = sign_vote(&vote, session_id, key).expect("sign_vote failed");
     let serialized = serialize_boxed(&tl_vote).expect("serialize vote failed");
     let vote_hash = UInt256::from_slice(&sha256_digest(&serialized));
-    VoteRecord { vote_hash, data: serialized.into(), node_idx }
+    VoteRecord { vote_hash, data: serialized.into(), node_idx, seqno: 0 }
 }
 
 #[test]
 fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() {
     let session_id = SessionId::default();
-    let options =
-        SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FirstCommitAfterFinalized, 1);
+    let options = SessionStartupRecoveryOptions::new(1);
     // Create 2-validator description where self is validator 1
     let self_idx = ValidatorIndex::new(1);
     let desc = create_test_desc_with_validators(2, 1);
@@ -766,6 +404,7 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         notar_certs,
         votes: votes.clone(),
         pool_state,
+        candidate_payloads: vec![],
     };
 
     let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
@@ -777,7 +416,7 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
     proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
 
     // ------------------------------------------------------------------------
-    // Ordering invariants (Phase 6.6 + CERT-1 sequencing)
+    // Ordering invariants (Phase 6.6 + last-finalized-cert sequencing)
     // ------------------------------------------------------------------------
     //
     // 1) All votes must be replayed BEFORE setting finalized boundary (Phase 6.6)
@@ -807,7 +446,7 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         "Local flags must be applied after finalized boundary is set"
     );
 
-    // 3) CERT-1 notification must happen AFTER seeding finalized tracking set
+    // 3) Last-finalized-cert notification must happen AFTER seeding finalized tracking set
     let last_seed_final_pos = listener
         .call_log
         .iter()
@@ -820,10 +459,10 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         .expect("expected NotifyLastFinalized call");
     assert!(
         last_seed_final_pos < cert1_pos,
-        "CERT-1 notification must happen after seeding finalized blocks set"
+        "Last-finalized-cert notification must happen after seeding finalized blocks set"
     );
 
-    // 4) Standstill cache rebuild must happen after CERT-1.
+    // 4) Standstill cache rebuild must happen after last-finalized-cert notification.
     let standstill_pos = listener
         .call_log
         .iter()
@@ -831,7 +470,7 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         .expect("expected RestoreStandstillCache call");
     assert!(
         cert1_pos < standstill_pos,
-        "Standstill cache rebuild must happen after CERT-1 notification"
+        "Standstill cache rebuild must happen after last-finalized-cert notification"
     );
 
     // Step 1: global replay
@@ -857,10 +496,10 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
     assert_eq!(listener.set_first_nonannounced_window, Some(WindowIndex::new(2)));
     assert_eq!(listener.generate_skip_calls, 1);
 
-    // Step 5 & 12: drain/restore votes
+    // Step 5 & 11: drain/restore votes
     assert_eq!(listener.restored_votes, drained_votes);
 
-    // Step 6: current_round seeded for restart replay (starts from 0; step 11 advances it)
+    // Step 6: current_round compatibility hook seeded to 0
     assert_eq!(listener.seeded_current_round, Some(0));
 
     // Step 7: finalized_blocks set seeded (2 blocks)
@@ -882,16 +521,88 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
     // Step 10b: standstill cache rebuild invoked with full bootstrap votes slice
     assert_eq!(listener.restored_standstill_cache_votes_len, Some(2));
 
-    // Strategy FirstCommitAfterFinalized => no historical recommit actions.
-    assert!(!listener.recommit_called);
     assert!(listener.cached_candidates.is_empty());
+}
+
+#[test]
+fn test_apply_bootstrap_seeds_persisted_empty_mc_chain_before_last_finalized_notification() {
+    let session_id = SessionId::default();
+    let options = SessionStartupRecoveryOptions::new(1);
+
+    let c1 = make_candidate_id(10, 0xA1);
+    let c2 = make_candidate_id(11, 0xA2);
+    let c3 = make_candidate_id(12, 0xA3);
+    let finalized_blocks = vec![
+        FinalizedBlockRecord {
+            candidate_id: c1.clone(),
+            block_id: make_block_id(100),
+            parent: None,
+            is_final: true,
+        },
+        FinalizedBlockRecord {
+            candidate_id: c2.clone(),
+            block_id: make_block_id(100),
+            parent: Some(c1.clone()),
+            is_final: true,
+        },
+        FinalizedBlockRecord {
+            candidate_id: c3.clone(),
+            block_id: make_block_id(101),
+            parent: Some(c2.clone()),
+            is_final: true,
+        },
+    ];
+
+    let bootstrap = Bootstrap {
+        finalized_blocks: finalized_blocks.clone(),
+        candidate_infos: vec![],
+        notar_certs: vec![],
+        votes: vec![],
+        pool_state: None,
+        candidate_payloads: vec![],
+    };
+
+    let desc = create_test_desc();
+    let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
+    let mut listener = MockRecoveryListener::default().with_drained_votes(vec![]);
+
+    proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
+
+    assert_eq!(listener.seeded_received_candidates.len(), finalized_blocks.len());
+    for (seeded, expected) in
+        listener.seeded_received_candidates.iter().zip(finalized_blocks.iter())
+    {
+        assert_eq!(seeded.candidate_id, expected.candidate_id);
+        assert_eq!(seeded.block_id, expected.block_id);
+        assert_eq!(seeded.parent, expected.parent);
+        assert_eq!(seeded.is_final, expected.is_final);
+    }
+
+    let seed_pos = listener
+        .call_log
+        .iter()
+        .position(|c| *c == RecoveryCall::SeedReceivedCandidates)
+        .expect("expected SeedReceivedCandidates call");
+    let notify_pos = listener
+        .call_log
+        .iter()
+        .position(|c| *c == RecoveryCall::NotifyLastFinalized)
+        .expect("expected NotifyLastFinalized call");
+    assert!(
+        seed_pos < notify_pos,
+        "received-candidate seeding must happen before the last-finalized notification"
+    );
+    assert_eq!(
+        listener.last_finalized_notification,
+        Some((c3.slot, c3.hash, 101)),
+        "the last-finalized notification must still target the newest final record"
+    );
 }
 
 #[test]
 fn test_apply_bootstrap_does_not_generate_skip_votes_when_first_nonannounced_window_zero() {
     let session_id = SessionId::default();
-    let options =
-        SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FirstCommitAfterFinalized, 1);
+    let options = SessionStartupRecoveryOptions::new(1);
 
     let bootstrap = Bootstrap {
         finalized_blocks: vec![FinalizedBlockRecord {
@@ -904,6 +615,7 @@ fn test_apply_bootstrap_does_not_generate_skip_votes_when_first_nonannounced_win
         notar_certs: vec![],
         votes: vec![],
         pool_state: Some(PoolStateRecord { first_nonannounced_window: WindowIndex::new(0) }),
+        candidate_payloads: vec![],
     };
 
     let desc = create_test_desc();
@@ -913,7 +625,7 @@ fn test_apply_bootstrap_does_not_generate_skip_votes_when_first_nonannounced_win
     proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
     assert_eq!(listener.set_first_nonannounced_window, Some(WindowIndex::new(0)));
     assert_eq!(listener.generate_skip_calls, 0);
-    // Step 6: current_round seeded for restart replay (starts from 0; step 11 advances it)
+    // Step 6: current_round compatibility hook seeded to 0
     assert_eq!(listener.seeded_current_round, Some(0));
     // Step 7: finalized_blocks set seeded (1 block)
     assert_eq!(listener.seeded_finalized_blocks.len(), 1);
@@ -939,19 +651,10 @@ fn test_apply_bootstrap_does_not_generate_skip_votes_when_first_nonannounced_win
 // Candidate bytes cache restoration: TL roundtrip + invariants
 // ============================================================================
 
-/// Listener that supports non-empty candidate fetch and captures cached CandidateData bytes.
+/// Listener that captures cached CandidateData bytes during candidate cache restoration.
 #[derive(Default)]
 struct CandidateCacheListener {
-    // Observations
     cached_candidates: Vec<(SlotIndex, UInt256, Vec<u8>)>,
-    fetched_non_empty: AtomicU32,
-
-    // Expectations for non-empty fetch request
-    expected_root_hash: UInt256,
-    expected_file_hash: UInt256,
-    expected_collated_file_hash: UInt256,
-    candidate_block_data: Vec<u8>,
-    candidate_collated_data: Vec<u8>,
 }
 
 impl SessionStartupRecoveryListener for CandidateCacheListener {
@@ -1037,58 +740,12 @@ impl SessionStartupRecoveryListener for CandidateCacheListener {
     ) {
         self.cached_candidates.push((slot, candidate_hash, candidate_data_bytes));
     }
-
-    fn recovery_notify_get_approved_candidate(
-        &self,
-        source: crate::PublicKey,
-        root_hash: crate::BlockHash,
-        file_hash: crate::BlockHash,
-        collated_data_hash: crate::BlockHash,
-        callback: Box<dyn FnOnce(Result<consensus_common::ValidatorBlockCandidatePtr>) + Send>,
-    ) {
-        // This must be called exactly for non-empty candidates only
-        self.fetched_non_empty.fetch_add(1, Ordering::SeqCst);
-
-        assert_eq!(root_hash, self.expected_root_hash, "unexpected root_hash requested");
-        assert_eq!(file_hash, self.expected_file_hash, "unexpected file_hash requested");
-        assert_eq!(
-            collated_data_hash, self.expected_collated_file_hash,
-            "unexpected collated_data_hash requested"
-        );
-
-        let candidate = consensus_common::ValidatorBlockCandidate {
-            public_key: source,
-            id: BlockIdExt::default(),
-            collated_file_hash: collated_data_hash,
-            data: ConsensusCommonFactory::create_block_payload(self.candidate_block_data.clone()),
-            collated_data: ConsensusCommonFactory::create_block_payload(
-                self.candidate_collated_data.clone(),
-            ),
-        };
-
-        callback(Ok(Arc::new(candidate)));
-    }
-
-    fn recovery_apply_restart_recommit_actions(
-        &mut self,
-        actions: &[RestartRoundAction],
-        _get_candidate: &mut dyn FnMut(
-            &RestartRoundAction,
-        )
-            -> Result<consensus_common::ValidatorBlockCandidatePtr>,
-    ) -> Result<()> {
-        // These candidate-cache tests use `FirstCommitAfterFinalized`, which must not
-        // re-accept historical blocks.
-        assert!(actions.is_empty(), "FirstCommitAfterFinalized should not replay actions");
-        Ok(())
-    }
 }
 
 #[test]
 fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
     let session_id = SessionId::default();
-    let options =
-        SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FirstCommitAfterFinalized, 0);
+    let options = SessionStartupRecoveryOptions::new(0);
     let desc = create_test_desc(); // single validator is enough for this test
 
     let shard = ShardIdent::masterchain();
@@ -1117,8 +774,9 @@ fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
     // ------------------------------------------------------------------------
     let non_empty_round_seqno: i32 = 51; // used as block seqno by extract_block_info_from_candidate
     let non_empty_root_hash = UInt256::from([0x22; 32]);
-    let non_empty_data = b"block_data_bytes".to_vec();
-    let non_empty_collated = b"collated_data_bytes".to_vec();
+    // Use valid BOC bytes — compress_candidate_data requires valid BOC input
+    let non_empty_data = make_test_boc(b"block_data_bytes", BocFlags::all());
+    let non_empty_collated = make_test_boc(b"collated_data_bytes", BocFlags::Crc32);
     let candidate_payload_bytes = make_validator_session_candidate_bytes(
         non_empty_round_seqno,
         non_empty_root_hash.clone(),
@@ -1132,6 +790,7 @@ fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
         Some((parent_id.slot, &parent_id.hash)),
         &shard,
         max_size,
+        0,
     )
     .expect("compute_candidate_id_hash_from_bytes failed");
     let non_empty_candidate_id = RawCandidateId { slot: SlotIndex::new(11), hash: non_empty_hash };
@@ -1190,83 +849,43 @@ fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
         notar_certs: vec![],
         votes: vec![],
         pool_state: None,
+        candidate_payloads: vec![],
     };
 
     let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
 
-    let mut listener = CandidateCacheListener {
-        expected_root_hash: non_empty_root_hash.clone(),
-        expected_file_hash: non_empty_file_hash.clone(),
-        expected_collated_file_hash: non_empty_collated_file_hash.clone(),
-        candidate_block_data: non_empty_data.clone(),
-        candidate_collated_data: non_empty_collated.clone(),
-        ..Default::default()
-    };
+    let mut listener = CandidateCacheListener::default();
 
     proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
 
-    // Invariant: exactly one non-empty fetch (empty must not trigger fetch)
-    assert_eq!(listener.fetched_non_empty.load(Ordering::SeqCst), 1);
+    // Post-condition: only empty candidate cached; non-empty candidates are skipped
+    // (simplex resolves non-empty candidates via peer overlay, not validator manager)
+    assert_eq!(listener.cached_candidates.len(), 1);
 
-    // Post-condition: both candidates cached
-    assert_eq!(listener.cached_candidates.len(), 2);
+    let (slot, _hash, bytes) = &listener.cached_candidates[0];
+    let msg = deserialize_boxed(bytes).expect("deserialize CandidateData");
+    let candidate_data = msg.downcast::<CandidateData>().expect("downcast CandidateData");
 
-    // Decode and validate cached CandidateData bytes
-    for (slot, _hash, bytes) in &listener.cached_candidates {
-        let msg = deserialize_boxed(bytes).expect("deserialize CandidateData");
-        let candidate_data = msg.downcast::<CandidateData>().expect("downcast CandidateData");
+    match candidate_data {
+        CandidateData::Consensus_Empty(empty) => {
+            assert_eq!(SlotIndex::new(empty.slot as u32), *slot);
+            assert_eq!(empty.signature, empty_info.signature);
+            assert_eq!(empty.block, empty_referenced_block);
 
-        match candidate_data {
-            CandidateData::Consensus_Empty(empty) => {
-                assert_eq!(SlotIndex::new(empty.slot as u32), *slot);
-                assert_eq!(empty.signature, empty_info.signature);
-                assert_eq!(empty.block, empty_referenced_block);
-
-                // Parent is a CandidateId (boxed), verify it matches the empty hash data parent
-                assert_eq!(SlotIndex::new(*empty.parent.slot() as u32), parent_id.slot);
-                assert_eq!(empty.parent.hash(), &parent_id.hash);
-            }
-            CandidateData::Consensus_Block(block) => {
-                assert_eq!(SlotIndex::new(block.slot as u32), *slot);
-                assert_eq!(block.signature, non_empty_info.signature);
-                assert_eq!(block.candidate.as_slice(), candidate_payload_bytes.as_slice());
-
-                // Nested candidate bytes MUST be validator_session.Candidate
-                let nested = consensus_common::utils::deserialize_tl_boxed_object::<
-                    ValidatorSessionCandidate,
-                >(&block.candidate)
-                .expect("deserialize nested validator_session.Candidate");
-                match nested {
-                    ValidatorSessionCandidate::ValidatorSession_Candidate(c) => {
-                        assert_eq!(c.src, UInt256::default());
-                        assert_eq!(c.round, non_empty_round_seqno);
-                        assert_eq!(c.root_hash, non_empty_root_hash);
-                        assert_eq!(c.data.to_vec(), non_empty_data);
-                        assert_eq!(c.collated_data.to_vec(), non_empty_collated);
-                    }
-                    _ => panic!("unexpected nested Candidate variant"),
-                }
-
-                // Parent is CandidateParent::CandidateParent with an id
-                match &block.parent {
-                    CandidateParent::Consensus_CandidateParent(p) => {
-                        assert_eq!(SlotIndex::new(*p.id.slot() as u32), parent_id.slot);
-                        assert_eq!(p.id.hash(), &parent_id.hash);
-                    }
-                    CandidateParent::Consensus_CandidateWithoutParents => {
-                        panic!("expected CandidateParent for non-empty candidate");
-                    }
-                }
-            }
+            // Parent is a CandidateId (boxed), verify it matches the empty hash data parent
+            assert_eq!(SlotIndex::new(*empty.parent.slot() as u32), parent_id.slot);
+            assert_eq!(empty.parent.hash(), &parent_id.hash);
+        }
+        CandidateData::Consensus_Block(_) => {
+            panic!("non-empty block should not be cached during startup recovery");
         }
     }
 }
 
 #[test]
-fn test_restart_restore_candidate_bytes_skips_non_empty_on_fetch_error_but_keeps_empty() {
+fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
     let session_id = SessionId::default();
-    let options =
-        SessionStartupRecoveryOptions::new(RestartRecommitStrategy::FirstCommitAfterFinalized, 0);
+    let options = SessionStartupRecoveryOptions::new(0);
     let desc = create_test_desc();
 
     let shard = ShardIdent::masterchain();
@@ -1334,6 +953,7 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_on_fetch_error_but_keeps
         notar_certs: vec![],
         votes: vec![],
         pool_state: None,
+        candidate_payloads: vec![],
     };
 
     let proc = SessionStartupRecoveryProcessor::new(session_id, desc, options, bootstrap);
@@ -1414,32 +1034,12 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_on_fetch_error_but_keeps
         ) {
             self.cached.push((slot, candidate_hash, candidate_data_bytes));
         }
-        fn recovery_notify_get_approved_candidate(
-            &self,
-            _source: crate::PublicKey,
-            _root_hash: crate::BlockHash,
-            _file_hash: crate::BlockHash,
-            _collated_data_hash: crate::BlockHash,
-            callback: Box<dyn FnOnce(Result<consensus_common::ValidatorBlockCandidatePtr>) + Send>,
-        ) {
-            callback(Err(error!("simulated fetch error")));
-        }
-        fn recovery_apply_restart_recommit_actions(
-            &mut self,
-            _actions: &[RestartRoundAction],
-            _get_candidate: &mut dyn FnMut(
-                &RestartRoundAction,
-            )
-                -> Result<consensus_common::ValidatorBlockCandidatePtr>,
-        ) -> Result<()> {
-            Ok(())
-        }
     }
 
     let mut listener = FailFetchListener::default();
     proc.apply_bootstrap(&mut listener).expect("apply_bootstrap failed");
 
-    // Post-condition: empty candidate cached, non-empty skipped due to fetch error
+    // Post-condition: empty candidate cached, non-empty skipped (not fetched)
     assert_eq!(listener.cached.len(), 1);
     assert_eq!(listener.cached[0].0, SlotIndex::new(10));
 

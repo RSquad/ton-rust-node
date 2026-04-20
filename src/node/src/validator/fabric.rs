@@ -27,7 +27,7 @@ use crate::{
         validate_query::ValidateQuery,
         validator_group::PipelineContext,
         validator_utils::PrevBlockHistory,
-        BlockCandidate,
+        BlockCandidate, CollatorSettings,
     },
 };
 use std::{sync::Arc, time::SystemTime};
@@ -39,6 +39,8 @@ use ton_block::{
 pub async fn run_validate_query_any_candidate(
     block_candidate: BlockCandidate,
     engine: Arc<dyn EngineOperations>,
+    pipeline_context: PipelineContext,
+    is_simplex: bool,
 ) -> Result<SystemTime> {
     let block_id = block_candidate.block_id.clone();
     let block_data = block_candidate.data.clone();
@@ -76,11 +78,13 @@ pub async fn run_validate_query_any_candidate(
         info.shard().clone(),
         min_mc_seqno,
         prev_blocks_ids,
+        pipeline_context,
         block_candidate,
         validator_set,
         engine.clone(),
         false,
         true,
+        is_simplex,
     );
     let validator_result = query.try_validate().await;
 
@@ -149,6 +153,7 @@ pub async fn run_validate_query(
     block: BlockCandidate,
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
+    is_simplex: bool,
 ) -> Result<SystemTime> {
     let next_block_descr = fmt_next_block_descr(&block.block_id);
 
@@ -169,11 +174,13 @@ pub async fn run_validate_query(
             shard.clone(),
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
+            Default::default(),
             block,
             set,
             engine.clone(),
             false,
             true,
+            is_simplex,
         )
         .try_validate()
         .await
@@ -182,11 +189,13 @@ pub async fn run_validate_query(
             shard.clone(),
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
+            Default::default(),
             block.clone(),
             set,
             engine.clone(),
             false,
             true,
+            is_simplex,
         );
         let validator_result = query.try_validate().await;
         if let Err(err) = &validator_result {
@@ -276,13 +285,14 @@ pub async fn run_accept_block_query(
 
 pub async fn run_collate_query(
     shard: ShardIdent,
-    _min_ts: SystemTime,
+    min_ts: SystemTime,
     min_mc_seqno: u32,
     prev: &PrevBlockHistory,
     pipeline_context: PipelineContext,
     collator_id: PublicKey,
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
+    is_simplex: bool,
 ) -> Result<(Arc<ValidatorBlockCandidate>, Arc<ShardStateStuff>, Block, Cell)> {
     let labels = [("shard", shard.to_string())];
     metrics::gauge!("ton_node_collator_active", &labels).increment(1.0);
@@ -298,7 +308,14 @@ pub async fn run_collate_query(
         UInt256::from(collator_id.pub_key()?),
         engine.clone(),
         None,
-        Default::default(),
+        CollatorSettings {
+            is_simplex,
+            min_gen_utime_ms: Some(
+                min_ts.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis()
+                    as u64,
+            ),
+            ..Default::default()
+        },
     )?;
     let collate_result = collator.collate().await;
 
@@ -333,7 +350,6 @@ pub async fn run_collate_query(
     let labels = [("shard", shard.to_string())];
     metrics::counter!("ton_node_collator_failures_total", &labels).increment(1);
     let test_bundles_config = &engine.test_bundles_config().collator;
-
     let err_str = if test_bundles_config.is_enable() { err.to_string() } else { String::default() };
 
     #[cfg(feature = "telemetry")]

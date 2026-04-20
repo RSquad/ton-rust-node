@@ -39,6 +39,7 @@ ton_api = { path = '../tl/ton_api' }
 
 [dev-dependencies]
 log4rs = '1.2'
+adnl = { path = ".", features = [ 'server' ] }
 
 [features]
 client = [  ]

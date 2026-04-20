@@ -94,6 +94,7 @@ impl BroadcastNeighbours {
 pub struct BroadcastRecvInfo {
     pub packets: u32,
     pub data: Vec<u8>,
+    pub extra: Option<Vec<u8>>,
     pub recv_from: Arc<KeyId>,
 }
 
@@ -120,7 +121,7 @@ pub(crate) struct BroadcastSendContext<'a> {
 
 pub(crate) enum BroadcastSendMethod {
     Fast,
-    Rldp,
+    QuicOrRldp,
     Safe,
 }
 
@@ -128,7 +129,7 @@ impl Display for BroadcastSendMethod {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let msg = match self {
             Self::Fast => "datagram ADNL",
-            Self::Rldp => "RLDP",
+            Self::QuicOrRldp => "QUIC/RLDP",
             Self::Safe => "stream ADNL",
         };
         write!(f, "{msg}")
@@ -212,6 +213,7 @@ declare_counted!(
         data_hash: [u8; 32],
         date: i32,
         encoder: RaptorqEncoder,
+        extra: Vec<u8>,
         flags: u32,
         seqno: u32,
         src_key: Arc<dyn KeyOption>,
@@ -341,12 +343,16 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
             return Ok(());
         }
         let info = self.check_broadcast(&bcast, &ctx)?;
+        let bcast_id = base64_encode(&info.bcast_id);
         if info.dup {
-            let bcast_id = base64_encode(&info.bcast_id);
             log::info!(target: TARGET, "Received duplicated {bcast_type} broadcast {bcast_id}");
             return Ok(());
         };
-        log::trace!(target: TARGET, "Received {bcast_type} broadcast, {} bytes", info.data_len);
+        log::trace!(
+            target: TARGET,
+            "Received {bcast_type} broadcast {bcast_id}, {} bytes",
+            info.data_len
+        );
         #[cfg(feature = "telemetry")]
         let tag = info.maybe_tag.unwrap_or(bcast.default_tag());
         #[cfg(feature = "telemetry")]
@@ -528,6 +534,9 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
 pub(crate) trait FecBroadcastParsed: BroadcastParsed {
     fn data_hash(&self) -> &[u8; 32];
     fn data_size(&self) -> usize;
+    fn extra(&self) -> Option<&[u8]> {
+        None
+    }
     fn fec_type(&self) -> Option<FecTypeRaptorQ>;
     fn part_data(&self) -> &[u8];
     fn seqno(&self) -> u32;
@@ -569,6 +578,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         tokio::spawn(async move {
             let mut received = false;
             let mut packets = 0;
+            let mut extra: Option<Vec<u8>> = None;
             #[cfg(feature = "telemetry")]
             let mut flags = RecvTransferFecTelemetry::FLAG_RECEIVE_STARTED;
             #[cfg(feature = "telemetry")]
@@ -579,6 +589,9 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                     Some(bcast) => bcast,
                     None => break,
                 };
+                if extra.is_none() {
+                    extra = bcast.extra().map(|extra| extra.to_vec());
+                }
                 packets += 1;
                 let Some(fec_type) = bcast.fec_type() else {
                     log::warn!(
@@ -622,6 +635,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                         overlay.received_rawbytes.push(BroadcastRecvInfo {
                             packets,
                             data,
+                            extra,
                             recv_from: src_key_id.clone(),
                         });
                         received = true;
@@ -929,10 +943,12 @@ trait BroadcastTwostep {
     fn calc_broadcast_id(
         data_hash: [u8; 32],
         date: i32,
+        data_size: usize,
         part_size: usize,
         src_key: &Arc<dyn KeyOption>,
         src_adnl_key_id: &Arc<KeyId>,
         flags: u32,
+        extra: &[u8],
     ) -> Result<BroadcastId> {
         let bcast_id = BroadcastTwostepId {
             date,
@@ -940,7 +956,9 @@ trait BroadcastTwostep {
             src: UInt256::from_slice(src_key.id().data()),
             src_adnl_id: UInt256::from_slice(src_adnl_key_id.data()),
             data_hash: UInt256::with_array(data_hash),
+            data_size: data_size as i32,
             part_size: part_size as i32,
+            extra: extra.to_vec(),
         };
         hash(bcast_id)
     }
@@ -948,15 +966,19 @@ trait BroadcastTwostep {
     fn calc_broadcast_id_when_send(
         ctx: &BroadcastSendContext,
         date: i32,
+        data_size: usize,
         part_size: usize,
+        extra: &[u8],
     ) -> Result<(BroadcastId, bool)> {
         let bcast_id = Self::calc_broadcast_id(
             sha256_digest(ctx.data.object),
             date,
+            data_size,
             part_size,
             &ctx.src_key,
             &ctx.src_adnl_key_id,
             ctx.flags,
+            extra,
         )?;
         Ok((bcast_id, true))
     }
@@ -1157,6 +1179,7 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
             data_hash: sha256_digest(ctx.data.object),
             date,
             encoder,
+            extra: Vec::new(),
             flags: ctx.flags,
             seqno: 0,
             src_key: ctx.src_key.clone(),
@@ -1394,6 +1417,7 @@ impl BroadcastSimpleProtocol {
         let info = BroadcastRecvInfo {
             packets: 1,
             data: bcast.data.into(),
+            extra: None,
             recv_from: src_key.id().clone(),
         };
         Ok((Some(info), true))
@@ -1634,6 +1658,7 @@ impl FecBroadcastParsed for BroadcastTwostepFec {
             symbol_size,
         })
     }
+    fn extra(&self) -> Option<&[u8]> { Some(&self.extra) }
     fn part_data(&self) -> &[u8] { &self.part }
     fn seqno(&self) -> u32 { self.seqno as u32 }
     fn signature(&self) -> &[u8] { &self.signature }
@@ -1645,17 +1670,16 @@ struct BroadcastTwostepSendContext {
 }
 
 pub(crate) struct BroadcastTwostepFecProtocol {
+    extra: Option<Vec<u8>>,
     send_ctx: Option<BroadcastTwostepSendContext>,
 }
 
 impl BroadcastTwostepFecProtocol {
-    const MAX_PART_SIZE: usize = 65536;
-
     pub(crate) fn for_recv() -> Self {
-        Self { send_ctx: None }
+        Self { extra: None, send_ctx: None }
     }
 
-    pub(crate) fn for_send(data: &[u8], neighbours: u32) -> Result<Self> {
+    pub(crate) fn for_send(data: &[u8], neighbours: u32, extra: Vec<u8>) -> Result<Self> {
         if neighbours <= 3 {
             fail!("Not enough neighbours to build {} broadcast", Self::broadcast_type());
         }
@@ -1664,11 +1688,8 @@ impl BroadcastTwostepFecProtocol {
         }
         let k = ((neighbours as usize) * 2 - 2) / 3;
         let part_size = (data.len() + k - 1) / k;
-        if part_size >= Self::MAX_PART_SIZE {
-            fail!("Too big part size {part_size} in {} broadcast", Self::broadcast_type());
-        }
         let ctx = BroadcastTwostepSendContext { neighbours, part_size };
-        Ok(Self { send_ctx: Some(ctx) })
+        Ok(Self { extra: Some(extra), send_ctx: Some(ctx) })
     }
 }
 
@@ -1700,7 +1721,7 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
     }
 
     fn send_method(&self) -> BroadcastSendMethod {
-        BroadcastSendMethod::Rldp
+        BroadcastSendMethod::QuicOrRldp
     }
 
     // Receive side
@@ -1716,10 +1737,12 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
             bcast_id: <Self as BroadcastTwostep>::calc_broadcast_id(
                 *bcast.data_hash.as_slice(),
                 bcast.date,
+                bcast.data_size as usize,
                 bcast.part.len(),
                 &src_key,
                 &src_adnl_key_id,
                 bcast.flags as u32,
+                &bcast.extra,
             )?,
             dup: false,
             data_len: bcast.part.len(),
@@ -1735,7 +1758,19 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
         ctx: &mut BroadcastRecvContext,
         bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
-        <Self as FecProtocol<BroadcastTwostepFec>>::process_broadcast(bcast, ctx, bcast_id).await
+        let (info, mut resend) =
+            <Self as FecProtocol<BroadcastTwostepFec>>::process_broadcast(bcast, ctx, bcast_id)
+                .await?;
+        if resend {
+            let Some(bcast) = ctx.overlay.owned_broadcasts.get(bcast_id) else {
+                return Ok((info, false));
+            };
+            let Some(transfer) = Self::unwrap_transfer(bcast.val()) else {
+                return Ok((info, false));
+            };
+            resend = ctx.peers.other() == &transfer.src_key_id;
+        }
+        Ok((info, resend))
     }
 
     // Send side
@@ -1748,7 +1783,13 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
         let Some(send_ctx) = self.send_ctx.as_ref() else {
             fail!("No send context set for {} broadcast", Self::broadcast_type());
         };
-        <Self as BroadcastTwostep>::calc_broadcast_id_when_send(ctx, date, send_ctx.part_size)
+        <Self as BroadcastTwostep>::calc_broadcast_id_when_send(
+            ctx,
+            date,
+            ctx.data.object.len(),
+            send_ctx.part_size,
+            self.extra.as_deref().unwrap_or_default(),
+        )
     }
 
     fn build_broadcast(
@@ -1785,7 +1826,8 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
             bcast_id: *bcast_id,
             data_hash: sha256_digest(ctx.data.object),
             date,
-            encoder: RaptorqEncoder::with_data(ctx.data.object, Some(send_ctx.part_size as u16)),
+            encoder: RaptorqEncoder::with_data(ctx.data.object, Some(send_ctx.part_size as u32)),
+            extra: self.extra.take().unwrap_or_default(),
             flags: ctx.flags,
             seqno: 0,
             src_key: ctx.src_key.clone(),
@@ -1870,6 +1912,7 @@ impl FecProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
             data_size: transfer.encoder.params().data_size as i32,
             seqno: transfer.seqno as i32,
             part: data,
+            extra: transfer.extra.clone(),
             signature,
         }
         .into_boxed())
@@ -1877,14 +1920,13 @@ impl FecProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
 
     fn calc_to_sign(
         bcast_id: &BroadcastId,
-        data_size: usize,
+        _data_size: usize,
         part_data: &[u8],
         seqno: u32,
         _date: i32,
     ) -> Result<Vec<u8>> {
         let to_sign = BroadcastTwostepFecToSign {
             id: UInt256::from_slice(bcast_id),
-            data_size: data_size as i32,
             seqno: seqno as i32,
             part: part_data.to_vec(),
         };
@@ -1916,12 +1958,16 @@ impl BroadcastParsed for BroadcastTwostepSimple {
 }
 
 pub(crate) struct BroadcastTwostepSimpleProtocol {
-    big_data: bool,
+    extra: Option<Vec<u8>>,
+    reliable: bool,
 }
 
 impl BroadcastTwostepSimpleProtocol {
-    pub(crate) fn new(big_data: bool) -> Self {
-        Self { big_data }
+    pub(crate) fn for_recv(reliable: bool) -> Self {
+        Self { reliable, extra: None }
+    }
+    pub(crate) fn for_send(reliable: bool, extra: Vec<u8>) -> Self {
+        Self { reliable, extra: Some(extra) }
     }
     fn calc_to_sign(bcast_id: BroadcastId, data: &[u8]) -> Result<Vec<u8>> {
         let to_sign =
@@ -1958,8 +2004,8 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
     }
 
     fn send_method(&self) -> BroadcastSendMethod {
-        if self.big_data {
-            BroadcastSendMethod::Rldp
+        if self.reliable {
+            BroadcastSendMethod::QuicOrRldp
         } else {
             BroadcastSendMethod::Fast
         }
@@ -1973,15 +2019,18 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
         ctx: &BroadcastRecvContext,
     ) -> Result<BroadcastCheckInfo> {
         let data_hash = sha256_digest(&bcast.data);
+        let data_size = bcast.data.len();
         let src_key: Arc<dyn KeyOption> = (&bcast.src).try_into()?;
         let src_adnl_key_id = KeyId::from_data(*bcast.src_adnl_id.as_slice());
         let bcast_id = <Self as BroadcastTwostep>::calc_broadcast_id(
             data_hash,
             bcast.date,
-            bcast.data.len(),
+            data_size,
+            data_size,
             &src_key,
             &src_adnl_key_id,
             bcast.flags as u32,
+            &bcast.extra,
         )?;
         let dup = if add_unbound_object_to_map(&ctx.overlay.owned_broadcasts, bcast_id, || {
             Ok(OwnedBroadcast::Send)
@@ -2016,8 +2065,12 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
         let src_adnl_key_id = KeyId::from_data(*bcast.src_adnl_id.as_slice());
         let resend = ctx.peers.other() == &src_adnl_key_id;
-        let info =
-            BroadcastRecvInfo { packets: 1, data: bcast.data.into(), recv_from: src_adnl_key_id };
+        let info = BroadcastRecvInfo {
+            packets: 1,
+            data: bcast.data.into(),
+            extra: Some(bcast.extra),
+            recv_from: src_adnl_key_id,
+        };
         Ok((Some(info), resend))
     }
 
@@ -2028,7 +2081,14 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
         ctx: &BroadcastSendContext,
         date: i32,
     ) -> Result<(BroadcastId, bool)> {
-        <Self as BroadcastTwostep>::calc_broadcast_id_when_send(ctx, date, ctx.data.object.len())
+        let data_size = ctx.data.object.len();
+        <Self as BroadcastTwostep>::calc_broadcast_id_when_send(
+            ctx,
+            date,
+            data_size,
+            data_size,
+            self.extra.as_deref().unwrap_or_default(),
+        )
     }
 
     fn build_broadcast(
@@ -2049,6 +2109,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
                 src_adnl_id: UInt256::from_slice(ctx.src_adnl_key_id.data()),
                 certificate: OverlayCertificate::Overlay_EmptyCertificate,
                 data,
+                extra: self.extra.take().unwrap_or_default(),
                 signature,
             }
             .into_boxed(),

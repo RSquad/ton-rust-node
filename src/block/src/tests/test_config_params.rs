@@ -933,10 +933,14 @@ fn test_accelerated_consensus_config() {
 #[test]
 fn test_simplex_config() {
     let config = SimplexConfig {
-        target_rate_ms: 300,
         slots_per_leader_window: 4,
-        first_block_timeout_ms: 1000,
-        max_leader_window_desync: 100,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 300,
+            first_block_timeout_ms: 1000,
+            max_leader_window_desync: 100,
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
     let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
@@ -944,18 +948,45 @@ fn test_simplex_config() {
 }
 
 #[test]
+fn test_simplex_config_with_quic() {
+    let config = SimplexConfig {
+        use_quic: true,
+        slots_per_leader_window: 4,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 300,
+            first_block_timeout_ms: 1000,
+            max_leader_window_desync: 100,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config, config2);
+    assert!(config2.use_quic);
+}
+
+#[test]
 fn test_new_consensus_config_all_both() {
     let mc_config = SimplexConfig {
-        target_rate_ms: 300,
         slots_per_leader_window: 4,
-        first_block_timeout_ms: 1000,
-        max_leader_window_desync: 100,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 300,
+            first_block_timeout_ms: 1000,
+            max_leader_window_desync: 100,
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let shard_config = SimplexConfig {
-        target_rate_ms: 200,
         slots_per_leader_window: 8,
-        first_block_timeout_ms: 500,
-        max_leader_window_desync: 50,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 200,
+            first_block_timeout_ms: 500,
+            max_leader_window_desync: 50,
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let config = NewConsensusConfigAll { mc: Some(mc_config), shard: Some(shard_config) };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
@@ -966,10 +997,14 @@ fn test_new_consensus_config_all_both() {
 #[test]
 fn test_new_consensus_config_all_shard_only() {
     let shard_config = SimplexConfig {
-        target_rate_ms: 200,
         slots_per_leader_window: 8,
-        first_block_timeout_ms: 500,
-        max_leader_window_desync: 50,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 200,
+            first_block_timeout_ms: 500,
+            max_leader_window_desync: 50,
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let config = NewConsensusConfigAll { mc: None, shard: Some(shard_config) };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
@@ -980,10 +1015,14 @@ fn test_new_consensus_config_all_shard_only() {
 #[test]
 fn test_new_consensus_config_all_mc_only() {
     let mc_config = SimplexConfig {
-        target_rate_ms: 300,
         slots_per_leader_window: 4,
-        first_block_timeout_ms: 1000,
-        max_leader_window_desync: 100,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 300,
+            first_block_timeout_ms: 1000,
+            max_leader_window_desync: 100,
+            ..Default::default()
+        },
+        ..Default::default()
     };
     let config = NewConsensusConfigAll { mc: Some(mc_config), shard: None };
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
@@ -997,4 +1036,148 @@ fn test_new_consensus_config_all_empty() {
     let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
     let config2 = NewConsensusConfigAll::construct_from_cell(cell).unwrap();
     assert_eq!(config, config2);
+}
+
+// ===================== simplex_config v2 serialization tests =====================
+
+#[test]
+fn test_simplex_config_v2_round_trip() {
+    let config = SimplexConfig {
+        use_quic: true,
+        slots_per_leader_window: 8,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 2400,
+            first_block_timeout_ms: 1000,
+            max_leader_window_desync: 250,
+            candidate_resolve_rate_limit: 10,
+            min_block_interval_ms: 333,
+            no_empty_blocks_on_error_timeout_ms: 22_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config, config2);
+}
+
+#[test]
+fn test_simplex_config_default_round_trip() {
+    let config = SimplexConfig::default();
+    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config, config2);
+}
+
+#[test]
+fn test_simplex_config_custom_noncritical_params() {
+    let config = SimplexConfig {
+        use_quic: true,
+        slots_per_leader_window: 6,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 500,
+            first_block_timeout_ms: 2000,
+            max_leader_window_desync: 100,
+            first_block_timeout_multiplier_bits: (1.5f32).to_bits(),
+            bad_signature_ban_duration_ms: 10_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let cell = config.write_to_new_cell().unwrap().into_cell().unwrap();
+    let config2 = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert_eq!(config, config2);
+}
+
+// ===================== v1 deserialization backward-compat tests =====================
+
+/// Build a raw simplex_config#21 cell by hand (the legacy on-chain format).
+fn build_v1_cell(use_quic: bool, target_rate_ms: u32, slots: u32, fbt_ms: u32, mld: u32) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_u8(0x21).unwrap();
+    b.append_u8(if use_quic { 1 } else { 0 }).unwrap();
+    target_rate_ms.write_to(&mut b).unwrap();
+    slots.write_to(&mut b).unwrap();
+    fbt_ms.write_to(&mut b).unwrap();
+    mld.write_to(&mut b).unwrap();
+    b.into_cell().unwrap()
+}
+
+#[test]
+fn test_deserialize_v1_cell() {
+    let cell = build_v1_cell(false, 300, 4, 1000, 100);
+    let config = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert!(!config.use_quic);
+    assert_eq!(config.slots_per_leader_window, 4);
+    assert_eq!(config.noncritical_params.target_rate_ms, 300);
+    assert_eq!(config.noncritical_params.first_block_timeout_ms, 1000);
+    assert_eq!(config.noncritical_params.max_leader_window_desync, 100);
+    let d = NoncriticalParams::default();
+    assert_eq!(
+        config.noncritical_params.first_block_timeout_multiplier_bits,
+        d.first_block_timeout_multiplier_bits
+    );
+}
+
+#[test]
+fn test_deserialize_v1_cell_with_quic() {
+    let cell = build_v1_cell(true, 300, 4, 1000, 100);
+    let config = SimplexConfig::construct_from_cell(cell).unwrap();
+    assert!(config.use_quic);
+}
+
+#[test]
+fn test_new_consensus_config_all_with_v2() {
+    let config = SimplexConfig {
+        use_quic: true,
+        slots_per_leader_window: 8,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 2400,
+            first_block_timeout_ms: 1000,
+            max_leader_window_desync: 250,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let all = NewConsensusConfigAll { mc: Some(config.clone()), shard: Some(config.clone()) };
+    let cell = all.write_to_new_cell().unwrap().into_cell().unwrap();
+    let parsed = NewConsensusConfigAll::construct_from_cell(cell).unwrap();
+    assert_eq!(parsed.mc.unwrap(), config);
+    assert_eq!(parsed.shard.unwrap(), config);
+}
+
+#[test]
+fn test_new_consensus_config_all_mixed_v1_mc_v2_shard() {
+    let mc_cell = build_v1_cell(false, 300, 4, 1000, 100);
+    let shard_config = SimplexConfig {
+        slots_per_leader_window: 6,
+        noncritical_params: NoncriticalParams {
+            target_rate_ms: 500,
+            first_block_timeout_ms: 2000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let shard_cell = shard_config.write_to_new_cell().unwrap().into_cell().unwrap();
+
+    let mut builder = BuilderData::new();
+    builder.append_u8(0x10).unwrap();
+    builder.append_bit_one().unwrap();
+    builder.checked_append_reference(mc_cell).unwrap();
+    builder.append_bit_one().unwrap();
+    builder.checked_append_reference(shard_cell).unwrap();
+    let cell = builder.into_cell().unwrap();
+
+    let parsed = NewConsensusConfigAll::construct_from_cell(cell).unwrap();
+    let mc = parsed.mc.unwrap();
+    assert_eq!(mc.noncritical_params.target_rate_ms, 300);
+
+    let shard = parsed.shard.unwrap();
+    assert_eq!(shard.noncritical_params.target_rate_ms, 500);
+    assert_eq!(shard.noncritical_params.first_block_timeout_ms, 2000);
+    assert_eq!(
+        shard.noncritical_params.max_leader_window_desync,
+        NoncriticalParams::default().max_leader_window_desync
+    );
 }

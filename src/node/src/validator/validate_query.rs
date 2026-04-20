@@ -28,6 +28,7 @@ use crate::{
     },
     validator::{
         out_msg_queue::{MsgQueueManager, StatesManager},
+        validator_group::PipelineContext,
         validator_utils::calc_subset_for_masterchain,
         BlockCandidate, McData,
     },
@@ -39,30 +40,31 @@ use std::fs;
 use std::{
     collections::HashMap,
     mem,
+    ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Instant,
 };
 #[cfg(test)]
 use ton_block::{base64_encode, write_boc, UsageTree};
-#[cfg(feature = "xp25")]
-use ton_block::{fail, ShardDescr, SHARD_FULL};
 use ton_block::{
-    read_boc, Account, AccountBlock, AccountDispatchQueue, AccountId, AccountIdPrefixFull,
+    fail, read_boc, Account, AccountBlock, AccountDispatchQueue, AccountId, AccountIdPrefixFull,
     AccountStatus, AccountStorageDictProof, AddSub, Block, BlockCreateStats, BlockError,
     BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, Coins, ConfigParamEnum,
-    ConfigParams, Counters, CreatorStats, CurrencyCollection, DepthBalanceInfo, Deserializable,
-    EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities, HashmapAugType, HashmapType, InMsg,
-    InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries, McBlockExtra, McShardRecord,
-    McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope, MsgMetadata,
-    OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable, ShardAccount, ShardAccountBlocks,
-    ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent, ShardStateUnsplit, SizeLimitsConfig,
-    SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase, Transaction, TransactionDescr,
-    UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID,
-    MAX_SPLIT_DEPTH,
+    ConfigParams, ConsensusExtraData, Counters, CreatorStats, CurrencyCollection, DepthBalanceInfo,
+    Deserializable, EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities, HashmapAugType,
+    HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries, McBlockExtra,
+    McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope,
+    MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable, ShardAccount,
+    ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent, ShardStateUnsplit,
+    SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase, Transaction,
+    TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr,
+    INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
 };
+#[cfg(feature = "xp25")]
+use ton_block::{ShardDescr, SHARD_FULL};
 use ton_executor::{
     BlockchainConfig, ExecuteParams, OrdinaryTransactionExecutor, TickTockTransactionExecutor,
     TransactionExecutor,
@@ -115,6 +117,7 @@ struct ValidateResult {
     removed_dispatch_queue_messages: lockfree::map::Map<(AccountId, u64), Cell>,
     new_dispatch_queue_messages: lockfree::map::Map<(AccountId, u64), Cell>,
     account_expected_defer_all_messages: lockfree::set::Set<AccountId>,
+    blackhole_burned: Mutex<Coins>,
 }
 
 impl Default for ValidateResult {
@@ -135,6 +138,7 @@ impl Default for ValidateResult {
             removed_dispatch_queue_messages: lockfree::map::Map::new(),
             new_dispatch_queue_messages: lockfree::map::Map::new(),
             account_expected_defer_all_messages: lockfree::set::Set::new(),
+            blackhole_burned: Mutex::new(Coins::default()),
         }
     }
 }
@@ -142,6 +146,7 @@ impl Default for ValidateResult {
 struct ValidateBase {
     global_id: i32,
     is_fake: bool,
+    is_simplex: bool,
     created_by: UInt256,
     after_merge: bool,
     after_split: bool,
@@ -167,6 +172,7 @@ struct ValidateBase {
     virt_states: HashMap<UInt256, ShardStateUnsplit>, // prev state and neighbour out msg queues proofs by block root hash
     storage_dict_proofs: HashMap<UInt256, Cell>,
     full_collated_data: bool,
+    now_ms: Option<u64>, // gen_utime_ms from ConsensusExtraData (simplex consensus)
 
     gas_used: Arc<AtomicU64>,
     transactions_executed: Arc<AtomicU32>,
@@ -257,6 +263,7 @@ pub struct ValidateQuery {
     validator_set: ValidatorSet,
     is_fake: bool,
     multithread: bool,
+    is_simplex: bool,
     // previous state can be as two states for merge
     prev_blocks_ids: Vec<BlockIdExt>,
     old_mc_shards: ShardHashes, // old_shard_conf_
@@ -270,6 +277,10 @@ pub struct ValidateQuery {
     block_create_count: HashMap<UInt256, u64>,
 
     engine: Arc<dyn EngineOperations>,
+
+    /// In-memory pipeline of recently collated states (accelerated consensus / Simplex).
+    /// Used to find prev states that haven't been persisted to DB yet.
+    pipeline_context: PipelineContext,
 
     next_block_descr: Arc<String>,
 }
@@ -290,11 +301,13 @@ impl ValidateQuery {
         shard: ShardIdent,
         min_mc_seqno: u32,
         prev_blocks_ids: Vec<BlockIdExt>,
+        pipeline_context: PipelineContext,
         block_candidate: BlockCandidate,
         validator_set: ValidatorSet,
         engine: Arc<dyn EngineOperations>,
         is_fake: bool,
         multithread: bool,
+        is_simplex: bool,
     ) -> Self {
         let next_block_descr = Arc::new(fmt_next_block_descr(&block_candidate.block_id));
         Self {
@@ -305,6 +318,7 @@ impl ValidateQuery {
             validator_set,
             is_fake,
             multithread,
+            is_simplex,
             prev_blocks_ids,
             old_mc_shards: Default::default(),
             // new state after applying block_candidate
@@ -313,6 +327,7 @@ impl ValidateQuery {
             create_stats_enabled: Default::default(),
             block_create_total: Default::default(),
             block_create_count: Default::default(),
+            pipeline_context,
             next_block_descr,
         }
     }
@@ -327,6 +342,7 @@ impl ValidateQuery {
         let mut base = ValidateBase {
             next_block_descr: self.next_block_descr.clone(),
             is_fake: self.is_fake,
+            is_simplex: self.is_simplex,
             created_by: self.block_candidate.created_by.clone(),
             prev_blocks_ids: mem::take(&mut self.prev_blocks_ids),
             ..Default::default()
@@ -443,6 +459,8 @@ impl ValidateQuery {
                     self.engine.engine_telemetry(),
                     self.engine.engine_allocated(),
                 )?
+            } else if let Some(state) = self.pipeline_context.try_get_state(block_id) {
+                state
             } else {
                 self.engine.clone().wait_state(block_id, Some(1_000), true).await?
             };
@@ -626,17 +644,55 @@ impl ValidateQuery {
                         if let Some(BlockError::InvalidConstructorTag { t: _, s: _ }) =
                             err.downcast_ref()
                         {
-                            let dict_proof =
-                                AccountStorageDictProof::construct_from_cell(croot.clone())?;
-                            log::debug!(
-                                target: "validate_query",
-                                "({}): collated datum # {idx} is an AccountStorageDictProof",
-                                base.next_block_descr
-                            );
-                            let dict_proof = MerkleProof::construct_from_cell(dict_proof.proof)?;
-                            base.storage_dict_proofs
-                                .insert(dict_proof.hash, dict_proof.proof.virtualize(1));
-                            base.full_collated_data = true;
+                            // Try AccountStorageDictProof first
+                            match AccountStorageDictProof::construct_from_cell(croot.clone()) {
+                                Ok(dict_proof) => {
+                                    log::debug!(
+                                        target: "validate_query",
+                                        "({}): collated datum # {idx} is an AccountStorageDictProof",
+                                        base.next_block_descr
+                                    );
+                                    let dict_proof =
+                                        MerkleProof::construct_from_cell(dict_proof.proof)?;
+                                    base.storage_dict_proofs
+                                        .insert(dict_proof.hash, dict_proof.proof.virtualize(1));
+                                    base.full_collated_data = true;
+                                }
+                                Err(_) => {
+                                    // Try ConsensusExtraData
+                                    match ConsensusExtraData::construct_from_cell(croot.clone()) {
+                                        Ok(extra) => {
+                                            log::debug!(
+                                                target: "validate_query",
+                                                "({}): collated datum # {idx} is a ConsensusExtraData, gen_utime_ms={}",
+                                                base.next_block_descr,
+                                                extra.gen_utime_ms
+                                            );
+                                            if base.now_ms.is_some() {
+                                                reject_query!(
+                                                    "duplicate ConsensusExtraData in collated data"
+                                                )
+                                            }
+                                            // Check: ConsensusExtraData is only valid when simplex is enabled
+                                            if !base.is_simplex {
+                                                reject_query!("unexpected ConsensusExtraData")
+                                            }
+                                            base.now_ms = Some(extra.gen_utime_ms);
+                                        }
+                                        Err(_) => {
+                                            let tag = SliceData::load_cell_ref(croot)?
+                                                .get_next_u32()
+                                                .unwrap_or(0);
+                                            log::warn!(
+                                                target: "validate_query",
+                                                "({}): collated datum # {idx} has unknown type (tag {:#010x}), ignoring",
+                                                base.next_block_descr,
+                                                tag
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             return Err(err);
                         }
@@ -880,7 +936,11 @@ impl ValidateQuery {
      *
      */
 
-    fn compute_next_state(&mut self, base: &mut ValidateBase, mc_data: &McData) -> Result<()> {
+    async fn compute_next_state(
+        &mut self,
+        base: &mut ValidateBase,
+        mc_data: &McData,
+    ) -> Result<()> {
         let prev_state = base.prev_states[0].clone();
         base.prev_state = Some(prev_state.clone());
         let prev_state_root = if base.after_merge && base.prev_states.len() == 2 {
@@ -895,9 +955,33 @@ impl ValidateQuery {
             base.prev_states[0].root_cell().clone()
         };
         log::debug!(target: "validate_query", "({}): computing next state", self.next_block_descr);
-        let next_state_root = base.state_update.apply_for(&prev_state_root).map_err(|err| {
-            error!("cannot apply Merkle update from block to compute new state : {}", err)
-        })?;
+        let engine = self.engine.clone();
+        let state_update = base.state_update.clone();
+        let next_block_descr = self.next_block_descr.clone();
+        let is_fake = base.is_fake;
+        let (next_state_root, _) = tokio::task::spawn_blocking(move || {
+            let fast_result = if is_fake {
+                Err(error!("not supported in test env"))
+            } else {
+                engine.db_cells_factory()
+                    .and_then(|cf| engine.db_cells_loader().map(|cl| (cf, cl)))
+                    .and_then(|(cf, cl)| {
+                        state_update.apply_for_ex(&prev_state_root, &cf, cl.deref())
+                    })
+            };
+            match fast_result {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    log::debug!(
+                        "({}): Failed the fast attempt of Merkle update applying: {}. Trying classic approach...",
+                        next_block_descr, e
+                    );
+                    state_update.apply_for(&prev_state_root).map_err(|err| {
+                        error!("cannot apply Merkle update from block to compute new state : {}", err)
+                    })
+                }
+            }
+        }).await??;
         log::debug!(target: "validate_query", "({}): next state computed", self.next_block_descr);
         let next_state = ShardStateStuff::from_root_cell(
             base.block_id().clone(),
@@ -2022,30 +2106,19 @@ impl ValidateQuery {
 
     fn check_utime_lt(&self, base: &ValidateBase, mc_data: &McData) -> Result<()> {
         CHECK!(&base.config_params, inited);
+        // C++ parity: allow_same_timestamp_ = global_version_ >= 13.
+        // Depends only on the global protocol version, not on consensus type.
+        // When true, also skips the future-time check (base.now > engine.now + 15)
+        // which C++ simplex testnet does not have.
         let allow_same_timestamp = {
-            #[cfg(feature = "simplex")]
+            #[cfg(feature = "xp25")]
             {
-                let simplex_enabled_for_shard = if base.shard().is_masterchain() {
-                    base.config_params.get_mc_simplex_config().ok().flatten().is_some()
-                } else {
-                    base.config_params.get_shard_simplex_config().ok().flatten().is_some()
-                };
-
-                simplex_enabled_for_shard
-                //TODO: LK: enable after change block version to 13
-                //&& base.config_params.global_version()
-                //        >= super::SIMPLEX_ALLOW_SAME_TIMESTAMP_FROM_GLOBAL_VERSION
+                true
             }
-            #[cfg(not(feature = "simplex"))]
+            #[cfg(not(feature = "xp25"))]
             {
-                #[cfg(feature = "xp25")]
-                {
-                    true
-                }
-                #[cfg(not(feature = "xp25"))]
-                {
-                    false
-                }
+                base.config_params.global_version()
+                    >= super::SIMPLEX_ALLOW_SAME_TIMESTAMP_FROM_GLOBAL_VERSION
             }
         };
         let mut gen_lt = u64::MIN;
@@ -2089,14 +2162,19 @@ impl ValidateQuery {
             )
         }
 
-        let now = self.engine.now();
-        if base.now() > now + 15 {
-            reject_query!(
-                "block has creation time {} too much in the future (it is only {} now)",
-                base.now(),
-                now
-            )
+        // C++ parity: C++ variants (mainnet, simplex-testnet, alpenglow-work) do not
+        // reject blocks for being too far in the future. To stay compatible with blocks
+        // produced by C++ collators, we only emit a warning instead of rejecting.
+        if !allow_same_timestamp {
+            let now = self.engine.now();
+            if base.now() > now + 15 {
+                log::warn!(
+                    "block has creation time {} too much in the future (local time is {now})",
+                    base.now(),
+                );
+            }
         }
+
         if base.info.start_lt() <= mc_data.state.state()?.gen_lt() {
             reject_query!(
                 "block has start_lt {} less than or equal to lt {} \
@@ -2133,6 +2211,19 @@ impl ValidateQuery {
                 base.info.end_lt() - base.info.start_lt(),
                 delta_hard
             )
+        }
+        if base.is_simplex {
+            match base.now_ms {
+                None => reject_query!("now_ms is not set"),
+                Some(now_ms) if now_ms / 1000 != base.info.gen_utime() as u64 => {
+                    reject_query!(
+                        "gen_utime is {}, but gen_utime_ms in ConsensusExtraData is {}",
+                        base.info.gen_utime(),
+                        now_ms
+                    )
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -2292,23 +2383,90 @@ impl ValidateQuery {
             )
         }
         let transaction_fees = base.account_blocks.full_transaction_fees();
+        let expected_fee_burned = Self::expected_fee_burned(&base, transaction_fees, &fees_import)?;
+        if !base.shard().is_masterchain() && !base.value_flow.burned.is_zero()? {
+            reject_query!(
+                "ValueFlow of block {} is invalid (non-zero burned value in a non-masterchain block)",
+                base.block_id()
+            )
+        }
+
         let mut expected_fees = transaction_fees.clone();
         expected_fees.add(&base.value_flow.fees_imported)?;
         expected_fees.add(&base.value_flow.created)?;
         expected_fees.add(&fees_import)?;
+        expected_fees.sub(&expected_fee_burned)?;
         if base.value_flow.fees_collected != expected_fees {
             reject_query!(
                 "ValueFlow for {} declares fees_collected={} but \
                 the total message import fees are {}, the total transaction fees are {}, \
                 creation fee for this block is {} and the total imported fees from shards \
-                are {} with a total of {}",
+                are {}, the burned fees are {} with a total of {}",
                 base.block_id(),
                 base.value_flow.fees_collected.coins,
                 fees_import,
                 transaction_fees.coins,
                 base.value_flow.created.coins,
                 base.value_flow.fees_imported.coins,
+                expected_fee_burned.coins,
                 expected_fees.coins
+            )
+        }
+        Ok(())
+    }
+
+    fn expected_fee_burned(
+        base: &ValidateBase,
+        transaction_fees: &CurrencyCollection,
+        fees_import: &CurrencyCollection,
+    ) -> Result<CurrencyCollection> {
+        if !base.shard().is_masterchain() {
+            return Ok(Default::default());
+        }
+        let Some(ConfigParamEnum::ConfigParam5(burning_cfg)) = base.config_params.config(5)? else {
+            return Ok(Default::default());
+        };
+
+        let total_fees = transaction_fees.coins.as_u128() + fees_import.coins.as_u128();
+        let mut burned = burning_cfg.calculate_burned_fees(total_fees)?;
+
+        let mut imported_base = base.value_flow.fees_imported.clone();
+        if !imported_base.sub(&base.mc_extra.fees().root_extra().create)? {
+            fail!(
+                "fees_imported ({}) is smaller than imported created fees ({})",
+                base.value_flow.fees_imported,
+                base.mc_extra.fees().root_extra().create
+            );
+        }
+        let burned_imported = burning_cfg.calculate_burned_fees(imported_base.coins.as_u128())?;
+        burned.add(&burned_imported)?;
+        Ok(CurrencyCollection::from_coins(burned))
+    }
+
+    fn check_burned_value_flow(base: &ValidateBase) -> Result<()> {
+        if !base.shard().is_masterchain() {
+            return Ok(());
+        }
+        let fees_import =
+            CurrencyCollection::from_coins(base.in_msg_descr.full_import_fees().fees_collected);
+        let mut expected_burned = Self::expected_fee_burned(
+            base,
+            base.account_blocks.full_transaction_fees(),
+            &fees_import,
+        )?;
+        expected_burned.coins.add(
+            &*base
+                .result
+                .blackhole_burned
+                .lock()
+                .map_err(|_| error!("blackhole burned accumulator is poisoned"))?,
+        )?;
+        if base.value_flow.burned != expected_burned {
+            reject_query!(
+                "ValueFlow of block {} declares burned fees {}, but the expected value is {}",
+                base.block_id(),
+                base.value_flow.burned.coins,
+                expected_burned
             )
         }
         Ok(())
@@ -3149,7 +3307,7 @@ impl ValidateQuery {
         };
         let (workchain_id, addr) = dst.extract_std_address(true).map_err(|err| {
             error!(
-                "destination of inbound internal message with hash {key:x} \
+                "destination {dst} of inbound internal message with hash {key:x} \
                 is an invalid blockchain address {err}"
             )
         })?;
@@ -3337,9 +3495,15 @@ impl ValidateQuery {
         }
 
         if from_dispatch_queue {
+            let (_, addr) = src.extract_std_address(true).map_err(|err| {
+                error!(
+                    "source {src} of deferred inbound message with hash {key:x} \
+                    is an invalid blockchain address {err}"
+                )
+            })?;
             // Check that the message was removed from DispatchQueue
             let Some(dispatched_msg_env_cell) =
-                base.removed_dispatch_queue_messages(src.address(), created_lt)
+                base.removed_dispatch_queue_messages(&addr, created_lt)
             else {
                 reject_query!(
                     "deferred InMsg with src_addr={addr:x} lt={created_lt} was not removed from \
@@ -5344,6 +5508,7 @@ impl ValidateQuery {
         let old_account_root = account_root.clone();
         #[cfg(test)]
         let mut our_trans = None;
+        let mut blackhole_burned = Coins::default();
         let mut error = None;
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
@@ -5381,6 +5546,14 @@ impl ValidateQuery {
                         base.gas_used.fetch_add(compute_ph.gas_used.as_u64(), Ordering::Relaxed);
                     }
                     base.transactions_executed.fetch_add(1, Ordering::Relaxed);
+                    blackhole_burned = trans_execute.blackhole_burned().clone();
+                    if !blackhole_burned.is_zero() {
+                        base.result
+                            .blackhole_burned
+                            .lock()
+                            .map_err(|_| error!("blackhole burned accumulator is poisoned"))?
+                            .add(&blackhole_burned)?;
+                    }
 
                     // we cannot know prev transaction in executor
                     trans_execute.set_prev_trans_hash(trans.prev_trans_hash().clone());
@@ -5406,18 +5579,20 @@ impl ValidateQuery {
             let mut right_balance = new_balance.clone();
             right_balance.add(&money_exported)?;
             right_balance.add(trans.total_fees())?;
+            right_balance.coins.add(&blackhole_burned)?;
             if left_balance != right_balance {
                 error = Some(error!(
                     "transaction {} of {:x} violates the currency flow condition: \
                     old balance={} + imported={} does not equal new balance={} + exported=\
-                    {} + total_fees={}",
+                    {} + total_fees={} + burned={}",
                     lt,
                     account_addr,
                     old_balance.coins,
                     money_imported.coins,
                     new_balance.coins,
                     money_exported.coins,
-                    trans.total_fees().coins
+                    trans.total_fees().coins,
+                    blackhole_burned
                 ));
             }
         }
@@ -6649,7 +6824,7 @@ impl ValidateQuery {
         let mut base = self.init_base()?;
         let mc_data = self.init_mc_data(&mut base).await?;
         // stage 0
-        self.compute_next_state(&mut base, &mc_data)?;
+        self.compute_next_state(&mut base, &mc_data).await?;
         self.unpack_prev_state(&mut base)?;
         self.unpack_next_state(&mut base, &mc_data)?;
         base.prev_blocks_info = PrevBlocksInfo::Raw(
@@ -6750,6 +6925,7 @@ impl ValidateQuery {
         // Self::check_delivered_dequeued(&base, &manager)?;
         Self::check_all_ticktock_processed(&base)?;
         Self::check_message_processing_order(&mut base)?;
+        Self::check_burned_value_flow(&base)?;
         Self::check_new_state(&mut base, &mc_data, &manager)?;
         Self::check_mc_block_extra(&base, &mc_data)?;
         self.check_mc_state_extra(&base, &mc_data)?;
@@ -6774,7 +6950,7 @@ impl ValidateQuery {
 
     pub async fn try_validate(mut self) -> Result<Option<Arc<ShardStateStuff>>> {
         let block_id = self.block_candidate.block_id.clone();
-        log::trace!("({}): VALIDATE {}", self.next_block_descr, block_id);
+        log::info!("({}): VALIDATE {}", self.next_block_descr, block_id);
         let now = Instant::now();
 
         let result = self.validate().await;

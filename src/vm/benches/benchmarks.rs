@@ -241,7 +241,7 @@ fn bench_mergesort_tuple(c: &mut Criterion) {
             engine.execute().unwrap();
             assert_eq!(engine.gas_used(), 51_216_096);
             assert_eq!(engine.stack().depth(), 1);
-            assert_eq!(engine.stack().get(0), &expected);
+            assert_eq!(engine.stack().get(0).unwrap(), &expected);
         })
     });
 }

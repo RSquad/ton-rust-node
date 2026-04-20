@@ -665,11 +665,51 @@ impl StateParser {
     }
 
     fn parse_simplex_config(p: &PathMap) -> Result<SimplexConfig> {
+        let d = NoncriticalParams::default();
         Ok(SimplexConfig {
-            target_rate_ms: p.get_num32("target_rate_ms")?,
+            use_quic: p.get_num32("use_quic").unwrap_or(0) != 0,
             slots_per_leader_window: p.get_num32("slots_per_leader_window")?,
-            first_block_timeout_ms: p.get_num32("first_block_timeout_ms")?,
-            max_leader_window_desync: p.get_num32("max_leader_window_desync")?,
+            noncritical_params: NoncriticalParams {
+                target_rate_ms: p.get_num32("target_rate_ms")?,
+                first_block_timeout_ms: p.get_num32("first_block_timeout_ms")?,
+                first_block_timeout_multiplier_bits: p
+                    .get_num32("first_block_timeout_multiplier_bits")
+                    .unwrap_or(d.first_block_timeout_multiplier_bits),
+                first_block_timeout_cap_ms: p
+                    .get_num32("first_block_timeout_cap_ms")
+                    .unwrap_or(d.first_block_timeout_cap_ms),
+                candidate_resolve_timeout_ms: p
+                    .get_num32("candidate_resolve_timeout_ms")
+                    .unwrap_or(d.candidate_resolve_timeout_ms),
+                candidate_resolve_timeout_multiplier_bits: p
+                    .get_num32("candidate_resolve_timeout_multiplier_bits")
+                    .unwrap_or(d.candidate_resolve_timeout_multiplier_bits),
+                candidate_resolve_timeout_cap_ms: p
+                    .get_num32("candidate_resolve_timeout_cap_ms")
+                    .unwrap_or(d.candidate_resolve_timeout_cap_ms),
+                candidate_resolve_cooldown_ms: p
+                    .get_num32("candidate_resolve_cooldown_ms")
+                    .unwrap_or(d.candidate_resolve_cooldown_ms),
+                standstill_timeout_ms: p
+                    .get_num32("standstill_timeout_ms")
+                    .unwrap_or(d.standstill_timeout_ms),
+                standstill_max_egress_bytes_per_s: p
+                    .get_num32("standstill_max_egress_bytes_per_s")
+                    .unwrap_or(d.standstill_max_egress_bytes_per_s),
+                max_leader_window_desync: p.get_num32("max_leader_window_desync")?,
+                bad_signature_ban_duration_ms: p
+                    .get_num32("bad_signature_ban_duration_ms")
+                    .unwrap_or(d.bad_signature_ban_duration_ms),
+                candidate_resolve_rate_limit: p
+                    .get_num32("candidate_resolve_rate_limit")
+                    .unwrap_or(d.candidate_resolve_rate_limit),
+                min_block_interval_ms: p
+                    .get_num32("min_block_interval_ms")
+                    .unwrap_or(d.min_block_interval_ms),
+                no_empty_blocks_on_error_timeout_ms: p
+                    .get_num32("no_empty_blocks_on_error_timeout_ms")
+                    .unwrap_or(d.no_empty_blocks_on_error_timeout_ms),
+            },
         })
     }
 

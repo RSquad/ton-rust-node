@@ -1239,7 +1239,7 @@ impl Account {
         let config_cell = data
             .checked_drain_reference()
             .map_err(|_| error!("config SMC data doesn't contain reference with config"))?;
-        Ok(ConfigParams::with_root(config_cell))
+        ConfigParams::with_root(config_cell)
     }
 }
 

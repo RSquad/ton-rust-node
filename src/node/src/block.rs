@@ -21,16 +21,19 @@ use ton_api::ton::{
         shardblocklink::ShardBlockLink,
         shardblockproof::ShardBlockProof,
         signature::Signature,
-        signatureset, BlockLink, SignatureSet,
+        signature_set::signatureset::{
+            Ordinary as TlSignatureSetOrdinary, Simplex as TlSignatureSetSimplex,
+        },
+        BlockLink, SignatureSet,
     },
     Bool,
 };
 use ton_block::{
     error, fail, read_single_root_boc, write_boc, AccountBlock, AccountId, AccountIdPrefixFull,
-    BlkPrevInfo, Block, BlockIdExt, BocReader, Cell, ConfigParams, CryptoSignaturePair,
-    Deserializable, ExtBlkRef, HashmapAugType, HashmapType, McStateExtra, MerkleProof,
-    OldMcBlocksInfo, Result, Serializable, ShardDescr, ShardIdent, ShardStateUnsplit, SliceData,
-    UInt256, UsageTree,
+    BlkPrevInfo, Block, BlockIdExt, BlockSignaturesVariant, BocReader, Cell, ConfigParams,
+    CryptoSignaturePair, Deserializable, ExtBlkRef, HashmapAugType, HashmapType, McStateExtra,
+    MerkleProof, OldMcBlocksInfo, Result, Serializable, ShardDescr, ShardIdent, ShardStateUnsplit,
+    SliceData, UInt256, UsageTree,
 };
 
 pub type ProofMode = i32;
@@ -503,12 +506,28 @@ fn sigset_from_proof_boc(id: &BlockIdExt, boc: &[u8]) -> Result<SignatureSet> {
             Ok(true)
         },
     )?;
-    let result = SignatureSet::LiteServer_SignatureSet(signatureset::SignatureSet {
-        validator_set_hash: block_sigs.validator_info().validator_list_hash_short as i32,
-        catchain_seqno: block_sigs.validator_info().catchain_seqno as i32,
-        signatures: out_sigs,
-    });
-    Ok(result)
+    let validator_set_hash = block_sigs.validator_info().validator_list_hash_short as i32;
+    let cc_seqno = block_sigs.validator_info().catchain_seqno as i32;
+
+    Ok(match block_sigs {
+        BlockSignaturesVariant::Ordinary(_) => {
+            SignatureSet::LiteServer_SignatureSet_Ordinary(TlSignatureSetOrdinary {
+                validator_set_hash,
+                catchain_seqno: cc_seqno,
+                signatures: out_sigs,
+            })
+        }
+        BlockSignaturesVariant::Simplex(simplex) => {
+            SignatureSet::LiteServer_SignatureSet_Simplex(TlSignatureSetSimplex {
+                cc_seqno,
+                validator_set_hash,
+                signatures: out_sigs,
+                session_id: simplex.session_id.clone(),
+                slot: simplex.slot as i32,
+                candidate: simplex.candidate_data_bytes()?,
+            })
+        }
+    })
 }
 
 async fn build_zs_config_proof(

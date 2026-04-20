@@ -9,6 +9,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 mod test_catchain_persistent_db;
+mod test_dynamic_boc_archive_db;
 mod test_dynamic_boc_rc_db;
 mod test_shardstate_db_async;
 
