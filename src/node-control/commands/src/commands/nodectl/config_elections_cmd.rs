@@ -38,6 +38,8 @@ pub enum ElectionsAction {
     Enable(EnableCmd),
     /// Disable elections for binding(s)
     Disable(DisableCmd),
+    /// Generate and assign a persistent ADNL address for a node
+    StaticAdnl(StaticAdnlCmd),
 }
 
 #[derive(clap::Args, Clone)]
@@ -92,6 +94,12 @@ pub struct DisableCmd {
     nodes: Vec<String>,
 }
 
+#[derive(clap::Args, Clone)]
+pub struct StaticAdnlCmd {
+    #[arg(short = 'n', long = "node", required = true, help = "Node name")]
+    node: String,
+}
+
 impl ElectionsCfgCmd {
     pub async fn run(
         &self,
@@ -106,6 +114,7 @@ impl ElectionsCfgCmd {
             ElectionsAction::MaxFactor(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Enable(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Disable(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::StaticAdnl(cmd) => cmd.run(url, token, config_path).await,
         }
     }
 }
@@ -333,6 +342,33 @@ impl DisableCmd {
         api_post(&base_url, "/v1/elections/exclude", token, &NodeListBody { nodes: &self.nodes })
             .await?;
         println!("{} Elections disabled for: {}", "OK".green().bold(), self.nodes.join(", "));
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StaticAdnlBody<'a> {
+    node: &'a str,
+}
+
+impl StaticAdnlCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let resp = api_post(
+            &base_url,
+            "/v1/elections/static-adnl",
+            token,
+            &StaticAdnlBody { node: &self.node },
+        )
+        .await?;
+        let parsed: serde_json::Value = serde_json::from_str(&resp)?;
+        let adnl_addr = parsed["result"]["adnl_addr"].as_str().unwrap_or("unknown");
+        println!("{} Static ADNL address for '{}': {}", "OK".green().bold(), self.node, adnl_addr);
         Ok(())
     }
 }

@@ -21,6 +21,7 @@ use common::{
 };
 use contracts::{NominatorWrapper, TonCoreNominatorWrapper, contract_provider};
 use control_client::client_adnl::ControlClientAdnl;
+use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use ton_block::MsgAddressInt;
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
@@ -311,6 +312,25 @@ pub struct EntityRefResponse {
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct OkResponse {
     pub ok: bool,
+}
+
+// --- Static ADNL ---
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct StaticAdnlRequest {
+    /// Node name for which to generate and assign a persistent ADNL address.
+    pub node: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct StaticAdnlDto {
+    pub adnl_addr: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct StaticAdnlResponse {
+    pub ok: bool,
+    pub result: StaticAdnlDto,
 }
 
 // --- Elections settings mutation ---
@@ -1674,4 +1694,64 @@ pub async fn v1_log_set_handler(
     let log = config.log.as_ref().cloned().unwrap_or_default();
     let dto = log_config_to_dto(&log);
     Ok(axum::Json(LogResponse { ok: true, result: dto }))
+}
+
+// ---------------------------------------------------------------------------
+// Static ADNL
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/v1/elections/static-adnl",
+    request_body = StaticAdnlRequest,
+    responses(
+        (status = 200, description = "Static ADNL address generated and saved", body = StaticAdnlResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_elections_static_adnl_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<StaticAdnlRequest>,
+) -> Result<axum::Json<StaticAdnlResponse>, AppError> {
+    let node_name = req.0.node;
+
+    let cfg = state.runtime_cfg.get();
+    if cfg.elections.is_none() {
+        return Err(AppError::bad_request("elections are not configured"));
+    }
+    if !cfg.nodes.contains_key(&node_name) {
+        return Err(AppError::bad_request(format!("node '{}' not found", node_name)));
+    }
+    drop(cfg);
+
+    let mut adnl_configs = state.runtime_cfg.node_adnl_configs().await;
+    let adnl_config = adnl_configs
+        .remove(&node_name)
+        .ok_or_else(|| AppError::bad_request(format!("node '{}' ADNL config error", node_name)))?;
+
+    let mut provider = DefaultElectionsProvider::new(adnl_config);
+    let key_id = provider
+        .generate_adnl_addr()
+        .await
+        .map_err(|e| AppError::internal(format!("generate_adnl_addr: {e}")))?;
+    let _ = provider.shutdown().await;
+
+    let adnl_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key_id);
+
+    let node = node_name.clone();
+    let b64 = adnl_b64.clone();
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            let elections = cfg.elections.get_or_insert_with(ElectionsConfig::default);
+            elections.static_adnls.insert(node, b64);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
+
+    tracing::info!("node [{}] static ADNL address set: {}", node_name, adnl_b64);
+    Ok(axum::Json(StaticAdnlResponse { ok: true, result: StaticAdnlDto { adnl_addr: adnl_b64 } }))
 }
