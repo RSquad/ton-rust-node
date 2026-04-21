@@ -27,7 +27,7 @@ use ton_api::{
     },
     BoxedSerialize,
 };
-use ton_block::{fail, KeyId, KeyOption, Result, ShardIdent, ValidatorSet};
+use ton_block::{fail, KeyId, KeyOption, Result, ShardIdent, ValidatorDescr};
 
 const MAX_FAST_SYNC_OVERLAY_CLIENTS: usize = 5;
 
@@ -36,12 +36,13 @@ pub struct FastSyncOverlayClient {
     shard: ShardIdent,
     client: Arc<OverlayClient>,
     engine: Arc<dyn EngineOperations>,
+    use_twostep: bool,
 }
 
 impl FastSyncOverlayClient {
     pub async fn new(
         shard: ShardIdent,
-        validators: &ValidatorSet,
+        validators: &[ValidatorDescr],
         key: Option<&Arc<dyn KeyOption>>,
         certificate: Option<MemberCertificate>,
         cancellation_token: tokio_util::sync::CancellationToken,
@@ -49,10 +50,13 @@ impl FastSyncOverlayClient {
         engine: Arc<dyn EngineOperations>,
         policy: DhtSearchPolicy,
         default_rldp_roundtrip: Option<u32>,
+        use_quic: bool,
     ) -> Result<Arc<Self>> {
-        let mut root_members = Vec::new();
-        for vd in validators.list() {
-            root_members.push(vd.adnl_addr().clone());
+        let mut root_adnl_ids = Vec::with_capacity(validators.len());
+        let mut root_public_keys = Vec::with_capacity(validators.len());
+        for vd in validators {
+            root_adnl_ids.push(vd.adnl_addr().clone());
+            root_public_keys.push(vd.public_key.pub_key().id().clone());
         }
         let id = ton_api::ton::ton_node::fastsyncoverlayid::FastSyncOverlayId {
             zero_state_file_hash: engine.zerostate_id()?.file_hash().clone(),
@@ -62,6 +66,13 @@ impl FastSyncOverlayClient {
         let overlay_key = OverlayKey { name: id_full.clone().into() };
         let id_short = OverlayShortId::from_data(hash(overlay_key)?);
 
+        let use_twostep = use_quic && network_context.stack.quic.is_some() && key.is_some();
+        if use_quic && !use_twostep {
+            log::warn!(
+                "Fast sync overlay {id_short}: use_quic=true but QUIC or key not available"
+            );
+        }
+
         log::info!(
             "Creating fast sync overlay client for shard {shard}, id: {id_short}, adnl id: {}",
             key.map(|k| k.id().to_string()).unwrap_or_default()
@@ -70,7 +81,8 @@ impl FastSyncOverlayClient {
         let client = OverlayClient::new_semiprivate(
             id_short.clone(),
             id_full,
-            root_members,
+            root_adnl_ids,
+            root_public_keys,
             key,
             certificate,
             network_context,
@@ -78,10 +90,11 @@ impl FastSyncOverlayClient {
             policy,
             default_rldp_roundtrip,
             MAX_FAST_SYNC_OVERLAY_CLIENTS,
+            use_twostep,
         )
         .await?;
 
-        let result = Arc::new(Self { id: id_short, shard, client, engine });
+        let result = Arc::new(Self { id: id_short, shard, client, engine, use_twostep });
 
         result.clone().listen_broadcasts(cancellation_token.clone());
 
@@ -262,5 +275,39 @@ impl FastSyncOverlayClient {
                 Err(e)
             }
         }
+    }
+
+    pub async fn send_twostep_broadcast(
+        &self,
+        data: &TaggedByteSlice<'_>,
+        flags: u32,
+    ) -> Result<()> {
+        match self
+            .client
+            .broadcast_twostep(data, None, flags | OverlayNode::FLAG_BCAST_ANY_SENDER)
+            .await
+        {
+            Ok(info) => {
+                #[cfg(feature = "telemetry")]
+                log::debug!(
+                    "sent twostep broadcast {:08x} in {} to {} nodes",
+                    data.tag,
+                    self.id,
+                    info.send_to
+                );
+                #[cfg(not(feature = "telemetry"))]
+                log::debug!("sent twostep broadcast in {} to {} nodes", self.id, info.send_to);
+
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("Error sending twostep broadcast: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn use_twostep(&self) -> bool {
+        self.use_twostep
     }
 }

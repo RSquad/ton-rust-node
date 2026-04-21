@@ -1373,7 +1373,17 @@ async fn test_overlay_semiprivate() -> Result<()> {
 
         adnl.start_over_udp(vec![pi.overlay.clone().unwrap()]).await.unwrap();
         let params = OverlayParams::with_id_only(overlay_id);
-        assert!(overlay.add_semiprivate_overlay(params, Some(&pi.key), roots, None, 1)?);
+        // In this test the overlay key serves both as ADNL id and as cert signer,
+        // so root_adnl_ids == root_public_keys.
+        assert!(overlay.add_semiprivate_overlay(
+            params,
+            Some(&pi.key),
+            roots,
+            roots,
+            None,
+            1,
+            false
+        )?);
         overlay
             .add_consumer(overlay_id, Arc::new(TestConsumer { received: pi.received.clone() }))?;
 
@@ -1428,7 +1438,17 @@ async fn test_overlay_semiprivate() -> Result<()> {
 
         pi.certificate = Some(cert.clone());
         let params = OverlayParams::with_id_only(overlay_id);
-        assert!(overlay.add_semiprivate_overlay(params, Some(&pi.key), roots, Some(cert), 1)?);
+        // In this test the overlay key serves both as ADNL id and as cert signer,
+        // so root_adnl_ids == root_public_keys.
+        assert!(overlay.add_semiprivate_overlay(
+            params,
+            Some(&pi.key),
+            roots,
+            roots,
+            Some(cert),
+            1,
+            false
+        )?);
         overlay
             .add_consumer(overlay_id, Arc::new(TestConsumer { received: pi.received.clone() }))?;
 
