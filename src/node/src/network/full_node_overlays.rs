@@ -390,10 +390,8 @@ impl FullNodeOverlaysRouter {
         let this_vset = config.validator_set()?;
         let next_vset = config.next_validator_set()?;
         let key = self.try_get_our_key(&this_vset)?;
-        let mc_use_quic =
-            config.get_mc_simplex_config().ok().flatten().map_or(false, |c| c.use_quic);
-        let shard_use_quic =
-            config.get_shard_simplex_config().ok().flatten().map_or(false, |c| c.use_quic);
+        let mc_use_quic = config.get_mc_simplex_config()?.map_or(false, |c| c.use_quic);
+        let shard_use_quic = config.get_shard_simplex_config()?.map_or(false, |c| c.use_quic);
         self.update_fast_sync_overlays(
             &prev_vset,
             &this_vset,

@@ -604,18 +604,31 @@ impl Overlay {
     ) -> Vec<Arc<KeyId>> {
         let root_adnl_ids = match &self.overlay_type {
             OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
-            _ => None,
+            OverlayType::Private { .. } => None,
+            _ => {
+                let mut neighbours = Vec::new();
+                let (mut iter, mut neighbour) = self.neighbours.first();
+                while let Some(node) = neighbour {
+                    let skipped = skip.map_or(false, |skip| &node == skip);
+                    if !skipped {
+                        neighbours.push(node);
+                    }
+                    neighbour = self.neighbours.next(&mut iter);
+                }
+                return neighbours;
+            }
         };
         let mut neighbours = Vec::new();
-        let (mut iter, mut neighbour) = self.neighbours.first();
+        let mut iter = None;
+        let mut neighbour = self.known_peers.next(&mut iter);
         while let Some(node) = neighbour {
-            let skipped = if let Some(skip) = &skip { &node == *skip } else { false };
+            let skipped = skip.map_or(false, |skip| &node == skip);
             // Skip CertifiedMembers: only send twostep to root members (validators).
-            let root = if let Some(roots) = root_adnl_ids { roots.contains(&node) } else { true };
+            let root = root_adnl_ids.map_or(true, |roots| roots.contains(&node));
             if !skipped && root {
                 neighbours.push(node);
             }
-            neighbour = self.neighbours.next(&mut iter);
+            neighbour = self.known_peers.next(&mut iter);
         }
         neighbours
     }
@@ -1068,7 +1081,7 @@ impl Overlay {
             {
                 (*max_slaves, root_public_keys)
             } else {
-                fail!("Overlay type is not certificated members")
+                fail!("Overlay type is not certified members")
             };
 
         // 1) Expire check
