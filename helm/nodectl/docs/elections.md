@@ -9,7 +9,7 @@ How nodectl participates in TON validator elections.
 - [How elections work](#how-elections-work)
 - [Stake policies](#stake-policies)
 - [Per-node overrides](#per-node-overrides)
-- [Single Nominator Pool](#single-nominator-pool)
+- [Nominator Pools](#nominator-pools)
 - [Auto-deploy](#auto-deploy)
 - [Fee constants](#fee-constants)
 - [Managing elections](#managing-elections)
@@ -34,7 +34,7 @@ When the `elections` section is present in the config, nodectl runs a background
    - **Calculate stake** — determine the stake amount based on the configured [stake policy](#stake-policies)
    - **Generate validator key** — request the TON node to generate a new Ed25519 validator key via the Control Server (if none exists for this election). Validator keys are ephemeral and auto-managed by the node — you do not need to create them
    - **Form election bid** — prepare the election bid message using the validator key
-   - **Submit stake** — send the transaction through the validator wallet or [nomination pool](#single-nominator-pool)
+   - **Submit stake** — send the transaction through the validator wallet or [nomination pool](#nominator-pools)
 
 The task repeats every `tick_interval` seconds (default: 40).
 
@@ -44,7 +44,9 @@ The task repeats every `tick_interval` seconds (default: 40).
 
 ## Stake policies
 
-Three policies determine how much TON to stake. All policies fail with an error if the available balance is below the Elector's minimum stake.
+Four policies determine how much TON to stake. All policies fail with an error if the available balance is below the Elector's minimum stake.
+
+> **TONCore caveat:** Split50 and AdaptiveSplit50 are designed for SNP. On TONCore bindings both policies are ignored — nodectl stakes the full liquid balance of the active slot's pool (floored at `min_stake`). Use Fixed or Minimum to cap per-round exposure. See [setup.md — Stake policy limitations](setup.md#stake-policy-limitations).
 
 ### Split50 (default)
 
@@ -82,6 +84,23 @@ Conservative approach — deposits the bare minimum to participate. Useful for t
 
 Config value: `"minimum"`
 
+### AdaptiveSplit50
+
+Like Split50, but estimates the Elector's **minimum effective stake** (the threshold to actually win a seat) and falls back to staking the full balance when half would not clear that bar:
+
+```
+if available / 2 >= min_eff_stake:
+    stake = available / 2
+else:
+    stake = available
+```
+
+The strategy waits for a configurable portion of the election window (`sleep_period_pct`, default 0.2) to observe competitor bids before acting, and re-evaluates on every tick — topping up if the threshold rises after the initial submission.
+
+Config value: `"adaptive_split50"`
+
+See [staking strategies](../../src/node-control/docs/staking-strategies.md) for the full algorithm, configuration parameters, and trade-offs.
+
 ### Setting the policy
 
 Via CLI:
@@ -90,6 +109,7 @@ Via CLI:
 nodectl config stake-policy --split50
 nodectl config stake-policy --fixed 1000000000000
 nodectl config stake-policy --minimum
+nodectl config stake-policy --adaptive-split50
 ```
 
 ### Balance calculation
@@ -132,11 +152,9 @@ nodectl config stake-policy --reset --node node0
 
 ---
 
-## Single Nominator Pool
+## Nominator Pools
 
-nodectl supports **Single Nominator Pool (SNP)** and **TONCore** nominator pools for staking. When a pool is configured for a node (via bindings), transactions are sent to the pool contract instead of directly to the Elector.
-
-### Configuration
+nodectl supports **Single Nominator Pool (SNP)** and standard **Nominator Pool (TONCore)** for staking. When a pool is configured for a node (via bindings), transactions are sent to the pool contract instead of directly to the Elector.
 
 Pools are defined in the top-level `pools` section and connected to nodes via `bindings`:
 
@@ -157,9 +175,9 @@ Pools are defined in the top-level `pools` section and connected to nodes via `b
 }
 ```
 
-### Address computation
+### Single Nominator Pool (SNP)
 
-The SNP contract address is deterministic:
+The SNP pool contract address is deterministic:
 
 ```
 address = hash(snp_code + owner_address + validator_wallet_address)
@@ -171,9 +189,9 @@ When you specify only the `owner` (no `address`), nodectl computes the pool addr
 
 Because the SNP address depends on both the owner and the validator wallet address, nodes that share a wallet produce the same pool address. This prevents them from participating in elections independently. **Always use one wallet per node** when using SNP.
 
-## TONCore nominator pool
+## Nominator Pool (TONCore)
 
-TONCore uses **even** and **odd** slots (two contracts per logical pool name). **`deposit-validator`** moves **validator stake** from the **binding’s wallet** into the chosen slot (see [setup.md — TONCore nominator pools](setup.md#toncore-nominator-pools)). Stake policies **Split50 / AdaptiveSplit50** behave differently than on SNP (full liquid balance of the active slot’s pool).
+TONCore pool uses **even** and **odd** slots (two contracts per logical pool name). **`deposit-validator`** moves **validator stake** from the **binding’s wallet** into the chosen slot (see [setup.md — Nominator Pool](setup.md#nominator-pool-(toncore))). Stake policies **Split50 / AdaptiveSplit50** behave differently than on SNP (full liquid balance of the active slot’s pool).
 
 ---
 

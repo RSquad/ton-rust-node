@@ -9,7 +9,6 @@ Step-by-step guide for deploying nodectl and configuring it to manage TON valida
 - [Prerequisites](#prerequisites)
 - [Step 1: Deploy the chart](#step-1-deploy-the-chart)
 - [Step 2: Configure](#step-2-configure)
-  - [TONCore nominator pools](#toncore-nominator-pools)
 - [Step 3: Set up keys](#step-3-set-up-keys)
 - [Step 4: Restart the service](#step-4-restart-the-service)
 - [Step 5: Fund and verify](#step-5-fund-and-verify)
@@ -143,16 +142,23 @@ nodectl config wallet add -n wallet2 -s wallet-key-2
 
 ### Add pools
 
-nodectl supports **Single Nominator Pool (SNP)** contracts and **TONCore** nominator pool pairs. SNP is covered first; for TONCore, see [TONCore nominator pools](#toncore-nominator-pools).
+nodectl supports two nominator pool types. Choose based on your operational model:
+
+| | **SNP** (Single Nominator Pool) | **TONCore** (Nominator Pool) |
+|---|---|---|
+| **Pool contracts** | 1 per node | 2 per node (even + odd slots) |
+| **Round participation** | Every round from one pool | Each pool participates in **1 of 2** consecutive rounds |
+| **Validator stake deposit** | Not required — pool balance is the stake | Required — validator must deposit into each pool via `deposit-validator` |
+| **Stake policies** | All supported (Minimum, Fixed, Split50, AdaptiveSplit50) | **Only Minimum and Fixed** — Split50 / AdaptiveSplit50 are ignored (see [below](#stake-policy-limitations)) |
 
 #### Single Nominator Pool (SNP)
 
 Add Single Nominator Pools with the owner address. The pool contract address is computed automatically on startup:
 
 ```bash
-nodectl config pool add -n pool0 --owner="<OWNER_ADDRESS>"
-nodectl config pool add -n pool1 --owner="<OWNER_ADDRESS>"
-nodectl config pool add -n pool2 --owner="<OWNER_ADDRESS>"
+nodectl config pool add -n pool0 --owner=”<OWNER_ADDRESS>”
+nodectl config pool add -n pool1 --owner=”<OWNER_ADDRESS>”
+nodectl config pool add -n pool2 --owner=”<OWNER_ADDRESS>”
 ```
 
 > **Note:** Use `--owner=` (with `=`) when the address starts with `-1:` — otherwise the CLI parser treats `-1:...` as a flag.
@@ -160,16 +166,32 @@ nodectl config pool add -n pool2 --owner="<OWNER_ADDRESS>"
 If the pool contract is already deployed, pass its address instead:
 
 ```bash
-nodectl config pool add -n pool0 -a "-1:<POOL_CONTRACT_ADDRESS>"
+nodectl config pool add -n pool0 -a “-1:<POOL_CONTRACT_ADDRESS>”
 ```
 
-#### TONCore nominator pools
+#### Nominator pool (TONCore)
 
-A **TONCore** configuration is a **pair of slots** — **`even`** and **`odd`** — under one pool name (for example `core0`). Each slot maps to a **different** on-chain pool contract and participates in **different** validation rounds: with a **single** slot you can validate in **one of two consecutive rounds** only. **SNP**, by contrast, uses one pool contract and can participate every round from that pool.
+##### How it works
 
-**If you must validate in every round with TONCore**, add **both** slots for the same logical pool name (`--even` and `--odd`). Bind the node once to that pool name; nodectl keeps both addresses for the pair.
+A Nominator Pool participates in **only one of every two consecutive election rounds**. The TON Elector alternates between even and odd rounds, and each on-chain pool contract is bound to one of them. This means:
 
-Register the two slots (example — adjust shares and minima to your network and economics):
+- With a **single slot** (even **or** odd) you validate in **every other round** — skipping the alternate one.
+- To validate in **every round**, configure **both slots** (`--even` and `--odd`) under the same pool name. nodectl automatically picks the correct slot for each round.
+
+Unlike SNP — where the pool balance is the stake — a TONCore pool requires a **validator stake deposit**. The validator must explicitly send funds into each pool contract via `deposit-validator` before elections can proceed. See [Validator stake deposit](#validator-stake-deposit) below.
+
+##### Adding pools
+
+Both slots are registered under a single pool name (e.g. `core0`) with two separate commands. You bind the node once to that pool name; nodectl manages both slot addresses.
+
+**If the pool contracts are already deployed**, pass their addresses:
+
+```bash
+nodectl config pool add core -n core0 --even --address=”-1:<EVEN_POOL_ADDRESS>”
+nodectl config pool add core -n core0 --odd  --address=”-1:<ODD_POOL_ADDRESS>”
+```
+
+**Otherwise**, register slots with deploy parameters (adjust shares and minima to your network and economics):
 
 ```bash
 nodectl config pool add core -n core0 --even \
@@ -183,35 +205,41 @@ nodectl config pool add core -n core0 --odd \
   --min-nominator-stake 10000
 ```
 
-> **Distinct slot addresses:** the **even** and **odd** contracts must get **different** on-chain addresses. The derived address is a function of the validator wallet plus the slot’s **init parameters**; identical params on both slots yield the **same** address. A common pattern is to change **`min-validator-stake` by one unit** (TON) between slots (this example uses **`10000` vs `10001`**). If you omit **`--min-validator-stake`** on both commands, both slots get the service default (**`100_000` TON**) and you still **must** change another field (e.g. **`--validator-share`**) so the two slots differ. You can vary any numeric deploy field as long as the resulting init data differs.
+> **Distinct slot addresses:** the **even** and **odd** contracts must have **different** on-chain addresses. The derived address is a function of the validator wallet plus the slot’s **init parameters**; identical params on both slots yield the **same** address. A common pattern is to change **`min-validator-stake` by one unit** (TON) between slots (this example uses **`10000` vs `10001`**). You can vary any numeric deploy field as long as the resulting init data differs.
 
 | Flag | Meaning |
 |------|---------|
 | `--even` / `--odd` | Which validation-round slot this contract covers (required; pick exactly one per command). |
 | `--validator-share` | Validator reward share in **basis points** (e.g. `1000` = 10%). |
-| `--min-validator-stake` | Minimum validator stake locked in the pool, **TON**. If omitted, the nodectl service applies **`100_000` TON**. |
-| `--min-nominator-stake` | Minimum stake per nominator, **TON**. If omitted, the nodectl service applies **`10_000` TON**. |
+| `--min-validator-stake` | Minimum validator stake locked in the pool, **TON**. If omitted, the service default is **`100_000` TON**. |
+| `--min-nominator-stake` | Minimum stake per nominator, **TON**. If omitted, the service default is **`10_000` TON**. |
 
-For production-style TONCore deployments, operators often set **minimum stake per nominator** around **10,000 TON** on the pool (`--min-nominator-stake 10000`). That is **independent** of the **validator stake**: each **`deposit-validator`** must still send at least that slot’s **`min-validator-stake`** into the pool.
+##### Validator stake deposit
 
-**Which account pays:** `deposit-validator` debits **the validator wallet from the binding** (`-b` resolves the binding → the configured **wallet**, not the master wallet and not nominator funds in the pool). Fund that wallet on-chain first; it must cover **`-a` plus gas** (nodectl checks balance before sending).
+TONCore pools require a validator stake — funds the validator locks into the pool before it can participate in elections. This is separate from nominator deposits. Each `deposit-validator` call sends TON from the **validator wallet** (resolved via the binding) into the specified pool slot.
+
+The deposit amount must be **>=** the slot’s `min-validator-stake`. Fund the validator wallet on-chain first; it must cover the deposit amount plus gas.
 
 After the binding exists and the validator wallet is funded, run:
 
 ```bash
-nodectl config pool deposit-validator -b node0 -a 10000 --pool-even --yes
-nodectl config pool deposit-validator -b node0 -a 10001 --pool-odd --yes
+nodectl config pool deposit-validator -b node0 -a 10000 --pool-even
+nodectl config pool deposit-validator -b node0 -a 10001 --pool-odd
 ```
 
-| Item | Description |
+| Flag | Description |
 |------|-------------|
-| `-b` | Binding name (same as the node name in `config bind add -n …`). Used to find the **validator wallet** and pool. |
-| `-a` | **Validator stake** in **TON**, sent from the binding’s wallet into the pool slot; must be **≥** that slot’s `min-validator-stake` from the pool config. |
+| `-b` | Binding name (same as the node name in `config bind add -n …`). Resolves the **validator wallet** and pool. |
+| `-a` | **Validator stake** in **TON**, sent from the binding’s wallet into the pool slot. |
 | `--pool-even` / `--pool-odd` | Which TONCore slot receives the deposit (default if omitted: even). |
 
 > **`deposit-validator` is executed by the CLI with local vault + RPC** (not via the REST API yet). Run it from the pod shell where `CONFIG_PATH` and `VAULT_URL` are set.
 
-**Stake policy note (Split50 / AdaptiveSplit50):** Those policies are aimed at **SNP**. For **TONCore**, nodectl **does not** apply the “stake half the balance” rule to the pool the same way: for TONCore it **stakes the full free (liquid) balance** of the **active slot’s** pool for the round (still subject to network minimum stake). If you configure Split50 while using TONCore, expect **whole-pool liquid balance** on the active slot to be considered for the stake amount, not “half of the pool” like a classic SNP Split50.
+##### Stake policy limitations
+
+**Split50** and **AdaptiveSplit50** are designed for SNP, where a single pool re-splits its balance across alternating rounds. TONCore uses **two separate pools** that each stake in only one round, so splitting inside a round has no effect. When the binding points at a TONCore pool, nodectl ignores these two policies and stakes the **full liquid balance** of the active slot’s pool (still floored at `min_stake`).
+
+To control per-round exposure with TONCore, use **Fixed** or **Minimum** instead. See [staking strategies](elections.md) for details.
 
 ### Add bindings
 
