@@ -405,7 +405,8 @@ pub fn convert_stack(items: &[StackItem]) -> Result<Vec<StackEntry>> {
                 StackEntryNumber { number }.into_boxed()
             }
             StackItem::Slice(slice) => {
-                let bytes = slice.get_bytestring(0);
+                let cell = slice.clone().into_cell()?;
+                let bytes = write_boc(&cell)?;
                 let slice = ton_api::ton::tvm::slice::Slice { bytes };
                 StackEntrySlice { slice }.into_boxed()
             }
@@ -484,8 +485,8 @@ pub fn convert_ton_stack(items: &[StackEntry]) -> Result<Vec<StackItem>> {
                 StackItem::int(value)
             }
             StackEntry::Tvm_StackEntrySlice(slice) => {
-                let slice = &slice.slice;
-                let slice = SliceData::from_raw(slice.bytes.as_slice(), slice.bytes.len() * 8);
+                let cell = read_single_root_boc(&slice.slice.bytes)?;
+                let slice = SliceData::load_cell(cell)?;
                 StackItem::slice(slice)
             }
             StackEntry::Tvm_StackEntryTuple(tuple) => {

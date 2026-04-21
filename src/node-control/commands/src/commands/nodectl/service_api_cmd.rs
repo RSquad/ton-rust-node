@@ -6,17 +6,13 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use crate::commands::nodectl::utils::resolve_service_url;
 use anyhow::Context;
 use colored::Colorize;
-use common::{
-    app_config::{AppConfig, StakePolicy},
-    ton_utils::display_tons_from_str,
-};
+use common::{app_config::StakePolicy, ton_utils::display_tons_from_str};
 use std::{
-    borrow::Cow,
     collections::HashSet,
     io::{self, Read},
-    path::Path,
 };
 
 #[derive(clap::Args, Clone)]
@@ -27,7 +23,8 @@ pub struct ApiCmd {
         short = 'u',
         long = "url",
         value_hint = clap::ValueHint::Url,
-        help = "URL to the node control service API (takes precedence over --config)",
+        help = "URL to the node control service API (takes precedence over --config; defaults to http://127.0.0.1:8080 if not --url, --config, or NODECTL_URL environment variable are provided)",
+        env = "NODECTL_URL",
         global = true,
     )]
     pub url: Option<String>,
@@ -50,7 +47,7 @@ pub struct ApiCmd {
         env = "CONFIG_PATH",
         global = true
     )]
-    config: String,
+    config: Option<String>,
 
     #[command(subcommand)]
     action: ServiceAction,
@@ -175,6 +172,8 @@ pub struct StakePolicyCmd {
     split50: bool,
     #[arg(long = "minimum")]
     minimum: bool,
+    #[arg(long = "adaptive-split50")]
+    adaptive_split50: bool,
     #[arg(
         short = 'n',
         long = "node",
@@ -185,12 +184,7 @@ pub struct StakePolicyCmd {
 
 impl ApiCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
-        let base_url = if let Some(url) = self.url.as_deref() {
-            normalize_base_url(Cow::Borrowed(url))
-        } else {
-            let app_cfg = AppConfig::load(Path::new(&self.config))?;
-            normalize_base_url(Cow::Owned(app_cfg.http.bind.clone()))
-        };
+        let base_url = resolve_service_url(self.url.as_deref(), self.config.as_deref())?;
         let client = reqwest::Client::new();
         let token = self.token.as_deref();
 
@@ -252,11 +246,15 @@ impl ApiCmd {
                 send_post(&client, &url, &payload, token).await?;
             }
             ServiceAction::StakePolicy(cmd) => {
-                let url = join_url(&base_url, "/v1/stake_strategy");
+                let url = join_url(&base_url, "/v1/elections/settings");
                 let Some(policy) = cmd.to_policy() else {
                     anyhow::bail!("no policy specified");
                 };
-                let request = StakePolicyRequest { policy, node: cmd.node.clone() };
+                let request = ElectionsSettingsRequest {
+                    policy: Some(policy),
+                    node: cmd.node.clone(),
+                    ..Default::default()
+                };
                 send_post(&client, &url, &request, token).await?;
             }
             ServiceAction::Login(cmd) => {
@@ -348,12 +346,20 @@ fn filter_response_by_nodes(
     Ok(serde_json::to_string(&value).context("failed to re-serialize filtered response to JSON")?)
 }
 
-#[derive(Clone, serde::Serialize)]
-struct StakePolicyRequest {
-    policy: StakePolicy,
-    /// If set, the policy is applied as a per-node override.
+/// Client-side mirror of `ElectionsSettingsUpdateRequest` in `service::http::config_handlers`.
+/// Must stay in sync with the server-side definition.
+#[derive(Clone, Default, serde::Serialize)]
+struct ElectionsSettingsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<StakePolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tick_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_factor: Option<f32>,
 }
 
 impl StakePolicyCmd {
@@ -366,6 +372,9 @@ impl StakePolicyCmd {
         }
         if self.minimum {
             return Some(StakePolicy::Minimum);
+        }
+        if self.adaptive_split50 {
+            return Some(StakePolicy::AdaptiveSplit50);
         }
         None
     }
@@ -380,17 +389,6 @@ struct ElectionsTaskControlRequest {
 #[derive(Clone, serde::Serialize)]
 struct NodeListPayload {
     nodes: Vec<String>,
-}
-
-fn normalize_base_url(url: Cow<'_, str>) -> String {
-    let mut base = url.into_owned();
-    if base.starts_with("0.0.0.0") {
-        base = base.replacen("0.0.0.0", "127.0.0.1", 1);
-    }
-    if !base.starts_with("http://") && !base.starts_with("https://") {
-        base = format!("http://{}", base);
-    }
-    base
 }
 
 fn join_url(base: &str, path: &str) -> String {

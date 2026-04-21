@@ -456,6 +456,50 @@ fn test_convert_stack() {
 }
 
 #[test]
+fn test_convert_stack_slice_roundtrip_preserves_msg_addr_bit_len() {
+    let owner: MsgAddressInt = "EQAW-1_rm44ppdD6qzcSSyZDAZH-KwldLeXmb2uTH6-WSkG0".parse().unwrap();
+    let owner_slice = owner.write_to_bitstring().unwrap();
+    assert_eq!(owner_slice.remaining_bits(), 267);
+
+    let items = convert_stack(&[StackItem::slice(owner_slice)]).unwrap();
+    let roundtrip = convert_ton_stack(&items).unwrap();
+
+    assert_eq!(roundtrip.len(), 1);
+
+    let roundtrip_slice = match &roundtrip[0] {
+        StackItem::Slice(s) => s.clone(),
+        other => panic!("expected slice, got {:?}", other),
+    };
+
+    assert_eq!(roundtrip_slice.remaining_bits(), 267);
+
+    let mut slice = roundtrip_slice;
+    let parsed = MsgAddressInt::construct_from(&mut slice).unwrap();
+    assert_eq!(parsed, owner);
+    assert_eq!(slice.remaining_bits(), 0);
+}
+
+#[test]
+fn test_convert_stack_slice_roundtrip_preserves_slice_window() {
+    let mut source = SliceData::from_raw(vec![0b1010_1100, 0b1111_0000], 16);
+    source.move_by(3).unwrap();
+    let slice = source.get_slice(7).unwrap();
+
+    let items = convert_stack(&[StackItem::slice(slice.clone())]).unwrap();
+    let roundtrip = convert_ton_stack(&items).unwrap();
+
+    let roundtrip_slice = match &roundtrip[0] {
+        StackItem::Slice(s) => s.clone(),
+        other => panic!("expected slice, got {:?}", other),
+    };
+
+    assert_eq!(roundtrip_slice.remaining_bits(), slice.remaining_bits());
+    for bit in 0..slice.remaining_bits() {
+        assert_eq!(roundtrip_slice.get_bit(bit).unwrap(), slice.get_bit(bit).unwrap());
+    }
+}
+
+#[test]
 fn test_convert_stack_none_is_empty_list() {
     let items = convert_stack(&[StackItem::None]).unwrap();
     assert_eq!(items.len(), 1);

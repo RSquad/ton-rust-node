@@ -127,7 +127,7 @@ impl UserStore {
 
         let user_name = username.to_owned();
         let secret_name = secret_id.to_string();
-        self.runtime_cfg.update_config(Box::new(move |cfg| {
+        self.runtime_cfg.update_and_save(Box::new(move |cfg| {
             let auth = cfg.http.auth.get_or_insert_with(Default::default);
             auth.users.push(UserEntry {
                 username: user_name,
@@ -137,7 +137,6 @@ impl UserStore {
                 revoked_after: None,
             });
         }))?;
-        self.runtime_cfg.save_to_file();
 
         Ok(())
     }
@@ -163,12 +162,11 @@ impl UserStore {
         }
 
         let user_name = username.to_owned();
-        self.runtime_cfg.update_config(Box::new(move |cfg| {
+        self.runtime_cfg.update_and_save(Box::new(move |cfg| {
             if let Some(auth) = &mut cfg.http.auth {
                 auth.users.retain(|u| u.username != user_name);
             }
         }))?;
-        self.runtime_cfg.save_to_file();
 
         Ok(())
     }
@@ -323,8 +321,8 @@ mod tests {
     struct NoopWallet;
     #[async_trait::async_trait]
     impl contracts::SmartContract for NoopWallet {
-        fn address(&self) -> MsgAddressInt {
-            MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap()
+        async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+            Ok(MsgAddressInt::with_standart(None, 0, [0u8; 32].into()).unwrap())
         }
         async fn balance(&self) -> anyhow::Result<u64> {
             Ok(0)
@@ -392,16 +390,12 @@ mod tests {
             Some(self.vault.clone())
         }
 
-        fn update_config(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
+        fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
             let mut guard = self.config.write().expect("lock");
             let mut cfg = (**guard).clone();
             f(&mut cfg);
             *guard = Arc::new(cfg);
             Ok(())
-        }
-
-        fn save_to_file(&self) {
-            // no-op in tests
         }
     }
 

@@ -1,4 +1,4 @@
-import { Address, beginCell, Cell, Dictionary, fromNano, toNano, TransactionDescriptionGeneric } from '@ton/core';
+import { Address, beginCell, Cell, Dictionary, fromNano, loadTransaction, toNano, TransactionDescriptionGeneric } from '@ton/core';
 import * as fs from 'fs';
 import { NetworkProvider, sleep } from "@ton/blueprint";
 import { TonClient, WalletContractV3R2 } from '@ton/ton';
@@ -32,21 +32,23 @@ export async function run(provider: NetworkProvider) {
     const criticals = cell10.beginParse().loadDictDirect(Dictionary.Keys.Uint(32), Dictionary.Values.Uint(0));
     console.log("get voting params...");
     const param11 = (await getConfig(11)).beginParse();
-    param11.loadRef();
-    const param11s = param11.loadRef().beginParse();
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    param11s.loadUint(8);
-    const minStoreSec = param11s.loadUint(32);
-    console.log(`minStoreSec (for critical params only): ${minStoreSec}`);
-    
-    const expiresAt = now + parseInt(process.env.EXPIRES_IN_SECS ?? (await ui.input('Expires in seconds:')));
+    const nonCriticalParamsCell = param11.loadRef();
+    const criticalParamsCell = param11.loadRef();
 
     for (const [name, param] of Object.entries(params)) {
         const id = parseInt(name.slice(1));
-        const queryId = (now << 32) | id;
+        const queryId = (BigInt(now) << 32n) | BigInt(id);
+        console.log(`param ${id} is ${criticals.has(id) ? 'critical' : 'not critical'}`);
+
+        const slice = (criticals.has(id) ? criticalParamsCell : nonCriticalParamsCell).beginParse();
+        slice.loadUint(8);
+        slice.loadUint(8);
+        slice.loadUint(8);
+        slice.loadUint(8);
+        slice.loadUint(8);
+        const minStoreSec = slice.loadUint(32);
+        console.log(`minStoreSec: ${minStoreSec}`);
+        const expiresAt = now + parseInt(process.env.EXPIRES_IN_SECS ?? (await ui.input('Expires in seconds:')));
         console.log(`creating proposal for param ${name}...`);
         console.log(`param: ${JSON.stringify(param, null, 2)}`);
         let paramCell = (() => {
@@ -105,11 +107,9 @@ export async function run(provider: NetworkProvider) {
 
         const state = await client.getContractState(configAddress);
         const { lt, hash } = state.lastTransaction!;
-        const transactions = await client.getTransactions(configAddress, {
-            limit: 10,
-            lt, hash,
-        });
-        for (const tx of transactions) {
+        const transactions = await getTransactions(configAddress, 10, parseInt(lt), hash);
+        for (const txCell of transactions) {
+            const tx = loadTransaction(Cell.fromBoc(Buffer.from(txCell.TransactionId.data, 'base64'))[0].beginParse());
             if (tx.inMessage! && tx.inMessage.info.src!.toString() === wallet.address.toString()) {
                 const description = tx.description as TransactionDescriptionGeneric;
                 console.log(`tx hash: ${tx.hash().toString('hex')}`);
@@ -179,18 +179,56 @@ async function proposalStoragePrice(
     return result.stack.readBigNumber();
 }
 
+function getBaseUrl(): string {
+    const idx = process.argv.findIndex(arg => arg == '--custom');
+    const url = idx !== -1 ? process.argv[idx + 1] : 'http://127.0.0.1:3301';
+    const baseUrl = url.endsWith("jsonRPC") ? url.slice(0, -7) : url;
+    return baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+}
+
 async function getConfig(id: number): Promise<Cell> {
-    const result = await fetch(`http://localhost/getConfigParam?config_id=${id}`, {
-        method: 'GET',
+    try {
+        const normalizedUrl = getBaseUrl();
+        console.log(`getting config ${id} from ${normalizedUrl}`);
+        const result = await fetch(`${normalizedUrl}getConfigParam?config_id=${id}`, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+        });
+        const data = await result.json();
+        if (!data.ok) {
+            throw new Error(`Failed to get config: ${data.error}`);
+        }
+        return Cell.fromBase64(data.result.config.bytes as string);
+    } catch (error) {
+        console.error(`Failed to get config: ${error}`);
+        throw error;
+    }
+}
+
+async function getTransactions(address: Address, limit: number, lt: number, hash: string) {
+    const result = await fetch(`${getBaseUrl()}jsonRPC`, {
+        method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
+        body: JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'getTransactions',
+            params: {
+                address: address.toString(),
+                limit,
+                lt,
+                hash,
+            },
+        }),
     });
     const data = await result.json();
     if (!data.ok) {
-        throw new Error(`Failed to get config: ${data.error}`);
+        throw new Error(`Failed to get transactions: ${data.error}`);
     }
-    return Cell.fromBase64(data.result.config.bytes as string);
+    return data.result;
 }
 
 function buildConfigParam15(param: any) {

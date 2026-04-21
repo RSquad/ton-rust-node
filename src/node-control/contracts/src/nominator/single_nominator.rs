@@ -6,7 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::{NominatorRoles, NominatorWrapper, PoolConfig, PoolData};
+use super::{
+    NominatorRoles, NominatorWrapper, PoolConfig, PoolData, PoolKind, SNP_STORAGE_RESERVE,
+};
 use crate::{ContractProvider, SmartContract};
 use anyhow::Context;
 use std::sync::Arc;
@@ -21,13 +23,13 @@ pub const NOMINATOR_POOL_WORKCHAIN: i32 = -1;
 /// Implementation of the single-nominator contract wrapper
 ///
 /// See: https://github.com/ton-blockchain/single-nominator
-pub struct NominatorWrapperImpl {
+pub struct SingleNominatorWrapper {
     provider: Arc<dyn ContractProvider>,
     nominator_addr: MsgAddressInt,
     state_init: Option<StateInit>,
 }
 
-impl NominatorWrapperImpl {
+impl SingleNominatorWrapper {
     pub fn new(provider: Arc<dyn ContractProvider>, nominator_addr: MsgAddressInt) -> Self {
         Self { provider, nominator_addr, state_init: None }
     }
@@ -38,9 +40,9 @@ impl NominatorWrapperImpl {
         validator_address: &MsgAddressInt,
         workchain: i32,
     ) -> anyhow::Result<Self> {
-        let state_init = Some(Self::build_state_init(owner_address, validator_address)?);
-        let nominator_addr = Self::calculate_address(workchain, owner_address, validator_address)?;
-        Ok(Self { provider, nominator_addr, state_init })
+        let (nominator_addr, state_init) =
+            Self::calculate_address_and_state(workchain, owner_address, validator_address)?;
+        Ok(Self { provider, nominator_addr, state_init: Some(state_init) })
     }
 
     pub fn calculate_address(
@@ -48,10 +50,20 @@ impl NominatorWrapperImpl {
         owner_address: &MsgAddressInt,
         validator_address: &MsgAddressInt,
     ) -> anyhow::Result<MsgAddressInt> {
-        let state_init = Self::build_state_init(owner_address, validator_address)?
-            .write_to_new_cell()?
-            .into_cell()?;
-        MsgAddressInt::with_params(wc, state_init.hash(0))
+        Self::calculate_address_and_state(wc, owner_address, validator_address)
+            .map(|(addr, _)| addr)
+    }
+
+    /// Calculate the pool address and `StateInit` in a single pass.
+    pub fn calculate_address_and_state(
+        wc: i32,
+        owner_address: &MsgAddressInt,
+        validator_address: &MsgAddressInt,
+    ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
+        let state_init = Self::build_state_init(owner_address, validator_address)?;
+        let cell = state_init.write_to_new_cell()?.into_cell()?;
+        let addr = MsgAddressInt::with_params(wc, cell.hash(0))?;
+        Ok((addr, state_init))
     }
 
     pub fn build_state_init(
@@ -70,20 +82,37 @@ impl NominatorWrapperImpl {
 }
 
 #[async_trait::async_trait]
-impl SmartContract for NominatorWrapperImpl {
+impl SmartContract for SingleNominatorWrapper {
     async fn balance(&self) -> anyhow::Result<u64> {
         self.provider.balance(&self.nominator_addr).await
     }
 
-    fn address(&self) -> MsgAddressInt {
-        self.nominator_addr.clone()
+    async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+        Ok(self.nominator_addr.clone())
     }
 }
 
 #[async_trait::async_trait]
-impl NominatorWrapper for NominatorWrapperImpl {
+impl NominatorWrapper for SingleNominatorWrapper {
+    fn pool_kind(&self) -> PoolKind {
+        PoolKind::SNP
+    }
+
     fn state_init(&self) -> Option<StateInit> {
         self.state_init.clone()
+    }
+
+    fn storage_reserve(&self) -> u64 {
+        SNP_STORAGE_RESERVE
+    }
+
+    fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
+        // Preserve state_init so contracts_task deploy sends code+data, not a plain transfer.
+        vec![Arc::new(SingleNominatorWrapper {
+            provider: self.provider.clone(),
+            nominator_addr: self.nominator_addr.clone(),
+            state_init: self.state_init.clone(),
+        }) as Arc<dyn NominatorWrapper>]
     }
 
     async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {
@@ -117,7 +146,8 @@ impl NominatorWrapper for NominatorWrapperImpl {
         let validator_reward_share = stack.i64(5).context("parse validator_reward_share")? as u16;
         let max_nominators_count = stack.i64(6).context("parse max_nominators_count")? as u16;
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
-        let max_nominators_stake = stack.i64(8).context("parse max_nominators_stake")? as u64;
+        let nominator_stake_threshold =
+            stack.i64(8).context("parse nominator_stake_threshold")? as u64;
         // skip indices 9-10 (nominators, withdraw_requests)
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {
@@ -130,7 +160,7 @@ impl NominatorWrapper for NominatorWrapperImpl {
             stack.i64(13).context("parse validator_set_changes_count")? as i32;
         let validator_set_change_time =
             stack.i64(14).context("parse validator_set_change_time")? as u64;
-        let stake_held_for = stack.i64(11).context("parse stake_held_for")? as u64;
+        let stake_held_for = stack.i64(15).context("parse stake_held_for")? as u64;
 
         Ok(PoolData {
             state,
@@ -142,7 +172,7 @@ impl NominatorWrapper for NominatorWrapperImpl {
                 validator_reward_share,
                 max_nominators_count,
                 min_validator_stake,
-                max_nominators_stake,
+                nominator_stake_threshold,
             },
             stake_at,
             saved_validator_set_hash,
@@ -162,7 +192,7 @@ mod tests {
     use ton_block::MsgAddressInt;
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
-    fn open_nominator() -> Option<NominatorWrapperImpl> {
+    fn open_nominator() -> Option<SingleNominatorWrapper> {
         let nominator_addr =
             MsgAddressInt::from_str("kf-d42Dwn_dzfdwlV_aEeX7WWnJ-bBU_eZp6CfKoMb4vQ3t0")
                 .expect("Failed to parse nominator address");
@@ -175,7 +205,7 @@ mod tests {
         };
 
         let client = ClientJsonRpc::connect(url, None).expect("Failed to connect to Ton network");
-        Some(NominatorWrapperImpl::new(contract_provider!(Arc::new(client)), nominator_addr))
+        Some(SingleNominatorWrapper::new(contract_provider!(Arc::new(client)), nominator_addr))
     }
 
     #[tokio::test]

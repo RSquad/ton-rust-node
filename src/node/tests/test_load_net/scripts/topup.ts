@@ -43,6 +43,7 @@ async function run() {
         endpoint: process.env.API_ENDPOINTS!.split(",")[0] + "jsonRPC",
     });
     const master = tonClient.open(masterWallet);
+    const balanceBefore = await tonClient.getBalance(address);
 
     await master.sendTransfer({
         seqno: await master.getSeqno(),
@@ -56,7 +57,19 @@ async function run() {
         ],
         sendMode: SendMode.PAY_GAS_SEPARATELY,
     });
-    console.log(`Topped up ${address} with ${fromNano(amount)} TON`);
+    console.log(`Sent ${fromNano(amount)} TON to ${address}, waiting for balance update...`);
+
+    const timeout = 30_000;
+    const poll = 1_000;
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+        const balance = await tonClient.getBalance(address);
+        if (balance > balanceBefore) {
+            return;
+        }
+        await new Promise((r) => setTimeout(r, poll));
+    }
+    throw new Error(`Timed out waiting for balance update after ${timeout / 1000}s`);
 }
 
 (async () => {

@@ -9,19 +9,21 @@
 use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{
-        calculate_wallet_address, save_config, try_create_rpc_client, warn_ton_api_unavailable,
+        SEND_TIMEOUT, api_delete, api_get, api_post, confirm, get_wallet_config,
+        load_config_vault_rpc_client, make_wallet, require_config,
+        resolve_pool_address_from_config, resolve_service_url, toncore_pool_slot_from_cli_flags,
+        wait_for_seqno_change, wallet_info,
     },
 };
-use colored::Colorize;
+use colored::{ColoredString, Colorize};
 use common::{
-    app_config::{AppConfig, PoolConfig},
-    ton_utils::display_tons,
+    app_config::PoolConfig,
+    task_cancellation::CancellationCtx,
+    ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
-use contracts::{NOMINATOR_POOL_WORKCHAIN, NominatorWrapperImpl};
-use secrets_vault::{vault::SecretVault, vault_builder::SecretVaultBuilder};
-use std::{path::Path, str::FromStr, sync::Arc};
-use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt};
-use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
+use contracts::{TonWallet, nominator::ton_core_pool as pool_messages};
+use std::{path::Path, str::FromStr};
+use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt, write_boc};
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage pools in the configuration")]
@@ -33,18 +35,39 @@ pub struct PoolCmd {
 #[derive(clap::Subcommand, Clone)]
 pub enum PoolAction {
     /// Add a pool to the configuration
-    Add(PoolAddCmd),
+    Add(PoolAddSubCmd),
     /// List all configured pools
     Ls(PoolLsCmd),
     /// Remove a pool from the configuration
     Rm(PoolRmCmd),
+    /// Deposit validator funds into a TONCore nominator pool
+    DepositValidator(PoolDepositValidatorCmd),
+    /// Withdraw validator funds from a TONCore nominator pool
+    WithdrawValidator(PoolWithdrawValidatorCmd),
 }
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Add a pool to the configuration")]
+pub struct PoolAddSubCmd {
+    #[command(subcommand)]
+    action: Option<PoolAddAction>,
+    #[command(flatten)]
+    snp: PoolAddCmd,
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum PoolAddAction {
+    /// Add an SNP pool to the configuration
+    Snp(PoolAddCmd),
+    /// Add a TONCore nominator pool to the configuration
+    Core(PoolAddCoreCmd),
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Add an SNP pool to the configuration")]
 pub struct PoolAddCmd {
     #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
-    name: String,
+    name: Option<String>,
     #[arg(
         short = 'a',
         long = "address",
@@ -57,6 +80,48 @@ pub struct PoolAddCmd {
         help = "Owner address, raw or base64url (for deployment/verification)"
     )]
     owner: Option<String>,
+}
+
+#[derive(clap::Args, Clone)]
+#[command(about = "Add a TONCore nominator pool to the configuration")]
+#[command(group(clap::ArgGroup::new("slot").required(true).args(&["even", "odd"])))]
+pub struct PoolAddCoreCmd {
+    #[arg(short = 'n', long = "name", help = "Pool name (unique identifier)")]
+    name: String,
+
+    #[arg(
+        long = "validator-share",
+        help = "Validator reward share in basis points (e.g. 1000 = 10%)"
+    )]
+    validator_share: Option<u16>,
+
+    #[arg(long = "max-nominators", help = "Max nominators (default: 40)")]
+    max_nominators: Option<u16>,
+
+    #[arg(
+        long = "min-validator-stake",
+        help = "Minimum validator stake in TON (server default when omitted: 100 000)"
+    )]
+    min_validator_stake: Option<f64>,
+
+    #[arg(long = "min-nominator-stake", help = "Minimum nominator stake in TON (default: 10 000)")]
+    min_nominator_stake: Option<f64>,
+
+    #[arg(long = "address", help = "Existing pool address for selected slot, raw or base64url")]
+    address: Option<String>,
+
+    #[arg(
+        long = "even",
+        conflicts_with = "odd",
+        help = "Configure/deploy TONCore slot 0 (even rounds)"
+    )]
+    even: bool,
+    #[arg(
+        long = "odd",
+        conflicts_with = "even",
+        help = "Configure/deploy TONCore slot 1 (odd rounds)"
+    )]
+    odd: bool,
 }
 
 #[derive(clap::Args, Clone)]
@@ -73,94 +138,258 @@ pub struct PoolRmCmd {
     name: String,
 }
 
-impl PoolCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        match &self.action {
-            PoolAction::Add(cmd) => cmd.run(path).await,
-            PoolAction::Ls(cmd) => cmd.run(path).await,
-            PoolAction::Rm(cmd) => cmd.run(path).await,
-        }
-    }
+#[derive(clap::Args, Clone)]
+#[command(about = "Deposit validator funds into a TONCore nominator pool")]
+pub struct PoolDepositValidatorCmd {
+    #[arg(short = 'b', long = "binding", help = "Binding name (resolves wallet and pool)")]
+    binding: String,
+    #[arg(short = 'a', long = "amount", help = "Amount in TON to deposit")]
+    amount: f64,
+    #[arg(
+        long = "pool-even",
+        conflicts_with = "pool_odd",
+        help = "Core: use the pool for even validation rounds (default if neither flag is set)"
+    )]
+    pool_even: bool,
+    #[arg(
+        long = "pool-odd",
+        conflicts_with = "pool_even",
+        help = "Core: use the pool for odd validation rounds"
+    )]
+    pool_odd: bool,
+    /// Skip the interactive confirmation prompt (for scripts and CI)
+    #[arg(long = "yes", help = "Do not ask for confirmation")]
+    yes: bool,
 }
 
-impl PoolAddCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        if self.address.is_none() && self.owner.is_none() {
-            anyhow::bail!("At least one of --address or --owner must be specified");
+#[derive(clap::Args, Clone)]
+#[command(about = "Withdraw validator funds from a TONCore nominator pool")]
+pub struct PoolWithdrawValidatorCmd {
+    #[arg(short = 'b', long = "binding", help = "Binding name (resolves wallet and pool)")]
+    binding: String,
+    #[arg(short = 'a', long = "amount", help = "Amount in TON to withdraw")]
+    amount: f64,
+    #[arg(
+        long = "pool-even",
+        conflicts_with = "pool_odd",
+        help = "Core: use the pool for even validation rounds (default if neither flag is set)"
+    )]
+    pool_even: bool,
+    #[arg(
+        long = "pool-odd",
+        conflicts_with = "pool_even",
+        help = "Core: use the pool for odd validation rounds"
+    )]
+    pool_odd: bool,
+    /// Skip the interactive confirmation prompt (for scripts and CI)
+    #[arg(long = "yes", help = "Do not ask for confirmation")]
+    yes: bool,
+}
+
+impl PoolCmd {
+    pub async fn run(
+        &self,
+        config_path: Option<&str>,
+        cancellation_ctx: CancellationCtx,
+        url: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match &self.action {
+            // Both SNP and Core add go through REST.
+            PoolAction::Add(cmd) => match &cmd.action {
+                Some(PoolAddAction::Snp(cmd)) => cmd.run(url, token, config_path).await,
+                Some(PoolAddAction::Core(cmd)) => cmd.run(url, token, config_path).await,
+                None => cmd.snp.run(url, token, config_path).await,
+            },
+            PoolAction::Ls(cmd) => cmd.run(url, token, config_path).await,
+            PoolAction::Rm(cmd) => cmd.run(url, token, config_path).await,
+            // Validator deposits/withdrawals require local secrets + RPC; not yet in REST.
+            PoolAction::DepositValidator(cmd) => {
+                cmd.run(require_config(config_path)?, cancellation_ctx).await
+            }
+            PoolAction::WithdrawValidator(cmd) => {
+                cmd.run(require_config(config_path)?, cancellation_ctx).await
+            }
         }
-
-        let normalized_address = self
-            .address
-            .as_deref()
-            .map(|addr| normalize_ton_address(addr, "address"))
-            .transpose()?;
-        let normalized_owner =
-            self.owner.as_deref().map(|owner| normalize_ton_address(owner, "owner")).transpose()?;
-
-        let mut config = AppConfig::load(path)?;
-
-        if config.pools.contains_key(&self.name) {
-            anyhow::bail!(
-                "Pool '{}' already exists. Remove it first or use a different name.",
-                self.name
-            );
-        }
-
-        let pool_config = PoolConfig::SNP {
-            address: normalized_address.clone(),
-            owner: normalized_owner.clone(),
-        };
-        config.pools.insert(self.name.clone(), pool_config);
-        save_config(&config, path)?;
-
-        let info = match (&normalized_address, &normalized_owner) {
-            (Some(a), Some(o)) => format!("address='{}', owner='{}'", a, o),
-            (Some(a), None) => format!("address='{}'", a),
-            (None, Some(o)) => format!("owner='{}' (address will be calculated on bind)", o),
-            _ => unreachable!(),
-        };
-        println!("\n{} Pool '{}' added ({})\n", "OK".green().bold(), self.name, info);
-        Ok(())
     }
 }
 
 #[derive(serde::Serialize)]
+struct PoolAddBody<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<&'a str>,
+}
+
+impl PoolAddCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let name = self.name.as_ref().ok_or_else(|| anyhow::anyhow!("--name must be specified"))?;
+        if self.address.is_none() && self.owner.is_none() {
+            anyhow::bail!("At least one of --address or --owner must be specified");
+        }
+
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = PoolAddBody {
+            name: name.as_str(),
+            address: self.address.as_deref(),
+            owner: self.owner.as_deref(),
+        };
+        api_post(&base_url, "/v1/pools", token, &body).await?;
+
+        let info = match (&self.address, &self.owner) {
+            (Some(a), Some(o)) => format!("address='{}', owner='{}'", a, o),
+            (Some(a), None) => format!("address='{}'", a),
+            (None, Some(o)) => format!("owner='{}' (address will be calculated on bind)", o),
+            (None, None) => String::new(),
+        };
+        println!("\n{} Pool '{}' added ({})\n", "OK".green().bold(), name, info);
+        Ok(())
+    }
+}
+
+/// Wire body for `POST /v1/pools/core`. Mirrors `service::PoolAddCoreRequest`
+/// — duplicated rather than shared to keep the CLI free of a service-crate
+/// dependency.
+#[derive(serde::Serialize)]
+struct PoolAddCoreBody<'a> {
+    name: &'a str,
+    slot: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validator_share: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_nominators: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_validator_stake: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_nominator_stake: Option<u64>,
+}
+
+impl PoolAddCoreCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if self.address.is_none() && self.validator_share.is_none() {
+            anyhow::bail!("At least one of --address or --validator-share must be specified");
+        }
+
+        if let Some(vs) = self.validator_share {
+            if !(0..=10_000).contains(&vs) {
+                anyhow::bail!("validator_share must be in 0..=10000 basis points (got {vs})");
+            }
+        }
+
+        let slot_name = if self.odd { "odd" } else { "even" };
+
+        // Validate locally so the user gets the standard "invalid TON address"
+        // message instead of a 400 from the server.
+        let address =
+            self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
+
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = PoolAddCoreBody {
+            name: &self.name,
+            slot: slot_name,
+            address: address.as_deref(),
+            validator_share: self.validator_share,
+            max_nominators: self.max_nominators,
+            // CLI flags accept TON (f64) — convert to nanotons for the API.
+            min_validator_stake: self.min_validator_stake.map(tons_f64_to_nanotons),
+            min_nominator_stake: self.min_nominator_stake.map(tons_f64_to_nanotons),
+        };
+        api_post(&base_url, "/v1/pools/core", token, &body).await?;
+
+        let mut info_parts = Vec::new();
+        if let Some(vs) = self.validator_share {
+            info_parts.push(format!("validator_share={vs} bp"));
+        }
+        if let Some(a) = &address {
+            info_parts.push(format!("address='{a}'"));
+        }
+
+        println!(
+            "\n{} TONCore pool '{}' slot '{}' configured ({})\n",
+            "OK".green().bold(),
+            self.name,
+            slot_name,
+            info_parts.join(", ")
+        );
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PoolView {
     name: String,
     kind: String,
-    balance: Option<String>,
+    balance: Option<u64>,
     address: Option<String>,
     owner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    addresses: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    validator_share: Option<u64>,
+    /// Per-slot data for TONCore pools; absent for SNP pools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slots: Option<Vec<TonCorePoolSlotView>>,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TonCorePoolSlotView {
+    /// "even" (slot 0) or "odd" (slot 1)
+    slot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
+    /// Account state: "active", "uninit", "frozen", "not deployed", or "error".
+    state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    balance: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validator_share: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_nominators: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_validator_stake: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_nominator_stake: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nominators_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stake_amount_sent: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validator_amount: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_state: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_election_id: Option<u32>,
 }
 
 impl PoolLsCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let config = AppConfig::load(path)?;
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        let body = api_get(&base_url, "/v1/pools", token).await?;
+        let resp: serde_json::Value = serde_json::from_str(&body)?;
+        let views: Vec<PoolView> = serde_json::from_value(resp["result"].clone())?;
 
-        if config.pools.is_empty() {
+        if views.is_empty() {
             match self.format {
                 OutputFormat::Json => println!("[]"),
                 OutputFormat::Table => println!("\n{}\n", "No pools configured".yellow()),
             }
             return Ok(());
         }
-
-        let rpc_client = match try_create_rpc_client(&config).await {
-            Ok(c) => Some(c),
-            Err(e) => {
-                if matches!(self.format, OutputFormat::Table) {
-                    warn_ton_api_unavailable(&e, "Balances will not be available");
-                }
-                None
-            }
-        };
-
-        let views =
-            collect_pool_views(&config, &rpc_client, self.format == OutputFormat::Table).await;
 
         match self.format {
             OutputFormat::Json => print_pools_json(&views)?,
@@ -170,203 +399,133 @@ impl PoolLsCmd {
     }
 }
 
-async fn collect_pool_views(
-    config: &AppConfig,
-    rpc_client: &Option<Arc<ClientJsonRpc>>,
-    warn_on_error: bool,
-) -> Vec<PoolView> {
-    let mut vault: Option<Option<Arc<SecretVault>>> = None;
-    let mut views = Vec::new();
-
-    for (name, pool) in &config.pools {
-        match pool {
-            PoolConfig::SNP { address, owner } => {
-                let needs_vault = address.is_none() && owner.is_some();
-                if needs_vault && vault.is_none() {
-                    vault = Some(match SecretVaultBuilder::from_env().await {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            if warn_on_error {
-                                println!(
-                                    "{}: {}",
-                                    "Warning: failed to initialize secret vault".yellow(),
-                                    e.to_string().yellow()
-                                );
-                            }
-                            None
-                        }
-                    });
-                }
-                let vault_ref = vault.as_ref().and_then(|v| v.clone());
-
-                let addr_result = get_pool_display_result(
-                    name,
-                    address.as_ref(),
-                    owner.as_ref(),
-                    config,
-                    vault_ref,
-                )
-                .await;
-
-                let balance_result = resolve_pool_balance(&addr_result, rpc_client).await;
-
-                let display_owner =
-                    owner.as_ref().and_then(|o| MsgAddressInt::from_str(o).ok()).and_then(|o| {
-                        o.to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE).ok()
-                    });
-
-                views.push(PoolView {
-                    name: name.clone(),
-                    kind: "SNP".to_string(),
-                    balance: balance_result.ok(),
-                    address: addr_result.ok(),
-                    owner: display_owner,
-                    addresses: None,
-                    validator_share: None,
-                });
-            }
-            PoolConfig::TONCore { addresses, validator_share } => {
-                views.push(PoolView {
-                    name: name.clone(),
-                    kind: "Core".to_string(),
-                    balance: None,
-                    address: None,
-                    owner: None,
-                    addresses: Some(addresses.to_vec()),
-                    validator_share: Some(*validator_share),
-                });
-            }
-        }
-    }
-    views
-}
-
 fn print_pools_json(views: &[PoolView]) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(views)?);
     Ok(())
 }
 
+fn display_ton_address(addr: Option<&str>) -> ColoredString {
+    addr.map(|s| {
+        MsgAddressInt::from_str(s)
+            .and_then(|a| a.to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE))
+            .unwrap_or_else(|_| s.to_string())
+    })
+    .map(|s| s.white())
+    .unwrap_or_else(|| "-".red())
+}
+
 fn print_pools_table(views: &[PoolView]) {
-    println!("\n{} {} ({})\n", "OK".green().bold(), "Pools:".green(), views.len());
+    let snp: Vec<&PoolView> = views.iter().filter(|v| v.kind == "SNP").collect();
+    let core: Vec<&PoolView> = views.iter().filter(|v| v.kind == "Core").collect();
+
+    if !snp.is_empty() {
+        print_snp_table(&snp);
+    }
+    if !core.is_empty() {
+        print_toncore_table(&core);
+    }
+}
+
+fn print_snp_table(views: &[&PoolView]) {
+    println!("\n{} {} ({})\n", "OK".green().bold(), "SNP pools:".green(), views.len());
     println!(
-        "  {:<15} {:<6} {:<14} {:<50} {}",
+        "  {:<15} {:<14} {:<50} {}",
         "Name".cyan().bold(),
-        "Kind".cyan().bold(),
         "Balance".cyan().bold(),
         "Address".cyan().bold(),
         "Owner".cyan().bold(),
     );
-    println!("  {}", "─".repeat(137).dimmed());
+    println!("  {}", "─".repeat(130).dimmed());
 
     for v in views {
-        match v.kind.as_str() {
-            "SNP" => {
-                let display_addr =
-                    v.address.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
-                let display_owner =
-                    v.owner.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
-                let display_balance =
-                    v.balance.as_deref().map(|s| s.white()).unwrap_or_else(|| "-".red());
+        let display_addr = display_ton_address(v.address.as_deref());
+        let display_owner = display_ton_address(v.owner.as_deref());
+        let display_balance =
+            v.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
+        println!("  {:<15} {:<14} {:<50} {}", v.name, display_balance, display_addr, display_owner,);
+    }
+    println!();
+}
 
-                println!(
-                    "  {:<15} {:<6} {:<14} {:<50} {}",
-                    v.name, "SNP", display_balance, display_addr, display_owner,
-                );
-            }
-            "Core" => {
-                let addrs = v.addresses.as_deref().map(|a| a.join(", ")).unwrap_or_default();
-                let share = v.validator_share.map(|s| s.to_string()).unwrap_or_default();
-                println!(
-                    "  {:<15} {:<6} {:<14} {:<50} share={}",
-                    v.name, "Core", "-", addrs, share,
-                );
-            }
-            _ => {}
+fn print_toncore_table(views: &[&PoolView]) {
+    let total_slots: usize = views.iter().filter_map(|v| v.slots.as_ref()).map(|s| s.len()).sum();
+    println!(
+        "\n{} {} ({} pools, {} slots)\n",
+        "OK".green().bold(),
+        "TONCore pools:".green(),
+        views.len(),
+        total_slots,
+    );
+    println!(
+        "  {:<15} {:<5} {:<10} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+        "Name".cyan().bold(),
+        "Slot".cyan().bold(),
+        "State".cyan().bold(),
+        "Balance".cyan().bold(),
+        "Noms".cyan().bold(),
+        "Share".cyan().bold(),
+        "Validator".cyan().bold(),
+        "Min nom.stake".cyan().bold(),
+        "Address".cyan().bold(),
+    );
+    println!("  {}", "─".repeat(160).dimmed());
+
+    for v in views {
+        let Some(slots) = v.slots.as_ref() else { continue };
+        if slots.is_empty() {
+            // Pool exists in config but no slots configured at all — surface this.
+            println!("  {:<15} {}", v.name, "(no slots configured)".dimmed());
+            continue;
+        }
+        for s in slots {
+            let display_addr = display_ton_address(s.address.as_deref());
+            let display_state = display_state(&s.pool_state.unwrap_or(-1));
+            let display_balance =
+                s.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
+            let noms = match (s.nominators_count, s.max_nominators) {
+                (Some(n), Some(m)) => format!("{n}/{m}"),
+                (Some(n), None) => format!("{n}"),
+                _ => "-".to_string(),
+            };
+            // `validator_share` is stored on-chain in basis points (1 bp = 0.01%);
+            // convert to a percentage for display (e.g. 4000 bp → "40.00%").
+            let share = s
+                .validator_share
+                .map(|sh| format!("{:.2}%", sh as f64 / 100.0))
+                .unwrap_or_else(|| "-".to_string());
+            let validator_amount = s
+                .validator_amount
+                .map(|b| display_tons(b).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let min_nom = s
+                .min_nominator_stake
+                .map(|b| display_tons(b).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:<15} {:<5} {:<10} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+                v.name,
+                s.slot,
+                display_state,
+                display_balance,
+                noms,
+                share,
+                validator_amount,
+                min_nom,
+                display_addr,
+            );
         }
     }
     println!();
 }
 
-async fn get_pool_display_result(
-    pool_name: &str,
-    address: Option<&String>,
-    owner: Option<&String>,
-    config: &AppConfig,
-    vault: Option<Arc<SecretVault>>,
-) -> Result<String, String> {
-    match (address, owner) {
-        (Some(addr), _) => Ok(MsgAddressInt::from_str(addr)
-            .map_err(|_| "invalid address")?
-            .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
-            .map_err(|_| "conversion failed")?),
-        (None, Some(owner_str)) => resolve_pool_address(pool_name, owner_str, config, vault).await,
-        (None, None) => Err("pool owner not configured".to_string()),
+fn display_state(state: &i32) -> ColoredString {
+    match state {
+        -1 => "error".red(),
+        0 => "idle".cyan(),
+        1 => "staking".green(),
+        2 => "staking".green(),
+        _ => "unknown".red(),
     }
-}
-
-async fn resolve_pool_balance(
-    addr_result: &Result<String, String>,
-    rpc_client: &Option<Arc<ClientJsonRpc>>,
-) -> Result<String, String> {
-    match (addr_result, rpc_client) {
-        (Ok(addr_str), Some(client)) => {
-            let addr = MsgAddressInt::from_str(addr_str).map_err(|_| "invalid address")?;
-            match client.get_address_information(&addr).await {
-                Ok(info) => Ok(display_tons(info.balance)),
-                Err(e) => Err(format!("ton api failed: {e}")),
-            }
-        }
-        (Err(_), _) => Err("-".to_string()),
-        (_, None) => Err("-".to_string()),
-    }
-}
-
-async fn resolve_pool_address(
-    pool_name: &str,
-    owner: &str,
-    config: &AppConfig,
-    vault: Option<Arc<SecretVault>>,
-) -> Result<String, String> {
-    // 1. Find binding referencing this pool; prefer enabled, then sort by name for determinism
-    let mut matching: Vec<_> =
-        config.bindings.iter().filter(|(_, b)| b.pool.as_deref() == Some(pool_name)).collect();
-    if matching.is_empty() {
-        return Err("no binding found".to_string());
-    }
-    matching.sort_by_key(|(k, b)| (!b.enable, k.as_str()));
-    let (_, binding) = matching[0];
-
-    // 2. Get wallet config
-    let wallet_cfg = config.wallets.get(&binding.wallet).ok_or("wallet not configured")?;
-
-    // 3. Read secret and get public key
-    let vault_arc = vault.ok_or("vault unavailable")?;
-    let secret =
-        wallet_cfg.key.read_secret(Some(vault_arc)).await.map_err(|_| "get wallet key error")?;
-    let keypair = secret.as_keypair().map_err(|_| "wallet key is not a keypair")?;
-    let pub_key = keypair
-        .public_key()
-        .await
-        .map_err(|_| "get public key error")?
-        .ok_or("empty public key")?;
-
-    // 4. Compute wallet address
-    let wallet_addr =
-        calculate_wallet_address(wallet_cfg, &pub_key).map_err(|_| "address calculation error")?;
-
-    // 5. Parse owner and compute pool address
-    let owner_addr = MsgAddressInt::from_str(owner).map_err(|_| "invalid owner address")?;
-    let pool_addr = NominatorWrapperImpl::calculate_address(
-        NOMINATOR_POOL_WORKCHAIN,
-        &owner_addr,
-        &wallet_addr,
-    )
-    .map_err(|_| "address calculation error")?;
-
-    let addr_str = pool_addr
-        .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
-        .map_err(|_| "failed to convert address to string")?;
-    Ok(addr_str)
 }
 
 fn normalize_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<String> {
@@ -388,27 +547,206 @@ fn validate_ton_address(addr: &str, flag_name: &str) -> anyhow::Result<()> {
 }
 
 impl PoolRmCmd {
-    pub async fn run(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = AppConfig::load(path)?;
-
-        if !config.pools.contains_key(&self.name) {
-            anyhow::bail!("Pool '{}' not found in configuration", self.name);
-        }
-
-        for (node_name, binding) in &config.bindings {
-            if binding.pool.as_deref() == Some(&self.name) {
-                anyhow::bail!(
-                    "Cannot remove pool '{}': referenced by binding for node '{}'",
-                    self.name,
-                    node_name
-                );
-            }
-        }
-
-        config.pools.remove(&self.name);
-        save_config(&config, path)?;
-
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(url, config_path)?;
+        api_delete(&base_url, &format!("/v1/pools/{}", self.name), token).await?;
         println!("\n{} Pool '{}' removed\n", "OK".green().bold(), self.name);
+        Ok(())
+    }
+}
+
+impl PoolDepositValidatorCmd {
+    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+
+        let binding = config
+            .bindings
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' not found", self.binding))?;
+
+        let wallet_cfg =
+            get_wallet_config(&binding.wallet, &config.wallets, config.master_wallet.as_ref())?;
+
+        let pool_name = binding
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' has no pool configured", self.binding))?;
+        let pool_cfg = config
+            .pools
+            .get(pool_name)
+            .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))?;
+        if !matches!(pool_cfg, PoolConfig::TONCore { .. }) {
+            anyhow::bail!(
+                "Binding '{}' points to non-TONCore pool '{}'; deposit-validator is only supported for TONCore pools",
+                self.binding,
+                pool_name
+            );
+        }
+
+        let (wallet_address, wallet_info_data, wallet_secret) =
+            wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
+
+        if wallet_info_data.account_state
+            != ton_http_api_client::v2::data_models::AccountState::Active
+        {
+            anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_data.account_state);
+        }
+
+        let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
+        let pool_address = resolve_pool_address_from_config(pool_cfg, &wallet_address, pool_slot)?;
+
+        let deposit_nanotons = tons_f64_to_nanotons(self.amount);
+        if deposit_nanotons == 0 {
+            anyhow::bail!("Amount must be greater than 0");
+        }
+
+        let gas_reserve: u64 = 2_000_000_000;
+        if wallet_info_data.balance < deposit_nanotons.saturating_add(gas_reserve) {
+            anyhow::bail!(
+                "Insufficient wallet balance: {} TON (need {} TON + gas)",
+                nanotons_to_tons_f64(wallet_info_data.balance),
+                self.amount,
+            );
+        }
+
+        println!(
+            "\n{}\n  Binding: {}\n  Wallet:  {} ({})\n  Pool:    {}\n  Amount:  {:.9} TON\n",
+            "Deposit validator summary:".cyan().bold(),
+            self.binding,
+            binding.wallet,
+            wallet_address,
+            pool_address,
+            self.amount,
+        );
+
+        if !self.yes && !confirm("Confirm deposit?")? {
+            println!("{}", "Deposit cancelled".yellow());
+            return Ok(());
+        }
+
+        let wallet =
+            make_wallet(rpc_client.clone(), wallet_cfg, wallet_secret, &binding.wallet).await?;
+
+        let pool_addr_display = pool_address.to_string();
+        let body = pool_messages::deposit_validator(0)?;
+        let msg = wallet
+            .build_message(pool_address, deposit_nanotons, body, true, None, None, None)
+            .await?;
+
+        let msg_boc = write_boc(&msg)?;
+        rpc_client.send_boc(&msg_boc).await?;
+
+        wait_for_seqno_change(
+            rpc_client.clone(),
+            &wallet_address,
+            wallet_info_data.seqno,
+            &cancellation_ctx,
+            SEND_TIMEOUT,
+        )
+        .await?;
+
+        println!(
+            "{} Deposited {:.9} TON to pool {}",
+            "OK".green().bold(),
+            self.amount,
+            pool_addr_display
+        );
+        Ok(())
+    }
+}
+
+impl PoolWithdrawValidatorCmd {
+    pub async fn run(&self, path: &Path, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+        let (config, vault, rpc_client) = load_config_vault_rpc_client(path).await?;
+
+        let binding = config
+            .bindings
+            .get(&self.binding)
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' not found", self.binding))?;
+
+        let wallet_cfg =
+            get_wallet_config(&binding.wallet, &config.wallets, config.master_wallet.as_ref())?;
+
+        let pool_name = binding
+            .pool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Binding '{}' has no pool configured", self.binding))?;
+        let pool_cfg = config
+            .pools
+            .get(pool_name)
+            .ok_or_else(|| anyhow::anyhow!("Pool '{}' not found", pool_name))?;
+        if !matches!(pool_cfg, PoolConfig::TONCore { .. }) {
+            anyhow::bail!(
+                "Binding '{}' points to non-TONCore pool '{}'; withdraw-validator is only supported for TONCore pools",
+                self.binding,
+                pool_name
+            );
+        }
+
+        let (wallet_address, wallet_info_data, wallet_secret) =
+            wallet_info(rpc_client.clone(), wallet_cfg, vault.clone()).await?;
+
+        if wallet_info_data.account_state
+            != ton_http_api_client::v2::data_models::AccountState::Active
+        {
+            anyhow::bail!("Wallet '{}' is {}", binding.wallet, wallet_info_data.account_state);
+        }
+
+        let pool_slot = toncore_pool_slot_from_cli_flags(self.pool_even, self.pool_odd);
+        let pool_address = resolve_pool_address_from_config(pool_cfg, &wallet_address, pool_slot)?;
+
+        let withdraw_nanotons = tons_f64_to_nanotons(self.amount);
+        if withdraw_nanotons == 0 {
+            anyhow::bail!("Amount must be greater than 0");
+        }
+
+        println!(
+            "\n{}\n  Binding: {}\n  Wallet:  {} ({})\n  Pool:    {}\n  Amount:  {:.9} TON\n",
+            "Withdraw validator summary:".cyan().bold(),
+            self.binding,
+            binding.wallet,
+            wallet_address,
+            pool_address,
+            self.amount,
+        );
+
+        if !self.yes && !confirm("Confirm withdrawal?")? {
+            println!("{}", "Withdrawal cancelled".yellow());
+            return Ok(());
+        }
+
+        let wallet =
+            make_wallet(rpc_client.clone(), wallet_cfg, wallet_secret, &binding.wallet).await?;
+
+        let pool_addr_display = pool_address.to_string();
+        let gas_amount: u64 = 1_000_000_000;
+        let body = pool_messages::withdraw_validator(0, withdraw_nanotons)?;
+        let msg =
+            wallet.build_message(pool_address, gas_amount, body, true, None, None, None).await?;
+
+        let msg_boc = write_boc(&msg)?;
+        rpc_client.send_boc(&msg_boc).await?;
+
+        wait_for_seqno_change(
+            rpc_client.clone(),
+            &wallet_address,
+            wallet_info_data.seqno,
+            &cancellation_ctx,
+            SEND_TIMEOUT,
+        )
+        .await?;
+
+        println!(
+            "{} Withdrawal of {:.9} TON requested from pool {}",
+            "OK".green().bold(),
+            self.amount,
+            pool_addr_display
+        );
         Ok(())
     }
 }
@@ -416,92 +754,6 @@ impl PoolRmCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{
-        TonWalletVersion,
-        app_config::{
-            AppConfig, BindingStatus, HttpConfig, KeyConfig, NodeBinding, TonHttpApiConfig,
-            WalletConfig,
-        },
-    };
-    use std::collections::HashMap;
-
-    fn minimal_config() -> AppConfig {
-        AppConfig {
-            nodes: HashMap::new(),
-            wallets: HashMap::new(),
-            pools: HashMap::new(),
-            bindings: HashMap::new(),
-            ton_http_api: TonHttpApiConfig::default(),
-            elections: None,
-            voting: None,
-            http: HttpConfig::default(),
-            master_wallet: None,
-            tick_interval: 40,
-            log: None,
-        }
-    }
-
-    const OWNER: &str = "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb";
-
-    #[tokio::test]
-    async fn test_display_result_with_address() {
-        let config = minimal_config();
-        let addr =
-            "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea".to_string();
-        let expected = MsgAddressInt::from_str(&addr)
-            .unwrap()
-            .to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE)
-            .unwrap();
-        let result = get_pool_display_result("pool1", Some(&addr), None, &config, None).await;
-        assert_eq!(result, Ok(expected));
-    }
-
-    #[tokio::test]
-    async fn test_display_result_no_address_no_owner() {
-        let config = minimal_config();
-        let result = get_pool_display_result("pool1", None, None, &config, None).await;
-        assert_eq!(result, Err("pool owner not configured".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_display_result_owner_no_binding() {
-        let config = minimal_config();
-        let owner = OWNER.to_string();
-        let result = get_pool_display_result("pool1", None, Some(&owner), &config, None).await;
-        assert_eq!(result, Err("no binding found".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_display_result_owner_wallet_not_configured() {
-        let mut config = minimal_config();
-        config.bindings.insert(
-            "node1".to_string(),
-            NodeBinding {
-                wallet: "missing_wallet".to_string(),
-                pool: Some("pool1".to_string()),
-                enable: false,
-                status: BindingStatus::default(),
-            },
-        );
-        let owner = OWNER.to_string();
-        let result = get_pool_display_result("pool1", None, Some(&owner), &config, None).await;
-        assert_eq!(result, Err("wallet not configured".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_balance_addr_error_returns_dash() {
-        let addr_result: Result<String, String> = Err("some error".to_string());
-        let result = resolve_pool_balance(&addr_result, &None).await;
-        assert_eq!(result, Err("-".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_balance_rpc_unavailable() {
-        let addr_result: Result<String, String> =
-            Ok("Ef+9Ez08YSxbbVoxLlgq6L_s94BXLwPZKHE1Wa7yQCb06Ic5".to_string());
-        let result = resolve_pool_balance(&addr_result, &None).await;
-        assert_eq!(result, Err("-".to_string()));
-    }
 
     #[test]
     fn test_validate_ton_address_valid_raw() {
@@ -576,29 +828,108 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_display_result_owner_vault_unavailable() {
-        let mut config = minimal_config();
-        config.bindings.insert(
-            "node1".to_string(),
-            NodeBinding {
-                wallet: "wallet1".to_string(),
-                pool: Some("pool1".to_string()),
-                enable: false,
-                status: BindingStatus::default(),
-            },
-        );
-        config.wallets.insert(
-            "wallet1".to_string(),
-            WalletConfig {
-                key: KeyConfig::VaultKey { name: "test-key".to_string() },
-                version: TonWalletVersion::V3R2,
-                subwallet_id: 698983191,
-                workchain: -1,
-            },
-        );
-        let owner = OWNER.to_string();
-        let result = get_pool_display_result("pool1", None, Some(&owner), &config, None).await;
-        assert_eq!(result, Err("vault unavailable".to_string()));
+    // ---- PoolView serde / table rendering ----
+
+    fn snp_view() -> PoolView {
+        PoolView {
+            name: "snp1".into(),
+            kind: "SNP".into(),
+            balance: Some(123_000_000_000),
+            address: Some(
+                "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
+            ),
+            owner: Some(
+                "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
+            ),
+            slots: None,
+        }
+    }
+
+    fn core_view_two_slots() -> PoolView {
+        PoolView {
+            name: "core1".into(),
+            kind: "Core".into(),
+            balance: None,
+            address: None,
+            owner: None,
+            slots: Some(vec![
+                TonCorePoolSlotView {
+                    slot: "even".into(),
+                    address: Some(
+                        "-1:0000000000000000000000000000000000000000000000000000000000000001"
+                            .into(),
+                    ),
+                    state: "active".into(),
+                    balance: Some(50_000_000_000),
+                    validator_share: Some(4000),
+                    max_nominators: Some(40),
+                    min_validator_stake: Some(10_000_000_000_000),
+                    min_nominator_stake: Some(10_000_000_000_000),
+                    nominators_count: Some(3),
+                    stake_amount_sent: Some(0),
+                    validator_amount: Some(0),
+                    pool_state: Some(0),
+                    last_election_id: Some(1_700_000_000),
+                },
+                TonCorePoolSlotView {
+                    slot: "odd".into(),
+                    address: None,
+                    state: "not deployed".into(),
+                    ..Default::default()
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn pool_view_snp_json_no_slots_field() {
+        // Round-trip: PoolView → JSON → PoolView. The SNP view must serialize
+        // without a `slots` field so the API contract for SNP stays stable.
+        let view = snp_view();
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["kind"], "SNP");
+        assert!(json.get("slots").is_none(), "SNP must not emit slots field");
+        let back: PoolView = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, "SNP");
+        assert!(back.slots.is_none());
+    }
+
+    #[test]
+    fn pool_view_toncore_json_round_trip() {
+        let view = core_view_two_slots();
+        let json = serde_json::to_value(&view).unwrap();
+        let slots = json["slots"].as_array().expect("slots present");
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0]["slot"], "even");
+        assert_eq!(slots[0]["validator_share"], 4000);
+        assert_eq!(slots[1]["slot"], "odd");
+        assert_eq!(slots[1]["state"], "not deployed");
+        // Optional fields on the not-deployed slot must be omitted, not null.
+        assert!(slots[1].get("balance").is_none());
+        assert!(slots[1].get("validator_share").is_none());
+
+        let back: PoolView = serde_json::from_value(json).unwrap();
+        let back_slots = back.slots.as_ref().unwrap();
+        assert_eq!(back_slots[0].nominators_count, Some(3));
+        assert_eq!(back_slots[1].state, "not deployed");
+    }
+
+    #[test]
+    fn print_pools_table_handles_mixed_kinds_without_panic() {
+        // Smoke test: rendering must not panic on the new two-table layout
+        // when both an SNP pool and a TONCore pool with mixed slots are
+        // present. Validates the column-formatting code paths for every slot
+        // state we care about.
+        let views = vec![snp_view(), core_view_two_slots()];
+        print_pools_table(&views);
+    }
+
+    #[test]
+    fn print_pools_table_skips_empty_sections() {
+        // Only TONCore configured → SNP renderer must be skipped (no panic,
+        // no "SNP pools (0)" header).
+        print_pools_table(&[core_view_two_slots()]);
+        // Only SNP configured → TONCore renderer is skipped.
+        print_pools_table(&[snp_view()]);
     }
 }

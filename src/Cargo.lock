@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "adnl",
  "anyhow",
@@ -876,6 +876,7 @@ dependencies = [
  "contracts",
  "control-client",
  "elections",
+ "hex",
  "reqwest",
  "rpassword",
  "scopeguard",
@@ -892,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "adnl",
  "anyhow",
@@ -992,7 +993,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "contracts"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1006,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "control-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "adnl",
  "anyhow",
@@ -1600,7 +1601,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "elections"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "adnl",
  "anyhow",
@@ -3246,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "adnl",
  "ahash",
@@ -3317,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "nodectl"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap 4.6.0",
@@ -4923,7 +4924,7 @@ dependencies = [
 
 [[package]]
 name = "service"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "adnl",
  "anyhow",
@@ -5597,7 +5598,7 @@ dependencies = [
 
 [[package]]
 name = "ton-http-api-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
