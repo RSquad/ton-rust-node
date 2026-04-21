@@ -590,10 +590,6 @@ impl Overlay {
         }
     }
 
-    pub(crate) fn calc_broadcast_twostep_neighbours(&self) -> u32 {
-        self.neighbours.count() as u32
-    }
-
     pub(crate) fn select_broadcast_neighbours(
         &self,
         count: u32,
@@ -629,6 +625,24 @@ impl Overlay {
         let mut buf = self.overlay_type.bcast_prefix().unwrap_or(self.message_prefix.clone());
         serialize_boxed_append(&mut buf, bcast)?;
         Ok(buf)
+    }
+
+    fn calc_broadcast_twostep_neighbours(&self) -> u32 {
+        let root_adnl_ids = match &self.overlay_type {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            OverlayType::Private { .. } => None,
+            _ => return self.neighbours.count(),
+        };
+        let mut count = 0u32;
+        let mut iter = None;
+        let mut neighbour = self.known_peers.next(&mut iter);
+        while let Some(node) = neighbour {
+            if root_adnl_ids.map_or(true, |root_adnl_ids| root_adnl_ids.contains(&node)) {
+                count += 1;
+            }
+            neighbour = self.known_peers.next(&mut iter);
+        }
+        count
     }
 
     fn check_peer(&self, peer: &Arc<KeyId>, certificate: Option<&MemberCertificate>) -> Result<()> {
