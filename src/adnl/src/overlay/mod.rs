@@ -620,28 +620,29 @@ impl Overlay {
         neighbours
     }
 
-    pub(crate) fn count_broadcast_twostep_neighbours(&self) -> u32 {
-        match &self.overlay_type {
-            OverlayType::CertifiedMembers { root_adnl_ids, .. } => {
-                let mut count = 0u32;
-                let (mut iter, mut neighbour) = self.neighbours.first();
-                while let Some(node) = neighbour {
-                    if root_adnl_ids.contains(&node) {
-                        count += 1;
-                    }
-                    neighbour = self.neighbours.next(&mut iter);
-                }
-                count
-            }
-            _ => return self.neighbours.count(),
-        }
-    }
-
     pub(crate) fn serialize_broadcast(&self, bcast: &Broadcast) -> Result<Vec<u8>> {
         // In semi-private overlays we use special message prefix (without certificate)
         let mut buf = self.overlay_type.bcast_prefix().unwrap_or(self.message_prefix.clone());
         serialize_boxed_append(&mut buf, bcast)?;
         Ok(buf)
+    }
+
+    fn calc_broadcast_twostep_neighbours(&self) -> u32 {
+        let root_adnl_ids = match &self.overlay_type {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            OverlayType::Private { .. } => None,
+            _ => return self.neighbours.count(),
+        };
+        let mut count = 0u32;
+        let mut iter = None;
+        let mut neighbour = self.known_peers.next(&mut iter);
+        while let Some(node) = neighbour {
+            if root_adnl_ids.map_or(true, |root_adnl_ids| root_adnl_ids.contains(&node)) {
+                count += 1;
+            }
+            neighbour = self.known_peers.next(&mut iter);
+        }
+        count
     }
 
     fn check_peer(&self, peer: &Arc<KeyId>, certificate: Option<&MemberCertificate>) -> Result<()> {
@@ -1655,7 +1656,7 @@ impl OverlayNode {
             src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
-        let neighbours = overlay.count_broadcast_twostep_neighbours();
+        let neighbours = overlay.calc_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
         let reliable = big_data || overlay.overlay_type.quic_requested();
         if big_data && (neighbours >= Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST) {
