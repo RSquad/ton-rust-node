@@ -149,7 +149,7 @@ nodectl supports two nominator pool types. Choose based on your operational mode
 | **Pool contracts** | 1 per node | 2 per node (even + odd slots) |
 | **Round participation** | Every round from one pool | Each pool participates in **1 of 2** consecutive rounds |
 | **Validator stake deposit** | Not required — pool balance is the stake | Required — validator must deposit into each pool via `deposit-validator` |
-| **Stake policies** | All supported (Minimum, Fixed, Split50, AdaptiveSplit50) | **Only Minimum and Fixed** — Split50 / AdaptiveSplit50 are ignored (see [below](#stake-policy-limitations)) |
+| **Stake policies** | All supported (Minimum, Fixed, Split50, AdaptiveSplit50) | Split50 / AdaptiveSplit50 behave differently — stake the **full liquid balance** instead of half (see [below](#stake-policy-limitations)) |
 
 #### Single Nominator Pool (SNP)
 

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Nominator Pool support** — nodectl now supports standard Nominator Pool contracts. This pool type uses a pair of pools that alternate between even and odd validation rounds. Add each pool with `config pool add core --even` / `--odd`, then manage the validator deposit with `config pool deposit-validator` and `config pool withdraw-validator`. The election runner automatically picks the available pool each round and tracks stake recovery from both.
+- **Nominator Pool support** — nodectl now supports TON Core Nominator Pool contracts. This pool type uses a pair of pools that alternate between even and odd validation rounds. Add each pool with `config pool add core --even` / `--odd`, then manage the validator deposit with `config pool deposit-validator` and `config pool withdraw-validator`. The election runner automatically picks the available pool each round and tracks stake recovery from both.
 - **Adaptive staking strategy (`adaptive_split50`)** — emulates the Elector's selection algorithm to estimate the minimum effective stake for the current round, then splits half when the remaining half is still competitive and stakes all otherwise. Adds `sleep_period_pct` / `waiting_period_pct` to the `elections` config. See `docs/staking-strategies.md`.
 - **Centralised config management through REST API** — all `config` mutations (entity CRUD, settings, logging, TON HTTP API) now flow through JWT-authenticated REST endpoints on the running service, with the CLI acting as a thin client. New endpoints:
   - `POST|DELETE /v1/nodes`, `POST|DELETE /v1/wallets`, `POST|DELETE /v1/pools`, `POST|DELETE /v1/bindings`
