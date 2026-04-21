@@ -6,6 +6,30 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.5.2] - 2026-04-21
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.2`
+
+### Changed
+
+- Optimized fast-sync overlay operation over QUIC
+
+### Fixed
+
+- TVM stack slice TL-serialization fix for LiteServer
+
+## [v0.5.1] - 2026-04-17
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.1`
+
+### Added
+
+- Switch to ubuntu base image and add console binary
+
+### Fixed
+
+- Fix LiteServer response handling for listBlockTransactions so clients accept it correctly
+
 ## [v0.5.0] - 2026-04-11
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.0`

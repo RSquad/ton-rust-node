@@ -58,8 +58,8 @@ use ton_api::{
 };
 use ton_block::{
     base64_encode, error, AccountIdPrefixFull, BlockIdExt, BlockSignaturesVariant, Cell,
-    ConfigParams, ImportedMsgQueueLimits, KeyOption, Result, ShardIdent, ValidatorSet,
-    BASE_WORKCHAIN_ID,
+    ConfigParams, ImportedMsgQueueLimits, KeyOption, Result, ShardIdent, ValidatorDescr,
+    ValidatorSet, BASE_WORKCHAIN_ID,
 };
 
 /// The router encapsulates work with full node overlays at the logical level. It abstracts creation,
@@ -386,12 +386,20 @@ impl FullNodeOverlaysRouter {
         self: &Arc<Self>,
         config: &ConfigParams,
     ) -> Result<()> {
-        let new_vset = config.validator_set()?;
-        let key = self.try_get_our_key(&new_vset)?;
+        let prev_vset = config.prev_validator_set()?;
+        let this_vset = config.validator_set()?;
+        let next_vset = config.next_validator_set()?;
+        let key = self.try_get_our_key(&this_vset)?;
+        let mc_use_quic = config.get_mc_simplex_config()?.map_or(false, |c| c.use_quic);
+        let shard_use_quic = config.get_shard_simplex_config()?.map_or(false, |c| c.use_quic);
         self.update_fast_sync_overlays(
-            &new_vset,
+            &prev_vset,
+            &this_vset,
+            &next_vset,
             config.base_workchain()?.monitor_min_split(),
             key.as_ref(),
+            mc_use_quic,
+            shard_use_quic,
         )
         .await?;
         Ok(())
@@ -450,12 +458,16 @@ impl FullNodeOverlaysRouter {
 
     async fn update_fast_sync_overlays(
         self: &Arc<Self>,
-        new_validators: &ValidatorSet,
+        prev_validators: &ValidatorSet,
+        this_validators: &ValidatorSet,
+        next_validators: &ValidatorSet,
         new_monitor_min_split: u8,
         key: Option<&Arc<dyn KeyOption>>,
+        mc_use_quic: bool,
+        shard_use_quic: bool,
     ) -> Result<()> {
         let mut cur_validators = self.validators.lock().await;
-        let validators_changed = *cur_validators != *new_validators;
+        let validators_changed = *cur_validators != *this_validators;
         let old_monitor_min_split = self.monitor_min_split_for_fast_sync.load(Ordering::Relaxed);
         if (old_monitor_min_split == new_monitor_min_split) && !validators_changed {
             return Ok(());
@@ -464,13 +476,26 @@ impl FullNodeOverlaysRouter {
         log::info!(
             "Updating fast sync overlays: \
             monitor min split {old_monitor_min_split} -> {new_monitor_min_split}, \
-            validators changed {validators_changed}"
+            validators changed {validators_changed}, \
+            mc_use_quic {mc_use_quic}, shard_use_quic {shard_use_quic}"
         );
 
-        let create_overlay = |shard: &ShardIdent| {
+        // Root members = union of past + current + next validator sets.
+        // Duplicates (a validator present in multiple rounds) are collapsed by
+        // the HashSet/HashMap inside add_semiprivate_overlay
+        let mut validators: Vec<ValidatorDescr> = Vec::with_capacity(
+            prev_validators.list().len()
+                + this_validators.list().len()
+                + next_validators.list().len(),
+        );
+        validators.extend(prev_validators.list().iter().cloned());
+        validators.extend(this_validators.list().iter().cloned());
+        validators.extend(next_validators.list().iter().cloned());
+
+        let create_overlay = |shard: &ShardIdent, use_quic: bool| {
             FastSyncOverlayClient::new(
                 shard.clone(),
-                new_validators,
+                &validators,
                 key,
                 None,
                 self.network.cancellation_token().child_token(),
@@ -478,6 +503,7 @@ impl FullNodeOverlaysRouter {
                 self.engine.clone(),
                 self.policy.clone(),
                 self.network.default_rldp_roundtrip(),
+                use_quic,
             )
         };
 
@@ -494,7 +520,7 @@ impl FullNodeOverlaysRouter {
                     if let Some(old) = self.fast_sync_overlays.remove(&shard) {
                         old.val().stop();
                     }
-                    let overlay = create_overlay(&shard).await?;
+                    let overlay = create_overlay(&shard, shard_use_quic).await?;
                     self.fast_sync_overlays.insert(shard, overlay)
                 } else {
                     self.fast_sync_overlays.remove(&shard)
@@ -517,7 +543,7 @@ impl FullNodeOverlaysRouter {
         if key.is_none() {
             self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
             log::info!("We are not a validator");
-            *cur_validators = new_validators.clone();
+            *cur_validators = this_validators.clone();
             return Ok(());
         }
 
@@ -527,7 +553,7 @@ impl FullNodeOverlaysRouter {
             if let Some(old) = self.fast_sync_overlays.remove(&shard) {
                 old.val().stop();
             }
-            let overlay = create_overlay(&shard).await?;
+            let overlay = create_overlay(&shard, mc_use_quic).await?;
             self.fast_sync_overlays.insert(shard, overlay);
         }
 
@@ -535,7 +561,7 @@ impl FullNodeOverlaysRouter {
         update_monitor_min_split(new_monitor_min_split, true).await?;
 
         self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
-        *cur_validators = new_validators.clone();
+        *cur_validators = this_validators.clone();
 
         Ok(())
     }
@@ -612,10 +638,14 @@ impl FullNodeOverlaysRouter {
                         #[cfg(feature = "telemetry")]
                         tag: BlockBroadcastCompressed::constructor_const(),
                     };
-                    if let Some(fast_sync_client) = fast_sync_client {
-                        fast_sync_client
-                            .send_broadcast(&broadcast, 0, AdnlSendMethod::Fast)
-                            .await?;
+                    if let Some(fast_sync_client) = &fast_sync_client {
+                        if fast_sync_client.use_twostep() {
+                            fast_sync_client.send_twostep_broadcast(&broadcast, 0).await?;
+                        } else {
+                            fast_sync_client
+                                .send_broadcast(&broadcast, 0, AdnlSendMethod::Fast)
+                                .await?;
+                        }
                     }
                     for overlay in custom_overlays {
                         overlay.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
@@ -650,8 +680,14 @@ impl FullNodeOverlaysRouter {
                     tag: BlockBroadcastCompressedV2::constructor_const(),
                 };
 
-                if let Some(fast_sync_client) = fast_sync_client {
-                    fast_sync_client.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                if let Some(fast_sync_client) = &fast_sync_client {
+                    if fast_sync_client.use_twostep() {
+                        fast_sync_client.send_twostep_broadcast(&broadcast, 0).await?;
+                    } else {
+                        fast_sync_client
+                            .send_broadcast(&broadcast, 0, AdnlSendMethod::Fast)
+                            .await?;
+                    }
                 }
                 for overlay in custom_overlays {
                     overlay.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
@@ -758,7 +794,11 @@ impl FullNodeOverlaysRouter {
                 overlay.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
             }
             if let Some(client) = fast_sync_client {
-                client.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                if client.use_twostep() {
+                    client.send_twostep_broadcast(&broadcast, 0).await?;
+                } else {
+                    client.send_broadcast(&broadcast, 0, AdnlSendMethod::Fast).await?;
+                }
             }
         }
         Ok(())
