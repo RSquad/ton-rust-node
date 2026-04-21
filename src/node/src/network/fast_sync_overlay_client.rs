@@ -68,9 +68,7 @@ impl FastSyncOverlayClient {
 
         let use_twostep = use_quic && network_context.stack.quic.is_some() && key.is_some();
         if use_quic && !use_twostep {
-            log::warn!(
-                "Fast sync overlay {id_short}: use_quic=true but QUIC or key not available"
-            );
+            log::warn!("Fast sync overlay {id_short}: use_quic=true but QUIC or key not available");
         }
 
         log::info!(

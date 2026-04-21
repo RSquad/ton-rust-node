@@ -383,7 +383,7 @@ impl OverlayType {
     fn quic_requested(&self) -> bool {
         matches!(
             self,
-            OverlayType::Private { use_quic: true, .. } 
+            OverlayType::Private { use_quic: true, .. }
                 | OverlayType::CertifiedMembers { use_quic: true, .. }
         )
     }
