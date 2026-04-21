@@ -590,10 +590,6 @@ impl Overlay {
         }
     }
 
-    pub(crate) fn calc_broadcast_twostep_neighbours(&self) -> u32 {
-        self.neighbours.count() as u32
-    }
-
     pub(crate) fn select_broadcast_neighbours(
         &self,
         count: u32,
@@ -622,6 +618,23 @@ impl Overlay {
             neighbour = self.neighbours.next(&mut iter);
         }
         neighbours
+    }
+
+    pub(crate) fn count_broadcast_twostep_neighbours(&self) -> u32 {
+        match &self.overlay_type {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => {
+                let mut count = 0u32;
+                let (mut iter, mut neighbour) = self.neighbours.first();
+                while let Some(node) = neighbour {
+                    if root_adnl_ids.contains(&node) {
+                        count += 1;
+                    }
+                    neighbour = self.neighbours.next(&mut iter);
+                }
+                count
+            }
+            _ => return self.neighbours.count(),
+        }
     }
 
     pub(crate) fn serialize_broadcast(&self, bcast: &Broadcast) -> Result<Vec<u8>> {
@@ -1642,7 +1655,7 @@ impl OverlayNode {
             src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
-        let neighbours = overlay.calc_broadcast_twostep_neighbours();
+        let neighbours = overlay.count_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
         let reliable = big_data || overlay.overlay_type.quic_requested();
         if big_data && (neighbours >= Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST) {
