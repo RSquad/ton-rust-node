@@ -130,7 +130,8 @@ impl OverlayClient {
     pub async fn new_semiprivate(
         id: Arc<OverlayShortId>,
         id_full: OverlayId,
-        root_members: Vec<Arc<KeyId>>,
+        root_adnl_ids: Vec<Arc<KeyId>>,
+        root_public_keys: Vec<Arc<KeyId>>,
         key: Option<&Arc<dyn KeyOption>>,
         certificate: Option<MemberCertificate>,
         network_context: Arc<NetworkContext>,
@@ -138,15 +139,18 @@ impl OverlayClient {
         policy: DhtSearchPolicy,
         default_rldp_roundtrip: Option<u32>,
         max_clients: usize,
+        use_quic: bool,
     ) -> Result<Arc<Self>> {
         // Add a new overlay to the protocol
         let params = OverlayParams::with_id_only(&id);
         network_context.stack.overlay.add_semiprivate_overlay(
             params,
             key,
-            &root_members,
+            &root_adnl_ids,
+            &root_public_keys,
             certificate,
             max_clients,
+            use_quic,
         )?;
 
         OverlayClient::init(
@@ -157,7 +161,7 @@ impl OverlayClient {
             policy,
             default_rldp_roundtrip,
             true,
-            root_members,
+            root_adnl_ids,
             None,
         )
         .await
@@ -296,6 +300,18 @@ impl OverlayClient {
         method: AdnlSendMethod,
     ) -> Result<BroadcastSendInfo> {
         self.ctx.overlay_node().broadcast(&self.ctx.id, data, source, flags, method).await
+    }
+
+    pub async fn broadcast_twostep(
+        &self,
+        data: &TaggedByteSlice<'_>,
+        source: Option<&Arc<dyn KeyOption>>,
+        flags: u32,
+    ) -> Result<BroadcastSendInfo> {
+        self.ctx
+            .overlay_node()
+            .broadcast_twostep(&self.ctx.id, data, source, flags, Vec::new())
+            .await
     }
 
     pub async fn send_adnl_query_to_peer<D: ton_api::AnyBoxedSerialize>(

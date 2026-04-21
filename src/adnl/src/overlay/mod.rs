@@ -26,7 +26,7 @@ use num_traits::pow::Pow;
 use std::{
     borrow::Borrow,
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -359,13 +359,16 @@ enum OverlayType {
     },
     // Overlay with externally certified members
     CertifiedMembers {
-        key: Option<Arc<dyn KeyOption>>,
-        // KeyId -> (Slot -> SlaveInfo)
-        root_members: HashMap<Arc<KeyId>, lockfree::map::Map<u32, SlaveInfo>>,
-        max_slaves: usize,
         // Prefix to use in broadcasts instead of Overlay::message_prefix
         bcast_prefix: Vec<u8>,
         certificate: Option<MemberCertificate>,
+        key: Option<Arc<dyn KeyOption>>,
+        max_slaves: usize,
+        // Validator ADNL IDs, bypassing the certificate check
+        root_adnl_ids: HashSet<Arc<KeyId>>,
+        // Validator Signing KeyId -> (Slot -> SlaveInfo)
+        root_public_keys: HashMap<Arc<KeyId>, lockfree::map::Map<u32, SlaveInfo>>,
+        use_quic: bool,
     },
 }
 
@@ -378,7 +381,11 @@ impl OverlayType {
     }
 
     fn quic_requested(&self) -> bool {
-        matches!(self, OverlayType::Private { use_quic: true, .. })
+        matches!(
+            self,
+            OverlayType::Private { use_quic: true, .. }
+                | OverlayType::CertifiedMembers { use_quic: true, .. }
+        )
     }
 
     fn calc_message_prefix(&self, overlay_id: &OverlayShortId) -> Result<Vec<u8>> {
@@ -583,10 +590,6 @@ impl Overlay {
         }
     }
 
-    pub(crate) fn calc_broadcast_twostep_neighbours(&self) -> u32 {
-        self.neighbours.count() as u32
-    }
-
     pub(crate) fn select_broadcast_neighbours(
         &self,
         count: u32,
@@ -599,11 +602,17 @@ impl Overlay {
         &self,
         skip: Option<&Arc<KeyId>>,
     ) -> Vec<Arc<KeyId>> {
+        let root_adnl_ids = match &self.overlay_type {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            _ => None,
+        };
         let mut neighbours = Vec::new();
         let (mut iter, mut neighbour) = self.neighbours.first();
         while let Some(node) = neighbour {
             let skipped = if let Some(skip) = &skip { &node == *skip } else { false };
-            if !skipped {
+            // Skip CertifiedMembers: only send twostep to root members (validators).
+            let root = if let Some(roots) = root_adnl_ids { roots.contains(&node) } else { true };
+            if !skipped && root {
                 neighbours.push(node);
             }
             neighbour = self.neighbours.next(&mut iter);
@@ -618,6 +627,24 @@ impl Overlay {
         Ok(buf)
     }
 
+    fn calc_broadcast_twostep_neighbours(&self) -> u32 {
+        let root_adnl_ids = match &self.overlay_type {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            OverlayType::Private { .. } => None,
+            _ => return self.neighbours.count(),
+        };
+        let mut count = 0u32;
+        let mut iter = None;
+        let mut neighbour = self.known_peers.next(&mut iter);
+        while let Some(node) = neighbour {
+            if root_adnl_ids.map_or(true, |root_adnl_ids| root_adnl_ids.contains(&node)) {
+                count += 1;
+            }
+            neighbour = self.known_peers.next(&mut iter);
+        }
+        count
+    }
+
     fn check_peer(&self, peer: &Arc<KeyId>, certificate: Option<&MemberCertificate>) -> Result<()> {
         match &self.overlay_type {
             OverlayType::Public => Ok(()),
@@ -627,8 +654,8 @@ impl Overlay {
                 }
                 Ok(())
             }
-            OverlayType::CertifiedMembers { root_members, .. } => {
-                if root_members.contains_key(peer) {
+            OverlayType::CertifiedMembers { root_adnl_ids, .. } => {
+                if root_adnl_ids.contains(peer) {
                     return Ok(());
                 }
                 // Bcasts are sent without a certificate, hoping the target already knows
@@ -1035,12 +1062,11 @@ impl Overlay {
 
     fn validate_certificate(&self, peer: &Arc<KeyId>, cert: &MemberCertificate) -> Result<()> {
         let utime = UnixTime::now() as u32;
-
-        let (max_slaves, root_members) =
-            if let OverlayType::CertifiedMembers { max_slaves, root_members, .. } =
+        let (max_slaves, root_public_keys) =
+            if let OverlayType::CertifiedMembers { max_slaves, root_public_keys, .. } =
                 &self.overlay_type
             {
-                (*max_slaves, root_members)
+                (*max_slaves, root_public_keys)
             } else {
                 fail!("Overlay type is not certificated members")
             };
@@ -1058,7 +1084,7 @@ impl Overlay {
 
         // 3) Issuer
         let issuer: Arc<dyn KeyOption> = (&cert.issued_by).try_into()?;
-        let Some(slaves_info) = root_members.get(issuer.id()) else {
+        let Some(slaves_info) = root_public_keys.get(issuer.id()) else {
             fail!("Certificate is issued by unknown member: {}", cert.issued_by);
         };
 
@@ -1557,22 +1583,27 @@ impl OverlayNode {
         &self,
         params: OverlayParams,
         overlay_key: Option<&Arc<dyn KeyOption>>,
-        root_members: &[Arc<KeyId>],
+        root_adnl_ids: &[Arc<KeyId>],
+        root_public_keys: &[Arc<KeyId>], // Can be empty if overlay created by non-validator
         certificate: Option<MemberCertificate>,
         max_slaves: usize,
+        use_quic: bool,
     ) -> Result<bool> {
-        let mut root_members_full = HashMap::with_capacity(root_members.len());
-        for member in root_members {
-            root_members_full.insert(member.clone(), lockfree::map::Map::new());
+        let root_adnl_set: HashSet<Arc<KeyId>> = root_adnl_ids.iter().cloned().collect();
+        let mut root_public_keys_map = HashMap::with_capacity(root_public_keys.len());
+        for pk in root_public_keys {
+            root_public_keys_map.insert(pk.clone(), lockfree::map::Map::new());
         }
         let overlay_type = OverlayType::CertifiedMembers {
-            root_members: root_members_full,
-            max_slaves,
             bcast_prefix: OverlayUtils::calc_message_prefix(params.overlay_id)?,
             certificate,
             key: overlay_key.cloned(),
+            max_slaves,
+            root_adnl_ids: root_adnl_set,
+            root_public_keys: root_public_keys_map,
+            use_quic,
         };
-        self.add_typed_private_overlay(overlay_type, params, root_members)
+        self.add_typed_private_overlay(overlay_type, params, root_adnl_ids)
     }
 
     /// Broadcast message
@@ -1977,11 +2008,7 @@ impl OverlayNode {
             penalty: 1,
             to_block: Self::MAX_FAIL_COUNT,
         };
-        let quic = if let OverlayType::Private { use_quic: true, .. } = &overlay_type {
-            self.quic.get().cloned()
-        } else {
-            None
-        };
+        let quic = if overlay_type.quic_requested() { self.quic.get().cloned() } else { None };
         let overlay = Overlay {
             adnl: self.adnl.clone(),
             rldp: self.rldp.get().cloned(),

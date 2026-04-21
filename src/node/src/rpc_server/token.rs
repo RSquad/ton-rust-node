@@ -155,6 +155,10 @@ fn parse_msg_address_from_stack_entry(entry: &StackEntry) -> Result<Option<MsgAd
             parse_msg_address_from_cell(&root)
         }
         StackEntry::Tvm_StackEntrySlice(stackentry::StackEntrySlice { slice }) => {
+            if let Ok(root) = read_single_root_boc(&slice.bytes) {
+                return parse_msg_address_from_cell(&root);
+            }
+
             const ADDR_BITS: usize = 267;
 
             if slice.bytes.len() * 8 < ADDR_BITS {
