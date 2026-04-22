@@ -13,7 +13,7 @@ use crate::StorageTelemetry;
 use crate::{
     cell_db::CellByHashStorageAdapter,
     db::rocksdb::{destroy_rocks_db, AccessType, RocksDb},
-    dynamic_boc_rc_db::DynamicBocDb,
+    dynamic_boc_rc_db::{AsyncCellsStorageAdapter, DynamicBocDb},
     shardstate_db_async::CellsDbConfig,
     tests::utils::{
         count_tree_unique_cells, get_another_test_tree_of_cells, get_test_tree_of_cells,
@@ -21,9 +21,9 @@ use crate::{
     },
     StorageAlloc,
 };
-use std::sync::Arc;
+use std::{io::Cursor, sync::Arc};
 use ton_block::{
-    read_single_root_boc, BigBocWriter, BocFlags, BuilderData, Cell, IBitstring, Result,
+    read_single_root_boc, BigBocWriter, BocFlags, BocReader, BuilderData, Cell, IBitstring, Result,
     MAX_SAFE_DEPTH,
 };
 
@@ -42,7 +42,6 @@ async fn test_dynamic_boc_rc_db() -> Result<()> {
         db.clone(),
         "cells",
         "counters",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -56,7 +55,7 @@ async fn test_dynamic_boc_rc_db() -> Result<()> {
     boc_db.save_boc(root_cell.clone(), &|| Ok(()))?;
     assert_eq!(boc_db.count(), initial_cell_count);
 
-    let loaded_boc = boc_db.load_cell(&root_cell.repr_hash(), true)?;
+    let loaded_boc = boc_db.load_cell(&root_cell.repr_hash())?;
     let fetched_count = count_tree_unique_cells(loaded_boc.clone());
     assert_eq!(fetched_count, initial_cell_count);
 
@@ -88,7 +87,6 @@ async fn test_dynamic_boc_rc_db_2() -> Result<()> {
         db.clone(),
         "cells",
         "counters",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -115,18 +113,18 @@ async fn test_dynamic_boc_rc_db_2() -> Result<()> {
     let check_stop = || Ok(());
 
     let r1 = create_ss(vec!["r1", "c1", "A", "B"]);
-    let r1_id = r1.repr_hash();
+    let r1_id = r1.repr_hash().clone();
     boc_db.save_boc(r1, &check_stop).unwrap();
 
     let r2 = create_ss(vec!["r2", "c2", "A", "B"]);
-    let r2_id = r2.repr_hash();
+    let r2_id = r2.repr_hash().clone();
     boc_db.save_boc(r2, &check_stop).unwrap();
 
     boc_db.delete_boc(&r1_id, &check_stop).unwrap();
     boc_db.delete_boc(&r2_id, &check_stop).unwrap();
 
     let r3 = create_ss(vec!["r3", "c3", "B"]);
-    let r3_id = r3.repr_hash();
+    let r3_id = r3.repr_hash().clone();
     boc_db.save_boc(r3, &check_stop).unwrap();
 
     boc_db.delete_boc(&r3_id, &check_stop).unwrap();
@@ -144,7 +142,7 @@ async fn test_dynamic_boc_rc_db_2() -> Result<()> {
 fn repack_without_hashes(cell: Cell) -> Result<Cell> {
     let mut builder = BuilderData::with_raw(cell.data(), cell.bit_length())?;
     builder.set_type(cell.cell_type());
-    for r in cell.clone_references() {
+    for r in cell.clone_references()? {
         let repacked_ref = repack_without_hashes(r.clone())?;
         builder.checked_append_reference(repacked_ref)?;
     }
@@ -164,7 +162,6 @@ async fn test_cell_by_hash_storage() -> Result<()> {
         db.clone(),
         "cells",
         "counters",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -197,5 +194,83 @@ async fn test_cell_by_hash_storage() -> Result<()> {
     drop(boc_db);
     drop(db);
     destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_is_stored_cell() -> Result<()> {
+    init_test_log();
+
+    const DB_NAME: &str = "test_is_stored_cell";
+
+    destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();
+
+    let db = RocksDb::new(DB_PATH, DB_NAME, None, AccessType::ReadWrite)?;
+    let boc_db = Arc::new(DynamicBocDb::with_db(
+        db.clone(),
+        "cells",
+        "counters",
+        &CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?);
+
+    let root_cell = get_test_tree_of_cells();
+
+    // Original cell is not a stored cell
+    assert!(!boc_db.cell_db().is_stored_cell(&root_cell));
+
+    // Save and load the cell from the DB
+    boc_db.save_boc(root_cell.clone(), &|| Ok(()))?;
+    let loaded_cell = boc_db.load_cell(&root_cell.repr_hash())?;
+
+    // Loaded cell should be recognized as stored
+    assert!(boc_db.cell_db().is_stored_cell(&loaded_cell));
+
+    // Child references of a loaded cell should also be stored cells
+    for child in loaded_cell.clone_references().unwrap() {
+        assert!(boc_db.cell_db().is_stored_cell(&child));
+    }
+
+    drop(boc_db);
+    drop(db);
+    destroy_rocks_db(DB_PATH, DB_NAME).await.unwrap();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_async_cells_storage_adapter() -> Result<()> {
+    init_test_log();
+
+    const DB_NAME: &str = "test_async_cells_storage_adapter";
+
+    destroy_rocks_db(DB_PATH, DB_NAME).await?;
+
+    let db = RocksDb::new(DB_PATH, DB_NAME, None, AccessType::ReadWrite)?;
+    let boc_db = Arc::new(DynamicBocDb::with_db(
+        db.clone(),
+        "cells",
+        "counters",
+        &CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?);
+
+    let data = std::fs::read("../../block/src/tests/data/6A3BD5B96ABEA186BFEE202B70D510C29F85E126A522B08C1DCAD39F92CF5C51.boc")?;
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut reader = BocReader::new();
+        let head = reader.read_header(&mut Cursor::new(&data))?.0;
+        let index = vec![Default::default(); head.cells_count];
+        reader.read_inmem_to_storage(
+            &data,
+            &mut AsyncCellsStorageAdapter::new(boc_db.clone(), index)?,
+        )?;
+        Ok(())
+    })
+    .await??;
+
     Ok(())
 }

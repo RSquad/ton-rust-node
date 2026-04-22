@@ -10,16 +10,16 @@
  */
 use crate::{
     cell::{self},
-    crc32_digest, error, fail, finalize_simple_cell_data, ByteOrderRead, Cell, CellData, Crc32,
-    DataCell, Result, SliceData, UInt256, DEPTH_SIZE, MAX_DATA_BYTES, MAX_REFERENCES_COUNT,
-    MAX_SAFE_DEPTH, SHA256_SIZE,
+    crc32_digest, error, fail, level_mask, BocCellDraft, ByteOrderRead, Cell, CellLoader,
+    CellsArena, Crc32, Result, SliceData, UInt256, DEPTH_SIZE, MAX_DATA_BYTES,
+    MAX_REFERENCES_COUNT, MAX_SAFE_DEPTH, SHA256_SIZE,
 };
 use std::{
     collections::{hash_map, HashMap, HashSet},
     fmt::Debug,
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom, Write},
-    ops::{BitOrAssign, Deref},
+    ops::BitOrAssign,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -204,7 +204,7 @@ impl BocWriterStack {
 
         let mut max_stack_len: usize = 0;
 
-        indices.insert(root_cell.repr_hash(), (iteration, false));
+        indices.insert(root_cell.repr_hash().clone(), (iteration, false));
         stack.push((iteration, StackItem::New(root_cell)));
 
         while let Some((index, item)) = stack.pop() {
@@ -357,7 +357,7 @@ impl<T: Clone> CellInfo<T> {
         CellInfo {
             data_size: cell.data().len() as u8,
             flags: CellInfoFlags::new(cell),
-            cell: cell.repr_hash(),
+            cell: cell.repr_hash().clone(),
             weight: 0,
             refs: [0; MAX_REFERENCES_COUNT],
             revisiting_status: -1,
@@ -524,15 +524,16 @@ macro_rules! define_BocWriter {
                     if root_cell.virtualization() != 0 {
                         fail!("Virtual cells serialisation is prohibited");
                     }
-                    if !roots_set.insert(root_cell.repr_hash()) {
+                    let root_hash = root_cell.repr_hash().clone();
+                    if !roots_set.insert(root_hash.clone()) {
                         fail!("roots must be all unique")
                     }
                     let depth = root_cell.repr_depth();
                     if depth > max_depth {
-                        fail!("Cell {:x} is too deep: {} > {}", root_cell.repr_hash(), depth, max_depth);
+                        fail!("Cell {:x} is too deep: {} > {}", root_hash, depth, max_depth);
                     }
 
-                    if let Some(rev_index) = boc.cells_index.get(&root_cell.repr_hash()) {
+                    if let Some(rev_index) = boc.cells_index.get(&root_hash) {
                         boc.roots_indexes_rev.push(*rev_index as usize);
                     } else {
                         let rev_index = boc.arrange_cells(root_cell)?;
@@ -573,7 +574,7 @@ macro_rules! define_BocWriter {
                 Ok(v)
             }
 
-            pub fn write_to_file(self, path: &str) -> Result<()> {
+            pub fn write_to_file(self, path: impl AsRef<Path>) -> Result<()> {
                 let mut file = File::create(path)?;
                 self.write(&mut file)
             }
@@ -773,6 +774,8 @@ macro_rules! define_BocWriter {
                     {
                         self.stored_hashes += cell_info.hashes_count();
                     }
+
+                    check_abort(self.abort)?;
                 }
 
                 Ok(())
@@ -956,7 +959,7 @@ impl BocWriter<'_> {
     fn arrange_cells(&mut self, cell: Cell) -> Result<u32> {
         check_abort(self.abort)?;
 
-        let repr_hash = cell.repr_hash();
+        let repr_hash = cell.repr_hash().clone();
 
         if cell.virtualization() != 0 {
             fail!("Virtual cells serialization is prohibited");
@@ -970,7 +973,7 @@ impl BocWriter<'_> {
 
         let mut weight = 1;
         let mut refs = [0; MAX_REFERENCES_COUNT];
-        for (i, child_cell) in cell.clone_references().into_iter().enumerate() {
+        for (i, child_cell) in cell.clone_references()?.into_iter().enumerate() {
             let child_rev_index = self.arrange_cells(child_cell)?;
             refs[i] = child_rev_index;
             weight += self.cells[child_rev_index as usize].weight as u32;
@@ -1144,6 +1147,7 @@ pub struct BocReaderResult {
     pub roots: Vec<Cell>,
     pub header: BocHeader,
     pub flags: BocFlags,
+    pub interrupted: bool,
 }
 
 impl BocReaderResult {
@@ -1159,14 +1163,9 @@ impl BocReaderResult {
 pub trait CellsTempStorage {
     fn load_hash_and_depth(&self, index: u32) -> Result<(UInt256, u16)>;
     fn load_cell(&self, index: u32) -> Result<Cell>;
-    fn store_simple_cell(
-        &mut self,
-        index: u32,
-        data: CellData,
-        refs: &[(UInt256, u16)],
-    ) -> Result<()>;
     fn store_cell(&mut self, index: u32, cell: &Cell) -> Result<()>;
     fn cleanup(&mut self) -> Result<()>;
+    fn loader(&self) -> &CellLoader;
 }
 
 enum BocIndex<'a> {
@@ -1197,18 +1196,22 @@ impl BocIndex<'_> {
 
 pub struct BocReader<'a> {
     abort: &'a dyn Fn() -> bool,
-    indexed_cells: HashMap<u32, RawCell>,
+    load_cell_callback: &'a dyn Fn(&Cell) -> bool,
+    draft_cells: HashMap<u32, BocCellDraft>,
     done_cells: HashMap<u32, Cell>,
     max_depth: u16,
+    arena: Option<Arc<CellsArena>>,
 }
 
 impl Default for BocReader<'_> {
     fn default() -> Self {
         Self {
             abort: &|| false,
-            indexed_cells: HashMap::new(),
+            load_cell_callback: &|_| true,
+            draft_cells: HashMap::new(),
             done_cells: HashMap::new(),
             max_depth: MAX_SAFE_DEPTH,
+            arena: None,
         }
     }
 }
@@ -1218,8 +1221,18 @@ pub fn read_boc(data: impl AsRef<[u8]>) -> Result<BocReaderResult> {
     BocReader::new().read(&mut cursor)
 }
 
+pub fn read_boc_file(path: &str) -> Result<BocReaderResult> {
+    let mut file = File::open(path)?;
+    BocReader::new().read(&mut file)
+}
+
 pub fn read_single_root_boc(data: impl AsRef<[u8]>) -> Result<Cell> {
     read_boc(data)?.withdraw_single_root()
+}
+
+pub fn read_single_root_boc_file(path: &str) -> Result<Cell> {
+    let mut file = File::open(path)?;
+    BocReader::new().read(&mut file)?.withdraw_single_root()
 }
 
 /// reads only single root cell from boc
@@ -1238,6 +1251,16 @@ impl<'a> BocReader<'a> {
 
     pub fn set_abort(mut self, abort: &'a dyn Fn() -> bool) -> Self {
         self.abort = abort;
+        self
+    }
+
+    pub fn set_load_cell_callback(mut self, load_cell_callback: &'a dyn Fn(&Cell) -> bool) -> Self {
+        self.load_cell_callback = load_cell_callback;
+        self
+    }
+
+    pub fn set_arena(mut self, arena: Arc<CellsArena>) -> Self {
+        self.arena = Some(arena);
         self
     }
 
@@ -1278,25 +1301,20 @@ impl<'a> BocReader<'a> {
             src.read_exact(&mut raw_index)?;
         }
 
-        // Read cells
+        // Read cells into drafts (pre-allocated cell memory, no intermediate Vec)
         #[cfg(not(target_family = "wasm"))]
         let now1 = std::time::Instant::now();
         let mut actual_data_size = src.stream_position()?;
         for cell_index in 0..header.cells_count {
             check_abort(self.abort)?;
-            let raw_cell =
-                Self::read_raw_cell(&mut src, header.ref_size, cell_index, header.cells_count)?;
-
-            // write!(&mut log, "{} {}{}",
-            //     cell_index,
-            //     if cell::store_hashes(&raw_cell.data) { "SH " } else { "" },
-            //     hex::encode(&raw_cell.data)).unwrap();
-            // for i in 0..cell::refs_count(&raw_cell.data) {
-            //     write!(&mut log, " {} ", raw_cell.refs[i]).unwrap();
-            // }
-            // write!(&mut log, "\n").unwrap();
-
-            self.indexed_cells.insert(cell_index as u32, raw_cell);
+            let draft_cell = Self::read_draft_cell(
+                &mut src,
+                header.ref_size,
+                cell_index,
+                header.cells_count,
+                &self.arena,
+            )?;
+            self.draft_cells.insert(cell_index as u32, draft_cell);
         }
         actual_data_size = src.stream_position()? - actual_data_size;
         if actual_data_size as usize != header.tot_cells_size {
@@ -1305,38 +1323,48 @@ impl<'a> BocReader<'a> {
         #[cfg(not(target_family = "wasm"))]
         let read_time = now1.elapsed().as_millis();
 
-        // Resolving references & constructing cells from leaves to roots
+        // Resolving references & constructing cells from drafts (leaves to roots)
         #[cfg(not(target_family = "wasm"))]
         let now1 = std::time::Instant::now();
+        let mut interrupted = false;
         for cell_index in (0..header.cells_count).rev() {
             check_abort(self.abort)?;
-            let raw_cell = self
-                .indexed_cells
+            let draft = self
+                .draft_cells
                 .remove(&(cell_index as u32))
                 .ok_or_else(|| error!("Cell #{} was not found", cell_index))?;
-            let mut refs = vec![];
-            for i in 0..cell::refs_count(&raw_cell.data) {
+
+            let rc = draft.refs_count();
+            if !header.roots_indexes.contains(&(cell_index as u32)) && draft.has_stored_hashes() {
+                flags |= BocFlags::IntHashes;
+            }
+
+            let mut refs = smallvec::SmallVec::<[Cell; 4]>::new();
+            for i in 0..rc {
+                let ref_idx = draft.ref_index(i);
                 refs.push(
                     self.done_cells
-                        .get(&raw_cell.refs[i])
-                        .ok_or_else(|| error!("Cell #{} was not found", raw_cell.refs[i]))?
+                        .get(&ref_idx)
+                        .ok_or_else(|| error!("Cell #{} was not found", ref_idx))?
                         .clone(),
                 );
             }
-            if !header.roots_indexes.contains(&(cell_index as u32))
-                && cell::store_hashes(&raw_cell.data)
-            {
-                flags |= BocFlags::IntHashes;
+
+            let cell =
+                Cell::from_boc_draft(draft, &refs, Some(self.max_depth), self.arena.as_ref())?;
+            if !(self.load_cell_callback)(&cell) {
+                self.done_cells.insert(cell_index as u32, cell);
+                interrupted = true;
+                break;
             }
-            let cell = DataCell::with_raw_data(refs, raw_cell.data, Some(self.max_depth))?;
-            self.done_cells.insert(cell_index as u32, Cell::with_cell_impl(cell));
+            self.done_cells.insert(cell_index as u32, cell);
         }
         #[cfg(not(target_family = "wasm"))]
         let constructing_time = now1.elapsed().as_millis();
 
-        let roots = self.collect_roots(&header, &mut flags)?;
+        let roots = if interrupted { Vec::new() } else { self.collect_roots(&header, &mut flags)? };
 
-        if header.has_crc {
+        if !interrupted && header.has_crc {
             src.check_crc()?;
         }
 
@@ -1353,100 +1381,17 @@ impl<'a> BocReader<'a> {
 
         // write!(&mut log, "flags: {:?}\n", flags).unwrap();
 
-        Ok(BocReaderResult { roots, header, flags })
-    }
-
-    pub fn read_inmem(&mut self, data: Arc<Vec<u8>>) -> Result<BocReaderResult> {
-        #[cfg(not(target_family = "wasm"))]
-        let now = std::time::Instant::now();
-        let mut src = Cursor::new(data.deref());
-
-        let (header, mut flags) = self.read_header(&mut src)?;
-
-        Self::precheck_cells_tree_len(&header, src.position(), data.len() as u64, false)?;
-
-        // Index processing - read existing index or traverse all vector to create own index2
-        #[cfg(not(target_family = "wasm"))]
-        let now1 = std::time::Instant::now();
-        let index = self.read_index(&data, &mut src, &header)?;
-        #[cfg(not(target_family = "wasm"))]
-        let index_time = now1.elapsed().as_millis();
-
-        // Resolving references & constructing cells from leaves to roots
-        #[cfg(not(target_family = "wasm"))]
-        let now1 = std::time::Instant::now();
-        for cell_index in (0..header.cells_count).rev() {
-            check_abort(self.abort)?;
-
-            let offset = index.offset(cell_index, &header)?;
-
-            if data.len() <= offset {
-                fail!(
-                    "Invalid data: data too short or index is invalid ({} <= {})",
-                    data.len(),
-                    offset
-                );
-            }
-            let mut src = Cursor::new(&data[offset..]);
-            let refs_indexes =
-                Self::read_refs_indexes(&mut src, header.ref_size, cell_index, header.cells_count)?;
-            let mut refs = Vec::with_capacity(refs_indexes.len());
-            for ref_cell_index in refs_indexes {
-                let child = self
-                    .done_cells
-                    .get(&ref_cell_index)
-                    .ok_or_else(|| error!("Cell #{} was not found", ref_cell_index))?;
-                refs.push(child.clone());
-            }
-            if !header.roots_indexes.contains(&(cell_index as u32))
-                && cell::store_hashes(&data[offset..])
-            {
-                flags |= BocFlags::IntHashes;
-            }
-            let cell = DataCell::with_external_data(refs, &data, offset, Some(self.max_depth))?;
-            self.done_cells.insert(cell_index as u32, Cell::with_cell_impl(cell));
-        }
-        #[cfg(not(target_family = "wasm"))]
-        let constructing_time = now1.elapsed().as_millis();
-
-        let roots = self.collect_roots(&header, &mut flags)?;
-
-        #[cfg(not(target_family = "wasm"))]
-        let now1 = std::time::Instant::now();
-        if header.has_crc {
-            let crc = crc32_digest(&data[..data.len() - 4]);
-            src.set_position(data.len() as u64 - 4);
-            let read_crc = src.read_le_u32()?;
-            if read_crc != crc {
-                fail!("crc not the same, values: {}, {}", read_crc, crc)
-            }
-        }
-        #[cfg(not(target_family = "wasm"))]
-        let crc_time = now1.elapsed().as_millis();
-
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let total_time = now.elapsed().as_millis();
-            log::trace!(
-                "TIME read_inmem: {}ms (index: {}, creating cells: {}, crc: {})",
-                total_time,
-                index_time,
-                constructing_time,
-                crc_time,
-            );
-        }
-
-        Ok(BocReaderResult { roots, header, flags })
+        Ok(BocReaderResult { roots, header, flags, interrupted })
     }
 
     pub fn read_inmem_to_storage(
         &mut self,
-        data: Arc<Vec<u8>>,
+        data: &[u8],
         cells_storage: &mut dyn CellsTempStorage,
     ) -> Result<BocReaderResult> {
         #[cfg(not(target_family = "wasm"))]
         let now = std::time::Instant::now();
-        let mut src = Cursor::new(data.deref());
+        let mut src = Cursor::new(data);
 
         let (header, mut flags) = self.read_header(&mut src)?;
 
@@ -1462,6 +1407,7 @@ impl<'a> BocReader<'a> {
         // Resolving references & constructing cells from leaves to roots
         #[cfg(not(target_family = "wasm"))]
         let now1 = std::time::Instant::now();
+        let mut interrupted = false;
         for cell_index in (0..header.cells_count).rev() {
             check_abort(self.abort)?;
 
@@ -1481,57 +1427,66 @@ impl<'a> BocReader<'a> {
                 flags |= BocFlags::IntHashes;
             }
 
-            let mut cell_data = CellData::with_external_data(&data, offset)?;
+            // let mut cell_data = CellData::with_external_data(&data, offset)?;
 
-            if cell_data.level() == 0 {
+            let cell = if level_mask(&data[offset..]).mask() == 0 {
                 // To calculate hash of this cell we need to know only
                 // repr hashes of its children
 
-                let mut refs = Vec::with_capacity(refs_indexes.len());
+                let mut ref_hashes = smallvec::SmallVec::<[UInt256; MAX_REFERENCES_COUNT]>::new();
+                let mut ref_depths = smallvec::SmallVec::<[u16; MAX_REFERENCES_COUNT]>::new();
                 for ref_cell_index in refs_indexes {
-                    let child = cells_storage.load_hash_and_depth(ref_cell_index)?;
-                    refs.push(child);
+                    let (h, d) = cells_storage.load_hash_and_depth(ref_cell_index)?;
+                    ref_hashes.push(h);
+                    ref_depths.push(d);
                 }
-
-                finalize_simple_cell_data(&mut cell_data, &refs, Some(self.max_depth))?;
-                cells_storage.store_simple_cell(cell_index as u32, cell_data, &refs)?;
+                Cell::with_data_and_loader(
+                    &data[offset..],
+                    true,
+                    &ref_hashes,
+                    &ref_depths,
+                    cells_storage.loader(),
+                    None,
+                )?
             } else {
                 // To calculate hash of this cell we need to know all hashes of its children,
                 // so we need to load them from the storage
 
-                let mut refs = Vec::with_capacity(refs_indexes.len());
+                let mut refs = smallvec::SmallVec::<[Cell; MAX_REFERENCES_COUNT]>::new();
                 for ref_cell_index in refs_indexes {
                     let child = cells_storage.load_cell(ref_cell_index)?;
                     refs.push(child.clone());
                 }
-                let cell = Cell::with_cell_impl(DataCell::with_cell_data(
-                    cell_data,
-                    refs,
-                    Some(self.max_depth),
-                )?);
-                cells_storage.store_cell(cell_index as u32, &cell)?;
+                Cell::with_data_and_refs(&data[offset..], true, &refs, Some(self.max_depth), None)?
+            };
+            cells_storage.store_cell(cell_index as u32, &cell)?;
+            if !(self.load_cell_callback)(&cell) {
+                interrupted = true;
+                break;
             }
         }
         #[cfg(not(target_family = "wasm"))]
         let constructing_time = now1.elapsed().as_millis();
 
-        let mut roots = Vec::with_capacity(header.roots_indexes.len());
-        let mut all_roots_with_hashes = true;
-        for i in &header.roots_indexes {
-            check_abort(self.abort)?;
-            let root = cells_storage.load_cell(*i)?;
-            if !root.store_hashes() {
-                all_roots_with_hashes = false;
+        let mut roots = Vec::new();
+        if !interrupted {
+            let mut all_roots_with_hashes = true;
+            for i in &header.roots_indexes {
+                check_abort(self.abort)?;
+                let root = cells_storage.load_cell(*i)?;
+                if !root.store_hashes() {
+                    all_roots_with_hashes = false;
+                }
+                roots.push(root);
             }
-            roots.push(root);
-        }
-        if all_roots_with_hashes {
-            flags |= BocFlags::TopHash;
+            if all_roots_with_hashes {
+                flags |= BocFlags::TopHash;
+            }
         }
 
         #[cfg(not(target_family = "wasm"))]
         let now1 = std::time::Instant::now();
-        if header.has_crc {
+        if !interrupted && header.has_crc {
             let crc = crc32_digest(&data[..data.len() - 4]);
             src.set_position(data.len() as u64 - 4);
             let read_crc = src.read_le_u32()?;
@@ -1560,7 +1515,7 @@ impl<'a> BocReader<'a> {
             );
         }
 
-        Ok(BocReaderResult { roots, header, flags })
+        Ok(BocReaderResult { roots, header, flags, interrupted })
     }
 
     fn collect_roots(&self, header: &BocHeader, flags: &mut BocFlags) -> Result<Vec<Cell>> {
@@ -1583,7 +1538,7 @@ impl<'a> BocReader<'a> {
     fn read_index(
         &self,
         data: &'a [u8],
-        cursor: &mut Cursor<&Vec<u8>>,
+        cursor: &mut Cursor<&[u8]>,
         header: &BocHeader,
     ) -> Result<BocIndex<'a>> {
         if !header.index_included {
@@ -1653,8 +1608,8 @@ impl<'a> BocReader<'a> {
         }
 
         // Read root cell data
-        let cell_data = CellData::with_unbounded_raw_data_slice(&data[offset..])?;
-        let slice = SliceData::with_bitstring(cell_data.data(), cell_data.bit_length());
+        let cell_data = Cell::check_data(&data[offset..], true)?;
+        let slice = SliceData::with_bitstring(cell_data.data, cell_data.bit_len);
 
         Ok((header, slice))
     }
@@ -1824,42 +1779,50 @@ impl<'a> BocReader<'a> {
         Ok(())
     }
 
-    fn read_raw_cell<T>(
+    fn read_draft_cell<T>(
         src: &mut T,
         ref_size: usize,
         cell_index: usize,
         cells_count: usize,
-    ) -> Result<RawCell>
+        arena: &Option<Arc<CellsArena>>,
+    ) -> Result<BocCellDraft>
     where
         T: Read,
     {
-        let mut refs = [0; 4];
-        let mut data;
-        let mut d1d2 = [0_u8; 2];
-        src.read_exact(&mut d1d2[0..2])?;
-        let refs_count = cell::refs_count(&d1d2);
+        // Max raw cell: d1(1) + d2(1) + hashes(32*4) + depths(2*4) + data(128) = 266
+        let mut buf = [0u8; 266];
+        src.read_exact(&mut buf[0..2])?;
+        let refs_count = cell::refs_count(&buf);
         if refs_count > MAX_REFERENCES_COUNT {
             fail!("refs_count can't be {}", refs_count);
         }
 
-        let data_len = cell::full_len(&d1d2);
-        data = vec![0; data_len];
-        data[..2].copy_from_slice(&d1d2);
-        src.read_exact(&mut data[2..])?;
-        let tag_completed = d1d2[1] & 1 != 0;
-        if tag_completed && data_len > 2 && (data[data_len - 1] & 0x7f == 0) {
+        let data_len = cell::full_len(&buf[..2]);
+        if data_len > buf.len() {
+            fail!("cell data too large: {}", data_len);
+        }
+        if data_len > 2 {
+            src.read_exact(&mut buf[2..data_len])?;
+        }
+        let tag_completed = buf[1] & 1 != 0;
+        if tag_completed && data_len > 2 && (buf[data_len - 1] & 0x7f == 0) {
             fail!("overly long tag-completed encoding")
         }
 
-        for reference in refs.iter_mut().take(refs_count) {
+        // new_draft copies hashes from raw data and sets store_hashes in d1 if present,
+        // so compute_hashes in from_draft will verify them automatically.
+        let mut refs = smallvec::SmallVec::<[u32; 4]>::new();
+        for _ in 0..refs_count {
             let r = src.read_be_uint(ref_size)? as u32;
             if r > cells_count as u32 || r <= cell_index as u32 {
-                fail!("reference out of range, cells_count: {}, ref: {}, refs_count {}, cell_index: {}", cells_count, r, refs_count, cell_index)
-            } else {
-                *reference = r;
+                fail!(
+                    "reference out of range, cells_count: {cells_count}, ref: {r}, \
+                    refs_count {refs_count}, cell_index: {cell_index}"
+                )
             }
+            refs.push(r);
         }
-        Ok(RawCell { data, refs })
+        Cell::new_boc_draft(&buf[..data_len], arena.clone(), &refs)
     }
 
     fn read_refs_indexes<T>(

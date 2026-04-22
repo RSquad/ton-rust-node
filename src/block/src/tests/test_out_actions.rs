@@ -63,7 +63,11 @@ fn get_out_actions() -> OutActions {
     oa.push_back(OutAction::new_set(Cell::default()));
     oa.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_coins(12345678)));
     oa.push_back(OutAction::new_reserve(RESERVE_ALL_BUT, CurrencyCollection::with_coins(87654321)));
-    oa.push_back(OutAction::new_change_library(CHANGE_LIB_MODE, None, Some(code.repr_hash())));
+    oa.push_back(OutAction::new_change_library(
+        CHANGE_LIB_MODE,
+        None,
+        Some(code.repr_hash().clone()),
+    ));
     oa.push_back(OutAction::new_change_library(SET_LIB_CODE_MODE, Some(code), None));
     oa
 }

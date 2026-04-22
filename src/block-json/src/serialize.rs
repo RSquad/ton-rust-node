@@ -1685,7 +1685,7 @@ pub fn debug_block_map(block: Block) -> Result<Map<String, Value>> {
     let root_cell = block.serialize()?;
     let set = BlockSerializationSet {
         block,
-        id: root_cell.repr_hash(),
+        id: root_cell.repr_hash().clone(),
         status: BlockProcessingStatus::Finalized,
         boc: Vec::new(),
     };
@@ -1716,7 +1716,7 @@ pub fn debug_block_full(block: &Block) -> Result<String> {
     let root_cell = block.serialize()?;
     let set = BlockSerializationSet {
         block: block.clone(),
-        id: root_cell.repr_hash(),
+        id: root_cell.repr_hash().clone(),
         status: BlockProcessingStatus::Finalized,
         boc: Vec::new(),
     };
@@ -2313,7 +2313,7 @@ pub fn debug_message(message: Message) -> Result<String> {
     let root_cell = message.serialize()?;
     let set = MessageSerializationSet {
         message,
-        id: root_cell.repr_hash(),
+        id: root_cell.repr_hash().clone(),
         block_id: None,
         transaction_id: None,
         transaction_now: None,

@@ -69,7 +69,6 @@ pub struct StorageTelemetry {
     pub handles: Arc<Metric>,
     pub packages: Arc<Metric>,
 
-    pub stored_cells: Arc<Metric>,
     pub storing_cells: Arc<Metric>,
     pub shardstates_queue: Arc<Metric>,
     pub cached_cells_counters: Arc<Metric>,
@@ -109,7 +108,6 @@ impl Default for StorageTelemetry {
             file_entries: Metric::without_totals("", 1),
             handles: Metric::without_totals("", 1),
             packages: Metric::without_totals("", 1),
-            stored_cells: Metric::without_totals("", 1),
             storing_cells: Metric::without_totals("", 1),
             shardstates_queue: Metric::without_totals("", 1),
             cached_cells_counters: Metric::without_totals("", 1),
@@ -165,7 +163,6 @@ pub struct StorageAlloc {
     pub file_entries: Arc<AtomicU64>,
     pub handles: Arc<AtomicU64>,
     pub packages: Arc<AtomicU64>,
-    pub storage_cells: Arc<AtomicU64>,
 }
 
 pub(crate) const TARGET: &str = "storage";

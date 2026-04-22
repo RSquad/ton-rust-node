@@ -51,7 +51,7 @@ fn compare_slices() {
     slice1.append_reference(SliceData::new_empty()).unwrap();
     slice2.append_reference(SliceData::new_empty()).unwrap();
     slice1.shrink_data(9..23);
-    slice1.shrink_references(1..2);
+    slice1.shrink_references(1..2).unwrap();
     slice2.shrink_data(1..);
     assert_eq!(slice1, slice2);
 
@@ -60,7 +60,7 @@ fn compare_slices() {
     slice1.append_reference(SliceData::new(vec![0xFF])).unwrap();
     slice1.append_reference(SliceData::new_empty()).unwrap();
     slice2.append_reference(SliceData::new_empty()).unwrap();
-    slice1.shrink_references(1..=1);
+    slice1.shrink_references(1..=1).unwrap();
     assert_eq!(slice1, slice2);
 }
 

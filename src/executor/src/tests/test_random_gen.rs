@@ -184,7 +184,8 @@ fn test_rand_1() {
             ),
             3 => {
                 state_init = Some(gen_state(&mut rng, acc_id, workchain_id));
-                let state_hash = state_init.clone().unwrap().serialize().unwrap().repr_hash();
+                let serialized = state_init.clone().unwrap().serialize().unwrap();
+                let state_hash = serialized.repr_hash();
                 let due = Coins::from(gen_int(&mut rng, 19));
                 Account::frozen(
                     MsgAddressInt::with_standart(None, workchain_id, acc_id.clone()).unwrap(),
@@ -192,7 +193,7 @@ fn test_rand_1() {
                     BLOCK_LT,
                     BLOCK_UT - std::cmp::min(gen_int(&mut rng, 11) as u32, BLOCK_UT),
                     if due.is_zero() { None } else { Some(due) },
-                    if gen_bool(&mut rng) { state_hash } else { UInt256::default() },
+                    if gen_bool(&mut rng) { state_hash.clone() } else { UInt256::default() },
                 )
             }
             _ => panic!("Incorrect value"),

@@ -326,7 +326,7 @@ pub async fn run_collate_query(
     let test_bundles_config = &engine.test_bundles_config().collator;
 
     let err = match collate_result {
-        Ok(CollateResult::Ok { candidate, new_state, new_block, block_root, .. }) => {
+        Ok(CollateResult::Ok { candidate, new_state, new_block, block_root, usage_tree }) => {
             let new_state = ShardStateStuff::from_state(
                 candidate.block_id.clone(),
                 new_state,
@@ -338,10 +338,11 @@ pub async fn run_collate_query(
 
             if test_bundles_config.build_all() {
                 spawn_build_test_bundle(
+                    Some(candidate.clone()),
                     test_bundles_config,
                     &candidate.block_id,
                     prev.get_prevs().to_vec(),
-                    None,
+                    Some(usage_tree),
                     None,
                     next_block_descr.clone(),
                     engine.clone(),
@@ -372,6 +373,7 @@ pub async fn run_collate_query(
     if test_bundles_config.is_enable() && test_bundles_config.need_to_build_for(&err_str) {
         let id = prev.get_next_block_id(&UInt256::default(), &UInt256::default());
         spawn_build_test_bundle(
+            None,
             test_bundles_config,
             &id,
             prev.get_prevs().to_vec(),
@@ -385,6 +387,7 @@ pub async fn run_collate_query(
 }
 
 fn spawn_build_test_bundle(
+    candidate: Option<BlockCandidate>,
     config: &CollatorTestBundlesConfig,
     id: &BlockIdExt,
     prev_blocks_ids: Vec<BlockIdExt>,
@@ -398,10 +401,21 @@ fn spawn_build_test_bundle(
     }
     let path = config.path().to_string();
     let id = id.clone();
+
     tokio::spawn(async move {
-        match CollatorTestBundle::build_for_collating_block(&engine, prev_blocks_ids, usage_tree)
+        let result = if let Some(candidate) = candidate {
+            CollatorTestBundle::build_for_validating_block(
+                &engine,
+                &PrevBlockHistory::with_prevs(id.shard(), prev_blocks_ids),
+                candidate,
+            )
             .await
-        {
+        } else {
+            CollatorTestBundle::build_for_collating_block(&engine, prev_blocks_ids, usage_tree)
+                .await
+        };
+
+        match result {
             Err(e) => log::error!(
                 "({}): Error while test bundle for {} building: {}",
                 next_block_descr,

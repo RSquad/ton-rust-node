@@ -34,7 +34,7 @@ use ton_block::{
 };
 use ton_vm::{
     error::tvm_exception_full,
-    executor::{gas::gas_state::Gas, BehaviorModifiers, Engine},
+    executor::{gas::gas_state::Gas, BehaviorModifiers, Engine, TraceCallback},
     smart_contract_info::{PrevBlocksInfo, SmartContractInfo},
     stack::{savelist::SaveList, Stack, StackItem},
 };
@@ -109,7 +109,7 @@ pub struct ExecuteParams {
     pub last_tr_lt: u64,
     pub seed_block: UInt256,
     pub debug: bool,
-    pub trace_callback: Option<Arc<ton_vm::executor::TraceCallback>>,
+    pub trace_callback: Option<Arc<TraceCallback>>,
     pub behavior_modifiers: Option<BehaviorModifiers>,
     pub prev_blocks_info: PrevBlocksInfo,
 }
@@ -251,7 +251,6 @@ pub trait TransactionExecutor {
         );
         acc_balance.add(msg_balance)?;
         Ok(TrCreditPhase::new(msg_balance.clone()))
-        //TODO: Is it need to credit with ihr_fee value in internal messages?
     }
 
     /// Implementation of transaction's computing phase.
@@ -535,7 +534,7 @@ pub trait TransactionExecutor {
         let mut phase = TrActionPhase::default();
         let mut total_reserved_value = Coins::default();
         let mut bounce = false;
-        phase.action_list_hash = actions_cell.repr_hash();
+        phase.action_list_hash = actions_cell.repr_hash().clone();
         let action_slices =
             match SliceData::load_cell(actions_cell).and_then(unpack_out_action_slices) {
                 Err(err) => {
@@ -1677,7 +1676,7 @@ fn change_library_action_handler(
         }
         let hash = code.repr_hash();
         let is_public = mode.bit(SET_LIB_CODE_ADD_PUBLIC);
-        if let Some(exist) = library.get(&hash)? {
+        if let Some(exist) = library.get(hash)? {
             if exist.root.repr_hash() == hash && exist.is_public_library() == is_public {
                 return Ok(0);
             }
@@ -1689,8 +1688,9 @@ fn change_library_action_handler(
                 sstat.cells(), sstat.bits(), max_merkle_depth);
             return Ok(RESULT_CODE_LIB_EXCEEDED_LIMITS);
         }
+        let key = hash.write_to_bitstring()?;
         let lib = SimpleLib::new(code, is_public);
-        library.set_raw(hash.write_to_bitstring()?, &lib.write_to_new_cell()?)?;
+        library.set_raw(key, &lib.write_to_new_cell()?)?;
     } else if let Some(hash) = hash {
         log::debug!(target: "executor", "OutAction::ChangeLibrary mode: {}, hash: {:x}", mode, hash);
         library.remove(&hash)?;

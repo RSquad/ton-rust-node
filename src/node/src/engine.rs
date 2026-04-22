@@ -71,9 +71,9 @@ use std::{
     },
     time::Duration,
 };
-use storage::{block_handle_db::BlockHandle, StorageAlloc};
 #[cfg(feature = "telemetry")]
-use storage::{types::StoredCell, StorageTelemetry};
+use storage::StorageTelemetry;
+use storage::{block_handle_db::BlockHandle, StorageAlloc};
 use ton_api::ton::ton_node::broadcast::NewShardBlockBroadcast;
 use ton_block::{
     error, fail, BlockIdExt, Cell, ConfigParams, OutMsgQueue, Result, ShardIdent, UInt256,
@@ -475,6 +475,7 @@ impl Engine {
             is_broken: Option<&AtomicBool>,
             stopper: &Arc<Stopper>,
             monitor_min_split: Arc<AtomicU8>,
+            truncate_db: Option<u32>,
             #[cfg(feature = "telemetry")] telemetry: Arc<EngineTelemetry>,
             allocated: Arc<EngineAlloc>,
         ) -> Result<Arc<InternalDb>> {
@@ -489,6 +490,7 @@ impl Engine {
                 restore_db_enabled,
                 force_check_db,
                 true,
+                truncate_db,
                 &check_stop,
                 is_broken,
                 monitor_min_split,
@@ -525,6 +527,8 @@ impl Engine {
         };
         let enable_shard_state_persistent_gc = general_config.enable_shard_state_persistent_gc();
         let skip_saving_persistent_states = general_config.skip_saving_persistent_states();
+        let pss_cells_cache_max_count = general_config.pss_cells_cache_max_count();
+        let pss_prev_part_max_size = general_config.pss_prev_part_max_size();
         let states_cache_mode = general_config.states_cache_mode();
         let restore_db = general_config.restore_db();
 
@@ -583,6 +587,7 @@ impl Engine {
             },
             &stopper,
             monitor_min_split.clone(),
+            flags.truncate_db,
             #[cfg(feature = "telemetry")]
             engine_telemetry.clone(),
             engine_allocated.clone(),
@@ -648,6 +653,8 @@ impl Engine {
             db.clone(),
             enable_shard_state_persistent_gc,
             skip_saving_persistent_states,
+            pss_cells_cache_max_count,
+            pss_prev_part_max_size,
             states_cache_mode,
             cells_lifetime_sec,
             stopper.clone(),
@@ -1458,7 +1465,6 @@ impl Engine {
             file_entries: create_metric("Alloc NODE file entries"),
             handles: create_metric("Alloc NODE block handles"),
             packages: create_metric("Alloc NODE packages"),
-            stored_cells: create_metric("Alloc NODE stored cells"),
             storing_cells: create_metric("Alloc NODE storing cells"),
             shardstates_queue: create_metric("Alloc NODE shardstates queue"),
             cached_cells_counters: create_metric("Alloc NODE cells counters"),
@@ -1531,7 +1537,6 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.file_entries.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.handles.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.packages.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.stored_cells.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.storing_cells.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.cached_cells_counters.clone()),
@@ -1554,6 +1559,9 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_traverse_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_tr_build_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_commit_micros.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_hits.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_misses.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.cell_cache_len.clone()),
             TelemetryItem::Metric(engine_telemetry.awaiters.clone()),
             TelemetryItem::Metric(engine_telemetry.catchain_clients.clone()),
             TelemetryItem::Metric(engine_telemetry.cells.clone()),
@@ -2013,7 +2021,7 @@ impl Engine {
             return;
         }
         let mut cache = self.storage_dicts_cache.lock();
-        if cache.1.push(dict.repr_hash(), StorageDictInfo { dict, size }).is_none() {
+        if cache.1.push(dict.repr_hash().clone(), StorageDictInfo { dict, size }).is_none() {
             cache.0 += size;
         }
         while cache.0 > Self::STORAGE_DICTS_CACHE_SIZE {
@@ -2384,18 +2392,12 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .update(engine.engine_allocated.storage.packages.load(Ordering::Relaxed));
             engine
                 .engine_telemetry
-                .storage
-                .stored_cells
-                .update(engine.engine_allocated.storage.storage_cells.load(Ordering::Relaxed));
-            engine
-                .engine_telemetry
                 .awaiters
                 .update(engine.engine_allocated.awaiters.load(Ordering::Relaxed));
             engine
                 .engine_telemetry
                 .catchain_clients
                 .update(engine.engine_allocated.catchain_clients.load(Ordering::Relaxed));
-            engine.engine_telemetry.storage.stored_cells.update(StoredCell::cell_count());
             engine.engine_telemetry.cells.update(Cell::cell_count());
             engine
                 .engine_telemetry
@@ -2428,32 +2430,6 @@ fn telemetry_logger(engine: Arc<Engine>) {
             }
 
             // print telemetry
-
-            {
-                let hits = engine
-                    .engine_telemetry
-                    .storage
-                    .cell_cache_hits
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let misses = engine
-                    .engine_telemetry
-                    .storage
-                    .cell_cache_misses
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let total = hits + misses;
-                let hit_rate = if total > 0 { hits * 100 / total } else { 0 };
-                log::info!(
-                    target: "telemetry",
-                    "Cell cache hit_rate: {}%",
-                    hit_rate
-                );
-            }
-
-            engine.telemetry_printer.try_print();
 
             let period = crate::full_node::telemetry::TPS_PERIOD_1;
             let tps_1 = engine.tps_counter.calc_tps(period).unwrap_or_else(|e| {
@@ -2500,6 +2476,30 @@ fn telemetry_logger(engine: Arc<Engine>) {
             if let Err(e) = engine.log_workers_stats() {
                 log::warn!("Can't log workers stats: {}", e);
             }
+            {
+                let hits = engine
+                    .engine_telemetry
+                    .storage
+                    .cell_cache_hits
+                    .metric()
+                    .total_amount()
+                    .unwrap_or(0);
+                let misses = engine
+                    .engine_telemetry
+                    .storage
+                    .cell_cache_misses
+                    .metric()
+                    .total_amount()
+                    .unwrap_or(0);
+                let total = hits + misses;
+                let hit_rate = if total > 0 { hits * 100 / total } else { 0 };
+                log::info!(
+                    target: "telemetry",
+                    "Cell cache hit_rate: {}%",
+                    hit_rate
+                );
+            }
+            engine.telemetry_printer.try_print();
         }
     });
 }

@@ -220,7 +220,7 @@ fn send_message_to_freeze_account(mut acc: Account, start_balance: u64, bounce: 
         create_int_msg(THIRD_ACCOUNT.clone(), SENDER_ACCOUNT.clone(), msg_income, bounce, BLOCK_LT);
 
     let state_init = acc.state_init().unwrap().clone();
-    let frozen_hash = state_init.serialize().unwrap().repr_hash();
+    let frozen_hash = state_init.serialize().unwrap().repr_hash().clone();
 
     // send message to freeze account
     let mut new_acc = Account::frozen(

@@ -181,7 +181,7 @@ impl AccountStorageStat {
     }
 
     fn add_cell(&mut self, cell: &Cell) -> Result<u8> {
-        let hash = cell.repr_hash();
+        let hash = cell.repr_hash().clone();
         let mut max_merkle_depth = 0;
         if let Some(data) = self.cache.get_mut(&hash) {
             data.ref_count += 1;
@@ -224,7 +224,7 @@ impl AccountStorageStat {
     }
 
     fn remove_cell(&mut self, cell: &Cell) -> Result<()> {
-        let hash = cell.repr_hash();
+        let hash = cell.repr_hash().clone();
         let removed = if let Some(data) = self.cache.get_mut(&hash) {
             data.ref_count -= 1;
             data.ref_count_diff -= 1;
@@ -266,11 +266,11 @@ impl AccountStorageStat {
     pub fn max_merkle_depth(&self) -> Result<u8> {
         let mut result = 0;
         for root in &self.roots {
-            let depth = if let Some(data) = self.cache.get(&root.repr_hash()) {
+            let depth = if let Some(data) = self.cache.get(root.repr_hash()) {
                 data.max_merkle_depth
             } else {
                 self.dict
-                    .get(&root.repr_hash())?
+                    .get(root.repr_hash())?
                     .ok_or_else(|| {
                         error!("Root {} not found in storage stat dictionary", root.repr_hash())
                     })?

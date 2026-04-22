@@ -176,7 +176,7 @@ impl StorageUsageCalc {
         gas_consumer: &mut impl GasConsumer,
     ) -> Result<u32> {
         if add_root
-            && (!self.hashes.insert(cell.repr_hash())
+            && (!self.hashes.insert(cell.repr_hash().clone())
                 || !self.add_checked(1, cell.bit_length() as u64))
         {
             return Ok(0);
@@ -185,7 +185,11 @@ impl StorageUsageCalc {
             return Ok(0);
         }
         let mut max_merkle_depth = 0;
-        let slice = gas_consumer.load_cell(cell.clone())?;
+        let slice = if add_root {
+            gas_consumer.load_cell(cell.clone())?
+        } else {
+            SliceData::load_cell(cell.clone())?
+        };
         for i in 0..slice.remaining_references() {
             let merkle_depth = self.append_cell(&slice.reference(i)?, true, gas_consumer)?;
             max_merkle_depth = max_merkle_depth.max(merkle_depth);
@@ -195,21 +199,6 @@ impl StorageUsageCalc {
         }
         self.max_merkle_depth = self.max_merkle_depth.max(max_merkle_depth);
         Ok(max_merkle_depth)
-    }
-
-    pub fn append_builder(
-        &mut self,
-        root: &BuilderData,
-        add_root: bool,
-        gas_consumer: &mut impl GasConsumer,
-    ) -> Result<()> {
-        if add_root && !self.add_checked(1, root.bits_used() as u64) {
-            return Ok(());
-        }
-        for cell in root.references() {
-            self.append_cell(cell, true, gas_consumer)?;
-        }
-        Ok(())
     }
 
     pub fn storage_used(&self) -> Result<StorageUsed> {
@@ -566,7 +555,7 @@ impl AccountStuff {
         {
             let dict_root = self.storage_stat.dict_root()?;
             self.storage_info.storage_extra.dict_hash =
-                Some(dict_root.map_or_else(Default::default, Cell::repr_hash));
+                Some(dict_root.map_or_else(UInt256::default, |c| c.repr_hash().clone()));
             Ok(dict_root.cloned())
         } else {
             self.storage_info.storage_extra.dict_hash = None;
@@ -600,7 +589,7 @@ impl AccountStuff {
             .storage_info
             .dict_hash()
             .ok_or_else(|| error!("Cannot import storage stat dict: dict_hash is None"))?;
-        if &dict.repr_hash() != dict_hash {
+        if dict.repr_hash() != dict_hash {
             fail!(
                 "Cannot import storage stat dict: hash mismatch, expected {:x}, got {:x}",
                 dict_hash,
@@ -981,7 +970,7 @@ impl Account {
 
     /// getting the hash of the root of the cell with Code of Smart Contract
     pub fn get_code_hash(&self) -> Option<UInt256> {
-        Some(self.state_init()?.code.as_ref()?.repr_hash())
+        Some(self.state_init()?.code.as_ref()?.repr_hash().clone())
     }
 
     /// getting the root of the cell with persistent Data of Smart Contract
@@ -996,7 +985,7 @@ impl Account {
 
     /// getting hash of the root of the cell with persistent Data of Smart Contract
     pub fn get_data_hash(&self) -> Option<UInt256> {
-        Some(self.state_init()?.data.as_ref()?.repr_hash())
+        Some(self.state_init()?.data.as_ref()?.repr_hash().clone())
     }
 
     /// save persistent data of smart contract

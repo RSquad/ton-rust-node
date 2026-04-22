@@ -932,16 +932,18 @@ fn compile_code_dict_cell(
 }
 
 fn adjust_debug_map(map: &mut DbgInfo, before: SliceData, after: SliceData) -> Status {
-    let hash_before = before.cell()?.repr_hash();
-    let hash_after = after.cell()?.repr_hash();
+    let cell_before = before.cell()?;
+    let hash_before = cell_before.repr_hash();
+    let cell_after = after.cell()?;
+    let hash_after = cell_after.repr_hash();
     let entry_before =
-        map.remove(&hash_before).ok_or_else(|| error!("Failed to remove old value."))?;
+        map.remove(hash_before).ok_or_else(|| error!("Failed to remove old value."))?;
     let adjustment = after.pos();
     let mut entry_after = BTreeMap::new();
     for (k, v) in entry_before {
         entry_after.insert(k + adjustment, v);
     }
-    map.insert(hash_after, entry_after);
+    map.insert(hash_after.clone(), entry_after);
     Ok(())
 }
 

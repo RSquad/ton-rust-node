@@ -8,7 +8,8 @@
  */
 use super::*;
 use ton_block::{
-    base64_decode, base64_encode, read_single_root_boc, write_boc, Serializable, Transaction,
+    base64_decode, base64_encode, read_single_root_boc, read_single_root_boc_file, write_boc,
+    Serializable, Transaction,
 };
 
 fn cell_to_base64(cell: &Cell) -> String {
@@ -21,7 +22,7 @@ fn test_emulator() {
     let config_params = ConfigParams::construct_from_file(config).unwrap();
     let config_params_boc = cell_to_base64(config_params.root().unwrap());
     let account = "../executor/real_boc/two_messages_account_old.boc";
-    let account_root = Cell::read_from_file(account);
+    let account_root = read_single_root_boc_file(account).unwrap();
     let shard_acc = ShardAccount::with_account_root(account_root, Default::default(), 0);
     let account = shard_acc.read_account().unwrap();
     let shard_account_boc = shard_acc.write_to_base64().unwrap();

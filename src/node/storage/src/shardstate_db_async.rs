@@ -22,7 +22,6 @@ use crate::{
     StorageAlloc, TARGET,
 };
 use std::{
-    path::Path,
     sync::{
         atomic::{AtomicU32, AtomicU8, Ordering},
         Arc,
@@ -128,8 +127,8 @@ impl Default for CellsDbConfig {
         Self {
             states_db_queue_len: 1000,
             prefill_cells_counters: false,
-            cells_cache_size_bytes: 500_000_000,
-            counters_cache_size_bytes: 500_000_000,
+            cells_cache_size_bytes: 2_000_000_000,
+            counters_cache_size_bytes: 1_000_000_000,
             cells_lru_cache_capacity: Self::default_cells_lru_cache_capacity(),
         }
     }
@@ -158,7 +157,6 @@ impl ShardStateDb {
         shardstate_db_cf: &str,
         cell_db_cf: &str,
         counters_cf_name: &str,
-        db_root_path: impl AsRef<Path>,
         config: CellsDbConfig,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
@@ -169,7 +167,6 @@ impl ShardStateDb {
             db.clone(),
             cell_db_cf,
             counters_cf_name,
-            db_root_path.as_ref(),
             &config,
             #[cfg(feature = "telemetry")]
             telemetry.clone(),
@@ -415,7 +412,7 @@ impl ShardStateDb {
         state_root: Cell,
         callback: Option<Arc<dyn Callback>>,
     ) -> Result<()> {
-        let root_id = state_root.repr_hash();
+        let root_id = state_root.repr_hash().clone();
         log::debug!(
             target: TARGET,
             "ShardStateDb::put  id {}  root_cell_id {:x}",
@@ -430,6 +427,10 @@ impl ShardStateDb {
                     id, root_id, in_queue
                 );
                 tokio::time::sleep(Duration::from_secs(1)).await;
+
+                if self.stop.load(Ordering::Relaxed) & Self::MASK_STOPPED != 0 {
+                    fail!("Stopped");
+                }
             } else {
                 break;
             }
@@ -476,13 +477,13 @@ impl ShardStateDb {
             }
         }
 
-        let root_cell = self.dynamic_boc_db.load_cell(&db_entry.cell_id, false)?;
+        let root_cell = self.dynamic_boc_db.load_cell(&db_entry.cell_id)?;
         Ok(root_cell)
     }
 
     pub fn get_cell(&self, id: &UInt256) -> Result<Cell> {
-        log::debug!(target: TARGET, "ShardStateDb::get_cell  id {:x}", id);
-        self.dynamic_boc_db.load_cell(id, false)
+        log::trace!(target: TARGET, "ShardStateDb::get_cell  id {:x}", id);
+        self.dynamic_boc_db.load_cell(id)
     }
 
     pub fn create_hashed_cell_storage(
@@ -599,7 +600,7 @@ impl ShardStateDb {
     }
 
     fn put_internal(self: Arc<Self>, id: &BlockIdExt, state_root: Cell) -> Result<Cell> {
-        let cell_id = state_root.repr_hash();
+        let cell_id = state_root.repr_hash().clone();
 
         log::trace!(
             target: TARGET,
@@ -613,7 +614,7 @@ impl ShardStateDb {
                 "ShardStateDb::put_internal  ALREADY EXISTS  id {}  root_cell_id {:x}",
                 id, cell_id
             );
-            return self.dynamic_boc_db.load_cell(&cell_id, false);
+            return self.dynamic_boc_db.load_cell(&cell_id);
         }
 
         let ss_db = self.clone();

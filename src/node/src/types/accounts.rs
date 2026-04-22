@@ -147,7 +147,7 @@ impl ShardAccountStuff {
         let state_update = HashUpdate::with_hashes(old_hash, new_hash);
         transaction.write_state_update(&state_update)?;
         let tr_root = transaction.serialize()?;
-        *self.shard_acc.last_trans_hash_mut() = tr_root.repr_hash();
+        *self.shard_acc.last_trans_hash_mut() = tr_root.repr_hash().clone();
         *self.shard_acc.last_trans_lt_mut() = transaction.logical_time();
         self.lt = transaction.logical_time() + transaction.out_msgs.len()? as u64 + 1;
         if self.lt_compatible {
@@ -184,7 +184,7 @@ impl ShardAccountStuff {
                 self.account_id
             ),
         };
-        if lib_descr.lib().repr_hash() != key {
+        if *lib_descr.lib().repr_hash() != key {
             fail!(
                 "Cannot remove public library {key:x} of account {:x} because this public \
                 library LibDescr record does not contain a library root cell with required hash",
@@ -214,7 +214,7 @@ impl ShardAccountStuff {
         libraries: &mut Libraries,
     ) -> Result<()> {
         log::trace!("Adding public library {key:x} of account {:x}", self.account_id);
-        if key != library.repr_hash() {
+        if key != *library.repr_hash() {
             fail!(
                 "Can't add library {:x} because it mismatch given key {key:x}",
                 library.repr_hash()

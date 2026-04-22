@@ -134,11 +134,11 @@ fn make_master_state(account: &Account) -> Arc<ShardStateStuff> {
     let publisher = account.get_id().unwrap().clone();
     let mut libraries = Libraries::new();
     let code = BuilderData::with_raw(vec![0x77], 1).unwrap().into_cell().unwrap(); // PUSHINT 1
-    let key = code.repr_hash();
+    let key = code.repr_hash().clone();
     println!("key1: {}", serialize_uint256(&key));
     libraries.set(&key, &LibDescr::from_lib_data_by_publisher(code, publisher.clone())).unwrap();
     let code = BuilderData::with_raw(vec![0x78], 2).unwrap().into_cell().unwrap(); // PUSHINT 2
-    let key = code.repr_hash();
+    let key = code.repr_hash().clone();
     println!("key2: {}", serialize_uint256(&key));
     libraries.set(&key, &LibDescr::from_lib_data_by_publisher(code, publisher.clone())).unwrap();
 
@@ -739,8 +739,8 @@ async fn test_boc_hash() {
     let boc2_b64 = "te6ccgEBAQEAcQAA3v8AIN0gggFMl7ohggEznLqxn3Gw7UTQ0x/THzHXC//jBOCk8mCDCNcYINMf0x/TH/gjE7vyY+1E0NMf0x/T/9FRMrryoVFEuvKiBPkBVBBV+RDyo/gAkyDXSpbTB9QC+wDo0QGkyMsfyx/L/8ntVA==";
     let boc1 = read_single_root_boc(base64_decode(boc1_b64).unwrap()).unwrap();
     let boc2 = read_single_root_boc(base64_decode(boc2_b64).unwrap()).unwrap();
-    let hash1: UInt256 = boc1.repr_hash();
-    let hash2 = boc2.repr_hash();
+    let hash1 = boc1.repr_hash().clone();
+    let hash2 = boc2.repr_hash().clone();
     println!("Hash1 {:?}", hash1);
     println!("Hash2 {:?}", hash2);
     pretty_assertions::assert_eq!(hash1, hash2);

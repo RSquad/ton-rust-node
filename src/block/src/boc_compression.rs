@@ -1500,7 +1500,7 @@ fn build_graph_recursive(
 
     // Assign new node ID
     let current_cell_id = graph.len();
-    visited.insert(cell_hash, current_cell_id);
+    visited.insert(cell_hash.clone(), current_cell_id);
 
     let data = cell.data();
     let bit_len = cell.bit_length();

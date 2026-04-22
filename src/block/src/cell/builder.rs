@@ -11,8 +11,7 @@
 use crate::{
     bits_to_bytes,
     cell::{
-        append_tag, find_tag, Cell, CellType, DataCell, LevelMask, SliceData, MAX_DATA_BITS,
-        MAX_SAFE_DEPTH,
+        append_tag, find_tag, Cell, CellType, LevelMask, SliceData, MAX_DATA_BITS, MAX_SAFE_DEPTH,
     },
     fail, ExceptionCode, Result,
 };
@@ -270,13 +269,14 @@ impl BuilderData {
         };
         append_tag(&mut self.data, self.length_in_bits);
 
-        Ok(Cell::with_cell_impl(DataCell::with_params(
-            self.references.to_vec(),
+        let data = Cell::build_data(
             &self.data,
             self.cell_type,
             level_mask.mask(),
-            Some(max_depth),
-        )?))
+            self.references.len(),
+            None,
+        )?;
+        Cell::with_data_and_refs(&data, false, self.references.as_slice(), Some(max_depth), None)
     }
 
     pub fn references(&self) -> &[Cell] {
@@ -308,7 +308,7 @@ impl BuilderData {
     pub fn from_cell(cell: &Cell) -> Result<BuilderData> {
         let data = smallvec::SmallVec::from_slice(cell.data());
         let mut builder = BuilderData::with_raw(data, cell.bit_length())?;
-        builder.references = cell.clone_references();
+        builder.references = cell.clone_references()?;
         builder.cell_type = cell.cell_type();
         Ok(builder)
     }

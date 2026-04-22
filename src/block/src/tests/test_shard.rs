@@ -1042,7 +1042,7 @@ fn test_shards_heighbors() {
 
 #[test]
 fn test_split_pss() -> Result<()> {
-    let root = Cell::read_from_file("src/tests/data/free-ton-mc-state-61884");
+    let root = read_single_root_boc(std::fs::read("src/tests/data/free-ton-mc-state-61884")?)?;
     let mut shard_state = ShardStateUnsplit::construct_from_cell(root.clone())?;
     let root = shard_state.serialize()?; // patch state serialization for xp25
     let accounts_root = shard_state.accounts_cell();

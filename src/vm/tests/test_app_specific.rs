@@ -579,18 +579,18 @@ fn test_send_msg() {
             // cpp bug representation:
             // base body and init with hdr
             // but then body and init in refs (but ref could be with hdr)
-            // old agorithm try to calculate storage used for serialization as is
-            // then put init to ref if it has two at least two refs
-            // then put body to ref if it has two at least two refs
+            // old algorithm try to calculate storage used for serialization as is
+            // then put init to ref if it has at least two refs
+            // then put body to ref if it has at least two refs
             // new algorithm in SENDMSG primitive doesn't try to calculate as is
             // it put init to ref if body and init don't fit in hdr
             msg.set_src_address(Default::default());
-            let body = msg.body().unwrap().clone().into_builder().unwrap();
-            let init = msg.state_init().unwrap().clone().write_to_new_cell().unwrap();
+            let body = msg.body().unwrap().clone().into_cell().unwrap();
+            let init = msg.state_init().unwrap().clone().serialize().unwrap();
             let (_, body_to_ref, init_to_ref) = msg.serialize_as_is().unwrap();
             let mut sstat = StorageUsageCalc::with_limits(0, 0);
-            sstat.append_builder(&body, body_to_ref, &mut 0).unwrap();
-            sstat.append_builder(&init, init_to_ref, &mut 0).unwrap();
+            sstat.append_cell(&body, body_to_ref, &mut 0).unwrap();
+            sstat.append_cell(&init, init_to_ref, &mut 0).unwrap();
             assert_eq!(sstat.cells(), 5);
             assert_eq!(sstat.bits(), 412 + len as u64);
         }
@@ -650,6 +650,42 @@ fn test_send_msg() {
             .with_account(SHARD_ACCOUNT.clone())
             .with_message_cell(msg_cell.clone())
             .expect_int_stack(&[len, fee, fee, fee]);
+    }
+}
+
+#[test]
+fn test_send_msg_with_same_cells() {
+    let mut params = Vec::new();
+
+    // body cell is present in state_init both are not in refs
+    let body = BuilderData::with_raw(vec![1, 2, 3], 24).unwrap().into_cell().unwrap();
+    let init =
+        StateInit::with_code_and_data(compile_code_to_cell("PUSHINT 1").unwrap(), body.clone());
+    params.push((body, init, 892, 1232000));
+
+    // body has same cell as state_init
+    let init = StateInit::with_code_and_data(
+        compile_code_to_cell("PUSHINT 1").unwrap(),
+        BuilderData::with_raw(vec![1, 2, 3], 24).unwrap().into_cell().unwrap(),
+    );
+    let cell = init.serialize().unwrap();
+    let body =
+        BuilderData::with_raw_and_refs(vec![1, 2, 3], 24, [cell]).unwrap().into_cell().unwrap();
+    params.push((body, init, 992, 1337000));
+
+    for (body, init, gas, expected_fee) in params {
+        let src = MsgAddressInt::standard(0, [0x11; 32]);
+        let dst = MsgAddressInt::standard(0, [0x22; 32]);
+        let h =
+            InternalMessageHeader::with_addresses(src, dst, CurrencyCollection::with_coins(6789));
+        let body = SliceData::load_cell(body).unwrap();
+        let mut msg = Message::with_int_header_and_body(h, body);
+        msg.set_state_init(init);
+        test_case_with_ref("PUSHREF ZERO SENDMSG", msg.serialize().unwrap())
+            .with_mc_state(MC_STATE_ROOT.clone())
+            .with_account(SHARD_ACCOUNT.clone())
+            .expect_gas_used(gas)
+            .expect_int_stack(&[expected_fee]);
     }
 }
 

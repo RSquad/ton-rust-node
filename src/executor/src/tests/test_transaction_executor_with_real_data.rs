@@ -12,9 +12,9 @@ use crate::blockchain_config::BlockchainConfig;
 use pretty_assertions::assert_eq;
 use std::io::{BufRead, BufReader};
 use ton_block::{
-    base64_decode, read_single_root_boc, Account, AccountStorage, Block, Cell, ConfigParams,
-    CurrencyCollection, Deserializable, Message, MsgAddressInt, Result, Serializable, ShardAccount,
-    StateInit, StorageInfo, TrComputePhase, Transaction, UnixTime,
+    base64_decode, read_single_root_boc, Account, AccountStorage, Block, BocWriter, Cell,
+    ConfigParams, CurrencyCollection, Deserializable, Message, MsgAddressInt, Result, Serializable,
+    ShardAccount, StateInit, StorageInfo, TrComputePhase, Transaction, UnixTime,
 };
 
 mod common;
@@ -591,14 +591,63 @@ fn test_msg_cell_fine_calc() {
     )
 }
 
-#[ignore = "test for replay transaction by files"]
+// bounced message with state init and value was sent to new account
+// account must be uninitialized if not enough value to compute
 #[test]
-fn test_replay_transaction_by_files() {
+fn test_state_init_nogas() {
+    replay_transaction_full(
+        "real_boc/empty_account.boc",
+        "real_boc/state_init_nogas_abc17907_account_new.boc",
+        "real_boc/state_init_nogas_abc17907_transaction.boc",
+        "real_boc/config.boc",
+        "",
+        "",
+    );
+}
+
+// not bounced message with state init and value was sent to new account
+// account must be uninitialized if not enough value to compute
+#[test]
+fn test_non_bounce_with_state_init_nogas() {
+    replay_transaction_full(
+        "real_boc/empty_account.boc",
+        "real_boc/non_bounce_with_state_init_nogas_account_new.boc",
+        "real_boc/non_bounce_with_state_init_nogas_transaction.boc",
+        "real_boc/config.boc",
+        "",
+        "",
+    );
+}
+
+#[ignore = "test for replay transaction by message from transaction"]
+#[test]
+fn test_replay_transaction_by_message_from_transaction() {
+    let transaction = Transaction::construct_from_file("real_boc/transaction.boc").unwrap();
+    let mut hash_update = transaction.read_state_update().unwrap();
+    let mut message = transaction.read_in_msg().unwrap().unwrap();
+    message.int_header_mut().unwrap().bounce = false;
+    let mut account = Account::construct_from_file("real_boc/empty_account.boc").unwrap();
+
+    let at = transaction.now();
+    let lt = transaction.logical_time();
+    let params = common::execute_params_simple(lt, at);
+    let config = ConfigParams::construct_from_file("real_boc/config.boc").unwrap();
+    let config = BlockchainConfig::with_config(config).unwrap();
+    let mut transaction =
+        try_replay_transaction(&mut account, Some(&message), config, &params).unwrap();
+    account.update_storage_stat(1 << 31).unwrap();
+    hash_update.new_hash = account.serialize().unwrap().repr_hash().clone();
+    transaction.write_state_update(&hash_update).unwrap();
+    transaction.write_to_file("real_boc/new_transaction.boc").unwrap();
+    account.write_to_file("real_boc/account_new.boc").unwrap();
+}
+
+#[ignore = "test for replay transaction by message from file"]
+#[test]
+fn test_replay_transaction_by_message_from_file() {
     let mut account = Account::construct_from_file("real_boc/account_old.boc").unwrap();
     let message = Message::construct_from_file("real_boc/message.boc").unwrap();
-    let key_block = Block::construct_from_file("real_boc/config.boc").unwrap();
-    let config =
-        key_block.read_extra().unwrap().read_custom().unwrap().unwrap().config().unwrap().clone();
+    let config = read_config("real_boc/config.boc").unwrap();
     let config = BlockchainConfig::with_config(config).unwrap();
     let at = match message.int_header() {
         Some(hdr) => hdr.created_at,
@@ -648,6 +697,18 @@ fn test_revert_action_phase() {
     assert_eq!(answer, account);
 }
 
+#[test]
+fn test_pruned_cell_load_tx() {
+    replay_transaction_full(
+        "real_boc/pruned_cell_load_account_old.boc",
+        "real_boc/pruned_cell_load_account_new.boc",
+        "real_boc/pruned_cell_load_transaction.boc",
+        "real_boc/config.boc",
+        "",
+        "",
+    )
+}
+
 #[ignore]
 #[test]
 fn test_bad_single() {
@@ -672,8 +733,14 @@ fn test_bad_trans() {
     let tr = json["tx_boc"].as_str().unwrap();
     let prev = json["prev_blocks_info_boc"].as_str().unwrap();
     let shard_acc = ShardAccount::construct_from_base64(acc).unwrap();
-    shard_acc.account_cell().write_to_file(prefix.clone() + "account_old.boc");
-    shard_acc.account_cell().write_to_file(prefix.clone() + "account_new.boc");
+    BocWriter::with_root(&shard_acc.account_cell())
+        .unwrap()
+        .write_to_file(prefix.clone() + "account_old.boc")
+        .unwrap();
+    BocWriter::with_root(&shard_acc.account_cell())
+        .unwrap()
+        .write_to_file(prefix.clone() + "account_new.boc")
+        .unwrap();
     std::fs::write(prefix.clone() + "transaction.boc", base64_decode(tr).unwrap()).unwrap();
 
     replay_transaction_full(

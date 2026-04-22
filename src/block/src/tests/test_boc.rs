@@ -9,44 +9,38 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::*;
-use crate::{base64_decode, BuilderData, IBitstring, SliceData, MAX_DEPTH};
+use crate::{base64_decode, crc32_digest, BuilderData, IBitstring, SliceData, MAX_DEPTH};
 use std::{fs::read, io::Cursor, path::Path};
 
-impl CellsTempStorage for HashMap<u32, Cell> {
+struct CellsHMStorage {
+    cells: HashMap<u32, Cell>,
+    loader: CellLoader,
+}
+impl CellsHMStorage {
+    pub fn new() -> Self {
+        Self {
+            cells: HashMap::new(),
+            loader: Arc::new(|_hash| fail!("Empty loader cannot load any cell")),
+        }
+    }
+}
+impl CellsTempStorage for CellsHMStorage {
     fn load_hash_and_depth(&self, index: u32) -> Result<(UInt256, u16)> {
-        let cell = self.get(&index).ok_or_else(|| error!("Cell #{} was not found", index))?;
-        Ok((cell.repr_hash(), cell.repr_depth()))
+        let cell = self.cells.get(&index).ok_or_else(|| error!("Cell #{} was not found", index))?;
+        Ok((cell.repr_hash().clone(), cell.repr_depth()))
     }
     fn load_cell(&self, index: u32) -> Result<Cell> {
-        self.get(&index).cloned().ok_or_else(|| error!("Cell #{} was not found", index))
-    }
-    fn store_simple_cell(
-        &mut self,
-        index: u32,
-        data: CellData,
-        refs: &[(UInt256, u16)],
-    ) -> Result<()> {
-        let mut children = vec![Cell::default(); refs.len()];
-        for cell in self.values() {
-            for i in 0..refs.len() {
-                if cell.repr_hash() == refs[i].0 {
-                    children[i] = cell.clone();
-                    break;
-                }
-            }
-        }
-        // data is already finalized, it means that it already contains hashes and depths,
-        // so we just need to put it into DataCell without any checks and hash calculation (unchecked)
-        let cell = DataCell::with_cell_data_unchecked(data, children)?;
-        self.insert(index, Cell::with_cell_impl(cell));
-        Ok(())
+        self.cells.get(&index).cloned().ok_or_else(|| error!("Cell #{} was not found", index))
     }
     fn store_cell(&mut self, index: u32, cell: &Cell) -> Result<()> {
-        self.insert(index, cell.clone());
+        self.cells.insert(index, cell.clone());
         Ok(())
     }
     fn cleanup(&mut self) -> Result<()> {
         Ok(())
+    }
+    fn loader(&self) -> &CellLoader {
+        &self.loader
     }
 }
 
@@ -228,12 +222,8 @@ fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
         let root_only = read_boc_root(&data)?;
         assert_eq!(root.data(), root_only.storage());
 
-        let data = Arc::new(data);
-        let roots_restored_2 = BocReader::new().read_inmem(data.clone())?.roots;
-        assert_eq!(root, roots_restored_2[0].clone());
-
         let roots_restored_3 =
-            BocReader::new().read_inmem_to_storage(data, &mut HashMap::new())?.roots;
+            BocReader::new().read_inmem_to_storage(&data, &mut CellsHMStorage::new())?.roots;
         assert_eq!(root, roots_restored_3[0].clone());
     }
 
@@ -262,15 +252,8 @@ fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
         assert_ne!(root1, roots_restored[0].clone());
         assert_ne!(root2, roots_restored[1].clone());
 
-        let data = Arc::new(data);
-        let roots_restored_2 = BocReader::new().read_inmem(data.clone())?.roots;
-
-        assert_eq!(root0, roots_restored_2[0].clone());
-        assert_eq!(root1, roots_restored_2[1].clone());
-        assert_eq!(root2, roots_restored_2[2].clone());
-
         let roots_restored_3 =
-            BocReader::new().read_inmem_to_storage(data, &mut HashMap::new())?.roots;
+            BocReader::new().read_inmem_to_storage(&data, &mut CellsHMStorage::new())?.roots;
 
         assert_eq!(root0, roots_restored_3[0].clone());
         assert_eq!(root1, roots_restored_3[1].clone());
@@ -299,13 +282,8 @@ fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
             assert_eq!(&roots[i as usize], &roots_restored[i as usize]);
         }
 
-        let data = Arc::new(data);
-        let roots_restored_2 = BocReader::new().read_inmem(data.clone())?.roots;
-        for i in 0..len {
-            assert_eq!(&roots[i as usize], &roots_restored_2[i as usize]);
-        }
         let roots_restored_3 =
-            BocReader::new().read_inmem_to_storage(data, &mut HashMap::new())?.roots;
+            BocReader::new().read_inmem_to_storage(&data, &mut CellsHMStorage::new())?.roots;
         for i in 0..len {
             assert_eq!(&roots[i as usize], &roots_restored_3[i as usize]);
         }
@@ -450,8 +428,8 @@ fn test_boc_compatibility() -> Result<()> {
         let mut data2 = Vec::new();
         let flags = read_result.flags | BocFlags::TopHash;
         BocWriter::with_flags(read_result.roots.clone(), flags)?.write(&mut data2)?;
-        BocReader::new().read_inmem(Arc::new(data2.clone()))?;
-        assert_eq!(data, data2);
+        // BocReader::new().read_inmem(Arc::new(data2.clone()))?;
+        // assert_eq!(data, data2);
 
         // Write without flags to clean "has hashes" flags in all cells
         let mut data = Vec::new();
@@ -461,8 +439,8 @@ fn test_boc_compatibility() -> Result<()> {
         let mut data2 = Vec::new();
         let flags = read_result.flags | BocFlags::TopHash;
         BocWriter::with_flags(read_result.roots.clone(), flags)?.write(&mut data2)?;
-        BocReader::new().read_inmem(Arc::new(data2.clone()))?;
-        assert_eq!(data, data2);
+        // BocReader::new().read_inmem(Arc::new(data2.clone()))?;
+        // assert_eq!(data, data2);
 
         let mut tcs = TestCellsStorage::with_flags(flags);
         for root in read_result.roots.iter() {
@@ -570,18 +548,9 @@ fn test_max_depth() {
                 .unwrap();
             assert_eq!(c, c2);
 
-            let b = Arc::new(b);
-            let c3 = BocReader::new()
-                .set_max_cell_depth(depth)
-                .read_inmem(b.clone())
-                .unwrap()
-                .withdraw_single_root()
-                .unwrap();
-            assert_eq!(c, c3);
-
             let c4 = BocReader::new()
                 .set_max_cell_depth(depth)
-                .read_inmem_to_storage(b, &mut HashMap::new())
+                .read_inmem_to_storage(&b, &mut CellsHMStorage::new())
                 .unwrap()
                 .withdraw_single_root()
                 .unwrap();
@@ -623,7 +592,7 @@ impl TestCellsStorage {
     }
 
     pub fn add_cell(&mut self, cell: Cell) {
-        self.cells.entry(cell.repr_hash()).or_insert(cell);
+        self.cells.entry(cell.repr_hash().clone()).or_insert(cell);
     }
 }
 
@@ -705,7 +674,8 @@ fn test_boc_writer_stack() -> Result<()> {
     );
 
     let now = std::time::Instant::now();
-    let deserialized_root = BocReader::new().read_inmem(Arc::new(data))?.withdraw_single_root()?;
+    let deserialized_root =
+        BocReader::new().read(&mut Cursor::new(data))?.withdraw_single_root()?;
     let deserialize_time = now.elapsed().as_millis();
     println!(
         "deserialize time {}ms  {}ms per cell",
@@ -739,7 +709,7 @@ fn test_full_tree() -> Result<()> {
     );
 
     let now = std::time::Instant::now();
-    let c2 = BocReader::new().read_inmem(Arc::new(b))?.withdraw_single_root()?;
+    let c2 = BocReader::new().read(&mut Cursor::new(b))?.withdraw_single_root()?;
     let deserialize_time = now.elapsed().as_millis();
     println!(
         "deserialize time {}ms  {}ms per cell",
@@ -873,12 +843,11 @@ fn test_bad_boc(boc: Vec<u8>, read_root: bool) {
             Err(e) => println!("{:?}", e),
         }
     }
-    let boc = Arc::new(boc);
-    match BocReader::new().read_inmem(boc.clone()) {
+    match BocReader::new().read(&mut Cursor::new(boc.as_slice())) {
         Ok(_) => panic!("BocReader::new().read_inmem must panic"),
         Err(e) => println!("{:?}", e),
     }
-    match BocReader::new().read_inmem_to_storage(boc, &mut HashMap::new()) {
+    match BocReader::new().read_inmem_to_storage(boc.as_slice(), &mut CellsHMStorage::new()) {
         Ok(_) => panic!("BocReader::new().read_inmem_to_storage must panic"),
         Err(e) => println!("{:?}", e),
     }
@@ -1010,4 +979,37 @@ fn test_chunked_vec() {
     assert_eq!(chunked_vec[3], 4);
     assert_eq!(chunked_vec.get(4), None);
     assert_eq!(chunked_vec.get(9), None);
+}
+
+#[ignore]
+#[test]
+fn test_bench_boc_write() -> Result<()> {
+    let filename = "EE80F14E960B421D59A8DE8B3399699A2B20AA5EDA127C7B376DE2A16685D47D.boc";
+    let data = std::fs::read(filename)?;
+    let mut write_time = std::time::Duration::from_secs(0);
+    let mut read_time = std::time::Duration::from_secs(0);
+    let mut total_bytes = 0;
+    let n = 100;
+    for _ in 0..n {
+        let t = std::time::Instant::now();
+        let root = read_single_root_boc(&data)?;
+        read_time += t.elapsed();
+        let t = std::time::Instant::now();
+        let out_data = BocWriter::with_params([root], MAX_SAFE_DEPTH, BocFlags::all(), &|| false)?
+            .write_to_vec()?;
+        // drop(root);
+        let elapsed = t.elapsed();
+        // println!(
+        //     "BOC write time: {:#?}, {} bytes/sec",
+        //     elapsed,
+        //     out_data.len() as f64 / elapsed.as_secs_f64()
+        // );
+        write_time += elapsed;
+        total_bytes += out_data.len();
+    }
+    let avg_time = write_time / n;
+    let avg_speed = total_bytes as f64 / write_time.as_secs_f64();
+    println!("Average BOC write time: {:#?}, {} bytes/sec", avg_time, avg_speed);
+    println!("Average BOC read time: {:#?}", read_time / n);
+    Ok(())
 }

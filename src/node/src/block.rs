@@ -12,7 +12,10 @@ use crate::{
     block_proof::BlockProofStuff, engine_traits::EngineOperations, shard_state::ShardHashesStuff,
     validating_utils::UNREGISTERED_CHAIN_MAX_LEN,
 };
-use std::{io::Write, sync::Arc};
+use std::{
+    io::{Cursor, Write},
+    sync::Arc,
+};
 use storage::block_handle_db::BlockHandle;
 use ton_api::ton::{
     lite_server::{
@@ -77,8 +80,8 @@ impl BlockStuff {
     }
 
     pub fn deserialize_block(id: BlockIdExt, data: Arc<Vec<u8>>) -> Result<Self> {
-        let root = BocReader::new().read_inmem(data.clone())?.withdraw_single_root()?;
-        if id.root_hash != root.repr_hash() {
+        let root = BocReader::new().read(&mut Cursor::new(&*data))?.withdraw_single_root()?;
+        if id.root_hash != *root.repr_hash() {
             fail!("wrong root hash for {}", id)
         }
         let block = Block::construct_from_cell(root.clone())?;
@@ -303,7 +306,7 @@ impl BlockStuff {
         let id = BlockIdExt {
             shard_id: block_info.shard().clone(),
             seq_no: block_info.seq_no(),
-            root_hash: root.repr_hash(),
+            root_hash: root.repr_hash().clone(),
             file_hash,
         };
         Ok(Self { id, block, root, data: Arc::new(data) })
@@ -312,13 +315,13 @@ impl BlockStuff {
     pub fn read_block_from_file(filename: &str) -> Result<Self> {
         let data = Arc::new(std::fs::read(filename)?);
         let file_hash = UInt256::calc_file_hash(&data);
-        let root = BocReader::new().read_inmem(data.clone())?.withdraw_single_root()?;
+        let root = read_single_root_boc(&*data)?;
         let block = Block::construct_from_cell(root.clone())?;
         let block_info = block.read_info()?;
         let id = BlockIdExt {
             shard_id: block_info.shard().clone(),
             seq_no: block_info.seq_no(),
-            root_hash: root.repr_hash(),
+            root_hash: root.repr_hash().clone(),
             file_hash,
         };
         Ok(Self { id, block, root, data })
@@ -376,7 +379,7 @@ pub fn construct_and_check_prev_stuff(
         BlockIdExt {
             shard_id: info.shard().clone(),
             seq_no: info.seq_no(),
-            root_hash: block_root.repr_hash(),
+            root_hash: block_root.repr_hash().clone(),
             file_hash: UInt256::default(),
         }
     } else {
@@ -390,7 +393,7 @@ pub fn construct_and_check_prev_stuff(
         if id.seq_no() != info.seq_no() {
             fail!("block header contains seq_no: {}, but expected: {}", info.seq_no(), id.seq_no())
         }
-        if *id.root_hash() != block_root.repr_hash() {
+        if *id.root_hash() != *block_root.repr_hash() {
             fail!(
                 "block header has incorrect root hash: {:x}, but expected: {:x}",
                 block_root.repr_hash(),

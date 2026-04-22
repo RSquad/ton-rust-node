@@ -14,9 +14,9 @@ include!("../../../common/src/log.rs");
 use std::{os::raw::c_char, sync::LazyLock};
 use ton_assembler::{compile_code, compile_code_to_builder, CompileError};
 use ton_block::{
-    BocWriter, Cell, Deserializable, Error, Exception, ExceptionCode, HashmapE, LibDescr,
-    Libraries, MerkleProof, Message, Result, Serializable, ShardAccount, ShardStateUnsplit,
-    SliceData, UInt256, UnixTime, SUPPORTED_VERSION,
+    read_single_root_boc_file, BocWriter, Cell, Deserializable, Error, Exception, ExceptionCode,
+    HashmapE, LibDescr, Libraries, MerkleProof, Message, Result, Serializable, ShardAccount,
+    ShardStateUnsplit, SliceData, UInt256, UnixTime, SUPPORTED_VERSION,
 };
 use ton_vm::{
     error::{tvm_exception, tvm_exception_code, tvm_exception_or_custom_code},
@@ -100,7 +100,7 @@ impl TestCaseInputs {
     pub fn with_mc_state(mut self, mc_state_root: Cell) -> TestCaseInputs {
         assert!(mc_state_root.level() == 0, "state should not contain pruned cells");
         let mc_state_proof = MerkleProof {
-            hash: mc_state_root.repr_hash(),
+            hash: mc_state_root.repr_hash().clone(),
             depth: mc_state_root.repr_depth(),
             proof: mc_state_root,
         };
@@ -321,7 +321,7 @@ static EMPTY_LIBRARY: LazyLock<Cell> = LazyLock::new(|| {
     let mut lib = LibDescr::new(lib_cell.clone());
     lib.publishers_mut().add_key(&UInt256::ZERO).unwrap();
     let mut library = Libraries::default();
-    library.set(&lib_cell.repr_hash(), &lib).unwrap();
+    library.set(lib_cell.repr_hash(), &lib).unwrap();
     library.root().unwrap().clone()
 });
 
@@ -340,7 +340,7 @@ fn compare_with_fift(
     block_version: i32,
 ) {
     #[cfg(windows)]
-    let lib_name = "../../ton/build/crypto/Release/vm_run_shared.dll";
+    let lib_name = "../../ton/build/crypto/vm_run_shared.dll";
     #[cfg(not(windows))]
     let lib_name = "../../ton-node-cpp/build/crypto/libvm_run_shared.so";
     assert!(std::fs::exists(lib_name).unwrap());
@@ -914,10 +914,10 @@ pub fn test_case_with_real_data(
     account: &str,
     message: &str,
 ) -> TestCaseInputs {
-    let mc_state_proof = Cell::read_from_file(mc_state_proof);
-    let account = Cell::read_from_file(account);
+    let mc_state_proof = read_single_root_boc_file(mc_state_proof).unwrap();
+    let account = read_single_root_boc_file(account).unwrap();
     let shard_account = ShardAccount::with_account_root(account, Default::default(), 0);
-    let message = Cell::read_from_file(message);
+    let message = read_single_root_boc_file(message).unwrap();
     TestCaseInputs::with_bytecode(Cell::default())
         .with_mc_state_proof(mc_state_proof)
         .with_account(shard_account)

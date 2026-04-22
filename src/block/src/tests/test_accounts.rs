@@ -389,7 +389,7 @@ fn test_account_account2() {
     assert_eq!(data, acc.get_data().unwrap());
 
     let mut lib = StateInitLib::default();
-    lib.set(&library.repr_hash(), &SimpleLib::new(library, false)).unwrap();
+    lib.set(&library.repr_hash().clone(), &SimpleLib::new(library, false)).unwrap();
     assert_eq!(lib, acc.libraries());
 
     let mut f_to_add = CurrencyCollection::with_coins(12);

@@ -222,7 +222,7 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
         while let Some(slice) = acc_block.transactions().get_as_slice(&lt)? {
             let tr_cell = slice.reference(0)?;
             // check hash if exist
-            if !expected_hash.is_zero() && tr_cell.repr_hash() != expected_hash {
+            if !expected_hash.is_zero() && *tr_cell.repr_hash() != expected_hash {
                 fail!("transaction hash mismatch: prev_trans_lt/hash invalid for wc={workchain_id}, lt={lt}")
             }
 
@@ -1018,8 +1018,8 @@ async fn get_block_transactions_int(
     })?;
     all_txs.sort_by(|a, b| a.1.cmp(&b.1));
     if let (Some(after_lt), Some(after_hash)) = (p.after_lt, p.after_hash.as_ref()) {
-        let after_hash = after_hash.parse()?;
-        let pos = all_txs.iter().position(|a| a.1 == after_lt && a.2.repr_hash() == after_hash);
+        let after_hash: UInt256 = after_hash.parse()?;
+        let pos = all_txs.iter().position(|a| a.1 == after_lt && *a.2.repr_hash() == after_hash);
         if let Some(pos) = pos {
             all_txs = all_txs.split_off(pos);
         }

@@ -11,7 +11,7 @@
 use clap::{Parser, Subcommand};
 use std::{collections::HashSet, io::Write, process::ExitCode};
 use ton_assembler::disasm::{disasm_ex, fmt::print_tree_of_cells, loader::Loader};
-use ton_block::{error, read_boc, write_boc, Cell, SliceData, Status};
+use ton_block::{error, fail, read_boc, write_boc, Cell, SliceData, Status};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -87,7 +87,18 @@ fn subcommand_dump(filename: String) -> Status {
         println!("{} {} in total", roots.len(), if roots.len() > 1 { "roots" } else { "root" });
         for i in 0..roots.len() {
             let root = roots.get(i).unwrap();
-            let count = root.count_cells(usize::MAX)?;
+            let mut count = 0;
+            let mut queue = vec![root.clone()];
+            while let Some(cell) = queue.pop() {
+                if count >= usize::MAX {
+                    fail!("cells count exceeds max {}", usize::MAX)
+                }
+                count += 1;
+                let count = cell.references_count();
+                for i in 0..count {
+                    queue.push(cell.reference(i)?);
+                }
+            }
             println!(
                 "root {} ({} {}, {} unique):",
                 i,
@@ -105,7 +116,7 @@ fn count_unique_cells(cell: &Cell) -> usize {
     let mut queue = vec![cell.clone()];
     let mut set = HashSet::new();
     while let Some(cell) = queue.pop() {
-        if set.insert(cell.repr_hash()) {
+        if set.insert(cell.repr_hash().clone()) {
             let count = cell.references_count();
             for i in 0..count {
                 queue.push(cell.reference(i).unwrap());

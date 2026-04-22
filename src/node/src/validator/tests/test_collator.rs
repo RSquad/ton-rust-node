@@ -32,7 +32,7 @@ use storage::{
     types::BlockMeta,
 };
 use ton_block::{
-    AccountIdPrefixFull, AccountStorageDictProof, BinTreeType, BocReader, InRefValue, MerkleProof,
+    read_boc, AccountIdPrefixFull, AccountStorageDictProof, BinTreeType, InRefValue, MerkleProof,
     Result,
 };
 
@@ -444,7 +444,7 @@ async fn try_collate_by_bundle(
         // println!("Original old state root {:#.3}", old_state);
         // println!("Original new state root {:#.3}", new_state);
         if let Err(result) =
-            compare_blocks(ethalon_block.block()?, &Block::construct_from_bytes(&candidate.data)?)
+            compare_blocks(&Block::construct_from_bytes(&candidate.data)?, ethalon_block.block()?)
         {
             panic!("Blocks are not equal: {}", result);
         }
@@ -565,8 +565,7 @@ async fn test_collated_data1() {
 
     let candidate = try_collate_by_bundle(Arc::new(bundle), true).await.unwrap();
 
-    let mut collated_data_roots =
-        BocReader::new().read_inmem(Arc::new(candidate.collated_data)).unwrap().roots;
+    let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
     assert_eq!(collated_data_roots.len(), 10);
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
@@ -601,8 +600,7 @@ async fn check_bundle(bundle: &str, collated_roots: usize) {
 
     let candidate = try_collate_by_bundle(Arc::new(bundle), true).await.unwrap();
 
-    let mut collated_data_roots =
-        BocReader::new().read_inmem(Arc::new(candidate.collated_data)).unwrap().roots;
+    let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
     assert_eq!(collated_data_roots.len(), collated_roots);
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
@@ -632,7 +630,7 @@ async fn check_bundle(bundle: &str, collated_roots: usize) {
             if let Some(dict_hash) = account.dict_hash() {
                 // check that we either have dict proof or account state is not pruned
                 // so we are able to init dict
-                if !dict_proofs.iter().any(|p| &p.proof.hash(0) == dict_hash) {
+                if !dict_proofs.iter().any(|p| p.proof.hash(0) == dict_hash) {
                     account
                         .init_storage_stat(
                             config.size_limits_config().unwrap().acc_state_cells_for_storage_dict,

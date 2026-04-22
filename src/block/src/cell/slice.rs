@@ -12,7 +12,7 @@ use crate::{
     cell::{BuilderData, Cell, CellType, LevelMask, SmallData},
     error, fail, parse_slice_base,
     types::{bits_to_bytes, UInt256},
-    ExceptionCode, Result,
+    ExceptionCode, Result, MAX_HASHES_COUNT,
 };
 use std::{
     cmp, fmt, hash, mem,
@@ -47,8 +47,11 @@ impl PartialOrd for SliceData {
 impl hash::Hash for SliceData {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.get_bytestring(0).hash(state);
-        for i in 0..self.remaining_references() {
-            state.write(self.reference(i).unwrap().repr_hash().as_slice());
+        if let InternalData::Cell(cell) = &self.data {
+            for i in 0..self.remaining_references() {
+                // reference_repr_hash returns error in case of incorrect index only
+                state.write(cell.reference_repr_hash(i).unwrap_or_default().as_slice());
+            }
         }
     }
 }
@@ -67,8 +70,10 @@ impl PartialEq for SliceData {
             return false;
         }
         for i in 0..refs_count {
-            let ref1 = self.reference(i).unwrap();
-            let ref2 = other.reference(i).unwrap();
+            // Only one case reference_repr_hash may fail is an incorrect index,
+            // here we guarantee it is correct
+            let ref1 = self.reference_repr_hash(i).unwrap();
+            let ref2 = other.reference_repr_hash(i).unwrap();
             if ref1 != ref2 {
                 return false;
             }
@@ -105,23 +110,16 @@ impl SliceData {
     };
 
     pub fn load_builder(builder: BuilderData) -> Result<SliceData> {
-        if builder.cell_type() == CellType::PrunedBranch {
-            fail!(ExceptionCode::PrunedCellAccess)
-        }
         // if no references we can load bitstring
         SliceData::load_cell(builder.into_cell()?)
     }
 
     pub fn load_cell(cell: Cell) -> Result<SliceData> {
-        if cell.is_pruned() {
-            fail!(ExceptionCode::PrunedCellAccess)
-        } else {
-            Ok(SliceData {
-                references_window: 0..cell.references_count(),
-                data_window: 0..cell.bit_length(),
-                data: InternalData::Cell(cell),
-            })
-        }
+        Ok(SliceData {
+            references_window: 0..cell.references_count(),
+            data_window: 0..cell.bit_length(),
+            data: InternalData::Cell(cell),
+        })
     }
 
     pub fn load_cell_with_window(
@@ -129,27 +127,23 @@ impl SliceData {
         data_window: Range<usize>,
         references_window: Range<usize>,
     ) -> Result<SliceData> {
-        if cell.is_pruned() {
-            fail!(ExceptionCode::PrunedCellAccess)
-        } else {
-            let bits = cell.bit_length();
-            let refs = cell.references_count();
-            if data_window.end > bits {
-                fail!(
-                    ExceptionCode::CellUnderflow,
-                    "data window end {} exceeds cell bits {bits}",
-                    data_window.end
-                )
-            }
-            if references_window.end > refs {
-                fail!(
-                    ExceptionCode::CellUnderflow,
-                    "references window end {} exceeds cell references {refs}",
-                    references_window.end
-                )
-            }
-            Ok(SliceData { references_window, data_window, data: InternalData::Cell(cell) })
+        let bits = cell.bit_length();
+        let refs = cell.references_count();
+        if data_window.end > bits {
+            fail!(
+                ExceptionCode::CellUnderflow,
+                "data window end {} exceeds cell bits {bits}",
+                data_window.end
+            )
         }
+        if references_window.end > refs {
+            fail!(
+                ExceptionCode::CellUnderflow,
+                "references window end {} exceeds cell references {refs}",
+                references_window.end
+            )
+        }
+        Ok(SliceData { references_window, data_window, data: InternalData::Cell(cell) })
     }
 
     pub fn with_bitstring(data: impl Into<SmallData>, length_in_bits: usize) -> Self {
@@ -346,7 +340,7 @@ impl SliceData {
     }
 
     /// shrinks references_window: range - subrange of current window, returns shrinked references
-    pub fn shrink_references<T: RangeBounds<usize>>(&mut self, range: T) -> Vec<Cell> {
+    pub fn shrink_references<T: RangeBounds<usize>>(&mut self, range: T) -> Result<Vec<Cell>> {
         let mut vec = vec![];
         if let InternalData::Cell(cell) = &self.data {
             let refs_count = self.remaining_references();
@@ -362,13 +356,17 @@ impl SliceData {
             };
 
             if (start <= end) && (end <= refs_count) {
-                (0..start).for_each(|i| vec.push(cell.reference(i).unwrap()));
-                (end..refs_count).for_each(|i| vec.push(cell.reference(i).unwrap()));
+                for i in 0..start {
+                    vec.push(cell.reference(i)?);
+                }
+                for i in end..refs_count {
+                    vec.push(cell.reference(i)?);
+                }
                 self.references_window.end = self.references_window.start + end;
                 self.references_window.start += start;
             }
         }
-        vec
+        Ok(vec)
     }
 
     pub fn clear_all_bits(&mut self) {
@@ -473,6 +471,20 @@ impl SliceData {
         )
     }
 
+    pub fn reference_repr_hash(&self, i: usize) -> Result<UInt256> {
+        if self.references_window.start + i < self.references_window.end {
+            if let InternalData::Cell(cell) = &self.data {
+                return cell.reference_repr_hash(self.references_window.start + i);
+            }
+        }
+        fail!(
+            ExceptionCode::CellUnderflow,
+            "not enough references to read {} max: {}",
+            i + 1,
+            self.remaining_references()
+        )
+    }
+
     pub fn reference_opt(&self, i: usize) -> Option<Cell> {
         if self.references_window.start + i < self.references_window.end {
             if let InternalData::Cell(cell) = &self.data {
@@ -526,8 +538,10 @@ impl SliceData {
     pub fn into_builder(self) -> Result<BuilderData> {
         let cell_type = self.cell_type();
         let slice = &self;
-        let refs =
-            (0..self.remaining_references()).map(|index| slice.reference(index).unwrap()).collect();
+        let mut refs = smallvec::SmallVec::new();
+        for i in 0..self.remaining_references() {
+            refs.push(slice.reference(i)?);
+        }
         let mut builder = self.remaining_data()?;
         builder.cell_type = cell_type;
         builder.references = refs;
@@ -940,18 +954,18 @@ impl SliceData {
     }
 
     /// Returns cell's higher hash for given index (last one - representation hash)
-    pub fn hash(&self, index: usize) -> UInt256 {
+    pub fn hash(&self, index: usize) -> &UInt256 {
         match &self.data {
             InternalData::Cell(cell) => Cell::hash(cell, index),
-            _ => Default::default(),
+            _ => &UInt256::ZERO,
         }
     }
 
     /// Returns cell's representation hash
-    pub fn repr_hash(&self) -> UInt256 {
+    pub fn repr_hash(&self) -> &UInt256 {
         match &self.data {
             InternalData::Cell(cell) => cell.repr_hash(),
-            _ => Default::default(),
+            _ => &UInt256::ZERO,
         }
     }
 
@@ -964,7 +978,7 @@ impl SliceData {
     }
 
     /// Returns cell's hashes (representation and highers)
-    pub fn hashes(&self) -> Vec<UInt256> {
+    pub fn hashes(&self) -> smallvec::SmallVec<[&UInt256; MAX_HASHES_COUNT]> {
         match &self.data {
             InternalData::Cell(cell) => cell.hashes(),
             _ => Default::default(),
@@ -972,7 +986,7 @@ impl SliceData {
     }
 
     /// Returns cell's depth (for current state and each level)
-    pub fn depths(&self) -> Vec<u16> {
+    pub fn depths(&self) -> smallvec::SmallVec<[u16; MAX_HASHES_COUNT]> {
         match &self.data {
             InternalData::Cell(cell) => cell.depths(),
             _ => Default::default(),

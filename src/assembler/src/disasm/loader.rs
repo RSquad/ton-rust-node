@@ -198,7 +198,7 @@ impl Loader {
             let bits = bytecode.remaining_bits() - slice.remaining_bits();
             let refs = bytecode.remaining_references() - slice.remaining_references();
             bytecode.shrink_data(..bits);
-            bytecode.shrink_references(..refs);
+            bytecode.shrink_references(..refs)?;
             insn.set_bytecode(bytecode);
             code.push(insn);
         }
@@ -230,7 +230,7 @@ impl Loader {
                         collapsed: false,
                     }))
                 });
-            self.history.insert(cell.repr_hash(), code.clone());
+            self.history.insert(cell.repr_hash().clone(), code.clone());
             Ok(code)
         }
     }
@@ -675,13 +675,13 @@ impl Loader {
 
         let mut subslice = slice.clone();
         subslice.shrink_data(..bits);
-        subslice.shrink_references(..r);
+        subslice.shrink_references(..r)?;
         subslice.trim_right();
         let missing_bits = bits - subslice.remaining_bits();
         let missing_refs = r - subslice.remaining_references();
 
         slice.shrink_data(bits..);
-        slice.shrink_references(r..);
+        slice.shrink_references(r..)?;
 
         let mut insn = Instruction::new("PUSHSLICE")
             .with_refs(r)
@@ -698,13 +698,13 @@ impl Loader {
 
         let mut subslice = slice.clone();
         subslice.shrink_data(..bits);
-        subslice.shrink_references(..r);
+        subslice.shrink_references(..r)?;
         subslice.trim_right();
         let missing_bits = bits - subslice.remaining_bits();
         let missing_refs = r - subslice.remaining_references();
 
         slice.shrink_data(bits..);
-        slice.shrink_references(r..);
+        slice.shrink_references(r..)?;
 
         let mut insn = Instruction::new("PUSHSLICE")
             .with_refs(r)
@@ -721,13 +721,13 @@ impl Loader {
 
         let mut subslice = slice.clone();
         subslice.shrink_data(..bits);
-        subslice.shrink_references(..r);
+        subslice.shrink_references(..r)?;
         let missing_bits = bits - subslice.remaining_bits();
         let missing_refs = r - subslice.remaining_references();
         let code = self.load(&mut subslice, false)?;
 
         slice.shrink_data(bits..);
-        slice.shrink_references(r..);
+        slice.shrink_references(r..)?;
 
         let mut insn = Instruction::new("PUSHCONT")
             .with_refs(r)
