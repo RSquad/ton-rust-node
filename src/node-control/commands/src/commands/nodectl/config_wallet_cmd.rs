@@ -27,9 +27,7 @@ use common::{
 use contracts::{ElectorWrapper, ElectorWrapperImpl, TonWallet, contract_provider, nominator};
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use std::{io::Write, path::Path, str::FromStr};
-use ton_block::{
-    ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, Cell, MsgAddressInt, write_boc,
-};
+use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
 
 const WALLET_SEND_GAS: u64 = 1_000_000; // 0.001 TON
