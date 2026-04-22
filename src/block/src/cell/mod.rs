@@ -1008,7 +1008,7 @@ impl LoadedCell {
         Ok(unsafe { &*(p.add(rh_off) as *const UInt256) })
     }
 
-    fn reference_repr_depth<'a>(p: *const u8, index: usize) -> Result<u16> {
+    fn reference_repr_depth(p: *const u8, index: usize) -> Result<u16> {
         let buf = Self::buf(p);
         let refs_count = refs_count(buf);
         if index >= refs_count {
@@ -1858,9 +1858,9 @@ impl Cell {
         let content = unsafe { ptr.add(prefix) };
 
         let refs_ptr = DataCell::refs_ptr(content);
-        for i in 0..refs_count {
+        for (i, &ref_val) in refs[..refs_count].iter().enumerate() {
             unsafe {
-                *(refs_ptr as *mut u8).add(CELL_PTR_SIZE * i).cast::<u32>() = refs[i];
+                *(refs_ptr as *mut u8).add(CELL_PTR_SIZE * i).cast::<u32>() = ref_val;
             }
         }
 
@@ -2420,7 +2420,7 @@ impl Cell {
         self.depth(MAX_LEVEL)
     }
 
-    pub fn hashes<'a>(&'a self) -> smallvec::SmallVec<[&'a UInt256; MAX_HASHES_COUNT]> {
+    pub fn hashes(&self) -> smallvec::SmallVec<[&UInt256; MAX_HASHES_COUNT]> {
         let mut hashes = smallvec::SmallVec::new();
         let mut i = 0;
         while hashes.len() < self.level() as usize + 1 {
@@ -2619,8 +2619,7 @@ impl UsageTree {
     }
 
     pub fn use_cell(&self, cell: Cell, visit_on_load: bool) -> Cell {
-        let usage_cell = Cell::usage(cell, visit_on_load, Arc::downgrade(&self.visited));
-        usage_cell
+        Cell::usage(cell, visit_on_load, Arc::downgrade(&self.visited))
     }
 
     pub fn root_cell(&self) -> Cell {
@@ -2678,7 +2677,7 @@ impl UsageTree {
     const PRUNNED_SIZE: usize = 41;
 
     pub fn estimate_proof_serialized_size(&self) -> Result<usize> {
-        if self.visited.get(&self.original_root().repr_hash()).is_some() {
+        if self.visited.get(self.original_root().repr_hash()).is_some() {
             self.estimate_cell(&self.original_root())
         } else {
             Ok(0)
@@ -2711,7 +2710,7 @@ impl UsageTree {
             size +=
                 Self::add_branch_internal(&cell.reference_without_usage(i)?, visited, is_include)?;
         }
-        if !is_include(&cell.repr_hash()) {
+        if !is_include(cell.repr_hash()) {
             Ok(0)
         } else {
             if visited.insert(cell.repr_hash().clone()) {

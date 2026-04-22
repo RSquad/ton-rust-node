@@ -1731,7 +1731,8 @@ impl Message {
     }
 
     pub fn normalized_hash(&self) -> Result<UInt256> {
-        let normalized = self.clone().normalize_external_inbound()?;
+        let mut normalized = self.clone();
+        normalized.normalize_external_inbound()?;
         GetRepresentationHash::hash(&normalized)
     }
 

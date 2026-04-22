@@ -262,7 +262,7 @@ impl BocWriterStack {
                         hash_map::Entry::Occupied(_) => continue,
                     };
 
-                    if let Some((_, written)) = indices.get_mut(&loaded.cell.repr_hash()) {
+                    if let Some((_, written)) = indices.get_mut(loaded.cell.repr_hash()) {
                         *written = true;
                     }
 
@@ -1051,7 +1051,7 @@ impl BigBocWriter<'_> {
     fn arrange_cells(&mut self, cell: Cell) -> Result<u32> {
         let repr_hash = cell.repr_hash();
         let _ = cell;
-        self.arrange_cells_(&repr_hash)
+        self.arrange_cells_(repr_hash)
     }
 
     fn arrange_cells_(&mut self, repr_hash: &UInt256) -> Result<u32> {
@@ -1400,7 +1400,7 @@ impl<'a> BocReader<'a> {
         // Index processing - read existing index or traverse all vector to create own index2
         #[cfg(not(target_family = "wasm"))]
         let now1 = std::time::Instant::now();
-        let index = self.read_index(&data, &mut src, &header)?;
+        let index = self.read_index(data, &mut src, &header)?;
         #[cfg(not(target_family = "wasm"))]
         let index_time = now1.elapsed().as_millis();
 

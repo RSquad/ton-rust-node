@@ -1494,7 +1494,7 @@ fn build_graph_recursive(
 ) -> Result<usize> {
     // Check if already visited (DAG deduplication)
     let cell_hash = cell.repr_hash();
-    if let Some(&id) = visited.get(&cell_hash) {
+    if let Some(&id) = visited.get(cell_hash) {
         return Ok(id);
     }
 

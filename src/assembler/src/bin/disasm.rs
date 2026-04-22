@@ -90,7 +90,7 @@ fn subcommand_dump(filename: String) -> Status {
             let mut count = 0;
             let mut queue = vec![root.clone()];
             while let Some(cell) = queue.pop() {
-                if count >= usize::MAX {
+                if count == usize::MAX {
                     fail!("cells count exceeds max {}", usize::MAX)
                 }
                 count += 1;

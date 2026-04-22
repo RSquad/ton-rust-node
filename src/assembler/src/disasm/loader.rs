@@ -212,7 +212,7 @@ impl Loader {
         }
     }
     fn load_cell_impl(&mut self, cell: &Cell) -> Result<Code> {
-        if let Some(code) = self.history.get(&cell.repr_hash()) {
+        if let Some(code) = self.history.get(cell.repr_hash()) {
             if self.collapse {
                 Ok(Code::single(Instruction::new(";;").with_param(InstructionParameter::Cell {
                     cell: Some(cell.clone()),

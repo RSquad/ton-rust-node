@@ -1974,7 +1974,7 @@ pub fn debug_transaction(transaction: Transaction) -> Result<String> {
     let root_cell = transaction.serialize()?;
     let set = TransactionSerializationSetEx {
         transaction: &transaction,
-        id: &root_cell.repr_hash(),
+        id: root_cell.repr_hash(),
         status: TransactionProcessingStatus::Finalized,
         block_id: None,
         workchain_id: None,

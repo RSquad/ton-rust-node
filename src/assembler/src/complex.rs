@@ -957,7 +957,7 @@ impl DbgNodeMaker {
     }
     fn make(&self, cell: Cell) -> DbgNode {
         let mut node = DbgNode::default();
-        if let Some(map) = self.info.get(&cell.repr_hash()) {
+        if let Some(map) = self.info.get(cell.repr_hash()) {
             for (offset, pos) in map {
                 node.offsets.push((*offset, pos.clone()))
             }

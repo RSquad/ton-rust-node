@@ -77,7 +77,7 @@ impl Serializable for MerkleProof {
 impl MerkleProof {
     /// Creating of a Merkle proof which includes cells whose hashes contain in `proof_for`.
     pub fn create(root: &Cell, is_include: impl Fn(&UInt256) -> bool) -> Result<Self> {
-        if !is_include(&root.repr_hash()) {
+        if !is_include(root.repr_hash()) {
             fail!(BlockError::InvalidArg(
                 "`bag` doesn't contain any cell to include into proof".to_string()
             ))
