@@ -847,10 +847,19 @@ impl QuicNode {
         };
         let name = Self::key_id_to_server_name(key_id);
         // Update last-added name for SNI fallback (C++ ngtcp2 doesn't send SNI)
-        if let Ok(mut last) = endpoint_state.last_added_name.lock() {
-            *last = Some(name);
+        let changed = if let Ok(mut last) = endpoint_state.last_added_name.lock() {
+            if last.as_deref() == Some(name.as_str()) {
+                false
+            } else {
+                *last = Some(name);
+                true
+            }
+        } else {
+            false
+        };
+        if changed {
+            log::info!(target: TARGET, "Activated QUIC identity {} on port {}", key_id, port);
         }
-        log::info!(target: TARGET, "Activated QUIC identity {} on port {}", key_id, port);
     }
 
     pub fn add_peer_key(&self, key_id: Arc<KeyId>, addr: SocketAddr) -> Result<()> {
