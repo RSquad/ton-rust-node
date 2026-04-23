@@ -175,7 +175,6 @@ impl NodeNetwork {
             let quic = adnl::QuicNode::new(
                 vec![overlay.clone()],
                 cancellation_token.clone(),
-                None,
                 tokio::runtime::Handle::current(),
                 None,
             );
