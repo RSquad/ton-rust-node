@@ -1506,7 +1506,7 @@ impl NodeConfigHandler {
         );
         config.remove_validator_key(oldest_key.validator_key_id.clone(), election_id).await?;
         validator_keys.remove(&oldest_key)?;
-        config.remove_key_from_key_ring(&oldest_key.validator_key_id.clone()).await?;
+        config.remove_key_from_key_ring(&oldest_key.validator_key_id).await?;
         let Some(adnl_key_id) = &oldest_key.validator_adnl_key_id else {
             return Ok(());
         };
