@@ -12,15 +12,7 @@ use adnl::{
     node::{AdnlNode, IpAddress},
     DhtNode, OverlayNode, QuicNode, QuicRateLimitConfig,
 };
-use std::{
-    collections::HashSet,
-    net::Ipv4Addr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashSet, net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use ton_api::{
     deserialize_boxed, serialize_boxed,
@@ -156,7 +148,6 @@ fn test_quic_concurrent_accept() {
         let server = QuicNode::new(
             vec![server_sub],
             server_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -190,7 +181,6 @@ fn test_quic_concurrent_accept() {
             let quic = QuicNode::new(
                 vec![sub],
                 token.clone(),
-                None,
                 tokio::runtime::Handle::current(),
                 Some(QuicRateLimitConfig::disabled()),
             );
@@ -291,7 +281,6 @@ fn test_quic_session() {
         let quic_a = QuicNode::new(
             vec![sub_a],
             token_a.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -300,7 +289,6 @@ fn test_quic_session() {
         let quic_b = QuicNode::new(
             vec![sub_b],
             token_b.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -380,7 +368,6 @@ fn test_quic_reconnect_after_server_restart() {
         let client = QuicNode::new(
             vec![client_sub],
             client_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -405,7 +392,6 @@ fn test_quic_reconnect_after_server_restart() {
         let server1 = QuicNode::new(
             vec![server_sub1],
             server_token1.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -444,7 +430,6 @@ fn test_quic_reconnect_after_server_restart() {
         let server2 = QuicNode::new(
             vec![server_sub2],
             server_token2.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -466,177 +451,6 @@ fn test_quic_reconnect_after_server_restart() {
         server2.shutdown();
         client_token.cancel();
         server_token2.cancel();
-    });
-}
-
-/// Subscriber that tracks concurrent processing count and holds streams open.
-struct SlowSubscriber {
-    key_id: Arc<KeyId>,
-    current: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-    processed: Arc<AtomicUsize>,
-    hold_duration: Duration,
-}
-
-#[async_trait::async_trait]
-impl Subscriber for SlowSubscriber {
-    async fn try_consume_custom(&self, _data: &[u8], peers: &AdnlPeers) -> Result<bool> {
-        if peers.local() != &self.key_id {
-            return Ok(false);
-        }
-        let prev = self.current.fetch_add(1, Ordering::SeqCst);
-        let concurrent = prev + 1;
-        self.peak.fetch_max(concurrent, Ordering::SeqCst);
-        tokio::time::sleep(self.hold_duration).await;
-        self.current.fetch_sub(1, Ordering::SeqCst);
-        self.processed.fetch_add(1, Ordering::SeqCst);
-        Ok(true)
-    }
-
-    async fn try_consume_query(&self, object: TLObject, peers: &AdnlPeers) -> Result<QueryResult> {
-        if peers.local() != &self.key_id {
-            return Ok(QueryResult::Rejected(object));
-        }
-        // Answer pings normally so the client can establish the connection.
-        match object.downcast::<AdnlPing>() {
-            Ok(ping) => QueryResult::consume(
-                AdnlPong { value: ping.value },
-                #[cfg(feature = "telemetry")]
-                None,
-            ),
-            Err(obj) => Ok(QueryResult::Rejected(obj)),
-        }
-    }
-}
-
-/// Verify that the per-connection stream semaphore limits concurrent processing.
-/// Server stream limit = 2, subscriber holds each stream for 1s.
-/// Client fires 4 messages concurrently — peak concurrency must not exceed 2.
-#[test]
-fn test_quic_stream_limit() {
-    init_test_log();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    rt.block_on(async {
-        const STREAM_LIMIT: usize = 2;
-        const NUM_MESSAGES: usize = 4;
-        const HOLD: Duration = Duration::from_secs(1);
-        const SERVER_PORT: u16 = 5850;
-        const CLIENT_PORT: u16 = 5851;
-        const TIMEOUT: Duration = Duration::from_secs(15);
-
-        // --- server with stream limit = 2 ---
-        let server_token = CancellationToken::new();
-        let server_key = ed25519_generate_private_key().unwrap().to_bytes();
-        let (_, server_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
-            &format!("127.0.0.1:{SERVER_PORT}"),
-            vec![(server_key, KEY_TAG)],
-        )
-        .unwrap();
-        let server_key_id = server_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
-
-        let peak = Arc::new(AtomicUsize::new(0));
-        let current = Arc::new(AtomicUsize::new(0));
-        let processed = Arc::new(AtomicUsize::new(0));
-        let server_sub = Arc::new(SlowSubscriber {
-            key_id: server_key_id.clone(),
-            current: current.clone(),
-            peak: peak.clone(),
-            processed: processed.clone(),
-            hold_duration: HOLD,
-        }) as Arc<dyn Subscriber>;
-
-        let server_bind: SocketAddr =
-            format!("127.0.0.1:{}", SERVER_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
-        let server = QuicNode::new(
-            vec![server_sub],
-            server_token.clone(),
-            Some(STREAM_LIMIT),
-            tokio::runtime::Handle::current(),
-            Some(QuicRateLimitConfig::disabled()),
-        );
-        server.add_key(&server_key, &server_key_id, server_bind).unwrap();
-
-        // --- client (normal limits) ---
-        let client_token = CancellationToken::new();
-        let client_key = ed25519_generate_private_key().unwrap().to_bytes();
-        let (_, client_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
-            &format!("127.0.0.1:{CLIENT_PORT}"),
-            vec![(client_key, KEY_TAG)],
-        )
-        .unwrap();
-        let client_key_id = client_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
-
-        let (cli_tx, _cli_rx) = tokio::sync::mpsc::unbounded_channel();
-        let client_sub = Arc::new(TestSubscriber { key_id: client_key_id.clone(), msg_tx: cli_tx })
-            as Arc<dyn Subscriber>;
-
-        let client_bind: SocketAddr =
-            format!("127.0.0.1:{}", CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
-        let client = QuicNode::new(
-            vec![client_sub],
-            client_token.clone(),
-            None,
-            tokio::runtime::Handle::current(),
-            Some(QuicRateLimitConfig::disabled()),
-        );
-        client.add_key(&client_key, &client_key_id, client_bind).unwrap();
-
-        // Register peers
-        client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
-        server.add_peer_key(client_key_id.clone(), client_bind).unwrap();
-        let peers = AdnlPeers::with_keys(client_key_id.clone(), server_key_id.clone());
-
-        // Establish the connection with a ping/pong first
-        let resp = tokio::time::timeout(
-            Duration::from_secs(10),
-            client.query(make_ping_data(100500), None, &peers, None),
-        )
-        .await
-        .expect("initial query timed out")
-        .expect("initial query failed");
-        assert_eq!(parse_pong(resp.unwrap()), 100500, "warmup pong mismatch");
-
-        // --- fire NUM_MESSAGES concurrently ---
-        let mut handles = Vec::with_capacity(NUM_MESSAGES);
-        for i in 0..NUM_MESSAGES {
-            let quic = client.clone();
-            let peers = peers.clone();
-            handles.push(tokio::spawn(async move {
-                let payload = format!("msg-{i}");
-                quic.message(payload.as_bytes().to_vec(), None, &peers)
-                    .await
-                    .unwrap_or_else(|e| panic!("message {i} failed: {e}"));
-            }));
-        }
-
-        // Wait for all messages to be processed by the slow subscriber
-        let _ = tokio::time::timeout(TIMEOUT, async {
-            for h in handles {
-                let _ = h.await;
-            }
-            while processed.load(Ordering::SeqCst) < NUM_MESSAGES {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("stream limit test timed out");
-
-        let observed_peak = peak.load(Ordering::SeqCst);
-        println!(
-            "Stream limit test: limit={STREAM_LIMIT}, \
-            messages={NUM_MESSAGES}, peak_concurrent={observed_peak}"
-        );
-        assert!(
-            observed_peak <= STREAM_LIMIT,
-            "Peak concurrency {observed_peak} exceeded stream limit {STREAM_LIMIT}"
-        );
-        assert!(observed_peak > 0, "No messages were processed — test is broken");
-
-        // --- cleanup ---
-        client.shutdown();
-        server.shutdown();
-        client_token.cancel();
-        server_token.cancel();
     });
 }
 
@@ -668,13 +482,8 @@ fn make_endpoint_with_config(
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let sub =
         Arc::new(TestSubscriber { key_id: key_id.clone(), msg_tx: tx }) as Arc<dyn Subscriber>;
-    let quic = QuicNode::new(
-        vec![sub],
-        token.clone(),
-        None,
-        tokio::runtime::Handle::current(),
-        Some(rl_config),
-    );
+    let quic =
+        QuicNode::new(vec![sub], token.clone(), tokio::runtime::Handle::current(), Some(rl_config));
     quic.add_key(&key, &key_id, bind).unwrap();
     (quic, key, key_id, bind, token)
 }
@@ -1610,7 +1419,6 @@ fn test_quic_connection_pool_exhaustion() {
             let quic = QuicNode::new(
                 vec![sub],
                 token.clone(),
-                None,
                 tokio::runtime::Handle::current(),
                 Some(QuicRateLimitConfig::disabled()),
             );
@@ -1720,7 +1528,6 @@ fn test_quic_message_burst_reconnect() {
         let client = QuicNode::new(
             vec![client_sub],
             client_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1742,7 +1549,6 @@ fn test_quic_message_burst_reconnect() {
         let server1 = QuicNode::new(
             vec![srv_sub1],
             srv_token1.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1788,7 +1594,6 @@ fn test_quic_message_burst_reconnect() {
         let server2 = QuicNode::new(
             vec![srv_sub2],
             srv_token2.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1862,7 +1667,6 @@ fn test_quic_single_sender_invariant() {
         let client = QuicNode::new(
             vec![client_sub],
             client_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1883,7 +1687,6 @@ fn test_quic_single_sender_invariant() {
         let server = QuicNode::new(
             vec![srv_sub],
             srv_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
