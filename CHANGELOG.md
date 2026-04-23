@@ -6,6 +6,15 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.5.3] - 2026-04-23
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.3`
+
+### Changed
+
+- Optimize QUIC for high latency links
+- Keep permanent ADNL validator keys
+
 ## [v0.5.2] - 2026-04-21
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.2`
