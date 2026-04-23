@@ -20,7 +20,7 @@ use adnl::{
     declare_counted,
     node::AdnlNode,
     AddressSearchContext, DhtNode, DhtSearchPolicy, NetworkStack, OverlayNode, OverlayShortId,
-    PrivateOverlayShortId, RldpNode,
+    PrivateOverlayShortId, QuicRateLimitConfig, RldpNode,
 };
 use catchain::{
     CatchainFactory, CatchainNode, CatchainOverlay, CatchainOverlayListenerPtr,
@@ -176,7 +176,7 @@ impl NodeNetwork {
                 vec![overlay.clone()],
                 cancellation_token.clone(),
                 tokio::runtime::Handle::current(),
-                None,
+                Some(QuicRateLimitConfig { stateless_retry: false, ..Default::default() }),
             );
             overlay.set_quic(quic.clone())?;
             Some(quic)
