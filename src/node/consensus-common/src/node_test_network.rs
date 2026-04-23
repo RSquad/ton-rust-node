@@ -248,7 +248,6 @@ impl<'a> NodeTestNetwork<'a> {
                     let quic = QuicNode::new(
                         vec![overlay.clone()],
                         cancellation_token.clone(),
-                        None,
                         tokio::runtime::Handle::current(),
                         Some(QuicRateLimitConfig::disabled()),
                     );
