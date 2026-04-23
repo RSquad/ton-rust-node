@@ -531,7 +531,6 @@ impl RustQuicTestNode {
             let quic = QuicNode::new(
                 quic_subscribers,
                 cancellation_token.clone(),
-                None,
                 rt.handle().clone(),
                 Some(QuicRateLimitConfig::disabled()),
             );
