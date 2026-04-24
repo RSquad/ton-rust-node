@@ -3617,12 +3617,13 @@ fn prepare_recursive_merkle_cell(mut depth: u32) -> Result<Cell> {
     let root = builder.into_cell()?;
 
     let merkle =
-        MerkleProof::create(&root, |hash| hash == &ref1.repr_hash() || hash == &root.repr_hash())?;
+        MerkleProof::create(&root, |hash| hash == ref1.repr_hash() || hash == root.repr_hash())?;
     let mut proof = merkle.serialize()?;
 
     depth -= 1;
     while depth > 0 {
-        let merkle = MerkleProof { hash: proof.repr_hash(), depth: proof.repr_depth(), proof };
+        let merkle =
+            MerkleProof { hash: proof.repr_hash().clone(), depth: proof.repr_depth(), proof };
         proof = merkle.serialize()?;
         depth -= 1;
     }

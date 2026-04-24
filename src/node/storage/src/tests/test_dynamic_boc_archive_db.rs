@@ -45,7 +45,6 @@ async fn test_dynamic_boc_archive_db() -> Result<()> {
     let boc_db = Arc::new(DynamicBocArchiveDb::with_db(
         db.clone(),
         "cells",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -60,7 +59,7 @@ async fn test_dynamic_boc_archive_db() -> Result<()> {
     assert_eq!(boc_db.cell_db().count(), initial_count);
 
     // Load and verify
-    let loaded = boc_db.cell_db().load_cell(&root_cell.repr_hash(), false)?;
+    let loaded = boc_db.cell_db().load_cell(&root_cell.repr_hash())?;
     assert_eq!(count_tree_unique_cells(loaded), initial_count);
 
     drop(boc_db);
@@ -80,7 +79,6 @@ async fn test_archive_save_idempotent() -> Result<()> {
     let boc_db = Arc::new(DynamicBocArchiveDb::with_db(
         db.clone(),
         "cells",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -114,7 +112,6 @@ async fn test_archive_shared_cells() -> Result<()> {
     let boc_db = Arc::new(DynamicBocArchiveDb::with_db(
         db.clone(),
         "cells",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -152,8 +149,8 @@ async fn test_archive_shared_cells() -> Result<()> {
     assert_eq!(count_after_r2, count_after_r1 + 1);
 
     // Both roots should be loadable
-    let _ = boc_db.cell_db().load_cell(&r1.repr_hash(), false)?;
-    let _ = boc_db.cell_db().load_cell(&r2.repr_hash(), false)?;
+    let _ = boc_db.cell_db().load_cell(&r1.repr_hash())?;
+    let _ = boc_db.cell_db().load_cell(&r2.repr_hash())?;
 
     drop(cells_factory);
     drop(boc_db);
@@ -174,7 +171,6 @@ async fn test_archive_shardstate_db() -> Result<()> {
         db.clone(),
         "shardstate_idx",
         "cells",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -215,7 +211,6 @@ async fn test_archive_cell_by_hash_storage() -> Result<()> {
     let boc_db = Arc::new(DynamicBocArchiveDb::with_db(
         db.clone(),
         "cells",
-        "",
         &CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -231,7 +226,7 @@ async fn test_archive_cell_by_hash_storage() -> Result<()> {
     fn repack(cell: ton_block::Cell) -> Result<ton_block::Cell> {
         let mut builder = BuilderData::with_raw(cell.data(), cell.bit_length())?;
         builder.set_type(cell.cell_type());
-        for r in cell.clone_references() {
+        for r in cell.clone_references()? {
             builder.checked_append_reference(repack(r)?)?;
         }
         builder.finalize(MAX_SAFE_DEPTH)

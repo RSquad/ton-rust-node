@@ -306,7 +306,6 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
         archive_states_db,
         ARCHIVE_SHARDSTATE_CF_NAME,
         ARCHIVE_CELLS_CF_NAME,
-        &config.node_db_path,
         &cells_db_config,
         #[cfg(feature = "telemetry")]
         engine_telemetry.storage.clone(),

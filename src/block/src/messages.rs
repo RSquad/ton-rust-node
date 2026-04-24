@@ -18,9 +18,9 @@ use crate::{
     read_boc_root,
     shard::MASTERCHAIN_ID,
     types::{Coins, CurrencyCollection, Number5, Number9},
-    AccountId, BlockError, BuilderData, Cell, ChildCell, Deserializable, GasConsumer,
-    GetRepresentationHash, IBitstring, Mask, Result, Serializable, SliceData, UInt256, UsageTree,
-    VarUInteger16, MAX_DATA_BITS, MAX_REFERENCES_COUNT,
+    AccountId, BlockError, BuilderData, Cell, ChildCell, Deserializable, GetRepresentationHash,
+    IBitstring, Mask, Result, Serializable, SliceData, UInt256, UsageTree, VarUInteger16,
+    MAX_DATA_BITS, MAX_REFERENCES_COUNT,
 };
 use num::FromPrimitive;
 use std::{fmt, str::FromStr};
@@ -1731,7 +1731,8 @@ impl Message {
     }
 
     pub fn normalized_hash(&self) -> Result<UInt256> {
-        let normalized = self.clone().normalize_external_inbound()?;
+        let mut normalized = self.clone();
+        normalized.normalize_external_inbound()?;
         GetRepresentationHash::hash(&normalized)
     }
 
@@ -1741,69 +1742,6 @@ impl Message {
         let mut slice = read_boc_root(data)?;
         let header = CommonMsgInfo::construct_from(&mut slice)?;
         Ok(header)
-    }
-
-    pub fn construct_with_gas_consumer(
-        cell: Cell,
-        gas_consumer: &mut impl GasConsumer,
-    ) -> Result<Self> {
-        let mut msg = Self::default();
-        let mut cell = gas_consumer.load_cell(cell)?;
-        msg.read_with_gas_consumer(&mut cell, gas_consumer)?;
-        Ok(msg)
-    }
-
-    fn read_with_gas_consumer(
-        &mut self,
-        cell: &mut SliceData,
-        gas_consumer: &mut impl GasConsumer,
-    ) -> Result<()> {
-        // read header
-        self.header.read_from(cell)?;
-
-        // read StateInit
-        if cell.get_next_bit()? {
-            // maybe of init
-            let mut init = StateInit::default();
-            if cell.get_next_bit()? {
-                // either of init
-                // read from reference
-                let mut r = gas_consumer.load_cell(cell.checked_drain_reference()?)?;
-                init.read_from(&mut r)?;
-                self.init = Some(init);
-                self.init_to_ref = Some(true);
-            } else {
-                // read from current cell
-                init.read_from(cell)?;
-                self.init = Some(init);
-                self.init_to_ref = Some(false);
-            }
-        } else {
-            self.init_to_ref = Some(false);
-        }
-
-        // read body
-        // A message is always serialized inside the blockchain as the last field in
-        // a cell. Therefore, the blockchain software may assume that whatever bits
-        // and references left unparsed after parsing the fields of a Message preceding
-        // body belong to the payload body : X, without knowing anything about the
-        // serialization of the type X.
-
-        self.body = if cell.get_next_bit()? {
-            // body in reference
-            self.body_to_ref = Some(true);
-            Some(gas_consumer.load_cell(cell.checked_drain_reference()?)?)
-        } else {
-            self.body_to_ref = Some(false);
-            if cell.is_empty_cell() {
-                // no body
-                None
-            } else {
-                // body is leftover
-                Some(cell.clone())
-            }
-        };
-        Ok(())
     }
 }
 
@@ -1820,7 +1758,7 @@ impl Serializable for Message {
                 return Ok(());
             }
         }
-        // now try to repack to possible serilalize
+        // now try to repack to possible serialize
         let (b, _, _) = self.serialize_with_params(None, None)?;
         if builder.is_empty() {
             *builder = b;
@@ -1832,9 +1770,45 @@ impl Serializable for Message {
 }
 
 impl Deserializable for Message {
-    fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        self.read_with_gas_consumer(cell, &mut 0)
+    fn construct_from(slice: &mut SliceData) -> Result<Self> {
+        // read header
+        let header = CommonMsgInfo::construct_from(slice)?;
+
+        // read StateInit
+        let (init, init_to_ref) = if !slice.get_next_bit()? {
+            // maybe of init
+            (None, Some(false))
+        } else if slice.get_next_bit()? {
+            // either of init
+            // read from reference
+            let init = StateInit::construct_from_cell(slice.checked_drain_reference()?)?;
+            (Some(init), Some(true))
+        } else {
+            // read from current cell
+            let init = StateInit::construct_from(slice)?;
+            (Some(init), Some(false))
+        };
+
+        // read body
+        // A message is always serialized inside the blockchain as the last field in
+        // a cell. Therefore, the blockchain software may assume that whatever bits
+        // and references left unparsed after parsing the fields of a Message preceding
+        // body belong to the payload body : X, without knowing anything about the
+        // serialization of the type X.
+
+        let (body, body_to_ref) = if slice.get_next_bit()? {
+            // body in reference
+            (Some(SliceData::load_cell(slice.checked_drain_reference()?)?), Some(true))
+        } else if slice.is_empty_cell() {
+            // no body
+            (None, Some(false))
+        } else {
+            // body is leftover
+            (Some(slice.clone()), Some(false))
+        };
+        Ok(Message { header, init, body, body_to_ref, init_to_ref })
     }
+
     fn skip(slice: &mut SliceData) -> Result<()> {
         // skip header
         CommonMsgInfo::skip(slice)?;
@@ -1936,9 +1910,9 @@ impl SimpleLib {
 }
 
 impl Serializable for SimpleLib {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.public.write_to(cell)?;
-        self.root.write_to(cell)?;
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        self.public.write_to(builder)?;
+        builder.checked_append_reference(self.root.clone())?;
         Ok(())
     }
 }
@@ -1946,7 +1920,7 @@ impl Serializable for SimpleLib {
 impl Deserializable for SimpleLib {
     fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
         self.public.read_from(slice)?;
-        self.root.read_from(slice)?;
+        self.root = slice.checked_drain_reference()?;
         Ok(())
     }
 }
@@ -2022,7 +1996,8 @@ impl StateInit {
     }
 
     pub fn set_library_code(&mut self, code: Cell, public: bool) -> Result<()> {
-        self.library.set(&code.repr_hash(), &SimpleLib::new(code, public))?;
+        let code_hash = code.repr_hash().clone();
+        self.library.set(&code_hash, &SimpleLib::new(code, public))?;
         Ok(())
     }
 }

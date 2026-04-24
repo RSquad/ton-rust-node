@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    base64_decode, read_single_root_boc, AccStatusChange, Account, AccountId, AccountStatus,
-    AccountStorage, AddSub, BuilderData, Cell, Coins, ComputeSkipReason, ConfigParam8,
-    ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable,
+    base64_decode, read_single_root_boc, read_single_root_boc_file, AccStatusChange, Account,
+    AccountId, AccountStatus, AccountStorage, AddSub, BuilderData, Cell, Coins, ComputeSkipReason,
+    ConfigParam8, ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable,
     ExternalInboundMessageHeader, GetRepresentationHash, HashmapAugType, HashmapType, InRefValue,
     InternalMessageHeader, KeyExtBlkRef, McStateExtra, MerkleProof, Message, MsgAddressInt,
     OutAction, OutActions, Result, Serializable, ShardAccount, ShardIdent, ShardStateUnsplit,
@@ -74,7 +74,7 @@ pub fn mc_state_cell_with_config(config: ConfigParams) -> ShardStateUnsplit {
 
 pub fn make_proof_cell(p: &impl Serializable) -> Cell {
     let proof = p.serialize().unwrap();
-    let proof = MerkleProof { hash: proof.hash(0), depth: proof.depth(0), proof };
+    let proof = MerkleProof { hash: proof.hash(0).clone(), depth: proof.depth(0), proof };
     proof.serialize().unwrap()
 }
 
@@ -834,12 +834,12 @@ pub fn replay_transaction(
     };
     // account.write_to_file("real_boc/storage_limit_old.boc").unwrap();
     // transaction.write_to_file("real_boc/storage_limit_transaction.boc").unwrap();
-    let old_hash = account.serialize().unwrap().repr_hash();
+    let old_root = account.serialize().unwrap();
     let hash_update = transaction.read_state_update().unwrap();
-    pretty_assertions::assert_eq!(hash_update.old_hash, old_hash);
+    pretty_assertions::assert_eq!(hash_update.old_hash, *old_root.repr_hash());
     // dbg!(&account, &transaction, transaction.read_in_msg().unwrap());
     println!("transaction hash: {:X}", transaction.serialize().unwrap().repr_hash());
-    println!("account hash: {:X}", old_hash);
+    println!("account hash: {:X}", old_root.repr_hash());
     let message = transaction.read_in_msg().unwrap();
     let msg_cell = transaction.in_msg_cell();
     let account_after = Account::construct_from_file(acc_after).unwrap_or_else(|_| account.clone());
@@ -931,12 +931,12 @@ pub fn replay_transaction(
     );
 
     // account.write_to_file(acc_after).unwrap();
-    let new_hash = account.serialize().unwrap().repr_hash();
+    let new_root = account.serialize().unwrap();
     // let hash_update = ton_block::HashUpdate::with_hashes(old_hash.clone(), new_hash.clone());
     // our_transaction.write_state_update(&hash_update).unwrap();
     // our_transaction.write_to_file(tr).unwrap();
     // account.write_to_file(acc_after).unwrap();
-    if hash_update.new_hash == new_hash {
+    if hash_update.new_hash == *new_root.repr_hash() {
         pretty_assertions::assert_eq!(our_transaction, transaction);
         pretty_assertions::assert_eq!(account, account_after);
         return;
@@ -1017,12 +1017,12 @@ pub fn replay_with_mc_state(mc: &str, cfg: &str, acc: &str, acc_after: &str, tr:
 }
 
 pub fn replay_with_mc_state_proof(mc: &str, acc: &str, acc_after: &str, tr: &str) {
-    let mc_state_proof = Cell::read_from_file(mc);
+    let mc_state_proof = read_single_root_boc_file(mc).unwrap();
     replay_transaction(None, acc, acc_after, tr, "", mc_state_proof)
 }
 
 pub fn replay_with_key_block_proof(mc: &str, acc: &str, acc_after: &str, tr: &str) {
-    let mc_state_proof = Cell::read_from_file(mc);
+    let mc_state_proof = read_single_root_boc_file(mc).unwrap();
     replay_transaction(None, acc, acc_after, tr, "", mc_state_proof)
 }
 
@@ -1256,12 +1256,12 @@ impl TransactionTestContext {
 pub fn append_message(storage: &mut StorageUsed, msg: &Message) -> Result<()> {
     let mut calc = StorageUsageCalc::with_limits(0, 0);
     // don't calc storage for Extra Currencies
-    let builder = if let Some(copy) = msg.copy_without_extra_currencies() {
-        copy.write_to_new_cell()?
+    let root = if let Some(copy) = msg.copy_without_extra_currencies() {
+        copy.serialize()?
     } else {
-        msg.write_to_new_cell()?
+        msg.serialize()?
     };
-    calc.append_builder(&builder, true, &mut 0)?;
+    calc.append_cell(&root, true, &mut 0)?;
     let other = calc.storage_used()?;
     storage.add_bits_and_cells(other.bits(), other.cells());
     Ok(())

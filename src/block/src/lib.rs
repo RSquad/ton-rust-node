@@ -447,7 +447,7 @@ pub trait GetRepresentationHash: Serializable + Debug {
                 log::error!("err: {}, wrong hash calculation for {:?}", err, self);
                 Err(err)
             }
-            Ok(cell) => Ok(cell.repr_hash()),
+            Ok(cell) => Ok(cell.repr_hash().clone()),
         }
     }
 }

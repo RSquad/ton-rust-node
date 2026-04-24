@@ -46,12 +46,12 @@ use storage::{
     StorageAlloc,
 };
 use ton_block::{
-    error, fail, read_boc, read_single_root_boc, AccountIdPrefixFull, BlockIdExt, BlockSignatures,
-    BlockSignaturesPure, BlockSignaturesVariant, Cell, CellType, ConfigParam8, ConfigParamEnum,
-    CurrencyCollection, Deserializable, Error, FundamentalSmcAddresses, HashmapAugType,
-    HashmapType, MerkleProof, Message, OutMsgQueue, Result, Serializable, ShardIdent,
-    ShardStateUnsplit, TopBlockDescr, TopBlockDescrSet, UInt256, UsageTree, ValidatorBaseInfo,
-    ValidatorSet,
+    error, fail, read_boc, read_single_root_boc, AccountIdPrefixFull, BlockExtra, BlockIdExt,
+    BlockSignatures, BlockSignaturesPure, BlockSignaturesVariant, Cell, CellType, ConfigParam8,
+    ConfigParamEnum, CurrencyCollection, Deserializable, Error, FundamentalSmcAddresses,
+    HashmapAugType, HashmapType, MerkleProof, Message, OutMsgQueue, Result, Serializable,
+    ShardIdent, ShardStateUnsplit, TopBlockDescr, TopBlockDescrSet, UInt256, UsageTree,
+    ValidatorBaseInfo, ValidatorSet,
 };
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -162,7 +162,7 @@ fn construct_from_file<T: Deserializable>(path: &str) -> Result<(T, UInt256, UIn
     let bytes = std::fs::read(path)?;
     let fh = UInt256::calc_file_hash(&bytes);
     let cell = read_single_root_boc(&bytes)?;
-    let rh = cell.repr_hash();
+    let rh = cell.repr_hash().clone();
     Ok((T::construct_from_cell(cell)?, fh, rh))
 }
 
@@ -351,13 +351,12 @@ impl CollatorTestBundle {
                 &allocated,
             )
         } else {
-            ShardStateStuff::deserialize_state_inmem(
+            ShardStateStuff::deserialize_state(
                 ss_id.clone(),
-                Arc::new(data),
+                &data,
                 #[cfg(feature = "telemetry")]
                 &telemetry,
                 &allocated,
-                &|| false,
             )
         }
     }
@@ -433,13 +432,12 @@ impl CollatorTestBundle {
                     &allocated,
                 )?
             } else {
-                ShardStateStuff::deserialize_state_inmem(
+                ShardStateStuff::deserialize_state(
                     ss_id.clone(),
-                    Arc::new(data),
+                    &data,
                     #[cfg(feature = "telemetry")]
                     &telemetry,
                     &allocated,
-                    &|| false,
                 )?
             };
             states.insert(ss_id.clone(), ss);
@@ -595,7 +593,7 @@ impl CollatorTestBundle {
     }
     fn use_extra_cc(cc: &CurrencyCollection, sub_trees: &mut HashSet<UInt256>) {
         if let Some(cell) = cc.other.root() {
-            sub_trees.insert(cell.repr_hash());
+            sub_trees.insert(cell.repr_hash().clone());
         }
     }
     fn add_simplified_state(
@@ -649,7 +647,7 @@ impl CollatorTestBundle {
             for i in 0..cell.references_count() {
                 let child = cell.reference(i)?;
                 for j in 0..child.references_count() {
-                    sub_trees.insert(child.reference(j)?.repr_hash());
+                    sub_trees.insert(child.reference(j)?.repr_hash().clone());
                 }
             }
         }
@@ -671,18 +669,18 @@ impl CollatorTestBundle {
                 &Default::default(),
             )? {
                 // if let Some(leaf) = accounts.get_serialized_raw(account_id)? {
-                sub_trees.insert(leaf.cell()?.repr_hash());
+                sub_trees.insert(leaf.cell()?.repr_hash().clone());
             }
             Ok(true)
         })?;
 
         // don't prune out_msg_queue_info - it could be very big
-        let hash = state.out_msg_queue_info_cell().repr_hash();
+        let hash = state.out_msg_queue_info_cell().repr_hash().clone();
         sub_trees.insert(hash);
         // TODO: libraries can become too big - then libraries proof should be added instead of full libraries
         if let Some(libs) = state.libraries().root() {
             if include_libs {
-                sub_trees.insert(libs.repr_hash());
+                sub_trees.insert(libs.repr_hash().clone());
             }
         }
         let proof = MerkleProof::create_with_subtrees(
@@ -966,9 +964,7 @@ impl CollatorTestBundle {
         //
         // external messages
         //
-        let external_messages = engine
-            .get_external_messages_iterator(candidate.block_id.shard().clone(), u64::MAX)
-            .collect::<Vec<_>>();
+        let external_messages = Self::collect_ext_msgs(&block.block()?.read_extra()?)?;
 
         //
         // prev states
@@ -1265,17 +1261,7 @@ impl CollatorTestBundle {
         //
         // external messages
         //
-        let mut external_messages = vec![];
-        let mut external_messages_ids = vec![];
-        let in_msgs = extra.read_in_msg_descr()?;
-        in_msgs.iterate_with_keys(|key, in_msg| {
-            let msg = in_msg.read_message()?;
-            if msg.is_inbound_external() {
-                external_messages_ids.push(key.clone());
-                external_messages.push((Arc::new(msg), key));
-            }
-            Ok(true)
-        })?;
+        let external_messages = Self::collect_ext_msgs(&extra)?;
 
         //
         // prev blocks
@@ -1344,7 +1330,7 @@ impl CollatorTestBundle {
         let index = CollatorTestBundleIndex {
             id: block.id().clone(),
             top_shard_blocks: top_shard_blocks_ids,
-            external_messages: external_messages_ids,
+            external_messages: external_messages.iter().map(|(_, id)| id.clone()).collect(),
             last_mc_state: last_mc_id,
             min_ref_mc_seqno: info.min_ref_mc_seqno(),
             mc_states,
@@ -1462,6 +1448,19 @@ impl CollatorTestBundle {
     pub fn exists(path: &str, block_id: &BlockIdExt) -> bool {
         let path = Self::build_filename(path, block_id);
         std::path::Path::new(&path).exists()
+    }
+
+    pub fn collect_ext_msgs(extra: &BlockExtra) -> Result<Vec<(Arc<Message>, UInt256)>> {
+        let mut external_messages = vec![];
+        let in_msgs = extra.read_in_msg_descr()?;
+        in_msgs.iterate_with_keys(|key, in_msg| {
+            let msg = in_msg.read_message()?;
+            if msg.is_inbound_external() {
+                external_messages.push((Arc::new(msg), key));
+            }
+            Ok(true)
+        })?;
+        Ok(external_messages)
     }
 
     fn build_filename(prefix: &str, block_id: &BlockIdExt) -> String {
@@ -1652,7 +1651,7 @@ impl EngineOperations for CollatorTestBundle {
     }
 
     fn add_account_storage_dict(&self, dict: Cell, _size: u64) {
-        self.storage_dicts.insert(dict.repr_hash(), dict);
+        self.storage_dicts.insert(dict.repr_hash().clone(), dict);
     }
 
     async fn wait_applied_block(

@@ -1494,13 +1494,13 @@ fn build_graph_recursive(
 ) -> Result<usize> {
     // Check if already visited (DAG deduplication)
     let cell_hash = cell.repr_hash();
-    if let Some(&id) = visited.get(&cell_hash) {
+    if let Some(&id) = visited.get(cell_hash) {
         return Ok(id);
     }
 
     // Assign new node ID
     let current_cell_id = graph.len();
-    visited.insert(cell_hash, current_cell_id);
+    visited.insert(cell_hash.clone(), current_cell_id);
 
     let data = cell.data();
     let bit_len = cell.bit_length();

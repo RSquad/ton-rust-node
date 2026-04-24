@@ -46,7 +46,7 @@ impl Deserializable for MerkleProof {
         self.hash.read_from(cell)?;
         self.depth = cell.get_next_u16()?;
         self.proof = cell.checked_drain_reference()?;
-        if self.hash != Cell::hash(&self.proof, 0) {
+        if self.hash != *Cell::hash(&self.proof, 0) {
             fail!(BlockError::WrongMerkleProof(
                 "Stored proof hash is not equal calculated one".to_string()
             ))
@@ -77,7 +77,7 @@ impl Serializable for MerkleProof {
 impl MerkleProof {
     /// Creating of a Merkle proof which includes cells whose hashes contain in `proof_for`.
     pub fn create(root: &Cell, is_include: impl Fn(&UInt256) -> bool) -> Result<Self> {
-        if !is_include(&root.repr_hash()) {
+        if !is_include(root.repr_hash()) {
             fail!(BlockError::InvalidArg(
                 "`bag` doesn't contain any cell to include into proof".to_string()
             ))
@@ -86,7 +86,7 @@ impl MerkleProof {
         let proof =
             MerkleProof::create_raw(root, &is_include, &|_| false, 0, &mut None, &mut done_cells)?;
 
-        Ok(MerkleProof { hash: root.repr_hash(), depth: root.repr_depth(), proof })
+        Ok(MerkleProof { hash: root.repr_hash().clone(), depth: root.repr_depth(), proof })
     }
 
     /// Creating of a Merkle proof which includes cells whose hashes contain in `proof_for`.
@@ -99,7 +99,7 @@ impl MerkleProof {
         is_include: impl Fn(&UInt256) -> bool,
         is_include_subtree: impl Fn(&UInt256) -> bool,
     ) -> Result<Self> {
-        let root_hash = root.repr_hash();
+        let root_hash = root.repr_hash().clone();
         if !is_include(&root_hash) && !is_include_subtree(&root_hash) {
             fail!(BlockError::InvalidArg(
                 "`bag` doesn't contain any cell to include into proof".to_string()
@@ -170,7 +170,7 @@ impl MerkleProof {
         }
 
         let proof_cell = proof_cell.into_cell()?;
-        done_cells.insert(cell.repr_hash(), proof_cell.clone());
+        done_cells.insert(cell.repr_hash().clone(), proof_cell.clone());
 
         Ok(proof_cell)
     }
@@ -248,7 +248,7 @@ pub fn check_transaction_proof(
     if let Some(mut tr_parent_slice) = tr_parent_slice_opt {
         if let Ok(tr_slice) = tr_parent_slice.checked_drain_reference() {
             // check hash
-            if tr_slice.repr_hash() != tr.hash()? {
+            if *tr_slice.repr_hash() != tr.hash()? {
                 fail!(BlockError::WrongMerkleProof("Wrong transaction's hash in proof".to_string()))
             }
         }
@@ -259,7 +259,7 @@ pub fn check_transaction_proof(
 }
 
 fn check_transaction_id(given_id: Option<UInt256>, tr_cell: Option<Cell>) -> Result<()> {
-    let existing_id = tr_cell.map(|c| c.repr_hash());
+    let existing_id = tr_cell.map(|c| c.repr_hash().clone());
     match (given_id, existing_id) {
         (None, Some(_)) => {
             fail!(BlockError::WrongMerkleProof(
@@ -312,7 +312,7 @@ pub fn check_message_proof(
         if let Ok(Some(in_msg)) = in_msg_descr.get(&msg_hash) {
             check_transaction_id(tr_id, in_msg.transaction_cell())?;
             if let Ok(msg_cell) = in_msg.message_cell() {
-                if msg_cell.repr_hash() != msg_hash {
+                if *msg_cell.repr_hash() != msg_hash {
                     fail!(BlockError::WrongMerkleProof(format!(
                         "Wrong message's hash in proof {:x} but {:x}",
                         msg_cell.repr_hash(),
@@ -368,7 +368,7 @@ pub fn check_account_proof(proof: &MerkleProof, acc: &Account) -> Result<BlockSe
     if let Ok(Some(shard_acc)) = shard_acc {
         let acc_root = shard_acc.account_cell();
         let acc_hash = Cell::hash(&acc_root, (max(acc_root.level(), 1) - 1) as usize);
-        if acc.hash()? != acc_hash {
+        if acc.hash()? != *acc_hash {
             fail!(BlockError::WrongMerkleProof("Wrong account's hash in proof".to_string()))
         } else {
             Ok(BlockSeqNoAndShard {

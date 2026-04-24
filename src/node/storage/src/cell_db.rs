@@ -9,23 +9,20 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
-    db::rocksdb::RocksDb,
-    shardstate_db_async::CellsDbConfig,
-    types::{StoredCell, StoringCell},
+    db::rocksdb::RocksDb, shardstate_db_async::CellsDbConfig, types::deserialize_stored_cell,
     StorageAlloc, TARGET,
 };
 #[cfg(feature = "telemetry")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "telemetry")]
+use std::time::Instant;
 use std::{
-    fs::write,
     io::Write,
-    ops::Deref,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, OnceLock},
 };
 use ton_block::{
-    error, fail, merkle_update::CellsFactory, BuilderData, Cell, CellsStorage, Result, UInt256,
+    error, fail, merkle_update::CellsFactory, BuilderData, Cell, CellLoader, CellsStorage, Result,
+    UInt256,
 };
 
 pub const BROKEN_CELL_BEACON_FILE: &str = "ton_node.broken_cell";
@@ -33,11 +30,14 @@ pub const BROKEN_CELL_BEACON_FILE: &str = "ton_node.broken_cell";
 pub struct CellDb {
     db: Arc<RocksDb>,
     cells_cf_name: String,
-    db_root_path: PathBuf,
     storing_cells: Arc<lockfree::map::Map<UInt256, Cell>>,
     #[cfg(feature = "telemetry")]
     storing_cells_count: AtomicU64,
     cell_cache: quick_cache::sync::Cache<UInt256, Cell>,
+    /// Loader for cells loaded from DB (StoredCell)
+    stored_loader: OnceLock<CellLoader>,
+    /// Loader for cells being stored (StoringCell)
+    storing_loader: OnceLock<CellLoader>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
     allocated: Arc<StorageAlloc>,
@@ -47,7 +47,6 @@ impl CellDb {
     pub fn with_db(
         db: Arc<RocksDb>,
         cell_db_cf: &str,
-        db_root_path: impl AsRef<Path>,
         config: &CellsDbConfig,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
@@ -58,11 +57,12 @@ impl CellDb {
         Ok(Self {
             db,
             cells_cf_name: cell_db_cf.to_string(),
-            db_root_path: db_root_path.as_ref().to_path_buf(),
             storing_cells: Arc::new(lockfree::map::Map::new()),
             #[cfg(feature = "telemetry")]
             storing_cells_count: AtomicU64::new(0),
             cell_cache: quick_cache::sync::Cache::new(config.cells_lru_cache_capacity),
+            stored_loader: OnceLock::new(),
+            storing_loader: OnceLock::new(),
             #[cfg(feature = "telemetry")]
             telemetry,
             allocated,
@@ -87,6 +87,12 @@ impl CellDb {
         // This length provides less than 1% false positive rate.
         block_opts.set_bloom_filter(10.0, false);
 
+        // Use two-level index with partitioned filters so that only the relevant
+        // partition of index/filter is loaded into the block cache on each lookup,
+        // instead of the full index/filter block for the entire SST file.
+        block_opts.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
+        block_opts.set_partition_filters(true);
+
         options.set_block_based_table_factory(&block_opts);
 
         // Enable whole key bloom filter in memtable.
@@ -101,7 +107,7 @@ impl CellDb {
         // so you may wish to adjust this parameter to control memory usage.
         // Also, a larger write buffer will result in a longer recovery time
         // the next time the database is opened.
-        options.set_write_buffer_size(1024 * 1024 * 1024);
+        options.set_write_buffer_size(64 * 1024 * 1024);
 
         // The maximum number of write buffers that are built up in memory.
         // The default and the minimum number is 2, so that when 1 write buffer
@@ -146,6 +152,35 @@ impl CellDb {
         &self.telemetry
     }
 
+    pub fn stored_loader(self: &Arc<Self>) -> &CellLoader {
+        &self.stored_loader.get_or_init(|| {
+            let weak = Arc::downgrade(self);
+            Arc::new(move |hash: &UInt256| -> Result<Cell> {
+                let db = weak.upgrade().ok_or_else(|| error!("BocDb is dropped"))?;
+                db.load_cell(hash)
+            })
+        })
+    }
+
+    pub fn storing_loader(self: &Arc<Self>) -> &CellLoader {
+        &self.storing_loader.get_or_init(|| {
+            let weak = Arc::downgrade(self);
+            Arc::new(move |hash: &UInt256| -> Result<Cell> {
+                let db = weak.upgrade().ok_or_else(|| error!("BocDb is dropped"))?;
+                db.load_cell(hash)
+            })
+        })
+    }
+
+    /// Check if a cell was created with this DynamicBocDb's stored_loader
+    pub fn is_stored_cell(&self, cell: &Cell) -> bool {
+        if let (Some(cell_ptr), Some(loader)) = (cell.loader_data_ptr(), self.stored_loader.get()) {
+            cell_ptr == Arc::as_ptr(loader) as *const ()
+        } else {
+            false
+        }
+    }
+
     /// If root cell already exists in DB, load and return it. Otherwise return None.
     pub fn try_load_existing_root(
         self: &Arc<Self>,
@@ -153,18 +188,15 @@ impl CellDb {
         cells_cf: &impl rocksdb::AsColumnFamilyRef,
     ) -> Result<Option<Cell>> {
         #[cfg(feature = "telemetry")]
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if let Some(val) = self.db.get_pinned_cf(cells_cf, root_id.as_slice())? {
-            let cell = StoredCell::deserialize(self, root_id, &val)?;
+            let cell = deserialize_stored_cell(root_id, &val, self.stored_loader())?;
             #[cfg(feature = "telemetry")]
             {
-                self.telemetry
-                    .stored_cells
-                    .update(self.allocated.storage_cells.load(Ordering::Relaxed));
                 self.telemetry.loaded_cells_from_db.update(1);
                 self.telemetry.load_cell_from_db_time_nanos.update(now.elapsed().as_nanos() as u64);
             }
-            Ok(Some(Cell::with_cell_impl(cell)))
+            Ok(Some(cell))
         } else {
             Ok(None)
         }
@@ -185,6 +217,9 @@ impl CellDb {
                         let _count = self.storing_cells_count.fetch_sub(1, Ordering::Relaxed);
                         self.telemetry.storing_cells.update(_count - 1);
                     }
+
+                    // Evict from cell_cache so next load gets stored_loader version
+                    self.cell_cache.remove(&id);
 
                     for i in 0..removed.val().references_count() {
                         if let Ok(ref_hash) = removed.val().reference_repr_hash(i) {
@@ -215,9 +250,9 @@ impl CellDb {
         }
     }
 
-    pub(crate) fn load_cell(self: &Arc<Self>, cell_id: &UInt256, panic: bool) -> Result<Cell> {
+    pub(crate) fn load_cell(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
         #[cfg(feature = "telemetry")]
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if let Some(cell) = self.cell_cache.get(cell_id) {
             #[cfg(feature = "telemetry")]
             {
@@ -230,9 +265,9 @@ impl CellDb {
         }
         #[cfg(feature = "telemetry")]
         self.telemetry.cell_cache_misses.update(1);
-        let cell = self.load_cell_uncached(cell_id, panic)?;
+        let cell = self.load_cell_uncached(cell_id)?;
         #[cfg(feature = "telemetry")]
-        let now_insert = std::time::Instant::now();
+        let now_insert = Instant::now();
         self.cell_cache.insert(cell_id.clone(), cell.clone());
         #[cfg(feature = "telemetry")]
         {
@@ -244,9 +279,9 @@ impl CellDb {
         Ok(cell)
     }
 
-    fn load_cell_uncached(self: &Arc<Self>, cell_id: &UInt256, panic: bool) -> Result<Cell> {
+    fn load_cell_uncached(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
         #[cfg(feature = "telemetry")]
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let storage_cell_data = match self.db.get_pinned_cf(&self.cells_cf()?, cell_id.as_slice()) {
             Ok(Some(data)) => data,
             _ => {
@@ -257,55 +292,23 @@ impl CellDb {
                     );
                     return Ok(guard.val().clone());
                 }
-
-                if !panic {
-                    fail!("Can't load cell {:x} from db", cell_id);
-                }
-
-                log::error!("FATAL!");
-                log::error!("FATAL! Can't load cell {:x} from db", cell_id);
-                log::error!("FATAL!");
-
-                let path = Path::new(&self.db_root_path).join(BROKEN_CELL_BEACON_FILE);
-                write(path, "")?;
-
-                std::thread::sleep(Duration::from_millis(100));
-                std::process::exit(0xFF);
+                fail!("Can't load cell {:x} from db", cell_id);
             }
         };
 
         #[cfg(feature = "telemetry")]
         let load_cell_from_db_time_nanos = now.elapsed().as_nanos() as u64;
 
-        let storage_cell = match StoredCell::deserialize(self, cell_id, &storage_cell_data) {
-            Ok(cell) => Arc::new(cell),
-            Err(e) => {
-                if !panic {
+        let storage_cell =
+            match deserialize_stored_cell(cell_id, &storage_cell_data, self.stored_loader()) {
+                Ok(cell) => cell,
+                Err(e) => {
                     fail!("Can't deserialize cell {:x} from db, error: {:?}", cell_id, e);
                 }
-
-                log::error!("FATAL!");
-                log::error!(
-                    "FATAL! Can't deserialize cell {:x} from db, data: {}, error: {:?}",
-                    cell_id,
-                    hex::encode(&storage_cell_data),
-                    e
-                );
-                log::error!("FATAL!");
-
-                let path = Path::new(&self.db_root_path).join(BROKEN_CELL_BEACON_FILE);
-                write(path, "")?;
-
-                std::thread::sleep(Duration::from_millis(100));
-                std::process::exit(0xFF);
-            }
-        };
+            };
 
         #[cfg(feature = "telemetry")]
         {
-            self.telemetry
-                .stored_cells
-                .update(self.allocated.storage_cells.load(Ordering::Relaxed));
             self.telemetry.load_cell_from_db_time_nanos.update(load_cell_from_db_time_nanos);
             self.telemetry.loaded_cells_from_db.update(1);
         }
@@ -315,15 +318,15 @@ impl CellDb {
             "CellDb::load_cell from DB id {cell_id:x}"
         );
 
-        Ok(Cell::with_cell_impl_arc(storage_cell))
+        Ok(storage_cell)
     }
 }
 
 impl CellsFactory for CellDb {
     fn create_cell(self: Arc<Self>, builder: BuilderData) -> Result<Cell> {
-        let cell = StoringCell::with_cell(&*builder.into_cell()?, &self)?;
-        let cell = Cell::with_cell_impl(cell);
-        let repr_hash = cell.repr_hash();
+        let built_cell = builder.into_cell()?;
+        let cell = Cell::with_cell_and_loader(built_cell, self.storing_loader(), None)?;
+        let repr_hash = cell.repr_hash().clone();
 
         let mut result_cell = None;
 
@@ -373,7 +376,7 @@ impl CellsFactory for CellDb {
 // to implement foreign trait (CellByHashStorage) for foreign type (Arc)
 pub struct CellByHashStorageAdapter {
     db: Arc<CellDb>,
-    root_cells_data: ahash::HashMap<UInt256, Vec<u8>>,
+    root_cells: ahash::HashMap<UInt256, Cell>,
 }
 
 impl CellByHashStorageAdapter {
@@ -382,40 +385,39 @@ impl CellByHashStorageAdapter {
         root_cell: Option<&Cell>,
         max_inmemory_cells: usize,
     ) -> Result<Self> {
-        let mut root_cells_data = ahash::HashMap::default();
+        let mut root_cells = ahash::HashMap::default();
         if let Some(root_cell) = root_cell {
-            if db.load_cell(&root_cell.repr_hash(), false).is_err() {
+            if db.load_cell(&root_cell.repr_hash()).is_err() {
                 let mut stack = vec![root_cell.clone()];
                 while let Some(cell) = stack.pop() {
-                    if root_cells_data.len() >= max_inmemory_cells {
+                    if root_cells.len() >= max_inmemory_cells {
                         fail!(
                             "Too many cells in boc to store in memory: {}, max_inmemory_cells: {}",
-                            root_cells_data.len(),
+                            root_cells.len(),
                             max_inmemory_cells
                         );
                     }
-                    let cell_data = StoredCell::serialize(cell.cell_impl().deref())?;
-                    let cell_hash = cell.repr_hash();
-                    root_cells_data.insert(cell_hash, cell_data);
+                    let cell_hash = cell.repr_hash().clone();
+                    root_cells.insert(cell_hash, cell.clone());
 
                     for i in 0..cell.references_count() {
-                        if db.load_cell(&cell.reference_repr_hash(i)?, false).is_err() {
+                        if db.load_cell(&cell.reference_repr_hash(i)?).is_err() {
                             stack.push(cell.reference(i)?);
                         }
                     }
                 }
             }
         }
-        Ok(Self { db, root_cells_data })
+        Ok(Self { db, root_cells })
     }
 }
 
 impl CellsStorage for CellByHashStorageAdapter {
     fn load_cell(&self, hash: &UInt256) -> Result<Cell> {
-        if let Ok(c) = self.db.clone().load_cell_uncached(hash, false) {
+        if let Ok(c) = self.db.clone().load_cell_uncached(hash) {
             Ok(c)
-        } else if let Some(data) = self.root_cells_data.get(hash) {
-            StoredCell::deserialize(&self.db, hash, data).map(Cell::with_cell_impl)
+        } else if let Some(cell) = self.root_cells.get(hash) {
+            Ok(cell.clone())
         } else {
             fail!("Can't load cell {:x} from db", hash);
         }
@@ -428,7 +430,7 @@ impl CellsStorage for CellByHashStorageAdapter {
         dest: &mut dyn Write,
     ) -> Result<()> {
         #[cfg(feature = "telemetry")]
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if let Ok(Some(data)) = self.db.db.get_pinned_cf(&self.db.cells_cf()?, hash.as_slice()) {
             #[cfg(feature = "telemetry")]
             {
@@ -439,9 +441,10 @@ impl CellsStorage for CellByHashStorageAdapter {
                 self.db.telemetry.loaded_cells_from_db.update(1);
             }
 
-            StoredCell::write_cell_data(&data, hash, write_hashes, dest)
-        } else if let Some(data) = self.root_cells_data.get(hash) {
-            StoredCell::write_cell_data(data, hash, write_hashes, dest)
+            deserialize_stored_cell(hash, &data, self.db.stored_loader())?
+                .write_data(write_hashes, dest)
+        } else if let Some(cell) = self.root_cells.get(hash) {
+            cell.write_data(write_hashes, dest)
         } else {
             fail!("Can't load cell {:x} from db", hash);
         }

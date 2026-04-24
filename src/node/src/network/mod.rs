@@ -349,7 +349,7 @@ fn decompress_and_check_candidate_data(
         fail!("Invalid BlockCandidateBroadcastCompressed: expected 1 root, got {}", roots.len());
     }
     let block_root = roots.remove(0);
-    if *broadcast.id.root_hash() != block_root.repr_hash() {
+    if *broadcast.id.root_hash() != *block_root.repr_hash() {
         fail!("Invalid BlockCandidateBroadcastCompressed: root hash mismatch");
     }
 

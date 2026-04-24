@@ -620,7 +620,7 @@ pub fn create_ext_message(data: &[u8]) -> Result<(UInt256, Message)> {
                 root.repr_hash()
             )
         }
-        Ok((root.repr_hash(), message))
+        Ok((root.repr_hash().clone(), message))
     } else {
         fail!("External inbound message {:x} doesn't have proper header", root.repr_hash())
     }

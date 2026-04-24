@@ -37,7 +37,7 @@ use std::{
     fs::create_dir_all,
     hash::Hash,
     io::SeekFrom,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, OnceLock,
@@ -237,7 +237,7 @@ impl ArchiveSlice {
         Ok(())
     }
 
-    pub fn db_root_path(&self) -> &std::path::Path {
+    pub fn db_root_path(&self) -> &Path {
         self.db_root_path.as_path()
     }
 

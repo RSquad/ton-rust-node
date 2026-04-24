@@ -11,7 +11,7 @@
 use super::*;
 use crate::{
     base64_decode, base64_encode,
-    cell::{Cell, CellType, DataCell},
+    cell::{Cell, CellType},
     ed25519_generate_private_key, ed25519_sign_with_secret, write_read_and_assert,
     Ed25519KeyOption,
 };
@@ -99,11 +99,12 @@ fn test_uint256_ordering() {
 
 #[test]
 fn test_check_cell_types() {
-    fn construct(cells: Vec<Cell>, cell_type: CellType, len: usize) -> Result<DataCell> {
+    fn construct(cells: Vec<Cell>, cell_type: CellType, len: usize) -> Result<Cell> {
         assert!(len > 1);
         let mut data = vec![0x80; len];
         data[0] = cell_type.into();
-        DataCell::with_params(cells, &data, cell_type, 0, None)
+        let raw = Cell::build_data(&data, cell_type, 0, cells.len(), None)?;
+        Cell::with_data_and_refs(&raw, false, &cells, None, None)
     }
 
     construct(vec![], CellType::LibraryReference, 2)

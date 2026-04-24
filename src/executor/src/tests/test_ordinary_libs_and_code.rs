@@ -491,7 +491,7 @@ fn account_frozen_with_libs_disabled() {
     state_init.set_code(compile_code_to_cell("NOP").unwrap());
     state_init.set_library_code(LIBRARY_CELL.to_owned(), true).unwrap();
 
-    let frozen_hash = state_init.serialize().unwrap().repr_hash();
+    let frozen_hash = state_init.serialize().unwrap().repr_hash().clone();
     let acc_id = SliceData::from(state_init.hash().unwrap());
     let mut acc = Account::frozen(
         MsgAddressInt::with_standart(None, -1, acc_id.clone()).unwrap(),

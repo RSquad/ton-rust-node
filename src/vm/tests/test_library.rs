@@ -58,7 +58,7 @@ fn test_use_library_normal_compose_cell() {
     let lib_code = BuilderData::with_raw(vec![0x72], 8).unwrap().into_cell().unwrap();
     let hash = lib_code.repr_hash();
     assert_eq!(
-        hash,
+        *hash,
         "d816dc4ba685aed03aacac298a2beb6bcd67241e35ddcf39c4020c7430b3cf8f"
             .parse::<UInt256>()
             .unwrap()
@@ -234,7 +234,7 @@ fn test_incorrect_library() {
     let hash =
         UInt256::from_str("0xd816dc4ba685aed03aacac298a2beb6bcd67241e35ddcf39c4020c7430b3cf80")
             .unwrap();
-    assert_ne!(hash, lib_code.repr_hash());
+    assert_ne!(hash, *lib_code.repr_hash());
 
     let mut lib = HashmapE::with_bit_len(256);
     lib.setref(hash.into(), lib_code.clone()).unwrap();
@@ -360,14 +360,14 @@ fn test_cdepth_merkle_proof() {
     let c2 = BuilderData::with_raw(vec![0x02], 8).unwrap().into_cell().unwrap();
     let c3 = BuilderData::with_raw(vec![0x03], 8).unwrap().into_cell().unwrap();
     let c4 = BuilderData::with_raw_and_refs(vec![0x04], 8, [c1, c2]).unwrap().into_cell().unwrap();
-    let hash3 = c3.repr_hash();
+    let hash3 = c3.repr_hash().clone();
     // let hash4 = c4.repr_hash();
     let root =
         BuilderData::with_raw_and_refs(vec![0x05], 8, [c4, c3]).unwrap().into_cell().unwrap();
     let hash5 = root.repr_hash();
 
     let merkle =
-        MerkleProof::create_with_subtrees(&root, |hash| hash == &hash3, |hash| hash == &hash5)
+        MerkleProof::create_with_subtrees(&root, |hash| *hash == hash3, |hash| hash == hash5)
             .unwrap();
     let merkle = merkle.serialize().unwrap();
 
@@ -458,7 +458,7 @@ fn test_cdepth_merkle_proof() {
     )
     .expect_success();
 
-    let merkle = MerkleProof::create(&merkle, |h| h != &hash3).unwrap().serialize().unwrap();
+    let merkle = MerkleProof::create(&merkle, |h| *h != hash3).unwrap().serialize().unwrap();
     println!("{:#.100}", merkle);
 
     test_case_with_ref(
@@ -503,18 +503,18 @@ fn test_complex_merkle_cells() {
     let cell3 = BuilderData::with_raw(vec![13], 8).unwrap().into_cell().unwrap();
     let cell4 =
         BuilderData::with_raw_and_refs(vec![43], 8, vec![cell3]).unwrap().into_cell().unwrap();
-    include.insert(cell1.repr_hash());
-    include.insert(cell2.repr_hash());
+    include.insert(cell1.repr_hash().clone());
+    include.insert(cell2.repr_hash().clone());
     let cell12 = BuilderData::with_raw_and_refs(vec![14], 8, vec![cell1, cell2])
         .unwrap()
         .into_cell()
         .unwrap();
-    include.insert(cell12.repr_hash());
+    include.insert(cell12.repr_hash().clone());
     let cell = BuilderData::with_raw_and_refs(vec![111], 8, vec![cell4, cell12])
         .unwrap()
         .into_cell()
         .unwrap();
-    include.insert(cell.repr_hash());
+    include.insert(cell.repr_hash().clone());
 
     let merkle_proof = MerkleProof::create_with_subtrees(
         &cell,
@@ -547,7 +547,7 @@ fn test_complex_merkle_cells() {
 
 #[test]
 fn test_merkle_update_cell() {
-    let hash = Cell::default().repr_hash();
+    let hash = Cell::default().repr_hash().clone();
     let mut data = vec![0x04];
     data.extend_from_slice(hash.as_slice());
     data.extend_from_slice(hash.as_slice());
@@ -1153,7 +1153,7 @@ fn recursive_load_cell_failed() {
         b.append_i8(2).unwrap();
         b.append_raw(hash.as_slice(), 256).unwrap();
         cell = b.clone().into_cell().unwrap();
-        hash = cell.repr_hash();
+        hash = cell.repr_hash().clone();
 
         library.set(&hash, &SimpleLib::new(cell.clone(), false)).unwrap();
     }

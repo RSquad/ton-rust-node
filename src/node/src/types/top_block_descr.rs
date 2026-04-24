@@ -347,7 +347,7 @@ impl TopBlockDescrStuff {
         let merkle_proof = MerkleProof::construct_from_cell(proof_root.clone())?;
         let block_virt_root = merkle_proof.proof.clone().virtualize(1);
 
-        if block_virt_root.repr_hash() != cur_id.root_hash {
+        if *block_virt_root.repr_hash() != cur_id.root_hash {
             fail!(
                 "link for block {} inside ShardTopBlockDescr of {} contains a Merkle proof \
                 with incorrect root hash: expected {}, found {}",

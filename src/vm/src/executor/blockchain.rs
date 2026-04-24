@@ -82,12 +82,12 @@ fn calc_storage_used_short(
         StorageUsageCalc::with_limits(limits.max_msg_cells as u64, limits.max_msg_bits as u64);
     let (body_to_ref, init_to_ref) = msg.recalc_serialization_params()?;
     if let Some(body) = msg.body() {
-        let root = body.clone().into_builder()?;
-        calc.append_builder(&root, body_to_ref, engine)?;
+        let root = body.clone().into_cell()?;
+        calc.append_cell(&root, body_to_ref, engine)?;
     }
     if let Some(init) = msg.state_init() {
-        let root = init.write_to_new_cell()?;
-        calc.append_builder(&root, init_to_ref, engine)?;
+        let root = init.serialize()?;
+        calc.append_cell(&root, init_to_ref, engine)?;
     }
     let sstat = calc.storage_used()?;
     Ok(sstat)
@@ -107,7 +107,8 @@ pub(super) fn execute_send_msg(engine: &mut Engine) -> Status {
     let x = x as u8;
     let cell = engine.cmd.var(1).as_cell()?.clone();
     // println!("msg: {}", ton_block::base64_encode(ton_block::write_boc(&cell)?));
-    let mut msg = Message::construct_with_gas_consumer(cell.clone(), engine)?;
+    let mut slice = engine.load_cell(cell.clone())?;
+    let mut msg = Message::construct_from(&mut slice)?;
     let my_addr = engine.smci_param(8)?.as_slice()?;
     let my_addr = MsgAddressInt::construct_from(&mut my_addr.clone())?;
     let is_masterchain = my_addr.is_masterchain() | msg.is_dst_masterchain();

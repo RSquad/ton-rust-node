@@ -417,6 +417,10 @@ pub struct TonNodeConfig {
     custom_overlays: CustomOverlaysConfigBoxed,
     #[serde(default)]
     pss_downloading_threads: usize,
+    #[serde(default = "TonNodeConfig::default_pss_cells_cache_max_count")]
+    pss_cells_cache_max_count: usize,
+    #[serde(default = "TonNodeConfig::default_pss_prev_part_max_size")]
+    pss_prev_part_max_size: usize,
 }
 
 pub struct TonNodeGlobalConfig(TonNodeGlobalConfigJson);
@@ -745,6 +749,22 @@ impl TonNodeConfig {
 
     pub fn pss_downloading_threads(&self) -> usize {
         self.pss_downloading_threads
+    }
+
+    const fn default_pss_cells_cache_max_count() -> usize {
+        100_000_000
+    }
+
+    const fn default_pss_prev_part_max_size() -> usize {
+        10 * 1024 * 1024 * 1024
+    }
+
+    pub fn pss_cells_cache_max_count(&self) -> usize {
+        self.pss_cells_cache_max_count
+    }
+
+    pub fn pss_prev_part_max_size(&self) -> usize {
+        self.pss_prev_part_max_size
     }
 
     pub fn load_global_config(&self) -> Result<TonNodeGlobalConfig> {

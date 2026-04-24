@@ -109,6 +109,9 @@ storage = { path = 'storage' }
 ton_api = { path = '../tl/ton_api' }
 validator_session = { path = 'validator-session' }
 
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 [[bench]]
 name = "liteserver_pipeline"
 harness = false
@@ -124,7 +127,8 @@ reqwest = { version = "0.12.24" }
 tokio = { features = ['macros'], version = '1.40' }
 
 [features]
-default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key']
+default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key', 'jemalloc']
+jemalloc = ['tikv-jemallocator']
 cell_counter = ['ton_block/cell_counter']
 ci_run = []
 export_key = ['catchain/export_key', 'ton_block/export_key']

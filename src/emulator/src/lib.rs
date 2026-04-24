@@ -489,7 +489,7 @@ impl Emulator {
                 let hash_update = HashUpdate::with_hashes(old_hash, new_hash);
                 transaction.write_state_update(&hash_update)?;
                 let tr_cell = transaction.serialize()?;
-                shard_acc.set_last_trans_hash(tr_cell.repr_hash());
+                shard_acc.set_last_trans_hash(tr_cell.repr_hash().clone());
                 shard_acc.set_last_trans_lt(transaction.logical_time());
                 let actions = json!(null);
                 json!({

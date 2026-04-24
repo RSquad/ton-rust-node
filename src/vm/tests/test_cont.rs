@@ -152,6 +152,8 @@ fn test_pushctr_different_type() {
          PUSHCTR c3",
     )
     .expect_failure(ExceptionCode::TypeCheckError);
+
+    expect_exception("NULL POPCTR c2", ExceptionCode::TypeCheckError);
 }
 
 #[test]
@@ -416,7 +418,7 @@ fn test_bug_pop_c2_null() {
         NULL
     ",
     )
-    .with_gas_limit(1000)
+    .with_gas_limit(60)
     .expect_failure(ExceptionCode::OutOfGas);
 }
 

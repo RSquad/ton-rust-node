@@ -966,7 +966,7 @@ impl ValidateQuery {
                 engine.db_cells_factory()
                     .and_then(|cf| engine.db_cells_loader().map(|cl| (cf, cl)))
                     .and_then(|(cf, cl)| {
-                        state_update.apply_for_ex(&prev_state_root, &cf, cl.deref())
+                        state_update.apply_with_loader(&prev_state_root, &cf, cl.deref())
                     })
             };
             match fast_result {
@@ -2548,7 +2548,7 @@ impl ValidateQuery {
             )
         }
         if let Some((old_state, _old_extra)) = old_val_extra {
-            if hash_upd.old_hash != old_state.account_cell().repr_hash() {
+            if hash_upd.old_hash != *old_state.account_cell().repr_hash() {
                 reject_query!(
                     "(HASH_UPDATE Account) from the AccountBlock of {:x} \
                     has incorrect old hash",
@@ -2557,7 +2557,7 @@ impl ValidateQuery {
             }
         }
         if let Some((new_state, _new_extra)) = new_val_extra {
-            if hash_upd.new_hash != new_state.account_cell().repr_hash() {
+            if hash_upd.new_hash != *new_state.account_cell().repr_hash() {
                 reject_query!(
                     "(HASH_UPDATE Account) from the AccountBlock of {:x} \
                     has incorrect new hash",
@@ -2668,12 +2668,12 @@ impl ValidateQuery {
             )
         }
         let msg_info = match (trans.in_msg_cell(), trans.read_in_msg()?) {
-            (Some(root), Some(msg)) => Some((root.repr_hash(), msg.is_internal())),
+            (Some(root), Some(msg)) => Some((root.repr_hash().clone(), msg.is_internal())),
             _ => None,
         };
         *prev_trans_lt_len = lt_len;
         *prev_trans_lt = trans_lt;
-        *prev_trans_hash = trans_root.repr_hash();
+        *prev_trans_hash = trans_root.repr_hash().clone();
         *acc_state_hash = hash_upd.new_hash;
         let mut c = 0;
         // trans.out_msgs.iterate_slices_with_keys(|key, value| {
@@ -2727,13 +2727,13 @@ impl ValidateQuery {
         let old_state =
             base.prev_state_accounts.get_serialized(acc_id.clone())?.unwrap_or_default();
         let new_state = base.next_state_accounts.get_serialized(acc_id.clone())?;
-        if hash_upd.old_hash != old_state.account_cell().repr_hash() {
+        if hash_upd.old_hash != *old_state.account_cell().repr_hash() {
             reject_query!(
                 "(HASH_UPDATE Account) from the AccountBlock of {:x} has incorrect old hash",
                 acc_id
             )
         }
-        if hash_upd.new_hash != new_state.clone().unwrap_or_default().account_cell().repr_hash() {
+        if hash_upd.new_hash != *new_state.clone().unwrap_or_default().account_cell().repr_hash() {
             reject_query!(
                 "(HASH_UPDATE Account) from the AccountBlock of {:x} has incorrect new hash",
                 acc_id
@@ -2944,7 +2944,7 @@ impl ValidateQuery {
                 // this is a msg_export_tr_req$111, a re-queued transit message (after merge)
                 // check that q_msg_env still contains msg
                 let q_msg = info.out_message_cell();
-                if info.out_message_cell().repr_hash() != out_msg_id.hash {
+                if *info.out_message_cell().repr_hash() != out_msg_id.hash {
                     reject_query!(
                         "MsgEnvelope in the old outbound queue with key {:x} \
                         contains a Message with incorrect hash {:x}",
@@ -3240,7 +3240,10 @@ impl ValidateQuery {
                 "imported message with hash {env_hash:x} has next hop address {next_prefix}... not in this shard"
             )
         }
-        let key = OutMsgQueueKey::with_account_prefix(&next_prefix, env.message_cell().repr_hash());
+        let key = OutMsgQueueKey::with_account_prefix(
+            &next_prefix,
+            env.message_cell().repr_hash().clone(),
+        );
         if let (Some(block_id), enq) = manager.find_message(&key, &cur_prefix)? {
             let Some(enq) = enq else {
                 reject_query!(
@@ -3290,15 +3293,15 @@ impl ValidateQuery {
         log::debug!(target: "validate_query", "({}): checking InMsg with key {key:x}", base.next_block_descr);
         CHECK!(in_msg, inited);
         // initial checks and unpack
-        let msg_hash = in_msg.message_cell()?.repr_hash();
-        if &msg_hash != key {
+        let msg_hash = in_msg.message_cell()?.repr_hash().clone();
+        if msg_hash != *key {
             reject_query!(
                 "InMsg with key {key:x} refers to a message with different hash {msg_hash:x}"
             )
         }
         let trans_cell = in_msg.transaction_cell();
         let msg_env_cell = in_msg.in_msg_envelope_cell().unwrap_or_default();
-        let msg_env_hash = msg_env_cell.repr_hash();
+        let msg_env_hash = msg_env_cell.repr_hash().clone();
         let env = in_msg.read_in_msg_envelope()?.unwrap_or_default();
         let msg = in_msg.read_message()?;
         let created_lt = msg.created_lt().unwrap_or_default();
@@ -3315,17 +3318,16 @@ impl ValidateQuery {
             let transaction = Transaction::construct_from_cell(trans_cell.clone())?;
             // check that the transaction reference is valid, and that
             // it points to a Transaction which indeed processes this input message
-            Self::is_valid_transaction_ref(base, &transaction, trans_cell.repr_hash()).map_err(
-                |err| {
+            Self::is_valid_transaction_ref(base, &transaction, trans_cell.repr_hash().clone())
+                .map_err(|err| {
                     error!(
                         "InMsg corresponding to inbound message with key {key:x} contains \
                         an invalid Transaction reference \
                         (transaction not in the block's transaction list) : {err}"
                     )
-                },
-            )?;
+                })?;
             if let Some(tr_msg_cell) = transaction.in_msg_cell() {
-                if tr_msg_cell.repr_hash() != msg_hash {
+                if *tr_msg_cell.repr_hash() != msg_hash {
                     reject_query!(
                         "InMsg corresponding to inbound message with key {key:x} \
                         refers to transaction that does not process this inbound message"
@@ -3738,7 +3740,7 @@ impl ValidateQuery {
                 )
             })?;
             // the rewritten transit message envelope must contain the same message
-            if &tr_env.message_cell().repr_hash() != key {
+            if tr_env.message_cell().repr_hash() != key {
                 reject_query!(
                     "InMsg for transit message with hash {:x} refers to a rewritten message \
                     envelope containing another message",
@@ -4104,15 +4106,14 @@ impl ValidateQuery {
             let transaction = Transaction::construct_from_cell(trans_cell.clone())?;
             // check that the transaction reference is valid, and that it
             // points to a Transaction which indeed creates this outbound internal message
-            Self::is_valid_transaction_ref(base, &transaction, trans_cell.repr_hash()).map_err(
-                |err| {
+            Self::is_valid_transaction_ref(base, &transaction, trans_cell.repr_hash().clone())
+                .map_err(|err| {
                     error!(
                         "OutMsg corresponding to outbound message with key {key:x} \
                         contains an invalid Transaction reference (transaction not in the \
                         block's transaction list : {err:?})"
                     )
-                },
-            )?;
+                })?;
             if !transaction.contains_out_msg(created_lt, key) {
                 reject_query!(
                     "OutMsg corresponding to outbound message with key {key:x} \
@@ -4156,7 +4157,7 @@ impl ValidateQuery {
                     added to the dispatch queue"
                 )
             };
-            if expected_msg_env.repr_hash() != msg_env_hash {
+            if *expected_msg_env.repr_hash() != msg_env_hash {
                 reject_query!(
                     "new deferred OutMsg with src_addr={src_addr:x}, lt={created_lt} msg envelope \
                     hash mismatch: {msg_env_hash:x} in OutMsg, {:x} in DispatchQueue",
@@ -4716,7 +4717,9 @@ impl ValidateQuery {
                         key
                     ),
                     Some(OutMsg::DequeueShort(deq)) => deq.msg_env_hash,
-                    Some(OutMsg::DequeueImmediate(deq)) => deq.out_message_cell().repr_hash(),
+                    Some(OutMsg::DequeueImmediate(deq)) => {
+                        deq.out_message_cell().repr_hash().clone()
+                    }
                     Some(deq) => reject_query!(
                         "{:?} msg_export_deq OutMsg record for already \
                         processed EnqueuedMsg with key {:x} of old outbound queue",
@@ -5359,7 +5362,7 @@ impl ValidateQuery {
         }
         // check that the original account state has correct hash
         let state_update = trans.read_state_update()?;
-        let old_hash = account_root.repr_hash();
+        let old_hash = account_root.repr_hash().clone();
         if state_update.old_hash != old_hash {
             reject_query!(
                 "transaction {} of account {:x} claims that the original \
@@ -5518,7 +5521,7 @@ impl ValidateQuery {
                     account.del_storage_stat();
                 }
                 *account_root = account.serialize()?;
-                let new_hash = account_root.repr_hash();
+                let new_hash = account_root.repr_hash().clone();
                 if state_update.new_hash != new_hash {
                     error = Some(error!(
                         "transaction {} of {:x} is invalid: it claims that the new \
@@ -5990,7 +5993,7 @@ impl ValidateQuery {
     ) -> Result<bool> {
         let new = match new {
             Some(new) => {
-                if new.lib().repr_hash() != key {
+                if *new.lib().repr_hash() != key {
                     reject_query!(
                         "LibDescr with key {:x} in the libraries dictionary of the new state \
                         contains a library with different root hash {:x}",

@@ -497,12 +497,6 @@ pub trait HashmapType {
     fn iter(&self) -> HashmapIterator<Self> {
         HashmapIterator::from_hashmap(self)
     }
-    fn count_cells(&self, max: usize) -> Result<usize> {
-        match self.data() {
-            Some(root) => root.count_cells(max),
-            None => Ok(0),
-        }
-    }
     fn hashmap_get(&self, mut key: SliceData, gas_consumer: &mut dyn GasConsumer) -> Leaf {
         let mut bit_len = self.bit_len();
         Self::check_key_fail(bit_len, &key)?;

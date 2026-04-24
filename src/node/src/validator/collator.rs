@@ -4178,7 +4178,7 @@ impl Collator {
 
         log::debug!("{}: finalize_block: fill block candidate", self.collated_block_descr);
         let cell = new_block.serialize()?;
-        block_id.root_hash = cell.repr_hash();
+        block_id.root_hash = cell.repr_hash().clone();
         let mut data = Vec::new();
         // Block must be serialized the same way as in the cpp collator implementation
         // because all nodes expect this serialisation while receiving compressed blocks.
@@ -4240,13 +4240,15 @@ impl Collator {
         cell: &Cell,
         visited: &HashSet<UInt256>,
         visited_from_root: &mut HashSet<UInt256>,
-    ) {
-        if visited.contains(&cell.repr_hash()) {
-            visited_from_root.insert(cell.repr_hash());
-            for r in cell.clone_references() {
-                Self::_check_visited_integrity(&r, visited, visited_from_root);
+    ) -> Result<()> {
+        if visited.contains(cell.repr_hash()) {
+            visited_from_root.insert(cell.repr_hash().clone());
+            let refs = cell.clone_references()?;
+            for r in refs.iter() {
+                Self::_check_visited_integrity(r, visited, visited_from_root)?;
             }
         }
+        Ok(())
     }
 
     fn extract_new_config(account: &Account, config_addr: &AccountId) -> Result<ConfigParams> {

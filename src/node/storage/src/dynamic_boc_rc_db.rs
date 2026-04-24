@@ -11,12 +11,15 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
-    cell_db::CellDb, db::rocksdb::RocksDb, shardstate_db_async::CellsDbConfig, types::StoredCell,
+    cell_db::CellDb,
+    db::rocksdb::RocksDb,
+    shardstate_db_async::CellsDbConfig,
+    types::{serialize_stored_cell, STORED_CELL_MAX_RAW_LEN},
     StorageAlloc, TARGET,
 };
-use std::{io::Cursor, ops::Deref, path::Path, sync::Arc, time::Instant};
+use std::{io::Cursor, sync::Arc, time::Instant};
 use ton_block::{
-    error, fail, ByteOrderRead, Cell, CellData, CellsFactory, CellsTempStorage, Result, UInt256,
+    error, fail, ByteOrderRead, Cell, CellLoader, CellsFactory, CellsTempStorage, Result, UInt256,
     MAX_LEVEL, MAX_REFERENCES_COUNT,
 };
 
@@ -78,11 +81,11 @@ impl VisitedCell {
         self.parents_count().to_le_bytes()
     }
 
-    fn serialize_cell(&self) -> Result<Option<Vec<u8>>> {
+    fn serialize_cell(&self) -> Result<Option<smallvec::SmallVec<[u8; STORED_CELL_MAX_RAW_LEN]>>> {
         match self {
             VisitedCell::Updated { .. } => Ok(None),
             VisitedCell::New { cell, .. } => {
-                let data = StoredCell::serialize(cell.deref())?;
+                let data = serialize_stored_cell(cell)?;
                 Ok(Some(data))
             }
         }
@@ -107,7 +110,6 @@ impl DynamicBocDb {
         db: Arc<RocksDb>,
         cell_db_cf: &str,
         counters_cf_name: &str,
-        db_root_path: impl AsRef<Path>,
         config: &CellsDbConfig,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
@@ -115,7 +117,6 @@ impl DynamicBocDb {
         let cell_db = CellDb::with_db(
             db.clone(),
             cell_db_cf,
-            db_root_path.as_ref(),
             config,
             #[cfg(feature = "telemetry")]
             telemetry,
@@ -149,8 +150,8 @@ impl DynamicBocDb {
         CellDb::build_cf_options(config.counters_cache_size_bytes)
     }
 
-    pub(crate) fn load_cell(&self, cell_id: &UInt256, panic: bool) -> Result<Cell> {
-        self.cell_db.load_cell(cell_id, panic)
+    pub(crate) fn load_cell(&self, cell_id: &UInt256) -> Result<Cell> {
+        self.cell_db.load_cell(cell_id)
     }
 
     #[allow(dead_code)]
@@ -177,6 +178,12 @@ impl DynamicBocDb {
         root_cell: Cell,
         check_stop: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Cell> {
+        // Ensure stored_loader OnceLock is initialized before traversal.
+        // is_stored_cell() uses stored_loader.get() (without init) to compare loader pointers.
+        // Without this, is_stored_cell() always returns false when all cell loads are cache hits,
+        // causing save_cells_recursive to traverse the entire tree instead of stopping at stored cells.
+        let _ = self.cell_db().stored_loader();
+
         let root_id = root_cell.hash(MAX_LEVEL);
         log::debug!(target: TARGET, "DynamicBocDb::save_boc  {:x}", root_id);
 
@@ -243,7 +250,7 @@ impl DynamicBocDb {
             c.clone()
         } else {
             // only if the root cell was already saved (just updated counter) - we need to load it here
-            self.cell_db.load_cell(&root_id, true)?
+            self.cell_db.load_cell(&root_id)?
         };
 
         let updated = visited.len() - wrote_cells;
@@ -353,7 +360,7 @@ impl DynamicBocDb {
                 // if there is no counter with the key, then it will be just ignored
                 transaction.delete_cf(&counters_cf, id.as_slice());
                 // Remove from cell_cache so that save_boc won't treat this cell
-                // as still persisted in DB (is::<StoredCell> + cache hit).
+                // as still persisted in DB
                 self.cell_db.remove_from_cache(id);
                 deleted += 1;
             } else {
@@ -435,7 +442,7 @@ impl DynamicBocDb {
 
         let cell_id = cell.repr_hash();
 
-        if cell.is::<StoredCell>() && self.cell_db.is_in_cache(&cell_id) {
+        if self.cell_db().is_stored_cell(cell) && self.cell_db.is_in_cache(&cell_id) {
             return Ok((false, None));
         }
 
@@ -627,7 +634,7 @@ impl DynamicBocDb {
                     let cell = if let Some(c) = cell {
                         c
                     } else {
-                        match self.cell_db.load_cell(&cell_id, true) {
+                        match self.cell_db.load_cell(&cell_id) {
                             Ok(cell) => cell,
                             Err(e) => {
                                 log::warn!("DynamicBocDb::delete_cells_recursive  {:?}", e);
@@ -781,7 +788,7 @@ impl AsyncCellsStorageAdapter {
                             cache_.remove(&i);
                         }
                     }
-                    let rh = cell.repr_hash();
+                    let rh = cell.repr_hash().clone();
                     boc_db_clone.save_one_cell(cell, &mut visited, &rh, &mut cells_counters)?;
                     indexes.push(cell_index);
                 }
@@ -825,37 +832,17 @@ impl CellsTempStorage for AsyncCellsStorageAdapter {
             Ok(guard.val().clone())
         } else {
             let (hash, _) = self.load_hash_and_depth(index)?;
-            let cell = self.boc_db.cell_db.load_cell(&hash, false)?;
+            let cell = self.boc_db.cell_db.load_cell(&hash)?;
             self.cache.insert(index, cell.clone());
             Ok(cell)
         }
     }
 
-    fn store_simple_cell(
-        &mut self,
-        index: u32,
-        data: CellData,
-        refs: &[(UInt256, u16)],
-    ) -> Result<()> {
-        if index as usize >= self.index.len() {
-            fail!("AsyncCellsStorageAdapter::store_simple_cell index out of bounds: {}", index);
-        }
-        if data.level() != 0 {
-            fail!("AsyncCellsStorageAdapter::store_simple_cell supports only zero level cells");
-        }
-        self.index[index as usize] = (data.hash(0), data.depth(0));
-        let cell =
-            Cell::with_cell_impl(StoredCell::with_cell_data(data, refs, &self.boc_db.cell_db)?);
-        self.cache.insert(index, cell.clone());
-        self.sender.blocking_send((index, cell))?;
-        Ok(())
-    }
-
     fn store_cell(&mut self, index: u32, cell: &Cell) -> Result<()> {
         if index as usize >= self.index.len() {
-            fail!("AsyncCellsStorageAdapter::store_simple_cell index out of bounds: {}", index);
+            fail!("AsyncCellsStorageAdapter::store_cell index out of bounds: {}", index);
         }
-        self.index[index as usize] = (cell.repr_hash(), cell.repr_depth());
+        self.index[index as usize] = (cell.repr_hash().clone(), cell.repr_depth());
         self.cache.insert(index, cell.clone());
         self.sender.blocking_send((index, cell.clone()))?;
         Ok(())
@@ -865,5 +852,9 @@ impl CellsTempStorage for AsyncCellsStorageAdapter {
         self.index = vec![];
         // self.cache.clear();
         Ok(())
+    }
+
+    fn loader(&self) -> &CellLoader {
+        self.boc_db.cell_db().storing_loader()
     }
 }

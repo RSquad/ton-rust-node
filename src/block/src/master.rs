@@ -1467,20 +1467,20 @@ impl Deserializable for LibDescr {
                 s: std::any::type_name::<Self>().to_string()
             })
         }
-        self.lib.read_from(slice)?;
+        self.lib = slice.checked_drain_reference()?;
         self.publishers.read_hashmap_root(slice)?;
         Ok(())
     }
 }
 
 impl Serializable for LibDescr {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
         if self.publishers.is_empty() {
             fail!(BlockError::InvalidData("self.publishers is empty".to_string()))
         }
-        cell.append_bits(0, 2)?;
-        self.lib.write_to(cell)?;
-        self.publishers.write_hashmap_root(cell)?;
+        builder.append_bits(0, 2)?;
+        builder.checked_append_reference(self.lib().clone())?;
+        self.publishers.write_hashmap_root(builder)?;
         Ok(())
     }
 }

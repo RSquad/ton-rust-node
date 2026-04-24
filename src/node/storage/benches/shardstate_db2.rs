@@ -46,7 +46,6 @@ async fn main() -> Result<()> {
             "shardstate_db",
             "cells",
             "counters",
-            DB_PATH,
             CellsDbConfig::default(),
             #[cfg(feature = "telemetry")]
             Arc::new(StorageTelemetry::default()),

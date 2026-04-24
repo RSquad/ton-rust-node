@@ -413,7 +413,7 @@ pub fn gen_master_state(
         BlockIdExt::with_params(
             ShardIdent::masterchain(),
             0,
-            cell.repr_hash(),
+            cell.repr_hash().clone(),
             UInt256::calc_file_hash(&bytes),
         )
     });
@@ -478,7 +478,7 @@ pub fn gen_shard_state(
         let shard_state_id = BlockIdExt::with_params(
             ShardIdent::full(0),
             0,
-            cell.repr_hash(),
+            cell.repr_hash().clone(),
             UInt256::calc_file_hash(&bytes),
         );
         let shard_state = ShardStateStuff::deserialize_zerostate(
@@ -573,6 +573,7 @@ impl TestEngine {
                 false,
                 false,
                 false,
+                None,
                 &|| Ok(()),
                 None,
                 Arc::new(AtomicU8::new(0)),

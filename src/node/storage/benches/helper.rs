@@ -36,7 +36,7 @@ pub fn update_boc_(
     rng.fill(&mut data[..]);
     builder.append_raw(&data, bits)?;
 
-    for child in old_root.clone_references() {
+    for child in old_root.clone_references()? {
         if rng.gen_range(0..need_cells) < *new_cells {
             builder.checked_append_reference(child)?;
         } else {

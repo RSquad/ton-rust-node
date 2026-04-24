@@ -28,6 +28,7 @@ use std::{
 };
 
 #[derive(Clone, Default, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[repr(transparent)]
 pub struct UInt256([u8; 32]);
 
 impl UInt256 {
@@ -1478,8 +1479,9 @@ impl<X: Deserializable + Serializable> Deserializable for InRefValue<X> {
 }
 
 impl<X: Deserializable + Serializable> Serializable for InRefValue<X> {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.0.serialize()?.write_to(cell)
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        builder.checked_append_reference(self.0.serialize()?)?;
+        Ok(())
     }
 }
 
@@ -1592,8 +1594,8 @@ impl<T: Serializable + Deserializable> ChildCell<T> {
 
     pub fn hash(&self) -> UInt256 {
         match self.cell.as_ref() {
-            Some(cell) => cell.repr_hash(),
-            None => T::default().serialize().unwrap_or_default().repr_hash(),
+            Some(cell) => cell.repr_hash().clone(),
+            None => T::default().serialize().unwrap_or_default().repr_hash().clone(),
         }
     }
 
@@ -1618,11 +1620,11 @@ impl<T: Default + Serializable + Deserializable> PartialEq for ChildCell<T> {
 }
 
 impl<T: Serializable + Deserializable> Serializable for ChildCell<T> {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
         if let Some(child_cell) = &self.cell {
-            child_cell.write_to(cell)?;
+            builder.checked_append_reference(child_cell.clone())?;
         } else {
-            T::default().serialize()?.write_to(cell)?;
+            builder.checked_append_reference(T::default().serialize()?)?;
         }
         Ok(())
     }

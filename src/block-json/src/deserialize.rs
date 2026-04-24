@@ -1175,7 +1175,7 @@ pub fn parse_block_proof(map: &Map<String, Value>, block_file_hash: UInt256) -> 
             block_info.shard().shard_prefix_with_tag(),
         )?,
         block_info.seq_no(),
-        block_virt_root.repr_hash(),
+        block_virt_root.repr_hash().clone(),
         block_file_hash,
     );
 

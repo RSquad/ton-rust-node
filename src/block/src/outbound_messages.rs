@@ -761,8 +761,8 @@ impl OutMsg {
     ///
     pub fn read_message_hash(&self) -> Result<UInt256> {
         let hash = match self {
-            OutMsg::External(x) => x.message_cell().repr_hash(),
-            OutMsg::Immediate(x) => x.read_out_message()?.message_cell().repr_hash(),
+            OutMsg::External(x) => x.message_cell().repr_hash().clone(),
+            OutMsg::Immediate(x) => x.read_out_message()?.message_cell().repr_hash().clone(),
             OutMsg::New(x) => x.read_out_message()?.message_hash(),
             OutMsg::Transit(x) => x.read_out_message()?.message_hash(),
             OutMsg::Dequeue(x) => x.read_out_message()?.message_hash(),
@@ -802,15 +802,15 @@ impl OutMsg {
     pub fn envelope_message_hash(&self) -> Option<UInt256> {
         match self {
             OutMsg::External(_) => None,
-            OutMsg::Immediate(x) => Some(x.out_message_cell().repr_hash()),
-            OutMsg::New(x) => Some(x.out_message_cell().repr_hash()),
-            OutMsg::Transit(x) => Some(x.out_message_cell().repr_hash()),
-            OutMsg::Dequeue(x) => Some(x.out_message_cell().repr_hash()),
+            OutMsg::Immediate(x) => Some(x.out_message_cell().repr_hash().clone()),
+            OutMsg::New(x) => Some(x.out_message_cell().repr_hash().clone()),
+            OutMsg::Transit(x) => Some(x.out_message_cell().repr_hash().clone()),
+            OutMsg::Dequeue(x) => Some(x.out_message_cell().repr_hash().clone()),
             OutMsg::DequeueShort(x) => Some(x.msg_env_hash.clone()),
-            OutMsg::DequeueImmediate(x) => Some(x.out_message_cell().repr_hash()),
-            OutMsg::TransitRequeued(x) => Some(x.out_message_cell().repr_hash()),
-            OutMsg::NewDefer(x) => Some(x.out_message_cell().repr_hash()),
-            OutMsg::DeferredTransit(x) => Some(x.out_message_cell().repr_hash()),
+            OutMsg::DequeueImmediate(x) => Some(x.out_message_cell().repr_hash().clone()),
+            OutMsg::TransitRequeued(x) => Some(x.out_message_cell().repr_hash().clone()),
+            OutMsg::NewDefer(x) => Some(x.out_message_cell().repr_hash().clone()),
+            OutMsg::DeferredTransit(x) => Some(x.out_message_cell().repr_hash().clone()),
             OutMsg::None => None,
         }
     }

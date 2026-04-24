@@ -52,8 +52,8 @@ fn test_merkle_proof1() {
     let root = root.into_cell().unwrap();
 
     let mut proof_for = HashSet::new();
-    proof_for.insert(root.repr_hash());
-    proof_for.insert(root.reference(0).unwrap().repr_hash());
+    proof_for.insert(root.repr_hash().clone());
+    proof_for.insert(root.reference(0).unwrap().repr_hash().clone());
 
     let proof = MerkleProof::create(&root, |h| proof_for.contains(h)).unwrap();
 
@@ -102,7 +102,7 @@ fn test_merkle_proof_with_subtrees() {
     // proof for c6 only
 
     let proof =
-        MerkleProof::create(&tree, |h| h == &tree.repr_hash() || h == &c6.repr_hash()).unwrap();
+        MerkleProof::create(&tree, |h| h == tree.repr_hash() || h == c6.repr_hash()).unwrap();
 
     let virt_tree: Cell = proof.proof.virtualize(1);
     assert!(virt_tree.repr_hash() == tree.repr_hash());
@@ -135,8 +135,8 @@ fn test_merkle_proof_with_subtrees() {
 
     let proof = MerkleProof::create_with_subtrees(
         &tree,
-        |h| h == &tree.repr_hash() || h == &c6.repr_hash(),
-        |h| h == &c4.repr_hash(),
+        |h| h == tree.repr_hash() || h == c6.repr_hash(),
+        |h| h == c4.repr_hash(),
     )
     .unwrap();
 
@@ -430,7 +430,7 @@ fn get_in_msg_from_block(block: &Block) -> (Option<Message>, Option<UInt256>) {
             let msg1 = in_msg.read_message().unwrap();
             assert_eq!(key, msg1.hash().unwrap());
             msg = Some(msg1);
-            tr = in_msg.transaction_cell().map(|c| c.repr_hash());
+            tr = in_msg.transaction_cell().map(|c| c.repr_hash().clone());
             Ok(false)
         })
         .unwrap();
@@ -450,7 +450,7 @@ fn get_out_msg_from_block(block: &Block) -> (Option<Message>, Option<UInt256>) {
                 println!("{}", key);
                 println!("{}", msg1.hash().unwrap());
                 msg = Some(msg1);
-                tr = out_msg.transaction_cell().map(|c| c.repr_hash());
+                tr = out_msg.transaction_cell().map(|c| c.repr_hash().clone());
                 Ok(false)
             } else {
                 Ok(true)

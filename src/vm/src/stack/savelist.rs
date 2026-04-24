@@ -33,8 +33,7 @@ impl SaveList {
     }
     pub fn can_put(index: usize, value: &StackItem) -> bool {
         match index {
-            0 | 1 | 3 => value.as_continuation().is_ok(),
-            2 => value.as_continuation().is_ok() || value.is_null(),
+            0..=3 => value.as_continuation().is_ok(),
             4 | 5 => value.as_cell().is_ok(),
             7 => value.as_tuple().is_ok(),
             _ => false,
