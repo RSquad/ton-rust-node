@@ -190,7 +190,7 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
 
         println!("\n  {}", "Bindings:".cyan().bold());
         let rule_len =
-            4 + W_NODE + W_ENABLE + W_STATUS + W_STAKE + if has_static_adnl { W_ADNL } else { 0 };
+            W_NODE + W_ENABLE + W_STATUS + W_STAKE + if has_static_adnl { W_ADNL } else { 0 };
         if has_static_adnl {
             println!(
                 "    {}{}{}{}{}",
