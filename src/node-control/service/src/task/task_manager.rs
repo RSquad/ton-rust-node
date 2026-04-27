@@ -227,6 +227,7 @@ mod tests {
                 http: HttpConfig::default(),
                 master_wallet: None,
                 tick_interval: 30,
+                contracts_automation: Default::default(),
                 log: None,
             }),
         })

@@ -715,6 +715,114 @@ impl Default for LogConfig {
     }
 }
 
+// Defaults aligned with `service/src/contracts/contracts_task.rs` (contracts monitor).
+
+fn default_contracts_wallet_deploy_nanotons() -> u64 {
+    1_100_000_000
+}
+
+fn default_contracts_wallet_topup_nanotons() -> u64 {
+    10_000_000_000
+}
+
+fn default_contracts_wallet_balance_threshold_nanotons() -> u64 {
+    5_000_000_000
+}
+
+fn default_contracts_automation_tick_interval_sec() -> u64 {
+    default_tick_interval()
+}
+
+fn default_contracts_automation_enabled() -> bool {
+    true
+}
+
+/// Deploy value (nanotons) sent from the master wallet per pool kind when deploying a pool.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PoolDeployAmounts {
+    #[serde(default = "default_contracts_wallet_deploy_nanotons")]
+    pub single_nominator: u64,
+    #[serde(default = "default_contracts_wallet_deploy_nanotons")]
+    pub ton_core: u64,
+}
+
+impl Default for PoolDeployAmounts {
+    fn default() -> Self {
+        Self {
+            single_nominator: default_contracts_wallet_deploy_nanotons(),
+            ton_core: default_contracts_wallet_deploy_nanotons(),
+        }
+    }
+}
+
+/// Parameters for the contracts monitor (auto-deploy wallets/pools, auto-topup validator wallets).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ContractsAutomationConfig {
+    /// Poll interval for the contracts monitor in seconds.
+    #[serde(default = "default_contracts_automation_tick_interval_sec")]
+    pub tick_interval_sec: u64,
+    #[serde(default = "default_contracts_automation_enabled")]
+    pub auto_deploy: bool,
+    #[serde(default = "default_contracts_automation_enabled")]
+    pub auto_topup: bool,
+    #[serde(default = "default_contracts_wallet_deploy_nanotons")]
+    pub wallet_deploy_nanotons: u64,
+    #[serde(default)]
+    pub pool_deploy_nanotons: PoolDeployAmounts,
+    #[serde(default = "default_contracts_wallet_topup_nanotons")]
+    pub wallet_topup_nanotons: u64,
+    #[serde(default = "default_contracts_wallet_balance_threshold_nanotons")]
+    pub wallet_balance_threshold_nanotons: u64,
+}
+
+impl Default for ContractsAutomationConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval_sec: default_contracts_automation_tick_interval_sec(),
+            auto_deploy: default_contracts_automation_enabled(),
+            auto_topup: default_contracts_automation_enabled(),
+            wallet_deploy_nanotons: default_contracts_wallet_deploy_nanotons(),
+            pool_deploy_nanotons: PoolDeployAmounts::default(),
+            wallet_topup_nanotons: default_contracts_wallet_topup_nanotons(),
+            wallet_balance_threshold_nanotons: default_contracts_wallet_balance_threshold_nanotons(
+            ),
+        }
+    }
+}
+
+impl ContractsAutomationConfig {
+    /// Validates contracts automation settings (amounts, tick interval).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MIN_TICK_SEC: u64 = 1;
+        const MAX_TICK_SEC: u64 = 24 * 60 * 60;
+
+        if !(MIN_TICK_SEC..=MAX_TICK_SEC).contains(&self.tick_interval_sec) {
+            anyhow::bail!(
+                "contracts_automation.tick_interval_sec must be in range [{MIN_TICK_SEC}, {MAX_TICK_SEC}], got {}",
+                self.tick_interval_sec
+            );
+        }
+        if self.wallet_deploy_nanotons == 0 {
+            anyhow::bail!("contracts_automation.wallet_deploy_nanotons must be > 0");
+        }
+        if self.pool_deploy_nanotons.single_nominator == 0 {
+            anyhow::bail!("contracts_automation.pool_deploy_nanotons.single_nominator must be > 0");
+        }
+        if self.pool_deploy_nanotons.ton_core == 0 {
+            anyhow::bail!("contracts_automation.pool_deploy_nanotons.ton_core must be > 0");
+        }
+        if self.wallet_topup_nanotons == 0 {
+            anyhow::bail!("contracts_automation.wallet_topup_nanotons must be > 0");
+        }
+        if self.wallet_balance_threshold_nanotons == 0 {
+            anyhow::bail!("contracts_automation.wallet_balance_threshold_nanotons must be > 0");
+        }
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct AppConfig {
     pub nodes: HashMap<String, AdnlConfig>,
@@ -734,6 +842,8 @@ pub struct AppConfig {
     /// Default interval for all tasks in seconds
     #[serde(default = "default_tick_interval")]
     pub tick_interval: u64,
+    #[serde(default)]
+    pub contracts_automation: ContractsAutomationConfig,
     pub log: Option<LogConfig>,
 }
 
@@ -778,6 +888,7 @@ impl AppConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.elections.as_ref().map(|e| e.validate(None)).transpose()?;
+        self.contracts_automation.validate()?;
         Ok(())
     }
 }
@@ -1197,5 +1308,29 @@ mod tests {
         let parsed: TonHttpApiConfig = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.endpoints(), vec!["http://a/", "http://b/"]);
         assert_eq!(parsed.resolved_endpoints()[1].1, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn contracts_automation_default_validate_ok() {
+        let c = ContractsAutomationConfig::default();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.tick_interval_sec, default_tick_interval());
+        assert!(c.auto_deploy && c.auto_topup);
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_zero_wallet_deploy() {
+        let mut c = ContractsAutomationConfig::default();
+        c.wallet_deploy_nanotons = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_tick_out_of_range() {
+        let mut c = ContractsAutomationConfig::default();
+        c.tick_interval_sec = 0;
+        assert!(c.validate().is_err());
+        c.tick_interval_sec = 24 * 60 * 60 + 1;
+        assert!(c.validate().is_err());
     }
 }

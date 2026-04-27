@@ -337,11 +337,11 @@ docker run -d \
 
 Once started, the service:
 
-1. **Serves the REST API** on `http.bind` (default `0.0.0.0:8080`). All subsequent configuration commands (nodes, wallets, pools, bindings, elections settings, logging, TON HTTP API) flow through this API. Protected endpoints require a JWT token — see [Step 8](#step-8-configure-rest-api-authentication).
+1. **Serves the REST API** on `http.bind` (default `0.0.0.0:8080`). All subsequent configuration commands (nodes, wallets, pools, bindings, elections settings, **contracts automation**, logging, TON HTTP API) flow through this API. Protected endpoints require a JWT token — see [Step 8](#step-8-configure-rest-api-authentication).
 
-2. **Auto-deploys contracts** — automatically deploys validator wallets and nominator pools that are configured but not yet deployed on-chain. Deployment is funded from the master wallet.
+2. **Auto-deploys contracts** — automatically deploys validator wallets and nominator pools that are configured but not yet deployed on-chain. Deployment is funded from the master wallet. **Amounts, separate SNP/TONCore pool values, the monitor tick interval, and on/off toggles** are configured under `contracts_automation` in the service config, or at runtime with `GET`/`POST /v1/contracts-automation/settings` and `nodectl config contracts-automation` — see **[Contracts automation](./contracts-automation.md)**.
 
-3. **Auto-funds wallets** — periodically checks validator wallet balances and sends **10 TON** from the master wallet when a wallet balance drops below **5 TON**.
+3. **Auto-funds wallets** — periodically checks validator wallet balances and tops them up from the master when the balance is below a configurable **threshold** (default **5 TON**; top-up amount default **10 TON**), unless **auto-topup** is turned off. Same link as above for changing defaults.
 
 4. **Runs the elections task** — participates in validator elections according to the configured stake policy for every enabled binding (see [Step 16](#step-16-enable-elections)).
 

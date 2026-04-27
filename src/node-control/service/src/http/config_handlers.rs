@@ -12,7 +12,7 @@ use adnl::common::Timeouts;
 use common::{
     TonWalletVersion,
     app_config::{
-        AdnlConfig, BindingStatus, DEFAULT_TONCORE_MAX_NOMINATORS,
+        AdnlConfig, BindingStatus, ContractsAutomationConfig, DEFAULT_TONCORE_MAX_NOMINATORS,
         DEFAULT_TONCORE_MIN_NOMINATOR_STAKE, DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, ElectionsConfig,
         EndpointEntry, KeyConfig, LogConfig, LogOutput, LogRotation, NodeBinding, PoolConfig,
         StakePolicy, TimeoutVariant, TonCoreInitParams, TonCorePoolConfig, WalletConfig,
@@ -186,6 +186,55 @@ pub struct ElectionsSettingsDto {
 pub struct ElectionsSettingsResponse {
     pub ok: bool,
     pub result: ElectionsSettingsDto,
+}
+
+// --- Contracts automation (auto-deploy / auto-topup) ---
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ContractsAutomationSettingsResponse {
+    pub ok: bool,
+    pub result: ContractsAutomationConfig,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PoolDeployAmountsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub single_nominator: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ton_core: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ContractsAutomationSettingsUpdateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_interval_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_deploy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_topup: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_deploy_nanotons: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_deploy_nanotons: Option<PoolDeployAmountsPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_topup_nanotons: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_balance_threshold_nanotons: Option<u64>,
+}
+
+impl ContractsAutomationSettingsUpdateRequest {
+    fn any_field_set(&self) -> bool {
+        self.tick_interval_sec.is_some()
+            || self.auto_deploy.is_some()
+            || self.auto_topup.is_some()
+            || self.wallet_deploy_nanotons.is_some()
+            || self.wallet_topup_nanotons.is_some()
+            || self.wallet_balance_threshold_nanotons.is_some()
+            || self
+                .pool_deploy_nanotons
+                .as_ref()
+                .is_some_and(|p| p.single_nominator.is_some() || p.ton_core.is_some())
+    }
 }
 
 // --- Log ---
@@ -820,6 +869,101 @@ fn build_binding_election_status(
         .collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/contracts-automation/settings",
+    responses(
+        (status = 200, description = "Contracts automation settings", body = ContractsAutomationSettingsResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_contracts_automation_settings_handler(
+    state: axum::extract::State<AppState>,
+) -> axum::Json<ContractsAutomationSettingsResponse> {
+    let config = state.runtime_cfg.get();
+    axum::Json(ContractsAutomationSettingsResponse {
+        ok: true,
+        result: config.contracts_automation.clone(),
+    })
+}
+
+fn merge_contracts_automation_update(
+    base: &ContractsAutomationConfig,
+    req: &ContractsAutomationSettingsUpdateRequest,
+) -> ContractsAutomationConfig {
+    let mut next = base.clone();
+    if let Some(v) = req.tick_interval_sec {
+        next.tick_interval_sec = v;
+    }
+    if let Some(v) = req.auto_deploy {
+        next.auto_deploy = v;
+    }
+    if let Some(v) = req.auto_topup {
+        next.auto_topup = v;
+    }
+    if let Some(v) = req.wallet_deploy_nanotons {
+        next.wallet_deploy_nanotons = v;
+    }
+    if let Some(v) = req.wallet_topup_nanotons {
+        next.wallet_topup_nanotons = v;
+    }
+    if let Some(v) = req.wallet_balance_threshold_nanotons {
+        next.wallet_balance_threshold_nanotons = v;
+    }
+    if let Some(ref patch) = req.pool_deploy_nanotons {
+        if let Some(v) = patch.single_nominator {
+            next.pool_deploy_nanotons.single_nominator = v;
+        }
+        if let Some(v) = patch.ton_core {
+            next.pool_deploy_nanotons.ton_core = v;
+        }
+    }
+    next
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/contracts-automation/settings",
+    request_body = ContractsAutomationSettingsUpdateRequest,
+    responses(
+        (status = 200, description = "Contracts automation settings updated", body = ContractsAutomationSettingsResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_contracts_automation_settings_update_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<ContractsAutomationSettingsUpdateRequest>,
+) -> Result<axum::Json<ContractsAutomationSettingsResponse>, AppError> {
+    let req = req.0;
+    if !req.any_field_set() {
+        return Err(AppError::bad_request("at least one setting is required"));
+    }
+
+    let cfg = state.runtime_cfg.get();
+    let next = merge_contracts_automation_update(&cfg.contracts_automation, &req);
+    next.validate().map_err(|e| AppError::bad_request(e.to_string()))?;
+    drop(cfg);
+
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            cfg.contracts_automation = next;
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    state.config_changed.notify_one();
+
+    let config = state.runtime_cfg.get();
+    Ok(axum::Json(ContractsAutomationSettingsResponse {
+        ok: true,
+        result: config.contracts_automation.clone(),
+    }))
 }
 
 #[utoipa::path(

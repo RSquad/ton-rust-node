@@ -9,6 +9,7 @@
 pub(crate) mod auth_cmd;
 pub(crate) mod config_bind_cmd;
 pub(crate) mod config_cmd;
+pub(crate) mod config_contracts_automation_cmd;
 pub(crate) mod config_elections_cmd;
 pub(crate) mod config_log_cmd;
 pub(crate) mod config_node_cmd;
