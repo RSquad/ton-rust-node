@@ -4,7 +4,7 @@ One-button bootstrap for local singlehost TON network + nodectl service.
 
 Supports multiple pool topologies via the SCENARIO env var:
   - "default"      — 5 SNP + 1 TONCore (NODE_CNT=6, CORE_COUNT=1)
-  - "snp-toncore"  — 2 SNP + 5 TONCore, split50, election observation (NODE_CNT=7, CORE_COUNT=5)
+  - "snp-toncore"  — 2 SNP + 3 TONCore, split50, election observation (NODE_CNT=5, CORE_COUNT=3)
 
 Individual env vars (NODE_CNT, CORE_COUNT, OBSERVE_ROUNDS, STAKE_POLICY, etc.)
 override scenario defaults.
@@ -69,7 +69,8 @@ from typing import Optional
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ELECTOR_ADDR    = "-1:3333333333333333333333333333333333333333333333333333333333333333"
-WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2", "V4R2"]
+# One entry per node index (node1..); default scenario uses up to 6 nodes, snp-toncore up to 5.
+WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2"]
 
 _STRIP_ANSI_CSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -89,8 +90,8 @@ SCENARIOS: dict[str, dict] = {
         "toncore_validator_deposit_ton": 100_100,
     },
     "snp-toncore": {
-        "node_cnt": 7,
-        "core_count": 5,
+        "node_cnt": 5,
+        "core_count": 3,
         "observe_rounds": 4,
         "observe_interval_sec": 20,
         "stake_policy": "split50",
@@ -525,11 +526,12 @@ class Bootstrap:
             return ""
 
     def _bun_topup(self, address: str, amount: str) -> None:
-        timeout_raw = os.environ.get("BUN_TOPUP_TIMEOUT_SECONDS", "120")
+        # Must be >= scripts/topup.ts balance wait (default TOPUP_BALANCE_WAIT_MS 300s) + margin.
+        timeout_raw = os.environ.get("BUN_TOPUP_TIMEOUT_SECONDS", "400")
         try:
             timeout = int(timeout_raw)
         except ValueError:
-            timeout = 120
+            timeout = 400
         subprocess.run(["bun", "run", "topup", address, amount],
                        cwd=self.paths.load_net_dir, check=True,
                        stdin=subprocess.DEVNULL, timeout=timeout)
