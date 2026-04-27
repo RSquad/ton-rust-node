@@ -69,7 +69,6 @@ from typing import Optional
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 ELECTOR_ADDR    = "-1:3333333333333333333333333333333333333333333333333333333333333333"
-# One entry per node index (node1..); default scenario uses up to 6 nodes, snp-toncore up to 5.
 WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2"]
 
 _STRIP_ANSI_CSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -526,7 +525,7 @@ class Bootstrap:
             return ""
 
     def _bun_topup(self, address: str, amount: str) -> None:
-        # Must be >= scripts/topup.ts balance wait (default TOPUP_BALANCE_WAIT_MS 300s) + margin.
+        # Keep subprocess timeout above topup.ts post-send balance poll (60s hardcoded) + margin.
         timeout_raw = os.environ.get("BUN_TOPUP_TIMEOUT_SECONDS", "400")
         try:
             timeout = int(timeout_raw)

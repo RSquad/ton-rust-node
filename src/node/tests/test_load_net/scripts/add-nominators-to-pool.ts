@@ -4,9 +4,6 @@
  * Pool FunC (`pool.fc`): nominator deposit uses **`op == 0`**, **`action == 100`** ('d'), value in message.
  * **`throw_unless(61, sender_wc == 0)`** — nominators must use **basechain (workchain 0)** wallets, not masterchain.
  *
- * CI / throughput: deploy+fund uses a **Highload Wallet v3** on masterchain (same key material as `MASTER_WALLET_KEY`)
- * in **one** `sendBatch` external carrying all deploy+fund `internal` messages; stake messages are then sent **in parallel**
- * from each nominator contract (each signs as its own V3R2). Large `count` / HTTP limits may return 500 — then raise gas / reduce N or use master-only path manually.
  *
  * Usage:
  *   bun scripts/add-nominators-to-pool.ts <pool_address> [amount_ton] [count]
@@ -25,8 +22,6 @@
  *   NOMINATOR_FUND_EXTRA_TON (default 0.15)
  *   POOL_INFO_DELAY_MS — wait before get_pool_data dump (default 5000)
  *   TONCORE_POOL_INFO_EXTRA — comma-separated extra pool addresses to print after (same API)
- *
- * Highload: each run starts `HighloadWalletV3.newSequence()`; reusing the same on-chain highload contract must match the next query id (see logged line after `sendBatch`).
  */
 import { TonClient } from "@ton/ton";
 import { Address, beginCell, fromNano, internal, SendMode, toNano } from "@ton/core";
@@ -49,12 +44,8 @@ const DEFAULT_POOL_INFO_DELAY_MS = 5000;
 
 /** Highload wallet timeout (seconds). */
 const HIGHLOAD_TIMEOUT_SEC = 60 * 60 * 24;
-/** After master→highload deploy/topup: poll until active and funded. */
-const HIGHLOAD_DEPLOY_FUND_WAIT_MS = 600_000;
-/** After highload `sendBatch`: wait until nominator wallets answer `seqno`. */
-const NOMINATOR_HL_DEPLOY_WAIT_MS = 600_000;
-/** Final poll until every nominator wallet is active. */
-const NOMINATOR_DEPLOY_WAIT_MS = 600_000;
+/** Max wait for master→highload fund poll and nominator `seqno` readiness (slow RPC / singlehost). */
+const SCRIPT_CHAIN_POLL_MAX_MS = 600_000;
 
 /** pool.fc: `op == 0`, `action == 100` ('d') */
 const TONCORE_ACTION_NOMINATOR_DEPOSIT = 100;
@@ -277,7 +268,7 @@ async function run() {
                 messages: [
                     internal({
                         to: highloadWallet.address,
-                        value: highloadTopup,
+                        value: highloadTopup + toNano("1"), // 1 TON for fees
                         bounce: false,
                         init: hlDeployed ? undefined : highloadWallet.init,
                     }),
@@ -299,7 +290,7 @@ async function run() {
                 const b = await client.getBalance(highloadWallet.address);
                 return b >= highloadFundedMinBalance;
             },
-            HIGHLOAD_DEPLOY_FUND_WAIT_MS,
+            SCRIPT_CHAIN_POLL_MAX_MS,
             2000,
         );
     }
@@ -317,25 +308,16 @@ async function run() {
         throw new Error(e instanceof Error ? e.message : String(e));
     }
     highloadWallet.sequence.next();
-    try {
-        await waitUntilAllWalletsSeqnoReady(client, nominatorWallets, "hl-deploy", NOMINATOR_HL_DEPLOY_WAIT_MS);
-    } catch (err) {
-        const hlB = await client.getBalance(highloadWallet.address).catch(() => 0n);
-        console.log(
-            `  ${err instanceof Error ? err.message : String(err)} · highload ${fromNano(hlB)} TON — not all nominators answered seqno after sendBatch within timeout; continuing (check RPC / balances / count).`,
-        );
-    }
-
     console.log(
         `  Next highload query id (local sequence after sendBatch; reuse same on-chain highload only with matching query id): ${highloadWallet.sequence.current()}`,
     );
     await new Promise((r) => setTimeout(r, 3000));
 
     console.log(
-        `  Waiting for all nominator wallets to become active (poll, max ${NOMINATOR_DEPLOY_WAIT_MS / 1000}s)…`,
+        `  Waiting for all nominator wallets to become active (poll, max ${SCRIPT_CHAIN_POLL_MAX_MS / 1000}s)…`,
     );
     try {
-        await waitUntilAllWalletsSeqnoReady(client, nominatorWallets, "deploy-wait", NOMINATOR_DEPLOY_WAIT_MS, {
+        await waitUntilAllWalletsSeqnoReady(client, nominatorWallets, "deploy-wait", SCRIPT_CHAIN_POLL_MAX_MS, {
             pollMs: 3000,
             logSuccess: false,
             onProgress: async (ready, total) => {
@@ -361,7 +343,7 @@ async function run() {
             ? `Highload balance ${fromNano(hlBal)} TON is low — top up the master and re-run (intended highload topup this run: ${fromNano(highloadTopup)} TON).`
             : `Highload still holds ${fromNano(hlBal)} TON — try lowering count if ton-http-api rejects large BOC (HTTP 500), or wait for the chain.`;
         throw new Error(
-            `Only ${ready}/${count} nominator wallets became active after ${NOMINATOR_DEPLOY_WAIT_MS} ms. ${hint} Stuck: ${stuck.join("; ")}`,
+            `Only ${ready}/${count} nominator wallets became active after ${SCRIPT_CHAIN_POLL_MAX_MS} ms. ${hint} Stuck: ${stuck.join("; ")}`,
         );
     }
     console.log(`  All ${count} nominator wallets active.`);
