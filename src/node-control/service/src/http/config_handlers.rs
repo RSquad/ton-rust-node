@@ -212,14 +212,14 @@ pub struct ContractsAutomationSettingsUpdateRequest {
     pub auto_deploy: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_topup: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wallet_deploy_nanotons: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pool_deploy_nanotons: Option<PoolDeployAmountsPatch>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wallet_topup_nanotons: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wallet_balance_threshold_nanotons: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "wallet_deploy_nanotons")]
+    pub wallet_deploy: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "pool_deploy_nanotons")]
+    pub pool_deploy: Option<PoolDeployAmountsPatch>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "wallet_topup_nanotons")]
+    pub wallet_topup: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "wallet_balance_threshold_nanotons")]
+    pub wallet_balance_threshold: Option<u64>,
 }
 
 impl ContractsAutomationSettingsUpdateRequest {
@@ -227,11 +227,11 @@ impl ContractsAutomationSettingsUpdateRequest {
         self.tick_interval_sec.is_some()
             || self.auto_deploy.is_some()
             || self.auto_topup.is_some()
-            || self.wallet_deploy_nanotons.is_some()
-            || self.wallet_topup_nanotons.is_some()
-            || self.wallet_balance_threshold_nanotons.is_some()
+            || self.wallet_deploy.is_some()
+            || self.wallet_topup.is_some()
+            || self.wallet_balance_threshold.is_some()
             || self
-                .pool_deploy_nanotons
+                .pool_deploy
                 .as_ref()
                 .is_some_and(|p| p.single_nominator.is_some() || p.ton_core.is_some())
     }
@@ -904,21 +904,21 @@ fn merge_contracts_automation_update(
     if let Some(v) = req.auto_topup {
         next.auto_topup = v;
     }
-    if let Some(v) = req.wallet_deploy_nanotons {
-        next.wallet_deploy_nanotons = v;
+    if let Some(v) = req.wallet_deploy {
+        next.wallet_deploy = v;
     }
-    if let Some(v) = req.wallet_topup_nanotons {
-        next.wallet_topup_nanotons = v;
+    if let Some(v) = req.wallet_topup {
+        next.wallet_topup = v;
     }
-    if let Some(v) = req.wallet_balance_threshold_nanotons {
-        next.wallet_balance_threshold_nanotons = v;
+    if let Some(v) = req.wallet_balance_threshold {
+        next.wallet_balance_threshold = v;
     }
-    if let Some(ref patch) = req.pool_deploy_nanotons {
+    if let Some(ref patch) = req.pool_deploy {
         if let Some(v) = patch.single_nominator {
-            next.pool_deploy_nanotons.single_nominator = v;
+            next.pool_deploy.single_nominator = v;
         }
         if let Some(v) = patch.ton_core {
-            next.pool_deploy_nanotons.ton_core = v;
+            next.pool_deploy.ton_core = v;
         }
     }
     next

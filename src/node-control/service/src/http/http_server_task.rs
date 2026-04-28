@@ -1245,6 +1245,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contracts_automation_settings_post_merges_wallet_deploy_and_toggles() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/contracts-automation/settings",
+                &serde_json::json!({
+                    "wallet_deploy": 2_000_000_000u64,
+                    "auto_deploy": false,
+                    "auto_topup": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["wallet_deploy"], 2_000_000_000);
+        assert_eq!(v["result"]["auto_deploy"], false);
+        assert_eq!(v["result"]["auto_topup"], false);
+
+        let cfg = runtime_cfg.get();
+        assert_eq!(cfg.contracts_automation.wallet_deploy, 2_000_000_000);
+        assert!(!cfg.contracts_automation.auto_deploy);
+        assert!(!cfg.contracts_automation.auto_topup);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_partial_pool_deploy_preserves_snp() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let snp_before = runtime_cfg.get().contracts_automation.pool_deploy.single_nominator;
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/contracts-automation/settings",
+                &serde_json::json!({
+                    "pool_deploy": { "ton_core": 3_000_000_000u64 },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["pool_deploy"]["single_nominator"], snp_before);
+        assert_eq!(v["result"]["pool_deploy"]["ton_core"].as_u64().unwrap(), 3_000_000_000u64);
+
+        let cfg = runtime_cfg.get();
+        assert_eq!(cfg.contracts_automation.pool_deploy.single_nominator, snp_before);
+        assert_eq!(cfg.contracts_automation.pool_deploy.ton_core, 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_accepts_legacy_wallet_topup_alias() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/contracts-automation/settings",
+                &serde_json::json!({ "wallet_topup_nanotons": 9_500_000_000u64 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["wallet_topup"].as_u64().unwrap(), 9_500_000_000u64);
+
+        assert_eq!(runtime_cfg.get().contracts_automation.wallet_topup, 9_500_000_000);
+    }
+
+    #[tokio::test]
     async fn elections_task_disable_enable_restart_toggles_status() {
         let store = Arc::new(SnapshotStore::new());
         let runtime_cfg =

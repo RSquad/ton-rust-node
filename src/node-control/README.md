@@ -568,8 +568,8 @@ Set one or more fields. Amounts are in **TON** (not nanotons). Requires a runnin
 nodectl config contracts-automation set --tick-interval-sec 60
 nodectl config contracts-automation set --wallet-deploy 1.1 --wallet-topup 10 --wallet-threshold 5
 nodectl config contracts-automation set --pool-deploy-snp 1.1 --pool-deploy-ton-core 2
-nodectl config contracts-automation set --disable-auto-deploy
-nodectl config contracts-automation set --enable-auto-topup
+nodectl config contracts-automation set --auto-deploy false
+nodectl config contracts-automation set --auto-topup true
 ```
 
 ---
@@ -1386,14 +1386,14 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
 
 #### `GET /v1/contracts-automation/settings`
 
-Returns the **contracts automation** block: `tick_interval_sec`, `auto_deploy`, `auto_topup`, `wallet_deploy_nanotons`, `pool_deploy_nanotons` (with `single_nominator` and `ton_core`), `wallet_topup_nanotons`, `wallet_balance_threshold_nanotons`. All monetary fields are in **nanotons**. See [Contracts automation](./docs/contracts-automation.md).
+Returns the **contracts automation** block: `tick_interval_sec`, `auto_deploy`, `auto_topup`, `wallet_deploy`, `pool_deploy` (with `single_nominator` and `ton_core`), `wallet_topup`, `wallet_balance_threshold`. All monetary fields are in **nanotons**. See [Contracts automation](./docs/contracts-automation.md).
 
 #### `POST /v1/contracts-automation/settings`
 
-**Operator only.** Partial update: include only keys to change (same names as in `result` of `GET`, plus nested `pool_deploy_nanotons` with any subset of `single_nominator` / `ton_core`). At least one field required. Invalid combinations are rejected with `400` (e.g. tick out of range, zero amounts). Example:
+**Operator only.** Partial update: include only keys to change (same names as in `result` of `GET`, plus nested `pool_deploy` with any subset of `single_nominator` / `ton_core`). Legacy `*_nanotons` keys are still accepted. At least one field required. Invalid combinations are rejected with `400` (e.g. tick out of range, zero amounts). Example:
 
 ```json
-{ "tick_interval_sec": 60, "auto_topup": false, "pool_deploy_nanotons": { "ton_core": 2000000000 } }
+{ "tick_interval_sec": 60, "auto_topup": false, "pool_deploy": { "ton_core": 2000000000 } }
 ```
 
 ---

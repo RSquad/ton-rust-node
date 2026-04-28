@@ -10,6 +10,7 @@ use crate::commands::nodectl::{
     output_format::OutputFormat,
     utils::{api_get, api_post, resolve_service_url},
 };
+use clap::builder::BoolishValueParser;
 use colored::Colorize;
 use common::{app_config::ContractsAutomationConfig, ton_utils::tons_f64_to_nanotons};
 
@@ -56,17 +57,21 @@ pub struct SetCmd {
     #[arg(long, help = "Minimum wallet balance in TON; below this, auto-topup sends wallet-topup")]
     wallet_threshold: Option<f64>,
 
-    #[arg(long = "enable-auto-deploy", conflicts_with = "disable_auto_deploy")]
-    enable_auto_deploy: bool,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        help = "Turn auto-deploy on or off (e.g. true, false, on, off)",
+        value_parser = BoolishValueParser::new()
+    )]
+    auto_deploy: Option<bool>,
 
-    #[arg(long = "disable-auto-deploy", conflicts_with = "enable_auto_deploy")]
-    disable_auto_deploy: bool,
-
-    #[arg(long = "enable-auto-topup", conflicts_with = "disable_auto_topup")]
-    enable_auto_topup: bool,
-
-    #[arg(long = "disable-auto-topup", conflicts_with = "enable_auto_topup")]
-    disable_auto_topup: bool,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        help = "Turn auto-topup on or off (e.g. true, false, on, off)",
+        value_parser = BoolishValueParser::new()
+    )]
+    auto_topup: Option<bool>,
 }
 
 impl ContractsAutomationCfgCmd {
@@ -131,23 +136,23 @@ fn print_table(cfg: &ContractsAutomationConfig) {
     println!(
         "  {:<28} {} TON",
         "Wallet deploy:".cyan().bold(),
-        nanotons_to_ton_display(cfg.wallet_deploy_nanotons)
+        nanotons_to_ton_display(cfg.wallet_deploy)
     );
     println!(
         "  {:<28} SNP {} TON, TONCore {} TON",
         "Pool deploy:".cyan().bold(),
-        nanotons_to_ton_display(cfg.pool_deploy_nanotons.single_nominator),
-        nanotons_to_ton_display(cfg.pool_deploy_nanotons.ton_core),
+        nanotons_to_ton_display(cfg.pool_deploy.single_nominator),
+        nanotons_to_ton_display(cfg.pool_deploy.ton_core),
     );
     println!(
         "  {:<28} {} TON",
         "Wallet top-up:".cyan().bold(),
-        nanotons_to_ton_display(cfg.wallet_topup_nanotons)
+        nanotons_to_ton_display(cfg.wallet_topup)
     );
     println!(
         "  {:<28} {} TON",
         "Wallet balance threshold:".cyan().bold(),
-        nanotons_to_ton_display(cfg.wallet_balance_threshold_nanotons)
+        nanotons_to_ton_display(cfg.wallet_balance_threshold)
     );
     println!();
 }
@@ -169,13 +174,13 @@ struct ContractsAutomationPatchBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_topup: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    wallet_deploy_nanotons: Option<u64>,
+    wallet_deploy: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pool_deploy_nanotons: Option<PoolDeployPatchBody>,
+    pool_deploy: Option<PoolDeployPatchBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    wallet_topup_nanotons: Option<u64>,
+    wallet_topup: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    wallet_balance_threshold_nanotons: Option<u64>,
+    wallet_balance_threshold: Option<u64>,
 }
 
 impl SetCmd {
@@ -190,28 +195,24 @@ impl SetCmd {
         if let Some(v) = self.tick_interval_sec {
             body.tick_interval_sec = Some(v);
         }
-        if self.enable_auto_deploy {
-            body.auto_deploy = Some(true);
-        } else if self.disable_auto_deploy {
-            body.auto_deploy = Some(false);
+        if let Some(v) = self.auto_deploy {
+            body.auto_deploy = Some(v);
         }
-        if self.enable_auto_topup {
-            body.auto_topup = Some(true);
-        } else if self.disable_auto_topup {
-            body.auto_topup = Some(false);
+        if let Some(v) = self.auto_topup {
+            body.auto_topup = Some(v);
         }
         if let Some(tons) = self.wallet_deploy {
-            body.wallet_deploy_nanotons = Some(tons_f64_to_nanotons(tons));
+            body.wallet_deploy = Some(tons_f64_to_nanotons(tons));
         }
         if let Some(tons) = self.wallet_topup {
-            body.wallet_topup_nanotons = Some(tons_f64_to_nanotons(tons));
+            body.wallet_topup = Some(tons_f64_to_nanotons(tons));
         }
         if let Some(tons) = self.wallet_threshold {
-            body.wallet_balance_threshold_nanotons = Some(tons_f64_to_nanotons(tons));
+            body.wallet_balance_threshold = Some(tons_f64_to_nanotons(tons));
         }
 
         if self.pool_deploy_snp.is_some() || self.pool_deploy_ton_core.is_some() {
-            body.pool_deploy_nanotons = Some(PoolDeployPatchBody {
+            body.pool_deploy = Some(PoolDeployPatchBody {
                 single_nominator: self.pool_deploy_snp.map(tons_f64_to_nanotons),
                 ton_core: self.pool_deploy_ton_core.map(tons_f64_to_nanotons),
             });
@@ -220,17 +221,16 @@ impl SetCmd {
         let any = body.tick_interval_sec.is_some()
             || body.auto_deploy.is_some()
             || body.auto_topup.is_some()
-            || body.wallet_deploy_nanotons.is_some()
-            || body.wallet_topup_nanotons.is_some()
-            || body.wallet_balance_threshold_nanotons.is_some()
-            || body.pool_deploy_nanotons.is_some();
+            || body.wallet_deploy.is_some()
+            || body.wallet_topup.is_some()
+            || body.wallet_balance_threshold.is_some()
+            || body.pool_deploy.is_some();
 
         if !any {
             anyhow::bail!(
                 "No settings to update. Pass at least one of: --tick-interval-sec, \
                  --wallet-deploy, --pool-deploy-snp, --pool-deploy-ton-core, --wallet-topup, \
-                 --wallet-threshold, --enable-auto-deploy / --disable-auto-deploy, \
-                 --enable-auto-topup / --disable-auto-topup"
+                 --wallet-threshold, --auto-deploy, --auto-topup"
             );
         }
 

@@ -10,7 +10,6 @@ use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{
     app_config::{AppConfig, ContractsAutomationConfig},
-    snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
 use contracts::{
@@ -22,6 +21,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::time::{self, MissedTickBehavior};
 use ton_block::{Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
 
@@ -36,14 +36,12 @@ pub(crate) async fn run(
     cancellation_ctx: CancellationCtx,
     _app_config: Arc<AppConfig>,
     runtime_cfg: Arc<dyn RuntimeConfig>,
-    store: Arc<SnapshotStore>,
 ) -> anyhow::Result<()> {
     let master_wallet = runtime_cfg.master_wallet();
     let pools = runtime_cfg.pools();
     let wallets = runtime_cfg.wallets();
     let rpc_client = runtime_cfg.rpc_client();
-    let monitor =
-        ContractsMonitor { master_wallet, pools, wallets, rpc_client, _store: store, runtime_cfg };
+    let monitor = ContractsMonitor { master_wallet, pools, wallets, rpc_client, runtime_cfg };
     monitor.run_loop(cancellation_ctx).await
 }
 
@@ -52,7 +50,6 @@ struct ContractsMonitor {
     pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     rpc_client: Arc<ClientJsonRpc>,
-    _store: Arc<SnapshotStore>,
     runtime_cfg: Arc<dyn RuntimeConfig>,
 }
 
@@ -63,18 +60,27 @@ impl ContractsMonitor {
 
     async fn run_loop(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         let mut cancel = cancellation_ctx.subscribe();
-        // First wait is zero so the first `run` matches `Interval::tick()` semantics.
-        let mut sleep_dur = Duration::from_secs(0);
+        let mut tick_secs = self.automation().tick_interval_sec.max(1);
+        let mut ticker = time::interval(Duration::from_secs(tick_secs));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(sleep_dur) => {
-                    sleep_dur =
-                        Duration::from_secs(self.automation().tick_interval_sec.max(1));
-                    tracing::info!(target: "contracts", "TICK");
+                _ = ticker.tick() => {
                     if let Err(e) = self.run().await {
                         tracing::error!(target: "contracts", "run error: {:#}", e);
                     }
-                    tracing::info!(target: "contracts", "SLEEP");
+
+                    let next_secs = self.automation().tick_interval_sec.max(1);
+                    if next_secs != tick_secs {
+                        tick_secs = next_secs;
+                        let period = Duration::from_secs(tick_secs);
+                        // `time::interval` fires its first tick immediately; after a period change,
+                        // schedule the next tick one full period from now to avoid two runs in a row.
+                        let start = time::Instant::now() + period;
+                        ticker = time::interval_at(start, period);
+                        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    }
                 }
                 _ = cancel.changed() => {
                     tracing::info!(target: "contracts", "cancel received");
@@ -150,7 +156,7 @@ impl ContractsMonitor {
             AccountState::Uninitialized => {}
         }
 
-        let min_balance = auto.wallet_deploy_nanotons;
+        let min_balance = auto.wallet_deploy;
         if balance < min_balance {
             return Err(Self::insufficient_master_balance_error(balance, min_balance));
         }
@@ -173,7 +179,7 @@ impl ContractsMonitor {
     /// Step 2: Deploy uninitialized wallets through the master wallet.
     ///
     /// The master wallet sends an internal message carrying the wallet's
-    /// state_init and configured `wallet_deploy_nanotons`, deploying and funding it in one go.
+    /// state_init and configured `wallet_deploy` (nanotons), deploying and funding it in one go.
     ///
     /// Returns `false` if master balance is insufficient (caller should sleep).
     async fn ensure_wallets_deployed(
@@ -239,7 +245,7 @@ impl ContractsMonitor {
             node_id, addr, balance as f64 / 1e9,
         );
 
-        let deploy_amount = auto.wallet_deploy_nanotons;
+        let deploy_amount = auto.wallet_deploy;
         let master_balance = self.master_wallet.balance().await.context("master wallet balance")?;
         if master_balance < deploy_amount + WALLET_GAS {
             return Err(Self::insufficient_master_balance_error(
@@ -329,8 +335,8 @@ impl ContractsMonitor {
         );
 
         let deploy_amount = match pool.pool_kind() {
-            PoolKind::SNP => auto.pool_deploy_nanotons.single_nominator,
-            PoolKind::TONCore => auto.pool_deploy_nanotons.ton_core,
+            PoolKind::SNP => auto.pool_deploy.single_nominator,
+            PoolKind::TONCore => auto.pool_deploy.ton_core,
         };
 
         let master_balance =
@@ -377,8 +383,8 @@ impl ContractsMonitor {
         if !auto.auto_topup {
             return Ok(true);
         }
-        let threshold = auto.wallet_balance_threshold_nanotons;
-        let topup_amount = auto.wallet_topup_nanotons;
+        let threshold = auto.wallet_balance_threshold;
+        let topup_amount = auto.wallet_topup;
         let mut all_topped_up = true;
         let mut processed_wallets = HashSet::new();
         for (node_id, wallet) in self.wallets.iter() {
@@ -532,10 +538,7 @@ mod tests {
     use super::ContractsMonitor;
     use crate::runtime_config::RuntimeConfig;
     use axum::{Json, Router, extract::State, routing::post};
-    use common::{
-        app_config::{AppConfig, ContractsAutomationConfig, HttpConfig, TonHttpApiConfig},
-        snapshot::SnapshotStore,
-    };
+    use common::app_config::{AppConfig, ContractsAutomationConfig, HttpConfig, TonHttpApiConfig};
     use contracts::{NominatorWrapper, SmartContract, TonWallet};
     use secrets_vault::vault::SecretVault;
     use std::{
@@ -768,7 +771,6 @@ mod tests {
             pools: Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),
             wallets,
             rpc_client,
-            _store: Arc::new(SnapshotStore::new()),
             runtime_cfg: Arc::new(CfgRuntime(test_app_config())) as Arc<dyn RuntimeConfig>,
         }
     }
