@@ -143,7 +143,11 @@ pub struct PoolRmCmd {
 pub struct PoolDepositValidatorCmd {
     #[arg(short = 'b', long = "binding", help = "Binding name (resolves wallet and pool)")]
     binding: String,
-    #[arg(short = 'a', long = "amount", help = "Amount in TON to deposit")]
+    #[arg(
+        short = 'a',
+        long = "amount",
+        help = "Validator stake to credit (TON); message adds 1 TON pool processing fee on-chain"
+    )]
     amount: f64,
     #[arg(
         long = "pool-even",
@@ -605,23 +609,32 @@ impl PoolDepositValidatorCmd {
             anyhow::bail!("Amount must be greater than 0");
         }
 
+        // Pool contract keeps DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS (1 TON) from the message value;
+        // send stake + fee so the credited validator_amount matches `--amount`.
+        let msg_value_nanotons = deposit_nanotons
+            .saturating_add(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS);
+
         let gas_reserve: u64 = 2_000_000_000;
-        if wallet_info_data.balance < deposit_nanotons.saturating_add(gas_reserve) {
+        if wallet_info_data.balance < msg_value_nanotons.saturating_add(gas_reserve) {
             anyhow::bail!(
-                "Insufficient wallet balance: {} TON (need {} TON + gas)",
+                "Insufficient wallet balance: {} TON (need {:.9} TON on-chain: {:.9} stake + {:.9} pool fee + gas reserve)",
                 nanotons_to_tons_f64(wallet_info_data.balance),
+                nanotons_to_tons_f64(msg_value_nanotons.saturating_add(gas_reserve)),
                 self.amount,
+                nanotons_to_tons_f64(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS),
             );
         }
 
         println!(
-            "\n{}\n  Binding: {}\n  Wallet:  {} ({})\n  Pool:    {}\n  Amount:  {:.9} TON\n",
+            "\n{}\n  Binding: {}\n  Wallet:  {} ({})\n  Pool:    {}\n  Credited to validator stake: {:.9} TON\n  Message value (stake + {:.9} TON pool fee): {:.9} TON\n",
             "Deposit validator summary:".cyan().bold(),
             self.binding,
             binding.wallet,
             wallet_address,
             pool_address,
             self.amount,
+            nanotons_to_tons_f64(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS),
+            nanotons_to_tons_f64(msg_value_nanotons),
         );
 
         if !self.yes && !confirm("Confirm deposit?")? {
@@ -635,7 +648,7 @@ impl PoolDepositValidatorCmd {
         let pool_addr_display = pool_address.to_string();
         let body = pool_messages::deposit_validator(0)?;
         let msg = wallet
-            .build_message(pool_address, deposit_nanotons, body, true, None, None, None)
+            .build_message(pool_address, msg_value_nanotons, body, true, None, None, None)
             .await?;
 
         let msg_boc = write_boc(&msg)?;
@@ -651,10 +664,12 @@ impl PoolDepositValidatorCmd {
         .await?;
 
         println!(
-            "{} Deposited {:.9} TON to pool {}",
+            "{} Credited {:.9} TON validator stake to pool {} (sent {:.9} TON including {:.9} TON pool fee)",
             "OK".green().bold(),
             self.amount,
-            pool_addr_display
+            pool_addr_display,
+            nanotons_to_tons_f64(msg_value_nanotons),
+            nanotons_to_tons_f64(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS),
         );
         Ok(())
     }

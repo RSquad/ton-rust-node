@@ -368,10 +368,12 @@ nodectl config pool rm --name pool0
 
 Deposit validator funds into a TONCore nominator pool. Builds and sends the on-chain deposit message through the binding's configured wallet.
 
+The pool contract charges a **fixed 1 TON processing fee** on each validator deposit (the credited `validator_amount` is the message value minus that fee). nodectl sends **`--amount` + 1 TON** on-chain so the stake credited to the validator matches **`--amount`**.
+
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--binding <NAME>` | `-b` | Binding name (resolves wallet and pool) |
-| `--amount <TON>` | `-a` | Amount in TON to deposit |
+| `--amount <TON>` | `-a` | Validator stake to credit (TON); the outbound message value adds the pool’s 1 TON fee |
 | `--pool-even` | | Use the pool for even validation rounds (default if neither flag is set) |
 | `--pool-odd` | | Use the pool for odd validation rounds |
 | `--yes` | | Skip the interactive confirmation prompt |
