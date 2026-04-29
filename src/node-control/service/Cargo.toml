@@ -11,7 +11,6 @@ async-trait = "0.1"
 common = { path = "../common", features = ["openapi"] }
 contracts = { path = "../contracts" }
 control-client = { path = "../control-client" }
-elections = { path = "../elections" }
 hex = "0.4.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -31,6 +30,7 @@ jsonwebtoken = "9"
 base64 = "0.22"
 
 [dev-dependencies]
+mockall = "0.13"
 argon2 = "0.5"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
