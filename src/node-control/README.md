@@ -305,7 +305,8 @@ nodectl config pool add --name pool0 --owner "-1:owner_address"
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--validator-share` | | Slot deploy: reward share in **basis points** (e.g. `1000` = 10%). Required when adding deploy params without an existing `--address`. |
+| `--validator-share` | | Slot deploy: reward share in **basis points** (`10000` = 100%; e.g. `5000` = 50%). Mutually exclusive with `--validator-share-percent`. |
+| `--validator-share-percent` | | Same as share above but as a **percent** (`0`–`100`, decimals allowed, e.g. `50.4` → 5040 bp). Easier than basis points for humans. |
 | `--max-nominators` | | Optional; default from contract defaults |
 | `--min-validator-stake` | | Optional; minimum validator stake in **TON** |
 | `--min-nominator-stake` | | Optional; minimum nominator stake in **TON** |
@@ -313,21 +314,22 @@ nodectl config pool add --name pool0 --owner "-1:owner_address"
 | `--even` | | Configure slot 0 (even rounds), required unless `--odd` is set |
 | `--odd` | | Configure slot 1 (odd rounds), required unless `--even` is set |
 
-At least one of `--address` or `--validator-share` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
+At least one of `--address`, `--validator-share`, or `--validator-share-percent` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
 
 ```bash
-# TONCore: configure slot 0 (even)
+# TONCore: configure slot 0 (even) — 50% validator share via basis points or percent
 nodectl config pool add core --name pool0 --validator-share 5000 --even
+nodectl config pool add core --name pool0 --validator-share-percent 50 --even
 
 # Configure both slots with explicit separate commands
 nodectl config pool add core \
   --name pool0 \
-  --validator-share 5000 \
+  --validator-share-percent 50 \
   --min-validator-stake 10000 \
   --even
 nodectl config pool add core \
   --name pool0 \
-  --validator-share 5000 \
+  --validator-share-percent 50.4 \
   --min-validator-stake 10001 \
   --odd
 
@@ -344,7 +346,7 @@ nodectl config pool add core \
 
 ##### `config pool ls`
 
-List all configured pools.
+List all configured pools. For **TONCore** slots, if the pool contract is not on-chain yet (or RPC cannot read it), the table shows **not deployed** (or **error** only for real failures) and fills **Share**, **Validator**, **Min nom. stake**, etc. from the **local slot config** when those values were set at `config pool add core` time.
 
 ```bash
 nodectl config pool ls

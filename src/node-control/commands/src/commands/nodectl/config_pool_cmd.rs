@@ -91,9 +91,17 @@ pub struct PoolAddCoreCmd {
 
     #[arg(
         long = "validator-share",
-        help = "Validator reward share in basis points (e.g. 1000 = 10%)"
+        conflicts_with = "validator_share_percent",
+        help = "Validator reward share in basis points (10000 = 100%; e.g. 5000 = 50%)"
     )]
     validator_share: Option<u16>,
+
+    #[arg(
+        long = "validator-share-percent",
+        conflicts_with = "validator_share",
+        help = "Validator reward share as percent of pool rewards (0–100, e.g. 50.4 for ~50.4%). Mutually exclusive with --validator-share"
+    )]
+    validator_share_percent: Option<f64>,
 
     #[arg(long = "max-nominators", help = "Max nominators (default: 40)")]
     max_nominators: Option<u16>,
@@ -277,6 +285,17 @@ struct PoolAddCoreBody<'a> {
     min_nominator_stake: Option<u64>,
 }
 
+fn validator_share_percent_to_bp(pct: f64) -> anyhow::Result<u16> {
+    if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+        anyhow::bail!("validator_share_percent must be a finite number in [0.0, 100.0] (got {pct})");
+    }
+    let bp = (pct * 100.0).round();
+    if !(0.0..=10_000.0).contains(&bp) {
+        anyhow::bail!("validator_share_percent rounds to an invalid basis-point value");
+    }
+    Ok(bp as u16)
+}
+
 impl PoolAddCoreCmd {
     pub async fn run(
         &self,
@@ -284,14 +303,35 @@ impl PoolAddCoreCmd {
         token: Option<&str>,
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
-        if self.address.is_none() && self.validator_share.is_none() {
-            anyhow::bail!("At least one of --address or --validator-share must be specified");
+        if self.address.is_none()
+            && self.validator_share.is_none()
+            && self.validator_share_percent.is_none()
+        {
+            anyhow::bail!(
+                "At least one of --address, --validator-share, or --validator-share-percent must be specified"
+            );
         }
 
-        if let Some(vs) = self.validator_share {
-            if !(0..=10_000).contains(&vs) {
-                anyhow::bail!("validator_share must be in 0..=10000 basis points (got {vs})");
+        let resolved_validator_share: Option<u16> = match (self.validator_share, self.validator_share_percent) {
+            (Some(bp), None) => {
+                if !(0..=10_000).contains(&bp) {
+                    anyhow::bail!("validator_share must be in 0..=10000 basis points (got {bp})");
+                }
+                Some(bp)
             }
+            (None, Some(pct)) => Some(validator_share_percent_to_bp(pct)?),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("clap conflicts validator_share with validator_share_percent"),
+        };
+
+        if resolved_validator_share.is_none()
+            && (self.max_nominators.is_some()
+                || self.min_validator_stake.is_some()
+                || self.min_nominator_stake.is_some())
+        {
+            anyhow::bail!(
+                "max_nominators / min_validator_stake / min_nominator_stake require a validator share (--validator-share or --validator-share-percent)"
+            );
         }
 
         let slot_name = if self.odd { "odd" } else { "even" };
@@ -306,7 +346,7 @@ impl PoolAddCoreCmd {
             name: &self.name,
             slot: slot_name,
             address: address.as_deref(),
-            validator_share: self.validator_share,
+            validator_share: resolved_validator_share,
             max_nominators: self.max_nominators,
             // CLI flags accept TON (f64) — convert to nanotons for the API.
             min_validator_stake: self.min_validator_stake.map(tons_f64_to_nanotons),
@@ -315,8 +355,9 @@ impl PoolAddCoreCmd {
         api_post(&base_url, "/v1/pools/core", token, &body).await?;
 
         let mut info_parts = Vec::new();
-        if let Some(vs) = self.validator_share {
-            info_parts.push(format!("validator_share={vs} bp"));
+        if let Some(vs) = resolved_validator_share {
+            let pct = vs as f64 / 100.0;
+            info_parts.push(format!("validator_share={vs} bp (~{pct:.2}%)"));
         }
         if let Some(a) = &address {
             info_parts.push(format!("address='{a}'"));
@@ -351,7 +392,8 @@ struct TonCorePoolSlotView {
     slot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     address: Option<String>,
-    /// Account state: "active", "uninit", "frozen", "not deployed", or "error".
+    /// Account / deployment state from API (`not deployed`, `active`, `error`, …).
+    #[serde(default)]
     state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     balance: Option<u64>,
@@ -483,7 +525,7 @@ fn print_toncore_table(views: &[&PoolView]) {
         }
         for s in slots {
             let display_addr = display_ton_address(s.address.as_deref());
-            let display_state = display_state(&s.pool_state.unwrap_or(-1));
+            let display_state = display_toncore_slot_row(s);
             let display_balance =
                 s.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
             let noms = match (s.nominators_count, s.max_nominators) {
@@ -522,13 +564,29 @@ fn print_toncore_table(views: &[&PoolView]) {
     println!();
 }
 
-fn display_state(state: &i32) -> ColoredString {
+/// Contract-internal pool state from `get_pool_data` (idle / staking / …).
+fn display_toncore_contract_state(state: i32) -> ColoredString {
     match state {
         -1 => "error".red(),
         0 => "idle".cyan(),
         1 => "staking".green(),
         2 => "staking".green(),
         _ => "unknown".red(),
+    }
+}
+
+/// Row "State" for TONCore table: prefer on-chain pool lifecycle when present; otherwise account /
+/// deployment state (so undeployed slots do not look like `error` just because `pool_state` is absent).
+fn display_toncore_slot_row(s: &TonCorePoolSlotView) -> ColoredString {
+    if let Some(ps) = s.pool_state {
+        return display_toncore_contract_state(ps);
+    }
+    match s.state.as_str() {
+        "not deployed" | "uninit" => "not deployed".yellow(),
+        "error" => "error".red(),
+        "active" => "active".green(),
+        "frozen" => "frozen".yellow(),
+        other => other.dimmed(),
     }
 }
 

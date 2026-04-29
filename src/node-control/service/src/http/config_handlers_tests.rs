@@ -170,7 +170,8 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed() {
     assert_eq!(slots[0]["state"], "not deployed");
     assert!(slots[0].get("address").is_none());
     assert!(slots[0].get("balance").is_none());
-    assert!(slots[0].get("validator_share").is_none());
+    assert_eq!(slots[0]["validator_share"], 4000);
+    assert_eq!(slots[0]["max_nominators"], 40);
 }
 
 #[tokio::test]
@@ -187,7 +188,12 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
                         "-1:0000000000000000000000000000000000000000000000000000000000000001"
                             .into(),
                     ),
-                    params: None,
+                    params: Some(TonCoreInitParams {
+                        validator_share: 4000,
+                        max_nominators: 40,
+                        min_validator_stake: 10_000_000_000_000,
+                        min_nominator_stake: 10_000_000_000_000,
+                    }),
                 }),
                 Some(TonCorePoolConfig {
                     address: Some(
@@ -215,6 +221,8 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
         assert!(slot.get("balance").is_none());
         assert!(slot["address"].is_string());
     }
+    // Even slot had deploy params in config — still exposed when RPC is down.
+    assert_eq!(slots[0]["validator_share"], 4000);
 }
 
 // ---------------------------------------------------------------------------
