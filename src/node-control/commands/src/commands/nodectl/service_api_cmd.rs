@@ -360,6 +360,10 @@ struct ElectionsSettingsRequest {
     tick_interval: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_factor: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sleep_period_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_period_pct: Option<f64>,
 }
 
 impl StakePolicyCmd {

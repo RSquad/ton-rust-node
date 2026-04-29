@@ -546,7 +546,7 @@ nodectl config log set --level warn --max-size-mb 100 --max-files 5
 
 #### `config elections`
 
-Manage elections configuration, including stake policies, tick intervals, and per-binding election participation.
+Manage elections configuration, including stake policies, tick intervals, AdaptiveSplit50 timing fractions, and per-binding election participation.
 
 ##### `config elections show`
 
@@ -613,6 +613,30 @@ Set the maximum stake factor for elections. The value must be between **1.0** an
 
 ```bash
 nodectl config elections max-factor 2.5
+```
+
+##### `config elections adaptive-sleep-period-pct`
+
+Set **AdaptiveSplit50** minimum wait as a fraction of election duration. Stored in config as `sleep_period_pct`. Value must be in **[0.0, 1.0]** and must not exceed the current `waiting_period_pct` (raise the waiting fraction first if needed).
+
+| Argument | Description |
+|----------|-------------|
+| `<VALUE>` | Fraction in `[0.0, 1.0]` |
+
+```bash
+nodectl config elections adaptive-sleep-period-pct 0.15
+```
+
+##### `config elections adaptive-waiting-period-pct`
+
+Set **AdaptiveSplit50** maximum wait for enough participants as a fraction of election duration. Stored in config as `waiting_period_pct`. Value must be in **[0.0, 1.0]** and must be **≥** the current `sleep_period_pct`.
+
+| Argument | Description |
+|----------|-------------|
+| `<VALUE>` | Fraction in `[0.0, 1.0]` |
+
+```bash
+nodectl config elections adaptive-waiting-period-pct 0.45
 ```
 
 ##### `config elections enable`
@@ -1119,8 +1143,8 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | GET | `/v1/elections` | N | Current elections snapshot |
 | POST | `/v1/elections/exclude` | O | Disable elections for given bindings |
 | POST | `/v1/elections/include` | O | Enable elections for given bindings |
-| GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, per-binding status) |
-| POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor) |
+| GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, adaptive sleep/wait fractions, per-binding status) |
+| POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor, `sleep_period_pct`, `waiting_period_pct`) |
 | POST | `/v1/elections/static-adnl` | O | Generate and assign a persistent ADNL address for a node |
 | GET | `/v1/validators` | N | Validators snapshot for controlled nodes |
 | POST | `/v1/task/elections` | O | Enable / disable / restart the elections background task |
@@ -1285,6 +1309,8 @@ Return the effective elections configuration plus per-binding status.
     "policy_overrides": { "node0": { "fixed": 500000000000 } },
     "max_factor": 3.0,
     "tick_interval": 40,
+    "sleep_period_pct": 0.2,
+    "waiting_period_pct": 0.4,
     "bindings": [
       {
         "name": "node0",
@@ -1310,6 +1336,8 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
 | `reset` | `bool` | Remove a per-node override (requires `node`) |
 | `tick_interval` | `u64` | Elections tick interval in seconds |
 | `max_factor` | `f32` | Validated against masterchain config param 17 |
+| `sleep_period_pct` | `f64` | AdaptiveSplit50 minimum wait as a fraction of election duration; must be in `[0.0, 1.0]` and ≤ `waiting_period_pct` |
+| `waiting_period_pct` | `f64` | AdaptiveSplit50 maximum wait for participants; must be in `[0.0, 1.0]` and ≥ `sleep_period_pct` |
 
 `StakePolicy` is `"minimum"`, `"split50"`, `"adaptive_split50"`, or `{ "fixed": <nanotons> }`.
 
@@ -1345,6 +1373,8 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
     "policy_overrides": {},
     "max_factor": 2.5,
     "tick_interval": 60,
+    "sleep_period_pct": 0.2,
+    "waiting_period_pct": 0.4,
     "bindings": []
   }
 }
@@ -2084,6 +2114,10 @@ nodectl config elections tick-interval 60
 
 # Set max factor
 nodectl config elections max-factor 2.5
+
+# AdaptiveSplit50 timing (fractions of election duration, [0.0, 1.0])
+nodectl config elections adaptive-sleep-period-pct 0.15
+nodectl config elections adaptive-waiting-period-pct 0.45
 ```
 
 ### Authentication Setup

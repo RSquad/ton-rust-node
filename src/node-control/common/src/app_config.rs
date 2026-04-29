@@ -569,7 +569,7 @@ impl ElectionsConfig {
         Ok(())
     }
 
-    fn validate_timing_fields(&self) -> anyhow::Result<()> {
+    pub fn validate_timing_fields(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.sleep_period_pct) {
             anyhow::bail!("sleep_period_pct must be in range [0.0..1.0]");
         }

@@ -178,6 +178,10 @@ pub struct ElectionsSettingsDto {
     pub policy_overrides: HashMap<String, StakePolicy>,
     pub max_factor: f32,
     pub tick_interval: u64,
+    /// AdaptiveSplit50: minimum wait as a fraction of election duration (`sleep_period_pct` in config).
+    pub sleep_period_pct: f64,
+    /// AdaptiveSplit50: maximum wait for participants (`waiting_period_pct` in config).
+    pub waiting_period_pct: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingElectionStatusDto>,
 }
@@ -354,6 +358,12 @@ pub struct ElectionsSettingsUpdateRequest {
     /// Max stake factor (validated against network param 17).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_factor: Option<f32>,
+    /// AdaptiveSplit50 minimum wait fraction (config `sleep_period_pct`, 0.0–1.0, ≤ `waiting_period_pct`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep_period_pct: Option<f64>,
+    /// AdaptiveSplit50 maximum wait fraction (config `waiting_period_pct`, 0.0–1.0, ≥ `sleep_period_pct`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_period_pct: Option<f64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -798,6 +808,8 @@ pub async fn v1_elections_settings_handler(
         policy_overrides: elections.policy_overrides.clone(),
         max_factor: elections.max_factor,
         tick_interval: elections.tick_interval,
+        sleep_period_pct: elections.sleep_period_pct,
+        waiting_period_pct: elections.waiting_period_pct,
         bindings,
     };
 
@@ -1468,7 +1480,12 @@ pub async fn v1_elections_settings_update_handler(
 ) -> Result<axum::Json<ElectionsSettingsResponse>, AppError> {
     let req = req.0;
 
-    if req.policy.is_none() && !req.reset && req.tick_interval.is_none() && req.max_factor.is_none()
+    if req.policy.is_none()
+        && !req.reset
+        && req.tick_interval.is_none()
+        && req.max_factor.is_none()
+        && req.sleep_period_pct.is_none()
+        && req.waiting_period_pct.is_none()
     {
         return Err(AppError::bad_request("at least one setting is required"));
     }
@@ -1478,6 +1495,18 @@ pub async fn v1_elections_settings_update_handler(
         .elections
         .as_ref()
         .ok_or_else(|| AppError::bad_request("elections are not configured"))?;
+
+    // --- Validate adaptive timing (merged with current config) ---
+    if req.sleep_period_pct.is_some() || req.waiting_period_pct.is_some() {
+        let mut merged = elections.clone();
+        if let Some(v) = req.sleep_period_pct {
+            merged.sleep_period_pct = v;
+        }
+        if let Some(v) = req.waiting_period_pct {
+            merged.waiting_period_pct = v;
+        }
+        merged.validate_timing_fields().map_err(|e| AppError::bad_request(e.to_string()))?;
+    }
 
     // --- Validate max_factor against network param 17 (best-effort) ---
     if let Some(value) = req.max_factor {
@@ -1510,6 +1539,8 @@ pub async fn v1_elections_settings_update_handler(
     let reset = req.reset;
     let tick_interval = req.tick_interval;
     let max_factor = req.max_factor;
+    let sleep_period_pct = req.sleep_period_pct;
+    let waiting_period_pct = req.waiting_period_pct;
 
     state
         .runtime_cfg
@@ -1534,6 +1565,12 @@ pub async fn v1_elections_settings_update_handler(
                 if let Some(value) = max_factor {
                     elections.max_factor = value;
                 }
+                if let Some(v) = sleep_period_pct {
+                    elections.sleep_period_pct = v;
+                }
+                if let Some(v) = waiting_period_pct {
+                    elections.waiting_period_pct = v;
+                }
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -1552,6 +1589,8 @@ pub async fn v1_elections_settings_update_handler(
         policy_overrides: elections.policy_overrides.clone(),
         max_factor: elections.max_factor,
         tick_interval: elections.tick_interval,
+        sleep_period_pct: elections.sleep_period_pct,
+        waiting_period_pct: elections.waiting_period_pct,
         bindings: vec![],
     };
 
