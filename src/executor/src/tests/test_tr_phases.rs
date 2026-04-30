@@ -1347,7 +1347,7 @@ fn test_generate_account_and_update() {
     let cell = account.serialize().unwrap(); // serialization doesn't update storage stat
     let account2 = Account::construct_from_cell(cell).unwrap();
     pretty_assertions::assert_eq!(account, account2);
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_ne!(account, account2);
 }
 

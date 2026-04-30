@@ -1,6 +1,6 @@
 # Simplex Consensus Protocol
 
-**Version**: 0.6.0 (April 8, 2026) | [Changelog](CHANGELOG.md)
+**Version**: 0.7.0 (April 21, 2026) | [Changelog](CHANGELOG.md)
 
 Rust implementation of the Simplex consensus protocol for TON blockchain.
 
@@ -8,15 +8,19 @@ Rust implementation of the Simplex consensus protocol for TON blockchain.
 >
 > **Protocol Spec**: [ton-blockchain/simplex-docs](https://github.com/ton-blockchain/simplex-docs) (`Simplex.md`).
 
-> **Current semantics (Apr 2026, v0.6.0):**
+> **Current semantics (Apr 2026, v0.7.0):**
 > - Simplex is finalized-driven.
 > - Finalized blocks are delivered through `on_block_finalized()` and may arrive out of order.
 > - `on_block_committed()` remains part of the shared listener interface for legacy sequential acceptance, but Simplex must not use it.
 > - Missing-body handling uses `finalized_pending_body`: a finalized block can be known before its body arrives locally.
 > - Historical Rust-only fallback/strict-parent mode has been removed; only the C++-compatible three-vote behavior is supported.
-> - Session creation is separated from start: `create_session()` + `start(initial_block_seqno)`.
+> - Session creation is separated from start: `create_session()` + `start(prev_blocks, min_masterchain_block_id)`. The session derives `initial_block_seqno` as `max(prev_blocks[].seq_no) + 1` (the merge case with two prev blocks picks the higher of the two parents).
 > - Restart recovery is state-restoration only — no historical replay callbacks.
-
+> - Validator-side `StateResolverCache` (in `node/src/validator/state_resolver_cache.rs`) materializes parent states from cached candidate Merkle updates so MC collation no longer deadlocks on a notarized-but-unfinalized parent. The simplex side exposes `SimplexSession::ensure_candidate_available` for resolver-driven repair and forwards every observed candidate via `SessionListener::on_candidate_observed` (in `consensus-common`).
+> - Certificates are persisted before any state transition (`CERT-ORDER-1`) and the cert DB schema is unified under `db.key.vote` + `db.cert` matching the C++ `simplex-work` model (`DB-WAIT-ORDER-1`).
+> - `BadSignatureBanState` mirrors C++ `pool.cpp::ban`: vote / cert / broadcast / requestCandidate ingress from a peer is dropped for `bad_signature_ban_duration` after a cert-verify failure (`SIMPLEX-DOS-HARDENING-1`).
+> - Per-session `MetricsHandle` dumps are republished to the global Prometheus recorder via the new `prometheus_publisher` module, with selectable label cardinality through `SessionOptions::prometheus_labels`.
+>
 ## Overview
 
 Simplex is a consensus protocol with TON-specific implementation choices:
@@ -67,12 +71,8 @@ This crate targets wire-compatibility with the upstream **C++ Simplex** implemen
 
 ### Protocol parity gaps (from C++ upstream)
 
-- Certificate persistence ordering — C++ persists certs before state transitions. **HIGH**
-- Deterministic vote replay ordering — wait-for-store semantics. **MEDIUM**
-- Anti-spam / DOS hardening — overlay-level antispam. **MEDIUM**
 - External-aware collation pipeline — callback-driven external wait loop. **MEDIUM**
-- Ghost-parent MC collation deadlock — notarized-but-unfinalized parent state unavailability. **HIGH**
-- Speculative state resolver — in-process state computation for unfinalized parents. **MEDIUM**
+- DB-CERT-INDEX follow-up: secondary index for `SimplexDb` cert lookups by `candidate_id` / `slot` to keep `load_*_by_id` / `load_skip_cert_by_slot` O(1) after the cert-storage consolidation. Tracked in [TN-1152](https://rsquad-blockchain-lab.atlassian.net/browse/TN-1152) / [NODE-175](https://linear.app/rsquad/issue/NODE-175/db-cert-index-1-secondary-index-for-simplexdb-cert-lookups-by). **MEDIUM**
 
 ### Implementation parity gaps
 
@@ -81,6 +81,12 @@ This crate targets wire-compatibility with the upstream **C++ Simplex** implemen
 - C++ overlay manager can buffer messages for unknown overlays (disabled by default) — Rust lacks equivalent.
 
 ### Resolved (for reference)
+
+- Ghost-parent MC collation deadlock — validator-side `StateResolverCache` (in `node/src/validator/state_resolver_cache.rs`) materializes parent states from cached candidate Merkle updates and races them against `engine.wait_state()`. Simplex bridges via `SimplexSession::ensure_candidate_available` and `SessionListener::on_candidate_observed` (`GHOST-PARENT-1` / `TN-1108` / `TN-1112`).
+- Certificate persistence ordering — every cert handler waits for DB persistence before any state transition or network side effect (`CERT-ORDER-1` / `TN-966`).
+- Deterministic vote replay + cert DB unification under `db.key.vote` + `db.cert` matching C++ `simplex-work` (`DB-WAIT-ORDER-1` / `TN-968`).
+- Anti-spam / DOS hardening — bad-signature peer-ban via `BadSignatureBanState` in receiver, ingress drops, and cert-verify-failure → ban (`SIMPLEX-DOS-HARDENING-1` / `TN-1034`).
+- Bootstrap deadlock on speculative MC parent — explicit Simplex session parents, empty-block parity with parent state, MC seqno-lag tolerance in the speculative parent flow (`BOOTSTRAP-DEADLOCK-1` / `TN-1116`).
 
 - Finalized-driven delivery: Simplex delivers through `on_block_finalized()`, matching C++ out-of-order finalized model.
 - Parent gating aligned with C++ flow: `is_wait_for_parent_ready()` mirrors `pool.cpp::maybe_resolve_request()`.
@@ -266,17 +272,18 @@ node/simplex/
 ├── README.md                  # This file
 ├── CHANGELOG.md               # Release notes (this crate)
 ├── src/
-│   ├── lib.rs                 # Public API: Session, SimplexSession, SessionOptions, SessionFactory
+│   ├── lib.rs                 # Public API: Session, SimplexSession, SessionOptions, SessionFactory, PrometheusLabels, RawVoteData
 │   ├── block.rs               # Block candidate types: RawCandidateId, Candidate, etc.
 │   ├── certificate.rs         # Certificate types: VoteSignature, Certificate<T> (crate-private)
-│   ├── database.rs            # DB persistence for restart recovery (crate-private)
+│   ├── database.rs            # DB persistence: unified `db.key.vote` + `db.cert` schema for cert-order parity (crate-private)
 │   ├── simplex_state.rs       # Core consensus FSM with event-based output
-│   ├── session.rs             # Session actor (multi-threaded wrapper, task queues)
-│   ├── session_processor.rs   # Integrates SimplexState with network (crate-private)
+│   ├── session.rs             # Session actor (multi-threaded wrapper, task queues, `ensure_candidate_available` bridge)
+│   ├── session_processor.rs   # Integrates SimplexState with network; emits `on_candidate_observed` (crate-private)
 │   ├── session_description.rs # Session constants and validators info (crate-private)
 │   ├── startup_recovery.rs    # Startup recovery / restart replay (crate-private)
 │   ├── task_queue.rs          # Task queue traits and types (crate-private)
-│   ├── receiver.rs            # Network overlay management (crate-private)
+│   ├── receiver.rs            # Network overlay management + `BadSignatureBanState` peer-ban (crate-private)
+│   ├── prometheus_publisher.rs # Republish per-session `MetricsHandle` snapshots to the global Prometheus recorder (crate-private)
 │   ├── utils.rs               # Signature verification, hash computation, thresholds
 │   ├── misbehavior.rs         # Misbehavior detection: MisbehaviorProof, MisbehaviorReport, RawVoteData
 │   └── tests/                 # Internal unit tests (crate-private)
@@ -287,6 +294,7 @@ node/simplex/
 │       ├── test_crypto.rs
 │       ├── test_database.rs
 │       ├── test_misbehavior.rs
+│       ├── test_prometheus_publisher.rs
 │       ├── test_receiver.rs
 │       ├── test_restart.rs
 │       ├── test_session_description.rs
@@ -317,18 +325,35 @@ Entry point for integration. See `lib.rs` documentation for detailed API referen
 | `Receiver` | Network sender interface (trait) |
 | `ReceiverListener` | Network receiver callbacks (trait) |
 
-**SimplexSession Trait** (for MC finalization notification):
+**SimplexSession Trait** (MC finalization notification + state-resolver bridge):
 
 ```rust
 pub trait SimplexSession: ConsensusSession {
-    /// Notify session about accepted MC top (for shard empty block decisions)
+    /// Notify session about accepted MC top (for shard empty block decisions).
     fn notify_mc_finalized(&self, applied_top: BlockIdExt);
+
+    /// Resolver-driven repair entry point. Posts to the main task queue so
+    /// the body / parent chain can be requested without blocking the
+    /// validator side. Used by `StateResolverCache::request_availability`
+    /// when collation/validation needs a parent state that's not yet in
+    /// the cache or applied by the engine.
+    fn ensure_candidate_available(
+        &self,
+        block_id: BlockIdExt,
+        opts: EnsureCandidateAvailabilityOptions,
+    );
 }
 ```
 
 This separate trait allows simplex-specific operations without modifying the shared `ConsensusSession` trait
 from validator-session. For shard chains, the higher layer (ValidatorManager) should call
-`notify_mc_finalized()` with the accepted MC top `BlockIdExt` when masterchain blocks are finalized to enable empty block generation.
+`notify_mc_finalized()` with the accepted MC top `BlockIdExt` when masterchain blocks are finalized to enable empty block generation. `ensure_candidate_available()` is called by the validator-side resolver cache and forwarded into Simplex via the main task queue.
+
+**Listener side**: the simplex `SessionProcessor` calls
+`SessionListener::on_candidate_observed(block_id, data, collated_data, flags)`
+(in `consensus-common`) on every observed candidate. The validator wires
+this into `StateResolverCache::upsert_observed_candidate` so the cache
+can serve future collation/validation without re-querying peers.
 
 ### Session (`session.rs`)
 
@@ -360,12 +385,12 @@ Single-threaded consensus algorithm (crate-private):
 - ✅ Validation flow (`on_block_broadcast()`, `check_validation()`)
 - ✅ Debug dump (`debug_dump()`) - structured stall diagnosis with conclusion, frontiers, heads, statistics, collation, validation inventory, per-peer activity, health findings, and `finalized_pending_body` tracking
 - ✅ Empty block generation - `should_generate_empty_block()`, `CollationResult` enum, `GeneratedBlockDesc`
-- ✅ MC finalization callback - `SimplexSession::notify_mc_finalized()` posts to `set_mc_finalized_seqno()`
-- ✅ Missing block requests - `schedule_request_candidate()` → delayed action → `receiver.request_candidate()`
-- ✅ Parent metadata resolution for empty/recovery helpers - `PendingParentResolution`, `update_resolution_cache_chain()`, `find_first_missing_parent()`
+- ✅ MC finalization callback - `SimplexSession::notify_mc_finalized(applied_top: BlockIdExt)` posts to `SessionProcessor::set_mc_finalized_block()`
+- ✅ Missing block requests - `Receiver::request_candidate(slot, block_hash)` (delayed action via `post_delayed_action()`); resolver-driven repair via `SimplexSession::ensure_candidate_available()`
+- ✅ Missing parent-metadata detection on the validation path - `find_first_missing_parent_metadata()` walks the parent chain on `check_validation()` and schedules a `request_candidate()` for the first gap (the legacy `PendingParentResolution` queue + `update_resolution_cache_chain()` were removed in 0.6.0; parent resolution is on-demand)
 - ✅ Finalized-driven delivery - `handle_block_finalized()`, `maybe_apply_finalized_state()`, `finalized_pending_body` for deferred body materialization
 - ✅ Roundless listener model - round is not used for Simplex sequencing logic
-- ✅ Separate session creation/start - `create_session()` + `start(initial_block_seqno)`
+- ✅ Separate session creation/start - `create_session()` + `start(prev_blocks, min_masterchain_block_id)`; `initial_block_seqno` is derived as `max(prev_blocks[].seq_no) + 1`
 - ✅ Candidate chaining within leader windows (C++ parity)
 - ✅ Leader window desync margin (`max_leader_window_desync`) for ingress filtering
 - ✅ Block-rate cap timing parity (`min_block_interval_ms`) for validation pacing
@@ -373,7 +398,7 @@ Single-threaded consensus algorithm (crate-private):
 - ✅ DB persistence - finalized blocks, candidate infos, notar certs, votes, pool state persisted to RocksDB
 - ✅ Startup recovery - bootstrap load, vote replay, receiver cache restore, finalized-boundary restoration
 - ✅ Late-join handling - finalized blocks can be known before body arrival via `finalized_pending_body`
-- ⚠️ Precollation parent tracking - needs fix for cross-window scenarios
+- ✅ Precollation pipeline - `precollate_block()` chains the next slot off the just-produced candidate; the original cross-window concern was superseded by notarized-parent collation mode (see CHANGELOG 0.5.0). Counters: `simplex_precollation_requests`, `simplex_precollation_results`, `simplex_collates_precollated.*`
 
 **Key methods:**
 - `check_all()` - Main loop entry point, calls FSM and processes events
@@ -388,14 +413,18 @@ Single-threaded consensus algorithm (crate-private):
 - `process_simplex_events()` - Dispatch FSM events to handlers
 - `init_metrics()` - Initialize all metrics for performance tracking
 
-**Metrics tracked:**
+**Metrics tracked** (representative subset; see `init_metrics()` in `session_processor.rs` for the full registration list — most metrics are republished to Prometheus via `prometheus_publisher.rs` with the `ton_node_simplex_` prefix):
+
 - `simplex_check_all_calls` - Counter for main loop iterations
 - `simplex_process_events_calls` - Counter for FSM event processing
 - `simplex_errors` - Counter for session errors (passed via `SessionStats`)
-- `simplex_time:slot_duration` - Histogram for slot duration
-- `simplex_time:validation_latency` - Histogram for validation time
-- `simplex_time:collation_latency` - Histogram for collation time
-- `simplex_active_weight` - Gauge for current network active weight
+- `time:slot_duration` - Histogram for slot duration
+- `time:validation_latency` - Histogram for validation time
+- `time:collation_latency` - Histogram for collation time
+- `time:self_collation_accept_latency` - Histogram for the gap between local collation start and finalized acceptance of the same candidate
+- `time:slot_stage1_received_latency` / `time:slot_stage2_notarized_latency` / `time:slot_stage3_finalized_latency` - Per-stage slot timing histograms
+- `simplex_active_weight` / `simplex_total_weight` / `simplex_threshold_66` - Gauges for the current network active/total weight and 2/3 threshold
+- `simplex_first_non_finalized_slot` / `simplex_first_non_progressed_slot` / `simplex_last_finalized_slot` - Gauges tracking the FSM cursors and finalized head
 - `simplex_validates.*` - ResultStatusCounter for validation requests
 - `simplex_collates.*` - ResultStatusCounter for collation completion results
 - `simplex_collation_starts` - Counter for all collation entry attempts
@@ -405,9 +434,14 @@ Single-threaded consensus algorithm (crate-private):
 - `simplex_collates_precollated.*` - ResultStatusCounter for precollated block hits
 - `simplex_candidate_received_broadcast` - Counter for peer-delivered broadcast candidate bodies
 - `simplex_candidate_received_query` - Counter for peer-delivered query-response candidate bodies
-- `simplex_skipped_slots` - Counter for skipped slots
-- `simplex_batch_commits` - legacy-named batch finalized-apply metric
-- `simplex_batch_commit_size` - legacy-named histogram for finalized batch size
+- `simplex_candidate_precheck_drop_*` - Counters for ingress prechecks (old/future slot, unexpected sender, conflicting slot)
+- `simplex_votes_in_total` / `simplex_votes_in_{notarize,finalize,skip}` - Counters for inbound vote stream by type
+- `simplex_votes_out_total` / `simplex_votes_out_{notarize,finalize,skip,persist_fail}` - Counters for outbound vote stream by type
+- `simplex_certs_in` / `simplex_certs_relayed` / `simplex_cert_conflict` / `simplex_cert_verify_fail` - Counters for inbound/relayed certs and verification failures
+- `simplex_skip_total` - Counter for skip-vote and skip-cert flow
+- `simplex_validation_reject` / `simplex_validation_late_callback` - Counters for validation rejects and late callbacks
+- `simplex_misbehavior` - Counter for detected misbehavior events
+- `simplex_health_warnings` - Counter for health-finding warnings emitted in dumps
 - `simplex_finalized_pending_body_count` - Gauge for finalized blocks waiting for body arrival
 
 ### SimplexState (`simplex_state.rs`)
@@ -558,8 +592,8 @@ Cryptographic and utility functions:
 | `slots_per_leader_window` | `u32` | 1 | Slots per leader window |
 | `target_rate` | `Duration` | 1s | Target block time |
 | `first_block_timeout` | `Duration` | 3s | First block timeout |
-| `timeout_increase_factor` | `f64` | 1.05 | Adaptive backoff factor |
-| `max_backoff_delay` | `Duration` | 100s | Max backoff delay |
+| `first_block_timeout_multiplier` | `f64` | 1.2 | Adaptive backoff multiplier for first block timeout |
+| `first_block_timeout_cap` | `Duration` | 100s | Adaptive backoff cap for first block timeout |
 | `max_block_size` | `usize` | 4 MB | Max block size |
 | `max_collated_data_size` | `usize` | 4 MB | Max collated data |
 | `collation_retry_timeout` | `Duration` | 1s | Collation retry timeout |
@@ -597,9 +631,13 @@ let session = SessionFactory::create_session(
     Arc::downgrade(&listener) as SessionListenerPtr,
 )?;
 
-// 4. Start consensus processing with expected first block seqno
-let initial_block_seqno = 1;
-session.start(initial_block_seqno);
+// 4. Start consensus processing. Pass the previous block(s) the new session
+//    builds on (one BlockIdExt for normal flow, two for a shard merge) and
+//    the masterchain block ID gating external-block bounds. The session
+//    derives `initial_block_seqno` as `max(prev_blocks[].seq_no) + 1`.
+let prev_blocks = vec![previous_block_id];          // BlockIdExt
+let min_masterchain_block_id = masterchain_block;   // BlockIdExt
+session.start(prev_blocks, min_masterchain_block_id);
 
 // 5. Session runs in background, callbacks via SessionListener
 // 6. Stop when done
@@ -636,9 +674,9 @@ impl SessionListener for MyListener {
 
 ## Tests
 
-**Total: 427 tests** (406 lib + 15 integration + 6 doc-tests)
+**Total: 428 tests** (406 lib + 16 integration + 6 doc-tests; lib count is a lower-bound — actual `cargo test -p simplex --lib` output as of v0.7.0 reports 487)
 
-**Integration tests**: 12 consensus + 1 collation + 1 validation + 1 restart
+**Integration tests**: 13 consensus + 1 collation + 1 validation + 1 restart
 
 **Crypto tests include**: Threshold calculations, session signatures, candidate signatures, vote TL serialization, vote signing with session wrapper, and signature format tests (C++ TL library compatibility).
 
@@ -656,7 +694,7 @@ Multi-instance consensus tests with in-process overlay.
 | `test_simplex_consensus_shard_with_mc_notifications` | MC finalization forwarding to shards | ✅ |
 | `test_simplex_consensus_adnl_overlay` | ADNL overlay-based consensus | ✅ |
 | `test_simplex_consensus_adnl_net_gremlin` | ADNL net gremlin (packet loss/delay simulation) | ✅ |
-| `test_simplex_consensus_restart_gremlin` | Restart gremlin (stop/restart with DB persistence) | ⚠️ (temp ignore) |
+| `test_simplex_consensus_restart_gremlin` | Restart gremlin (stop/restart with DB persistence) | ✅ (residual flakiness tracked in [TN-1085](https://rsquad-blockchain-lab.atlassian.net/browse/TN-1085) / [NODE-136](https://linear.app/rsquad/issue/NODE-136/simplex-restart-gremlin-stability-1-fix-timeout-in-test-simplex)) |
 | `test_simplex_consensus_candidate_chaining` | Candidate chaining within leader windows | ✅ |
 | `test_simplex_consensus_candidate_chaining_with_lossy_overlay` | Candidate chaining with packet loss | ✅ |
 | `test_simplex_start_gate` | Session start gate (create/start separation) | ✅ |
@@ -717,6 +755,7 @@ Crate-private unit tests with access to internal symbols.
 | `test_slot_bounds.rs` | Slot bounds validation |
 | `test_misbehavior.rs` | Misbehavior proofs and invariant checks |
 | `test_session_description.rs` | Validator indexing, thresholds, time control |
+| `test_prometheus_publisher.rs` | Snapshot republishing for the per-session Prometheus bridge: label-strategy assertions for `ShardOnly` and `ShardAndSessionId`, `*.speed` derivative drop, parallel-safe via thread-local mock recorder |
 
 **Running:**
 ```bash
@@ -973,6 +1012,168 @@ simplex_last_finalized_slot       42     0.28/s
 simplex_commits.total             42     0.28/s
 simplex_votes_in_notarize        126     0.84/s
 ```
+
+### Prometheus Export
+
+Each session's local `MetricsDumper` is also republished to the global
+`metrics_exporter_prometheus` recorder that backs the node's
+`/metrics` HTTP endpoint. Republication runs on the same dump cadence
+(session 15 s, receiver 30 s) inside the existing dump hooks; no extra
+threads are spawned.
+
+The bridge lives in [`node/simplex/src/prometheus_publisher.rs`](src/prometheus_publisher.rs)
+and is wired in by `SessionImpl::main_loop` and `ReceiverWrapper::create`.
+
+#### Naming and label conventions
+
+- Prefix: every Simplex series is renamed from `simplex_<name>` to
+  `ton_node_simplex_<name>` to match the rest of the node's
+  Prometheus families (`ton_node_engine_*`, `ton_node_validator_*`,
+  `ton_node_collator_*`, etc.).
+- `.` and `:` in the original key are replaced with `_` (Prometheus
+  naming rules); e.g. `simplex_collates.success` becomes
+  `ton_node_simplex_collates_success`,
+  `simplex_receiver_main_queue.posts` becomes
+  `ton_node_simplex_receiver_main_queue_posts`.
+- `*.speed` derivative variants emitted by `MetricsDumper` are dropped
+  on purpose. Prometheus computes per-second rates from the raw counter
+  via `rate(...[1m])` / `irate(...[30s])` itself; exporting both would
+  double-count.
+- Counters (`MetricUsage::Counter`) become Prometheus counters (cumulative
+  `u64`); everything else (`Derivative`, `Float`, `Percents`, `Latency`)
+  becomes a Prometheus gauge.
+
+#### Per-session labels
+
+Multiple Simplex sessions run in parallel (one per shard, rotating per
+validator-set epoch). Each Prometheus series carries enough labels to
+disambiguate itself; the strategy is configurable per session via
+`SessionOptions::prometheus_labels`:
+
+| `PrometheusLabels` variant | Labels attached | Use when |
+|---|---|---|
+| `ShardOnly` (default) | `shard="<shard_id>"` (e.g. `0:8000000000000000`) | Lowest cardinality; one series per shard. Cannot tell two consecutive sessions of the same shard apart in PromQL. |
+| `ShardAndSessionId` | `shard=...`, `session_id="<sid8>"` (first 8 hex chars; matches the `sid8` prefix in log dumps and `consensus_session_dump.py` reports) | Per-validator-set-epoch breakdown. Cardinality grows by one new series per shard on every rotation; choose this for short-lived debug deployments where per-session timelines matter. |
+
+#### Sample `/metrics` lines
+
+```
+ton_node_simplex_votes_in_total{shard="0:8000000000000000"} 22060
+ton_node_simplex_certs_in{shard="0:8000000000000000"} 10150
+ton_node_simplex_certs_relayed{shard="0:8000000000000000"} 1186
+ton_node_simplex_last_finalized_slot{shard="0:8000000000000000"} 12345
+ton_node_simplex_active_weight{shard="0:8000000000000000"} 17
+```
+
+With `ShardAndSessionId`:
+
+```
+ton_node_simplex_votes_in_total{shard="0:8000000000000000",session_id="2a5ea688"} 22060
+```
+
+#### Useful PromQL
+
+| Query | What it shows |
+|---|---|
+| `rate(ton_node_simplex_last_finalized_slot{shard="0:8000000000000000"}[1m])` | Finalization rate per shard (slots/s) |
+| `rate(ton_node_simplex_votes_in_total[1m])` | Total inbound vote throughput |
+| `sum by (shard) (rate(ton_node_simplex_certs_relayed[1m]))` | Certificates relayed per shard |
+| `ton_node_simplex_active_weight / ton_node_simplex_total_weight` | Active validator weight fraction (0..1) |
+| `histogram_quantile(0.95, sum by (le) (rate(ton_node_simplex_slot_duration_avg[5m])))` | Approximation of p95 slot duration (note: histogram is currently flattened to `*_avg`/`_med`/`_min`/`_max`/`_cnt` gauges, not native Prometheus histogram buckets) |
+
+#### Enumeration of exported families
+
+The list below is the full set of published metrics, grouped by source.
+Names below omit the `ton_node_simplex_` prefix and the labels.
+
+**Vote counters (session)**
+
+- `votes_in_total`, `votes_in_notarize`, `votes_in_finalize`, `votes_in_skip`
+- `votes_out_total`, `votes_out_notarize`, `votes_out_finalize`, `votes_out_skip`
+- `votes_in_skip_share`, `votes_in_notarize_share`, `votes_in_finalize_share` (gauges, %)
+- `votes_in_skip_to_notar_ratio`, `votes_in_skip_to_finalize_ratio` (gauges, ratio)
+
+**Certificate counters (session)**
+
+- `certs_in`, `certs_relayed`, `cert_conflict`, `cert_verify_fail`
+
+**Validation / collation counters (session)**
+
+- `validates_total`, `validates_success`, `validates_failure` (+ `*_frequency` gauges)
+- `collates_total`, `collates_success`, `collates_failure` (+ `*_frequency` gauges)
+- `collates_expire_*`, `collates_precollated_*`
+- `commits_*` (legacy finalized-delivery family name)
+- `collation_starts`, `precollation_requests`, `precollation_results`,
+  `precollation_pending`
+- `validation_reject`, `validation_late_callback`,
+  `generated_candidate_validation_missed`
+
+**Candidate counters (session)**
+
+- `candidate_received_broadcast`, `candidate_received_query`
+
+**Loop / scheduling counters (session)**
+
+- `main_loop_iterations`, `main_loop_overloads`, `main_loop_load` (gauge, %)
+- `callbacks_loop_iterations`, `callbacks_loop_overloads`,
+  `callbacks_loop_load` (gauge, %)
+- `check_all_calls`, `process_events_calls`, `iterations_per_check_all`
+- `processing_queue_posts`, `processing_queue_pulls`, `processing_queue` (size)
+- `callbacks_queue_posts`, `callbacks_queue_pulls`, `callbacks_queue` (size)
+
+**State / progression gauges (session)**
+
+- `active_weight`, `total_weight`, `threshold_66`,
+  `active_nodes_percent`
+- `last_finalized_slot`, `first_non_finalized_slot`,
+  `first_non_progressed_slot`
+- `finalized_pending_body_count`
+- `health_warnings`, `errors`, `misbehavior`, `skip_total`,
+  `batch_commits`
+
+**Latency histograms flattened to `*_avg` / `*_med` / `*_min` / `*_max` / `*_cnt` / `*_last` (session)**
+
+- `slot_duration`, `slot_stage1_received_latency`,
+  `slot_stage2_notarized_latency`, `slot_stage3_finalized_latency`
+- `validation_latency`, `collation_latency`,
+  `broadcast_validation_latency`
+- `batch_commit_size` (count, not time)
+
+**Receiver counters (receiver thread)**
+
+- `receiver_in_messages_count`, `receiver_out_messages_count`
+- `receiver_in_broadcasts_count`, `receiver_out_broadcasts_count`
+- `receiver_in_queries_count`
+- `receiver_in_messages_bytes`, `receiver_out_messages_bytes`
+- `receiver_in_broadcasts_bytes`, `receiver_out_broadcasts_bytes`
+- `receiver_in_queries_bytes`
+- `receiver_in_bytes`, `receiver_out_bytes`
+- `receiver_main_loop_iterations`,
+  `receiver_main_queue_posts`, `receiver_main_queue_pulls`
+
+**Candidate request / standstill counters (receiver thread)**
+
+- `candidate_requests`, `candidate_request_retries`,
+  `candidate_request_timeouts`, `candidate_request_giveups`
+- `standstill_triggers`, `standstill_votes_rebroadcast`,
+  `standstill_certs_rebroadcast`
+
+> Note: a handful of metrics whose registered name carries no
+> `float:` / `percents:` prefix in the source (e.g.
+> `simplex_active_weight`, `simplex_last_finalized_slot`) are
+> classified by the dumper as `MetricUsage::Counter` and therefore
+> republished as Prometheus *counters*, not gauges. They still carry
+> the right value at every scrape (use `last_over_time(...)` or just
+> read the latest sample), but stricter gauge semantics will require
+> updating the corresponding `register_gauge(...)` call sites to use
+> the `float:` prefix in a follow-up.
+
+#### HELP text and engine-side declarations
+
+`metrics::describe_*!` declarations for the full `ton_node_simplex_*`
+family live in [`init_prometheus_recorder`](../src/engine.rs) so the
+rendered `/metrics` carries human-readable HELP lines for every
+counter and gauge.
 
 ## References
 

@@ -520,9 +520,9 @@ pub trait HashmapAugType<
         Ok(())
     }
     /// multiset items to hashmapaug
-    fn multiset<I>(&mut self, iter: I) -> Result<()>
+    fn multiset<'a, I>(&mut self, iter: I) -> Result<()>
     where
-        I: Iterator<Item = (SliceData, Option<SliceData>)>,
+        I: IntoIterator<Item = (crate::dictionary::FixedBitsKey<'a>, Option<SliceData>)>,
     {
         self.hashmap_multiset(iter)?;
         self.update_root_extra()?;

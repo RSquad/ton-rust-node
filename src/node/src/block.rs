@@ -12,10 +12,7 @@ use crate::{
     block_proof::BlockProofStuff, engine_traits::EngineOperations, shard_state::ShardHashesStuff,
     validating_utils::UNREGISTERED_CHAIN_MAX_LEN,
 };
-use std::{
-    io::{Cursor, Write},
-    sync::Arc,
-};
+use std::{io::Write, sync::Arc};
 use storage::block_handle_db::BlockHandle;
 use ton_api::ton::{
     lite_server::{
@@ -80,7 +77,7 @@ impl BlockStuff {
     }
 
     pub fn deserialize_block(id: BlockIdExt, data: Arc<Vec<u8>>) -> Result<Self> {
-        let root = BocReader::new().read(&mut Cursor::new(&*data))?.withdraw_single_root()?;
+        let root = BocReader::new().read(&*data)?.withdraw_single_root()?;
         if id.root_hash != *root.repr_hash() {
             fail!("wrong root hash for {}", id)
         }

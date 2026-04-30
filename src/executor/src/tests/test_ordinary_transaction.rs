@@ -535,7 +535,7 @@ fn create_test_transfer_account_with_ending(amount: u64, mode: u8, ending: &str)
         &AccountStorage::active(0, CurrencyCollection::with_coins(amount), StateInit::default()),
     );
     acc.set_code(test_transfer_code(mode, ending));
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     acc
 }
 
@@ -585,10 +585,10 @@ fn test_trexecutor_active_acc_with_code2() {
     new_acc.set_last_tr_time(tr_lt + 2);
 
     let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 1).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     new_acc.set_data(acc.get_data().unwrap());
     new_acc.set_last_paid(acc.last_paid());
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, tr_lt).unwrap();
     good_trans.set_now(BLOCK_UT);
@@ -860,12 +860,12 @@ fn test_drain_account() {
     new_acc.set_last_paid(BLOCK_UT);
     new_acc.set_last_tr_time(BLOCK_LT + 4);
     new_acc.set_balance(CurrencyCollection::default());
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     new_acc.set_due_payment(Some(86774881.into()));
 
     let tr_lt = BLOCK_LT + 1;
     let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 0).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc, new_acc);
 
@@ -1273,7 +1273,7 @@ fn test_send_msg_value_to_account_without_money_with_bounce() {
     let mut good_trans = Transaction::with_account_and_message(&new_acc, &msg, tr_lt).unwrap();
 
     let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 1).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc, new_acc);
 
@@ -2074,7 +2074,8 @@ fn test_uninit_account(
     if code.is_some() {
         msg.set_state_init(state_init);
     }
-    acc.update_storage_stat(config.size_limits_config().acc_state_cells_for_storage_dict).unwrap();
+    acc.calc_storage_stat_dict(config.size_limits_config().acc_state_cells_for_storage_dict)
+        .unwrap();
     let acc_copy = acc.clone();
     let trans =
         try_replay_transaction(&mut acc, Some(&msg), config, &execute_params_none()).unwrap();
@@ -2506,7 +2507,7 @@ fn test_fail_bound_message_with_nonexist_account() {
     );
     new_acc.set_last_paid(1576526553);
     new_acc.set_last_tr_time(BLOCK_LT + 3);
-    new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_eq!(acc, new_acc);
 
     let mut description = TransactionDescrOrdinary::default();
@@ -2618,7 +2619,7 @@ fn account_without_code2() {
         create_two_messages_data(),
     );
     *acc.state_init_mut().unwrap() = state_init.clone();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     let mut msg = create_int_msg(THIRD_ACCOUNT.clone(), acc_id, 14_200_000, false, BLOCK_LT - 2);
     msg.set_state_init(state_init);
@@ -3948,7 +3949,7 @@ fn test_empty_dict_hash() {
     )
     .unwrap();
     assert_eq!(acc.storage_info().unwrap().dict_hash(), None);
-    assert_eq!(acc.update_storage_stat(1).unwrap(), None);
+    assert_eq!(acc.calc_storage_stat_dict(1).unwrap(), None);
 
     let mut config = ConfigParams::construct_from_file("real_boc/config.boc").unwrap();
 
@@ -3959,7 +3960,7 @@ fn test_empty_dict_hash() {
 
     try_replay_transaction(&mut acc, Some(&msg), config.clone(), &execute_params_none()).unwrap();
     assert_eq!(acc.storage_info().unwrap().dict_hash(), Some(&UInt256::default()));
-    assert_eq!(acc.update_storage_stat(1).unwrap(), None);
+    assert_eq!(acc.calc_storage_stat_dict(1).unwrap(), None);
 }
 
 #[test]

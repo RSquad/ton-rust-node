@@ -19,6 +19,7 @@ mod mutex_wrapper;
 pub mod out_msg_queue;
 mod out_msg_queue_cleaner;
 pub mod out_msg_queue_manager;
+pub mod state_resolver_cache;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod validate_query;

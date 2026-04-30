@@ -21,7 +21,7 @@ use std::{
 };
 
 const EXACT_CAPACITY: usize = 128;
-pub(crate) type SmallData = smallvec::SmallVec<[u8; EXACT_CAPACITY]>;
+pub type SmallData = smallvec::SmallVec<[u8; EXACT_CAPACITY]>;
 
 trait AppendBits {
     fn extend(&mut self, slice: &[u8]) -> &mut [u8];

@@ -75,6 +75,7 @@ test-adnl:
 	@cargo test test_adnl_$(what) $(config) --package adnl --features "client,server,node,telemetry" -- --nocapture
 	@cargo test test_overlay_$(what) $(config) --package adnl --features "client,server,node" -- --nocapture
 	@cargo test test_rldp_$(what) $(config) --package adnl --features "client,server,node,debug" -- --nocapture
+	@cargo test test_quic_$(what) $(config) --package adnl --features "client,server,node,telemetry" -- --nocapture
 
 test-catchain:
 	@cargo test $(what) $(config) --package catchain -- --nocapture

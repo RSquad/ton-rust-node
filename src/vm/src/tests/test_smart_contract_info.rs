@@ -483,7 +483,7 @@ fn test_convert_stack_slice_roundtrip_preserves_msg_addr_bit_len() {
 fn test_convert_stack_slice_roundtrip_preserves_slice_window() {
     let mut source = SliceData::from_raw(vec![0b1010_1100, 0b1111_0000], 16);
     source.move_by(3).unwrap();
-    let slice = source.get_slice(7).unwrap();
+    let slice = source.get_slice(0, 7).unwrap();
 
     let items = convert_stack(&[StackItem::slice(slice.clone())]).unwrap();
     let roundtrip = convert_ton_stack(&items).unwrap();

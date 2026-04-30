@@ -567,14 +567,23 @@ impl SliceData {
     }
 
     /// Returns subslice of current slice
-    pub fn get_slice(&self, bits: usize) -> Result<SliceData> {
-        self.check_remaining_bits(bits)?;
-        let start = self.data_window.start;
-        Ok(SliceData {
-            data: self.data.clone(),
-            data_window: start..start + bits,
-            references_window: 0..0,
-        })
+    pub fn get_slice(&self, offset: usize, bits: usize) -> Result<SliceData> {
+        // Use `checked_add` so a wraparound on `offset + bits` (defined as
+        // wrapping in release) cannot bypass `check_remaining_bits` and
+        // produce a `start..end` range that points outside the window.
+        let end_offset = offset
+            .checked_add(bits)
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "bit range overflow"))?;
+        self.check_remaining_bits(end_offset)?;
+        let start = self
+            .data_window
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| error!(ExceptionCode::RangeCheckError, "bit range overflow"))?;
+        let end = start
+            .checked_add(bits)
+            .ok_or_else(|| error!(ExceptionCode::RangeCheckError, "bit range overflow"))?;
+        Ok(SliceData { data: self.data.clone(), data_window: start..end, references_window: 0..0 })
     }
 
     pub fn get_bit_opt(&self, offset: usize) -> Option<bool> {
@@ -593,13 +602,77 @@ impl SliceData {
             .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "no bits to read"))
     }
 
+    /// Check whether all `len` bits starting at `offset` (relative to window start)
+    /// have the same value as `bit`
+    pub fn are_bits_same(&self, bit: bool, offset: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        // `checked_add` here mirrors `get_slice`: a wraparound on `offset + len`
+        // or `data_window.start + offset` must reject the input rather than
+        // silently fall through to indexing logic with a corrupt range.
+        let Some(end_offset) = offset.checked_add(len) else {
+            return false;
+        };
+        if end_offset > self.remaining_bits() {
+            return false;
+        }
+        let data = self.storage();
+        let Some(start) = self.data_window.start.checked_add(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let expected = if bit { 0xFFu8 } else { 0x00u8 };
+        let first_byte = start / 8;
+        let last_byte = (end - 1) / 8;
+
+        // Full bytes between head and tail
+        for i in first_byte + 1..last_byte {
+            if data[i] != expected {
+                return false;
+            }
+        }
+
+        // Build combined mask for first and last byte:
+        // head_mask covers bits [head_shift..8) of first byte
+        // tail_mask covers bits [0..tail_bits) of last byte
+        let head_mask = 0xFFu8 >> start % 8;
+        let tail_bits = ((end - 1) % 8) + 1; // used high bits in last byte
+        let tail_mask = 0xFFu8 << (8 - tail_bits);
+        // Check first+last (they may be the same byte)
+        let boundary_check = if first_byte == last_byte {
+            (data[first_byte] ^ expected) & head_mask & tail_mask
+        } else {
+            ((data[first_byte] ^ expected) & head_mask) | ((data[last_byte] ^ expected) & tail_mask)
+        };
+        if boundary_check != 0 {
+            return false;
+        }
+
+        true
+    }
+
     pub fn get_bits(&self, offset: usize, bits: usize) -> Result<u8> {
-        self.check_remaining_bits(bits)?;
         if bits == 0 || bits > 8 {
             fail!(ExceptionCode::RangeCheckError, "bits should be in range 1..=8 but it is {bits}")
         }
+        // The two-byte fast path below (`data[q + 1]`) can read past the slice
+        // window when `offset > 0`. Validate `offset + bits` against the
+        // available remainder via `checked_add` so a wraparound cannot bypass
+        // the bounds check — matches the `get_slice(offset, bits)` and
+        // `are_bits_same(bit, offset, len)` style in this file.
+        let end_offset = offset
+            .checked_add(bits)
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "bit range overflow"))?;
+        self.check_remaining_bits(end_offset)?;
         let data = self.storage();
-        let index = self.data_window.start + offset;
+        let index = self
+            .data_window
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| error!(ExceptionCode::RangeCheckError, "bit range overflow"))?;
         let q = index / 8;
         let r = index % 8;
         if r == 0 {
@@ -791,13 +864,13 @@ impl SliceData {
         Ok(())
     }
 
-    pub fn get_bytestring(&self, offset: usize) -> Vec<u8> {
+    pub fn get_bytestring(&self, offset: usize) -> SmallData {
         if self.remaining_bits() <= offset {
-            return vec![];
+            return SmallData::new();
         }
         let bits = self.remaining_bits() - offset;
         let bytes = bits_to_bytes(bits);
-        let mut buffer = vec![0; bytes];
+        let mut buffer = SmallData::from_elem(0, bytes);
         self.get_bits_to_slice(&mut buffer, Some((offset, bits)));
         buffer
     }
@@ -1057,7 +1130,8 @@ impl SliceData {
 /// it used from other repos
 /// need task
 impl SliceData {
-    pub fn new(data: Vec<u8>) -> SliceData {
+    pub fn new(data: impl Into<SmallData>) -> SliceData {
+        let data = data.into();
         match crate::find_tag(data.as_slice()) {
             0 => SliceData::default(),
             length_in_bits => SliceData::from_raw(data, length_in_bits),

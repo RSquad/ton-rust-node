@@ -96,6 +96,12 @@ pub(super) struct TransportErrors {
     pub rate_limited_global: AtomicU64,
     /// stateless Retry packets sent
     pub retry_sent: AtomicU64,
+    /// connections accepted into handle_connection()
+    pub accepted: AtomicU64,
+    /// connections that went through the delayed accept path
+    pub delayed: AtomicU64,
+    /// connections refused because the delayed-accept limit was reached
+    pub delayed_refused: AtomicU64,
 }
 
 impl TransportErrors {
@@ -109,24 +115,43 @@ impl TransportErrors {
             rate_limited_per_ip: AtomicU64::new(0),
             rate_limited_global: AtomicU64::new(0),
             retry_sent: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            delayed: AtomicU64::new(0),
+            delayed_refused: AtomicU64::new(0),
         })
     }
 
-    /// Take current values and reset to zero; returns (send_failed, query_timeout,
-    /// connect_failed, queue_full, dead_conn_removed, rate_limited_per_ip,
-    /// rate_limited_global, retry_sent).
-    pub fn take(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
-        (
-            self.send_failed.swap(0, Ordering::Relaxed),
-            self.query_timeout.swap(0, Ordering::Relaxed),
-            self.connect_failed.swap(0, Ordering::Relaxed),
-            self.queue_full.swap(0, Ordering::Relaxed),
-            self.dead_conn_removed.swap(0, Ordering::Relaxed),
-            self.rate_limited_per_ip.swap(0, Ordering::Relaxed),
-            self.rate_limited_global.swap(0, Ordering::Relaxed),
-            self.retry_sent.swap(0, Ordering::Relaxed),
-        )
+    /// Atomically take current values and reset all counters to zero.
+    pub fn take(&self) -> TransportErrorsSnapshot {
+        TransportErrorsSnapshot {
+            send_failed: self.send_failed.swap(0, Ordering::Relaxed),
+            query_timeout: self.query_timeout.swap(0, Ordering::Relaxed),
+            connect_failed: self.connect_failed.swap(0, Ordering::Relaxed),
+            queue_full: self.queue_full.swap(0, Ordering::Relaxed),
+            dead_conn_removed: self.dead_conn_removed.swap(0, Ordering::Relaxed),
+            rate_limited_per_ip: self.rate_limited_per_ip.swap(0, Ordering::Relaxed),
+            rate_limited_global: self.rate_limited_global.swap(0, Ordering::Relaxed),
+            retry_sent: self.retry_sent.swap(0, Ordering::Relaxed),
+            accepted: self.accepted.swap(0, Ordering::Relaxed),
+            delayed: self.delayed.swap(0, Ordering::Relaxed),
+            delayed_refused: self.delayed_refused.swap(0, Ordering::Relaxed),
+        }
     }
+}
+
+/// Point-in-time snapshot returned by `TransportErrors::take()`.
+pub(super) struct TransportErrorsSnapshot {
+    pub send_failed: u64,
+    pub query_timeout: u64,
+    pub connect_failed: u64,
+    pub queue_full: u64,
+    pub dead_conn_removed: u64,
+    pub rate_limited_per_ip: u64,
+    pub rate_limited_global: u64,
+    pub retry_sent: u64,
+    pub accepted: u64,
+    pub delayed: u64,
+    pub delayed_refused: u64,
 }
 
 /// Snapshot of cumulative counters from a single connection, used to compute deltas.

@@ -25,6 +25,7 @@ use crate::{
     validating_utils::fmt_next_block_descr,
     validator::{
         collator::{CollateResult, Collator},
+        state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
         validator_group::PipelineContext,
         validator_utils::PrevBlockHistory,
@@ -41,6 +42,7 @@ pub async fn run_validate_query_any_candidate(
     block_candidate: BlockCandidate,
     engine: Arc<dyn EngineOperations>,
     pipeline_context: PipelineContext,
+    state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     is_simplex: bool,
 ) -> Result<SystemTime> {
     let block_id = block_candidate.block_id.clone();
@@ -80,6 +82,7 @@ pub async fn run_validate_query_any_candidate(
         min_mc_seqno,
         prev_blocks_ids,
         pipeline_context,
+        if is_simplex { Some(state_resolver_cache.clone()) } else { None },
         block_candidate,
         validator_set,
         engine.clone(),
@@ -92,8 +95,14 @@ pub async fn run_validate_query_any_candidate(
     metrics::gauge!("ton_node_validator_active", &labels).decrement(1.0);
 
     match validator_result {
-        Ok(_next_state) => {
+        Ok(next_state_opt) => {
             metrics::counter!("ton_node_validator_successes_total", &labels).increment(1);
+
+            if is_simplex {
+                if let Some(next_state) = next_state_opt {
+                    state_resolver_cache.lock().await.store_validated_state(&block_id, next_state);
+                }
+            }
 
             // Store block data so accept_block_routine can find it without a network download.
             // Note: download_and_apply_block_worker also requires a proof/link on the handle
@@ -176,6 +185,7 @@ pub async fn run_validate_query(
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
             Default::default(),
+            None,
             block,
             set,
             engine.clone(),
@@ -191,6 +201,7 @@ pub async fn run_validate_query(
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
             Default::default(),
+            None,
             block.clone(),
             set,
             engine.clone(),
@@ -290,6 +301,7 @@ pub async fn run_collate_query(
     min_mc_seqno: u32,
     prev: &PrevBlockHistory,
     pipeline_context: PipelineContext,
+    state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     collator_id: PublicKey,
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
@@ -305,6 +317,7 @@ pub async fn run_collate_query(
         min_mc_seqno,
         prev,
         pipeline_context,
+        state_resolver_cache,
         set,
         UInt256::from(collator_id.pub_key()?),
         engine.clone(),

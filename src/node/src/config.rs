@@ -1538,6 +1538,9 @@ impl NodeConfigHandler {
         let Some(adnl_key_id) = &oldest_key.validator_adnl_key_id else {
             return Ok(());
         };
+        // Stable-adnl-key rotations: share one ADNL key across several
+        // ValidatorKeysJson entries. Keyring and ADNL/QUIC teardown must wait
+        // until the LAST entry referencing this ADNL key is pruned.
         let still_used = config
             .validator_keys
             .as_ref()
@@ -1552,7 +1555,9 @@ impl NodeConfigHandler {
             );
         } else {
             config.remove_key_from_key_ring(adnl_key_id).await?;
-            // Notify subscribers to clean up ADNL/QUIC/DHT state
+            // Notify subscribers to clean up ADNL/QUIC/DHT state for the
+            // removed election entry, only when the ADNL key is actually torn
+            // down (avoids spurious removals while the key is still in use).
             let adnl_key_bytes = base64_decode(adnl_key_id)?;
             let adnl_key_id = KeyId::from_data(
                 adnl_key_bytes[..]

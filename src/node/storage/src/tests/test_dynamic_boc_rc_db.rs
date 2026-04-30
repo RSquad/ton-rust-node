@@ -264,10 +264,8 @@ async fn test_async_cells_storage_adapter() -> Result<()> {
         let mut reader = BocReader::new();
         let head = reader.read_header(&mut Cursor::new(&data))?.0;
         let index = vec![Default::default(); head.cells_count];
-        reader.read_inmem_to_storage(
-            &data,
-            &mut AsyncCellsStorageAdapter::new(boc_db.clone(), index)?,
-        )?;
+        reader
+            .read_to_storage(&data, &mut AsyncCellsStorageAdapter::new(boc_db.clone(), index)?)?;
         Ok(())
     })
     .await??;

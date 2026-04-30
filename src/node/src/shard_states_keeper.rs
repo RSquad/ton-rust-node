@@ -23,7 +23,6 @@ use crate::{
 use adnl::common::add_unbound_object_to_map_with_update;
 use std::{
     collections::HashSet,
-    io::Cursor,
     ops::Deref,
     sync::{
         atomic::{AtomicU64, AtomicUsize},
@@ -335,7 +334,7 @@ impl ShardStatesKeeper {
                 let mut fast_cell_storage = ssk.db.create_fast_cell_storage(cells_index)?;
                 let r = BocReader::new()
                     .set_abort(&|| ssk.stopper.check_stop())
-                    .read_inmem_to_storage(data.as_slice(), &mut fast_cell_storage)?
+                    .read_to_storage(data.as_slice(), &mut fast_cell_storage)?
                     .withdraw_single_root()?;
                 Ok((r, fast_cell_storage))
             })
@@ -370,10 +369,9 @@ impl ShardStatesKeeper {
         let ssk = self.clone();
         let data_clone = header_boc.clone();
         let proof_root = tokio::task::spawn_blocking(move || -> Result<Cell> {
-            // Do not use read_inmem here because data buffer must be released soon after this call.
             BocReader::new()
                 .set_abort(&|| ssk.stopper.check_stop())
-                .read(&mut Cursor::new(&data_clone[..]))?
+                .read(&data_clone[..])?
                 .withdraw_single_root()
         })
         .await??;
@@ -446,7 +444,7 @@ impl ShardStatesKeeper {
                 let mut fast_cell_storage = ssk.db.create_fast_cell_storage(cells_index)?;
                 let r = BocReader::new()
                     .set_abort(&|| ssk.stopper.check_stop())
-                    .read_inmem_to_storage(data_.as_slice(), &mut fast_cell_storage)?
+                    .read_to_storage(data_.as_slice(), &mut fast_cell_storage)?
                     .withdraw_single_root()?;
                 Ok((r, fast_cell_storage))
             })
@@ -1349,7 +1347,7 @@ impl PssStorer {
                     .set_abort(abort.deref())
                     .set_arena(arena)
                     .set_load_cell_callback(&|cell| cells_cache.insert(cell.clone(), false))
-                    .read(&mut read_obj)?;
+                    .stream_read(&mut read_obj)?;
                 let load_time = now.elapsed();
                 log::debug!("pss worker: loaded prev {} in {:#?}", prev_part_id, load_time,);
                 prev_stuff.cached_states.insert(prev_part_id.clone());

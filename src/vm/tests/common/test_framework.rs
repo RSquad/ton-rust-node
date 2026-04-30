@@ -16,7 +16,7 @@ use ton_assembler::{compile_code, compile_code_to_builder, CompileError};
 use ton_block::{
     read_single_root_boc_file, BocWriter, Cell, Deserializable, Error, Exception, ExceptionCode,
     HashmapE, LibDescr, Libraries, MerkleProof, Message, Result, Serializable, ShardAccount,
-    ShardStateUnsplit, SliceData, UInt256, UnixTime, SUPPORTED_VERSION,
+    ShardStateUnsplit, SliceData, SmallData, UInt256, UnixTime, SUPPORTED_VERSION,
 };
 use ton_vm::{
     error::{tvm_exception, tvm_exception_code, tvm_exception_or_custom_code},
@@ -204,13 +204,13 @@ impl TestCaseInputs {
         self
     }
 
-    pub fn expect_bytecode(self, bytecode: Vec<u8>) -> TestCaseInputs {
+    pub fn expect_bytecode(self, bytecode: impl Into<SmallData>) -> TestCaseInputs {
         self.expect_bytecode_extended(bytecode, None)
     }
 
     pub fn expect_bytecode_extended(
         self,
-        bytecode: Vec<u8>,
+        bytecode: impl Into<SmallData>,
         message: Option<&str>,
     ) -> TestCaseInputs {
         let inputcode = SliceData::new(bytecode);
@@ -220,7 +220,7 @@ impl TestCaseInputs {
                 let mut selfcode = selfcode.clone();
                 let mut bytevec = vec![];
                 while selfcode.remaining_bits() != 0 {
-                    bytevec.append(&mut selfcode.get_bytestring(0));
+                    bytevec.extend_from_slice(&selfcode.get_bytestring(0));
                     if selfcode.remaining_references() > 0 {
                         selfcode = SliceData::load_cell(selfcode.reference(0).unwrap()).unwrap();
                     } else {

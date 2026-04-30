@@ -16,7 +16,7 @@ use crate::{
     validating_utils::build_checked_data,
     validator::validator_utils::{calc_subset_for_masterchain, ValidatorSubsetInfo},
 };
-use std::{io::Cursor, sync::Arc};
+use std::sync::Arc;
 use ton_block::{
     error, fail, write_boc, Block, BlockIdExt, BlockInfo, BlockProof, BlockSignaturesVariant,
     BocReader, Cell, ConfigParams, Deserializable, HashmapType, MerkleProof, Result, Serializable,
@@ -38,7 +38,7 @@ pub struct BlockProofStuff {
 impl BlockProofStuff {
     pub fn deserialize(block_id: &BlockIdExt, data: Vec<u8>, is_link: bool) -> Result<Self> {
         let data = Arc::new(data);
-        let root = BocReader::new().read(&mut Cursor::new(&*data))?.withdraw_single_root()?;
+        let root = BocReader::new().read(&*data)?.withdraw_single_root()?;
         let proof = BlockProof::construct_from_cell(root.clone())?;
         if &proof.proof_for != block_id {
             fail!(NodeError::InvalidData(format!(

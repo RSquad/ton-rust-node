@@ -102,7 +102,7 @@ fn create_test_account(amount: u64, address: AccountId, code: Cell, data: Cell) 
     );
     account.set_code(code);
     account.set_data(data);
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     account
 }
 

@@ -298,7 +298,7 @@ fn test_merkle_proof_hi_hashes2() {
 
 fn get_real_ton_block(filename: &str) -> (Block, Cell) {
     let root = BocReader::new()
-        .read(&mut File::open(filename).expect("Error open boc file"))
+        .stream_read(&mut File::open(filename).expect("Error open boc file"))
         .expect("Error deserializing boc file")
         .withdraw_single_root()
         .expect("Error deserializing boc file - expected one root");
@@ -309,7 +309,7 @@ fn get_real_ton_block(filename: &str) -> (Block, Cell) {
 
 fn get_real_ton_state(filename: &str) -> (ShardStateUnsplit, Cell) {
     let root = BocReader::new()
-        .read(&mut File::open(filename).expect("Error open boc file"))
+        .stream_read(&mut File::open(filename).expect("Error open boc file"))
         .expect("Error deserializing boc file")
         .withdraw_single_root()
         .expect("Error deserializing boc file - expected one root");

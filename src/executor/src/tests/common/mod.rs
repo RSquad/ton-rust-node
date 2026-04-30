@@ -278,7 +278,7 @@ pub fn create_test_account_workchain(
     );
     account.set_code(code);
     account.set_data(data);
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     account
 }
 
@@ -481,7 +481,7 @@ pub fn execute_with_params(
         if block_version < 11 {
             acc.del_storage_stat();
         } else {
-            acc.update_storage_stat(dict_hash_min_cells).unwrap();
+            acc.calc_storage_stat_dict(dict_hash_min_cells).unwrap();
         }
     }
     #[cfg(feature = "cross_check")]
@@ -1245,9 +1245,9 @@ impl TransactionTestContext {
         let key = code.repr_hash().write_to_bitstring().unwrap();
         let value = SimpleLib::new(code, public).write_to_new_cell().unwrap();
         self.acc.library_mut().unwrap().set_raw(key.clone(), &value).unwrap();
-        self.acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+        self.acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
         self.new_acc.library_mut().unwrap().set_raw(key, &value).unwrap();
-        self.new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+        self.new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     }
 }
 

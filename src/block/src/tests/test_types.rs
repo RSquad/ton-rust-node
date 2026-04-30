@@ -168,68 +168,68 @@ fn test_shared_secret() {
 fn test_get_bytestring() {
 
     let mut slice = SliceData::from_raw( vec![0b10110111, 0b01111011, 0b11101111, 0b10111111], 32);
-    assert_eq!(slice.get_bytestring( 0), vec![0b10110111, 0b01111011, 0b11101111, 0b10111111]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b01101110, 0b11110111, 0b11011111, 0b01111110]);
-    assert_eq!(slice.get_bytestring( 2), vec![0b11011101, 0b11101111, 0b10111110, 0b11111100]);
-    assert_eq!(slice.get_bytestring( 3), vec![0b10111011, 0b11011111, 0b01111101, 0b11111000]);
-    assert_eq!(slice.get_bytestring( 7), vec![0b10111101, 0b11110111, 0b11011111, 0b10000000]);
-    assert_eq!(slice.get_bytestring( 8), vec![0b01111011, 0b11101111, 0b10111111]);
-    assert_eq!(slice.get_bytestring( 9), vec![0b11110111, 0b11011111, 0b01111110]);
-    assert_eq!(slice.get_bytestring(10), vec![0b11101111, 0b10111110, 0b11111100]);
-    assert_eq!(slice.get_bytestring(24), vec![0b10111111]);
-    assert_eq!(slice.get_bytestring(25), vec![0b01111110]);
-    assert_eq!(slice.get_bytestring(26), vec![0b11111100]);
-    assert_eq!(slice.get_bytestring(31), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b10110111, 0b01111011, 0b11101111, 0b10111111]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b01101110, 0b11110111, 0b11011111, 0b01111110]);
+    assert_eq!(slice.get_bytestring( 2).as_slice(), &[0b11011101, 0b11101111, 0b10111110, 0b11111100]);
+    assert_eq!(slice.get_bytestring( 3).as_slice(), &[0b10111011, 0b11011111, 0b01111101, 0b11111000]);
+    assert_eq!(slice.get_bytestring( 7).as_slice(), &[0b10111101, 0b11110111, 0b11011111, 0b10000000]);
+    assert_eq!(slice.get_bytestring( 8).as_slice(), &[0b01111011, 0b11101111, 0b10111111]);
+    assert_eq!(slice.get_bytestring( 9).as_slice(), &[0b11110111, 0b11011111, 0b01111110]);
+    assert_eq!(slice.get_bytestring(10).as_slice(), &[0b11101111, 0b10111110, 0b11111100]);
+    assert_eq!(slice.get_bytestring(24).as_slice(), &[0b10111111]);
+    assert_eq!(slice.get_bytestring(25).as_slice(), &[0b01111110]);
+    assert_eq!(slice.get_bytestring(26).as_slice(), &[0b11111100]);
+    assert_eq!(slice.get_bytestring(31).as_slice(), &[0b10000000]);
     assert!(slice.get_bytestring(32).is_empty());
     assert!(slice.get_bytestring(33).is_empty());
 
     slice.move_by(1).unwrap();
-    assert_eq!(slice.get_bytestring( 0), vec![0b01101110, 0b11110111, 0b11011111, 0b01111110]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b11011101, 0b11101111, 0b10111110, 0b11111100]);
-    assert_eq!(slice.get_bytestring(25), vec![0b11111100]);
-    assert_eq!(slice.get_bytestring(30), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b01101110, 0b11110111, 0b11011111, 0b01111110]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b11011101, 0b11101111, 0b10111110, 0b11111100]);
+    assert_eq!(slice.get_bytestring(25).as_slice(), &[0b11111100]);
+    assert_eq!(slice.get_bytestring(30).as_slice(), &[0b10000000]);
     assert!(slice.get_bytestring(31).is_empty());
 
     let mut slice = SliceData::from_raw( vec![0b10110111, 0b01111011, 0b11101111, 0b10111111], 32);
     slice.shrink_data(0..=30);
-    assert_eq!(slice.get_bytestring( 0), vec![0b10110111, 0b01111011, 0b11101111, 0b10111110]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b01101110, 0b11110111, 0b11011111, 0b01111100]);
-    assert_eq!(slice.get_bytestring(25), vec![0b01111100]);
-    assert_eq!(slice.get_bytestring(30), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b10110111, 0b01111011, 0b11101111, 0b10111110]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b01101110, 0b11110111, 0b11011111, 0b01111100]);
+    assert_eq!(slice.get_bytestring(25).as_slice(), &[0b01111100]);
+    assert_eq!(slice.get_bytestring(30).as_slice(), &[0b10000000]);
     assert!(slice.get_bytestring(31).is_empty());
 
     let mut slice = SliceData::from_raw( vec![0b10110111, 0b01111011, 0b11101111, 0b10111111], 32);
     slice.shrink_data(0..=29);
-    assert_eq!(slice.get_bytestring( 0), vec![0b10110111, 0b01111011, 0b11101111, 0b10111100]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b01101110, 0b11110111, 0b11011111, 0b01111000]);
-    assert_eq!(slice.get_bytestring(25), vec![0b01111000]);
-    assert_eq!(slice.get_bytestring(29), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b10110111, 0b01111011, 0b11101111, 0b10111100]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b01101110, 0b11110111, 0b11011111, 0b01111000]);
+    assert_eq!(slice.get_bytestring(25).as_slice(), &[0b01111000]);
+    assert_eq!(slice.get_bytestring(29).as_slice(), &[0b10000000]);
     assert!(slice.get_bytestring(30).is_empty());
 
     let mut slice = SliceData::from_raw( vec![0b10110111, 0b01111011, 0b11101111, 0b10111111], 32);
     slice.shrink_data(0..=23);
-    assert_eq!(slice.get_bytestring( 0), vec![0b10110111, 0b01111011, 0b11101111]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b01101110, 0b11110111, 0b11011110]);
-    assert_eq!(slice.get_bytestring(23), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b10110111, 0b01111011, 0b11101111]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b01101110, 0b11110111, 0b11011110]);
+    assert_eq!(slice.get_bytestring(23).as_slice(), &[0b10000000]);
     assert!(slice.get_bytestring(24).is_empty());
 
     let mut slice = SliceData::from_raw( vec![0b10110111, 0b01111011, 0b11101111, 0b10111111], 32);
     slice.shrink_data(0..=21);
-    assert_eq!(slice.get_bytestring( 0), vec![0b10110111, 0b01111011, 0b11101100]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b01101110, 0b11110111, 0b11011000]);
-    assert_eq!(slice.get_bytestring(21), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b10110111, 0b01111011, 0b11101100]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b01101110, 0b11110111, 0b11011000]);
+    assert_eq!(slice.get_bytestring(21).as_slice(), &[0b10000000]);
     assert!(slice.get_bytestring(22).is_empty());
 
     slice.move_by(6).unwrap();
-    assert_eq!(slice.get_bytestring( 0), vec![0b11011110, 0b11111011]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b10111101, 0b11110110]);
-    assert_eq!(slice.get_bytestring(14), vec![0b11000000]);
-    assert_eq!(slice.get_bytestring(15), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b11011110, 0b11111011]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b10111101, 0b11110110]);
+    assert_eq!(slice.get_bytestring(14).as_slice(), &[0b11000000]);
+    assert_eq!(slice.get_bytestring(15).as_slice(), &[0b10000000]);
 
     slice.move_by(1).unwrap();
-    assert_eq!(slice.get_bytestring( 0), vec![0b10111101, 0b11110110]);
-    assert_eq!(slice.get_bytestring( 1), vec![0b01111011, 0b11101100]);
-    assert_eq!(slice.get_bytestring(14), vec![0b10000000]);
+    assert_eq!(slice.get_bytestring( 0).as_slice(), &[0b10111101, 0b11110110]);
+    assert_eq!(slice.get_bytestring( 1).as_slice(), &[0b01111011, 0b11101100]);
+    assert_eq!(slice.get_bytestring(14).as_slice(), &[0b10000000]);
     assert!(slice.get_bytestring(15).is_empty());
 
 }

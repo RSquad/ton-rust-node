@@ -489,9 +489,9 @@ macro_rules! define_HashmapE {
                 let key = key.write_to_bitstring()?;
                 self.add_key_serialized(key)
             }
-            pub fn multiset<I>(&mut self, iter: I) -> Result<()>
+            pub fn multiset<'a, I>(&mut self, iter: I) -> Result<()>
             where
-                I: Iterator<Item = (SliceData, Option<SliceData>)>,
+                I: IntoIterator<Item = ($crate::dictionary::FixedBitsKey<'a>, Option<SliceData>)>,
             {
                 $crate::HashmapType::hashmap_multiset(&mut self.0, iter)?;
                 Ok(())
@@ -502,6 +502,9 @@ macro_rules! define_HashmapE {
                     .transpose()
             }
             pub fn get_as_slice<K: Serializable>(&self, key: &K) -> Result<Option<SliceData>> {
+                if self.is_empty() {
+                    return Ok(None);
+                }
                 let key = key.write_to_bitstring()?;
                 self.get_raw(key)
             }
