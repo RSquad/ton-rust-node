@@ -640,7 +640,6 @@ impl Account {
         Account { stuff: None }
     }
     const fn with_stuff(stuff: AccountStuff) -> Self {
-        debug_assert!(stuff.addr.rewrite_pfx().is_none());
         Self { stuff: Some(stuff) }
     }
 

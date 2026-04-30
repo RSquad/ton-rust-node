@@ -1077,11 +1077,19 @@ impl Engine {
                 }
                 let mut is_link = false;
                 if handle.has_data() && handle.has_proof_or_link(&mut is_link) {
+                    log::debug!(
+                        "download_and_apply_block_worker: block {} has data+proof, entering \
+                        apply awaiter loop (pre_apply: {}, applied: {}, has_state: {})",
+                        id,
+                        pre_apply,
+                        handle.is_applied(),
+                        handle.has_state()
+                    );
                     while !((pre_apply && handle.has_state()) || handle.is_applied()) {
                         let s = self.clone();
                         let res = self
                             .block_applying_awaiters()
-                            .do_or_wait(handle.id(), None, async {
+                            .do_or_wait(handle.id(), Some(10_000), async {
                                 let block = s.load_block(&handle).await?;
                                 s.apply_block_worker(
                                     &handle,
@@ -1468,7 +1476,6 @@ impl Engine {
             packages: create_metric("Alloc NODE packages"),
             storing_cells: create_metric("Alloc NODE storing cells"),
             shardstates_queue: create_metric("Alloc NODE shardstates queue"),
-            cached_cells_counters: create_metric("Alloc NODE cells counters"),
 
             loaded_cells_from_db: create_metric_per_sec("NODE loaded from db cells/sec"),
             load_cell_from_db_time_nanos: create_metric_with_total_average(
@@ -1522,6 +1529,9 @@ impl Engine {
             cell_cache_hits: create_metric_per_sec("NODE cell cache hits/sec"),
             cell_cache_misses: create_metric_per_sec("NODE cell cache misses/sec"),
             cell_cache_len: create_metric("NODE cell cache len"),
+            counter_cache_hits: create_metric_per_sec("NODE counter cache hits/sec"),
+            counter_cache_misses: create_metric_per_sec("NODE counter cache misses/sec"),
+            counter_cache_len: create_metric("NODE counter cache len"),
             rocksdb_mem_table_mb: create_metric("Alloc NODE RocksDB mem tables, MB"),
             rocksdb_block_cache_mb: create_metric("Alloc NODE RocksDB block cache, MB"),
         });
@@ -1544,7 +1554,6 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.packages.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.storing_cells.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.cached_cells_counters.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells_from_db.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_db_time_nanos.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_cache_time_nanos.clone()),
@@ -1569,6 +1578,9 @@ impl Engine {
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_hits.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_misses.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.cell_cache_len.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.counter_cache_hits.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.counter_cache_misses.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.counter_cache_len.clone()),
             TelemetryItem::Metric(engine_telemetry.awaiters.clone()),
             TelemetryItem::Metric(engine_telemetry.catchain_clients.clone()),
             TelemetryItem::Metric(engine_telemetry.cells.clone()),
@@ -2127,16 +2139,15 @@ async fn boot(
         load_zero_state(engine, zerostate_path).await?;
     }
 
-    let result = match engine.load_last_applied_mc_block_id() {
-        Ok(Some(id)) => crate::boot::warm_boot(engine.clone(), id, hardfork_path).await,
-        Ok(None) => Err(error!("No last applied MC block, warm boot is not possible")),
-        Err(x) => Err(x),
-    };
-
-    let (last_applied_mc_block, cold) = match result {
-        Ok(block_id) => (block_id.clone(), false),
-        Err(err) => {
-            log::warn!("Before cold boot: {err}");
+    let (last_applied_mc_block, cold) = match engine.load_last_applied_mc_block_id() {
+        Ok(Some(id)) => {
+            let id =
+                crate::boot::warm_boot(engine.clone(), id.clone(), hardfork_path).await.map_err(
+                    |e| error!("Warm boot failed: {e}. Need to clear the DB and re-sync node"),
+                )?;
+            (id, false)
+        }
+        _ => {
             engine.acquire_stop(Engine::MASK_SERVICE_BOOT);
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
@@ -2508,26 +2519,11 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 log::warn!("Can't log workers stats: {}", e);
             }
             {
-                let hits = engine
-                    .engine_telemetry
-                    .storage
-                    .cell_cache_hits
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let misses = engine
-                    .engine_telemetry
-                    .storage
-                    .cell_cache_misses
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let total = hits + misses;
-                let hit_rate = if total > 0 { hits * 100 / total } else { 0 };
+                let st = &engine.engine_telemetry.storage;
                 log::info!(
                     target: "telemetry",
-                    "Cell cache hit_rate: {}%",
-                    hit_rate
+                    "Cell cache hit_rate: {}%, Counter cache hit_rate: {}%",
+                    st.cell_cache_hit_rate(), st.counter_cache_hit_rate()
                 );
             }
             engine.telemetry_printer.try_print();

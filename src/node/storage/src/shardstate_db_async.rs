@@ -109,15 +109,21 @@ impl Job {
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct CellsDbConfig {
     pub states_db_queue_len: u32,
-    pub prefill_cells_counters: bool,
+    #[serde(default, skip_serializing, rename = "prefill_cells_counters")]
+    _prefill_cells_counters: Option<bool>,
     pub cells_cache_size_bytes: u64,
     pub counters_cache_size_bytes: u64,
     #[serde(default = "CellsDbConfig::default_cells_lru_cache_capacity")]
     pub cells_lru_cache_capacity: usize,
+    #[serde(default = "CellsDbConfig::default_counters_lru_cache_capacity")]
+    pub counters_lru_cache_capacity: usize,
 }
 
 impl CellsDbConfig {
     fn default_cells_lru_cache_capacity() -> usize {
+        5_000_000
+    }
+    fn default_counters_lru_cache_capacity() -> usize {
         5_000_000
     }
 }
@@ -126,10 +132,11 @@ impl Default for CellsDbConfig {
     fn default() -> Self {
         Self {
             states_db_queue_len: 1000,
-            prefill_cells_counters: false,
+            _prefill_cells_counters: None,
             cells_cache_size_bytes: 2_000_000_000,
             counters_cache_size_bytes: 1_000_000_000,
             cells_lru_cache_capacity: Self::default_cells_lru_cache_capacity(),
+            counters_lru_cache_capacity: Self::default_counters_lru_cache_capacity(),
         }
     }
 }
@@ -534,21 +541,6 @@ impl ShardStateDb {
                 false
             }
         };
-
-        let ss_db = Arc::clone(&self);
-
-        if ss_db.config.prefill_cells_counters {
-            log::info!(target: TARGET, "ShardStateDb worker: prefilling cells counters started");
-            if let Err(e) = tokio::task::block_in_place(|| -> Result<()> {
-                ss_db.dynamic_boc_db.fill_counters(&check_stop)
-            }) {
-                log::error!(
-                    target: TARGET,
-                    "CRITICAL! ShardStateDb::put_internal: Can't fill cells counters: {e}"
-                );
-                return;
-            }
-        }
 
         loop {
             if check_stop() {

@@ -1550,7 +1550,7 @@ fn test_store_opt_std_address() {
         );
 
     // standard address without anycast
-    let addr = MsgAddressInt::with_standart(None, 0, [0x33; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x33; 32]);
     let builder = addr.write_to_new_cell().unwrap();
     let cell = builder.clone().into_cell().unwrap();
     test_case_with_ref("PUSHREFSLICE NEWC STSTDADDR", cell.clone())
