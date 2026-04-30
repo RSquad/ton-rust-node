@@ -180,39 +180,65 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
 
     if !view.bindings.is_empty() {
         let has_static_adnl = view.bindings.iter().any(|b| b.static_adnl.is_some());
+        // Column widths: stake policy strings can be long (e.g. adaptive_split50 (50% or 100%)).
+        // Headers/data must pad plain text before coloring — ANSI must not count toward {:<N}.
+        const W_NODE: usize = 20;
+        const W_ENABLE: usize = 12;
+        const W_STATUS: usize = 18;
+        const W_STAKE: usize = 38;
+        const W_ADNL: usize = 24;
+
         println!("\n  {}", "Bindings:".cyan().bold());
+        let rule_len =
+            W_NODE + W_ENABLE + W_STATUS + W_STAKE + if has_static_adnl { W_ADNL } else { 0 };
         if has_static_adnl {
             println!(
-                "    {:<20} {:<12} {:<16} {:<20} {}",
-                "Node".cyan(),
-                "Enable".cyan(),
-                "Status".cyan(),
-                "Stake Policy".cyan(),
-                "Static ADNL".cyan(),
+                "    {}{}{}{}{}",
+                format!("{:<w$}", "Node", w = W_NODE).cyan(),
+                format!("{:<w$}", "Enable", w = W_ENABLE).cyan(),
+                format!("{:<w$}", "Status", w = W_STATUS).cyan(),
+                format!("{:<w$}", "Stake Policy", w = W_STAKE).cyan(),
+                format!("{:<w$}", "Static ADNL", w = W_ADNL).cyan(),
             );
         } else {
             println!(
-                "    {:<20} {:<12} {:<16} {}",
-                "Node".cyan(),
-                "Enable".cyan(),
-                "Status".cyan(),
-                "Stake Policy".cyan(),
+                "    {}{}{}{}",
+                format!("{:<w$}", "Node", w = W_NODE).cyan(),
+                format!("{:<w$}", "Enable", w = W_ENABLE).cyan(),
+                format!("{:<w$}", "Status", w = W_STATUS).cyan(),
+                format!("{:<w$}", "Stake Policy", w = W_STAKE).cyan(),
             );
         }
-        println!("    {}", "─".repeat(if has_static_adnl { 100 } else { 70 }).dimmed());
+        println!("    {}", "─".repeat(rule_len).dimmed());
         for b in &view.bindings {
-            let enable_str =
-                if b.enable { "yes".green().to_string() } else { "no".red().to_string() };
+            let enable_cell = if b.enable {
+                format!("{:<w$}", "yes", w = W_ENABLE).green()
+            } else {
+                format!("{:<w$}", "no", w = W_ENABLE).red()
+            };
+
+            let status_cell = format!("{:<w_st$}", b.status.to_string(), w_st = W_STATUS);
+            let stake_cell = format!("{:<w_sk$}", b.stake_policy.to_string(), w_sk = W_STAKE);
             if has_static_adnl {
                 let adnl = b.static_adnl.as_deref().unwrap_or("—");
+                let adnl_cell = format!("{:<w_ad$}", adnl, w_ad = W_ADNL);
                 println!(
-                    "    {:<20} {:<21} {:<16} {:<20} {}",
-                    b.name, enable_str, b.status, b.stake_policy, adnl,
+                    "    {:<w$}{}{}{}{}",
+                    b.name,
+                    enable_cell,
+                    status_cell,
+                    stake_cell,
+                    adnl_cell,
+                    w = W_NODE,
                 );
             } else {
                 println!(
-                    "    {:<20} {:<21} {:<16} {}",
-                    b.name, enable_str, b.status, b.stake_policy,
+                    "    {:<w$}{}{}{}",
+                    b.name,
+                    enable_cell,
+                    status_cell,
+                    stake_cell,
+                    w = W_NODE,
                 );
             }
         }
