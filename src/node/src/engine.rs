@@ -2139,16 +2139,15 @@ async fn boot(
         load_zero_state(engine, zerostate_path).await?;
     }
 
-    let result = match engine.load_last_applied_mc_block_id() {
-        Ok(Some(id)) => crate::boot::warm_boot(engine.clone(), id, hardfork_path).await,
-        Ok(None) => Err(error!("No last applied MC block, warm boot is not possible")),
-        Err(x) => Err(x),
-    };
-
-    let (last_applied_mc_block, cold) = match result {
-        Ok(block_id) => (block_id.clone(), false),
-        Err(err) => {
-            log::warn!("Before cold boot: {err}");
+    let (last_applied_mc_block, cold) = match engine.load_last_applied_mc_block_id() {
+        Ok(Some(id)) => {
+            let id =
+                crate::boot::warm_boot(engine.clone(), id.clone(), hardfork_path).await.map_err(
+                    |e| error!("Warm boot failed: {e}. Need to clear the DB and re-sync node"),
+                )?;
+            (id, false)
+        }
+        _ => {
             engine.acquire_stop(Engine::MASK_SERVICE_BOOT);
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
