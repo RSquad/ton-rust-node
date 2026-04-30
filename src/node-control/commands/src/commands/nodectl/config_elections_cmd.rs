@@ -12,7 +12,7 @@ use crate::commands::nodectl::{
 };
 use colored::Colorize;
 use common::{
-    app_config::{BindingStatus, StakePolicy},
+    app_config::{BindingStatus, ElectionsConfig, StakePolicy},
     ton_utils::tons_f64_to_nanotons,
 };
 use std::collections::HashMap;
@@ -279,6 +279,34 @@ struct ElectionsSettingsBody {
 
 const ELECTIONS_SETTINGS_PATH: &str = "/v1/elections/settings";
 
+/// Current adaptive timing from `GET /v1/elections/settings` (same merge semantics as the service).
+async fn fetch_adaptive_timing_percentages(
+    base_url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<(f64, f64)> {
+    let body = api_get(base_url, "/v1/elections/settings", token).await?;
+    let resp: serde_json::Value = serde_json::from_str(&body)?;
+    let result = resp
+        .get("result")
+        .ok_or_else(|| anyhow::anyhow!("elections settings response: missing 'result'"))?;
+    let sleep = result
+        .get("sleep_period_pct")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow::anyhow!("elections settings: missing sleep_period_pct"))?;
+    let waiting = result
+        .get("waiting_period_pct")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow::anyhow!("elections settings: missing waiting_period_pct"))?;
+    Ok((sleep, waiting))
+}
+
+fn validate_sleep_waiting_pair(sleep: f64, waiting: f64) -> anyhow::Result<()> {
+    let mut ec = ElectionsConfig::default();
+    ec.sleep_period_pct = sleep;
+    ec.waiting_period_pct = waiting;
+    ec.validate_timing_fields()
+}
+
 impl StakePolicySetCmd {
     pub async fn run(
         &self,
@@ -387,6 +415,8 @@ impl AdaptivePeriodPctCmd {
     ) -> anyhow::Result<()> {
         Self::validate_range(self.value)?;
         let base_url = resolve_service_url(url, config_path)?;
+        let (_cur_sleep, cur_waiting) = fetch_adaptive_timing_percentages(&base_url, token).await?;
+        validate_sleep_waiting_pair(self.value, cur_waiting)?;
         api_post(
             &base_url,
             ELECTIONS_SETTINGS_PATH,
@@ -410,6 +440,8 @@ impl AdaptivePeriodPctCmd {
     ) -> anyhow::Result<()> {
         Self::validate_range(self.value)?;
         let base_url = resolve_service_url(url, config_path)?;
+        let (cur_sleep, _cur_waiting) = fetch_adaptive_timing_percentages(&base_url, token).await?;
+        validate_sleep_waiting_pair(cur_sleep, self.value)?;
         api_post(
             &base_url,
             ELECTIONS_SETTINGS_PATH,
