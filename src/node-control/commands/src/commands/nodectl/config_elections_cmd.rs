@@ -35,9 +35,9 @@ pub enum ElectionsAction {
     /// Set the max-factor
     MaxFactor(MaxFactorCmd),
     /// Set AdaptiveSplit50 minimum wait fraction (`sleep_period_pct` in config, 0.0–1.0, must be ≤ waiting period)
-    AdaptiveSleepPeriodPct(AdaptivePeriodPctCmd),
+    AdaptiveSleepPeriodPct(AdaptiveSleepPeriodPctCmd),
     /// Set AdaptiveSplit50 maximum wait fraction (`waiting_period_pct` in config, 0.0–1.0, must be ≥ sleep period)
-    AdaptiveWaitingPeriodPct(AdaptivePeriodPctCmd),
+    AdaptiveWaitingPeriodPct(AdaptiveWaitingPeriodPctCmd),
     /// Enable elections for binding(s)
     Enable(EnableCmd),
     /// Disable elections for binding(s)
@@ -87,7 +87,13 @@ pub struct MaxFactorCmd {
 }
 
 #[derive(clap::Args, Clone)]
-pub struct AdaptivePeriodPctCmd {
+pub struct AdaptiveSleepPeriodPctCmd {
+    #[arg(help = "Fraction of election duration in [0.0, 1.0]")]
+    value: f64,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct AdaptiveWaitingPeriodPctCmd {
     #[arg(help = "Fraction of election duration in [0.0, 1.0]")]
     value: f64,
 }
@@ -122,11 +128,9 @@ impl ElectionsCfgCmd {
             ElectionsAction::StakePolicy(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::TickInterval(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::MaxFactor(cmd) => cmd.run(url, token, config_path).await,
-            ElectionsAction::AdaptiveSleepPeriodPct(cmd) => {
-                cmd.run_adaptive_sleep(url, token, config_path).await
-            }
+            ElectionsAction::AdaptiveSleepPeriodPct(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::AdaptiveWaitingPeriodPct(cmd) => {
-                cmd.run_adaptive_waiting(url, token, config_path).await
+                cmd.run(url, token, config_path).await
             }
             ElectionsAction::Enable(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Disable(cmd) => cmd.run(url, token, config_path).await,
@@ -168,19 +172,12 @@ struct ElectionsSettingsView {
     policy_overrides: HashMap<String, StakePolicy>,
     max_factor: f32,
     tick_interval: u64,
-    #[serde(default = "default_sleep_period_pct")]
+    #[serde(default = "common::app_config::default_sleep_pct")]
     sleep_period_pct: f64,
-    #[serde(default = "default_waiting_period_pct")]
+    #[serde(default = "common::app_config::default_waiting_pct")]
     waiting_period_pct: f64,
+    #[serde(default)]
     bindings: Vec<BindingElectionView>,
-}
-
-fn default_sleep_period_pct() -> f64 {
-    0.2
-}
-
-fn default_waiting_period_pct() -> f64 {
-    0.4
 }
 
 #[derive(serde::Deserialize)]
@@ -198,16 +195,8 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
     println!("  {:<20} {}", "Stake Policy:".cyan().bold(), view.stake_policy);
     println!("  {:<20} {}", "Max Factor:".cyan().bold(), view.max_factor);
     println!("  {:<20} {}s", "Tick Interval:".cyan().bold(), view.tick_interval);
-    println!(
-        "  {:<28} {} (config: sleep_period_pct)",
-        "adaptive_sleep_period_pct:".cyan().bold(),
-        view.sleep_period_pct
-    );
-    println!(
-        "  {:<28} {} (config: waiting_period_pct)",
-        "adaptive_waiting_period_pct:".cyan().bold(),
-        view.waiting_period_pct
-    );
+    println!("  {:<28} {}", "adaptive_sleep_period_pct:".cyan().bold(), view.sleep_period_pct);
+    println!("  {:<28} {}", "adaptive_waiting_period_pct:".cyan().bold(), view.waiting_period_pct);
 
     if !view.policy_overrides.is_empty() {
         println!("\n  {}", "Policy Overrides:".cyan().bold());
@@ -305,6 +294,13 @@ fn validate_sleep_waiting_pair(sleep: f64, waiting: f64) -> anyhow::Result<()> {
     ec.sleep_period_pct = sleep;
     ec.waiting_period_pct = waiting;
     ec.validate_timing_fields()
+}
+
+fn validate_adaptive_pct_range(v: f64) -> anyhow::Result<()> {
+    if !(0.0..=1.0).contains(&v) {
+        anyhow::bail!("value must be in range [0.0, 1.0]");
+    }
+    Ok(())
 }
 
 impl StakePolicySetCmd {
@@ -406,14 +402,14 @@ impl MaxFactorCmd {
     }
 }
 
-impl AdaptivePeriodPctCmd {
-    pub async fn run_adaptive_sleep(
+impl AdaptiveSleepPeriodPctCmd {
+    pub async fn run(
         &self,
         url: Option<&str>,
         token: Option<&str>,
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
-        Self::validate_range(self.value)?;
+        validate_adaptive_pct_range(self.value)?;
         let base_url = resolve_service_url(url, config_path)?;
         let (_cur_sleep, cur_waiting) = fetch_adaptive_timing_percentages(&base_url, token).await?;
         validate_sleep_waiting_pair(self.value, cur_waiting)?;
@@ -431,14 +427,16 @@ impl AdaptivePeriodPctCmd {
         );
         Ok(())
     }
+}
 
-    pub async fn run_adaptive_waiting(
+impl AdaptiveWaitingPeriodPctCmd {
+    pub async fn run(
         &self,
         url: Option<&str>,
         token: Option<&str>,
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
-        Self::validate_range(self.value)?;
+        validate_adaptive_pct_range(self.value)?;
         let base_url = resolve_service_url(url, config_path)?;
         let (cur_sleep, _cur_waiting) = fetch_adaptive_timing_percentages(&base_url, token).await?;
         validate_sleep_waiting_pair(cur_sleep, self.value)?;
@@ -454,13 +452,6 @@ impl AdaptivePeriodPctCmd {
             "OK".green().bold(),
             self.value
         );
-        Ok(())
-    }
-
-    fn validate_range(v: f64) -> anyhow::Result<()> {
-        if !(0.0..=1.0).contains(&v) {
-            anyhow::bail!("value must be in range [0.0, 1.0]");
-        }
         Ok(())
     }
 }
