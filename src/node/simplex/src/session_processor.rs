@@ -91,7 +91,8 @@ use crate::{
     SessionId, SessionListenerPtr, ValidatorWeight, SIMPLEX_ROUNDLESS,
 };
 use consensus_common::{
-    check_execution_time, instrument, profiling::ResultStatusCounter, StorageAsyncResultPtr,
+    check_execution_time, instrument, profiling::ResultStatusCounter, CandidateObservedFlags,
+    EnsureCandidateAvailabilityOptions, StorageAsyncResultPtr,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -156,9 +157,25 @@ const CANDIDATE_REQUEST_DELAY: Duration = Duration::from_secs(1);
 /// Under network partitions, a single request may time out; we must retry, but not spam.
 const CANDIDATE_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Maximum empty-parent ancestry depth to walk when resolving the expected
-/// normal tip for empty candidates.
-const MAX_CHAIN_DEPTH: u32 = 10000;
+/// Soft warning threshold for deep empty-parent ancestry walks.
+///
+/// We keep processing beyond this depth because long empty tails are possible on
+/// live networks during prolonged empty-block recovery windows.
+const EMPTY_CHAIN_WARN_DEPTH: u32 = 10_000;
+
+/// Hard stop for empty-parent ancestry walks.
+///
+/// This is a defense-in-depth bound against corrupted/self-referential parent
+/// metadata while still allowing very deep (but finite) empty tails.
+const MAX_CHAIN_DEPTH: u32 = 100_000;
+
+/// Delay between deferred retries of `ensure_candidate_available` when the
+/// `BlockIdExt → RawCandidateId` mapping is not yet known.
+const RESOLVER_AVAILABILITY_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Maximum number of deferred retries before giving up on resolving a
+/// `BlockIdExt` to `RawCandidateId` for the resolver.
+const RESOLVER_AVAILABILITY_MAX_RETRIES: u32 = 6;
 
 /// SessionProcessor always enforces C++ `WaitForParent` readiness before dispatching validation.
 ///
@@ -430,8 +447,8 @@ use crate::ValidatorBlockCandidatePtr;
 struct PrecollatedBlock {
     /// Request for tracking/cancellation
     request: Arc<AsyncRequestImpl>,
-    /// Candidate data - None if still pending
-    candidate: Option<ValidatorBlockCandidatePtr>,
+    /// Completed collation result - None if still pending
+    result: Option<CollationResult>,
     /// Parent captured at collation start (avoids race vs consensus events)
     ///
     /// This is the parent that was available when collation was initiated.
@@ -466,6 +483,41 @@ struct LocalChainHead {
     block_id: BlockIdExt,
     /// Exact generation time extracted from ConsensusExtraData, if available.
     gen_utime_ms: Option<u64>,
+}
+
+struct PreparedCollation {
+    prev_block_ids: Vec<BlockIdExt>,
+    slot_start_time: SystemTime,
+    new_seqno: u32,
+    is_first_session_block: bool,
+}
+
+enum CollationPreparation {
+    Ready(PreparedCollation),
+    Deferred(SystemTime),
+    WaitingForParent,
+}
+
+#[derive(Clone, Copy)]
+enum CollationAttempt {
+    Initial,
+    Retry { retry_count: u32 },
+}
+
+impl CollationAttempt {
+    fn log_context(self) -> &'static str {
+        match self {
+            Self::Initial => "invoke_collation",
+            Self::Retry { .. } => "invoke_collation_retry",
+        }
+    }
+
+    fn failure_retry_count(self) -> u32 {
+        match self {
+            Self::Initial => 0,
+            Self::Retry { retry_count } => retry_count,
+        }
+    }
 }
 
 /*
@@ -630,6 +682,13 @@ enum McValidationReadiness {
     WaitingForAcceptedHead,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaitForParentDecision {
+    Ready,
+    Wait,
+    Reject(String),
+}
+
 /*
     Finalization Journal
 
@@ -719,6 +778,12 @@ pub(crate) struct SessionProcessor {
     /// Contains all immutable session-level configuration including session_id,
     /// local_key, initial_block_seqno, session_creation_time.
     description: Arc<SessionDescription>,
+    /// Explicit session start parents from ValidatorGroup.
+    ///
+    /// `SimplexState` still models the first slot as "session base" internally
+    /// (`parent=None`), but all validator-facing collation requests must remap
+    /// that sentinel back to these concrete start parents.
+    session_start_prev_blocks: Vec<BlockIdExt>,
     /// Task queue for main processing
     task_queue: TaskQueuePtr,
     /// Task queue for callbacks
@@ -746,6 +811,10 @@ pub(crate) struct SessionProcessor {
     candidate_info_store_results: HashMap<RawCandidateId, StorageAsyncResultPtr<()>>,
     /// NotarCert DB writes in-flight/completed (for WaitCandidateInfoStored parity)
     notar_cert_store_results: HashMap<RawCandidateId, StorageAsyncResultPtr<()>>,
+    /// FinalCert DB writes in-flight/completed.
+    final_cert_store_results: HashMap<RawCandidateId, StorageAsyncResultPtr<()>>,
+    /// SkipCert DB writes in-flight/completed.
+    skip_cert_store_results: HashMap<SlotIndex, StorageAsyncResultPtr<()>>,
     /// Use separate callback thread for session callbacks
     use_callback_thread: bool,
     /// Current active weight from receiver
@@ -798,6 +867,20 @@ pub(crate) struct SessionProcessor {
     /// `candidate_decision_ok_internal()` outcome.
     generated_candidates_waiting_validation:
         HashMap<RawCandidateId, GeneratedCandidateValidationWatch>,
+    /// Self-collation flows currently in progress, keyed by slot.
+    ///
+    /// Tracks `(started_at, expected_seqno)` for the FIRST `on_generate_slot()`
+    /// dispatch on this slot. Retry attempts collapse onto the same entry, so
+    /// the whole collation flow (initial + retries) is counted as ONE collation.
+    /// Removed when the flow ends — either by success (moved to
+    /// `self_collation_pending_acceptance`), by final failure (no more retries),
+    /// or by an ignore path (e.g. cancelled callback / pipeline reset).
+    self_collation_starts_by_slot: HashMap<SlotIndex, (SystemTime, u32)>,
+    /// Self-collations whose candidate has been generated and is waiting for
+    /// `notify_block_finalized` to fire on `(slot, hash)`. Carries
+    /// `(started_at, expected_seqno)` so acceptance latency is measured from
+    /// the original `on_generate_slot()` dispatch.
+    self_collation_pending_acceptance: HashMap<RawCandidateId, (SystemTime, u32)>,
 
     /*
         Validation state
@@ -862,6 +945,8 @@ pub(crate) struct SessionProcessor {
     validates_counter: ResultStatusCounter,
     /// Result status counter for collation requests
     collates_counter: ResultStatusCounter,
+    /// Result status counter for self-collation attempts.
+    self_collates_counter: ResultStatusCounter,
     /// Counter for precollation requests
     precollation_requests_counter: metrics::Counter,
     /// Counter for precollation results
@@ -873,6 +958,9 @@ pub(crate) struct SessionProcessor {
     /// Counter for all collation entry attempts, including async, retry, precollated,
     /// and empty-block fast paths.
     collation_starts_counter: metrics::Counter,
+    /// Histogram for self-collation acceptance latency (request start to
+    /// finalized callback emission).
+    self_collation_accept_latency_histogram: metrics::Histogram,
     /// Histogram for broadcast-to-validation complete latency
     broadcast_validation_latency_histogram: metrics::Histogram,
     /// Counter for errors during session (for SessionStats)
@@ -936,22 +1024,30 @@ pub(crate) struct SessionProcessor {
     /// last non-empty finalized block id available for empty block generation.
     finalized_head_block_id: Option<BlockIdExt>,
 
-    /// Last finalized head block's before_split flag (for split/merge handling)
+    /// Last finalized head block's before_split flag (for split/merge handling).
     ///
-    /// C++ parity: C++ always generates empty blocks when previous block has `before_split=true`.
-    /// We track this flag to implement the same behavior in `should_generate_empty_block()`.
+    /// Kept as a fallback when parent-specific `before_split` metadata is unavailable.
+    /// Primary empty-policy source is now parent-derived (`resolve_parent_before_split_flag`).
     ///
     /// Reference: C++ block-producer.cpp `is_before_split()` + `should_generate_empty_block()`
     finalized_head_before_split: bool,
 
-    /// Last consensus-finalized seqno tracked from finalized delivery in this session.
+    /// Observed `before_split` values for non-empty block ids.
     ///
-    /// C++ parity: mirrors `last_consensus_finalized_seqno_` in block-producer.cpp, which
-    /// advances on FinalizeBlock(is_final=true) and on BlockFinalizedInMasterchain events.
-    /// Used for `should_generate_empty_block()` on masterchain.
+    /// This is used to evaluate empty-block policy from the current collation parent
+    /// (including parent chains with empty candidates that all reference the same
+    /// normal-tip `BlockIdExt`), matching C++ `state->is_before_split()` semantics.
+    before_split_by_block_id: HashMap<BlockIdExt, bool>,
+
+    /// Last consensus-finalized seqno tracked by the producer-side state for this session.
     ///
-    /// Updated in `maybe_apply_finalized_state()` and in `set_mc_finalized_block()`
-    /// (coupled max with last_mc_finalized_seqno).
+    /// Tracks the highest seqno considered finalized for empty-block generation on
+    /// masterchain sessions.
+    ///
+    /// Updated by:
+    /// - local finalized delivery paths (`maybe_apply_finalized_state()`, recovery, etc.), and
+    /// - manager-applied top notifications via `set_mc_finalized_block()`, mirroring
+    ///   C++ `block-producer.cpp::handle(BlockFinalizedInMasterchain)`.
     last_consensus_finalized_seqno: Option<u32>,
 
     /// Blocks whose finalized state has already been materialized locally.
@@ -1049,6 +1145,12 @@ pub(crate) struct SessionProcessor {
     /// - finalization is observed before candidate body (delayed emit path), or
     /// - repeated finalization/candidate events arrive from network.
     finalized_delivery_sent: HashSet<RawCandidateId>,
+    /// Seqno-level finalized callback tracking.
+    ///
+    /// Protocol invariant: a session must never emit more than one
+    /// `on_block_finalized()` callback for the same block seqno.
+    /// Any second attempt is treated as a protocol breach and asserted.
+    finalized_delivery_sent_seqno: HashMap<u32, BlockIdExt>,
 
     /// Collected misbehavior reports from this session
     ///
@@ -1077,6 +1179,8 @@ pub(crate) struct SessionProcessor {
     votes_out_notarize_counter: metrics::Counter,
     votes_out_finalize_counter: metrics::Counter,
     votes_out_skip_counter: metrics::Counter,
+    /// Outgoing votes aborted because required persistence confirmation failed.
+    votes_out_persist_fail_counter: metrics::Counter,
     /// Local vote totals for health anomaly delta checks (inbound stream).
     votes_in_notarize_total: u64,
     votes_in_finalize_total: u64,
@@ -1160,6 +1264,265 @@ impl SessionProcessor {
     #[inline]
     fn record_collation_start(&self) {
         self.collation_starts_counter.increment(1);
+    }
+
+    #[inline]
+    fn collation_attempt_label(attempt: CollationAttempt) -> String {
+        match attempt {
+            CollationAttempt::Initial => "initial".to_string(),
+            CollationAttempt::Retry { retry_count } => format!("retry-{retry_count}"),
+        }
+    }
+
+    /// Format the linkage key used to grep `COLLATION_FLOW` log lines together.
+    ///
+    /// Self-collation flows do not yet have a final `BlockIdExt` (root_hash/file_hash
+    /// are produced by collation), so we synthesize an "expected block id" of the form
+    /// `<workchain>:<shard>:<expected_seqno>` from the session shard and the seqno
+    /// the FSM is asking us to produce. This is the linkage handle used in every
+    /// `COLLATION_FLOW` log message.
+    fn format_expected_block_id(&self, expected_seqno: u32) -> String {
+        format!("{}:{}", self.description.get_shard(), expected_seqno)
+    }
+
+    /// Record the start of a self-collation flow triggered by an `on_generate_slot()`
+    /// dispatch.
+    ///
+    /// The whole flow (initial attempt + any retries) counts as ONE self-collation:
+    /// the metric counter is incremented only on `CollationAttempt::Initial`. Retries
+    /// keep the same start time so latency reflects end-to-end time, not just the
+    /// last attempt's time.
+    ///
+    /// Empty blocks created internally by the simplex layer (without going through
+    /// `on_generate_slot()`) MUST NOT call this — they are not self-collations.
+    fn record_self_collation_start(
+        &mut self,
+        slot: SlotIndex,
+        expected_seqno: u32,
+        attempt: CollationAttempt,
+        parent: Option<&crate::block::CandidateParentInfo>,
+        prev_block_ids: &[BlockIdExt],
+    ) {
+        let expected_block_id = self.format_expected_block_id(expected_seqno);
+        let parent_label = parent
+            .map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
+            .unwrap_or_else(|| "none".to_string());
+        let prevs_label = if prev_block_ids.is_empty() {
+            "none".to_string()
+        } else {
+            prev_block_ids
+                .iter()
+                .map(|id| format!("{}:{}", id.seq_no, &id.root_hash.to_hex_string()[..8]))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        match attempt {
+            CollationAttempt::Initial => {
+                let started_at = self.now();
+                self.self_collation_starts_by_slot.insert(slot, (started_at, expected_seqno));
+                self.self_collates_counter.total_increment();
+                log::info!(
+                    "Session {} COLLATION_FLOW start: expected_block_id={} slot={} \
+                    expected_seqno={} attempt=initial parent={} prevs={}",
+                    &self.session_id().to_hex_string()[..8],
+                    expected_block_id,
+                    slot,
+                    expected_seqno,
+                    parent_label,
+                    prevs_label,
+                );
+            }
+            CollationAttempt::Retry { retry_count } => {
+                log::info!(
+                    "Session {} COLLATION_FLOW retry: expected_block_id={} slot={} \
+                    expected_seqno={} attempt=retry-{} parent={} prevs={}",
+                    &self.session_id().to_hex_string()[..8],
+                    expected_block_id,
+                    slot,
+                    expected_seqno,
+                    retry_count,
+                    parent_label,
+                    prevs_label,
+                );
+            }
+        }
+    }
+
+    /// Log that the collator produced a candidate for this slot.
+    ///
+    /// This is NOT a terminal event for the metric — the success counter is
+    /// incremented later in `record_self_collation_acceptance()` once
+    /// `notify_block_finalized` fires. We only log here so the flow can be linked
+    /// in logs by `expected_block_id`.
+    fn record_self_collation_generated(&self, slot: SlotIndex, outcome: &str) {
+        let Some((started_at, expected_seqno)) = self.self_collation_starts_by_slot.get(&slot)
+        else {
+            return;
+        };
+        let elapsed_ms = self.now().duration_since(*started_at).unwrap_or_default().as_millis();
+        let expected_block_id = self.format_expected_block_id(*expected_seqno);
+
+        log::info!(
+            "Session {} COLLATION_FLOW generated: expected_block_id={} slot={} \
+            expected_seqno={} outcome={} generation_ms={}",
+            &self.session_id().to_hex_string()[..8],
+            expected_block_id,
+            slot,
+            expected_seqno,
+            outcome,
+            elapsed_ms,
+        );
+    }
+
+    /// Record a TERMINAL failure of the self-collation flow (no more retries).
+    ///
+    /// Called only when collation attempts have ended without producing an accepted
+    /// block — either max retries reached, slot has progressed past, or our generated
+    /// candidate was rejected before reaching the finalized callback.
+    /// Intermediate per-attempt failures that will be retried do NOT call this.
+    fn record_self_collation_final_failure(&mut self, slot: SlotIndex, reason: &str) {
+        let Some((started_at, expected_seqno)) = self.self_collation_starts_by_slot.remove(&slot)
+        else {
+            return;
+        };
+
+        self.self_collates_counter.failure();
+
+        let elapsed_ms = self.now().duration_since(started_at).unwrap_or_default().as_millis();
+        let expected_block_id = self.format_expected_block_id(expected_seqno);
+
+        log::info!(
+            "Session {} COLLATION_FLOW failure: expected_block_id={} slot={} expected_seqno={} \
+            elapsed_ms={} reason={}",
+            &self.session_id().to_hex_string()[..8],
+            expected_block_id,
+            slot,
+            expected_seqno,
+            elapsed_ms,
+            reason,
+        );
+    }
+
+    /// Drop self-collation tracking for a slot WITHOUT incrementing failure.
+    ///
+    /// Used when the flow is abandoned (e.g. cancelled callback, pipeline reset,
+    /// stale-window result, future-slot precollation entry removed). The "ignore"
+    /// metric is not tracked explicitly — `add_compute_result_metric()` derives it
+    /// automatically as `total - success - failure`, so we just need to leave the
+    /// counters consistent.
+    fn forget_self_collation_tracking(&mut self, slot: SlotIndex, reason: &str) {
+        let Some((started_at, expected_seqno)) = self.self_collation_starts_by_slot.remove(&slot)
+        else {
+            return;
+        };
+
+        let elapsed_ms = self.now().duration_since(started_at).unwrap_or_default().as_millis();
+        let expected_block_id = self.format_expected_block_id(expected_seqno);
+
+        log::info!(
+            "Session {} COLLATION_FLOW ignore: expected_block_id={} slot={} expected_seqno={} \
+            elapsed_ms={} reason={}",
+            &self.session_id().to_hex_string()[..8],
+            expected_block_id,
+            slot,
+            expected_seqno,
+            elapsed_ms,
+            reason,
+        );
+    }
+
+    /// Link an in-flight self-collation flow to the concrete `RawCandidateId`
+    /// produced by the collator, so acceptance can be matched on `notify_block_finalized`.
+    fn link_self_collation_candidate(&mut self, slot: SlotIndex, candidate_id: &RawCandidateId) {
+        let Some((started_at, expected_seqno)) = self.self_collation_starts_by_slot.remove(&slot)
+        else {
+            return;
+        };
+
+        self.self_collation_pending_acceptance
+            .insert(candidate_id.clone(), (started_at, expected_seqno));
+
+        let expected_block_id = self.format_expected_block_id(expected_seqno);
+        log::info!(
+            "Session {} COLLATION_FLOW candidate: expected_block_id={} slot={} \
+            expected_seqno={} candidate={}:{}",
+            &self.session_id().to_hex_string()[..8],
+            expected_block_id,
+            slot,
+            expected_seqno,
+            candidate_id.slot,
+            &candidate_id.hash.to_hex_string()[..8],
+        );
+    }
+
+    /// Record successful acceptance of our self-collated candidate when the
+    /// finalized callback fires for it. This increments the success counter and
+    /// records end-to-end acceptance latency.
+    fn record_self_collation_acceptance(
+        &mut self,
+        candidate_id: &RawCandidateId,
+        block_id: &BlockIdExt,
+        has_final_cert: bool,
+    ) {
+        let Some((started_at, expected_seqno)) =
+            self.self_collation_pending_acceptance.remove(candidate_id)
+        else {
+            return;
+        };
+
+        let acceptance_ms = self.now().duration_since(started_at).unwrap_or_default().as_millis();
+        let expected_block_id = self.format_expected_block_id(expected_seqno);
+
+        self.self_collates_counter.success();
+        self.self_collation_accept_latency_histogram.record(acceptance_ms as f64);
+
+        log::info!(
+            "Session {} COLLATION_FLOW acceptance: expected_block_id={} slot={} \
+            expected_seqno={} candidate={}:{} block_id={} has_final_cert={} acceptance_ms={}",
+            &self.session_id().to_hex_string()[..8],
+            expected_block_id,
+            candidate_id.slot,
+            expected_seqno,
+            candidate_id.slot,
+            &candidate_id.hash.to_hex_string()[..8],
+            block_id,
+            has_final_cert,
+            acceptance_ms,
+        );
+    }
+
+    /// Record terminal failure for a self-collation tracked by `RawCandidateId`
+    /// (i.e. the candidate already passed `link_self_collation_candidate`). Used
+    /// when a generated candidate is rejected before reaching the finalized callback.
+    fn record_self_collation_candidate_failure(
+        &mut self,
+        candidate_id: &RawCandidateId,
+        reason: &str,
+    ) {
+        let Some((started_at, expected_seqno)) =
+            self.self_collation_pending_acceptance.remove(candidate_id)
+        else {
+            return;
+        };
+
+        self.self_collates_counter.failure();
+
+        let elapsed_ms = self.now().duration_since(started_at).unwrap_or_default().as_millis();
+        let expected_block_id = self.format_expected_block_id(expected_seqno);
+
+        log::info!(
+            "Session {} COLLATION_FLOW failure: expected_block_id={} slot={} expected_seqno={} \
+            candidate={}:{} elapsed_ms={} reason={}",
+            &self.session_id().to_hex_string()[..8],
+            expected_block_id,
+            candidate_id.slot,
+            expected_seqno,
+            candidate_id.slot,
+            &candidate_id.hash.to_hex_string()[..8],
+            elapsed_ms,
+            reason,
+        );
     }
 
     /// Clear manual time override (return to real-time mode).
@@ -1340,6 +1703,7 @@ impl SessionProcessor {
     /// * `initial_errors` - Error count from startup phase (before processor was created)
     pub fn new(
         description: Arc<SessionDescription>,
+        session_start_prev_blocks: Vec<BlockIdExt>,
         listener: SessionListenerPtr,
         task_queue: TaskQueuePtr,
         callbacks_task_queue: CallbackTaskQueuePtr,
@@ -1354,6 +1718,18 @@ impl SessionProcessor {
         let session_id = description.get_session_id().clone();
         let initial_block_seqno = description.get_initial_block_seqno();
         let use_callback_thread = description.opts().use_callback_thread;
+        assert!(
+            !session_start_prev_blocks.is_empty() && session_start_prev_blocks.len() <= 2,
+            "INVARIANT VIOLATION: SessionProcessor::new requires one or two session start prev blocks, got {}",
+            session_start_prev_blocks.len()
+        );
+        assert_eq!(
+            session_start_prev_blocks.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1,
+            initial_block_seqno,
+            "INVARIANT VIOLATION: session start prevs imply initial seqno {} != SessionDescription initial seqno {}",
+            session_start_prev_blocks.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1,
+            initial_block_seqno
+        );
 
         // INVARIANT: initial_block_seqno must be > 0.
         // Block seqno 0 is reserved for the zerostate (genesis), so the first real block is seqno 1.
@@ -1409,11 +1785,13 @@ impl SessionProcessor {
             active_weight_gauge,
             validates_counter,
             collates_counter,
+            self_collates_counter,
             precollation_requests_counter,
             precollation_results_counter,
             collates_precollated_counter,
             collates_expire_counter,
             collation_starts_counter,
+            self_collation_accept_latency_histogram,
             broadcast_validation_latency_histogram,
             first_candidate_received_latency_histogram,
             first_candidate_notarized_latency_histogram,
@@ -1432,6 +1810,7 @@ impl SessionProcessor {
             votes_out_notarize_counter,
             votes_out_finalize_counter,
             votes_out_skip_counter,
+            votes_out_persist_fail_counter,
             certs_in_counter,
             certs_relayed_counter,
             cert_conflict_counter,
@@ -1461,6 +1840,7 @@ impl SessionProcessor {
 
         let processor = Self {
             description,
+            session_start_prev_blocks,
             task_queue,
             callbacks_task_queue,
             listener,
@@ -1472,6 +1852,8 @@ impl SessionProcessor {
             first_nonannounced_window,
             candidate_info_store_results: HashMap::new(),
             notar_cert_store_results: HashMap::new(),
+            final_cert_store_results: HashMap::new(),
+            skip_cert_store_results: HashMap::new(),
             use_callback_thread,
             active_weight: 0,
             last_activity: vec![None; num_validators],
@@ -1487,6 +1869,8 @@ impl SessionProcessor {
             generated_parent_cache: HashMap::new(),
             generated_parent_gen_utime_ms_cache: HashMap::new(),
             generated_candidates_waiting_validation: HashMap::new(),
+            self_collation_starts_by_slot: HashMap::new(),
+            self_collation_pending_acceptance: HashMap::new(),
             // Validation state
             pending_validations: HashMap::new(),
             pending_approve: HashSet::new(),
@@ -1509,11 +1893,13 @@ impl SessionProcessor {
             active_weight_gauge,
             validates_counter,
             collates_counter,
+            self_collates_counter,
             precollation_requests_counter,
             precollation_results_counter,
             collates_precollated_counter,
             collates_expire_counter,
             collation_starts_counter,
+            self_collation_accept_latency_histogram,
             broadcast_validation_latency_histogram,
             errors_counter,
             finalized_pending_body_gauge,
@@ -1538,6 +1924,7 @@ impl SessionProcessor {
             finalized_head_slot: None,
             finalized_head_block_id: None,
             finalized_head_before_split: false,
+            before_split_by_block_id: HashMap::new(),
             last_consensus_finalized_seqno: initial_block_seqno.checked_sub(1),
             // Batch finalization tracking
             finalized_blocks: HashSet::new(),
@@ -1550,6 +1937,7 @@ impl SessionProcessor {
             // Candidate request tracking
             requested_candidates: HashMap::new(),
             finalized_delivery_sent: HashSet::new(),
+            finalized_delivery_sent_seqno: HashMap::new(),
             // Misbehavior tracking
             misbehavior_reports: Vec::new(),
             misbehavior_counter,
@@ -1565,6 +1953,7 @@ impl SessionProcessor {
             votes_out_notarize_counter,
             votes_out_finalize_counter,
             votes_out_skip_counter,
+            votes_out_persist_fail_counter,
             votes_in_notarize_total: 0,
             votes_in_finalize_total: 0,
             votes_in_skip_total: 0,
@@ -1666,11 +2055,13 @@ impl SessionProcessor {
         metrics::Gauge,      // active_weight_gauge
         ResultStatusCounter, // validates_counter
         ResultStatusCounter, // collates_counter
+        ResultStatusCounter, // self_collates_counter
         metrics::Counter,    // precollation_requests_counter
         metrics::Counter,    // precollation_results_counter
         ResultStatusCounter, // collates_precollated_counter
         ResultStatusCounter, // collates_expire_counter
         metrics::Counter,    // collation_starts_counter
+        metrics::Histogram,  // self_collation_accept_latency_histogram
         metrics::Histogram,  // broadcast_validation_latency_histogram
         metrics::Histogram,  // first_candidate_received_latency_histogram
         metrics::Histogram,  // first_candidate_notarized_latency_histogram
@@ -1689,6 +2080,7 @@ impl SessionProcessor {
         metrics::Counter,    // votes_out_notarize_counter
         metrics::Counter,    // votes_out_finalize_counter
         metrics::Counter,    // votes_out_skip_counter
+        metrics::Counter,    // votes_out_persist_fail_counter
         metrics::Counter,    // certs_in_counter
         metrics::Counter,    // certs_relayed_counter
         metrics::Counter,    // cert_conflict_counter
@@ -1715,6 +2107,8 @@ impl SessionProcessor {
         let validation_latency_histogram =
             sink.register_histogram(&"time:validation_latency".into());
         let collation_latency_histogram = sink.register_histogram(&"time:collation_latency".into());
+        let self_collation_accept_latency_histogram =
+            sink.register_histogram(&"time:self_collation_accept_latency".into());
         let check_all_wake_slip_histogram =
             sink.register_histogram(&"time:check_all_wake_slip_ms".into());
         let broadcast_validation_latency_histogram =
@@ -1740,6 +2134,8 @@ impl SessionProcessor {
         // Result status counters
         let validates_counter = ResultStatusCounter::new(metrics_receiver, "simplex_validates");
         let collates_counter = ResultStatusCounter::new(metrics_receiver, "simplex_collates");
+        let self_collates_counter =
+            ResultStatusCounter::new(metrics_receiver, "simplex_self_collates");
 
         // Precollation metrics
         let precollation_requests_counter =
@@ -1774,6 +2170,8 @@ impl SessionProcessor {
         let votes_out_finalize_counter =
             sink.register_counter(&"simplex_votes_out_finalize".into());
         let votes_out_skip_counter = sink.register_counter(&"simplex_votes_out_skip".into());
+        let votes_out_persist_fail_counter =
+            sink.register_counter(&"simplex_votes_out_persist_fail".into());
 
         let certs_in_counter = sink.register_counter(&"simplex_certs_in".into());
         let certs_relayed_counter = sink.register_counter(&"simplex_certs_relayed".into());
@@ -1810,11 +2208,13 @@ impl SessionProcessor {
             active_weight_gauge,
             validates_counter,
             collates_counter,
+            self_collates_counter,
             precollation_requests_counter,
             precollation_results_counter,
             collates_precollated_counter,
             collates_expire_counter,
             collation_starts_counter,
+            self_collation_accept_latency_histogram,
             broadcast_validation_latency_histogram,
             first_candidate_received_latency_histogram,
             first_candidate_notarized_latency_histogram,
@@ -1833,6 +2233,7 @@ impl SessionProcessor {
             votes_out_notarize_counter,
             votes_out_finalize_counter,
             votes_out_skip_counter,
+            votes_out_persist_fail_counter,
             certs_in_counter,
             certs_relayed_counter,
             cert_conflict_counter,
@@ -1911,6 +2312,10 @@ impl SessionProcessor {
         };
 
         self.generated_candidate_validation_missed_counter.increment(1);
+        self.record_self_collation_candidate_failure(
+            candidate_id,
+            &format!("generated_candidate_validation_missed: {}", reason),
+        );
 
         let waited_ms =
             self.now().duration_since(watch.generated_at).unwrap_or_default().as_millis();
@@ -1934,6 +2339,10 @@ impl SessionProcessor {
         let reason = reason.into();
         if let Some((candidate_id, watch)) = self.take_generated_candidate_watch_by_slot(slot) {
             self.generated_candidate_validation_missed_counter.increment(1);
+            self.record_self_collation_candidate_failure(
+                &candidate_id,
+                &format!("generated_candidate_validation_missed_for_slot: {}", reason),
+            );
 
             let waited_ms =
                 self.now().duration_since(watch.generated_at).unwrap_or_default().as_millis();
@@ -2066,7 +2475,10 @@ impl SessionProcessor {
         id: &RawCandidateId,
         wait_candidate_info: bool,
         wait_notar_cert: bool,
-    ) {
+    ) -> bool {
+        let mut candidate_info_ok = true;
+        let mut notar_cert_ok = true;
+
         log::trace!(
             "Session {} WaitCandidateInfoStored: start s{}:{} info={} notar={}",
             &self.session_id().to_hex_string()[..8],
@@ -2089,18 +2501,29 @@ impl SessionProcessor {
                         res.is_ready(),
                     );
                     if let Err(e) = res.wait() {
-                        log::error!(
-                            "Session {} WaitCandidateInfoStored: candidateInfo wait failed for \
-                            s{}:{} after {}ms: {e}",
-                            &self.session_id().to_hex_string()[..8],
-                            id.slot.value(),
-                            &id.hash.to_hex_string()[..8],
-                            self.now()
-                                .duration_since(wait_started_at)
-                                .map(|d| d.as_millis())
-                                .unwrap_or(0),
-                        );
-                        self.increment_error();
+                        if e.to_string().contains("result already taken") {
+                            log::trace!(
+                                "Session {} WaitCandidateInfoStored: candidateInfo result already \
+                                consumed for s{}:{}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                            );
+                        } else {
+                            log::error!(
+                                "Session {} WaitCandidateInfoStored: candidateInfo wait failed \
+                                for s{}:{} after {}ms: {e}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                                self.now()
+                                    .duration_since(wait_started_at)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0),
+                            );
+                            self.increment_error();
+                            candidate_info_ok = false;
+                        }
                     } else {
                         log::trace!(
                             "Session {} WaitCandidateInfoStored: candidateInfo stored for s{}:{} \
@@ -2117,7 +2540,7 @@ impl SessionProcessor {
                 }
                 None => {
                     // We can't reconstruct CandidateInfo here without additional context.
-                    // Treat as persistence error but do not block consensus.
+                    // Treat as persistence error and let the caller decide whether to abort.
                     log::error!(
                         "Session {} WaitCandidateInfoStored: missing candidateInfo store result \
                         for s{}:{}",
@@ -2126,6 +2549,7 @@ impl SessionProcessor {
                         &id.hash.to_hex_string()[..8],
                     );
                     self.increment_error();
+                    candidate_info_ok = false;
                 }
             }
         }
@@ -2143,18 +2567,29 @@ impl SessionProcessor {
                         res.is_ready(),
                     );
                     if let Err(e) = res.wait() {
-                        log::error!(
-                            "Session {} WaitCandidateInfoStored: notarCert wait failed for s{}:{} \
-                            after {}ms: {e}",
-                            &self.session_id().to_hex_string()[..8],
-                            id.slot.value(),
-                            &id.hash.to_hex_string()[..8],
-                            self.now()
-                                .duration_since(wait_started_at)
-                                .map(|d| d.as_millis())
-                                .unwrap_or(0),
-                        );
-                        self.increment_error();
+                        if e.to_string().contains("result already taken") {
+                            log::trace!(
+                                "Session {} WaitCandidateInfoStored: notarCert result already \
+                                consumed for s{}:{}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                            );
+                        } else {
+                            log::error!(
+                                "Session {} WaitCandidateInfoStored: notarCert wait failed for \
+                                s{}:{} after {}ms: {e}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                                self.now()
+                                    .duration_since(wait_started_at)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0),
+                            );
+                            self.increment_error();
+                            notar_cert_ok = false;
+                        }
                     } else {
                         log::trace!(
                             "Session {} WaitCandidateInfoStored: notarCert stored for s{}:{} in \
@@ -2178,9 +2613,12 @@ impl SessionProcessor {
                         &id.hash.to_hex_string()[..8],
                     );
                     self.increment_error();
+                    notar_cert_ok = false;
                 }
             }
         }
+
+        candidate_info_ok && notar_cert_ok
     }
 
     /// Save candidate info to database (fire-and-forget)
@@ -2277,23 +2715,21 @@ impl SessionProcessor {
     /// Update applied-top tracking from manager notification.
     ///
     /// This should be called when manager forwards the current applied top for this
-    /// session shard (C++ `top_block_id()` / `BlockFinalizedInMasterchain` semantics).
+    /// session shard.
+    ///
+    /// Mirrors the C++ external notify path:
+    /// - `block-producer.cpp::handle(BlockFinalizedInMasterchain)` updates
+    ///   `last_mc_finalized_seqno_` and `last_consensus_finalized_seqno_`
+    /// - `block-validator.cpp::handle(BlockFinalizedInMasterchain)` advances the exact
+    ///   accepted head when `seqno != 0`
+    ///
     /// The seqno is used in `should_generate_empty_block()` and the exact block id is
-    /// also used to seed the MC validation accepted-head cursor when known.
+    /// also used to seed the accepted-head cursor when known.
     ///
     /// # Arguments
     ///
     /// * `applied_top` - Current applied top for this session shard
     ///
-    /// # Reference
-    ///
-    /// C++ `block-producer.cpp`:
-    /// ```cpp
-    /// void handle(BusHandle, std::shared_ptr<const BlockFinalizedInMasterchain> event) {
-    ///     last_mc_finalized_seqno_ = std::max(event->block.seqno(), last_mc_finalized_seqno_);
-    ///     last_consensus_finalized_seqno_ = std::max(last_mc_finalized_seqno_, last_consensus_finalized_seqno_);
-    /// }
-    /// ```
     pub fn set_mc_finalized_block(&mut self, applied_top: BlockIdExt) {
         self.observability.last_mc_applied_block_id = Some(applied_top.clone());
         let session_shard = self.description.get_shard();
@@ -2317,14 +2753,21 @@ impl SessionProcessor {
         // Keep last_mc_finalized_seqno monotonic, mirroring C++ behavior:
         // last_mc_finalized_seqno_ = std::max(event->block.seqno(), last_mc_finalized_seqno_);
         let prev_mc = self.last_mc_finalized_seqno.unwrap_or(0);
-        self.last_mc_finalized_seqno = Some(seqno.max(prev_mc));
-        self.advance_accepted_normal_head_block(applied_top);
-        // C++ parity: BlockFinalizedInMasterchain also couples to last_consensus_finalized_seqno_
-        let consensus = self.last_consensus_finalized_seqno.unwrap_or(0);
-        let mc = self.last_mc_finalized_seqno.unwrap_or(0);
-        let new_val = mc.max(consensus);
-        if new_val > consensus {
-            self.last_consensus_finalized_seqno = Some(new_val);
+        let updated_mc = seqno.max(prev_mc);
+        self.last_mc_finalized_seqno = Some(updated_mc);
+
+        // C++ block-producer.cpp parity:
+        // last_consensus_finalized_seqno_ = std::max(last_mc_finalized_seqno_,
+        //                                            last_consensus_finalized_seqno_);
+        let prev_consensus = self.last_consensus_finalized_seqno.unwrap_or(0);
+        self.last_consensus_finalized_seqno = Some(updated_mc.max(prev_consensus));
+
+        // C++ block-validator.cpp ignores seqno 0 on external notify, so only seed the
+        // exact accepted head when the applied top is a non-zerostate block.
+        if seqno != 0 {
+            self.advance_accepted_normal_head_block(applied_top);
+        } else {
+            self.advance_accepted_normal_head_seqno(seqno);
         }
         self.wake_now();
     }
@@ -2346,6 +2789,8 @@ impl SessionProcessor {
     ///
     /// # Arguments
     ///
+    /// * `parent_before_split` - Optional `before_split` flag for the current
+    ///   collation parent (resolved from current parent state)
     /// * `new_seqno` - The seqno of the block that would be generated
     ///
     /// # Logic
@@ -2369,21 +2814,19 @@ impl SessionProcessor {
     ///     }
     /// }
     /// ```
-    pub fn should_generate_empty_block(&self, slot: SlotIndex, new_seqno: u32) -> bool {
-        // Empty blocks are only generated for the current slot (progress cursor).
-        let fsm_first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
-        if slot != fsm_first_non_progressed_slot {
-            // Empty blocks are only generated for current slot
-            return false;
-        }
-
-        // C++ parity: ALWAYS generate empty if previous block has before_split flag
-        // This is required for shard split/merge operations.
-        // Reference: C++ block-producer.cpp is_before_split() check
-        if self.finalized_head_before_split {
+    pub fn should_generate_empty_block(
+        &self,
+        slot: SlotIndex,
+        new_seqno: u32,
+        parent_before_split: Option<bool>,
+    ) -> bool {
+        // C++ parity: ALWAYS generate empty if current parent state has
+        // before_split=true. Prefer parent-derived value; fall back to finalized
+        // head only when parent-specific metadata is unavailable.
+        if parent_before_split.unwrap_or(self.finalized_head_before_split) {
             log::debug!(
                 "Session {} should_generate_empty_block: slot={}, seqno={} - generating EMPTY \
-                (prev block has before_split=true, required for split/merge)",
+                (parent before_split=true, required for split/merge)",
                 &self.session_id().to_hex_string()[..8],
                 slot,
                 new_seqno
@@ -2393,8 +2836,8 @@ impl SessionProcessor {
 
         if self.description.get_shard().is_masterchain() {
             // Masterchain: consensus-finalized seqno must be at most 1 behind new seqno.
-            // C++ parity: block-producer.cpp uses `last_consensus_finalized_seqno_` which
-            // advances on FinalizeBlock(is_final) and on BlockFinalizedInMasterchain.
+            // C++ parity: external notify via `set_mc_finalized_block()` also advances
+            // this producer-side cursor through `last_mc_finalized_seqno`.
             match self.last_consensus_finalized_seqno {
                 Some(finalized) => finalized + 1 < new_seqno,
                 None => false,
@@ -3702,6 +4145,482 @@ impl SessionProcessor {
             .or_else(|| self.received_candidates.get(&parent_id).map(|c| c.block_id.clone()))
     }
 
+    #[allow(dead_code)]
+    fn resolve_candidate_id_by_block_id(&self, block_id: &BlockIdExt) -> Option<RawCandidateId> {
+        self.generated_parent_cache
+            .iter()
+            .find_map(|(candidate_id, candidate_block_id)| {
+                (candidate_block_id == block_id).then_some(candidate_id.clone())
+            })
+            .or_else(|| {
+                self.received_candidates.iter().find_map(|(candidate_id, received)| {
+                    (&received.block_id == block_id).then_some(candidate_id.clone())
+                })
+            })
+    }
+
+    /// Resolve the best-known `before_split` flag for the current collation parent.
+    ///
+    /// C++ parity: `block-producer.cpp::should_generate_empty_block()` uses
+    /// `state->is_before_split()` where `state` is the resolved parent state for the
+    /// slot being generated (not necessarily the latest finalized head).
+    fn resolve_parent_before_split_flag(
+        &self,
+        parent: Option<&crate::block::CandidateParentInfo>,
+        prev_block_ids: &[BlockIdExt],
+    ) -> Option<bool> {
+        let parent_block_id = match parent {
+            Some(parent_info) => self.resolve_parent_block_id(parent_info),
+            None if prev_block_ids.len() == 1 => Some(prev_block_ids[0].clone()),
+            _ => None,
+        }?;
+
+        self.before_split_by_block_id.get(&parent_block_id).copied().or_else(|| {
+            self.finalized_head_block_id
+                .as_ref()
+                .filter(|finalized| *finalized == &parent_block_id)
+                .map(|_| self.finalized_head_before_split)
+        })
+    }
+
+    fn resolve_collation_prev_block_ids(
+        &self,
+        parent: Option<&crate::block::CandidateParentInfo>,
+    ) -> Option<Vec<BlockIdExt>> {
+        match parent {
+            Some(parent_info) => Some(vec![self.resolve_parent_block_id(parent_info)?]),
+            None => Some(self.session_start_prev_blocks.clone()),
+        }
+    }
+
+    fn prepare_collation(
+        &self,
+        _slot: SlotIndex,
+        parent: Option<crate::block::CandidateParentInfo>,
+    ) -> CollationPreparation {
+        let Some(prev_block_ids) = self.resolve_collation_prev_block_ids(parent.as_ref()) else {
+            return CollationPreparation::WaitingForParent;
+        };
+
+        let slot_start_time = self.compute_collation_start_time(parent.as_ref());
+        let now = self.now();
+        if slot_start_time > now {
+            return CollationPreparation::Deferred(slot_start_time);
+        }
+
+        let new_seqno = prev_block_ids.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1;
+        let is_first_session_block = parent.is_none();
+
+        CollationPreparation::Ready(PreparedCollation {
+            prev_block_ids,
+            slot_start_time,
+            new_seqno,
+            is_first_session_block,
+        })
+    }
+
+    fn try_begin_collation_slot(
+        &self,
+        slot: SlotIndex,
+        attempt: CollationAttempt,
+    ) -> Option<ValidatorIndex> {
+        if self.precollated_blocks.contains_key(&slot) {
+            log::trace!(
+                "Session {} {}: slot {} already pending",
+                self.session_id().to_hex_string(),
+                attempt.log_context(),
+                slot
+            );
+            return None;
+        }
+
+        let self_idx = self.description.get_self_idx();
+        let leader = self.description.get_leader(slot);
+        if leader != self_idx {
+            log::trace!(
+                "Session {} {}: not leader for slot {} (leader={})",
+                self.session_id().to_hex_string(),
+                attempt.log_context(),
+                slot,
+                leader
+            );
+            return None;
+        }
+
+        Some(self_idx)
+    }
+
+    fn update_max_precollated_slot(&mut self, slot: SlotIndex) {
+        if self.precollated_blocks_max_slot.map_or(true, |max| slot > max) {
+            self.precollated_blocks_max_slot = Some(slot);
+        }
+    }
+
+    fn create_pending_collation_request(
+        &mut self,
+        slot: SlotIndex,
+        parent: Option<crate::block::CandidateParentInfo>,
+        slot_start_time: SystemTime,
+    ) -> (u32, Arc<AsyncRequestImpl>) {
+        self.update_max_precollated_slot(slot);
+
+        let request_id = self.precollated_blocks_next_request_id;
+        self.precollated_blocks_next_request_id += 1;
+
+        let request = AsyncRequestImpl::new(request_id, true, slot_start_time);
+        let precollated_block = PrecollatedBlock { request: request.clone(), result: None, parent };
+        self.precollated_blocks.insert(slot, precollated_block);
+
+        (request_id, request)
+    }
+
+    fn finish_empty_collation_attempt(
+        &mut self,
+        slot: SlotIndex,
+        parent: Option<crate::block::CandidateParentInfo>,
+        slot_start_time: SystemTime,
+        parent_block_id: BlockIdExt,
+    ) {
+        // NOTE: empty-block fast path is generated by simplex itself (no
+        // `on_generate_slot()` dispatch to the validator), so this is NOT a
+        // self-collation and must not be tracked by `simplex_self_collates`.
+        let (request_id, _request) =
+            self.create_pending_collation_request(slot, parent, slot_start_time);
+        self.record_collation_start();
+        self.on_collation_complete(slot, request_id, CollationResult::Empty { parent_block_id });
+        self.update_collation_pacing();
+    }
+
+    fn make_roundless_collation_source_info(
+        &self,
+        self_idx: ValidatorIndex,
+    ) -> crate::BlockSourceInfo {
+        crate::BlockSourceInfo {
+            source: self.description.get_source_public_key(self_idx).clone(),
+            priority: BlockCandidatePriority {
+                round: SIMPLEX_ROUNDLESS,
+                first_block_round: SIMPLEX_ROUNDLESS,
+                priority: 0,
+            },
+        }
+    }
+
+    fn make_collation_callback(
+        &self,
+        slot: SlotIndex,
+        request_id: u32,
+        request: Arc<AsyncRequestImpl>,
+        attempt: CollationAttempt,
+    ) -> crate::ValidatorBlockCandidateCallback {
+        let session_id = self.session_id().clone();
+        let description = self.description.clone();
+        let collation_latency_histogram = self.collation_latency_histogram.clone();
+        let start_time = self.now();
+        let task_queue = self.task_queue.clone();
+        let request_clone = request.clone();
+        let attempt_label = Self::collation_attempt_label(attempt);
+
+        Box::new(move |result: Result<ValidatorBlockCandidatePtr>| {
+            if request_clone.is_cancelled() {
+                log::warn!(
+                    "Session {} {}: request {} for slot {} was cancelled",
+                    session_id.to_hex_string(),
+                    attempt.log_context(),
+                    request_id,
+                    slot
+                );
+                crate::task_queue::post_closure(
+                    &task_queue,
+                    move |processor: &mut SessionProcessor| {
+                        processor.forget_self_collation_tracking(
+                            slot,
+                            "callback_cancelled_before_generation_result",
+                        );
+                    },
+                );
+                return;
+            }
+
+            let generation_duration =
+                description.get_time().duration_since(start_time).unwrap_or_default();
+            collation_latency_histogram.record(generation_duration.as_millis() as f64);
+
+            if generation_duration > MAX_GENERATION_TIME {
+                log::warn!(
+                    "Session {} {}: block generation took {:.3}s (expected <{:.3}s) for slot {}",
+                    session_id.to_hex_string(),
+                    attempt.log_context(),
+                    generation_duration.as_secs_f64(),
+                    MAX_GENERATION_TIME.as_secs_f64(),
+                    slot
+                );
+            }
+
+            let session_id_clone = session_id.clone();
+            crate::task_queue::post_closure(
+                &task_queue,
+                move |processor: &mut SessionProcessor| {
+                    let expected_block_id = processor
+                        .self_collation_starts_by_slot
+                        .get(&slot)
+                        .map(|(_, exp)| processor.format_expected_block_id(*exp))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    match result {
+                        Ok(candidate) => {
+                            log::info!(
+                                "Session {} COLLATION_FLOW callback: expected_block_id={} slot={} \
+                                attempt={} outcome=generated generation_ms={} candidate_block_id={}",
+                                &session_id_clone.to_hex_string()[..8],
+                                expected_block_id,
+                                slot,
+                                attempt_label,
+                                generation_duration.as_millis(),
+                                candidate.id,
+                            );
+                            match attempt {
+                                CollationAttempt::Initial => {
+                                    log::trace!(
+                                        "Session {} invoke_collation: block generated for slot {} \
+                                        (request_id={})",
+                                        session_id_clone.to_hex_string(),
+                                        slot,
+                                        request_id
+                                    );
+                                }
+                                CollationAttempt::Retry { retry_count } => {
+                                    log::trace!(
+                                        "Session {} invoke_collation_retry: block generated for \
+                                        slot {} (request_id={}, retry={})",
+                                        session_id_clone.to_hex_string(),
+                                        slot,
+                                        request_id,
+                                        retry_count
+                                    );
+                                }
+                            }
+                            processor.on_collation_complete(
+                                slot,
+                                request_id,
+                                CollationResult::Block(candidate),
+                            );
+                        }
+                        Err(err) => {
+                            log::info!(
+                                "Session {} COLLATION_FLOW callback: expected_block_id={} slot={} \
+                                attempt={} outcome=callback_failure generation_ms={} error={}",
+                                &session_id_clone.to_hex_string()[..8],
+                                expected_block_id,
+                                slot,
+                                attempt_label,
+                                generation_duration.as_millis(),
+                                err,
+                            );
+                            match attempt {
+                                CollationAttempt::Initial => {
+                                    log::warn!(
+                                        "Session {} invoke_collation: block generation failed for \
+                                        slot {slot}: {err}",
+                                        session_id_clone.to_hex_string(),
+                                    );
+                                }
+                                CollationAttempt::Retry { retry_count } => {
+                                    log::warn!(
+                                        "Session {} invoke_collation_retry: block generation \
+                                        failed for slot {} (retry={}): {}",
+                                        session_id_clone.to_hex_string(),
+                                        slot,
+                                        retry_count,
+                                        err
+                                    );
+                                }
+                            }
+                            processor.on_collation_failed_impl(
+                                slot,
+                                request_id,
+                                err,
+                                attempt.failure_retry_count(),
+                            );
+                        }
+                    }
+                },
+            );
+        })
+    }
+
+    fn dispatch_collation_request(
+        &mut self,
+        slot: SlotIndex,
+        parent: Option<crate::block::CandidateParentInfo>,
+        prev_block_ids: Vec<BlockIdExt>,
+        slot_start_time: SystemTime,
+        new_seqno: u32,
+        self_idx: ValidatorIndex,
+        attempt: CollationAttempt,
+    ) {
+        let (request_id, request) =
+            self.create_pending_collation_request(slot, parent.clone(), slot_start_time);
+
+        self.precollation_requests_counter.increment(1);
+        self.update_collation_pacing();
+        self.collates_expire_counter.total_increment();
+
+        match attempt {
+            CollationAttempt::Initial => {
+                log::debug!(
+                    "Session {} COLLATION request: slot={}, expected_seqno={}, parent={:?}",
+                    &self.session_id().to_hex_string()[..8],
+                    slot,
+                    new_seqno,
+                    parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
+                );
+                log::trace!(
+                    "Session {} invoke_collation: requesting block for slot={slot}, \
+                    expected_seqno={new_seqno}, request_id={request_id}",
+                    self.session_id().to_hex_string(),
+                );
+            }
+            CollationAttempt::Retry { retry_count } => {
+                log::trace!(
+                    "Session {} invoke_collation_retry: requesting block for slot {} \
+                    (request_id={}, retry={}/{}, parent={:?})",
+                    self.session_id().to_hex_string(),
+                    slot,
+                    request_id,
+                    retry_count,
+                    self.description.opts().collation_retry_max_attempts,
+                    parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
+                );
+            }
+        }
+
+        let source_info = self.make_roundless_collation_source_info(self_idx);
+        let callback = self.make_collation_callback(slot, request_id, request.clone(), attempt);
+
+        self.record_collation_start();
+        self.record_self_collation_start(
+            slot,
+            new_seqno,
+            attempt,
+            parent.as_ref(),
+            &prev_block_ids,
+        );
+        self.collates_counter.total_increment();
+        self.notify_generate_slot(slot, source_info, request, parent, prev_block_ids, callback);
+    }
+
+    fn execute_collation_attempt(
+        &mut self,
+        slot: SlotIndex,
+        parent: Option<crate::block::CandidateParentInfo>,
+        self_idx: ValidatorIndex,
+        attempt: CollationAttempt,
+        clear_pending_generate_on_not_ready: bool,
+        enforce_progress_slot_invariant: bool,
+    ) {
+        let prepared = match self.prepare_collation(slot, parent.clone()) {
+            CollationPreparation::Ready(prepared) => prepared,
+            CollationPreparation::Deferred(slot_start_time) => {
+                log::trace!(
+                    "Session {} {}: deferring slot {} until {:?}",
+                    self.session_id().to_hex_string(),
+                    attempt.log_context(),
+                    slot,
+                    slot_start_time
+                );
+                if clear_pending_generate_on_not_ready {
+                    self.slot_set_pending_generate(slot, false);
+                }
+                self.set_next_awake_time(slot_start_time);
+                return;
+            }
+            CollationPreparation::WaitingForParent => {
+                if let Some(parent_info) = parent.as_ref() {
+                    log::trace!(
+                        "Session {} {}: waiting for resolved parent BlockIdExt for slot {slot} \
+                        (parent={parent_info})",
+                        self.session_id().to_hex_string(),
+                        attempt.log_context(),
+                    );
+                }
+                if clear_pending_generate_on_not_ready {
+                    self.slot_set_pending_generate(slot, false);
+                }
+                return;
+            }
+        };
+
+        let prev_block_ids = prepared.prev_block_ids.clone();
+        let slot_start_time = prepared.slot_start_time;
+        let new_seqno = prepared.new_seqno;
+        let is_first_session_block = prepared.is_first_session_block;
+        let parent_before_split =
+            self.resolve_parent_before_split_flag(parent.as_ref(), &prev_block_ids);
+
+        if self.should_generate_empty_block(slot, new_seqno, parent_before_split) {
+            assert!(
+                !is_first_session_block,
+                "Session {} INVARIANT VIOLATION: {} should_generate_empty_block({}) returned \
+                true but no parent available. First block in epoch cannot be empty. \
+                finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
+                self.session_id().to_hex_string(),
+                attempt.log_context(),
+                new_seqno,
+                self.finalized_head_seqno,
+                self.last_mc_finalized_seqno
+            );
+            let parent_block_id = prev_block_ids.first().cloned().expect(
+                "non-first Simplex collation attempt must have one resolved parent block id",
+            );
+            match attempt {
+                CollationAttempt::Initial => {
+                    log::debug!(
+                        "Session {} invoke_collation: generating EMPTY block for slot {}! \
+                        new_seqno={}, finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
+                        self.session_id().to_hex_string(),
+                        slot,
+                        new_seqno,
+                        self.finalized_head_seqno,
+                        self.last_mc_finalized_seqno
+                    );
+                }
+                CollationAttempt::Retry { .. } => {
+                    log::debug!(
+                        "Session {} invoke_collation_retry: generating EMPTY block for slot {} \
+                        on retry! new_seqno={}, finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
+                        self.session_id().to_hex_string(),
+                        slot,
+                        new_seqno,
+                        self.finalized_head_seqno,
+                        self.last_mc_finalized_seqno
+                    );
+                }
+            }
+            self.finish_empty_collation_attempt(slot, parent, slot_start_time, parent_block_id);
+            return;
+        }
+
+        if enforce_progress_slot_invariant {
+            let first_non_progressed = self.simplex_state.get_first_non_progressed_slot();
+            assert!(
+                slot >= first_non_progressed,
+                "SessionProcessor INVARIANT VIOLATION: invoke_collation for slot {} \
+                but first_non_progressed_slot is {} (cannot generate for progressed slot)",
+                slot,
+                first_non_progressed
+            );
+        }
+
+        self.dispatch_collation_request(
+            slot,
+            parent,
+            prev_block_ids,
+            slot_start_time,
+            new_seqno,
+            self_idx,
+            attempt,
+        );
+    }
+
     fn resolve_parent_gen_utime_ms(
         &self,
         parent: &crate::block::CandidateParentInfo,
@@ -3793,20 +4712,27 @@ impl SessionProcessor {
             return;
         }
 
-        // Invalidate the local chain head and cancel stale precollations when the
-        // leader window has changed since the last generation (C++ parity: the
-        // OurLeaderWindowStarted handler cancels the previous generation coroutine).
-        if let Some(ref head) = self.local_chain_head {
-            if head.window != current_window {
-                log::debug!(
-                    "Session {} check_collation: leader window changed ({} -> {}), \
-                    resetting precollation pipeline",
-                    &self.session_id().to_hex_string()[..8],
-                    head.window,
-                    current_window,
-                );
-                self.reset_precollations();
-            }
+        // C++ parity: cancel stale precollations when the leader window changes.
+        // C++ block-producer.cpp replaces cancellation_source_ on each new
+        // OurLeaderWindowStarted, which cancels all previous-window collations.
+        //
+        // Rust must detect stale-window precollations even when local_chain_head
+        // is None (common during bootstrap when no block was generated yet).
+        let has_stale_precollations = if let Some(ref head) = self.local_chain_head {
+            head.window != current_window
+        } else {
+            self.precollated_blocks
+                .keys()
+                .any(|&s| self.description.get_window_idx(s) != current_window)
+        };
+        if has_stale_precollations {
+            log::debug!(
+                "Session {} check_collation: leader window changed to {}, \
+                resetting precollation pipeline",
+                &self.session_id().to_hex_string()[..8],
+                current_window,
+            );
+            self.reset_precollations();
         }
 
         // Don't generate if already generated or pending for this slot.
@@ -3881,13 +4807,13 @@ impl SessionProcessor {
         // Check for precollated block first
         self.collates_precollated_counter.total_increment();
 
-        // Clone precollated candidate before consuming (avoids borrow checker issues)
-        let precollated_candidate =
-            self.precollated_blocks.get(&current_slot).and_then(|pb| pb.candidate.clone());
+        // Clone precollated result before consuming (avoids borrow checker issues)
+        let precollated_result =
+            self.precollated_blocks.get(&current_slot).and_then(|pb| pb.result.clone());
 
-        if let Some(candidate) = precollated_candidate {
+        if let Some(result) = precollated_result {
             log::trace!(
-                "Session {} check_collation: precollated block found for slot {}",
+                "Session {} check_collation: precollated result found for slot {}",
                 self.session_id().to_hex_string(),
                 current_slot
             );
@@ -3895,8 +4821,8 @@ impl SessionProcessor {
             self.collates_precollated_counter.success();
             self.record_collation_start();
 
-            // Use precollated candidate (precollated blocks are never empty)
-            self.generated_block(current_slot, CollationResult::Block(candidate));
+            // C++ parity: future slots may be precollated as either normal or empty blocks.
+            self.generated_block(current_slot, result);
             self.update_collation_pacing();
 
             // Precollate next block
@@ -3921,29 +4847,9 @@ impl SessionProcessor {
         parent: Option<crate::block::CandidateParentInfo>,
     ) {
         instrument!();
-
-        // Skip if already pending for this slot
-        if self.precollated_blocks.contains_key(&slot) {
-            log::trace!(
-                "Session {} invoke_collation: slot {} already pending",
-                self.session_id().to_hex_string(),
-                slot
-            );
+        let Some(self_idx) = self.try_begin_collation_slot(slot, CollationAttempt::Initial) else {
             return;
-        }
-
-        // Check if we're leader for this slot
-        let self_idx = self.description.get_self_idx();
-        let leader = self.description.get_leader(slot);
-        if leader != self_idx {
-            log::trace!(
-                "Session {} invoke_collation: not leader for slot {} (leader={})",
-                self.session_id().to_hex_string(),
-                slot,
-                leader
-            );
-            return;
-        }
+        };
 
         // INVARIANT: Generation slots must be monotonically increasing (gaps allowed)
         if let Some(last_slot) = self.last_generated_slot {
@@ -3957,245 +4863,14 @@ impl SessionProcessor {
         }
         //TODO: LK: implement precollation pipeline reset
         self.last_generated_slot = Some(slot);
-
-        // Resolve parent BlockIdExt (required for explicit-parent hints and seqno derivation).
-        //
-        // IMPORTANT: If the FSM parent is notarized but the body is still missing, we MUST wait.
-        // This is required for both normal blocks (parent hint) and empty blocks (empty candidate hash).
-        let resolved_parent_block_id = match parent.as_ref() {
-            None => None,
-            Some(parent_info) => self.resolve_parent_block_id(parent_info),
-        };
-
-        if let Some(parent_info) = parent.as_ref() {
-            if resolved_parent_block_id.is_none() {
-                log::trace!(
-                    "Session {} invoke_collation: waiting for resolved parent BlockIdExt for slot \
-                    {slot} (parent={parent_info})",
-                    self.session_id().to_hex_string(),
-                );
-                self.slot_set_pending_generate(slot, false);
-                return;
-            }
-        }
-
-        let slot_start_time = self.compute_collation_start_time(parent.as_ref());
-        let now = self.now();
-        if slot_start_time > now {
-            log::trace!(
-                "Session {} invoke_collation: deferring slot {} until {:?}",
-                self.session_id().to_hex_string(),
-                slot,
-                slot_start_time
-            );
-            self.slot_set_pending_generate(slot, false);
-            self.set_next_awake_time(slot_start_time);
-            return;
-        }
-
-        // Derive `new_seqno` from the locked parent (C++ behavior).
-        //
-        // Reference: C++ block-producer.cpp:
-        //   BlockSeqno new_seqno = parent.next_seqno();
-        let new_seqno = match resolved_parent_block_id.as_ref() {
-            Some(parent_block_id) => parent_block_id.seq_no + 1,
-            None => self.description.get_initial_block_seqno(),
-        };
-
-        // Check if we should generate an empty block for finalization recovery.
-        // Reference: C++ block-producer.cpp should_generate_empty_block(new_seqno, ...).
-        if self.should_generate_empty_block(slot, new_seqno) {
-            let fsm_first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
-            assert!(
-                slot == fsm_first_non_progressed_slot,
-                "Empty block generation is only allowed for current slot (slot={}, fsm={})",
-                slot,
-                fsm_first_non_progressed_slot
-            );
-            // Empty blocks re-sign parent's BlockIdExt (C++ `block = parent.id()->block`).
-            // The parent must exist for empty blocks (C++ CHECK(parent.id().has_value())).
-            if let Some(parent_block_id) = resolved_parent_block_id.clone() {
-                log::debug!(
-                    "Session {} invoke_collation: generating EMPTY block for slot {}! \
-                    new_seqno={}, finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
-                    self.session_id().to_hex_string(),
-                    slot,
-                    new_seqno,
-                    self.finalized_head_seqno,
-                    self.last_mc_finalized_seqno
-                );
-
-                // Generate a fake request_id for tracking
-                let request_id = self.precollated_blocks_next_request_id;
-                self.precollated_blocks_next_request_id += 1;
-
-                // Ensure `generated_block()` can read the locked parent from `precollated_blocks`,
-                // same as the normal collation path.
-                //
-                // Without this, empty blocks would fail with:
-                // `generated_block: empty block for slot sX has no parent`.
-                let request = AsyncRequestImpl::new(request_id, true, slot_start_time);
-                let precollated_block = PrecollatedBlock {
-                    request: request.clone(),
-                    candidate: None,
-                    parent: parent.clone(),
-                };
-                self.precollated_blocks.insert(slot, precollated_block);
-
-                // Call collation complete with empty block result
-                self.record_collation_start();
-                self.on_collation_complete(
-                    slot,
-                    request_id,
-                    CollationResult::Empty { parent_block_id },
-                );
-                self.update_collation_pacing();
-
-                return;
-            }
-
-            // INVARIANT: First block in epoch cannot be empty
-            panic!(
-                "Session {} INVARIANT VIOLATION: should_generate_empty_block({}) returned true \
-                but no parent available. First block in epoch cannot be empty. \
-                finalized_head_seqno={:?}, last_mc_finalized_seqno={:?}",
-                self.session_id().to_hex_string(),
-                new_seqno,
-                self.finalized_head_seqno,
-                self.last_mc_finalized_seqno
-            );
-        }
-
-        // Update max slot tracking
-        if self.precollated_blocks_max_slot.map_or(true, |max| slot > max) {
-            self.precollated_blocks_max_slot = Some(slot);
-        }
-
-        // Create request and precollated block entry
-        let request_id = self.precollated_blocks_next_request_id;
-        self.precollated_blocks_next_request_id += 1;
-
-        let request = AsyncRequestImpl::new(request_id, true, slot_start_time);
-        let precollated_block =
-            PrecollatedBlock { request: request.clone(), candidate: None, parent: parent.clone() };
-
-        self.precollated_blocks.insert(slot, precollated_block);
-        self.precollation_requests_counter.increment(1);
-        self.update_collation_pacing();
-
-        // Track collation expiry (total_increment at start)
-        self.collates_expire_counter.total_increment();
-
-        // DEBUG: Short pattern for quick grep (COLLATION = block generation flow)
-        log::debug!(
-            "Session {} COLLATION request: slot={}, expected_seqno={}, parent={:?}",
-            &self.session_id().to_hex_string()[..8],
+        self.execute_collation_attempt(
             slot,
-            new_seqno,
-            parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
+            parent,
+            self_idx,
+            CollationAttempt::Initial,
+            true,
+            true,
         );
-        // TRACE: Method name pattern for detailed tracking
-        log::trace!(
-            "Session {} invoke_collation: requesting block for slot={slot}, \
-            expected_seqno={new_seqno}, request_id={request_id}",
-            self.session_id().to_hex_string(),
-        );
-
-        // Seqno validation for on_generate_slot
-        // Assert we're not generating for a slot that's already progressed (going backwards)
-        // Gaps are allowed (we might skip some slots due to skips)
-        let first_non_progressed = self.simplex_state.get_first_non_progressed_slot();
-        assert!(
-            slot >= first_non_progressed,
-            "SessionProcessor INVARIANT VIOLATION: invoke_collation for slot {} \
-            but first_non_progressed_slot is {} (cannot generate for progressed slot)",
-            slot,
-            first_non_progressed
-        );
-
-        // Create BlockSourceInfo
-        let source_info = crate::BlockSourceInfo {
-            source: self.description.get_source_public_key(self_idx).clone(),
-            priority: BlockCandidatePriority {
-                round: SIMPLEX_ROUNDLESS, // Simplex roundless mode: bypass ValidatorGroup round invariants
-                first_block_round: SIMPLEX_ROUNDLESS, // Must match round for need_send_candidate_broadcast()
-                priority: 0,                          // Leader always has priority 0
-            },
-        };
-
-        // Capture what we need for the callback
-        let session_id = self.session_id().clone();
-        let description = self.description.clone();
-        let collation_latency_histogram = self.collation_latency_histogram.clone();
-        let start_time = self.now();
-        let task_queue = self.task_queue.clone();
-        let request_clone = request.clone();
-
-        // Create callback
-        let callback: crate::ValidatorBlockCandidateCallback =
-            Box::new(move |result: Result<ValidatorBlockCandidatePtr>| {
-                // Check if request was cancelled
-                if request_clone.is_cancelled() {
-                    log::warn!(
-                        "Session {} invoke_collation: request {} for slot {} was cancelled",
-                        session_id.to_hex_string(),
-                        request_id,
-                        slot
-                    );
-                    return;
-                }
-
-                // Record latency
-                let generation_duration =
-                    description.get_time().duration_since(start_time).unwrap_or_default();
-                collation_latency_histogram.record(generation_duration.as_millis() as f64);
-
-                if generation_duration > MAX_GENERATION_TIME {
-                    log::warn!(
-                        "Session {} invoke_collation: block generation took {:.3}s \
-                        (expected <{:.3}s) for slot {}",
-                        session_id.to_hex_string(),
-                        generation_duration.as_secs_f64(),
-                        MAX_GENERATION_TIME.as_secs_f64(),
-                        slot
-                    );
-                }
-
-                // Post result to main loop
-                let session_id_clone = session_id.clone();
-                crate::task_queue::post_closure(
-                    &task_queue,
-                    move |processor: &mut SessionProcessor| match result {
-                        Ok(candidate) => {
-                            log::trace!(
-                                "Session {} invoke_collation: block generated for slot {} \
-                                    (request_id={})",
-                                session_id_clone.to_hex_string(),
-                                slot,
-                                request_id
-                            );
-                            processor.on_collation_complete(
-                                slot,
-                                request_id,
-                                CollationResult::Block(candidate),
-                            );
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "Session {} invoke_collation: block generation failed for slot \
-                                {slot}: {err}",
-                                session_id_clone.to_hex_string(),
-                            );
-                            processor.on_collation_failed(slot, request_id, err);
-                        }
-                    },
-                );
-            });
-
-        // Notify listener
-        self.record_collation_start();
-        self.collates_counter.total_increment();
-        self.notify_generate_slot(slot, source_info, request, parent, callback);
     }
 
     /// Handle successful collation callback
@@ -4205,13 +4880,38 @@ impl SessionProcessor {
         instrument!();
         check_execution_time!(50_000);
 
-        // Use FSM's progress cursor to determine if this collation result is for current/future/past slot.
-        // Collation follows notarized/skipped progress, not finalization.
+        // C++ parity: the post-collation publication gate is the current leader
+        // window, not the Rust progress cursor alone. The C++ block producer
+        // continues to publish CandidateGenerated/CandidateReceived as long as
+        // `current_leader_window_ == window`, even if consensus has already
+        // timeout-skipped earlier slots inside that same window.
         let fsm_first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
+        let current_window = self.simplex_state.get_current_leader_window_idx();
+        let slot_window = self.description.get_window_idx(slot);
+
+        if slot_window != current_window {
+            log::warn!(
+                "Session {} on_collation_complete: discarding stale candidate for slot {} \
+                (window {} != current {}, request_id={})",
+                self.session_id().to_hex_string(),
+                slot,
+                slot_window,
+                current_window,
+                request_id
+            );
+            self.forget_self_collation_tracking(
+                slot,
+                "stale_window_result_discarded_before_publish",
+            );
+            self.collates_expire_counter.success();
+            self.remove_precollated_block(slot);
+            return;
+        }
 
         if slot == fsm_first_non_progressed_slot {
             // Process block for current slot immediately
             self.collates_counter.success();
+            self.record_self_collation_generated(slot, "published_current_slot");
 
             // Track expiry: failure() means NOT expired (which is good)
             self.collates_expire_counter.failure();
@@ -4223,28 +4923,11 @@ impl SessionProcessor {
             self.precollate_block(slot + 1);
         } else if slot > fsm_first_non_progressed_slot {
             // Store as precollated for future slot
-            // Note: Empty blocks are not precollated - they are generated on-demand
-            // based on current finalization state
-            if let CollationResult::Empty { .. } = result {
-                log::warn!(
-                    "Session {} on_collation_complete: empty block for future slot {} ignored \
-                    (empty blocks should only be generated for current slot)",
-                    self.session_id().to_hex_string(),
-                    slot
-                );
-                return;
-            }
-
-            let candidate = match result {
-                CollationResult::Block(c) => c,
-                CollationResult::Empty { .. } => unreachable!(),
-            };
-
             let mut publish_now = false;
             if let Some(precollated_block) = self.precollated_blocks.get_mut(&slot) {
-                if precollated_block.candidate.is_some() {
+                if precollated_block.result.is_some() {
                     log::error!(
-                        "Session {} on_collation_complete: precollated candidate for slot {} \
+                        "Session {} on_collation_complete: precollated result for slot {} \
                         already exists! (request_id={})",
                         self.session_id().to_hex_string(),
                         slot,
@@ -4253,11 +4936,12 @@ impl SessionProcessor {
                     self.increment_error();
                     return;
                 }
-                precollated_block.candidate = Some(candidate);
+                precollated_block.result = Some(result.clone());
                 self.collates_counter.success();
+                self.record_self_collation_generated(slot, "stored_future_slot");
 
                 log::trace!(
-                    "Session {} on_collation_complete: stored precollated block for slot {} \
+                    "Session {} on_collation_complete: stored precollated result for slot {} \
                     (request_id={})",
                     self.session_id().to_hex_string(),
                     slot,
@@ -4291,41 +4975,37 @@ impl SessionProcessor {
                     slot,
                     request_id
                 );
+                self.forget_self_collation_tracking(slot, "future_slot_missing_precollation_entry");
             }
 
             if publish_now {
-                if let Some(precollated_candidate) =
-                    self.precollated_blocks.get(&slot).and_then(|pb| pb.candidate.clone())
+                if let Some(precollated_result) =
+                    self.precollated_blocks.get(&slot).and_then(|pb| pb.result.clone())
                 {
-                    self.generated_block(slot, CollationResult::Block(precollated_candidate));
+                    self.generated_block(slot, precollated_result);
                     self.precollate_block(slot + 1);
                 }
             }
         } else {
-            // Slot already passed - collation result came too late (expired)
+            // C++ parity: if the leader window is still current, publish the
+            // late result anyway instead of suppressing it just because Rust's
+            // `first_non_progressed_slot` already advanced inside the window.
+            self.collates_counter.success();
+            self.record_self_collation_generated(slot, "published_late_same_window");
+            self.collates_expire_counter.failure();
+
             log::warn!(
-                "Session {} on_collation_complete: slot {} already passed (current={})",
+                "Session {} on_collation_complete: slot {} already passed (current={}) \
+                but window {} is still current; publishing late same-window candidate",
                 self.session_id().to_hex_string(),
                 slot,
-                fsm_first_non_progressed_slot
+                fsm_first_non_progressed_slot,
+                current_window
             );
 
-            // Track expiry: success() means the time slot expired (which is bad)
-            self.collates_expire_counter.success();
-
-            self.remove_precollated_block(slot);
+            self.generated_block(slot, result);
+            self.precollate_block(slot + 1);
         }
-    }
-
-    /// Handle failed collation callback
-    ///
-    /// Implements retry logic similar to validator-session:
-    /// - Tracks retry attempts via closure (retry_count parameter)
-    /// - Checks conditions before retrying (slot passed, max_slot, already precollated)
-    /// - Respects max retry attempts from options
-    fn on_collation_failed(&mut self, slot: SlotIndex, request_id: u32, err: Error) {
-        // Entry point - start with retry_count = 0
-        self.on_collation_failed_impl(slot, request_id, err, 0);
     }
 
     /// Internal implementation of collation failure handling with retry count tracking
@@ -4338,6 +5018,10 @@ impl SessionProcessor {
     ) {
         instrument!();
 
+        // `simplex_collates` increments per attempt for legacy reasons.
+        // Self-collation flows count attempts as ONE (initial + retries), so we
+        // only mark the self-collation flow as failed once we know no further
+        // retry will be scheduled (slot passed or max retries reached).
         self.collates_counter.failure();
 
         // Use FSM's progress cursor to check if slot has already progressed.
@@ -4350,6 +5034,7 @@ impl SessionProcessor {
                 self.session_id().to_hex_string(),
                 slot
             );
+            self.record_self_collation_final_failure(slot, "slot_progressed_past_during_attempt");
             self.remove_precollated_block(slot);
             return;
         }
@@ -4368,9 +5053,27 @@ impl SessionProcessor {
                 err,
                 request_id
             );
+            self.record_self_collation_final_failure(
+                slot,
+                &format!("max_retries_exhausted: {}", err),
+            );
             self.remove_precollated_block(slot);
             return;
         }
+
+        log::info!(
+            "Session {} COLLATION_FLOW attempt_failed: expected_block_id={} slot={} \
+            attempt_failure={}/{} reason={}",
+            &self.session_id().to_hex_string()[..8],
+            self.self_collation_starts_by_slot
+                .get(&slot)
+                .map(|(_, exp)| self.format_expected_block_id(*exp))
+                .unwrap_or_else(|| "unknown".to_string()),
+            slot,
+            retry_count + 1,
+            retry_max + 1,
+            err,
+        );
 
         let next_retry_count = retry_count + 1;
         let expiration_time = self.now() + retry_timeout;
@@ -4426,7 +5129,7 @@ impl SessionProcessor {
 
             // Already precollated (completed successfully while we were waiting)
             if let Some(precollated) = processor.precollated_blocks.get(&slot) {
-                if precollated.candidate.is_some() {
+                if precollated.result.is_some() {
                     log::trace!(
                         "Session {} on_collation_failed retry: slot {} already \
                         precollated, skipping",
@@ -4455,163 +5158,22 @@ impl SessionProcessor {
     /// Similar to invoke_collation but passes retry_count through the callback chain.
     fn invoke_collation_retry(&mut self, slot: SlotIndex, retry_count: u32) {
         instrument!();
-
-        // Skip if already pending for this slot
-        if self.precollated_blocks.contains_key(&slot) {
-            log::trace!(
-                "Session {} invoke_collation_retry: slot {} already pending",
-                self.session_id().to_hex_string(),
-                slot
-            );
+        let Some(self_idx) =
+            self.try_begin_collation_slot(slot, CollationAttempt::Retry { retry_count })
+        else {
             return;
-        }
-
-        // Check if we're leader for this slot
-        let self_idx = self.description.get_self_idx();
-        let leader = self.description.get_leader(slot);
-        if leader != self_idx {
-            log::trace!(
-                "Session {} invoke_collation_retry: not leader for slot {} (leader={})",
-                self.session_id().to_hex_string(),
-                slot,
-                leader
-            );
-            return;
-        }
-
-        // Update max slot tracking
-        if self.precollated_blocks_max_slot.map_or(true, |max| slot > max) {
-            self.precollated_blocks_max_slot = Some(slot);
-        }
-
-        // Create request and precollated block entry
-        let request_id = self.precollated_blocks_next_request_id;
-        self.precollated_blocks_next_request_id += 1;
+        };
 
         // Capture parent at collation start (same as invoke_collation)
         let parent = self.simplex_state.get_available_parent(&self.description, slot);
-
-        let slot_start_time = self.compute_collation_start_time(parent.as_ref());
-        let now = self.now();
-        if slot_start_time > now {
-            log::trace!(
-                "Session {} invoke_collation_retry: deferring slot {} retry until {:?}",
-                self.session_id().to_hex_string(),
-                slot,
-                slot_start_time
-            );
-            self.set_next_awake_time(slot_start_time);
-            return;
-        }
-
-        let request = AsyncRequestImpl::new(request_id, true, slot_start_time);
-        let precollated_block =
-            PrecollatedBlock { request: request.clone(), candidate: None, parent: parent.clone() };
-
-        self.precollated_blocks.insert(slot, precollated_block);
-        self.precollation_requests_counter.increment(1);
-        self.update_collation_pacing();
-
-        // Track collation expiry (total_increment at start)
-        self.collates_expire_counter.total_increment();
-
-        log::trace!(
-            "Session {} invoke_collation_retry: requesting block for slot {} \
-            (request_id={}, retry={}/{}, parent={:?})",
-            self.session_id().to_hex_string(),
+        self.execute_collation_attempt(
             slot,
-            request_id,
-            retry_count,
-            self.description.opts().collation_retry_max_attempts,
-            parent.as_ref().map(|p| format!("{}:{}", p.slot, &p.hash.to_hex_string()[..8]))
+            parent,
+            self_idx,
+            CollationAttempt::Retry { retry_count },
+            false,
+            false,
         );
-
-        // Create BlockSourceInfo
-        // SIMPLEX_ROUNDLESS: bypass ValidatorGroup round invariants
-        let source_info = crate::BlockSourceInfo {
-            source: self.description.get_source_public_key(self_idx).clone(),
-            priority: BlockCandidatePriority {
-                round: SIMPLEX_ROUNDLESS,             // Simplex roundless mode
-                first_block_round: SIMPLEX_ROUNDLESS, // Must match round for need_send_candidate_broadcast()
-                priority: 0,
-            },
-        };
-
-        // Capture what we need for the callback (including retry_count)
-        let session_id = self.session_id().clone();
-        let description = self.description.clone();
-        let collation_latency_histogram = self.collation_latency_histogram.clone();
-        let start_time = self.now();
-        let task_queue = self.task_queue.clone();
-        let request_clone = request.clone();
-
-        // Create callback - passes retry_count through closure
-        let callback: crate::ValidatorBlockCandidateCallback =
-            Box::new(move |result: Result<ValidatorBlockCandidatePtr>| {
-                if request_clone.is_cancelled() {
-                    log::warn!(
-                        "Session {} invoke_collation_retry: request {} for slot {} was cancelled",
-                        session_id.to_hex_string(),
-                        request_id,
-                        slot
-                    );
-                    return;
-                }
-
-                let generation_duration =
-                    description.get_time().duration_since(start_time).unwrap_or_default();
-                collation_latency_histogram.record(generation_duration.as_millis() as f64);
-
-                if generation_duration > MAX_GENERATION_TIME {
-                    log::warn!(
-                        "Session {} invoke_collation_retry: block generation took {:.3}s \
-                        (expected <{:.3}s) for slot {}",
-                        session_id.to_hex_string(),
-                        generation_duration.as_secs_f64(),
-                        MAX_GENERATION_TIME.as_secs_f64(),
-                        slot
-                    );
-                }
-
-                let session_id_clone = session_id.clone();
-                crate::task_queue::post_closure(
-                    &task_queue,
-                    move |processor: &mut SessionProcessor| match result {
-                        Ok(candidate) => {
-                            log::trace!(
-                                "Session {} invoke_collation_retry: block generated for slot {} \
-                                (request_id={}, retry={})",
-                                session_id_clone.to_hex_string(),
-                                slot,
-                                request_id,
-                                retry_count
-                            );
-                            processor.on_collation_complete(
-                                slot,
-                                request_id,
-                                CollationResult::Block(candidate),
-                            );
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "Session {} invoke_collation_retry: block generation failed \
-                                for slot {} (retry={}): {}",
-                                session_id_clone.to_hex_string(),
-                                slot,
-                                retry_count,
-                                err
-                            );
-                            // Pass retry_count through to failure handler
-                            processor.on_collation_failed_impl(slot, request_id, err, retry_count);
-                        }
-                    },
-                );
-            });
-
-        // Notify listener
-        self.record_collation_start();
-        self.collates_counter.total_increment();
-        self.notify_generate_slot(slot, source_info, request, parent, callback);
     }
 
     /// Persist candidate info for a locally generated candidate.
@@ -4712,25 +5274,19 @@ impl SessionProcessor {
             return;
         }
 
-        // Use FSM's progress cursor to validate this is for the current slot.
-        // Collation follows notarized/skipped progress, not finalization.
+        // C++ parity: only the leader-window freshness gate applies here.
+        // If the callback is late but still belongs to the current leader
+        // window, C++ still publishes CandidateGenerated/CandidateReceived.
         let fsm_first_non_progressed_slot = self.simplex_state.get_first_non_progressed_slot();
         if slot < fsm_first_non_progressed_slot {
-            log::warn!(
-                "Session {} generated_block: slot {} < fsm first_non_progressed_slot {}",
+            log::trace!(
+                "Session {} generated_block: publishing late same-window slot {} \
+                (first_non_progressed_slot={})",
                 self.session_id().to_hex_string(),
                 slot,
                 fsm_first_non_progressed_slot
             );
-            self.note_generated_candidate_validation_missed_for_slot(
-                slot,
-                format!(
-                    "generated_block_old_progress_slot first_non_progressed_slot={fsm_first_non_progressed_slot}"
-                ),
-            );
-            return;
-        }
-        if slot > fsm_first_non_progressed_slot {
+        } else if slot > fsm_first_non_progressed_slot {
             log::trace!(
                 "Session {} generated_block: publishing future in-window slot {} \
                 (first_non_progressed_slot={})",
@@ -4795,6 +5351,7 @@ impl SessionProcessor {
         let candidate_parent_info =
             crate::block::CandidateParentInfo { slot, hash: prepared.candidate_hash.clone() };
         let raw_id = RawCandidateId { slot, hash: prepared.candidate_hash.clone() };
+        self.link_self_collation_candidate(slot, &raw_id);
         self.generated_parent_cache.insert(raw_id.clone(), prepared.block_id_ext.clone());
         if let Some(gen_utime_ms) = prepared.gen_utime_ms {
             self.generated_parent_gen_utime_ms_cache.insert(
@@ -5180,7 +5737,7 @@ impl SessionProcessor {
         if self.precollated_blocks.contains_key(&target_slot) {
             if let Some(max_slot) = self.precollated_blocks_max_slot {
                 if let Some(precollated) = self.precollated_blocks.get(&max_slot) {
-                    if precollated.candidate.is_some() {
+                    if precollated.result.is_some() {
                         target_slot = max_slot + 1;
                     }
                 }
@@ -5265,7 +5822,13 @@ impl SessionProcessor {
         self.invoke_collation(target_slot, parent);
     }
 
-    /// Remove precollated block entry
+    /// Remove precollated block entry.
+    ///
+    /// Does NOT touch `self_collation_starts_by_slot` — self-collation tracking
+    /// has multiple terminal semantics (success, final failure, ignore) and is
+    /// managed explicitly by callers. `generated_block()` in particular calls
+    /// this BEFORE `link_self_collation_candidate()` and must NOT lose the
+    /// in-flight tracking entry.
     fn remove_precollated_block(&mut self, slot: SlotIndex) {
         if self.precollated_blocks.remove(&slot).is_some() {
             log::trace!(
@@ -5292,8 +5855,12 @@ impl SessionProcessor {
         );
 
         // Cancel all pending requests
+        let cancelled_slots: Vec<SlotIndex> = self.precollated_blocks.keys().copied().collect();
         for (_slot, precollated_block) in self.precollated_blocks.iter() {
             precollated_block.request.cancel();
+        }
+        for slot in cancelled_slots {
+            self.forget_self_collation_tracking(slot, "precollation_pipeline_reset");
         }
 
         self.precollated_blocks.clear();
@@ -5727,6 +6294,10 @@ impl SessionProcessor {
                     source_idx,
                     e
                 );
+                // C++ parity (`pool.cpp`): bad-signature certificates trigger a
+                // temporary peer ban so repeated forged traffic cannot starve
+                // the receiver/processor pipeline.
+                self.receiver.ban_source_for_bad_signature(source_idx.value());
                 return;
             }
         };
@@ -5785,8 +6356,10 @@ impl SessionProcessor {
                             &notar_vote.block_hash.to_hex_string()[..8],
                             cert.signatures.len(),
                         );
-                        // NOTE: NotarizationReached is emitted by SimplexState when the cert is stored.
-                        // SessionProcessor handles persistence/caching/relay in handle_notarization_reached().
+                        self.receiver.notify_certificate_accepted(
+                            notar_vote.slot.value(),
+                            StandstillCertificateType::Notar,
+                        );
                     }
                     Ok(false) => {
                         // Already stored for same block - idempotent
@@ -5829,10 +6402,10 @@ impl SessionProcessor {
                             &final_vote.block_hash.to_hex_string()[..8],
                             cert.signatures.len(),
                         );
-                        // NOTE: SimplexState emits:
-                        // - BlockFinalized (finalization trigger) and
-                        // - FinalizationReached (standstill caching)
-                        // when the cert is stored. SessionProcessor handles those in event handlers.
+                        self.receiver.notify_certificate_accepted(
+                            final_vote.slot.value(),
+                            StandstillCertificateType::Final,
+                        );
                     }
                     Ok(false) => {
                         // Already stored for same block - idempotent
@@ -5871,8 +6444,10 @@ impl SessionProcessor {
                             skip_vote.slot,
                             cert.signatures.len()
                         );
-                        // NOTE: SkipCertificateReached is emitted by SimplexState when the cert is stored.
-                        // SessionProcessor handles caching (and optional broadcast) in handle_skip_certificate_reached().
+                        self.receiver.notify_certificate_accepted(
+                            skip_vote.slot.value(),
+                            StandstillCertificateType::Skip,
+                        );
                     }
                     Ok(false) => {
                         // Already stored - idempotent
@@ -6363,6 +6938,8 @@ impl SessionProcessor {
                 consensus_common::ConsensusCommonFactory::create_empty_block_payload(),
             ),
         };
+        let observed_data = block_data.clone();
+        let observed_collated_data = collated_data.clone();
 
         let parent_id = raw_candidate.parent_id.clone();
 
@@ -6446,14 +7023,37 @@ impl SessionProcessor {
         // Remove from requested_candidates if we were waiting for this
         self.requested_candidates.remove(&candidate_id);
 
-        // Delayed finalized delivery:
-        // if FinalCert arrived earlier and body has just appeared, emit now.
-        let pending_finalized_event =
-            self.finalized_pending_body.get(&candidate_id).map(|entry| entry.event.clone());
-        if let Some(event) = pending_finalized_event {
-            self.maybe_emit_out_of_order_finalized(&candidate_id, &event);
-            self.maybe_apply_finalized_state(&candidate_id);
+        if !is_empty {
+            match crate::utils::extract_before_split_flag(observed_data.data()) {
+                Ok(before_split) => {
+                    self.before_split_by_block_id.insert(block_id.clone(), before_split);
+                }
+                Err(e) => {
+                    log::trace!(
+                        "Session {} on_candidate_received: failed to extract before_split flag \
+                        for block_id={}: {}",
+                        self.session_id().to_hex_string(),
+                        block_id,
+                        e
+                    );
+                }
+            }
+
+            let observed_flags = CandidateObservedFlags {
+                body_present: true,
+                parent_ready: self.simplex_state.get_notarize_certificate(slot, &id_hash).is_some(),
+                local_collated: is_local_self_candidate,
+            };
+            self.notify_candidate_observed(
+                block_id.clone(),
+                observed_data,
+                observed_collated_data,
+                observed_flags,
+            );
         }
+
+        // Candidate arrival can unblock deferred recursive finalization chains.
+        self.retry_pending_recursive_finalization();
 
         // DEBUG: Short pattern for quick grep (RECV = candidate received)
         log::debug!(
@@ -6495,6 +7095,32 @@ impl SessionProcessor {
         self.register_candidate_for_validation(raw_candidate, slot, leader_idx, receive_time);
 
         // Immediately process the new candidate (don't wait for next awake)
+        self.check_all();
+    }
+
+    /// Handle notar-only progress from requestCandidate repair path.
+    ///
+    /// This callback is used when receiver-side merge logic obtains notarization
+    /// signatures before candidate body completeness. It allows the processor/FSM to
+    /// ingest the certificate immediately and unblock parent-gated validations.
+    pub fn on_candidate_notar_received(
+        &mut self,
+        source_idx: u32,
+        slot: SlotIndex,
+        block_hash: UInt256,
+        notar_cert: Vec<u8>,
+    ) {
+        if !self.is_valid_source(ValidatorIndex::new(source_idx)) {
+            log::warn!(
+                "Session {} on_candidate_notar_received: invalid source_idx={} (max={})",
+                self.session_id().to_hex_string(),
+                source_idx,
+                self.description.get_total_nodes(),
+            );
+            return;
+        }
+
+        self.process_received_notar_cert(slot, &block_hash, &notar_cert);
         self.check_all();
     }
 
@@ -6557,8 +7183,37 @@ impl SessionProcessor {
                     notar_cert_ptr.signatures.len(),
                 );
 
-                // Store in SimplexState
-                let first_non_finalized_slot = self.simplex_state.get_first_non_finalized_slot();
+                // Ensure cert is persisted before updating FSM state.
+                let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+                if !self.notar_cert_store_results.contains_key(&candidate_id) {
+                    match self.db.save_notar_cert_async(&candidate_id, notar_cert_ptr.as_ref()) {
+                        Ok(result) => {
+                            self.notar_cert_store_results.insert(candidate_id.clone(), result);
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Session {} process_received_notar_cert: failed to create \
+                                notar_cert save slot={slot}: {e}",
+                                &self.session_id().to_hex_string()[..8],
+                            );
+                            self.increment_error();
+                            return;
+                        }
+                    }
+                }
+
+                if !self.wait_candidate_info_stored(&candidate_id, false, true) {
+                    log::warn!(
+                        "Session {} process_received_notar_cert: skipping FSM feed because notar \
+                        cert is not durable yet for slot={} hash={}",
+                        &self.session_id().to_hex_string()[..8],
+                        slot,
+                        &block_hash.to_hex_string()[..8],
+                    );
+                    return;
+                }
+
+                // Store in SimplexState after durability confirmation.
                 let store_result = self.simplex_state.set_notarize_certificate(
                     &self.description,
                     slot,
@@ -6567,32 +7222,7 @@ impl SessionProcessor {
                 );
                 match store_result {
                     Ok(true) => {
-                        // For tracked (non-old) slots, SimplexState emits NotarizationReached,
-                        // and SessionProcessor handles DB persistence + receiver cache updates there.
-                        //
-                        // For old slots, SimplexState intentionally avoids emitting events,
-                        // but we still persist the cert for restart recovery.
-                        if slot < first_non_finalized_slot {
-                            let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
-                            if !self.notar_cert_store_results.contains_key(&candidate_id) {
-                                match self
-                                    .db
-                                    .save_notar_cert_async(&candidate_id, notar_cert_ptr.as_ref())
-                                {
-                                    Ok(result) => {
-                                        self.notar_cert_store_results.insert(candidate_id, result);
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Session {} process_received_notar_cert: failed to \
-                                            create notar_cert save slot={slot}: {e}",
-                                            &self.session_id().to_hex_string()[..8],
-                                        );
-                                        self.increment_error();
-                                    }
-                                }
-                            }
-                        }
+                        // Cert accepted into FSM; DB persistence is already guaranteed above.
                     }
                     Ok(false) => {
                         // Already stored for the same block - idempotent
@@ -6616,6 +7246,10 @@ impl SessionProcessor {
                 );
             }
         }
+
+        // Newly ingested NotarCert can unblock deferred recursive-finalization chains
+        // where ancestors require notar-signature callback mode.
+        self.retry_pending_recursive_finalization();
     }
 
     /// Verify notarization certificate from VoteSignatureSet (C++ wire format)
@@ -6687,7 +7321,9 @@ impl SessionProcessor {
 
     fn sync_standstill_slots_from_state(&self) {
         let (begin, end) = self.simplex_state.get_tracked_slots_interval();
-        let progress = self.simplex_state.get_first_non_progressed_slot().value();
+        // Keep receiver ingress progress within tracked interval bounds.
+        // This mirrors C++ behavior where `now_` never stays behind finalized frontier.
+        let progress = self.simplex_state.get_first_non_progressed_slot().value().max(begin);
         self.receiver.set_ingress_slot_begin(begin);
         self.receiver.set_ingress_progress_slot(progress);
         self.receiver.set_standstill_slots(begin, end);
@@ -6720,13 +7356,25 @@ impl SessionProcessor {
     ) -> Option<crate::block::RawCandidateId> {
         let mut current_parent = candidate.parent_id.clone();
         let mut depth = 0u32;
+        let mut depth_warned = false;
 
         while let Some(parent_id) = current_parent {
             depth += 1;
+            if depth > EMPTY_CHAIN_WARN_DEPTH && !depth_warned {
+                log::warn!(
+                    "Session {} find_first_missing_parent_metadata: deep empty-parent chain \
+                    depth={} (warn_threshold={EMPTY_CHAIN_WARN_DEPTH}) for candidate slot={}; \
+                    continuing until hard limit={MAX_CHAIN_DEPTH}",
+                    self.session_id().to_hex_string(),
+                    depth,
+                    candidate.id.slot,
+                );
+                depth_warned = true;
+            }
             if depth > MAX_CHAIN_DEPTH {
                 log::error!(
                     "Session {} find_first_missing_parent_metadata: exceeded \
-                    MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH} for candidate slot={}",
+                    hard MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH} for candidate slot={}",
                     self.session_id().to_hex_string(),
                     candidate.id.slot,
                 );
@@ -6846,12 +7494,15 @@ impl SessionProcessor {
         Reference: validator-session/src/session_processor.rs try_approve_block, candidate_decision_*
     */
 
-    /// C++ `WaitForParent`-equivalent readiness check.
+    /// C++ `WaitForParent`-equivalent parent gating decision.
     ///
-    /// Validates parent and skip-gap preconditions before the candidate can be sent
-    /// to higher-layer validation.
-    fn is_wait_for_parent_ready(&self, pending: &PendingValidation) -> bool {
+    /// Mirrors `pool.cpp::maybe_resolve_request` semantics:
+    /// - `Ready`: candidate can proceed to higher-layer validation now
+    /// - `Wait`: keep candidate pending until more cert state arrives
+    /// - `Reject`: parent chain conflicts with already established consensus state
+    fn evaluate_wait_for_parent(&self, pending: &PendingValidation) -> WaitForParentDecision {
         let slot = pending.slot;
+        let candidate_id = &pending.raw_candidate.id;
         let first_non_finalized = self.simplex_state.get_first_non_finalized_slot();
         let parent_id = pending.raw_candidate.parent_id.as_ref();
 
@@ -6860,7 +7511,10 @@ impl SessionProcessor {
         let next_slot_after_parent = match parent_id {
             Some(pid) => {
                 if pid.slot >= slot {
-                    return false;
+                    return WaitForParentDecision::Reject(format!(
+                        "invalid parent slot {} for candidate slot {}",
+                        pid.slot, slot
+                    ));
                 }
                 pid.slot + 1
             }
@@ -6868,10 +7522,31 @@ impl SessionProcessor {
         };
 
         if slot < first_non_finalized {
-            return false;
+            return WaitForParentDecision::Reject(format!(
+                "candidate slot {} is already finalized (first_non_finalized={})",
+                slot, first_non_finalized
+            ));
         }
         if next_slot_after_parent < first_non_finalized {
-            return false;
+            return WaitForParentDecision::Reject(format!(
+                "candidate parent frontier {} is below first_non_finalized={}",
+                next_slot_after_parent, first_non_finalized
+            ));
+        }
+
+        // C++ parity (pool.cpp maybe_resolve_request):
+        // reject candidates conflicting with already notarized/finalized candidate in this slot.
+        if let Some(notarized_hash) =
+            self.simplex_state.get_notarized_block_hash(&self.description, slot)
+        {
+            if notarized_hash != candidate_id.hash {
+                return WaitForParentDecision::Reject(format!(
+                    "slot {} already notarized/finalized with different hash {} (candidate={})",
+                    slot,
+                    notarized_hash.to_hex_string(),
+                    candidate_id.hash.to_hex_string()
+                ));
+            }
         }
 
         // C++ parity (pool.cpp maybe_resolve_request):
@@ -6880,21 +7555,33 @@ impl SessionProcessor {
         if next_slot_after_parent == first_non_finalized {
             match parent_id {
                 None => {
-                    // Genesis parent at genesis boundary: both last_finalized and parent
-                    // are None. C++ invariant: first_nonfinalized==0 <=> !last_finalized.has_value(),
-                    // so when both are None they match and the check passes.
+                    // C++ parity: only genesis frontier (`first_non_finalized == 0`) can have
+                    // `parent_id=None` at boundary check.
                     if first_non_finalized.value() != 0 {
-                        return false;
+                        return WaitForParentDecision::Reject(format!(
+                            "expected finalized-boundary parent at slot {}, got genesis parent",
+                            first_non_finalized.value().saturating_sub(1)
+                        ));
                     }
                 }
                 Some(pid) => {
                     let Some((last_finalized_slot, final_cert)) =
                         self.simplex_state.get_last_finalize_certificate()
                     else {
-                        return false;
+                        return WaitForParentDecision::Reject(format!(
+                            "finalized-boundary parent mismatch: no finalized certificate for parent {}:{}",
+                            pid.slot,
+                            pid.hash.to_hex_string()
+                        ));
                     };
                     if last_finalized_slot != pid.slot || final_cert.vote.block_hash != pid.hash {
-                        return false;
+                        return WaitForParentDecision::Reject(format!(
+                            "finalized-boundary parent mismatch: expected {}:{} got {}:{}",
+                            last_finalized_slot,
+                            final_cert.vote.block_hash.to_hex_string(),
+                            pid.slot,
+                            pid.hash.to_hex_string()
+                        ));
                     }
                 }
             }
@@ -6902,32 +7589,40 @@ impl SessionProcessor {
             // next_slot_after_parent > first_non_finalized, so parent must exist and be notarized.
             // Genesis parent has next_slot_after_parent=0 which can't exceed first_non_finalized.
             let Some(pid) = parent_id else {
-                return false;
+                return WaitForParentDecision::Reject(format!(
+                    "missing parent id for non-boundary candidate at slot {}",
+                    slot
+                ));
             };
-            let Some(notarized_hash) =
-                self.simplex_state.get_notarized_block_hash(&self.description, pid.slot)
-            else {
-                return false;
-            };
-            if notarized_hash != pid.hash {
-                return false;
+            match self.simplex_state.get_notarized_block_hash(&self.description, pid.slot) {
+                Some(notarized_hash) => {
+                    if notarized_hash != pid.hash {
+                        return WaitForParentDecision::Reject(format!(
+                            "parent notarized hash mismatch at slot {}: expected {} got {}",
+                            pid.slot,
+                            pid.hash.to_hex_string(),
+                            notarized_hash.to_hex_string()
+                        ));
+                    }
+                }
+                None => return WaitForParentDecision::Wait,
             }
         }
 
         if next_slot_after_parent == slot {
-            return true;
+            return WaitForParentDecision::Ready;
         }
 
         // All intermediate slots must have Skip certificates.
         let mut gap_slot = next_slot_after_parent;
         while gap_slot < slot {
             if !self.simplex_state.has_skip_certificate_for_slot(&self.description, gap_slot) {
-                return false;
+                return WaitForParentDecision::Wait;
             }
             gap_slot += 1;
         }
 
-        true
+        WaitForParentDecision::Ready
     }
 
     /// Check pending validations and send to higher layer for validation
@@ -6955,21 +7650,17 @@ impl SessionProcessor {
 
         let candidate_ids: Vec<RawCandidateId> = self.pending_validations.keys().cloned().collect();
         for candidate_id in candidate_ids {
-            let (slot, source_idx, receive_time, raw_candidate, wait_for_parent_ready) =
+            let (slot, source_idx, receive_time, raw_candidate, wait_for_parent_decision) =
                 match self.pending_validations.get(&candidate_id) {
                     Some(p) => (
                         p.slot,
                         p.source_idx,
                         p.receive_time,
                         p.raw_candidate.clone(),
-                        self.is_wait_for_parent_ready(p),
+                        self.evaluate_wait_for_parent(p),
                     ),
                     None => continue,
                 };
-
-            if !wait_for_parent_ready {
-                continue;
-            }
 
             // Skip if already being validated or decided
             if self.pending_approve.contains(&candidate_id) {
@@ -6980,6 +7671,26 @@ impl SessionProcessor {
             }
             if self.approved.contains_key(&candidate_id) {
                 continue;
+            }
+
+            match wait_for_parent_decision {
+                WaitForParentDecision::Ready => {}
+                WaitForParentDecision::Wait => continue,
+                WaitForParentDecision::Reject(reason) => {
+                    log::warn!(
+                        "Session {} check_validation: rejecting candidate {:?} by WaitForParent \
+                         parity gate: {}",
+                        self.session_id().to_hex_string(),
+                        candidate_id,
+                        reason
+                    );
+                    self.validation_attempt_map.insert(
+                        candidate_id.clone(),
+                        self.description.opts().validation_retry_attempts,
+                    );
+                    self.candidate_decision_fail(slot, candidate_id, error!("{reason}"));
+                    continue;
+                }
             }
 
             // Check validation attempt count
@@ -7063,9 +7774,26 @@ impl SessionProcessor {
         }
         let mut current_parent = parent.parent_id.clone();
         let mut depth = 0u32;
+        let mut depth_warned = false;
         while let Some(pid) = current_parent {
             depth += 1;
+            if depth > EMPTY_CHAIN_WARN_DEPTH && !depth_warned {
+                log::warn!(
+                    "Session {} resolve_parent_normal_tip: deep empty-parent chain \
+                    depth={} (warn_threshold={EMPTY_CHAIN_WARN_DEPTH}); \
+                    continuing until hard limit={MAX_CHAIN_DEPTH}",
+                    self.session_id().to_hex_string(),
+                    depth,
+                );
+                depth_warned = true;
+            }
             if depth > MAX_CHAIN_DEPTH {
+                log::error!(
+                    "Session {} resolve_parent_normal_tip: exceeded hard \
+                    MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH} while resolving empty-parent chain",
+                    self.session_id().to_hex_string(),
+                );
+                self.increment_error();
                 return None;
             }
             let ancestor = self.received_candidates.get(&pid)?;
@@ -7556,6 +8284,20 @@ impl SessionProcessor {
         let _current_slot = self.simplex_state.get_first_non_progressed_slot();
 
         while let Some(candidate) = self.validated_candidates.pop_front() {
+            let candidate_id =
+                RawCandidateId { slot: candidate.id.slot, hash: candidate.id.hash.clone() };
+
+            if !self.wait_candidate_info_stored(&candidate_id, true, false) {
+                log::warn!(
+                    "Session {} process_validated_candidates: skipping candidate due to \
+                    missing candidateInfo durability slot={} hash={}",
+                    self.session_id().to_hex_string(),
+                    candidate_id.slot,
+                    &candidate_id.hash.to_hex_string()[..8],
+                );
+                continue;
+            }
+
             log::trace!(
                 "Session {} process_validated_candidates: feeding candidate to FSM, slot={}",
                 self.session_id().to_hex_string(),
@@ -7629,21 +8371,9 @@ impl SessionProcessor {
         }
     }
 
-    /// Broadcast a vote to all validators and return the signature
+    /// Broadcast a vote to all validators.
     ///
     /// Signs the vote with session-scoped signature and sends via receiver.
-    ///
-    /// # Flow
-    /// 1. Convert FSM vote to TL vote and sign
-    /// 2. Send via receiver.send_vote()
-    /// 3. Return signature for own FSM vote accounting (P2.3)
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(signature)` on success, `None` on signing failure.
-    /// The signature is used by the caller to submit to own FSM for vote accounting
-    /// and certificate creation (P2.3).
-    /// Broadcast a vote to all validators and return signature + raw bytes for own FSM
     ///
     /// Broadcast vote to all validators
     ///
@@ -7671,16 +8401,27 @@ impl SessionProcessor {
         // WaitCandidateInfoStored parity (C++ consensus.cpp):
         // - before NotarizeVote: wait candidateInfo stored
         // - before FinalizeVote: wait notarCert stored
-        match &vote {
+        let wait_persist_ok = match &vote {
             Vote::Notarize(v) => {
                 let id = RawCandidateId { slot: v.slot, hash: v.block_hash.clone() };
-                self.wait_candidate_info_stored(&id, true, false);
+                self.wait_candidate_info_stored(&id, true, false)
             }
             Vote::Finalize(v) => {
                 let id = RawCandidateId { slot: v.slot, hash: v.block_hash.clone() };
-                self.wait_candidate_info_stored(&id, false, true);
+                self.wait_candidate_info_stored(&id, false, true)
             }
-            _ => {}
+            _ => true,
+        };
+
+        if !wait_persist_ok {
+            log::error!(
+                "Session {} broadcast_vote: aborting vote send due to durability wait failure: {:?}",
+                self.session_id().to_hex_string(),
+                vote
+            );
+            self.votes_out_persist_fail_counter.increment(1);
+            self.increment_error();
+            return;
         }
 
         // Track first notarize vote in this slot (stage 2 latency)
@@ -7792,10 +8533,10 @@ impl SessionProcessor {
         │      │                                                                          │
         │      ▼                                                                          │
         │  handle_block_finalized():                                                      │
-        │      ├── Record pending finalization if body is still missing                   │
-        │      ├── maybe_emit_out_of_order_finalized(...)                                 │
-        │      ├── maybe_apply_finalized_state(...)                                       │
-        │      └── Reset round state once finalized state is materialized                 │
+        │      ├── Record/update pending trigger in finalized_pending_body                │
+        │      ├── retry_pending_recursive_finalization_for(trigger)                      │
+        │      ├── Walk parent chain and evaluate each block independently                 │
+        │      └── Emit/apply immediately when ready; request/defer only missing blocks   │
         │                                                                                 │
         │  SimplexEvent::SlotSkipped(slot)                                                │
         │      │                                                                          │
@@ -7962,6 +8703,179 @@ impl SessionProcessor {
         }
     }
 
+    /// Handle a reverse-bridge request from the validator layer to ensure a
+    /// candidate body (and optionally its parent chain) is available.
+    ///
+    /// The validator calls this when collation/validation needs a parent
+    /// state that hasn't been applied by the engine yet. Simplex resolves
+    /// `BlockIdExt` to the internal `RawCandidateId` and triggers repair.
+    ///
+    /// Important: a slot may be skipped but still have a notarized candidate.
+    /// The repair must handle that case — the candidate body might not have
+    /// been received via the normal broadcast path.
+    ///
+    /// C++ equivalent: demand-driven path in `BlockProducerImpl::produce()`
+    /// that triggers `StateResolverImpl::resolve()`.
+    pub(crate) fn ensure_candidate_available(
+        &mut self,
+        block_id: BlockIdExt,
+        opts: EnsureCandidateAvailabilityOptions,
+    ) {
+        self.ensure_candidate_available_impl(block_id, opts, 0);
+    }
+
+    fn ensure_candidate_available_impl(
+        &mut self,
+        block_id: BlockIdExt,
+        opts: EnsureCandidateAvailabilityOptions,
+        attempt: u32,
+    ) {
+        log::info!(
+            target: "simplex_resolver",
+            "SessionProcessor::ensure_candidate_available session_id={} block_id={} \
+            purpose={:?} include_parent_chain={} attempt={}/{}",
+            self.session_id().to_hex_string(),
+            block_id,
+            opts.purpose,
+            opts.include_parent_chain,
+            attempt,
+            RESOLVER_AVAILABILITY_MAX_RETRIES,
+        );
+
+        let Some(candidate_id) = self.resolve_candidate_id_by_block_id(&block_id) else {
+            if attempt < RESOLVER_AVAILABILITY_MAX_RETRIES {
+                let next_attempt = attempt + 1;
+                let expiration_time = self.now() + RESOLVER_AVAILABILITY_RETRY_DELAY;
+                log::info!(
+                    target: "simplex_resolver",
+                    "SessionProcessor::ensure_candidate_available: unresolved block_id={} \
+                    purpose={:?}; scheduling deferred retry {}/{} in {}ms",
+                    block_id,
+                    opts.purpose,
+                    next_attempt,
+                    RESOLVER_AVAILABILITY_MAX_RETRIES,
+                    RESOLVER_AVAILABILITY_RETRY_DELAY.as_millis(),
+                );
+                self.post_delayed_action(expiration_time, move |processor| {
+                    processor.ensure_candidate_available_impl(block_id, opts, next_attempt);
+                });
+            } else {
+                log::warn!(
+                    target: "simplex_resolver",
+                    "SessionProcessor::ensure_candidate_available: unresolved block_id={} \
+                    purpose={:?}; exhausted {RESOLVER_AVAILABILITY_MAX_RETRIES} retries, giving up",
+                    block_id,
+                    opts.purpose,
+                );
+            }
+            return;
+        };
+
+        self.request_candidate_body_for_resolver(candidate_id.clone());
+
+        if !opts.include_parent_chain {
+            return;
+        }
+
+        let mut current = candidate_id;
+        let mut depth = 0u32;
+        let mut depth_warned = false;
+        loop {
+            depth += 1;
+            if depth > EMPTY_CHAIN_WARN_DEPTH && !depth_warned {
+                log::warn!(
+                    target: "simplex_resolver",
+                    "SessionProcessor::ensure_candidate_available: deep parent chain depth={} \
+                    (warn_threshold={EMPTY_CHAIN_WARN_DEPTH}) for block_id={}; \
+                    continuing until hard limit={MAX_CHAIN_DEPTH}",
+                    depth,
+                    block_id,
+                );
+                depth_warned = true;
+            }
+            if depth > MAX_CHAIN_DEPTH {
+                log::error!(
+                    target: "simplex_resolver",
+                    "SessionProcessor::ensure_candidate_available: exceeded \
+                    hard MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH} while resolving parents for block_id={}",
+                    block_id,
+                );
+                self.increment_error();
+                break;
+            }
+
+            let parent_id = match self
+                .received_candidates
+                .get(&current)
+                .and_then(|received| received.parent_id.clone())
+            {
+                Some(parent_id) => parent_id,
+                None => break,
+            };
+
+            self.request_candidate_body_for_resolver(parent_id.clone());
+
+            if !self.received_candidates.contains_key(&parent_id) {
+                log::trace!(
+                    target: "simplex_resolver",
+                    "SessionProcessor::ensure_candidate_available: parent metadata missing at \
+                    slot={} hash={} while resolving block_id={}; stopping chain traversal",
+                    parent_id.slot,
+                    &parent_id.hash.to_hex_string()[..8],
+                    block_id,
+                );
+                break;
+            }
+
+            current = parent_id;
+        }
+    }
+
+    /// Resolver-driven candidate body request.
+    ///
+    /// Unlike `request_candidate`, this path is used by validator-side state resolution and
+    /// must still request a candidate even when the slot already has a skip certificate.
+    /// (A slot can be skipped and still have a notarized block body needed for parent state.)
+    fn request_candidate_body_for_resolver(&mut self, candidate_id: RawCandidateId) {
+        let now = self.now();
+
+        if self.has_real_candidate_body(&candidate_id) {
+            return;
+        }
+
+        if let Some(next_allowed_at) = self.requested_candidates.get(&candidate_id) {
+            if *next_allowed_at > now {
+                log::trace!(
+                    target: "simplex_resolver",
+                    "Session {} request_candidate_body_for_resolver: slot={} hash={} \
+                    - throttled until {:?}",
+                    &self.session_id().to_hex_string()[..8],
+                    candidate_id.slot,
+                    &candidate_id.hash.to_hex_string()[..8],
+                    next_allowed_at,
+                );
+                return;
+            }
+        }
+
+        let skipped =
+            self.simplex_state.has_skip_certificate_for_slot(&self.description, candidate_id.slot);
+
+        log::debug!(
+            target: "simplex_resolver",
+            "Session {} request_candidate_body_for_resolver: requesting slot={} hash={} \
+            immediately (skipped_slot={})",
+            &self.session_id().to_hex_string()[..8],
+            candidate_id.slot,
+            &candidate_id.hash.to_hex_string()[..8],
+            skipped,
+        );
+
+        self.requested_candidates
+            .insert(candidate_id.clone(), now + CANDIDATE_REQUEST_RETRY_INTERVAL);
+        self.receiver.request_candidate(candidate_id.slot.value(), candidate_id.hash.clone());
+    }
+
     fn cancel_candidate_repairs_for_slot(&mut self, slot: SlotIndex) {
         let before = self.requested_candidates.len();
         self.requested_candidates.retain(|candidate_id, _| candidate_id.slot != slot);
@@ -8024,17 +8938,12 @@ impl SessionProcessor {
             self.increment_error();
         }
 
-        // Keep only pending finalizations that still wait for candidate body.
-        let should_store_for_later = self
-            .received_candidates
-            .get(&finalized_id)
-            .map(|r| r.candidate_hash_data_bytes.is_empty() || r.is_empty)
-            .unwrap_or(true);
-        if should_store_for_later {
-            let entry = FinalizedEntry { event: event.clone(), finalized_at: self.now() };
-            self.finalized_pending_body.insert(finalized_id.clone(), entry);
-            self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
-        }
+        // Always keep a pending entry until recursive parent-chain materialization
+        // succeeds end-to-end. This provides deterministic retries on late body/cert
+        // arrivals and ensures ancestor parity is eventually reached.
+        let entry = FinalizedEntry { event: event.clone(), finalized_at: self.now() };
+        self.finalized_pending_body.insert(finalized_id.clone(), entry);
+        self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
 
         log::debug!(
             "Session {} FINALIZED: slot={}, hash={} - recorded in journal, weight={}/{} ({:.0}%)",
@@ -8049,9 +8958,8 @@ impl SessionProcessor {
         // Note: Certificate caching for standstill is handled in handle_finalization_reached()
         // which is triggered by SimplexEvent::FinalizationReached (emitted after BlockFinalized).
 
-        // Finalized delivery (with delayed body support + dedup).
-        self.maybe_emit_out_of_order_finalized(&finalized_id, &event);
-        self.maybe_apply_finalized_state(&finalized_id);
+        // Attempt recursive parent-chain finalization immediately.
+        self.retry_pending_recursive_finalization_for(std::slice::from_ref(&finalized_id));
 
         // Continue FSM event processing (do NOT push event back to queue)
     }
@@ -8128,7 +9036,13 @@ impl SessionProcessor {
         self.pending_reject.retain(|id, _| id.slot >= up_to_slot);
         self.rejected.retain(|id| id.slot >= up_to_slot);
         self.approved.retain(|id, _| id.slot >= up_to_slot);
+        self.self_collation_starts_by_slot.retain(|slot, _| *slot >= up_to_slot);
+        self.self_collation_pending_acceptance.retain(|id, _| id.slot >= up_to_slot);
         self.validation_attempt_map.retain(|id, _| id.slot >= up_to_slot);
+        self.candidate_info_store_results.retain(|id, _| id.slot >= up_to_slot);
+        self.notar_cert_store_results.retain(|id, _| id.slot >= up_to_slot);
+        self.final_cert_store_results.retain(|id, _| id.slot >= up_to_slot);
+        self.skip_cert_store_results.retain(|slot, _| *slot >= up_to_slot);
         // validated_candidates is a VecDeque, retain elements for slots >= up_to_slot
         self.validated_candidates.retain(|c| c.id.slot >= up_to_slot);
 
@@ -8203,6 +9117,11 @@ impl SessionProcessor {
         // Cleanup old slot data (receiver cache + validated candidates)
         self.cleanup_old_slots(slot);
 
+        // Self-collation safety net: if the flow never reached success or final
+        // failure (e.g. crash, race, missing callback), drop the tracking entry
+        // so it auto-counts as ignore (auto-derived as `total - success - failure`).
+        self.forget_self_collation_tracking(slot, "reset_slot_state");
+
         //TODO: LK: check if this is really needed here
         self.remove_precollated_block(slot);
     }
@@ -8257,21 +9176,53 @@ impl SessionProcessor {
             self.request_candidate(event.slot, event.block_hash.clone(), None);
         }
 
-        if !self.notar_cert_store_results.contains_key(&candidate_id) {
-            match self.db.save_notar_cert_async(&candidate_id, &event.certificate) {
-                Ok(result) => {
-                    self.notar_cert_store_results.insert(candidate_id.clone(), result);
-                }
-                Err(e) => {
-                    log::error!(
+        if let Some(received) = self.received_candidates.get(&candidate_id) {
+            if !received.is_empty {
+                let observed_flags = CandidateObservedFlags {
+                    body_present: true,
+                    parent_ready: true,
+                    local_collated: received.source_idx == self.description.get_self_idx(),
+                };
+                self.notify_candidate_observed(
+                    received.block_id.clone(),
+                    received.data.clone(),
+                    received.collated_data.clone(),
+                    observed_flags,
+                );
+            }
+        }
+
+        let notar_store_result =
+            if let Some(existing) = self.notar_cert_store_results.get(&candidate_id) {
+                existing.clone()
+            } else {
+                match self.db.save_notar_cert_async(&candidate_id, &event.certificate) {
+                    Ok(result) => {
+                        self.notar_cert_store_results.insert(candidate_id.clone(), result.clone());
+                        result
+                    }
+                    Err(e) => {
+                        log::error!(
                         "Session {} handle_notarization_reached: failed to create notar_cert save \
                         slot={}: {e}",
                         &self.session_id().to_hex_string()[..8],
                         event.slot,
                     );
-                    self.increment_error();
+                        self.increment_error();
+                        return;
+                    }
                 }
-            }
+            };
+
+        // TN-968 wait-for-store guarantee: certificate must be durable before broadcast/cache.
+        if let Err(e) = notar_store_result.wait() {
+            log::error!(
+                "Session {} handle_notarization_reached: failed to store notar cert slot={}: {e}",
+                &self.session_id().to_hex_string()[..8],
+                event.slot,
+            );
+            self.increment_error();
+            return;
         }
 
         // Serialize and cache the notarization certificate for query responses
@@ -8370,6 +9321,40 @@ impl SessionProcessor {
             event.certificate.signatures.len()
         );
 
+        let skip_store_result =
+            if let Some(existing) = self.skip_cert_store_results.get(&event.slot) {
+                existing.clone()
+            } else {
+                match self.db.save_skip_cert_async(event.slot, &event.certificate) {
+                    Ok(result) => {
+                        self.skip_cert_store_results.insert(event.slot, result.clone());
+                        result
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Session {} handle_skip_certificate_reached: failed to create skip \
+                            cert save slot={}: {e}",
+                            &self.session_id().to_hex_string()[..8],
+                            event.slot,
+                        );
+                        self.increment_error();
+                        return;
+                    }
+                }
+            };
+
+        // TN-968 wait-for-store guarantee: certificate must be durable before broadcast/cache.
+        if let Err(e) = skip_store_result.wait() {
+            log::error!(
+                "Session {} handle_skip_certificate_reached: failed to store skip cert slot={}: \
+                {e}",
+                &self.session_id().to_hex_string()[..8],
+                event.slot,
+            );
+            self.increment_error();
+            return;
+        }
+
         // Convert to TL format
         let tl_cert = match event.certificate.to_tl() {
             Ok(cert) => cert,
@@ -8436,6 +9421,40 @@ impl SessionProcessor {
             &event.block_hash.to_hex_string()[..8],
             event.certificate.signatures.len()
         );
+
+        let candidate_id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
+        let final_store_result =
+            if let Some(existing) = self.final_cert_store_results.get(&candidate_id) {
+                existing.clone()
+            } else {
+                match self.db.save_final_cert_async(&candidate_id, &event.certificate) {
+                    Ok(result) => {
+                        self.final_cert_store_results.insert(candidate_id, result.clone());
+                        result
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Session {} handle_finalization_reached: failed to create final cert \
+                            save slot={}: {e}",
+                            &self.session_id().to_hex_string()[..8],
+                            event.slot,
+                        );
+                        self.increment_error();
+                        return;
+                    }
+                }
+            };
+
+        // TN-968 wait-for-store guarantee: certificate must be durable before broadcast/cache.
+        if let Err(e) = final_store_result.wait() {
+            log::error!(
+                "Session {} handle_finalization_reached: failed to store final cert slot={}: {e}",
+                &self.session_id().to_hex_string()[..8],
+                event.slot,
+            );
+            self.increment_error();
+            return;
+        }
 
         // Convert to TL format
         let tl_cert = match event.certificate.to_tl() {
@@ -8541,8 +9560,17 @@ impl SessionProcessor {
         let (begin, end) = self.simplex_state.get_tracked_slots_interval();
         self.sync_standstill_slots_from_state();
 
-        // Cancel any precollations for the skipped slot
-        self.remove_precollated_block(slot);
+        // C++ parity: do NOT remove precollated blocks for same-window slots.
+        // C++ block-producer.cpp only cancels collations at window transitions
+        // (via CancellationTokenSource replacement), not on per-slot skip events.
+        // Removing the entry here destroys the locked parent context that a
+        // late same-window callback needs to publish the candidate.
+        let slot_window = self.description.get_window_idx(slot);
+        let current_window = self.simplex_state.get_current_leader_window_idx();
+        if slot_window != current_window {
+            self.forget_self_collation_tracking(slot, "skipped_window_mismatch");
+            self.remove_precollated_block(slot);
+        }
 
         log::trace!(
             "Session {} handle_slot_skipped: completed slot={} tracked_slots=[{}, {})",
@@ -8629,6 +9657,43 @@ impl SessionProcessor {
         });
     }
 
+    fn notify_candidate_observed(
+        &self,
+        block_id: BlockIdExt,
+        data: crate::BlockPayloadPtr,
+        collated_data: crate::BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    ) {
+        check_execution_time!(20_000);
+
+        log::trace!(
+            "Session {} notify_candidate_observed: block_id={} parent_ready={} local_collated={} body_present={}",
+            self.session_id().to_hex_string(),
+            block_id,
+            flags.parent_ready,
+            flags.local_collated,
+            flags.body_present,
+        );
+        log::info!(
+            target: "simplex_resolver",
+            "SessionProcessor::notify_candidate_observed session_id={} block_id={} parent_ready={} local_collated={} body_present={}",
+            self.session_id().to_hex_string(),
+            block_id,
+            flags.parent_ready,
+            flags.local_collated,
+            flags.body_present,
+        );
+
+        let listener = self.listener.clone();
+        self.invoke_session_callback(move || {
+            check_execution_time!(20_000);
+
+            if let Some(listener) = listener.upgrade() {
+                listener.on_candidate_observed(block_id, data, collated_data, flags);
+            }
+        });
+    }
+
     /// Notify listener about a generation slot
     ///
     /// Called when this validator should generate a block.
@@ -8638,6 +9703,7 @@ impl SessionProcessor {
         source_info: crate::BlockSourceInfo,
         request: crate::AsyncRequestPtr,
         parent: Option<crate::block::CandidateParentInfo>,
+        prev_block_ids: Vec<BlockIdExt>,
         callback: crate::ValidatorBlockCandidateCallback,
     ) {
         check_execution_time!(20_000);
@@ -8647,35 +9713,55 @@ impl SessionProcessor {
             self.session_id().to_hex_string()
         );
 
-        // For non-genesis blocks, we can provide explicit parent `BlockIdExt` to ValidatorGroup.
-        // This matches C++ behavior (block-producer.cpp passes parent block id directly).
-        let parent_hint = match parent.as_ref() {
-            None => consensus_common::CollationParentHint::Implicit,
-            Some(parent_info) => {
-                let parent_block_id =
-                    self.resolve_parent_block_id(parent_info).unwrap_or_else(|| {
-                        log::error!(
-                            "Session {} notify_generate_slot: parent BlockIdExt is not resolved \
-                            for slot {slot} (parent={parent_info})",
-                            self.session_id().to_hex_string(),
-                        );
-                        panic!(
-                            "SessionProcessor INVARIANT VIOLATION: unresolved parent BlockIdExt for slot {} (parent={})",
-                            slot,
-                            parent_info
-                        );
-	                    });
-
-                log::trace!(
-                    "Session {} notify_generate_slot: explicit parent for slot {}: {}",
+        assert!(
+            !prev_block_ids.is_empty() && prev_block_ids.len() <= 2,
+            "SessionProcessor INVARIANT VIOLATION: notify_generate_slot requires one or two explicit prev blocks for slot {}",
+            slot
+        );
+        if let Some(parent_info) = parent.as_ref() {
+            let parent_block_id = self.resolve_parent_block_id(parent_info).unwrap_or_else(|| {
+                log::error!(
+                    "Session {} notify_generate_slot: parent BlockIdExt is not resolved \
+                    for slot {slot} (parent={parent_info})",
                     self.session_id().to_hex_string(),
-                    slot,
-                    parent_block_id
                 );
-
-                consensus_common::CollationParentHint::Explicit(parent_block_id)
-            }
-        };
+                panic!(
+                    "SessionProcessor INVARIANT VIOLATION: unresolved parent BlockIdExt for slot {} (parent={})",
+                    slot,
+                    parent_info
+                );
+            });
+            assert_eq!(
+                prev_block_ids.len(),
+                1,
+                "SessionProcessor INVARIANT VIOLATION: non-bootstrap Simplex collation must have exactly one parent"
+            );
+            assert_eq!(
+                prev_block_ids[0], parent_block_id,
+                "SessionProcessor INVARIANT VIOLATION: explicit prev block does not match resolved parent for slot {}",
+                slot
+            );
+        }
+        log::trace!(
+            "Session {} notify_generate_slot: explicit prevs for slot {}: {}",
+            self.session_id().to_hex_string(),
+            slot,
+            prev_block_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+        );
+        let expected_block_id = self
+            .self_collation_starts_by_slot
+            .get(&slot)
+            .map(|(_, exp)| self.format_expected_block_id(*exp))
+            .unwrap_or_else(|| "unknown".to_string());
+        log::info!(
+            "Session {} COLLATION_FLOW handoff: expected_block_id={} slot={} prev_count={} \
+            target=SessionListener::on_generate_slot",
+            &self.session_id().to_hex_string()[..8],
+            expected_block_id,
+            slot,
+            prev_block_ids.len(),
+        );
+        let parent_hint = consensus_common::CollationParentHint::Explicit(prev_block_ids);
 
         let listener = self.listener.clone();
 
@@ -8692,43 +9778,422 @@ impl SessionProcessor {
         });
     }
 
-    /// Emit finalized callback if all required data is available.
+    /// Retry all triggers currently stored in `finalized_pending_body`.
     ///
-    /// This helper is called from:
-    /// - `handle_block_finalized` (immediate path), and
-    /// - `on_candidate_received` (delayed path when body arrives after FinalCert).
-    fn maybe_emit_out_of_order_finalized(
+    /// This is the broad "scan everything pending" entrypoint used from
+    /// periodic/auxiliary paths (candidate arrivals, notar cert arrivals, etc).
+    /// We sort by `(slot, hash)` to keep retries deterministic across runs.
+    fn retry_pending_recursive_finalization(&mut self) {
+        // Snapshot current trigger ids from the pending journal.
+        let mut pending_ids: Vec<RawCandidateId> =
+            self.finalized_pending_body.keys().cloned().collect();
+        if pending_ids.is_empty() {
+            return;
+        }
+
+        // Stable order helps reproducible diagnostics/callback behavior.
+        pending_ids.sort_by(|left, right| {
+            left.slot
+                .value()
+                .cmp(&right.slot.value())
+                .then_with(|| left.hash.as_slice().cmp(right.hash.as_slice()))
+        });
+
+        self.retry_pending_recursive_finalization_for(&pending_ids);
+    }
+
+    /// Retry recursive finalization for an explicit set of trigger ids.
+    ///
+    /// Completed triggers are removed from the pending journal; unresolved ones
+    /// remain queued and will be retried when missing data/certs arrive.
+    fn retry_pending_recursive_finalization_for(&mut self, pending_ids: &[RawCandidateId]) {
+        if pending_ids.is_empty() {
+            return;
+        }
+
+        // Collect completed triggers first; remove after the pass.
+        let mut completed = Vec::new();
+        for trigger_id in pending_ids {
+            // Clone event payload to avoid holding a map borrow across processing.
+            let Some(event) =
+                self.finalized_pending_body.get(trigger_id).map(|entry| entry.event.clone())
+            else {
+                continue;
+            };
+
+            if self.try_finalize_recursive_chain(trigger_id, &event) {
+                completed.push(trigger_id.clone());
+            }
+        }
+
+        if completed.is_empty() {
+            return;
+        }
+
+        for trigger_id in completed {
+            self.finalized_pending_body.remove(&trigger_id);
+        }
+        self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
+    }
+
+    /// Incrementally resolve finalized trigger + parent chain.
+    ///
+    /// Processing model:
+    /// - The trigger is evaluated immediately (out-of-order friendly).
+    /// - Each ancestor is handled independently in the same walk.
+    /// - Missing data/certs for one block do not block already-ready blocks.
+    ///
+    /// Return value:
+    /// - `true`  => all currently relevant blocks are resolved/emitted/applied.
+    /// - `false` => at least one block still waits for requested data/certs.
+    ///
+    /// C++ parity (`consensus.cpp::finalize_blocks_inner`):
+    /// The `FinalCert` context (`maybe_final_cert`) flows through empty candidates
+    /// unchanged and is consumed by the first non-empty candidate. On masterchain,
+    /// once the cert is consumed the walk stops (null cert + MC → early return).
+    fn try_finalize_recursive_chain(
         &mut self,
-        finalized_id: &RawCandidateId,
+        trigger_id: &RawCandidateId,
         event: &BlockFinalizedEvent,
+    ) -> bool {
+        let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
+        let mut complete = true;
+        let mut visited = HashSet::new();
+        let mut depth = 0u32;
+        let mut depth_warned = false;
+        let mut current_id = trigger_id.clone();
+
+        // C++ parity: `maybe_final_cert` flows through empty candidates and is
+        // consumed (dropped to null) by the first non-empty candidate.
+        let mut has_final_cert = true;
+
+        // Capture trigger's slot and candidate hash data for FinalCert signature
+        // verification context (C++ `maybe_final_candidate->id.slot` /
+        // `maybe_final_candidate->hash_data()`).
+        let trigger_slot = trigger_id.slot;
+        let trigger_candidate_hash_data: Vec<u8> = self
+            .received_candidates
+            .get(trigger_id)
+            .map(|r| r.candidate_hash_data_bytes.clone())
+            .unwrap_or_default();
+
+        loop {
+            depth += 1;
+            if depth > EMPTY_CHAIN_WARN_DEPTH && !depth_warned {
+                depth_warned = true;
+                log::warn!(
+                    "Session {} recursive finalization: deep chain depth={} \
+                     (warn_threshold={EMPTY_CHAIN_WARN_DEPTH}) trigger=s{}:{}",
+                    &self.session_id().to_hex_string()[..8],
+                    depth,
+                    trigger_id.slot,
+                    &trigger_id.hash.to_hex_string()[..8],
+                );
+            }
+            if depth > MAX_CHAIN_DEPTH {
+                log::error!(
+                    "Session {} recursive finalization: exceeded MAX_CHAIN_DEPTH={} \
+                     while resolving trigger=s{}:{}",
+                    &self.session_id().to_hex_string()[..8],
+                    MAX_CHAIN_DEPTH,
+                    trigger_id.slot,
+                    &trigger_id.hash.to_hex_string()[..8],
+                );
+                self.increment_error();
+                return true;
+            }
+            if !visited.insert(current_id.clone()) {
+                log::error!(
+                    "Session {} recursive finalization: parent-cycle detected at s{}:{} \
+                     while resolving trigger=s{}:{}",
+                    &self.session_id().to_hex_string()[..8],
+                    current_id.slot,
+                    &current_id.hash.to_hex_string()[..8],
+                    trigger_id.slot,
+                    &trigger_id.hash.to_hex_string()[..8],
+                );
+                self.increment_error();
+                return true;
+            }
+
+            // Step 1: resolve candidate metadata/body holder.
+            let Some(received) = self.received_candidates.get(&current_id).cloned() else {
+                log::debug!(
+                    "Session {} recursive finalization: missing candidate metadata for \
+                     s{}:{}, requesting body+cert and deferring trigger=s{}:{}",
+                    &self.session_id().to_hex_string()[..8],
+                    current_id.slot,
+                    &current_id.hash.to_hex_string()[..8],
+                    trigger_id.slot,
+                    &trigger_id.hash.to_hex_string()[..8],
+                );
+                self.request_candidate(
+                    current_id.slot,
+                    current_id.hash.clone(),
+                    Some(Duration::ZERO),
+                );
+                complete = false;
+                break;
+            };
+
+            // C++ parity (`consensus.cpp`):
+            // if (maybe_final_cert.is_null() && shard.is_masterchain()) { co_return; }
+            // On MC, once the final cert is consumed, stop the walk.
+            if self.description.get_shard().is_masterchain() && !has_final_cert {
+                if !received.is_empty && !self.finalized_delivery_sent.contains(&current_id) {
+                    self.finalized_delivery_sent.insert(current_id.clone());
+                }
+                break;
+            }
+
+            // Step 2: evaluate local readiness + floor constraints for this block only.
+            // C++ parity: cert-carrying walks bypass the floor check because the
+            // recursive finalization in C++ has no applied-floor guard.
+            let block_below_applied_floor =
+                !has_final_cert && received.block_id.seq_no() < applied_floor;
+            let body_available = !received.candidate_hash_data_bytes.is_empty();
+
+            if body_available {
+                // Step 3: persist/apply local finalized state before listener callback emission.
+                if !self.maybe_apply_finalized_state(&current_id, has_final_cert) {
+                    complete = false;
+                    break;
+                }
+
+                // Step 4: callback emission policy + signature mode is handled per block.
+                self.try_emit_recursive_finalized_callback(
+                    &current_id,
+                    &received,
+                    event,
+                    has_final_cert,
+                    trigger_slot,
+                    &trigger_candidate_hash_data,
+                    &mut complete,
+                );
+            } else if !block_below_applied_floor {
+                log::debug!(
+                    "Session {} recursive finalization: candidate body missing for s{}:{}, \
+                     requesting and deferring trigger=s{}:{}",
+                    &self.session_id().to_hex_string()[..8],
+                    current_id.slot,
+                    &current_id.hash.to_hex_string()[..8],
+                    trigger_id.slot,
+                    &trigger_id.hash.to_hex_string()[..8],
+                );
+                self.request_candidate(
+                    current_id.slot,
+                    current_id.hash.clone(),
+                    Some(Duration::ZERO),
+                );
+                complete = false;
+            }
+
+            // Step 5: stop climbing once we reached already-applied floor.
+            if block_below_applied_floor {
+                if !received.is_empty && !self.finalized_delivery_sent.contains(&current_id) {
+                    log::debug!(
+                        "Session {} recursive finalization: stopping parent walk below applied-top \
+                         floor for block_id={} seqno={} floor={}",
+                        &self.session_id().to_hex_string()[..8],
+                        received.block_id,
+                        received.block_id.seq_no(),
+                        applied_floor,
+                    );
+                    self.finalized_delivery_sent.insert(current_id.clone());
+                }
+                break;
+            }
+
+            // C++ parity: final cert context flows through empty candidates,
+            // is consumed by the first non-empty candidate.
+            // `if (is_empty) { recurse(parent, maybe_final_cert); }`
+            // `else { recurse(parent, {}); }`
+            if !received.is_empty {
+                has_final_cert = false;
+            }
+
+            let Some(parent_id) = received.parent_id else {
+                break;
+            };
+
+            current_id = parent_id;
+        }
+
+        complete
+    }
+
+    /// Attempt to emit `on_block_finalized()` for one block in recursive walk.
+    ///
+    /// C++ parity (`consensus.cpp::finalize_blocks_inner`):
+    /// - Empty candidates never get `BlockFinalized` / `do_finalize_block`.
+    /// - Non-empty candidates with `maybe_final_cert` use FinalCert signatures
+    ///   and the **trigger** candidate's slot/hash_data for the signature set
+    ///   (C++ `maybe_final_candidate->id.slot`, `maybe_final_candidate->hash_data()`).
+    /// - Non-empty candidates without cert use NotarCert signatures and their own
+    ///   slot/hash_data.
+    ///
+    /// `complete` is set to `false` when dependencies are missing and were requested.
+    fn try_emit_recursive_finalized_callback(
+        &mut self,
+        candidate_id: &RawCandidateId,
+        received: &ReceivedCandidate,
+        event: &BlockFinalizedEvent,
+        has_final_cert: bool,
+        trigger_slot: SlotIndex,
+        trigger_candidate_hash_data: &[u8],
+        complete: &mut bool,
     ) {
-        if self.finalized_delivery_sent.contains(finalized_id) {
+        // C++ parity: empty candidates never emit BlockFinalized / do_finalize_block.
+        if received.is_empty || self.finalized_delivery_sent.contains(candidate_id) {
             return;
         }
 
-        let Some(received) = self.received_candidates.get(finalized_id) else {
-            // Candidate body not known yet.
-            return;
-        };
-        if received.candidate_hash_data_bytes.is_empty() || received.is_empty {
-            // Boundary stubs and empty blocks are not delivered via on_block_finalized.
+        // Protocol invariant: exactly one finalized callback per seqno.
+        let seqno = received.block_id.seq_no();
+        if let Some(existing_block_id) = self.finalized_delivery_sent_seqno.get(&seqno) {
+            assert!(
+                false,
+                "Session {} protocol breach: multiple finalized callbacks for seqno={} \
+                 existing_block_id={} new_block_id={}",
+                &self.session_id().to_hex_string()[..8],
+                seqno,
+                existing_block_id,
+                received.block_id,
+            );
+        }
+
+        // Apply shard/MC callback emission policy for this block.
+        // C++ parity: on MC, emit only when final cert context is present
+        // (matches `maybe_final_cert.not_null()` gate before `BlockFinalized` publish).
+        let should_emit =
+            self.should_emit_on_block_finalized_for_block(&received.block_id, has_final_cert);
+
+        if !should_emit {
+            if self.description.get_shard().is_masterchain() {
+                assert!(
+                    !has_final_cert,
+                    "Session {} invariant breach: masterchain FinalCert callback unexpectedly suppressed \
+                     for block_id={} seqno={}",
+                    &self.session_id().to_hex_string()[..8],
+                    received.block_id,
+                    seqno,
+                );
+                log::debug!(
+                    "Session {} recursive finalization: skip masterchain ancestor callback \
+                     without FinalCert context for block_id={} seqno={}",
+                    &self.session_id().to_hex_string()[..8],
+                    received.block_id,
+                    seqno,
+                );
+            } else {
+                let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
+                log::warn!(
+                    "Session {} recursive finalization: skip callback below applied-top \
+                     floor for block_id={} seqno={} floor={}",
+                    &self.session_id().to_hex_string()[..8],
+                    received.block_id,
+                    seqno,
+                    applied_floor,
+                );
+            }
+            self.finalized_delivery_sent.insert(candidate_id.clone());
             return;
         }
 
-        let source_idx = received.source_idx;
-        let source_public_key = self.description.get_source_public_key(source_idx).clone();
-        let source_info = crate::BlockSourceInfo {
-            source: source_public_key,
-            priority: crate::BlockCandidatePriority {
-                round: SIMPLEX_ROUNDLESS,
-                priority: 0,
-                first_block_round: SIMPLEX_ROUNDLESS,
-            },
+        // C++ parity: FinalCert context → use FinalCert signatures from the trigger
+        // event; otherwise use NotarCert from this candidate's slot.
+        let signatures = if has_final_cert {
+            self.build_finalization_raw_signatures(&event.certificate.signatures)
+        } else {
+            let Some(notar_cert) =
+                self.simplex_state.get_notarize_certificate(candidate_id.slot, &candidate_id.hash)
+            else {
+                log::debug!(
+                    "Session {} recursive finalization: missing ancestor NotarCert for \
+                     s{}:{}, requesting and deferring callback",
+                    &self.session_id().to_hex_string()[..8],
+                    candidate_id.slot,
+                    &candidate_id.hash.to_hex_string()[..8],
+                );
+                self.request_candidate(
+                    candidate_id.slot,
+                    candidate_id.hash.clone(),
+                    Some(Duration::ZERO),
+                );
+                *complete = false;
+                return;
+            };
+            self.build_finalization_raw_signatures(&notar_cert.signatures)
         };
 
-        let sigs: Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)> = event
-            .certificate
-            .signatures
+        // C++ parity: when using FinalCert, the signature set references the
+        // *trigger* candidate's slot/hash_data (C++ `maybe_final_candidate`),
+        // not the current ancestor's. When using NotarCert, use this block's own.
+        let (sig_slot, sig_hash_data) = if has_final_cert {
+            (trigger_slot, trigger_candidate_hash_data.to_vec())
+        } else {
+            (received.slot, received.candidate_hash_data_bytes.clone())
+        };
+
+        let source_info = self.build_source_info_for_received(received);
+        let delivered = self.notify_block_finalized(
+            received.block_id.clone(),
+            source_info,
+            received.root_hash.clone(),
+            received.file_hash.clone(),
+            received.data.clone(),
+            signatures,
+            Vec::new(),
+            sig_slot,
+            sig_hash_data,
+            has_final_cert,
+        );
+        if self.description.get_shard().is_masterchain() && has_final_cert {
+            assert!(
+                delivered,
+                "Session {} protocol breach: failed to emit masterchain FinalCert callback \
+                 for block_id={} seqno={}",
+                &self.session_id().to_hex_string()[..8],
+                received.block_id,
+                seqno,
+            );
+        }
+        if delivered {
+            self.record_self_collation_acceptance(candidate_id, &received.block_id, has_final_cert);
+            self.finalized_delivery_sent.insert(candidate_id.clone());
+            let previous =
+                self.finalized_delivery_sent_seqno.insert(seqno, received.block_id.clone());
+            assert!(
+                previous.is_none(),
+                "Session {} protocol breach: duplicate finalized callback seqno={} \
+                 previous_block_id={} new_block_id={}",
+                &self.session_id().to_hex_string()[..8],
+                seqno,
+                previous.unwrap_or_else(|| received.block_id.clone()),
+                received.block_id,
+            );
+        } else {
+            *complete = false;
+        }
+    }
+
+    fn should_emit_on_block_finalized_for_block(
+        &self,
+        block_id: &BlockIdExt,
+        has_final_cert: bool,
+    ) -> bool {
+        if self.description.get_shard().is_masterchain() {
+            return has_final_cert;
+        }
+        let applied_floor = self.last_mc_finalized_seqno.unwrap_or(0);
+        block_id.seq_no() >= applied_floor
+    }
+
+    fn build_finalization_raw_signatures(
+        &self,
+        signatures: &[crate::certificate::VoteSignature],
+    ) -> Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)> {
+        signatures
             .iter()
             .map(|s| {
                 (
@@ -8738,23 +10203,21 @@ impl SessionProcessor {
                     ),
                 )
             })
-            .collect();
+            .collect()
+    }
 
-        let delivered = self.notify_block_finalized(
-            received.block_id.clone(),
-            source_info,
-            received.root_hash.clone(),
-            received.file_hash.clone(),
-            received.data.clone(),
-            sigs,
-            Vec::new(),
-            event.slot,
-            received.candidate_hash_data_bytes.clone(),
-        );
-        if delivered {
-            self.finalized_delivery_sent.insert(finalized_id.clone());
-            self.finalized_pending_body.remove(finalized_id);
-            self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
+    fn build_source_info_for_received(
+        &self,
+        received: &ReceivedCandidate,
+    ) -> crate::BlockSourceInfo {
+        let source_public_key = self.description.get_source_public_key(received.source_idx).clone();
+        crate::BlockSourceInfo {
+            source: source_public_key,
+            priority: crate::BlockCandidatePriority {
+                round: SIMPLEX_ROUNDLESS,
+                priority: 0,
+                first_block_round: SIMPLEX_ROUNDLESS,
+            },
         }
     }
 
@@ -8764,17 +10227,23 @@ impl SessionProcessor {
     /// - updates local finalized/head cursors
     /// - persists finalized records for restart recovery
     /// - clears per-slot runtime once finalization is materially applied
-    fn maybe_apply_finalized_state(&mut self, finalized_id: &RawCandidateId) {
+    ///
+    /// Returns `false` when persistence fails and this candidate must be retried.
+    fn maybe_apply_finalized_state(
+        &mut self,
+        finalized_id: &RawCandidateId,
+        is_final: bool,
+    ) -> bool {
         if self.finalized_blocks.contains(finalized_id) {
-            return;
+            return true;
         }
 
         let Some(received) = self.received_candidates.get(finalized_id).cloned() else {
-            return;
+            return true;
         };
 
         if received.candidate_hash_data_bytes.is_empty() {
-            return;
+            return true;
         }
 
         let slot = received.slot;
@@ -8790,6 +10259,48 @@ impl SessionProcessor {
             if let Ok(latency) = self.now().duration_since(slot_started_at) {
                 self.first_candidate_finalized_latency_histogram.record(latency.as_millis() as f64);
             }
+        }
+
+        let record = FinalizedBlockRecord {
+            candidate_id: finalized_id.clone(),
+            block_id: received.block_id.clone(),
+            parent: received.parent_id.clone(),
+            is_final,
+        };
+
+        if self.description.get_shard().is_masterchain() {
+            match self.db.save_finalized_block_async(&record) {
+                Ok(result) => {
+                    if let Err(e) = result.wait() {
+                        log::error!(
+                            "Session {} maybe_apply_finalized_state: failed to store finalized block for \
+                            slot={}: {e}",
+                            &self.session_id().to_hex_string()[..8],
+                            slot.value(),
+                        );
+                        self.increment_error();
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Session {} maybe_apply_finalized_state: failed to create finalized block save for \
+                        slot={}: {e}",
+                        &self.session_id().to_hex_string()[..8],
+                        slot.value(),
+                    );
+                    self.increment_error();
+                    return false;
+                }
+            }
+        } else if let Err(e) = self.db.save_finalized_block(&record) {
+            log::error!(
+                "Session {} maybe_apply_finalized_state: failed to store finalized block for slot={}: {e}",
+                &self.session_id().to_hex_string()[..8],
+                slot.value(),
+            );
+            self.increment_error();
+            return false;
         }
 
         let previous_head_seqno = self.finalized_head_seqno.unwrap_or(0);
@@ -8813,6 +10324,7 @@ impl SessionProcessor {
                     crate::utils::extract_before_split_flag(received.data.data())
                 {
                     self.finalized_head_before_split = before_split;
+                    self.before_split_by_block_id.insert(received.block_id.clone(), before_split);
                     if before_split {
                         log::info!(
                             "Session {} maybe_apply_finalized_state: block at slot={slot} seqno={seqno} has \
@@ -8847,47 +10359,6 @@ impl SessionProcessor {
         self.round_debug_at = now + ROUND_DEBUG_PERIOD;
         self.last_finalization_time = now;
 
-        let record = FinalizedBlockRecord {
-            candidate_id: finalized_id.clone(),
-            block_id: received.block_id.clone(),
-            parent: received.parent_id.clone(),
-            is_final: true,
-        };
-
-        if self.description.get_shard().is_masterchain() {
-            match self.db.save_finalized_block_async(&record) {
-                Ok(result) => {
-                    if let Err(e) = result.wait() {
-                        log::error!(
-                            "Session {} maybe_apply_finalized_state: failed to store finalized block for \
-                            slot={}: {e}",
-                            &self.session_id().to_hex_string()[..8],
-                            slot.value(),
-                        );
-                        self.increment_error();
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        "Session {} maybe_apply_finalized_state: failed to create finalized block save for \
-                        slot={}: {e}",
-                        &self.session_id().to_hex_string()[..8],
-                        slot.value(),
-                    );
-                    self.increment_error();
-                }
-            }
-        } else if let Err(e) = self.db.save_finalized_block(&record) {
-            log::error!(
-                "Session {} maybe_apply_finalized_state: failed to store finalized block for slot={}: {e}",
-                &self.session_id().to_hex_string()[..8],
-                slot.value(),
-            );
-            self.increment_error();
-        }
-
-        self.finalized_pending_body.remove(finalized_id);
-        self.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
         if self.simplex_state.is_slot_progressed(&self.description, slot) {
             self.reset_slot_state(slot);
         } else {
@@ -8897,6 +10368,8 @@ impl SessionProcessor {
                 &self.session_id().to_hex_string()[..8],
             );
         }
+
+        true
     }
 
     /// Emit `on_block_finalized` to the listener for finalized-driven acceptance.
@@ -8911,6 +10384,7 @@ impl SessionProcessor {
         approve_signatures: Vec<(crate::PublicKeyHash, crate::BlockPayloadPtr)>,
         slot: SlotIndex,
         candidate_hash_data_bytes: Vec<u8>,
+        is_final: bool,
     ) -> bool {
         check_execution_time!(20_000);
 
@@ -8927,7 +10401,7 @@ impl SessionProcessor {
             &signatures,
             slot,
             candidate_hash_data_bytes,
-            true, // always final
+            is_final,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -9324,9 +10798,10 @@ impl SessionStartupRecoveryListener for SessionProcessor {
             slot.value()
         );
         self.simplex_state.set_first_non_finalized_slot(slot);
-        self.receiver.set_ingress_slot_begin(slot.value());
-        self.receiver
-            .set_ingress_progress_slot(self.simplex_state.get_first_non_progressed_slot().value());
+        let (begin, _) = self.simplex_state.get_tracked_slots_interval();
+        let progress = self.simplex_state.get_first_non_progressed_slot().value().max(begin);
+        self.receiver.set_ingress_slot_begin(begin);
+        self.receiver.set_ingress_progress_slot(progress);
     }
 
     fn recovery_on_vote(
@@ -9489,12 +10964,29 @@ impl SessionStartupRecoveryListener for SessionProcessor {
 
             // Skip if already present (shouldn't happen, but be safe)
             if self.received_candidates.contains_key(&candidate_id) {
+                if !is_empty {
+                    self.finalized_delivery_sent.insert(candidate_id.clone());
+                    let seqno = block_id.seq_no();
+                    if let Some(existing_block_id) = self.finalized_delivery_sent_seqno.get(&seqno)
+                    {
+                        assert!(
+                            false,
+                            "Session {} protocol breach: duplicate finalized seqno={} while seeding \
+                             existing_block_id={} new_block_id={}",
+                            &self.session_id().to_hex_string()[..8],
+                            seqno,
+                            existing_block_id,
+                            block_id,
+                        );
+                    }
+                    self.finalized_delivery_sent_seqno.insert(seqno, block_id);
+                }
                 continue;
             }
 
             // Seed a minimal received candidate record for restart-side parent/tip lookups.
             self.received_candidates.insert(
-                candidate_id,
+                candidate_id.clone(),
                 ReceivedCandidate {
                     slot,
                     source_idx: self.description.get_self_idx(),
@@ -9511,6 +11003,23 @@ impl SessionStartupRecoveryListener for SessionProcessor {
                     parent_id: block.parent.clone(),
                 },
             );
+
+            if !is_empty {
+                self.finalized_delivery_sent.insert(candidate_id);
+                let seqno = block_id.seq_no();
+                if let Some(existing_block_id) = self.finalized_delivery_sent_seqno.get(&seqno) {
+                    assert!(
+                        false,
+                        "Session {} protocol breach: duplicate finalized seqno={} while seeding \
+                         existing_block_id={} new_block_id={}",
+                        &self.session_id().to_hex_string()[..8],
+                        seqno,
+                        existing_block_id,
+                        block_id,
+                    );
+                }
+                self.finalized_delivery_sent_seqno.insert(seqno, block_id);
+            }
         }
 
         log::debug!(

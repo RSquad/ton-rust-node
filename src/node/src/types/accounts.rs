@@ -17,6 +17,8 @@ use ton_block::{
     UsageTree,
 };
 
+const STAT_UPDATE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub struct ShardAccountStuff {
     account: Account,
     account_id: AccountId,
@@ -48,11 +50,26 @@ impl ShardAccountStuff {
         let mut storage_dict = if let Some(dict_hash) = account.dict_hash() {
             if let Some(dict) = engine.get_account_storage_dict(dict_hash) {
                 Some(dict)
-            } else {
+            } else if full_collated_data {
                 let now = std::time::Instant::now();
-                let result = account.init_storage_stat(dict_hash_min_cells)?;
-                log::debug!("TIME account {:x} init_storage_stat {:?}", account_id, now.elapsed());
+                let result = account.calc_and_check_storage_stat_dict(dict_hash_min_cells)?;
+                let elapsed = now.elapsed();
+                if elapsed > STAT_UPDATE_THRESHOLD {
+                    log::warn!(
+                        "TIME account {:x} calc_and_check_storage_stat_dict {:?}",
+                        account_id,
+                        elapsed
+                    );
+                } else {
+                    log::debug!(
+                        "TIME account {:x} calc_and_check_storage_stat_dict {:?}",
+                        account_id,
+                        elapsed
+                    );
+                }
                 result
+            } else {
+                None
             }
         } else {
             None
@@ -140,7 +157,16 @@ impl ShardAccountStuff {
         transaction.set_prev_trans_lt(self.shard_acc.last_trans_lt());
         // log::trace!("{} {}", self.collated_block_descr, debug_transaction(transaction.clone())?);
         self.account = account;
-        self.storage_dict = self.account.update_storage_stat(self.dict_hash_min_cells)?;
+
+        let now = std::time::Instant::now();
+        self.storage_dict = self.account.calc_storage_stat_dict(self.dict_hash_min_cells)?;
+        let elapsed = now.elapsed();
+        if elapsed > STAT_UPDATE_THRESHOLD {
+            log::warn!("TIME account {:x} calc_storage_stat_dict {:?}", self.account_id, elapsed);
+        } else {
+            log::debug!("TIME account {:x} calc_storage_stat_dict {:?}", self.account_id, elapsed);
+        }
+
         self.account_updates.extend(AccountStorageStat::get_roots(self.account.state_init()));
         self.shard_acc.write_account(&self.account)?;
         let new_hash = self.shard_acc.account_hash();

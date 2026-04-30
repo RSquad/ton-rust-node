@@ -27,7 +27,10 @@ use crate::{
         UNREGISTERED_CHAIN_MAX_LEN,
     },
     validator::{
+        collator::PREV_STATE_WAIT_TIMEOUT_MS,
+        consensus::{BlockPayloadPtr, ResolverPurpose},
         out_msg_queue::{MsgQueueManager, StatesManager},
+        state_resolver_cache::StateResolverCache,
         validator_group::PipelineContext,
         validator_utils::calc_subset_for_masterchain,
         BlockCandidate, McData,
@@ -279,8 +282,10 @@ pub struct ValidateQuery {
     engine: Arc<dyn EngineOperations>,
 
     /// In-memory pipeline of recently collated states (accelerated consensus / Simplex).
-    /// Used to find prev states that haven't been persisted to DB yet.
+    /// Used only by accelerated Catchain consensus.
     pipeline_context: PipelineContext,
+    /// Simplex speculative state cache for notarized-but-not-yet-applied parents.
+    state_resolver_cache: Option<Arc<tokio::sync::Mutex<StateResolverCache>>>,
 
     next_block_descr: Arc<String>,
 }
@@ -297,11 +302,222 @@ impl ValidateQuery {
     fn shard(&self) -> &ShardIdent {
         &self.shard
     }
+
+    async fn wait_prev_state_via_engine_or_cache(
+        &self,
+        prev_id: &BlockIdExt,
+    ) -> Result<Arc<ShardStateStuff>> {
+        let Some(state_resolver_cache) = self.state_resolver_cache.clone() else {
+            return self
+                .engine
+                .clone()
+                .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
+                .await;
+        };
+
+        if let Some(state) = {
+            let cache = state_resolver_cache.lock().await;
+            cache.try_get_state(prev_id)
+        } {
+            metrics::counter!("ton_node_resolver_wait_result_total", "source" => "cache_hit")
+                .increment(1);
+            return Ok(state);
+        }
+
+        if let Some(state) =
+            self.try_materialize_prev_state_from_cache(state_resolver_cache.clone(), prev_id).await
+        {
+            metrics::counter!("ton_node_resolver_wait_result_total", "source" => "materialized")
+                .increment(1);
+            return Ok(state);
+        }
+
+        let mut cache_rx = {
+            let mut cache = state_resolver_cache.lock().await;
+            cache.request_availability(prev_id, ResolverPurpose::SimplexValidationParent);
+            cache.subscribe_state(prev_id)
+        };
+
+        let cache_wait = async {
+            loop {
+                if let Some(state) = cache_rx.borrow().clone() {
+                    return Some(state);
+                }
+                if cache_rx.changed().await.is_err() {
+                    return None;
+                }
+            }
+        };
+
+        tokio::select! {
+            engine_state = self
+                .engine
+                .clone()
+                .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true) => {
+                metrics::counter!("ton_node_resolver_wait_result_total", "source" => "engine").increment(1);
+                engine_state
+            },
+            cache_state = cache_wait => {
+                if let Some(state) = cache_state {
+                    metrics::counter!("ton_node_resolver_wait_result_total", "source" => "cache_async").increment(1);
+                    Ok(state)
+                } else {
+                    metrics::counter!("ton_node_resolver_wait_result_total", "source" => "engine_fallback").increment(1);
+                    self.engine
+                        .clone()
+                        .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
+                        .await
+                }
+            }
+        }
+    }
+
+    async fn try_materialize_prev_state_from_cache(
+        &self,
+        state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
+        target_id: &BlockIdExt,
+    ) -> Option<Arc<ShardStateStuff>> {
+        let (chain_to_apply, mut current_state) = {
+            let mut cache = state_resolver_cache.lock().await;
+
+            if cache.is_materializing(target_id) {
+                return None;
+            }
+
+            let (chain_ids, base_state) = cache.collect_unresolved_chain(target_id);
+            let base_state = base_state?;
+
+            if chain_ids.is_empty() {
+                return Some(base_state);
+            }
+
+            // Validate every chain entry before claiming the materializing slot.
+            // `collect_unresolved_chain` doesn't filter by `body_present`, so any
+            // missing body must abort here — and the marker is only released by
+            // `store_validated_state()`, which won't fire if we early-return.
+            // Setting the marker first would permanently flag `target_id` as
+            // "in flight" and block every retry until pruning.
+            let mut chain = Vec::with_capacity(chain_ids.len());
+            for block_id in chain_ids {
+                let Some(entry) = cache.try_get_entry(&block_id) else {
+                    return None;
+                };
+                if !entry.flags.body_present || entry.data.data().is_empty() {
+                    return None;
+                }
+                chain.push((block_id, entry.data.clone()));
+            }
+
+            cache.try_start_materializing(target_id);
+
+            (chain, base_state)
+        };
+
+        let mut resolved_states = Vec::with_capacity(chain_to_apply.len());
+        for (block_id, block_data) in chain_to_apply {
+            let next_state = match self
+                .apply_candidate_state_update_from_cache(&block_id, &block_data, current_state)
+                .await
+            {
+                Ok(state) => state,
+                Err(err) => {
+                    log::warn!(
+                        target: "simplex_resolver",
+                        "failed to materialize validation resolver state for {}: {}",
+                        block_id,
+                        err,
+                    );
+                    state_resolver_cache.lock().await.finish_materializing(target_id);
+                    return None;
+                }
+            };
+            resolved_states.push((block_id.clone(), next_state.clone()));
+            current_state = next_state;
+        }
+
+        if !resolved_states.is_empty() {
+            let mut cache = state_resolver_cache.lock().await;
+            for (block_id, state) in &resolved_states {
+                cache.store_validated_state(block_id, state.clone());
+            }
+            // `store_validated_state(target_id, ...)` above clears the marker
+            // for `target_id` (it's the last entry in the chain). The explicit
+            // call here is defense-in-depth in case the chain shape ever changes.
+            cache.finish_materializing(target_id);
+            metrics::counter!("ton_node_resolver_materialized_total")
+                .increment(resolved_states.len() as u64);
+            log::info!(
+                target: "simplex_resolver",
+                "materialized validation resolver state chain target={} chain_len={}",
+                target_id,
+                resolved_states.len(),
+            );
+        }
+
+        Some(current_state)
+    }
+
+    async fn apply_candidate_state_update_from_cache(
+        &self,
+        block_id: &BlockIdExt,
+        block_data: &BlockPayloadPtr,
+        prev_state: Arc<ShardStateStuff>,
+    ) -> Result<Arc<ShardStateStuff>> {
+        let block = Block::construct_from_bytes(block_data.data())?;
+        let state_update = block.read_state_update()?;
+        let prev_state_root = prev_state.root_cell().clone();
+        let engine = self.engine.clone();
+        let materialized_block_id = block_id.clone();
+        let log_block_id = block_id.clone();
+
+        let (next_state_root, _) = tokio::task::spawn_blocking(move || {
+            let fast_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine
+                    .db_cells_factory()
+                    .and_then(|cf| state_update.apply_with_factory(&prev_state_root, &cf))
+            }))
+            .unwrap_or_else(|_| {
+                Err(error!(
+                    "resolver fast Merkle apply path unavailable for {}; falling back",
+                    log_block_id
+                ))
+            });
+
+            match fast_result {
+                Ok(result) => Ok(result),
+                Err(err) => {
+                    log::debug!(
+                        target: "simplex_resolver",
+                        "validation resolver fast Merkle apply failed for {}: {}. Falling back to apply_for()",
+                        log_block_id,
+                        err,
+                    );
+                    state_update.apply_for(&prev_state_root).map_err(|apply_err| {
+                        error!(
+                            "cannot apply Merkle update for validation resolver materialization {}: {}",
+                            log_block_id, apply_err
+                        )
+                    })
+                }
+            }
+        })
+        .await??;
+
+        ShardStateStuff::from_root_cell(
+            materialized_block_id,
+            next_state_root,
+            #[cfg(feature = "telemetry")]
+            self.engine.engine_telemetry(),
+            self.engine.engine_allocated(),
+        )
+    }
+
     pub fn new(
         shard: ShardIdent,
         min_mc_seqno: u32,
         prev_blocks_ids: Vec<BlockIdExt>,
         pipeline_context: PipelineContext,
+        state_resolver_cache: Option<Arc<tokio::sync::Mutex<StateResolverCache>>>,
         block_candidate: BlockCandidate,
         validator_set: ValidatorSet,
         engine: Arc<dyn EngineOperations>,
@@ -328,6 +544,7 @@ impl ValidateQuery {
             block_create_total: Default::default(),
             block_create_count: Default::default(),
             pipeline_context,
+            state_resolver_cache,
             next_block_descr,
         }
     }
@@ -459,6 +676,8 @@ impl ValidateQuery {
                     self.engine.engine_telemetry(),
                     self.engine.engine_allocated(),
                 )?
+            } else if self.is_simplex {
+                self.wait_prev_state_via_engine_or_cache(block_id).await?
             } else if let Some(state) = self.pipeline_context.try_get_state(block_id) {
                 state
             } else {
@@ -5515,7 +5734,7 @@ impl ValidateQuery {
         let mut error = None;
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
-                *storage_dict = account.update_storage_stat(dict_hash_min_cells)?;
+                *storage_dict = account.calc_storage_stat_dict(dict_hash_min_cells)?;
                 #[cfg(test)]
                 if block_version < 12 {
                     account.del_storage_stat();

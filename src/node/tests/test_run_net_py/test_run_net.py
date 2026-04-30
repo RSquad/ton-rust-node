@@ -32,6 +32,17 @@ rust_src_path: Path
 cpp_log_level: int
 cpp_build_command: str
 
+# Validator permanent key lifetime used by `addpermkey` in this harness.
+# `addpermkey {key} {start} {expire}` takes Unix timestamps. A hard-coded
+# constant in the past silently produces an already-expired key — fine
+# today only because enforcement is lenient, fragile if it tightens. Derive
+# the expiry from wall-clock time so the harness stays valid over time.
+VALIDATOR_KEY_LIFETIME_SECONDS = 365 * 24 * 3600
+
+
+def validator_key_expire_at() -> int:
+    return int(time.time()) + VALIDATOR_KEY_LIFETIME_SECONDS
+
 
 def load_config() -> bool:
     global \
@@ -394,7 +405,7 @@ def generate_validator_key(node_index: int, console_config_path: str | Path) -> 
 
 def import_validator_key(node_index: int, console_config_path: str | Path, key: str):
     print(f"Adding validator key for node {node_index}...", end="")
-    params = ["-c", f"addpermkey {key} {str(int(time.time()))} 1610000000"]
+    params = ["-c", f"addpermkey {key} {int(time.time())} {validator_key_expire_at()}"]
     run_console(params, node_index, console_config_path)
     print(" done")
 

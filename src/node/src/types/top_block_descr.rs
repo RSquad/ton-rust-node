@@ -178,7 +178,7 @@ impl TopBlockDescrStuff {
         let mut bytes = Cursor::new(bytes);
 
         // Read BOC first
-        let root = BocReader::new().read(&mut bytes)?.withdraw_single_root()?;
+        let root = BocReader::new().stream_read(&mut bytes)?.withdraw_single_root()?;
 
         // Try to read meta from the remaining data. Defaults to 0 for compatibility
         let mut meta = 0u8;

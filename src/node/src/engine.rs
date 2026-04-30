@@ -2766,6 +2766,150 @@ pub fn init_prometheus_recorder(
     );
     metrics::describe_histogram!("ton_node_block_size_bytes", "Block size in bytes");
 
+    // -- simplex (republished from per-session MetricsHandle by
+    //    `simplex::prometheus_publisher`; see MONITORING-PROM-1).
+    //
+    // All series carry the `shard` label by default; sessions configured with
+    // `PrometheusLabels::ShardAndSessionId` also carry `session_id` (first
+    // 8 hex chars of the simplex session id, matching the `sid8` prefix used
+    // in log dumps and consensus_session_dump.py reports).
+    //
+    // Counters (monotonically non-decreasing).
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_total",
+        "Total simplex votes received (notarize+finalize+skip)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_notarize",
+        "Simplex notarize votes received"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_finalize",
+        "Simplex finalize votes received"
+    );
+    metrics::describe_counter!("ton_node_simplex_votes_in_skip", "Simplex skip votes received");
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_total",
+        "Total simplex votes sent (notarize+finalize+skip)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_notarize",
+        "Simplex notarize votes sent"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_finalize",
+        "Simplex finalize votes sent"
+    );
+    metrics::describe_counter!("ton_node_simplex_votes_out_skip", "Simplex skip votes sent");
+    metrics::describe_counter!(
+        "ton_node_simplex_certs_in",
+        "Simplex certificates received from the network (skip+notarize+finalize aggregate)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_certs_relayed",
+        "Simplex certificates relayed to peers (skip+notarize+finalize aggregate)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collation_starts",
+        "Number of simplex collation invocations started"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collates_total",
+        "Total simplex collations (success+failure)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collates_success",
+        "Successful simplex collations"
+    );
+    metrics::describe_counter!("ton_node_simplex_collates_failure", "Failed simplex collations");
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_total",
+        "Total self-collation attempts (success+failure+ignore)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_success",
+        "Self-collation attempts accepted via finalized callback emission"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_failure",
+        "Self-collation attempts that failed before finalized callback emission"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_validates_total",
+        "Total simplex validations (success+failure)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_validates_success",
+        "Successful simplex validations"
+    );
+    metrics::describe_counter!("ton_node_simplex_validates_failure", "Failed simplex validations");
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_received_broadcast",
+        "Simplex block candidates received via broadcast"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_received_query",
+        "Simplex block candidates received via requestCandidate query"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_requests",
+        "Simplex outgoing requestCandidate queries"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_health_warnings",
+        "Total SIMPLEX_HEALTH anomaly warnings emitted"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_standstill_triggers",
+        "Number of standstill triggers fired"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_errors",
+        "Total simplex errors recorded by SessionProcessor"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_misbehavior",
+        "Total simplex misbehavior events detected"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_receiver_in_bytes",
+        "Total bytes received by the simplex receiver overlay"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_receiver_out_bytes",
+        "Total bytes sent by the simplex receiver overlay"
+    );
+
+    // Gauges (latest active value).
+    metrics::describe_gauge!(
+        "ton_node_simplex_active_weight",
+        "Current active validator weight in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_total_weight",
+        "Total validator weight in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_last_finalized_slot",
+        "Last finalized slot index in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_first_non_finalized_slot",
+        "First non-finalized slot index in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_first_non_progressed_slot",
+        "First non-progressed slot index (C++ pool.cpp `now_` parity)"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_main_loop_load",
+        "Fraction of simplex main loop iterations that detected overload"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_active_nodes_percent",
+        "Percentage of validator weight currently active in the session"
+    );
+
     handle
 }
 

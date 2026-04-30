@@ -480,7 +480,7 @@ impl Emulator {
         let elapsed_time = now.elapsed().as_micros() as i64;
         let result = match result {
             Ok(mut transaction) => {
-                account.update_storage_stat(dict_hash_min_cells).unwrap();
+                account.calc_storage_stat_dict(dict_hash_min_cells).unwrap();
                 transaction.set_prev_trans_lt(shard_acc.last_trans_lt());
                 transaction.set_prev_trans_hash(shard_acc.last_trans_hash().clone());
                 let old_hash = shard_acc.account_hash();

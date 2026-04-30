@@ -927,16 +927,49 @@ pub trait AsyncRequest: Send + Sync {
 
 /// Collation parent hint for `SessionListener::on_generate_slot`.
 ///
-/// This allows consensus implementations (e.g. Simplex) to provide an explicit
-/// parent `ValidatorBlockId` for collation without changing validator-session behavior.
+/// This allows consensus implementations (e.g. Simplex) to provide explicit
+/// previous block ids for collation without changing validator-session behavior.
 #[derive(Debug, Clone)]
 pub enum CollationParentHint {
     /// Keep existing behavior (validator-session / default ValidatorGroup logic).
     Implicit,
-    /// Collate on top of this explicit parent (parent is locked at collation start).
+    /// Collate on top of these explicit parents (locked at collation start).
     ///
-    /// Intended for Simplex notarized-parent collation (before finalization).
-    Explicit(ValidatorBlockId),
+    /// Intended for Simplex notarized-parent collation (before finalization)
+    /// and first-block session starts after merge, where two parents are possible.
+    Explicit(Vec<ValidatorBlockId>),
+}
+
+/// Purpose of a resolver-driven parent/state lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolverPurpose {
+    /// Resolve state for Simplex collation on an explicit parent anchor.
+    SimplexCollationParent,
+    /// Resolve state for candidate-native Simplex validation.
+    SimplexValidationParent,
+    /// Resolve state for local Catchain speculative collation only.
+    CatchainLocalCollation,
+}
+
+/// Store-only candidate observation flags sent from consensus to validator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandidateObservedFlags {
+    /// The candidate body is locally available.
+    pub body_present: bool,
+    /// This block id is currently usable as a Simplex parent anchor.
+    pub parent_ready: bool,
+    /// The candidate belongs to the local speculative collation chain.
+    pub local_collated: bool,
+}
+
+/// Options for validator-triggered candidate/body availability requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnsureCandidateAvailabilityOptions {
+    /// Why the validator is requesting availability.
+    pub purpose: ResolverPurpose,
+    /// Request the ancestry required to resolve the candidate state, not just the
+    /// direct block body.
+    pub include_parent_chain: bool,
 }
 
 /// Session listener callbacks API
@@ -971,13 +1004,12 @@ pub trait SessionListener: Send + Sync {
         callback: ValidatorBlockCandidateCallback,
     );
 
-    /// New block is committed
+    // ---- Catchain-only callbacks ----
+
+    /// New block is committed (catchain only).
     ///
     /// Called for sequential block acceptance callbacks.
-    /// Catchain uses this directly; Simplex now delivers finalized blocks via
-    /// `on_block_finalized` and must not rely on this callback.
-    /// The `signatures` parameter contains the block signatures in variant format
-    /// (either Ordinary for catchain-based consensus or Simplex for simplex consensus).
+    /// Simplex delivers finalized blocks via `on_block_finalized` instead.
     #[allow(clippy::too_many_arguments)]
     fn on_block_committed(
         &self,
@@ -990,10 +1022,10 @@ pub trait SessionListener: Send + Sync {
         stats: SessionStats,
     );
 
-    /// Block generation is skipped for the current round
+    /// Block generation is skipped for the current round (catchain only).
     fn on_block_skipped(&self, round: u32);
 
-    /// Ask validator to retrieve a previously approved block candidate
+    /// Ask validator to retrieve a previously approved block candidate (catchain only).
     fn get_approved_candidate(
         &self,
         source: PublicKey,
@@ -1003,19 +1035,36 @@ pub trait SessionListener: Send + Sync {
         callback: ValidatorBlockCandidateCallback,
     );
 
+    // ---- Simplex-only callbacks ----
+
+    /// A block candidate was observed by Simplex consensus.
+    ///
+    /// Notifies the validator layer about a candidate so it can be cached
+    /// in the resolver without triggering validation. The flags describe
+    /// whether the body is present, the block is notarized (parent-ready),
+    /// and whether this node collated it.
+    ///
+    /// Counterpart: C++ `BlockProducerImpl` receives candidates via the
+    /// state-resolver pipeline; this callback is the Rust equivalent.
+    #[allow(unused_variables)]
+    fn on_candidate_observed(
+        &self,
+        block_id: BlockIdExt,
+        data: BlockPayloadPtr,
+        collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    ) {
+    }
+
     /// A block has been finalized (FinalCert observed) and is ready for
-    /// validator-side acceptance.
+    /// validator-side acceptance (Simplex only).
     ///
     /// Called immediately when a finalization certificate is collected for a
     /// slot, regardless of whether predecessors have been committed yet.
-    /// This is the Simplex finalized-delivery counterpart to `on_block_committed`.
     ///
     /// `block_id` carries the full `BlockIdExt` (shard, seqno, root_hash,
     /// file_hash) so `ValidatorGroup` can derive the block identity without
     /// relying on sequential `prev_block_ids` tracking.
-    ///
-    /// Has a default no-op implementation for backward compatibility with
-    /// legacy listeners that do not participate in finalized delivery.
     #[allow(unused_variables)]
     fn on_block_finalized(
         &self,
@@ -1027,7 +1076,6 @@ pub trait SessionListener: Send + Sync {
         signatures: BlockSignaturesVariant,
         approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
-        // Default no-op for backward compatibility with legacy listeners.
     }
 }
 
@@ -1042,15 +1090,19 @@ pub trait SessionListener: Send + Sync {
 pub trait Session: fmt::Display + Send + Sync {
     /// Signal the session to begin active consensus processing.
     ///
-    /// For Simplex sessions, `initial_block_seqno` is the expected seqno of
-    /// the first block to be produced (derived from prev_block_ids).  The
-    /// session overlay is created at `create()` time so it can warm up
-    /// connections to peers.  The FSM timeout clock only starts after
+    /// For Simplex sessions, `prev_blocks` and `min_masterchain_block_id`
+    /// mirror the C++ `start(blocks, min_mc_block_id)` contract:
+    /// - `prev_blocks` is the exact shard parent set for the first block
+    /// - `min_masterchain_block_id` is the MC anchor that collation and
+    ///   validation must not go behind
+    ///
+    /// The session overlay is created at `create()` time so it can warm up
+    /// connections to peers. The FSM timeout clock only starts after
     /// `start()` is called, preventing premature skip-votes on an
     /// unconnected overlay.
     ///
-    /// For Catchain sessions, the parameter is ignored (no-op).
-    fn start(&self, initial_block_seqno: u32);
+    /// For Catchain sessions, the parameters are ignored (no-op).
+    fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt);
 
     /// Stop the session (blocks until all threads have stopped)
     /// Database is preserved for potential restart/recovery.

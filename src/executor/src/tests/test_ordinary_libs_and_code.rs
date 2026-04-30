@@ -261,7 +261,7 @@ fn set_code_test() {
     );
     let data = out_msg.serialize().unwrap();
     acc.set_data(data);
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     // run send tx code
     execute_c(&msg, &mut acc, tr_lt, 403394216, 1).unwrap();

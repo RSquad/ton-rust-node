@@ -137,7 +137,7 @@ async fn apply_boc(boc_path: &str, db_path: &str, cleanup: bool) -> Result<()> {
     boc_file.read_to_end(&mut data)?;
     let now = Instant::now();
     tokio::task::spawn_blocking(move || -> Result<_> {
-        let result = BocReader::new().read_inmem_to_storage(data.as_slice(), &mut cs)?;
+        let result = BocReader::new().read_to_storage(data.as_slice(), &mut cs)?;
 
         let elapsed = now.elapsed();
         let cells = result.header.cells_count;

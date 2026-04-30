@@ -340,7 +340,7 @@ fn test_merkle_update4() {
 
 #[test]
 fn test_merkle_update5() {
-    std::env::set_var("RUST_BACKTRACE", "full");
+    // std::env::set_var("RUST_BACKTRACE", "full");
 
     fn create_cell(bytes: &[u8], refs: &[&Cell]) -> Cell {
         let mut c = BuilderData::new();

@@ -1098,7 +1098,7 @@ impl StateParser {
             accounts.iter().try_for_each::<_, Result<()>>(|account| {
                 let account = PathMap::cont(&map_path, "accounts", account)?;
                 let mut account = Account::construct_from_bytes(&account.get_base64("boc")?)?;
-                account.update_storage_stat(
+                account.calc_storage_stat_dict(
                     self.extra.config.size_limits_config()?.acc_state_cells_for_storage_dict,
                 )?;
                 if let Some(account_id) = account.get_id() {

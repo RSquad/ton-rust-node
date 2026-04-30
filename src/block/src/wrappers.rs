@@ -18,7 +18,6 @@ pub use ed25519_dalek::{
     PUBLIC_KEY_LENGTH as ED25519_PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH as ED25519_SECRET_KEY_LENGTH,
     SIGNATURE_LENGTH as ED25519_SIGNATURE_LENGTH,
 };
-use sha2::Digest;
 use std::sync::LazyLock;
 pub const P256_PUBLIC_KEY_LENGTH: usize = 33;
 pub const P256_SIGNATURE_LENGTH: usize = 64;
@@ -149,8 +148,8 @@ pub fn ed25519_encode_private_key_to_pkcs8(src: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn ed25519_expand_private_key(src: &Ed25519PrivateKey) -> Result<Ed25519ExpandedPrivateKey> {
-    let bytes = sha2::Sha512::default().chain_update(src.inner).finalize();
-    let ret = Ed25519ExpandedPrivateKey { inner: bytes.into() };
+    let bytes = openssl::sha::sha512(&src.inner);
+    let ret = Ed25519ExpandedPrivateKey { inner: bytes };
     Ok(ret)
 }
 
@@ -174,6 +173,8 @@ pub fn ed25519_sign(exp_pvt_key: &[u8], pub_key: Option<&[u8]>, data: &[u8]) -> 
     } else {
         VerifyingKey::from(&exp_key)
     };
+    // sha2::Sha512 is required by raw_sign's API, can't be replaced with openssl.
+    // ed25519 dalek mandatory use sha2
     Ok(ed25519_dalek::hazmat::raw_sign::<sha2::Sha512>(&exp_key, data, &pub_key).to_vec())
 }
 
@@ -267,38 +268,38 @@ pub fn ristretto_255_mulbase(n: [u8; 32]) -> [u8; 32] {
 // SHA-2 ----------------------------------------------------------------
 
 pub struct Sha256 {
-    inner: sha2::Sha256,
+    inner: openssl::sha::Sha256,
 }
 
 impl Sha256 {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { inner: sha2::Sha256::new() }
+        Self { inner: openssl::sha::Sha256::new() }
     }
 
     pub fn update(&mut self, data: impl AsRef<[u8]>) {
-        self.inner.update(data)
+        self.inner.update(data.as_ref())
     }
 
     pub fn finalize(self) -> [u8; 32] {
-        self.inner.finalize().into()
+        self.inner.finish()
     }
 }
 
 pub fn sha256_digest(data: impl AsRef<[u8]>) -> [u8; 32] {
-    sha2::Sha256::digest(data).into()
+    openssl::sha::sha256(data.as_ref())
 }
 
 pub fn sha256_digest_slices(data: &[&[u8]]) -> [u8; 32] {
-    let mut digest = sha2::Sha256::new();
+    let mut digest = openssl::sha::Sha256::new();
     for data in data {
         digest.update(data);
     }
-    digest.finalize().into()
+    digest.finish()
 }
 
 pub fn sha512_digest(data: impl AsRef<[u8]>) -> [u8; 64] {
-    sha2::Sha512::digest(data).into()
+    openssl::sha::sha512(data.as_ref())
 }
 
 // Blake ----------------------------------------------------------------

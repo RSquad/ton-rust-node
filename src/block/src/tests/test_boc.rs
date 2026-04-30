@@ -10,7 +10,12 @@
  */
 use super::*;
 use crate::{base64_decode, crc32_digest, BuilderData, IBitstring, SliceData, MAX_DEPTH};
-use std::{fs::read, io::Cursor, path::Path};
+use std::{
+    fs::read,
+    io::Cursor,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 struct CellsHMStorage {
     cells: HashMap<u32, Cell>,
@@ -181,6 +186,8 @@ fn build_tree3(val: u32) -> Cell {
 
 #[test]
 fn test_many_bocs_in_one_file() -> Result<()> {
+    // std::env::set_var("RUST_BACKTRACE", "full");
+
     let mut data = Vec::new();
     let mut roots = vec![];
 
@@ -192,7 +199,7 @@ fn test_many_bocs_in_one_file() -> Result<()> {
 
     let mut cursor = Cursor::new(&data);
     for root in roots {
-        let roots_restored = BocReader::new().read(&mut cursor)?.roots;
+        let roots_restored = BocReader::new().stream_read(&mut cursor)?.roots;
         assert_eq!(root, roots_restored[0]);
     }
     Ok(())
@@ -201,7 +208,7 @@ fn test_many_bocs_in_one_file() -> Result<()> {
 #[cfg(feature = "ci_run")]
 #[test]
 fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
-    std::env::set_var("RUST_BACKTRACE", "full");
+    // std::env::set_var("RUST_BACKTRACE", "full");
 
     println!("one root");
     for flags in 0..32 {
@@ -214,16 +221,19 @@ fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
         let root = build_tree();
 
         let mut data = Vec::new();
-        BocWriter::with_flags([root.clone()], boc_flags)?.write_ex(&mut data, None, None)?;
+        BocWriter::with_flags([root.clone()], boc_flags)?.write(&mut data)?;
 
-        let roots_restored = BocReader::new().read(&mut Cursor::new(&data))?.roots;
+        let roots_restored = BocReader::new().read(&data)?.roots;
         assert_eq!(root, roots_restored[0].clone());
+
+        let roots_restored_2 = BocReader::new().stream_read(&mut Cursor::new(&data))?.roots;
+        assert_eq!(root, roots_restored_2[0].clone());
 
         let root_only = read_boc_root(&data)?;
         assert_eq!(root.data(), root_only.storage());
 
         let roots_restored_3 =
-            BocReader::new().read_inmem_to_storage(&data, &mut CellsHMStorage::new())?.roots;
+            BocReader::new().read_to_storage(&data, &mut CellsHMStorage::new())?.roots;
         assert_eq!(root, roots_restored_3[0].clone());
     }
 
@@ -241,8 +251,8 @@ fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
 
         let mut data = Vec::new();
         BocWriter::with_flags([root0.clone(), root1.clone(), root2.clone()], boc_flags)?
-            .write_ex(&mut data, None, None)?;
-        let roots_restored = BocReader::new().read(&mut Cursor::new(&data))?.roots;
+            .write(&mut data)?;
+        let roots_restored = BocReader::new().read(&data)?.roots;
 
         assert_eq!(root0, roots_restored[0].clone());
         assert_eq!(root1, roots_restored[1].clone());
@@ -252,8 +262,14 @@ fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
         assert_ne!(root1, roots_restored[0].clone());
         assert_ne!(root2, roots_restored[1].clone());
 
+        let roots_restored_2 = BocReader::new().stream_read(&mut Cursor::new(&data))?.roots;
+
+        assert_eq!(root0, roots_restored_2[0].clone());
+        assert_eq!(root1, roots_restored_2[1].clone());
+        assert_eq!(root2, roots_restored_2[2].clone());
+
         let roots_restored_3 =
-            BocReader::new().read_inmem_to_storage(&data, &mut CellsHMStorage::new())?.roots;
+            BocReader::new().read_to_storage(&data, &mut CellsHMStorage::new())?.roots;
 
         assert_eq!(root0, roots_restored_3[0].clone());
         assert_eq!(root1, roots_restored_3[1].clone());
@@ -275,15 +291,20 @@ fn test_tree_of_cells_serialization_deserialization() -> Result<()> {
         }
 
         let mut data = Vec::new();
-        BocWriter::with_flags(roots.clone(), boc_flags)?.write_ex(&mut data, None, None)?;
+        BocWriter::with_flags(roots.clone(), boc_flags)?.write(&mut data)?;
 
-        let roots_restored = BocReader::new().read(&mut Cursor::new(&data))?.roots;
+        let roots_restored = BocReader::new().read(&data)?.roots;
         for i in 0..len {
             assert_eq!(&roots[i as usize], &roots_restored[i as usize]);
         }
 
+        let roots_restored_2 = BocReader::new().stream_read(&mut Cursor::new(&data))?.roots;
+        for i in 0..len {
+            assert_eq!(&roots[i as usize], &roots_restored_2[i as usize]);
+        }
+
         let roots_restored_3 =
-            BocReader::new().read_inmem_to_storage(&data, &mut CellsHMStorage::new())?.roots;
+            BocReader::new().read_to_storage(&data, &mut CellsHMStorage::new())?.roots;
         for i in 0..len {
             assert_eq!(&roots[i as usize], &roots_restored_3[i as usize]);
         }
@@ -307,7 +328,7 @@ fn test_roots_share_same_tree() -> Result<()> {
     let mut output = vec![];
     let boc = BocWriter::with_roots(roots.clone())?;
     boc.write(&mut output)?;
-    let res = BocReader::new().read(&mut Cursor::new(&output))?;
+    let res = BocReader::new().stream_read(&mut Cursor::new(&output))?;
     assert_eq!(roots, res.roots);
     Ok(())
 }
@@ -322,7 +343,7 @@ fn test_bug_serialization() -> Result<()> {
     let mut output = vec![];
     let boc = BocWriter::with_roots(roots.clone())?;
     boc.write(&mut output)?;
-    let res = BocReader::new().read(&mut Cursor::new(&output))?;
+    let res = BocReader::new().stream_read(&mut Cursor::new(&output))?;
     assert_eq!(roots, res.roots);
     Ok(())
 }
@@ -380,7 +401,7 @@ fn test_crc_with_files() {
 fn test_boc_write_crc() -> Result<()> {
     let mut bytes = Vec::new();
     BocWriter::with_params([Cell::default()], u16::MAX - 1, BocFlags::Crc32, &|| false)?
-        .write_ex(&mut bytes, None, None)?;
+        .write(&mut bytes)?;
 
     let crc1 = crc32_digest(&bytes[..bytes.len() - 4]);
     let crc2 = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into()?);
@@ -408,10 +429,10 @@ fn test_real_ton_boc2() -> Result<()> {
     }
 
     let boc = BocWriter::with_flags(rr.roots.clone(), boc_flags)?;
-    let mut bytes = Vec::with_capacity(orig_bytes.len());
-    boc.write_ex(&mut bytes, Some(rr.header.ref_size), Some(rr.header.offset_size))?;
-    let rr = BocReader::new().read(&mut Cursor::new(&bytes)).expect("Error deserialising BOC");
-    assert_eq!(orig_bytes.len(), bytes.len());
+    let mut bytes = Vec::new();
+    boc.write(&mut bytes)?;
+    let rr =
+        BocReader::new().stream_read(&mut Cursor::new(&bytes)).expect("Error deserialising BOC");
 
     let root_only = read_boc_root(&bytes)?;
     assert_eq!(root_only.storage(), rr.roots[0].data());
@@ -478,9 +499,8 @@ fn test_all_boc_modes() -> Result<()> {
             }
             println!("BOC flags {:?}", boc_flags);
             let mut data2 = Vec::new();
-            BocWriter::with_flags(read_result.roots.clone(), boc_flags)?
-                .write_ex(&mut data2, None, None)?;
-            let read_result2 = BocReader::new().read(&mut Cursor::new(&data2))?;
+            BocWriter::with_flags(read_result.roots.clone(), boc_flags)?.write(&mut data2)?;
+            let read_result2 = BocReader::new().stream_read(&mut Cursor::new(&data2))?;
             assert_eq!(read_result.roots, read_result2.roots);
         }
         Ok(())
@@ -513,7 +533,7 @@ fn test_default_max_safe_depth() {
             let c = build_tree_with_depth(2048);
             let b = write_boc(&c).unwrap();
             let c2 = BocReader::new()
-                .read(&mut std::io::Cursor::new(&b))
+                .stream_read(&mut std::io::Cursor::new(&b))
                 .unwrap()
                 .withdraw_single_root()
                 .unwrap();
@@ -542,7 +562,7 @@ fn test_max_depth() {
 
             let c2 = BocReader::new()
                 .set_max_cell_depth(depth)
-                .read(&mut std::io::Cursor::new(&b))
+                .read(&b)
                 .unwrap()
                 .withdraw_single_root()
                 .unwrap();
@@ -550,7 +570,7 @@ fn test_max_depth() {
 
             let c4 = BocReader::new()
                 .set_max_cell_depth(depth)
-                .read_inmem_to_storage(&b, &mut CellsHMStorage::new())
+                .read_to_storage(&b, &mut CellsHMStorage::new())
                 .unwrap()
                 .withdraw_single_root()
                 .unwrap();
@@ -675,7 +695,7 @@ fn test_boc_writer_stack() -> Result<()> {
 
     let now = std::time::Instant::now();
     let deserialized_root =
-        BocReader::new().read(&mut Cursor::new(data))?.withdraw_single_root()?;
+        BocReader::new().stream_read(&mut Cursor::new(data))?.withdraw_single_root()?;
     let deserialize_time = now.elapsed().as_millis();
     println!(
         "deserialize time {}ms  {}ms per cell",
@@ -709,7 +729,7 @@ fn test_full_tree() -> Result<()> {
     );
 
     let now = std::time::Instant::now();
-    let c2 = BocReader::new().read(&mut Cursor::new(b))?.withdraw_single_root()?;
+    let c2 = BocReader::new().stream_read(&mut Cursor::new(b))?.withdraw_single_root()?;
     let deserialize_time = now.elapsed().as_millis();
     println!(
         "deserialize time {}ms  {}ms per cell",
@@ -833,8 +853,8 @@ fn test_boc_write_iterative() -> Result<()> {
 }
 
 fn test_bad_boc(boc: Vec<u8>, read_root: bool) {
-    match BocReader::new().read(&mut std::io::Cursor::new(&boc)) {
-        Ok(_) => panic!("BocReader::new().read must panic"),
+    match BocReader::new().stream_read(&mut std::io::Cursor::new(&boc)) {
+        Ok(_) => panic!("BocReader::new().stream_read must panic"),
         Err(e) => println!("{:?}", e),
     }
     if read_root {
@@ -843,12 +863,12 @@ fn test_bad_boc(boc: Vec<u8>, read_root: bool) {
             Err(e) => println!("{:?}", e),
         }
     }
-    match BocReader::new().read(&mut Cursor::new(boc.as_slice())) {
-        Ok(_) => panic!("BocReader::new().read_inmem must panic"),
+    match BocReader::new().read(boc.as_slice()) {
+        Ok(_) => panic!("BocReader::new().read must panic"),
         Err(e) => println!("{:?}", e),
     }
-    match BocReader::new().read_inmem_to_storage(boc.as_slice(), &mut CellsHMStorage::new()) {
-        Ok(_) => panic!("BocReader::new().read_inmem_to_storage must panic"),
+    match BocReader::new().read_to_storage(boc.as_slice(), &mut CellsHMStorage::new()) {
+        Ok(_) => panic!("BocReader::new().read_to_storage must panic"),
         Err(e) => println!("{:?}", e),
     }
 }
@@ -949,7 +969,7 @@ fn test_bad_boc_10() {
 
 #[test]
 fn test_bad_boc_11() {
-    std::env::set_var("RUST_BACKTRACE", "full");
+    // std::env::set_var("RUST_BACKTRACE", "full");
 
     let bb = base64_decode("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").unwrap();
     test_bad_boc(bb, false);
@@ -986,15 +1006,37 @@ fn test_chunked_vec() {
 fn test_bench_boc_write() -> Result<()> {
     let filename = "EE80F14E960B421D59A8DE8B3399699A2B20AA5EDA127C7B376DE2A16685D47D.boc";
     let data = std::fs::read(filename)?;
-    let mut write_time = std::time::Duration::from_secs(0);
-    let mut read_time = std::time::Duration::from_secs(0);
+    let mut hash = [0; 32];
+
+    let t = Instant::now();
+    for _ in 0..1000 {
+        // hash = crate::sha256_digest(&data);
+        // let hash = sha256::digest(&data);
+        hash = openssl::sha::sha256(&data);
+    }
+    let elapsed = t.elapsed();
+    println!("HASH {:#?}", elapsed);
+    println!("{}", hex::encode(&hash));
+
+    let mut write_time = Duration::from_secs(0);
+    let mut read_time = Duration::from_secs(0);
+    let mut read_time_2 = Duration::from_secs(0);
     let mut total_bytes = 0;
+    let mut header = Default::default();
     let n = 100;
     for _ in 0..n {
-        let t = std::time::Instant::now();
-        let root = read_single_root_boc(&data)?;
+        let t = Instant::now();
+        let read_result = BocReader::new().stream_read(&mut Cursor::new(&data))?;
         read_time += t.elapsed();
-        let t = std::time::Instant::now();
+        header = read_result.header.clone();
+        let root = read_result.withdraw_single_root()?;
+
+        let t = Instant::now();
+        let read_result = BocReader::new().read(&data)?;
+        read_time_2 += t.elapsed();
+        assert_eq!(root, read_result.withdraw_single_root()?);
+
+        let t = Instant::now();
         let out_data = BocWriter::with_params([root], MAX_SAFE_DEPTH, BocFlags::all(), &|| false)?
             .write_to_vec()?;
         // drop(root);
@@ -1011,5 +1053,9 @@ fn test_bench_boc_write() -> Result<()> {
     let avg_speed = total_bytes as f64 / write_time.as_secs_f64();
     println!("Average BOC write time: {:#?}, {} bytes/sec", avg_time, avg_speed);
     println!("Average BOC read time: {:#?}", read_time / n);
+    println!("Average BOC read inmem time: {:#?}", read_time_2 / n);
+
+    println!("{:?}", header);
+
     Ok(())
 }

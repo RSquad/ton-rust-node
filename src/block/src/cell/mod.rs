@@ -17,7 +17,7 @@ use std::{
     collections::HashSet,
     fmt::{self, Display, Formatter},
     hash,
-    io::Write,
+    io::{Read, Write},
     ops::{BitOr, BitOrAssign},
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
@@ -218,13 +218,7 @@ pub fn find_tag(bitsting: &[u8]) -> usize {
         if *x == 0 {
             length -= 8;
         } else {
-            let mut skip = 1;
-            let mut mask = 1;
-            while (*x & mask) == 0 {
-                skip += 1;
-                mask <<= 1
-            }
-            length -= skip;
+            length -= 1 + x.trailing_zeros() as usize;
             break;
         }
     }
@@ -498,6 +492,28 @@ fn cell_depth(buf: &[u8], index: usize) -> u16 {
         array_index = 0;
     }
     depth(buf, array_index)
+}
+
+/// Resolve hash and depth by level index in a single pass.
+/// Avoids double level_mask/cell_type parsing compared to separate cell_hash + cell_depth.
+fn cell_hash_depth(buf: &[u8], index: usize) -> (&UInt256, u16) {
+    let lm = level_mask(buf);
+    let mut array_index = lm.calc_hash_index(index);
+    if cell_type(buf) == CellType::PrunedBranch {
+        let lvl = lm.level() as usize;
+        if array_index < lvl {
+            let data = cell_data(buf);
+            let h_off = 1 + 1 + array_index * SHA256_SIZE;
+            let d_off = 1 + 1 + lvl * SHA256_SIZE + array_index * DEPTH_SIZE;
+            let h = unsafe { &*(data.as_ptr().add(h_off) as *const UInt256) };
+            let d = ((data[d_off] as u16) << 8) | (data[d_off + 1] as u16);
+            return (h, d);
+        }
+        array_index = 0;
+    }
+    let h = unsafe { &*(hash(buf, array_index).as_ptr() as *const UInt256) };
+    let d = depth(buf, array_index);
+    (h, d)
 }
 
 /// Thread-safe bump allocator for arena-allocated cells.
@@ -1205,6 +1221,9 @@ impl fmt::Binary for Cell {
 trait RefsHashes {
     fn hash(&self, ref_index: usize, level: usize) -> &UInt256;
     fn depth(&self, ref_index: usize, level: usize) -> u16;
+    fn hash_depth(&self, ref_index: usize, level: usize) -> (&UInt256, u16) {
+        (self.hash(ref_index, level), self.depth(ref_index, level))
+    }
 }
 
 impl RefsHashes for [Cell] {
@@ -1213,6 +1232,9 @@ impl RefsHashes for [Cell] {
     }
     fn depth(&self, ref_index: usize, level: usize) -> u16 {
         self[ref_index].depth(level)
+    }
+    fn hash_depth(&self, ref_index: usize, level: usize) -> (&UInt256, u16) {
+        self[ref_index].hash_depth(level)
     }
 }
 
@@ -1230,6 +1252,9 @@ impl RefsHashes for ReprRefs<'_> {
     }
     fn depth(&self, ref_index: usize, _level: usize) -> u16 {
         self.depths[ref_index]
+    }
+    fn hash_depth(&self, ref_index: usize, _level: usize) -> (&UInt256, u16) {
+        (&self.hashes[ref_index], self.depths[ref_index])
     }
 }
 
@@ -1656,16 +1681,18 @@ impl Cell {
                 hasher.update(std::slice::from_raw_parts(d1_ptr.add(prev_off), SHA256_SIZE));
             }
 
+            let mut child_hashes = smallvec::SmallVec::<[&UInt256; MAX_REFERENCES_COUNT]>::new();
             for r_idx in 0..refs_count {
-                let child_depth = refs.depth(r_idx, i + is_merkle as usize);
+                let (child_hash, child_depth) = refs.hash_depth(r_idx, i + is_merkle as usize);
                 cur_depth = max(cur_depth, child_depth + 1);
                 if cur_depth > max_depth {
                     fail!("depth {} > {}", cur_depth, max_depth.min(MAX_DEPTH));
                 }
                 hasher.update(child_depth.to_be_bytes());
+                child_hashes.push(child_hash);
             }
-            for r_idx in 0..refs_count {
-                hasher.update(refs.hash(r_idx, i + is_merkle as usize).as_slice());
+            for hash in child_hashes {
+                hasher.update(hash.as_slice());
             }
 
             let computed = hasher.finalize();
@@ -1710,6 +1737,20 @@ impl Cell {
         let refs_off = DataCell::refs_offset(data_len, hash_count);
         for (i, r) in references.iter().enumerate() {
             std::ptr::write((content.add(refs_off) as *mut Cell).add(i), r.clone());
+        }
+    }
+
+    /// Like write_refs but consumes the refs, avoiding extra clone/refcount bump.
+    unsafe fn write_refs_owned(
+        content: *mut u8,
+        references: smallvec::SmallVec<[Cell; MAX_REFERENCES_COUNT]>,
+    ) {
+        let buf = DataCell::buf(content);
+        let data_len = cell_data_len(buf);
+        let hash_count = hashes_count(buf);
+        let refs_off = DataCell::refs_offset(data_len, hash_count);
+        for (i, r) in references.into_iter().enumerate() {
+            std::ptr::write((content.add(refs_off) as *mut Cell).add(i), r);
         }
     }
 
@@ -1829,55 +1870,83 @@ impl Cell {
         Ok(Self { tagged_pointer: ptr as usize | tag })
     }
 
-    /// Phase 1: Allocate a DataCell and fill in d1/d2/cell_data from raw wire data.
-    /// Hashes, depths, and references are NOT yet written.
+    /// Read a cell from a BOC stream and create a draft in one step.
     ///
-    /// Accepts input data with or without the `store_hashes` flag in d1.
-    /// If `store_hashes` is set in the input, original hashes/depths are copied into
-    /// the draft's hash area and the `store_hashes` flag is set in the internal d1.
-    /// When [`Cell::from_draft()`] later calls `compute_hashes`, it will detect the
-    /// flag and verify computed values against the pre-filled ones.
+    /// Reads wire data, validates via [`check_data`], allocates the cell, and
+    /// reads reference indices directly into the cell's refs area — no
+    /// intermediate refs buffer needed.
     ///
-    /// Finalize with [`Cell::from_draft()`].
-    pub fn new_boc_draft(
-        raw: &[u8],
-        arena: Option<Arc<CellsArena>>,
-        refs: &[u32],
+    /// `read_ref` reads one reference index from the stream (encoding depends on
+    /// `ref_size` chosen by the caller).
+    pub fn read_boc_draft<T: Read>(
+        src: &mut T,
+        cell_index: usize,
+        cells_count: usize,
+        arena: &Option<Arc<CellsArena>>,
+        read_ref: &dyn Fn(&mut T, &mut [u8; 4]) -> std::io::Result<u32>,
     ) -> Result<BocCellDraft> {
-        let info = Self::check_data(raw, true)?;
-        let has_store_hashes = store_hashes(raw);
-        let refs_count = crate::cell::refs_count(raw);
+        // --- Read wire data into stack buffer ---
+        // Max raw cell: d1(1) + d2(1) + hashes(32*4) + depths(2*4) + data(128) = 266
+        let mut buf = [0u8; 266];
+        src.read_exact(&mut buf[0..2])?;
 
-        if refs_count != refs.len() {
-            // draft is dropped here, freeing memory
-            fail!("refs.len() {} != d1 refs_count {}", refs.len(), refs_count);
+        let rc = refs_count(&buf);
+        if rc > MAX_REFERENCES_COUNT {
+            fail!("refs_count can't be {}", rc);
         }
 
-        let (ptr, tag) = Self::alloc_data_cell(&info, refs_count, &arena);
-        let prefix = Self::prefix_size_for(&arena);
+        let wire_len = full_len(&buf[..2]);
+        if wire_len > buf.len() {
+            fail!("cell data too large: {}", wire_len);
+        }
+        if wire_len > 2 {
+            src.read_exact(&mut buf[2..wire_len])?;
+        }
+
+        // BOC-specific: stricter tag-completion check than check_data
+        if buf[1] & 1 != 0 && wire_len > 2 && (buf[wire_len - 1] & 0x7f == 0) {
+            fail!("overly long tag-completed encoding");
+        }
+
+        // Validate & allocate (reuse shared helpers)
+        let info = Self::check_data(&buf[..wire_len], true)?;
+        let (ptr, tag) = Self::alloc_data_cell(&info, rc, arena);
+        let prefix = Self::prefix_size_for(arena);
         let content = unsafe { ptr.add(prefix) };
 
+        // Create draft early so Drop handles cleanup on error
+        let draft = BocCellDraft { tagged_pointer: ptr as usize | tag };
+
+        // Read refs directly into cell's refs area
         let refs_ptr = DataCell::refs_ptr(content);
-        for (i, &ref_val) in refs[..refs_count].iter().enumerate() {
+        let mut ref_buf = [0u8; 4];
+        for i in 0..rc {
+            let r = read_ref(src, &mut ref_buf)?;
+            if r >= cells_count as u32 || r <= cell_index as u32 {
+                // draft is dropped here, freeing memory
+                fail!(
+                    "reference out of range, cells_count: {cells_count}, ref: {r}, \
+                    refs_count {rc}, cell_index: {cell_index}"
+                )
+            }
             unsafe {
-                *(refs_ptr as *mut u8).add(CELL_PTR_SIZE * i).cast::<u32>() = ref_val;
+                *(refs_ptr as *mut u8).add(CELL_PTR_SIZE * i).cast::<u32>() = r;
             }
         }
 
-        if has_store_hashes {
-            // Copy original hashes/depths and set store_hashes in d1,
-            // so that compute_hashes in from_draft will verify them.
+        // Copy pre-existing hashes/depths from wire data
+        if store_hashes(&buf) {
             let d1 = unsafe { *content };
             let hash_count = hashes_count(&[d1, info.d2]);
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    raw[2..].as_ptr(),
+                    buf[2..].as_ptr(),
                     content.add(2),
                     SHA256_SIZE * hash_count,
                 );
-                let depths_src = crate::cell::depths_offset(raw);
+                let depths_src = depths_offset(&buf[..wire_len]);
                 std::ptr::copy_nonoverlapping(
-                    raw[depths_src..].as_ptr(),
+                    buf[depths_src..].as_ptr(),
                     content.add(2 + SHA256_SIZE * hash_count),
                     DEPTH_SIZE * hash_count,
                 );
@@ -1885,7 +1954,7 @@ impl Cell {
             }
         }
 
-        Ok(BocCellDraft { tagged_pointer: ptr as usize | tag })
+        Ok(draft)
     }
 
     /// Phase 2: Compute hashes/depths from children, write references, return completed Cell.
@@ -1899,7 +1968,7 @@ impl Cell {
     /// `arena` must be the same as the one passed to `new_draft()`, UB otherwise.
     pub fn from_boc_draft(
         draft: BocCellDraft,
-        references: &[Cell],
+        references: smallvec::SmallVec<[Cell; MAX_REFERENCES_COUNT]>,
         max_depth: Option<u16>,
         arena: Option<&Arc<CellsArena>>,
     ) -> Result<Cell> {
@@ -1915,17 +1984,17 @@ impl Cell {
         }
 
         if let Some(a) = arena {
-            Self::check_refs_belong_to_arena(a, references)?;
+            Self::check_refs_belong_to_arena(a, &references)?;
         }
 
         unsafe {
             Self::compute_hashes(
                 content,
-                references,
+                references.as_slice(),
                 references.len(),
                 max_depth.unwrap_or(MAX_DEPTH),
             )?;
-            Self::write_refs(content, references);
+            Self::write_refs_owned(content, references);
         }
 
         let cell = Cell { tagged_pointer: draft.tagged_pointer };
@@ -2350,6 +2419,26 @@ impl Cell {
             }
         }
         cell_depth(self.cell_buf(), index)
+    }
+
+    pub fn hash_depth(&self, index: usize) -> (&UInt256, u16) {
+        if !self.is_data_cell() {
+            match self.variant_tag() {
+                CELL_VARIANT_USAGE => {
+                    let inner = UsageCell::inner(self.content_ptr());
+                    return inner.hash_depth(index);
+                }
+                CELL_VARIANT_VIRTUAL => {
+                    let p = self.content_ptr();
+                    let off = VirtualCell::offset(p);
+                    let inner = VirtualCell::inner(p);
+                    let virt_idx = inner.level_mask().calc_virtual_hash_index(index, off);
+                    return inner.hash_depth(virt_idx);
+                }
+                _ => {}
+            }
+        }
+        cell_hash_depth(self.cell_buf(), index)
     }
 
     pub fn reference_repr_hash(&self, index: usize) -> Result<UInt256> {

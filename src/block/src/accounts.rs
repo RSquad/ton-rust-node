@@ -548,12 +548,12 @@ impl AccountStuff {
             _ => None,
         }
     }
-    fn update_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
-        self.storage_info.used = self.storage_stat.update(&self.storage)?;
+    fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+        self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
         if self.storage_info.used.cells.as_u64() >= dict_hash_min_cells as u64
             && !self.addr.is_masterchain()
         {
-            let dict_root = self.storage_stat.dict_root()?;
+            let dict_root = self.storage_stat.calc_dict()?;
             self.storage_info.storage_extra.dict_hash =
                 Some(dict_root.map_or_else(UInt256::default, |c| c.repr_hash().clone()));
             Ok(dict_root.cloned())
@@ -563,10 +563,13 @@ impl AccountStuff {
         }
     }
 
-    fn init_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    fn calc_and_check_storage_stat_dict(
+        &mut self,
+        dict_hash_min_cells: u32,
+    ) -> Result<Option<Cell>> {
         let dict_hash = self.storage_info.dict_hash().cloned();
         let used = self.storage_info.used.clone();
-        let result = self.update_storage_stat(dict_hash_min_cells)?;
+        let result = self.calc_storage_stat_dict(dict_hash_min_cells)?;
         if dict_hash.as_ref() != self.storage_info.dict_hash() {
             fail!(
                 "Storage stat dict hash mismatch, expected {:?}, got {:?}",
@@ -655,7 +658,7 @@ impl Account {
             storage: AccountStorage::active(last_trans_lt, balance, state_init),
             storage_stat: AccountStorageStat::new(),
         });
-        account.update_storage_stat(dict_hash_min_cells)?;
+        account.calc_storage_stat_dict(dict_hash_min_cells)?;
         Ok(account)
     }
 
@@ -876,16 +879,19 @@ impl Account {
         self.stuff().and_then(|s| s.storage_info.dict_hash())
     }
 
-    pub fn update_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    pub fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
         match self.stuff_mut() {
-            Some(stuff) => stuff.update_storage_stat(dict_hash_min_cells),
+            Some(stuff) => stuff.calc_storage_stat_dict(dict_hash_min_cells),
             None => Ok(None),
         }
     }
 
-    pub fn init_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    pub fn calc_and_check_storage_stat_dict(
+        &mut self,
+        dict_hash_min_cells: u32,
+    ) -> Result<Option<Cell>> {
         match self.stuff_mut() {
-            Some(stuff) => stuff.init_storage_stat(dict_hash_min_cells),
+            Some(stuff) => stuff.calc_and_check_storage_stat_dict(dict_hash_min_cells),
             None => Ok(None),
         }
     }
@@ -898,8 +904,13 @@ impl Account {
         }
     }
 
-    pub fn storage_stat(&self) -> Option<&AccountStorageStat> {
-        self.stuff().map(|stuff| &stuff.storage_stat)
+    pub fn precalc_storage_stat(&mut self) -> Result<Option<&AccountStorageStat>> {
+        self.stuff_mut()
+            .map(|stuff| {
+                stuff.storage_stat.calc_stat(&stuff.storage)?;
+                Ok(&stuff.storage_stat)
+            })
+            .transpose()
     }
 
     pub fn del_storage_stat(&mut self) {

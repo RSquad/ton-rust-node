@@ -124,7 +124,7 @@ pub fn boc_decompress(compressed: impl AsRef<[u8]>, max_size: usize) -> Result<V
     match compressed.as_ref()[0] {
         0 => {
             let decompressed = boc_decompress_baseline_lz4(compressed_data, max_size)?;
-            Ok(BocReader::new().read(&mut Cursor::new(&decompressed))?.roots)
+            Ok(BocReader::new().stream_read(&mut Cursor::new(&decompressed))?.roots)
         }
         1 => boc_decompress_improved_structure_lz4(compressed_data, max_size),
         any => Err(anyhow::format_err!("Invalid compression algorithm {}", any)),

@@ -130,7 +130,9 @@ fn try_replay_contract_as_transaction(
         &AccountStorage::active(0, balance, state),
     );
     account
-        .update_storage_stat(config.size_limits_config().unwrap().acc_state_cells_for_storage_dict)
+        .calc_storage_stat_dict(
+            config.size_limits_config().unwrap().acc_state_cells_for_storage_dict,
+        )
         .unwrap();
     let params = common::execute_params_simple(lt, at);
     let config = BlockchainConfig::with_config(config).unwrap();
@@ -635,7 +637,7 @@ fn test_replay_transaction_by_message_from_transaction() {
     let config = BlockchainConfig::with_config(config).unwrap();
     let mut transaction =
         try_replay_transaction(&mut account, Some(&message), config, &params).unwrap();
-    account.update_storage_stat(1 << 31).unwrap();
+    account.calc_storage_stat_dict(1 << 31).unwrap();
     hash_update.new_hash = account.serialize().unwrap().repr_hash().clone();
     transaction.write_state_update(&hash_update).unwrap();
     transaction.write_to_file("real_boc/new_transaction.boc").unwrap();

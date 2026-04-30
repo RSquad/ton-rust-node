@@ -1463,7 +1463,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
         Ok(())
     }
 
-    std::env::set_var("RUST_BACKTRACE", "full");
+    // std::env::set_var("RUST_BACKTRACE", "full");
 
     let zero_state_file_hash = base64_decode(ZERO_STATE)?;
     let zero_state_file_hash = zero_state_file_hash.as_slice().try_into()?;

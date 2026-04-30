@@ -853,7 +853,7 @@ pub trait TransactionExecutor {
                 if extra_flags.bit(EXTRA_FLAG_FULL_BODY_BOUNCE) {
                     body.clone().into_cell()?
                 } else {
-                    body.get_slice(body.remaining_bits())?.into_cell()?
+                    body.get_slice(0, body.remaining_bits())?.into_cell()?
                 }
             } else {
                 Cell::default()
@@ -1914,14 +1914,13 @@ fn check_vm_init_params(ctrls: &SaveList, stack: &Stack) {
 }
 
 pub(super) fn check_account_size_limits(cfg: &SizeLimitsConfig, acc: &mut Account) -> Result<bool> {
-    acc.update_storage_stat(cfg.acc_state_cells_for_storage_dict)?;
-    let Some(stat) = acc.storage_stat() else {
-        return Ok(true);
-    };
     let max_acc_state_cells = if acc.get_addr().is_some_and(|addr| addr.is_masterchain()) {
         cfg.max_mc_acc_state_cells as u64
     } else {
         cfg.max_acc_state_cells as u64
+    };
+    let Some(stat) = acc.precalc_storage_stat()? else {
+        return Ok(true);
     };
     if stat.total_cells() > max_acc_state_cells {
         log::debug!(target: "executor", "account has too many cells {} (max cells = {})", stat.total_cells(), max_acc_state_cells);
