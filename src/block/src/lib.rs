@@ -494,21 +494,22 @@ impl Serializable for AccountId {
     }
 }
 
-impl Deserializable for () {
-    fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        if cell.is_empty_cell() {
+#[derive(Clone, Default)]
+pub struct EmptyValue;
+impl Serializable for EmptyValue {
+    fn write_to(&self, _cell: &mut BuilderData) -> Result<()> {
+        Ok(())
+    }
+}
+impl Deserializable for EmptyValue {
+    fn read_from(&mut self, slice: &mut SliceData) -> Result<()> {
+        if slice.is_empty_cell() {
             Ok(())
         } else {
             fail!(BlockError::InvalidData(format!(
                 "It must be True by TLB, but some data is present: {:x}",
-                cell
+                slice
             )))
         }
-    }
-}
-
-impl Serializable for () {
-    fn write_to(&self, _cell: &mut BuilderData) -> Result<()> {
-        Ok(())
     }
 }

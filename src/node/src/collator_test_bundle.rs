@@ -202,6 +202,8 @@ pub fn create_engine_telemetry() -> Arc<EngineTelemetry> {
         validator_adnl_keys: Metric::without_totals("", 1),
         validator_peers: Metric::without_totals("", 1),
         validator_sets: Metric::without_totals("", 1),
+        account_state_cache_mb: Metric::without_totals("", 1),
+        storage_dicts_cache_cells: Metric::without_totals("", 1),
     })
 }
 
@@ -215,6 +217,7 @@ pub fn create_engine_allocated() -> Arc<EngineAlloc> {
         validator_adnl_keys: Arc::new(AtomicU64::new(0)),
         validator_peers: Arc::new(AtomicU64::new(0)),
         validator_sets: Arc::new(AtomicU64::new(0)),
+        account_state_cache_bytes: Arc::new(AtomicU64::new(0)),
     })
 }
 

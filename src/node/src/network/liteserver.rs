@@ -1011,6 +1011,11 @@ impl LiteServerQuerySubscriber {
                             break;
                         }
                     }
+                    context
+                        .engine
+                        .engine_allocated()
+                        .account_state_cache_bytes
+                        .store(lru.total_bytes, Ordering::Relaxed);
                 } else {
                     log::info!(
                         "liteserver: GetAccountState coalesced for {key} in {}ms",

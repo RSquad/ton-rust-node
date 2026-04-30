@@ -799,7 +799,7 @@ fn get_config_param7() -> ConfigParam7 {
 fn get_config_param9() -> ConfigParam9 {
     let mut mp = MandatoryParams::default();
     for _ in 1..100 {
-        mp.set(&rand::random::<u32>(), &()).unwrap();
+        mp.set(&rand::random::<u32>(), &EmptyValue).unwrap();
     }
     ConfigParam9 { mandatory_params: mp }
 }
@@ -807,7 +807,7 @@ fn get_config_param9() -> ConfigParam9 {
 fn get_config_param10() -> ConfigParam10 {
     let mut cp = MandatoryParams::default();
     for _ in 1..100 {
-        cp.set(&rand::random::<u32>(), &()).unwrap();
+        cp.set(&rand::random::<u32>(), &EmptyValue).unwrap();
     }
     ConfigParam10 { critical_params: cp }
 }

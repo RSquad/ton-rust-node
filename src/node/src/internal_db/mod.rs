@@ -495,6 +495,16 @@ impl InternalDb {
         )
     }
 
+    /// Returns approximate RocksDB memory usage summing main DB,
+    /// archive states DB (if archival), and all epoch DBs.
+    pub fn rocksdb_memory_usage(&self) -> storage::RocksDbMemoryUsage {
+        let mut usage = self.archive_manager.rocksdb_memory_usage();
+        if let StateDb::Archive(db) = &self.state_db {
+            usage += db.rocksdb_memory_usage();
+        }
+        usage
+    }
+
     pub fn start_states_gc(&self, resolver: Arc<dyn AllowStateGcResolver>) {
         if let StateDb::Dynamic(db) = &self.state_db {
             db.clone().start_gc(resolver, self.cells_gc_interval.clone())
