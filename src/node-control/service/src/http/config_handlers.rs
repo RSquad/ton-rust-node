@@ -24,8 +24,7 @@ use control_client::client_adnl::ControlClientAdnl;
 use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use ton_block::MsgAddressInt;
-use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
-use ton_http_api_client::v2::data_models::AccountState;
+use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
 
 /// `type_id` for ADNL public keys (Ed25519).
 const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
@@ -721,8 +720,7 @@ async fn fetch_toncore_slot_dto(
     }
     .or_else(|| slot_cfg.address.as_deref().and_then(|a| MsgAddressInt::from_str(a).ok()));
 
-    let address_str =
-        addr_opt.as_ref().map(|a| a.to_string()).or_else(|| slot_cfg.address.clone());
+    let address_str = addr_opt.as_ref().map(|a| a.to_string()).or_else(|| slot_cfg.address.clone());
 
     let mut dto = match &addr_opt {
         None => TonCorePoolSlotDto {

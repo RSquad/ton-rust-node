@@ -287,7 +287,9 @@ struct PoolAddCoreBody<'a> {
 
 fn validator_share_percent_to_bp(pct: f64) -> anyhow::Result<u16> {
     if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
-        anyhow::bail!("validator_share_percent must be a finite number in [0.0, 100.0] (got {pct})");
+        anyhow::bail!(
+            "validator_share_percent must be a finite number in [0.0, 100.0] (got {pct})"
+        );
     }
     let bp = (pct * 100.0).round();
     if !(0.0..=10_000.0).contains(&bp) {
@@ -312,17 +314,22 @@ impl PoolAddCoreCmd {
             );
         }
 
-        let resolved_validator_share: Option<u16> = match (self.validator_share, self.validator_share_percent) {
-            (Some(bp), None) => {
-                if !(0..=10_000).contains(&bp) {
-                    anyhow::bail!("validator_share must be in 0..=10000 basis points (got {bp})");
+        let resolved_validator_share: Option<u16> =
+            match (self.validator_share, self.validator_share_percent) {
+                (Some(bp), None) => {
+                    if !(0..=10_000).contains(&bp) {
+                        anyhow::bail!(
+                            "validator_share must be in 0..=10000 basis points (got {bp})"
+                        );
+                    }
+                    Some(bp)
                 }
-                Some(bp)
-            }
-            (None, Some(pct)) => Some(validator_share_percent_to_bp(pct)?),
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("clap conflicts validator_share with validator_share_percent"),
-        };
+                (None, Some(pct)) => Some(validator_share_percent_to_bp(pct)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => {
+                    unreachable!("clap conflicts validator_share with validator_share_percent")
+                }
+            };
 
         if resolved_validator_share.is_none()
             && (self.max_nominators.is_some()
@@ -669,8 +676,8 @@ impl PoolDepositValidatorCmd {
 
         // Pool contract keeps DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS (1 TON) from the message value;
         // send stake + fee so the credited validator_amount matches `--amount`.
-        let msg_value_nanotons = deposit_nanotons
-            .saturating_add(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS);
+        let msg_value_nanotons =
+            deposit_nanotons.saturating_add(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS);
 
         let gas_reserve: u64 = 2_000_000_000;
         if wallet_info_data.balance < msg_value_nanotons.saturating_add(gas_reserve) {
