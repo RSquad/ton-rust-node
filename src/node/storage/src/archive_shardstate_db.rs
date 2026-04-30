@@ -115,6 +115,10 @@ impl ArchiveShardStateDb {
         self.boc_db.cell_db().clone() as Arc<dyn CellsFactory>
     }
 
+    pub fn rocksdb_memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        self.boc_db.cell_db().db().memory_usage()
+    }
+
     pub fn create_hashed_cell_storage(
         &self,
         root: Option<&Cell>,

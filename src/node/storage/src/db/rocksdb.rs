@@ -189,6 +189,21 @@ impl RocksDb {
         self.db.as_ref().expect("rocksdb was occasionaly destroyed")
     }
 
+    /// Returns approximate memory usage of this RocksDB instance (in bytes).
+    pub fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        let Ok(mut builder) = rocksdb::perf::MemoryUsageBuilder::new() else {
+            return Default::default();
+        };
+        builder.add_db(self.db());
+        let Ok(mu) = builder.build() else {
+            return Default::default();
+        };
+        crate::RocksDbMemoryUsage {
+            mem_tables: mu.approximate_mem_table_total(),
+            block_cache: mu.approximate_cache_total(),
+        }
+    }
+
     pub fn cfs(&self) -> Option<Vec<String>> {
         let Some(db) = &self.db else { return None };
         DBWithThreadMode::<MultiThreaded>::list_cf(&Options::default(), db.path()).ok()

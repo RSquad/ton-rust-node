@@ -438,12 +438,43 @@ impl DynamicBocDb {
         cells_counters: &mut Option<&mut CellsCounters>,
         counters_cf: &impl rocksdb::AsColumnFamilyRef,
     ) -> Result<(bool, Option<u32>)> {
+        let try_load_counter = |cell_id: &UInt256,
+                                cells_counters: &Option<&mut CellsCounters>|
+         -> Result<Option<u32>> {
+            // This cell is possibly existing
+            if let Some(c) = cells_counters.as_ref().and_then(|c| c.get(cell_id)) {
+                // Cell is existing
+                return Ok(Some(*c));
+            }
+            #[cfg(feature = "telemetry")]
+            let now = Instant::now();
+            if let Some(raw) = self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())? {
+                // Cell is existing
+                #[cfg(feature = "telemetry")]
+                {
+                    self.cell_db
+                        .telemetry()
+                        .load_counter_time_nanos
+                        .update(now.elapsed().as_nanos() as u64);
+                    self.cell_db.telemetry().loaded_counters.update(1);
+                }
+                let mut reader = Cursor::new(raw);
+                return Ok(Some(reader.read_le_u32()?));
+            }
+            Ok(None)
+        };
+
         check_stop()?;
 
         let cell_id = cell.repr_hash();
+        let mut skip_counter_check = false;
 
-        if self.cell_db().is_stored_cell(cell) && self.cell_db.is_in_cache(&cell_id) {
-            return Ok((false, None));
+        if self.cell_db().is_stored_cell(cell) {
+            // This cell is possibly in DB, trying to load counter
+            if let Some(counter) = try_load_counter(cell_id, cells_counters)? {
+                return Ok((false, Some(counter)));
+            }
+            skip_counter_check = true; // already checked, not in DB
         }
 
         let mut is_new_cell = false;
@@ -468,26 +499,10 @@ impl DynamicBocDb {
             }
         }
 
-        if !is_new_cell {
+        if !is_new_cell && !skip_counter_check {
             // This cell is possibly existing
-            if let Some(c) = cells_counters.as_ref().and_then(|c| c.get(&cell_id)) {
-                // Cell is existing
-                return Ok((false, Some(*c)));
-            }
-            #[cfg(feature = "telemetry")]
-            let now = Instant::now();
-            if let Some(raw) = self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())? {
-                // Cell is existing
-                #[cfg(feature = "telemetry")]
-                {
-                    self.cell_db
-                        .telemetry()
-                        .load_counter_time_nanos
-                        .update(now.elapsed().as_nanos() as u64);
-                    self.cell_db.telemetry().loaded_counters.update(1);
-                }
-                let mut reader = Cursor::new(raw);
-                return Ok((false, Some(reader.read_le_u32()?)));
+            if let Some(counter) = try_load_counter(cell_id, cells_counters)? {
+                return Ok((false, Some(counter)));
             }
         }
 

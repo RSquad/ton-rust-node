@@ -100,6 +100,9 @@ pub struct StorageTelemetry {
     pub cell_cache_hits: Arc<MetricBuilder>,
     pub cell_cache_misses: Arc<MetricBuilder>,
     pub cell_cache_len: Arc<Metric>,
+
+    pub rocksdb_mem_table_mb: Arc<Metric>,
+    pub rocksdb_block_cache_mb: Arc<Metric>,
 }
 #[cfg(feature = "telemetry")]
 impl Default for StorageTelemetry {
@@ -154,7 +157,22 @@ impl Default for StorageTelemetry {
                 1000000000,
             ),
             cell_cache_len: Metric::without_totals("", 1),
+            rocksdb_mem_table_mb: Metric::without_totals("", 1),
+            rocksdb_block_cache_mb: Metric::without_totals("", 1),
         }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct RocksDbMemoryUsage {
+    pub mem_tables: u64,
+    pub block_cache: u64,
+}
+
+impl std::ops::AddAssign for RocksDbMemoryUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.mem_tables += rhs.mem_tables;
+        self.block_cache += rhs.block_cache;
     }
 }
 

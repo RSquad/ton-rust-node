@@ -517,6 +517,7 @@ impl Engine {
             validator_adnl_keys: Arc::new(AtomicU64::new(0)),
             validator_peers: Arc::new(AtomicU64::new(0)),
             validator_sets: Arc::new(AtomicU64::new(0)),
+            account_state_cache_bytes: Arc::new(AtomicU64::new(0)),
         });
 
         let archives_life_time_hours = general_config.gc_archives_life_time_hours();
@@ -1521,6 +1522,8 @@ impl Engine {
             cell_cache_hits: create_metric_per_sec("NODE cell cache hits/sec"),
             cell_cache_misses: create_metric_per_sec("NODE cell cache misses/sec"),
             cell_cache_len: create_metric("NODE cell cache len"),
+            rocksdb_mem_table_mb: create_metric("Alloc NODE RocksDB mem tables, MB"),
+            rocksdb_block_cache_mb: create_metric("Alloc NODE RocksDB block cache, MB"),
         });
         let engine_telemetry = Arc::new(EngineTelemetry {
             storage: storage_telemetry,
@@ -1532,6 +1535,8 @@ impl Engine {
             validator_adnl_keys: create_metric("Alloc NODE validator ADNL keys"),
             validator_peers: create_metric("Alloc NODE validator peers"),
             validator_sets: create_metric("Alloc NODE validator sets"),
+            account_state_cache_mb: create_metric("Alloc NODE account state cache, MB"),
+            storage_dicts_cache_cells: create_metric("Alloc NODE storage dicts cache cells"),
         });
         let metrics = vec![
             TelemetryItem::Metric(engine_telemetry.storage.file_entries.clone()),
@@ -1559,6 +1564,8 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_traverse_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_tr_build_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_commit_micros.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_mem_table_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_block_cache_mb.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_hits.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_misses.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.cell_cache_len.clone()),
@@ -1570,6 +1577,8 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.validator_adnl_keys.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_peers.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_sets.clone()),
+            TelemetryItem::Metric(engine_telemetry.account_state_cache_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage_dicts_cache_cells.clone()),
         ];
         (metrics, engine_telemetry)
     }
@@ -2419,6 +2428,14 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .engine_telemetry
                 .validator_sets
                 .update(engine.engine_allocated.validator_sets.load(Ordering::Relaxed));
+            engine.engine_telemetry.account_state_cache_mb.update(
+                engine.engine_allocated.account_state_cache_bytes.load(Ordering::Relaxed)
+                    / (1024 * 1024),
+            );
+            engine
+                .engine_telemetry
+                .storage_dicts_cache_cells
+                .update(engine.storage_dicts_cache.lock().0);
 
             // check timeout
 
@@ -2430,6 +2447,20 @@ fn telemetry_logger(engine: Arc<Engine>) {
             }
 
             // print telemetry
+
+            {
+                let usage = engine.db().rocksdb_memory_usage();
+                engine
+                    .engine_telemetry
+                    .storage
+                    .rocksdb_mem_table_mb
+                    .update(usage.mem_tables / (1024 * 1024));
+                engine
+                    .engine_telemetry
+                    .storage
+                    .rocksdb_block_cache_mb
+                    .update(usage.block_cache / (1024 * 1024));
+            }
 
             let period = crate::full_node::telemetry::TPS_PERIOD_1;
             let tps_1 = engine.tps_counter.calc_tps(period).unwrap_or_else(|e| {

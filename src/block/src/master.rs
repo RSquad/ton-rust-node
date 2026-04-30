@@ -22,8 +22,8 @@ use crate::{
     signature::CryptoSignaturePair,
     types::{ChildCell, CurrencyCollection, InRefValue},
     validators::ValidatorInfo,
-    AccountId, Augmentation, BuilderData, Cell, Deserializable, IBitstring, Result, Serializable,
-    SliceData, UInt256,
+    AccountId, Augmentation, BuilderData, Cell, Deserializable, EmptyValue, IBitstring, Result,
+    Serializable, SliceData, UInt256,
 };
 use std::fmt;
 
@@ -1428,7 +1428,7 @@ impl Serializable for BlkMasterInfo {
     }
 }
 
-define_HashmapE!(Publishers, 256, ());
+define_HashmapE!(Publishers, 256, EmptyValue);
 /*
 shared_lib_descr$00 lib:^Cell publishers:(Hashmap 256 True) = LibDescr;
 */
@@ -1444,7 +1444,7 @@ impl LibDescr {
     }
     pub fn from_lib_data_by_publisher(lib: Cell, publisher: AccountId) -> Self {
         let mut publishers = Publishers::default();
-        publishers.set(&publisher, &()).unwrap();
+        publishers.set(&publisher, &EmptyValue).unwrap();
         Self { lib, publishers }
     }
     pub fn publishers(&self) -> &Publishers {

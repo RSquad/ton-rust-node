@@ -11,9 +11,10 @@
 use crate::engine_traits::EngineOperations;
 use std::sync::Arc;
 use ton_block::{
-    fail, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell, HashUpdate,
-    HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries, Result, Serializable,
-    ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions, UInt256, UsageTree,
+    fail, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell, EmptyValue,
+    HashUpdate, HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries, Result,
+    Serializable, ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions, UInt256,
+    UsageTree,
 };
 
 pub struct ShardAccountStuff {
@@ -237,7 +238,7 @@ impl ShardAccountStuff {
                     self.account_id
                 )
             }
-            old_lib_descr.publishers_mut().set(&self.account_id, &())?;
+            old_lib_descr.publishers_mut().set(&self.account_id, &EmptyValue)?;
             old_lib_descr
         } else {
             LibDescr::from_lib_data_by_publisher(library, self.account_id.clone())

@@ -3673,11 +3673,13 @@ impl Collator {
         collator_data: &mut CollatorData,
     ) -> Result<Option<AsyncMessage>> {
         let from_dispatch_queue = msg.tr_cell.is_empty();
-        if (collator_data.block_full || collator_data.have_unprocessed_account_dispatch_queue)
+        if (collator_data.block_full
+            || collator_data.have_unprocessed_account_dispatch_queue
+            || self.check_cutoff_timeout())
             && !collator_data.enqueue_only
         {
             log::debug!(
-                "{}: BLOCK FULL or unprocessed dispatch queue, stop processing new messages",
+                "{}: BLOCK FULL or unprocessed dispatch queue or cutoff timeout, stop processing new messages",
                 self.collated_block_descr
             );
             collator_data.enqueue_only = true;
