@@ -9,7 +9,7 @@
 use crate::{
     crypto::{key_material::KeyMaterial, prng::Prng},
     errors::error::VaultError,
-    memory::protected_memory::{ProtectedMemory, WriteGuard},
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner, WriteHandle},
     utils::process::interrupt,
 };
 use aes_gcm::{aead::Aead, AeadInPlace, KeyInit};
@@ -17,18 +17,14 @@ use aes_gcm::{aead::Aead, AeadInPlace, KeyInit};
 pub(crate) const NONCE_SIZE: usize = 12;
 pub(crate) const TAG_SIZE: usize = 16;
 
-pub async fn encrypt(
-    key: &KeyMaterial,
-    plaintext: &[u8],
-    prng: &dyn Prng,
-) -> anyhow::Result<Vec<u8>> {
+pub fn encrypt(key: &KeyMaterial, plaintext: &[u8], prng: &dyn Prng) -> anyhow::Result<Vec<u8>> {
     // Output format: [nonce (12 bytes)][ciphertext][tag (16 bytes)]
     let secret_key = key
         .secret_key
         .as_ref()
         .ok_or_else(|| VaultError::empty_secret_key("Secret key is not set"))?;
 
-    let secret_key_len = secret_key.len().await;
+    let secret_key_len = secret_key.len();
 
     if secret_key_len != 32 {
         anyhow::bail!(VaultError::invalid_key_size(format!(
@@ -38,10 +34,10 @@ pub async fn encrypt(
     }
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    prng.fill_random(&mut nonce_bytes).await?;
+    prng.fill_random(&mut nonce_bytes)?;
     let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
 
-    let key_read_lock = secret_key.lock().await?;
+    let key_read_lock = secret_key.lock()?;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key_read_lock)
         .map_err(|e| VaultError::internal(format!("Invalid AES-256 key: {}", e)))?;
     let ciphertext = cipher
@@ -55,10 +51,7 @@ pub async fn encrypt(
     Ok(result)
 }
 
-pub async fn decrypt(
-    key_material: &KeyMaterial,
-    ciphertext: &[u8],
-) -> anyhow::Result<ProtectedMemory> {
+pub fn decrypt(key_material: &KeyMaterial, ciphertext: &[u8]) -> anyhow::Result<ProtectedMemory> {
     // Input format: [nonce (12 bytes)][ciphertext][tag (16 bytes)]
     if ciphertext.len() < NONCE_SIZE + TAG_SIZE {
         anyhow::bail!(VaultError::decryption_failed("Ciphertext too short"))
@@ -69,7 +62,7 @@ pub async fn decrypt(
         .as_ref()
         .ok_or_else(|| VaultError::empty_secret_key("Secret key is not set"))?;
 
-    let secret_key_len = secret_key.len().await;
+    let secret_key_len = secret_key.len();
 
     if secret_key_len != 32 {
         anyhow::bail!(VaultError::invalid_key_size(format!(
@@ -81,31 +74,29 @@ pub async fn decrypt(
     let nonce = aes_gcm::Nonce::from_slice(&ciphertext[..NONCE_SIZE]);
     let encrypted_data = &ciphertext[NONCE_SIZE..];
 
-    let key_read_lock = secret_key.lock().await?;
+    let key_read_lock = secret_key.lock()?;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key_read_lock)
         .map_err(|e| VaultError::internal(format!("Invalid AES-256 key: {}", e)))?;
 
-    let mut decrypted = ProtectedMemory::new(0)?;
-
+    let mut decrypted = ProtectedMemoryInner::new(0)?;
     {
-        let mut decrypted_write_guard = decrypted.lock_mut().await?;
-        decrypted_write_guard.extend_from_slice(encrypted_data)?;
-        cipher.decrypt_in_place(nonce, b"", &mut decrypted_write_guard).map_err(|e| {
-            let err = VaultError::decryption_failed(format!("AES-GCM decryption failed: {}", e));
-            err
+        let mut handle = decrypted.write_handle()?;
+        handle.extend_from_slice(encrypted_data)?;
+        cipher.decrypt_in_place(nonce, b"", &mut handle).map_err(|e| {
+            VaultError::decryption_failed(format!("AES-GCM decryption failed: {}", e))
         })?
     }
 
-    Ok(decrypted)
+    Ok(decrypted.into())
 }
 
-impl<'a> aes_gcm::aead::Buffer for WriteGuard<'a> {
+impl<'a> aes_gcm::aead::Buffer for WriteHandle<'a> {
     fn extend_from_slice(&mut self, other: &[u8]) -> aes_gcm::aead::Result<()> {
-        WriteGuard::extend_from_slice(self, other).map_err(|_| aes_gcm::aead::Error)
+        WriteHandle::extend_from_slice(self, other).map_err(|_| aes_gcm::aead::Error)
     }
 
     fn truncate(&mut self, len: usize) {
-        if let Err(e) = WriteGuard::truncate(self, len) {
+        if let Err(e) = WriteHandle::truncate(self, len) {
             eprintln!("Error when truncating AES GCM buffer: {e}. Exiting...");
             interrupt();
         }

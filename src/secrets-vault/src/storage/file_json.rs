@@ -7,25 +7,25 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    crypto::{
-        crypto_trait::Crypto, factory::CryptoFactory, key_material::KeyMaterial,
-        master_key::MasterKey,
-    },
+    crypto::{crypto_trait::Crypto, key_material::KeyMaterial, master_key::MasterKey},
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory,
     storage::{
         file_json_migrator::migrate_tree_node_v1_to_v2,
-        storage_trait::Storage,
+        storage_trait::{ListMode, Storage},
         utils::{decrypt, generate_secret_in_memory, hex_string, prepare_to_store},
     },
     types::{
-        metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
+        metadata::Metadata,
+        secret::{Secret, SecretInMemoryFactory},
+        secret_id::SecretId,
+        secret_spec::SecretSpec,
         store_mode::StoreMode,
     },
 };
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -127,8 +127,7 @@ pub struct FileJsonStorage {
     master_key: MasterKey,
     file_path: PathBuf,
     tree: tokio::sync::RwLock<SecretNode>,
-    crypto_factory: Box<dyn CryptoFactory>,
-    crypto: Box<dyn Crypto>,
+    crypto: Arc<dyn Crypto>,
 }
 
 impl FileJsonStorage {
@@ -137,14 +136,12 @@ impl FileJsonStorage {
     pub async fn new(
         master_key: MasterKey,
         file_path: &Path,
-        crypto_factory: Box<dyn CryptoFactory>,
         auto_migrate: bool,
+        crypto: Arc<dyn Crypto>,
     ) -> anyhow::Result<Self> {
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-
-        let crypto = crypto_factory.new_crypto()?;
 
         let tree = if tokio::fs::metadata(&file_path).await.is_ok() {
             let mut json = tokio::fs::read_to_string(&file_path).await?;
@@ -159,7 +156,7 @@ impl FileJsonStorage {
                     );
                 }
 
-                Self::migrate(file_path, master_key.key_material(), crypto.as_ref()).await?;
+                Self::migrate(file_path, master_key.key_material(), crypto.clone()).await?;
                 json = tokio::fs::read_to_string(&file_path).await?;
                 storage_file = serde_json::from_str(&json)?;
             }
@@ -173,7 +170,6 @@ impl FileJsonStorage {
             master_key,
             file_path: file_path.to_path_buf(),
             tree: tokio::sync::RwLock::new(tree),
-            crypto_factory,
             crypto,
         })
     }
@@ -321,12 +317,12 @@ impl FileJsonStorage {
         to_version: u32,
         mut value_json: serde_json::Value,
         master_key: &KeyMaterial,
-        crypto: &dyn Crypto,
+        crypto: Arc<dyn Crypto>,
     ) -> anyhow::Result<serde_json::Value> {
         match (from_version, to_version) {
             (1, 2) => {
                 if let Some(tree) = value_json.get_mut("tree") {
-                    migrate_tree_node_v1_to_v2(tree, master_key, crypto).await?;
+                    migrate_tree_node_v1_to_v2(tree, master_key, crypto.as_ref())?;
                 }
                 value_json["version"] = serde_json::json!(2);
                 Ok(value_json)
@@ -344,7 +340,7 @@ impl FileJsonStorage {
     pub async fn migrate(
         file_path: &Path,
         master_key: &KeyMaterial,
-        crypto: &dyn Crypto,
+        crypto: Arc<dyn Crypto>,
     ) -> anyhow::Result<()> {
         let json_str = tokio::fs::read_to_string(file_path).await?;
         let mut json_value: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -388,9 +384,14 @@ impl FileJsonStorage {
         let mut current_version = format_version;
         while current_version < Self::FORMAT_VERSION {
             let next_version = current_version + 1;
-            json_value =
-                Self::migrate_to(current_version, next_version, json_value, master_key, crypto)
-                    .await?;
+            json_value = Self::migrate_to(
+                current_version,
+                next_version,
+                json_value,
+                master_key,
+                crypto.clone(),
+            )
+            .await?;
             current_version = next_version;
         }
 
@@ -413,8 +414,7 @@ impl Storage for FileJsonStorage {
         spec: &SecretSpec,
         secret_id: &SecretId,
     ) -> anyhow::Result<Secret> {
-        let secret =
-            generate_secret_in_memory(spec, secret_id, self.crypto_factory.new_crypto()?).await?;
+        let secret = generate_secret_in_memory(spec, secret_id, self.crypto.clone())?;
         self.store(&secret, StoreMode::NewOnly).await?;
         self.load(secret_id).await
     }
@@ -427,7 +427,7 @@ impl Storage for FileJsonStorage {
             }
         };
 
-        let data = secret.serialize().await?;
+        let data = secret.serialize()?;
         let mut tree = self.tree.write().await;
         let path_parts = Self::parse_path(secret_id);
         let exists = tree.exists(&path_parts);
@@ -438,46 +438,10 @@ impl Storage for FileJsonStorage {
             exists,
             self.master_key.key_material(),
             self.crypto.as_ref(),
-        )
-        .await?;
+        )?;
         tree.insert(&path_parts, encrypted_data);
 
         self.save_to_disk(&tree).await
-    }
-
-    async fn store_vec(
-        &self,
-        secrets: Vec<(ProtectedMemory, Metadata, StoreMode)>,
-    ) -> anyhow::Result<()> {
-        let mut tree = self.tree.write().await;
-        let mut elements_to_insert = Vec::<(Vec<String>, Vec<u8>)>::with_capacity(secrets.len());
-
-        for (data, metadata, mode) in secrets {
-            let secret_id = metadata
-                .secret_id
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!(VaultError::empty_secret_id("Failed to store")))?;
-            let path_parts = Self::parse_path(secret_id);
-            let exists = tree.exists(&path_parts);
-            let encrypted_data = prepare_to_store(
-                &data,
-                &metadata,
-                mode,
-                exists,
-                self.master_key.key_material(),
-                self.crypto.as_ref(),
-            )
-            .await?;
-            elements_to_insert.push((path_parts, encrypted_data));
-        }
-
-        for (path_parts, encrypted_data) in elements_to_insert {
-            tree.insert(&path_parts, encrypted_data);
-        }
-
-        self.save_to_disk(&tree).await?;
-
-        Ok(())
     }
 
     async fn load(&self, secret_id: &SecretId) -> anyhow::Result<Secret> {
@@ -487,10 +451,9 @@ impl Storage for FileJsonStorage {
             .get(&path_parts)
             .ok_or_else(|| VaultError::not_found(format!("Secret '{}' not found", secret_id)))?;
         let (data, metadata) =
-            decrypt(self.master_key.key_material(), &stored.encrypted_data, self.crypto.as_ref())
-                .await?;
+            decrypt(self.master_key.key_material(), &stored.encrypted_data, self.crypto.as_ref())?;
 
-        let secret = Secret::deserialize(data, metadata, self.crypto_factory.new_crypto()?).await?;
+        let secret = SecretInMemoryFactory::deserialize(data, metadata, self.crypto.clone())?;
         Ok(secret)
     }
 
@@ -510,7 +473,7 @@ impl Storage for FileJsonStorage {
         }
     }
 
-    async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
+    async fn list_metadata(&self, _mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
         let tree = self.tree.read().await;
         let mut all_secrets = Vec::new();
         tree.collect_all(Vec::new(), &mut all_secrets);
@@ -522,9 +485,7 @@ impl Storage for FileJsonStorage {
                 self.master_key.key_material(),
                 &stored.encrypted_data,
                 self.crypto.as_ref(),
-            )
-            .await
-            {
+            ) {
                 Ok((_, mut meta)) => {
                     if let Some(ref secret_id) = meta.secret_id {
                         meta.secret_id = Some(Self::migrate_legacy_secret_id(secret_id));

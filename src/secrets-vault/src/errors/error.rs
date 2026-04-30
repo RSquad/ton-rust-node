@@ -69,12 +69,6 @@ pub enum VaultError {
         #[source]
         source: Option<ErrorSource>,
     },
-    #[error("[E{}: Empty crypto implementation] {message}", Self::EMPTY_CRYPTO)]
-    EmptyCrypto {
-        message: String,
-        #[source]
-        source: Option<ErrorSource>,
-    },
     #[error("[E{}: The key is already set] {message}", Self::KEY_IS_ALREADY_SET)]
     KeyIsAlreadySet {
         message: String,
@@ -297,7 +291,6 @@ impl VaultError {
     pub const EMPTY_SECRET_ID: u16 = 106;
     pub const EMPTY_PUBLIC_KEY: u16 = 107;
     pub const EMPTY_SECRET_KEY: u16 = 108;
-    pub const EMPTY_CRYPTO: u16 = 109;
     pub const KEY_IS_ALREADY_SET: u16 = 110;
     pub const WRONG_SECRET_TYPE: u16 = 111;
     pub const INVALID_KEY_SIZE: u16 = 112;
@@ -352,7 +345,6 @@ impl VaultError {
             VaultError::EmptySecretId { .. } => Self::EMPTY_SECRET_ID,
             VaultError::EmptyPublicKey { .. } => Self::EMPTY_PUBLIC_KEY,
             VaultError::EmptySecretKey { .. } => Self::EMPTY_SECRET_KEY,
-            VaultError::EmptyCrypto { .. } => Self::EMPTY_CRYPTO,
             VaultError::KeyIsAlreadySet { .. } => Self::KEY_IS_ALREADY_SET,
             VaultError::WrongSecretType { .. } => Self::WRONG_SECRET_TYPE,
             VaultError::InvalidKeySize { .. } => Self::INVALID_KEY_SIZE,
@@ -399,7 +391,6 @@ impl VaultError {
             | VaultError::EmptySecretId { message, .. }
             | VaultError::EmptyPublicKey { message, .. }
             | VaultError::EmptySecretKey { message, .. }
-            | VaultError::EmptyCrypto { message, .. }
             | VaultError::KeyIsAlreadySet { message, .. }
             | VaultError::WrongSecretType { message, .. }
             | VaultError::InvalidKeySize { message, .. }
@@ -449,7 +440,6 @@ impl VaultError {
             EmptySecretId,
             EmptyPublicKey,
             EmptySecretKey,
-            EmptyCrypto,
             KeyIsAlreadySet,
             WrongSecretType,
             InvalidKeySize,
@@ -536,10 +526,6 @@ impl VaultError {
         VaultError::EmptySecretKey { message: msg.into(), source: None }
     }
 
-    pub fn empty_crypto(msg: impl Into<String>) -> Self {
-        VaultError::EmptyCrypto { message: msg.into(), source: None }
-    }
-
     pub fn key_is_already_set(msg: impl Into<String>) -> Self {
         VaultError::KeyIsAlreadySet { message: msg.into(), source: None }
     }
@@ -554,6 +540,10 @@ impl VaultError {
 
     pub fn empty_metadata(msg: impl Into<String>) -> Self {
         VaultError::EmptyMetadata { message: msg.into(), source: None }
+    }
+
+    pub fn backend_auth_failed(msg: impl Into<String>) -> Self {
+        VaultError::BackendAuthFailed { message: msg.into(), source: None }
     }
 
     pub fn backend_operation_failed(msg: impl Into<String>) -> Self {

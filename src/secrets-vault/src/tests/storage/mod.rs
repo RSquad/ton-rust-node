@@ -11,4 +11,7 @@ mod file_json_migration;
 #[cfg(feature = "file-storage-json")]
 mod file_storage_json;
 
-pub(crate) mod storage;
+#[cfg(feature = "hashicorp-storage")]
+mod hashicorp_api;
+
+pub(crate) mod storage_trait;
