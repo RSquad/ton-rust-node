@@ -908,8 +908,12 @@ async fn extract_public_key(state: &AppState) -> Option<String> {
     let vault = state.runtime_cfg.vault()?;
     let secret = master_wallet_cfg.key.read_secret(Some(vault)).await.ok()?;
     if let secrets_vault::types::secret::Secret::KeyPair { keypair } = secret {
-        let pk = keypair.public_key().await.ok()??;
-        Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pk.as_slice()))
+        match keypair.public_key() {
+            Some(pk) => {
+                Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pk))
+            }
+            None => None,
+        }
     } else {
         None
     }

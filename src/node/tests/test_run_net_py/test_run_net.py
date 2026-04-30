@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -181,6 +182,11 @@ def run_command(
     check: bool = True,
     capture_output: bool = True,
 ):
+    if cwd:
+       print(f"$ (in {cwd}) {shlex.join(cmd)}")
+    else:
+       print(f"$ {shlex.join(cmd)}")
+
     try:
         result = subprocess.run(
             cmd,
@@ -315,8 +321,16 @@ def run_rust_node(
     stderr_path = logs_path / f"stderr_{node_index}.log"
     working_dir = build_node_work_path(node_index)
     node_bin_path = bins_path / (node_proc_name + "_" + rust_proc_suffix)
+    cmd = [str(node_bin_path)] + params
+    print(shlex.join(cmd))
     if start_new_session:
         print(f"Starting node {node_index}...")
+
+    node_env = os.environ.copy()
+    per_node_url = node_env.get(f"VAULT_URL_NODE_{node_index}")
+    if per_node_url:
+        node_env["VAULT_URL"] = per_node_url
+
     with stdout_path.open("w") as out_log, stderr_path.open("w") as err_log:
         proc = subprocess.Popen(
             [str(node_bin_path)] + params,
@@ -324,6 +338,7 @@ def run_rust_node(
             stdout=out_log,
             stderr=err_log,
             start_new_session=start_new_session,
+            env=node_env,
         )
     return proc
 

@@ -13,7 +13,10 @@ use common::{
     app_config::{AppConfig, Role, UserEntry},
     hash_password, time_format,
 };
-use secrets_vault::{types::secret_id::SecretId, vault_builder::SecretVaultBuilder};
+use secrets_vault::{
+    crypto::factory::CryptoFactory, types::secret_id::SecretId, vault_block::BlockCryptoFactory,
+    vault_builder::SecretVaultBuilder,
+};
 use service::auth::user_store::{store_password_blob, user_secret_id, validate_username};
 use std::{io::Read, path::Path};
 
@@ -181,7 +184,9 @@ impl AddUserCmd {
         }
 
         let hash = hash_password(&password).context("failed to hash password")?;
-        let vault = SecretVaultBuilder::from_env().await.context("failed to open vault")?;
+        let vault = SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?)
+            .await
+            .context("failed to open vault")?;
         let secret_id = user_secret_id(&self.username);
         let secret_name = secret_id.to_string();
 
@@ -237,7 +242,7 @@ impl RemoveUserCmd {
             .clone();
 
         if let Some(ref secret_name) = entry.password_name {
-            match SecretVaultBuilder::from_env().await {
+            match SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?).await {
                 Ok(vault) => {
                     let sid = SecretId::new(secret_name);
                     if vault.exists(&sid).await? {

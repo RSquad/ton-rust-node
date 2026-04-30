@@ -21,9 +21,8 @@ serde = "1.0.228"
 contracts = { path = "../contracts" }
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
-    "crypto-default",
     "hashicorp-storage",
-    "with-base64",
+    "ton-block",
 ] }
 
 [dev-dependencies]

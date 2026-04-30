@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::memory::protected_memory::ProtectedMemory;
+use crate::memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner};
 
 #[inline]
 fn hex_val(b: u8) -> Option<u8> {
@@ -42,19 +42,20 @@ pub fn hex_decode(input_hex_str: &[u8], output: &mut [u8]) -> anyhow::Result<()>
     Ok(())
 }
 
-pub async fn hex_val_to_pm(name: &str, val: &str) -> anyhow::Result<ProtectedMemory> {
-    let hex_data = val_to_pm(name, val).await?;
-    let mut data = ProtectedMemory::new(hex_data.len().await / 2)?;
-
-    hex_decode(hex_data.lock().await?.as_ref(), data.lock_mut().await?.as_mut())?;
-
-    Ok(data)
+pub fn hex_val_to_pm(name: &str, val: &str) -> anyhow::Result<ProtectedMemory> {
+    let hex_data = val_to_pm(name, val)?;
+    let mut data = ProtectedMemoryInner::new(hex_data.len() / 2)?;
+    {
+        let mut handle = data.write_handle()?;
+        hex_decode(hex_data.lock()?.as_ref(), handle.as_mut())?;
+    }
+    Ok(data.into())
 }
 
-pub async fn val_to_pm(name: &str, val: &str) -> anyhow::Result<ProtectedMemory> {
+pub fn val_to_pm(name: &str, val: &str) -> anyhow::Result<ProtectedMemory> {
     if val.is_empty() {
         anyhow::bail!("value '{}' is empty", name);
     }
 
-    ProtectedMemory::from_slice(val.as_bytes()).await
+    Ok(ProtectedMemoryInner::from_slice(val.as_bytes())?.into())
 }

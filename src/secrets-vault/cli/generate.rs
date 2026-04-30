@@ -20,12 +20,12 @@ pub async fn execute(
     let spec = SecretSpec::new(algorithm).extractable(extractable);
     vault.generate_secret(&spec, &secret_id).await?;
     vault.flush().await?;
-    let secret = vault.get(&secret_id).await?;
+    let secret = vault.load(&secret_id).await?;
 
     println!("\n{} {}\n", "✓".green().bold(), "The secret was successfully generated".green());
 
     print_secret_header();
-    print_secret(&secret).await?;
+    print_secret(&secret)?;
 
     Ok(())
 }

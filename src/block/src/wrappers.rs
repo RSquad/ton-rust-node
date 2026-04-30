@@ -82,6 +82,10 @@ impl Ed25519ExpandedPrivateKey {
     pub fn to_bytes(&self) -> [u8; 64] {
         self.inner
     }
+
+    pub fn as_bytes(&self) -> &[u8; 64] {
+        &self.inner
+    }
 }
 
 pub struct Ed25519PrivateKey {

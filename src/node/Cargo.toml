@@ -102,8 +102,8 @@ ton_vm = { path = '../vm' }
 lockfree = { path = '../lockfree' }
 secrets-vault = { path = '../secrets-vault', default-features = false, features = [
     "file-storage-json",
-    "crypto-default",
-    "crypto-block",
+    "hashicorp-storage",
+    "ton-block",
 ] }
 storage = { path = 'storage' }
 ton_api = { path = '../tl/ton_api' }
