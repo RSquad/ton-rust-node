@@ -128,13 +128,12 @@ impl RocksDb {
 
         options.set_max_total_wal_size(1024 * 1024 * 1024);
 
-        // Compaction and flush I/O bypasses the OS page cache, preventing
-        // compaction traffic (~10+ GB/hour) from evicting useful cached data
-        // and causing the sawtooth memory pattern visible in Rancher.
-        options.set_use_direct_io_for_flush_and_compaction(true);
-        // With direct I/O the kernel no longer does readahead, so we set an
-        // explicit 2 MB readahead for the sequential reads that compaction does.
-        options.set_compaction_readahead_size(2 * 1024 * 1024);
+        // Let compaction and flush go through the OS page cache (the default)
+        // so that newly created SST files are already warm in cache and
+        // subsequent reads don't cause cold disk I/O. Previously direct I/O
+        // was enabled here to avoid compaction traffic evicting useful data,
+        // but with partitioned filters the metadata working set is much
+        // smaller, so the eviction pressure from compaction is acceptable.
 
         options.enable_statistics();
         options.set_dump_malloc_stats(true);

@@ -122,6 +122,19 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let (wc_id, account_id) = account_address.extract_std_address(true)?;
         let is_masterchain = wc_id == MASTERCHAIN_ID;
         log::debug!(target: "executor", "Account = {}:{:x}", wc_id, account_id);
+        if let Some(address) = account.get_addr() {
+            if let Some(anyacast) = address.rewrite_pfx() {
+                let (_, id) = address.extract_std_address(true)?;
+                if id != account_id {
+                    log::warn!(target: "executor", "Account address has anycast prefix, but anycast id: {:x} does not match account id: {:x}",
+                        anyacast.rewrite_pfx, account_id);
+                    *account = Default::default();
+                } else {
+                    log::warn!(target: "executor", "Account address has anycast prefix, anycast id: {:x} with address: {:x}",
+                        anyacast.rewrite_pfx, address.address());
+                }
+            }
+        }
         if let Some(hash) = account.frozen_hash() {
             log::debug!(target: "executor", "Account is frozen, hash = {:x}", hash);
         } else if account.is_uninit() {
@@ -213,11 +226,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         if description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
                 Ok(credit_ph) => Some(credit_ph),
-                Err(e) => fail!(
-                    ExecutorError::TrExecutorError(
-                        format!("cannot create credit phase of a new transaction for smart contract for reason {}", e)
-                    )
-                )
+                Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                    "cannot create credit phase of a new transaction for smart contract for reason {e}"
+                ))),
             };
         }
         let storage_fees_collected;
@@ -235,8 +246,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 Some(storage_ph)
             }
             Err(e) => fail!(ExecutorError::TrExecutorError(format!(
-                "cannot create storage phase of a new transaction for smart contract for reason {}",
-                e
+                "cannot create storage phase of a new transaction for smart contract for reason {e}"
             ))),
         };
 
@@ -254,11 +264,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         if !description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
                 Ok(credit_ph) => Some(credit_ph),
-                Err(e) => fail!(
-                    ExecutorError::TrExecutorError(
-                        format!("cannot create credit phase of a new transaction for smart contract for reason {}", e)
-                    )
-                )
+                Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                    "cannot create credit phase of a new transaction for smart contract for reason {e}",
+                ))),
             };
         }
         log::debug!(target: "executor",
@@ -358,18 +366,16 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                         actions.unwrap_or_default(),
                         new_data,
                         &account_address,
-                        is_special
+                        is_special,
                     ) {
-                        Ok(ActionPhaseResult{phase, messages, bounce}) => {
+                        Ok(ActionPhaseResult { phase, messages, bounce }) => {
                             need_bounce = bounce;
                             out_msgs = messages;
                             Some(phase)
                         }
-                        Err(e) => fail!(
-                            ExecutorError::TrExecutorError(
-                                format!("cannot create action phase of a new transaction for smart contract for reason {}", e)
-                            )
-                        )
+                        Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                            "cannot create action phase of a new transaction for smart contract for reason {e}",
+                        ))),
                     }
                 } else {
                     log::debug!(target: "executor", "compute_phase: failed");
@@ -424,18 +430,16 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 description.action.as_ref(),
                 &in_msg,
                 &mut tr,
-                &account_address
+                &account_address,
             ) {
                 Ok((bounce_ph, Some(bounce_msg))) => {
                     out_msgs.push(bounce_msg);
                     Some(bounce_ph)
                 }
                 Ok((bounce_ph, None)) => Some(bounce_ph),
-                Err(e) => fail!(
-                    ExecutorError::TrExecutorError(
-                        format!("cannot create bounce phase of a new transaction for smart contract for reason {}", e)
-                    )
-                )
+                Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                    "cannot create bounce phase of a new transaction for smart contract for reason {e}"
+                ))),
             };
             // TODO: check here
             // if money can be returned to sender
@@ -455,6 +459,8 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             log::debug!(target: "executor", "balance is not zero, so make uninit account");
             *account = Account::uninit(account_address, acc_balance.clone(), 0, last_paid);
             // }
+        } else {
+            account.set_addr(account_address);
         }
         tr.set_end_status(account.status());
         if let Some(hash) = account.frozen_hash() {

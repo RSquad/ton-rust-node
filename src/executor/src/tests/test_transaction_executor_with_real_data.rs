@@ -621,14 +621,61 @@ fn test_non_bounce_with_state_init_nogas() {
     );
 }
 
+#[test]
+fn test_pruned_cell_load_tx() {
+    replay_transaction_full(
+        "real_boc/pruned_cell_load_account_old.boc",
+        "real_boc/pruned_cell_load_account_new.boc",
+        "real_boc/pruned_cell_load_transaction.boc",
+        "real_boc/config.boc",
+        "",
+        "",
+    )
+}
+
+// account has anycast in address
+#[test]
+fn test_with_anycast() {
+    replay_transaction_full(
+        "real_boc/with_anycast_account_old.boc",
+        "real_boc/with_anycast_account_new.boc",
+        "real_boc/with_anycast_transaction.boc",
+        "real_boc/config.boc",
+        "",
+        "",
+    );
+}
+
+#[test]
+fn test_with_bad_anycast() {
+    replay_transaction_full(
+        "real_boc/with_bad_anycast_account_old.boc",
+        "real_boc/with_bad_anycast_account_new.boc",
+        "real_boc/with_bad_anycast_transaction.boc",
+        "real_boc/config.boc",
+        "",
+        "",
+    );
+}
+
 #[ignore = "test for replay transaction by message from transaction"]
 #[test]
 fn test_replay_transaction_by_message_from_transaction() {
-    let transaction = Transaction::construct_from_file("real_boc/transaction.boc").unwrap();
+    let prefix = "real_boc/bad_";
+    let transaction =
+        Transaction::construct_from_file(prefix.to_owned() + "transaction.boc").unwrap();
     let mut hash_update = transaction.read_state_update().unwrap();
     let mut message = transaction.read_in_msg().unwrap().unwrap();
-    message.int_header_mut().unwrap().bounce = false;
-    let mut account = Account::construct_from_file("real_boc/empty_account.boc").unwrap();
+    message.int_header_mut().unwrap().bounce = true;
+    let mut account = Account::construct_from_file(prefix.to_owned() + "account_old.boc").unwrap();
+    let addr = account.get_addr().unwrap().clone();
+    let rewrite_pfx = ton_block::SliceData::new(vec![0x01, 0x20, 0x80]);
+    let anycast = ton_block::AnycastInfo::with_rewrite_pfx(rewrite_pfx).ok();
+    let addr = MsgAddressInt::with_standart(anycast, 0, addr.address().clone()).unwrap();
+    account.set_addr(addr);
+    account.set_due_payment(Some(100.into()));
+    account.write_to_file(prefix.to_owned() + "account_old.boc").unwrap();
+    hash_update.old_hash = account.serialize().unwrap().repr_hash().clone();
 
     let at = transaction.now();
     let lt = transaction.logical_time();
@@ -640,8 +687,8 @@ fn test_replay_transaction_by_message_from_transaction() {
     account.calc_storage_stat_dict(1 << 31).unwrap();
     hash_update.new_hash = account.serialize().unwrap().repr_hash().clone();
     transaction.write_state_update(&hash_update).unwrap();
-    transaction.write_to_file("real_boc/new_transaction.boc").unwrap();
-    account.write_to_file("real_boc/account_new.boc").unwrap();
+    transaction.write_to_file(prefix.to_owned() + "transaction.boc").unwrap();
+    account.write_to_file(prefix.to_owned() + "account_new.boc").unwrap();
 }
 
 #[ignore = "test for replay transaction by message from file"]
@@ -697,18 +744,6 @@ fn test_revert_action_phase() {
     answer.set_balance(account.get_balance().unwrap().clone());
     answer.set_last_tr_time(account.last_tr_time().unwrap_or(0));
     assert_eq!(answer, account);
-}
-
-#[test]
-fn test_pruned_cell_load_tx() {
-    replay_transaction_full(
-        "real_boc/pruned_cell_load_account_old.boc",
-        "real_boc/pruned_cell_load_account_new.boc",
-        "real_boc/pruned_cell_load_transaction.boc",
-        "real_boc/config.boc",
-        "",
-        "",
-    )
 }
 
 #[ignore]

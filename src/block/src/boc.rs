@@ -1195,7 +1195,8 @@ impl BocIndex<'_> {
                     if header.has_cache_bits {
                         o2 >>= 1;
                     }
-                    offset += o2;
+                    offset =
+                        offset.checked_add(o2).ok_or_else(|| error!("cell offset overflow"))?;
                 }
                 Ok(offset as usize)
             }
@@ -1312,7 +1313,7 @@ impl<'a> BocReader<'a> {
         // so the caller can read the next BOC from the same stream.
         let header = &result.header;
         let index_size =
-            header.index_included as u64 * (header.cells_count * header.offset_size) as u64;
+            header.index_included as u64 * (header.cells_count as u64 * header.offset_size as u64);
         let boc_len =
             header_len + index_size + header.tot_cells_size as u64 + header.has_crc as u64 * 4;
         src.seek(SeekFrom::Start(position + boc_len))?;
@@ -1332,7 +1333,10 @@ impl<'a> BocReader<'a> {
 
             const PART_LEN: usize = 4 * 1024;
             let mut part = [0; PART_LEN];
-            let mut rest = header.cells_count * header.offset_size;
+            let mut rest = header
+                .cells_count
+                .checked_mul(header.offset_size)
+                .ok_or_else(|| error!("index size overflow"))?;
             while rest > 0 {
                 let cur_len = rest.min(PART_LEN);
                 src.read_exact(&mut part[..cur_len])?;
@@ -1438,7 +1442,14 @@ impl<'a> BocReader<'a> {
 
         // Build cell offsets
         let cells_data_start = if header.index_included {
-            header_len + header.cells_count * header.offset_size
+            header_len
+                .checked_add(
+                    header
+                        .cells_count
+                        .checked_mul(header.offset_size)
+                        .ok_or_else(|| error!("index size overflow"))?,
+                )
+                .ok_or_else(|| error!("cells_data_start overflow"))?
         } else {
             header_len
         };
@@ -1448,13 +1459,37 @@ impl<'a> BocReader<'a> {
             let idx_base = header_len;
             let mut prev: usize = 0;
             for i in 0..header.cells_count {
-                v.push(cells_data_start + prev);
+                if i & CHECK_ABORT_EACH == 0 {
+                    check_abort(self.abort)?;
+                }
+
+                let off = cells_data_start
+                    .checked_add(prev)
+                    .ok_or_else(|| error!("cell offset overflow at cell {}", i))?;
+                if off > data.len() {
+                    fail!("cell offset out of bounds at cell {}", i);
+                }
+                v.push(off);
+
                 let mut entry =
                     read_be_uint_at(data, idx_base + i * header.offset_size, header.offset_size);
                 if header.has_cache_bits {
                     entry >>= 1;
                 }
-                prev = entry as usize;
+                let entry = entry as usize;
+                if entry > header.tot_cells_size {
+                    fail!("cell index entry out of bounds at cell {}", i);
+                }
+                if entry < prev {
+                    fail!("cell index entries are not monotonic at cell {}", i);
+                }
+                if entry - prev < 2 {
+                    fail!("cell too small in index at cell {}", i);
+                }
+                prev = entry;
+            }
+            if prev != header.tot_cells_size {
+                fail!("actual data size disagrees with the size from header");
             }
             v
         } else {
@@ -1478,6 +1513,7 @@ impl<'a> BocReader<'a> {
         };
 
         // Single-pass cell construction (reverse: leaves → roots)
+        let cells_data_end = cells_data_start + header.tot_cells_size;
         let mut cells: Vec<Cell> = Vec::with_capacity(header.cells_count);
         let mut interrupted = false;
 
@@ -1489,8 +1525,13 @@ impl<'a> BocReader<'a> {
             let off = offsets[i];
             let raw = &data[off..];
 
-            // BOC-specific stricter tag-completion check
             let wire_len = cell::full_len(raw);
+            let rc = cell::refs_count(raw);
+            if off + wire_len + rc * header.ref_size > cells_data_end {
+                fail!("cell {} wire data exceeds cells area", i);
+            }
+
+            // BOC-specific stricter tag-completion check
             if raw[1] & 1 != 0 && wire_len > 2 && raw[wire_len - 1] & 0x7f == 0 {
                 fail!("overly long tag-completed encoding at cell {}", i);
             }
@@ -1501,7 +1542,6 @@ impl<'a> BocReader<'a> {
             }
 
             // Resolve child references directly from already-built cells
-            let rc = cell::refs_count(raw);
             let refs_off = off + wire_len;
             let mut refs = smallvec::SmallVec::<[Cell; MAX_REFERENCES_COUNT]>::new();
             for k in 0..rc {
@@ -1568,7 +1608,7 @@ impl<'a> BocReader<'a> {
 
             let offset = index.offset(cell_index, &header)?;
 
-            if data.len() <= offset {
+            if offset + 2 > data.len() {
                 fail!("Invalid data: data too short or index is invalid");
             }
 
@@ -1714,7 +1754,7 @@ impl<'a> BocReader<'a> {
             Ok(BocIndex::Own(index))
         } else {
             let index = cursor.position();
-            let cells_start = index + (header.cells_count * header.offset_size) as u64;
+            let cells_start = index + header.cells_count as u64 * header.offset_size as u64;
             Ok(BocIndex::Ref(&data[index as usize..], cells_start))
         }
     }
@@ -1742,10 +1782,18 @@ impl<'a> BocReader<'a> {
         let mut offset = 0;
         if header.index_included {
             let index = &data[src.position() as usize..];
-            if index.len() < header.cells_count * header.offset_size {
+            let index_size = header
+                .cells_count
+                .checked_mul(header.offset_size)
+                .ok_or_else(|| error!("index size overflow"))?;
+            if index.len() < index_size {
                 fail!("Invalid data: too small to fit index");
             }
-            offset = src.position() as usize + header.cells_count * header.offset_size;
+            offset = src.position() as usize
+                + header
+                    .cells_count
+                    .checked_mul(header.offset_size)
+                    .ok_or_else(|| error!("index size overflow"))?;
             if root_index > 0 {
                 let o = (root_index - 1) * header.offset_size;
                 let mut o2 = Cursor::new(&index[o..o + header.offset_size])
@@ -1753,7 +1801,7 @@ impl<'a> BocReader<'a> {
                 if header.has_cache_bits {
                     o2 >>= 1;
                 }
-                offset += o2;
+                offset = offset.checked_add(o2).ok_or_else(|| error!("cell offset overflow"))?;
             }
         } else {
             for cell_index in 0_usize..header.cells_count {
@@ -1937,7 +1985,7 @@ impl<'a> BocReader<'a> {
     ) -> Result<()> {
         // calculate boc len
         let index_size =
-            header.index_included as u64 * ((header.cells_count * header.offset_size) as u64);
+            header.index_included as u64 * (header.cells_count as u64 * header.offset_size as u64);
         let len =
             header_len + index_size + header.tot_cells_size as u64 + header.has_crc as u64 * 4;
         if unbounded {
@@ -1969,7 +2017,7 @@ impl<'a> BocReader<'a> {
             smallvec::SmallVec::with_capacity(refs_count);
         for _ in 0..refs_count {
             let i = src.read_be_uint(ref_size)? as usize;
-            if i > cells_count || i <= cell_index {
+            if i >= cells_count || i <= cell_index {
                 fail!(
                     "reference out of range, cells_count: {}, ref: {}, cell_index: {}",
                     cells_count,

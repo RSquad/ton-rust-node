@@ -836,10 +836,10 @@ pub fn replay_transaction(
     // transaction.write_to_file("real_boc/storage_limit_transaction.boc").unwrap();
     let old_root = account.serialize().unwrap();
     let hash_update = transaction.read_state_update().unwrap();
-    pretty_assertions::assert_eq!(hash_update.old_hash, *old_root.repr_hash());
-    // dbg!(&account, &transaction, transaction.read_in_msg().unwrap());
     println!("transaction hash: {:X}", transaction.serialize().unwrap().repr_hash());
     println!("account hash: {:X}", old_root.repr_hash());
+    pretty_assertions::assert_eq!(&hash_update.old_hash, old_root.repr_hash());
+    // dbg!(&account, &transaction, transaction.read_in_msg().unwrap());
     let message = transaction.read_in_msg().unwrap();
     let msg_cell = transaction.in_msg_cell();
     let account_after = Account::construct_from_file(acc_after).unwrap_or_else(|_| account.clone());

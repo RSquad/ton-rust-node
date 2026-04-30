@@ -519,9 +519,18 @@ impl FullNodeOverlayClient {
                 fail!("neighbour is not found!")
             }
         };
-        log::trace!("USE PEER {}, REQUEST {:?}", peer, request.object);
+        log::debug!(
+            "download_next_block_full: sending RLDP to peer {}, prev: {}",
+            peer.id(),
+            prev_id
+        );
         let data_full: DataFull =
             self.client.send_rldp_query_typed(&request, &peer, 0, true).await?;
+        log::debug!(
+            "download_next_block_full: got RLDP reply from peer {}, prev: {}",
+            peer.id(),
+            prev_id
+        );
         match data_full {
             DataFull::TonNode_DataFull(data_full) => {
                 let proof = BlockProofStuff::deserialize(

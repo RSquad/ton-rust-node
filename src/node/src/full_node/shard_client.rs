@@ -103,10 +103,15 @@ async fn load_next_master_block(
     engine: &Arc<dyn EngineOperations>,
     prev_id: &BlockIdExt,
 ) -> Result<BlockIdExt> {
-    log::trace!("load_next_master_block: prev block: {}", prev_id);
+    log::debug!("load_next_master_block: prev block: {}", prev_id);
     if let Some(prev_handle) = engine.load_block_handle(prev_id)? {
         if prev_handle.has_next1() {
             let next_id = engine.load_block_next1(prev_id)?;
+            log::debug!(
+                "load_next_master_block: has_next1, will download_and_apply_block {}, prev: {}",
+                next_id,
+                prev_id
+            );
             engine.clone().download_and_apply_block(&next_id, next_id.seq_no(), false).await?;
             return Ok(next_id);
         }
@@ -114,14 +119,16 @@ async fn load_next_master_block(
         fail!("Cannot load handle for prev block {}", prev_id)
     };
 
-    log::trace!("load_next_master_block: downloading next block... prev: {}", prev_id);
+    log::debug!("load_next_master_block: downloading next block... prev: {}", prev_id);
     let (block, proof) = engine.download_next_block(prev_id).await?;
-    log::trace!("load_next_master_block: got next block: {}", prev_id);
+    log::debug!("load_next_master_block: downloaded next block {}, prev: {}", block.id(), prev_id);
     if block.id().seq_no != prev_id.seq_no + 1 {
         fail!("Invalid next master block got: {}, prev: {}", block.id(), prev_id);
     }
 
+    log::debug!("load_next_master_block: waiting for prev state {}", prev_id);
     let prev_state = engine.clone().wait_state(prev_id, None, true).await?;
+    log::debug!("load_next_master_block: got prev state, checking proof for {}", block.id());
     proof.check_with_master_state(&prev_state)?;
     let mut next_handle = loop {
         if let Some(next_handle) = engine.load_block_handle(block.id())? {
@@ -152,6 +159,7 @@ async fn load_next_master_block(
                 )
             })?;
     }
+    log::debug!("load_next_master_block: applying block {}", block.id());
     engine.clone().apply_block(&next_handle, &block, next_handle.id().seq_no(), false).await?;
     Ok(block.id().clone())
 }
