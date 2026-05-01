@@ -6,28 +6,43 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::{output_format::OutputFormat, utils::save_config};
+use crate::commands::nodectl::{
+    output_format::OutputFormat,
+    utils::{api_delete, api_get, api_post, resolve_service_url},
+};
 use anyhow::Context;
-use base64::Engine;
 use colored::Colorize;
-use common::app_config::{AppConfig, VotingConfig};
-use contracts::{ConfigContractImpl, ConfigContractWrapper, ConfigProposal, contract_provider};
+use serde::{Deserialize, Serialize};
 use std::{
     io::{IsTerminal, Write, stdin, stdout},
-    path::Path,
-    sync::Arc,
-    time::SystemTime,
 };
-use ton_block::write_boc;
-use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
 #[derive(clap::Args, Clone)]
-#[command(about = "Config proposals voting")]
+#[command(about = "Config proposals voting (REST client; requires running nodectl service)")]
 pub struct VoteCmd {
+    #[arg(
+        short = 'u',
+        long = "url",
+        value_hint = clap::ValueHint::Url,
+        help = "URL to the node control service API (overrides --config; env: NODECTL_URL)",
+        env = "NODECTL_URL",
+        global = true
+    )]
+    url: Option<String>,
+
+    #[arg(
+        long = "token",
+        env = "NODECTL_API_TOKEN",
+        value_name = "TOKEN",
+        help = "JWT token (nominator for read, operator for add/rm; env: NODECTL_API_TOKEN)",
+        global = true
+    )]
+    token: Option<String>,
+
     #[arg(
         short = 'c',
         long = "config",
-        help = "Path to the configuration file",
+        help = "Path to the configuration file (for service URL from http.bind)",
         default_value = "nodectl-config.json",
         env = "CONFIG_PATH",
         global = true
@@ -52,11 +67,13 @@ enum VoteAction {
 
 impl VoteCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
+        let base_url = resolve_service_url(self.url.as_deref(), Some(self.config.as_str()))?;
+        let token = self.token.as_deref();
         match &self.action {
-            VoteAction::Ls(cmd) => cmd.run(&self.config).await,
-            VoteAction::Inspect(cmd) => cmd.run(&self.config).await,
-            VoteAction::Add(cmd) => cmd.run(&self.config).await,
-            VoteAction::Rm(cmd) => cmd.run(&self.config),
+            VoteAction::Ls(cmd) => cmd.run(&base_url, token).await,
+            VoteAction::Inspect(cmd) => cmd.run(&base_url, token).await,
+            VoteAction::Add(cmd) => cmd.run(&base_url, token).await,
+            VoteAction::Rm(cmd) => cmd.run(&base_url, token).await,
         }
     }
 }
@@ -69,7 +86,7 @@ struct VoteLsCmd {
     format: OutputFormat,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ProposalRow {
     hash: String,
     param_id: i32,
@@ -84,38 +101,20 @@ struct ProposalRow {
     tracked: bool,
 }
 
-fn proposal_to_row(p: &ConfigProposal, tracked_hashes: &[String]) -> ProposalRow {
-    let hash = hex::encode(p.hash);
-    ProposalRow {
-        tracked: tracked_hashes.contains(&hash),
-        hash,
-        param_id: p.param.id,
-        is_critical: p.is_critical,
-        expires: p.expires,
-        expires_in: format_expires(p.expires),
-        voters_count: p.voters.len(),
-        weight_remaining: p.weight_remaining,
-        rounds_remaining: p.rounds_remaining,
-        wins: p.wins,
-        losses: p.losses,
-    }
-}
-
 impl VoteLsCmd {
-    async fn run(&self, config_path: &str) -> anyhow::Result<()> {
-        let (config, rpc_client) = load_config_rpc(config_path)?;
-        let config_contract = ConfigContractImpl::new(contract_provider!(rpc_client));
+    async fn run(&self, base_url: &str, token: Option<&str>) -> anyhow::Result<()> {
+        let body = api_get(base_url, "/v1/voting/proposals", token).await?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        let rows: Vec<ProposalRow> = serde_json::from_value(
+            v.get("result")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("voting proposals: missing 'result'"))?,
+        )?;
 
-        let proposals = config_contract.list_proposals().await.context("list_proposals")?;
-
-        if proposals.is_empty() {
+        if rows.is_empty() {
             println!("No active proposals");
             return Ok(());
         }
-
-        let tracked = tracked_proposals(&config);
-        let rows: Vec<ProposalRow> =
-            proposals.iter().map(|p| proposal_to_row(p, &tracked)).collect();
 
         match self.format {
             OutputFormat::Json => {
@@ -171,7 +170,7 @@ struct VoteInspectCmd {
     format: OutputFormat,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ProposalDetail {
     hash: String,
     param_id: i32,
@@ -188,41 +187,17 @@ struct ProposalDetail {
     losses: u8,
 }
 
-impl From<&ConfigProposal> for ProposalDetail {
-    fn from(p: &ConfigProposal) -> Self {
-        Self {
-            hash: hex::encode(p.hash),
-            param_id: p.param.id,
-            param_hash: p.param.hash.map(hex::encode),
-            param_cell_boc: p.param.cell.as_ref().and_then(|c| {
-                write_boc(c).ok().map(|boc| base64::engine::general_purpose::STANDARD.encode(&boc))
-            }),
-            is_critical: p.is_critical,
-            expires: p.expires,
-            expires_in: format_expires(p.expires),
-            voters: p.voters.clone(),
-            weight_remaining: p.weight_remaining,
-            vset_id: hex::encode(p.vset_id),
-            rounds_remaining: p.rounds_remaining,
-            wins: p.wins,
-            losses: p.losses,
-        }
-    }
-}
-
 impl VoteInspectCmd {
-    async fn run(&self, config_path: &str) -> anyhow::Result<()> {
-        let phash = parse_proposal_hash(&self.hash)?;
-        let (_config, rpc_client) = load_config_rpc(config_path)?;
-        let config_contract = ConfigContractImpl::new(contract_provider!(rpc_client));
-
-        let proposal = config_contract
-            .get_proposal(phash)
-            .await
-            .context("get_proposal")?
-            .ok_or_else(|| anyhow::anyhow!("proposal not found"))?;
-
-        let detail = ProposalDetail::from(&proposal);
+    async fn run(&self, base_url: &str, token: Option<&str>) -> anyhow::Result<()> {
+        let h = parse_proposal_hash_hex_normalized(&self.hash)?;
+        let path = format!("/v1/voting/proposals/{h}");
+        let body = api_get(base_url, &path, token).await?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        let detail: ProposalDetail = serde_json::from_value(
+            v.get("result")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("inspect: missing 'result'"))?,
+        )?;
 
         match self.format {
             OutputFormat::Json => {
@@ -253,8 +228,8 @@ impl VoteInspectCmd {
                 if let Some(ref boc) = detail.param_cell_boc {
                     println!("  {:<20} {}", "Param cell (b64):".cyan().bold(), boc);
                 }
-                if let Some(ref h) = detail.param_hash {
-                    println!("  {:<20} {}", "Param hash:".cyan().bold(), h);
+                if let Some(ref ph) = detail.param_hash {
+                    println!("  {:<20} {}", "Param hash:".cyan().bold(), ph);
                 }
                 println!();
             }
@@ -274,41 +249,28 @@ struct VoteAddCmd {
 }
 
 impl VoteAddCmd {
-    async fn run(&self, config_path: &str) -> anyhow::Result<()> {
-        let path = Path::new(config_path);
-        let (mut config, rpc_client) = load_config_rpc(config_path)?;
-        let config_contract = ConfigContractImpl::new(contract_provider!(rpc_client));
-
-        let proposals = config_contract.list_proposals().await.context("list_proposals")?;
-        if proposals.is_empty() {
-            anyhow::bail!("no active proposals on-chain");
-        }
-
-        let tracked = tracked_proposals(&config);
-
+    async fn run(&self, base_url: &str, token: Option<&str>) -> anyhow::Result<()> {
         let selected_hash = match &self.hash {
-            Some(h) => {
-                let phash = parse_proposal_hash(h)?;
-                if !proposals.iter().any(|p| p.hash == phash) {
-                    anyhow::bail!("proposal {} not found on-chain", h);
-                }
-                hex::encode(phash)
-            }
+            Some(h) => parse_proposal_hash_hex_normalized(h)?,
             None => {
                 require_interactive()?;
-                select_proposal(&proposals, &tracked)?
+                let rows = fetch_proposal_rows(base_url, token).await?;
+                if rows.is_empty() {
+                    anyhow::bail!("no active proposals on-chain");
+                }
+                select_proposal(&rows)?
             }
         };
 
-        if tracked.contains(&selected_hash) {
-            println!("Proposal {} is already tracked", selected_hash);
+        if fetch_tracked_lower(base_url, token).await?.contains(&selected_hash.to_lowercase()) {
+            println!("Proposal {selected_hash} is already tracked");
             return Ok(());
         }
 
-        add_proposal_to_config(&mut config, &selected_hash);
-        save_config(&config, path)?;
+        let body = serde_json::json!({ "hash": selected_hash });
+        api_post(base_url, "/v1/voting/proposals", token, &body).await?;
 
-        println!("{} proposal {} added to voting config", "OK".green().bold(), selected_hash);
+        println!("{} proposal {selected_hash} added to voting config", "OK".green().bold());
         Ok(())
     }
 }
@@ -323,12 +285,8 @@ struct VoteRmCmd {
 }
 
 impl VoteRmCmd {
-    fn run(&self, config_path: &str) -> anyhow::Result<()> {
-        let path = Path::new(config_path);
-        let mut config = AppConfig::load(path)?;
-
-        let tracked = tracked_proposals(&config);
-
+    async fn run(&self, base_url: &str, token: Option<&str>) -> anyhow::Result<()> {
+        let tracked = fetch_tracked_hashes(base_url, token).await?;
         if tracked.is_empty() {
             println!("No proposals in voting config");
             return Ok(());
@@ -336,9 +294,9 @@ impl VoteRmCmd {
 
         let selected_hash = match &self.hash {
             Some(h) => {
-                let normalized = h.to_lowercase();
-                if !tracked.contains(&normalized) {
-                    anyhow::bail!("proposal {} is not in voting config", h);
+                let normalized = parse_proposal_hash_hex_normalized(h)?;
+                if !tracked.iter().any(|t| t.eq_ignore_ascii_case(&normalized)) {
+                    anyhow::bail!("proposal {h} is not in voting config");
                 }
                 normalized
             }
@@ -348,60 +306,59 @@ impl VoteRmCmd {
             }
         };
 
-        let voting = config.voting.as_mut().unwrap();
-        voting.proposals.retain(|h| h != &selected_hash);
-        save_config(&config, path)?;
+        let path = format!(
+            "/v1/voting/proposals/{}",
+            parse_proposal_hash_hex_normalized(&selected_hash)?
+        );
+        api_delete(base_url, &path, token).await?;
 
-        println!("{} proposal {} removed from voting config", "OK".green().bold(), selected_hash);
+        println!(
+            "{} proposal {} removed from voting config",
+            "OK".green().bold(),
+            selected_hash
+        );
         Ok(())
     }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-fn load_config_rpc(config_path: &str) -> anyhow::Result<(AppConfig, Arc<ClientJsonRpc>)> {
-    let config = AppConfig::load(Path::new(config_path))?;
-    let rpc_client = Arc::new(
-        ClientJsonRpc::connect_many(
-            config.ton_http_api.resolved_endpoints(),
-            config.ton_http_api.api_key.clone(),
-        )
-        .context("ClientJsonRpc")?,
-    );
-    Ok((config, rpc_client))
+async fn fetch_proposal_rows(base_url: &str, token: Option<&str>) -> anyhow::Result<Vec<ProposalRow>> {
+    let body = api_get(base_url, "/v1/voting/proposals", token).await?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    serde_json::from_value(
+        v.get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("voting proposals: missing 'result'"))?,
+    )
+    .context("parse proposal rows")
 }
 
-fn tracked_proposals(config: &AppConfig) -> Vec<String> {
-    config.voting.as_ref().map(|v| v.proposals.clone()).unwrap_or_default()
+async fn fetch_tracked_hashes(base_url: &str, token: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let body = api_get(base_url, "/v1/voting/config", token).await?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let arr = v
+        .get("result")
+        .and_then(|r| r.get("proposals"))
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| anyhow::anyhow!("voting config: missing result.proposals"))?;
+    Ok(arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
 }
 
-fn parse_proposal_hash(s: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes = hex::decode(s).context("invalid hex")?;
+async fn fetch_tracked_lower(base_url: &str, token: Option<&str>) -> anyhow::Result<Vec<String>> {
+    Ok(fetch_tracked_hashes(base_url, token)
+        .await?
+        .into_iter()
+        .map(|h| h.to_lowercase())
+        .collect())
+}
+
+fn parse_proposal_hash_hex_normalized(s: &str) -> anyhow::Result<String> {
+    let bytes = hex::decode(s.trim()).context("invalid hex")?;
     if bytes.len() != 32 {
         anyhow::bail!("proposal hash must be 32 bytes, got {}", bytes.len());
     }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn format_expires(expires: u32) -> String {
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
-        as u32;
-    if expires <= now {
-        return "expired".to_string();
-    }
-    let diff = expires - now;
-    let days = diff / 86400;
-    let hours = (diff % 86400) / 3600;
-    let mins = (diff % 3600) / 60;
-    if days > 0 {
-        format!("in {}d {}h", days, hours)
-    } else if hours > 0 {
-        format!("in {}h {}m", hours, mins)
-    } else {
-        format!("in {}m", mins)
-    }
+    Ok(hex::encode(bytes))
 }
 
 fn require_interactive() -> anyhow::Result<()> {
@@ -411,28 +368,27 @@ fn require_interactive() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn select_proposal(proposals: &[ConfigProposal], tracked: &[String]) -> anyhow::Result<String> {
+fn select_proposal(proposals: &[ProposalRow]) -> anyhow::Result<String> {
     println!("\n  Active proposals:\n");
     for (i, p) in proposals.iter().enumerate() {
-        let hash = hex::encode(p.hash);
-        let marker = if tracked.contains(&hash) { "*" } else { " " };
+        let marker = if p.tracked { "*" } else { " " };
         println!(
             "  {}{} [{}] p{} critical={} {} voters={}",
             marker.green().bold(),
             format!("  {}", i + 1).bold(),
-            &hash[..16],
-            p.param.id,
+            p.hash.chars().take(16).collect::<String>(),
+            p.param_id,
             if p.is_critical { "yes" } else { "no" },
-            format_expires(p.expires),
-            p.voters.len(),
+            p.expires_in,
+            p.voters_count,
         );
     }
-    if tracked.iter().any(|h| proposals.iter().any(|p| hex::encode(p.hash) == *h)) {
+    if proposals.iter().any(|p| p.tracked) {
         println!("\n  {} already tracked", "*".green().bold());
     }
 
     let idx = prompt_selection(proposals.len())?;
-    Ok(hex::encode(proposals[idx].hash))
+    Ok(proposals[idx].hash.clone())
 }
 
 fn select_tracked_proposal(tracked: &[String]) -> anyhow::Result<String> {
@@ -456,16 +412,4 @@ fn prompt_selection(count: usize) -> anyhow::Result<usize> {
         anyhow::bail!("selection out of range");
     }
     Ok(n - 1)
-}
-
-fn add_proposal_to_config(config: &mut AppConfig, hash: &str) {
-    match config.voting.as_mut() {
-        Some(voting) => {
-            voting.proposals.push(hash.to_string());
-        }
-        None => {
-            config.voting =
-                Some(VotingConfig { proposals: vec![hash.to_string()], tick_interval: 40 });
-        }
-    }
 }

@@ -347,6 +347,30 @@ async fn nominator_forbidden_on_operator_route() {
 }
 
 #[tokio::test]
+async fn voting_config_no_token_401_when_auth_enabled() {
+    let st = state_with_auth().await;
+    let resp = app(st).oneshot(get("/v1/voting/config")).await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn voting_config_nominator_token_200() {
+    let st = state_with_auth().await;
+    let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
+    let resp = app(st).oneshot(get_bearer("/v1/voting/config", &tok)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn voting_proposals_post_nominator_forbidden() {
+    let st = state_with_auth().await;
+    let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
+    let body = serde_json::json!({ "hash": "aa".repeat(32) });
+    let resp = app(st).oneshot(post_bearer("/v1/voting/proposals", &body, &tok)).await.unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
 async fn operator_allowed_on_operator_route() {
     let st = state_with_auth().await;
     let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
