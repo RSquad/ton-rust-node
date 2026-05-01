@@ -429,7 +429,7 @@ impl Engine {
             if self.trace_bit(Engine::TRACE_CODE) {
                 log::info!(target: "tvm", "code cell hash: {:X} offset: {}\n", info.cmd_code.cell().unwrap().repr_hash(), info.cmd_code.pos());
                 let cmd_str = match info.cmd_str.as_str() {
-                    "POP s0" => "POP",
+                    "POP s0" => "DROP",
                     "POP s1" => "NIP",
                     "PUSH s0" => "DUP",
                     "PUSH s1" => "OVER",
@@ -825,7 +825,7 @@ impl Engine {
         loop {
             if !library_loaded {
                 let hash = cell.repr_hash();
-                let first = self.visited_cells.insert(hash);
+                let first = self.visited_cells.insert(hash.clone());
                 self.try_use_gas(Gas::load_cell_price(first))?;
             }
             let mut slice = SliceData::load_cell(cell)?;
@@ -1246,11 +1246,11 @@ impl Engine {
             fail!(ExceptionCode::InvalidOpcode)
         }
         code.shrink_data(shift - offset..);
-        code.shrink_references(refs..);
+        code.shrink_references(refs..)?;
         *self.cc.code_mut() = code;
 
         slice.shrink_data(..bits);
-        slice.shrink_references(..refs);
+        slice.shrink_references(..refs)?;
 
         Ok(slice)
     }

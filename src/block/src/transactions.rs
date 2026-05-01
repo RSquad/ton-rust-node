@@ -707,19 +707,19 @@ pub struct TransactionDescrOrdinary {
 }
 
 impl Serializable for TransactionDescrOrdinary {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
         // constructor tag is written in TransactionDescr::write_to
-        cell.append_bit_bool(self.credit_first)?;
-        self.storage_ph.write_to(cell)?;
-        self.credit_ph.write_to(cell)?;
-        self.compute_ph.write_to(cell)?;
-        cell.append_bit_bool(self.action.is_some())?;
-        cell.append_bit_bool(self.aborted)?;
-        self.bounce.write_to(cell)?;
-        cell.append_bit_bool(self.destroyed)?;
+        builder.append_bit_bool(self.credit_first)?;
+        self.storage_ph.write_to(builder)?;
+        self.credit_ph.write_to(builder)?;
+        self.compute_ph.write_to(builder)?;
+        builder.append_bit_bool(self.action.is_some())?;
+        builder.append_bit_bool(self.aborted)?;
+        self.bounce.write_to(builder)?;
+        builder.append_bit_bool(self.destroyed)?;
 
         if let Some(a) = &self.action {
-            a.serialize()?.write_to(cell)?;
+            builder.checked_append_reference(a.serialize()?)?;
         }
 
         Ok(())
@@ -781,16 +781,16 @@ impl TransactionDescrTickTock {
 }
 
 impl Serializable for TransactionDescrTickTock {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.tt.write_to(cell)?;
-        self.storage.write_to(cell)?;
-        self.compute_ph.write_to(cell)?;
-        cell.append_bit_bool(self.action.is_some())?;
-        cell.append_bit_bool(self.aborted)?;
-        cell.append_bit_bool(self.destroyed)?;
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        self.tt.write_to(builder)?;
+        self.storage.write_to(builder)?;
+        self.compute_ph.write_to(builder)?;
+        builder.append_bit_bool(self.action.is_some())?;
+        builder.append_bit_bool(self.aborted)?;
+        builder.append_bit_bool(self.destroyed)?;
 
         if let Some(a) = &self.action {
-            a.serialize()?.write_to(cell)?;
+            builder.checked_append_reference(a.serialize()?)?;
         }
 
         Ok(())
@@ -831,15 +831,15 @@ pub struct TransactionDescrSplitPrepare {
 }
 
 impl Serializable for TransactionDescrSplitPrepare {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.split_info.write_to(cell)?;
-        self.compute_ph.write_to(cell)?;
-        self.action.is_some().write_to(cell)?;
-        self.aborted.write_to(cell)?;
-        self.destroyed.write_to(cell)?;
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        self.split_info.write_to(builder)?;
+        self.compute_ph.write_to(builder)?;
+        self.action.is_some().write_to(builder)?;
+        self.aborted.write_to(builder)?;
+        self.destroyed.write_to(builder)?;
 
         if let Some(a) = &self.action {
-            a.serialize()?.write_to(cell)?;
+            builder.checked_append_reference(a.serialize()?)?;
         }
 
         Ok(())
@@ -948,17 +948,17 @@ pub struct TransactionDescrMergeInstall {
 }
 
 impl Serializable for TransactionDescrMergeInstall {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.split_info.write_to(cell)?;
-        cell.checked_append_reference(self.prepare_transaction.serialize()?)?;
-        self.credit_ph.write_to(cell)?;
-        self.compute_ph.write_to(cell)?;
-        self.action.is_some().write_to(cell)?;
-        self.aborted.write_to(cell)?;
-        self.destroyed.write_to(cell)?;
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        self.split_info.write_to(builder)?;
+        builder.checked_append_reference(self.prepare_transaction.serialize()?)?;
+        self.credit_ph.write_to(builder)?;
+        self.compute_ph.write_to(builder)?;
+        self.action.is_some().write_to(builder)?;
+        self.aborted.write_to(builder)?;
+        self.destroyed.write_to(builder)?;
 
         if let Some(a) = &self.action {
-            a.serialize()?.write_to(cell)?;
+            builder.checked_append_reference(a.serialize()?)?;
         }
 
         Ok(())
@@ -1500,7 +1500,7 @@ impl Transaction {
         if (created_lt > self.lt) && (created_lt <= self.lt + self.outmsg_cnt as u64) {
             let key = UInt15::from_lt(created_lt - self.lt - 1);
             if let Ok(Some(cell)) = self.out_msgs.get_ref(&key) {
-                return &cell.repr_hash() == hash;
+                return cell.repr_hash() == hash;
             }
         }
         false
@@ -1785,7 +1785,8 @@ impl AccountBlock {
                     ))
                 })?
                 .account_cell()
-                .repr_hash();
+                .repr_hash()
+                .clone();
             let new_hash = new_state
                 .read_accounts()?
                 .get_serialized(self.account_addr.clone())?
@@ -1796,7 +1797,8 @@ impl AccountBlock {
                     ))
                 })?
                 .account_cell()
-                .repr_hash();
+                .repr_hash()
+                .clone();
             self.write_state_update(&HashUpdate::with_hashes(old_hash, new_hash))?;
         }
         Ok(())

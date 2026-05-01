@@ -71,9 +71,9 @@ use std::{
     },
     time::Duration,
 };
-use storage::{block_handle_db::BlockHandle, StorageAlloc};
 #[cfg(feature = "telemetry")]
-use storage::{types::StoredCell, StorageTelemetry};
+use storage::StorageTelemetry;
+use storage::{block_handle_db::BlockHandle, StorageAlloc};
 use ton_api::ton::ton_node::broadcast::NewShardBlockBroadcast;
 use ton_block::{
     error, fail, BlockIdExt, Cell, ConfigParams, OutMsgQueue, Result, ShardIdent, UInt256,
@@ -475,6 +475,7 @@ impl Engine {
             is_broken: Option<&AtomicBool>,
             stopper: &Arc<Stopper>,
             monitor_min_split: Arc<AtomicU8>,
+            truncate_db: Option<u32>,
             #[cfg(feature = "telemetry")] telemetry: Arc<EngineTelemetry>,
             allocated: Arc<EngineAlloc>,
         ) -> Result<Arc<InternalDb>> {
@@ -489,6 +490,7 @@ impl Engine {
                 restore_db_enabled,
                 force_check_db,
                 true,
+                truncate_db,
                 &check_stop,
                 is_broken,
                 monitor_min_split,
@@ -515,6 +517,7 @@ impl Engine {
             validator_adnl_keys: Arc::new(AtomicU64::new(0)),
             validator_peers: Arc::new(AtomicU64::new(0)),
             validator_sets: Arc::new(AtomicU64::new(0)),
+            account_state_cache_bytes: Arc::new(AtomicU64::new(0)),
         });
 
         let archives_life_time_hours = general_config.gc_archives_life_time_hours();
@@ -525,6 +528,8 @@ impl Engine {
         };
         let enable_shard_state_persistent_gc = general_config.enable_shard_state_persistent_gc();
         let skip_saving_persistent_states = general_config.skip_saving_persistent_states();
+        let pss_cells_cache_max_count = general_config.pss_cells_cache_max_count();
+        let pss_prev_part_max_size = general_config.pss_prev_part_max_size();
         let states_cache_mode = general_config.states_cache_mode();
         let restore_db = general_config.restore_db();
 
@@ -583,6 +588,7 @@ impl Engine {
             },
             &stopper,
             monitor_min_split.clone(),
+            flags.truncate_db,
             #[cfg(feature = "telemetry")]
             engine_telemetry.clone(),
             engine_allocated.clone(),
@@ -648,6 +654,8 @@ impl Engine {
             db.clone(),
             enable_shard_state_persistent_gc,
             skip_saving_persistent_states,
+            pss_cells_cache_max_count,
+            pss_prev_part_max_size,
             states_cache_mode,
             cells_lifetime_sec,
             stopper.clone(),
@@ -1069,11 +1077,19 @@ impl Engine {
                 }
                 let mut is_link = false;
                 if handle.has_data() && handle.has_proof_or_link(&mut is_link) {
+                    log::debug!(
+                        "download_and_apply_block_worker: block {} has data+proof, entering \
+                        apply awaiter loop (pre_apply: {}, applied: {}, has_state: {})",
+                        id,
+                        pre_apply,
+                        handle.is_applied(),
+                        handle.has_state()
+                    );
                     while !((pre_apply && handle.has_state()) || handle.is_applied()) {
                         let s = self.clone();
                         let res = self
                             .block_applying_awaiters()
-                            .do_or_wait(handle.id(), None, async {
+                            .do_or_wait(handle.id(), Some(10_000), async {
                                 let block = s.load_block(&handle).await?;
                                 s.apply_block_worker(
                                     &handle,
@@ -1458,10 +1474,8 @@ impl Engine {
             file_entries: create_metric("Alloc NODE file entries"),
             handles: create_metric("Alloc NODE block handles"),
             packages: create_metric("Alloc NODE packages"),
-            stored_cells: create_metric("Alloc NODE stored cells"),
             storing_cells: create_metric("Alloc NODE storing cells"),
             shardstates_queue: create_metric("Alloc NODE shardstates queue"),
-            cached_cells_counters: create_metric("Alloc NODE cells counters"),
 
             loaded_cells_from_db: create_metric_per_sec("NODE loaded from db cells/sec"),
             load_cell_from_db_time_nanos: create_metric_with_total_average(
@@ -1515,6 +1529,11 @@ impl Engine {
             cell_cache_hits: create_metric_per_sec("NODE cell cache hits/sec"),
             cell_cache_misses: create_metric_per_sec("NODE cell cache misses/sec"),
             cell_cache_len: create_metric("NODE cell cache len"),
+            counter_cache_hits: create_metric_per_sec("NODE counter cache hits/sec"),
+            counter_cache_misses: create_metric_per_sec("NODE counter cache misses/sec"),
+            counter_cache_len: create_metric("NODE counter cache len"),
+            rocksdb_mem_table_mb: create_metric("Alloc NODE RocksDB mem tables, MB"),
+            rocksdb_block_cache_mb: create_metric("Alloc NODE RocksDB block cache, MB"),
         });
         let engine_telemetry = Arc::new(EngineTelemetry {
             storage: storage_telemetry,
@@ -1526,15 +1545,15 @@ impl Engine {
             validator_adnl_keys: create_metric("Alloc NODE validator ADNL keys"),
             validator_peers: create_metric("Alloc NODE validator peers"),
             validator_sets: create_metric("Alloc NODE validator sets"),
+            account_state_cache_mb: create_metric("Alloc NODE account state cache, MB"),
+            storage_dicts_cache_cells: create_metric("Alloc NODE storage dicts cache cells"),
         });
         let metrics = vec![
             TelemetryItem::Metric(engine_telemetry.storage.file_entries.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.handles.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.packages.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.stored_cells.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.storing_cells.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.cached_cells_counters.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells_from_db.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_db_time_nanos.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_cache_time_nanos.clone()),
@@ -1554,6 +1573,14 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_traverse_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_tr_build_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_commit_micros.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_mem_table_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_block_cache_mb.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_hits.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_misses.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.cell_cache_len.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.counter_cache_hits.clone()),
+            TelemetryItem::MetricBuilder(engine_telemetry.storage.counter_cache_misses.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.counter_cache_len.clone()),
             TelemetryItem::Metric(engine_telemetry.awaiters.clone()),
             TelemetryItem::Metric(engine_telemetry.catchain_clients.clone()),
             TelemetryItem::Metric(engine_telemetry.cells.clone()),
@@ -1562,6 +1589,8 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.validator_adnl_keys.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_peers.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_sets.clone()),
+            TelemetryItem::Metric(engine_telemetry.account_state_cache_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage_dicts_cache_cells.clone()),
         ];
         (metrics, engine_telemetry)
     }
@@ -2013,7 +2042,7 @@ impl Engine {
             return;
         }
         let mut cache = self.storage_dicts_cache.lock();
-        if cache.1.push(dict.repr_hash(), StorageDictInfo { dict, size }).is_none() {
+        if cache.1.push(dict.repr_hash().clone(), StorageDictInfo { dict, size }).is_none() {
             cache.0 += size;
         }
         while cache.0 > Self::STORAGE_DICTS_CACHE_SIZE {
@@ -2110,16 +2139,15 @@ async fn boot(
         load_zero_state(engine, zerostate_path).await?;
     }
 
-    let result = match engine.load_last_applied_mc_block_id() {
-        Ok(Some(id)) => crate::boot::warm_boot(engine.clone(), id, hardfork_path).await,
-        Ok(None) => Err(error!("No last applied MC block, warm boot is not possible")),
-        Err(x) => Err(x),
-    };
-
-    let (last_applied_mc_block, cold) = match result {
-        Ok(block_id) => (block_id.clone(), false),
-        Err(err) => {
-            log::warn!("Before cold boot: {err}");
+    let (last_applied_mc_block, cold) = match engine.load_last_applied_mc_block_id() {
+        Ok(Some(id)) => {
+            let id =
+                crate::boot::warm_boot(engine.clone(), id.clone(), hardfork_path).await.map_err(
+                    |e| error!("Warm boot failed: {e}. Need to clear the DB and re-sync node"),
+                )?;
+            (id, false)
+        }
+        _ => {
             engine.acquire_stop(Engine::MASK_SERVICE_BOOT);
             let result = boot::cold_boot(engine.clone(), pss_downloading_threads).await;
             engine.release_stop(Engine::MASK_SERVICE_BOOT);
@@ -2384,18 +2412,12 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .update(engine.engine_allocated.storage.packages.load(Ordering::Relaxed));
             engine
                 .engine_telemetry
-                .storage
-                .stored_cells
-                .update(engine.engine_allocated.storage.storage_cells.load(Ordering::Relaxed));
-            engine
-                .engine_telemetry
                 .awaiters
                 .update(engine.engine_allocated.awaiters.load(Ordering::Relaxed));
             engine
                 .engine_telemetry
                 .catchain_clients
                 .update(engine.engine_allocated.catchain_clients.load(Ordering::Relaxed));
-            engine.engine_telemetry.storage.stored_cells.update(StoredCell::cell_count());
             engine.engine_telemetry.cells.update(Cell::cell_count());
             engine
                 .engine_telemetry
@@ -2417,6 +2439,14 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .engine_telemetry
                 .validator_sets
                 .update(engine.engine_allocated.validator_sets.load(Ordering::Relaxed));
+            engine.engine_telemetry.account_state_cache_mb.update(
+                engine.engine_allocated.account_state_cache_bytes.load(Ordering::Relaxed)
+                    / (1024 * 1024),
+            );
+            engine
+                .engine_telemetry
+                .storage_dicts_cache_cells
+                .update(engine.storage_dicts_cache.lock().0);
 
             // check timeout
 
@@ -2430,30 +2460,18 @@ fn telemetry_logger(engine: Arc<Engine>) {
             // print telemetry
 
             {
-                let hits = engine
+                let usage = engine.db().rocksdb_memory_usage();
+                engine
                     .engine_telemetry
                     .storage
-                    .cell_cache_hits
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let misses = engine
+                    .rocksdb_mem_table_mb
+                    .update(usage.mem_tables / (1024 * 1024));
+                engine
                     .engine_telemetry
                     .storage
-                    .cell_cache_misses
-                    .metric()
-                    .total_amount()
-                    .unwrap_or(0);
-                let total = hits + misses;
-                let hit_rate = if total > 0 { hits * 100 / total } else { 0 };
-                log::info!(
-                    target: "telemetry",
-                    "Cell cache hit_rate: {}%",
-                    hit_rate
-                );
+                    .rocksdb_block_cache_mb
+                    .update(usage.block_cache / (1024 * 1024));
             }
-
-            engine.telemetry_printer.try_print();
 
             let period = crate::full_node::telemetry::TPS_PERIOD_1;
             let tps_1 = engine.tps_counter.calc_tps(period).unwrap_or_else(|e| {
@@ -2500,6 +2518,15 @@ fn telemetry_logger(engine: Arc<Engine>) {
             if let Err(e) = engine.log_workers_stats() {
                 log::warn!("Can't log workers stats: {}", e);
             }
+            {
+                let st = &engine.engine_telemetry.storage;
+                log::info!(
+                    target: "telemetry",
+                    "Cell cache hit_rate: {}%, Counter cache hit_rate: {}%",
+                    st.cell_cache_hit_rate(), st.counter_cache_hit_rate()
+                );
+            }
+            engine.telemetry_printer.try_print();
         }
     });
 }
@@ -2734,6 +2761,150 @@ pub fn init_prometheus_recorder(
         "Number of accounts parsed per block"
     );
     metrics::describe_histogram!("ton_node_block_size_bytes", "Block size in bytes");
+
+    // -- simplex (republished from per-session MetricsHandle by
+    //    `simplex::prometheus_publisher`; see MONITORING-PROM-1).
+    //
+    // All series carry the `shard` label by default; sessions configured with
+    // `PrometheusLabels::ShardAndSessionId` also carry `session_id` (first
+    // 8 hex chars of the simplex session id, matching the `sid8` prefix used
+    // in log dumps and consensus_session_dump.py reports).
+    //
+    // Counters (monotonically non-decreasing).
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_total",
+        "Total simplex votes received (notarize+finalize+skip)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_notarize",
+        "Simplex notarize votes received"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_in_finalize",
+        "Simplex finalize votes received"
+    );
+    metrics::describe_counter!("ton_node_simplex_votes_in_skip", "Simplex skip votes received");
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_total",
+        "Total simplex votes sent (notarize+finalize+skip)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_notarize",
+        "Simplex notarize votes sent"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_votes_out_finalize",
+        "Simplex finalize votes sent"
+    );
+    metrics::describe_counter!("ton_node_simplex_votes_out_skip", "Simplex skip votes sent");
+    metrics::describe_counter!(
+        "ton_node_simplex_certs_in",
+        "Simplex certificates received from the network (skip+notarize+finalize aggregate)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_certs_relayed",
+        "Simplex certificates relayed to peers (skip+notarize+finalize aggregate)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collation_starts",
+        "Number of simplex collation invocations started"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collates_total",
+        "Total simplex collations (success+failure)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_collates_success",
+        "Successful simplex collations"
+    );
+    metrics::describe_counter!("ton_node_simplex_collates_failure", "Failed simplex collations");
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_total",
+        "Total self-collation attempts (success+failure+ignore)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_success",
+        "Self-collation attempts accepted via finalized callback emission"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_self_collates_failure",
+        "Self-collation attempts that failed before finalized callback emission"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_validates_total",
+        "Total simplex validations (success+failure)"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_validates_success",
+        "Successful simplex validations"
+    );
+    metrics::describe_counter!("ton_node_simplex_validates_failure", "Failed simplex validations");
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_received_broadcast",
+        "Simplex block candidates received via broadcast"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_received_query",
+        "Simplex block candidates received via requestCandidate query"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_candidate_requests",
+        "Simplex outgoing requestCandidate queries"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_health_warnings",
+        "Total SIMPLEX_HEALTH anomaly warnings emitted"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_standstill_triggers",
+        "Number of standstill triggers fired"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_errors",
+        "Total simplex errors recorded by SessionProcessor"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_misbehavior",
+        "Total simplex misbehavior events detected"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_receiver_in_bytes",
+        "Total bytes received by the simplex receiver overlay"
+    );
+    metrics::describe_counter!(
+        "ton_node_simplex_receiver_out_bytes",
+        "Total bytes sent by the simplex receiver overlay"
+    );
+
+    // Gauges (latest active value).
+    metrics::describe_gauge!(
+        "ton_node_simplex_active_weight",
+        "Current active validator weight in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_total_weight",
+        "Total validator weight in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_last_finalized_slot",
+        "Last finalized slot index in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_first_non_finalized_slot",
+        "First non-finalized slot index in the session"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_first_non_progressed_slot",
+        "First non-progressed slot index (C++ pool.cpp `now_` parity)"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_main_loop_load",
+        "Fraction of simplex main loop iterations that detected overload"
+    );
+    metrics::describe_gauge!(
+        "ton_node_simplex_active_nodes_percent",
+        "Percentage of validator weight currently active in the session"
+    );
 
     handle
 }

@@ -340,7 +340,7 @@ fn test_merkle_update4() {
 
 #[test]
 fn test_merkle_update5() {
-    std::env::set_var("RUST_BACKTRACE", "full");
+    // std::env::set_var("RUST_BACKTRACE", "full");
 
     fn create_cell(bytes: &[u8], refs: &[&Cell]) -> Cell {
         let mut c = BuilderData::new();
@@ -378,19 +378,24 @@ fn test_merkle_update5() {
 
     // merkle proof of c6 subtree in old tree
     let cells = [
-        old_tree.repr_hash(),
-        c6.repr_hash(),
-        c3.repr_hash(),
-        c4.repr_hash(),
-        c1.repr_hash(),
-        c2.repr_hash(),
+        old_tree.repr_hash().clone(),
+        c6.repr_hash().clone(),
+        c3.repr_hash().clone(),
+        c4.repr_hash().clone(),
+        c1.repr_hash().clone(),
+        c2.repr_hash().clone(),
     ];
     let old_proof =
         MerkleProof::create(&old_tree, |h| cells.contains(h)).unwrap().serialize().unwrap();
 
     // merkle proof of c6' subtree in new tree
-    let cells =
-        [new_tree.repr_hash(), c6_.repr_hash(), c3_.repr_hash(), c4_.repr_hash(), c1.repr_hash()];
+    let cells = [
+        new_tree.repr_hash().clone(),
+        c6_.repr_hash().clone(),
+        c3_.repr_hash().clone(),
+        c4_.repr_hash().clone(),
+        c1.repr_hash().clone(),
+    ];
     let new_proof =
         MerkleProof::create(&new_tree, |h| cells.contains(h)).unwrap().serialize().unwrap();
 
@@ -407,8 +412,8 @@ fn test_merkle_update5() {
         } else {
             // "fast"
             let cells = [
-                old_tree.repr_hash(),
-                c6.repr_hash(), /*c3.repr_hash(), c4.repr_hash(), c1.repr_hash()*/
+                old_tree.repr_hash().clone(),
+                c6.repr_hash().clone(), /*c3.repr_hash(), c4.repr_hash(), c1.repr_hash()*/
             ];
 
             let update =
@@ -425,10 +430,11 @@ fn test_merkle_update5() {
         let b5 = create_cell(&[3], &[&b4]);
 
         // merkle proof of merkle update in the big tree
-        let mut cells = vec![b1.repr_hash(), b4.repr_hash(), b5.repr_hash()];
+        let mut cells =
+            vec![b1.repr_hash().clone(), b4.repr_hash().clone(), b5.repr_hash().clone()];
         fn visit(c: &Cell, cells: &mut Vec<UInt256>) {
-            cells.push(c.repr_hash());
-            for child in c.clone_references() {
+            cells.push(c.repr_hash().clone());
+            for child in c.clone_references().unwrap() {
                 visit(&child, cells);
             }
         }

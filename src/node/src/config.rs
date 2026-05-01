@@ -19,14 +19,19 @@ use adnl::{
     server::{AdnlServerConfig, AdnlServerConfigJson},
 };
 use secrets_vault::{
-    crypto::factory::{AutoCryptoFactory, CryptoFactory},
+    crypto::factory::CryptoFactory,
     errors::error::VaultError,
     make_secret_id,
+    storage::storage_trait::ListMode,
     types::{
-        algorithm::Algorithm as SecretAlgorithm, metadata::Metadata as SecretMetadata,
-        secret::Secret, secret_id::SecretId, store_mode::StoreMode as SecretStoreMode,
+        algorithm::Algorithm as SecretAlgorithm,
+        metadata::Metadata as SecretMetadata,
+        secret::{Secret, SecretInMemoryFactory},
+        secret_id::SecretId,
+        store_mode::StoreMode as SecretStoreMode,
     },
     vault::SecretVault,
+    vault_block::BlockCryptoFactory,
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -79,6 +84,30 @@ macro_rules! key_option_public_key {
         )
         .as_str()
     };
+}
+
+async fn try_n_times<F, Fut, T, E>(
+    attempts: usize,
+    retry_delay: Duration,
+    mut f: F,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    let mut last_err;
+    let mut i = 0;
+    loop {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => last_err = e,
+        }
+        i += 1;
+        if i >= attempts {
+            return Err(last_err);
+        }
+        tokio::time::sleep(retry_delay).await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -207,7 +236,8 @@ impl SecretsVaultConfig {
     const TYPE_VALIDATOR_KEY: &str = "validator_key";
 
     async fn open_vault() -> Result<Option<Arc<SecretVault>>> {
-        let vault = SecretVaultBuilder::from_url_or_env(None).await?;
+        let vault =
+            SecretVaultBuilder::from_url_or_env(None, BlockCryptoFactory {}.new_crypto()?).await?;
         Ok(vault)
     }
 
@@ -226,7 +256,7 @@ impl SecretsVaultConfig {
         let Some(vault) = Self::open_vault().await? else {
             return Ok(());
         };
-        log::info!("Drop key from the vault");
+        log::info!("Drop key from the vault: {key_id}");
         let err1 = delete(&vault, Self::SID_PRIVATE_KEYS, key_id).await;
         let err2 = delete(&vault, Self::SID_VALIDATOR_KEYS, key_id).await;
         match (err1, err2) {
@@ -243,22 +273,26 @@ impl SecretsVaultConfig {
 
         // Create/Load secrets vault
         log::info!("Load keys from the vault");
-        let metadata_list = vault.list_metadata().await?;
+        let metadata_list = vault.list_metadata(ListMode::OnlyNeeded).await?;
 
         // Read private keys
         for metadata in &metadata_list {
             let secret_id = metadata.secret_id.as_ref().ok_or_else(|| error!("Empty secret id"))?;
-            let secret: Secret = vault.get(secret_id).await?;
+            let secret: Secret = vault.load(secret_id).await?;
             let Secret::Blob { blob } = secret else {
                 continue;
             };
             if metadata.get_tag_str(Self::KEY_TYPE)? != Self::TYPE_PRIVATE_KEY {
                 continue;
             }
-            let private_key = blob.data().await?;
-            let private_key_lock = private_key.lock().await?;
-            let private_key_data: &[u8] = &private_key_lock.get(..32).unwrap();
-            let key = UInt256::with_array(private_key_data.try_into()?);
+            let key = {
+                let private_key = blob.data();
+                let private_key_lock = private_key.lock()?;
+                let private_key_data: &[u8] = &private_key_lock
+                    .get(..32)
+                    .ok_or_else(|| error!("Wrong private key length"))?;
+                UInt256::with_array(private_key_data.try_into()?)
+            };
             let private_key_in = PrivateKey::Pk_Ed25519(Ed25519Private { key });
             config.import_private_key(private_key_in)?;
             log::info!("Read key {} from the vault", secret_id);
@@ -267,7 +301,7 @@ impl SecretsVaultConfig {
         // Read elections metadata
         for metadata in &metadata_list {
             let secret_id = metadata.secret_id.as_ref().ok_or_else(|| error!("Empty secret id"))?;
-            let secret: Secret = vault.get(secret_id).await?;
+            let secret: Secret = vault.load(secret_id).await?;
             let Secret::Blob { blob: _ } = secret else {
                 continue;
             };
@@ -294,64 +328,42 @@ impl SecretsVaultConfig {
         Ok(())
     }
 
-    async fn on_save(config: &TonNodeConfig) -> Result<()> {
+    pub async fn save_private_key(key_id_b64: &str, key_json: &KeyOptionJson) -> Result<()> {
         let Some(vault) = Self::open_vault().await? else {
             return Ok(());
         };
+        let crypto = BlockCryptoFactory {}.new_crypto()?;
 
-        // Create/Save secrets vault
-        log::info!("Save keys to the vault");
+        log::info!("Write key {key_id_b64} to the vault");
+        let key_pvt = key_json.get_pvt_key()?;
+        let secret_id = make_secret_id!(Self::SID_PRIVATE_KEYS, key_id_b64);
+        let metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
+            .with_tag(Self::KEY_TYPE, Self::TYPE_PRIVATE_KEY);
+        let secret = SecretInMemoryFactory::new_ed25519_pvtkey(&key_pvt, metadata, crypto)?;
 
-        // Write private keys
-        let mut secrets = Vec::new();
-        if let Some(key_ring) = config.validator_key_ring.as_ref() {
-            let crypto_factory = AutoCryptoFactory {};
-            for (key_id, key_opt_json) in key_ring {
-                log::info!("Write key {key_id} to the vault");
-                let key_pvt = key_opt_json.get_pvt_key()?;
-                let secret_id = make_secret_id!(Self::SID_PRIVATE_KEYS, key_id);
-                let metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
-                    .with_tag(Self::KEY_TYPE, Self::TYPE_PRIVATE_KEY);
-                let secret =
-                    Secret::from_raw_data(&key_pvt, metadata, crypto_factory.new_crypto()?).await?;
-                secrets.push((secret, SecretStoreMode::CreateOrReplace));
-            }
+        vault.store(&secret, SecretStoreMode::CreateOrReplace).await
+    }
+
+    pub async fn save_validator_key(key: &ValidatorKeysJson) -> Result<()> {
+        let Some(vault) = Self::open_vault().await? else {
+            return Ok(());
+        };
+        let crypto = BlockCryptoFactory {}.new_crypto()?;
+
+        log::info!("Write metadata for key {} to the vault", &key.validator_key_id);
+        let secret_id: SecretId = make_secret_id!(Self::SID_VALIDATOR_KEYS, &key.validator_key_id);
+        let mut metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
+            .with_tag(Self::KEY_TYPE, Self::TYPE_VALIDATOR_KEY)
+            .with_tag(Self::KEY_ELECTION_ID, key.election_id.to_string())
+            .with_tag(Self::KEY_EXPIRE_AT, key.expire_at.to_string())
+            .with_tag(Self::KEY_VALIDATOR_KEY_ID, &key.validator_key_id);
+        if let Some(adnl_key_id) = &key.validator_adnl_key_id {
+            log::info!("Write metadata for ADNL key {adnl_key_id} to the vault");
+            metadata = metadata.with_tag(Self::KEY_ADNL_KEY_ID, adnl_key_id);
         }
+        let secret = SecretInMemoryFactory::new_raw(b"".as_slice(), metadata, crypto)?;
 
-        // Write elections metadata
-        if let Some(validator_keys) = config.validator_keys.as_ref() {
-            let crypto_factory = AutoCryptoFactory {};
-            for validator_key_json in validator_keys {
-                log::info!(
-                    "Write metadata for key {} to the vault",
-                    &validator_key_json.validator_key_id
-                );
-
-                let secret_id: SecretId =
-                    make_secret_id!(Self::SID_VALIDATOR_KEYS, &validator_key_json.validator_key_id);
-                let mut metadata =
-                    SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
-                        .with_tag(Self::KEY_TYPE, Self::TYPE_VALIDATOR_KEY)
-                        .with_tag(Self::KEY_ELECTION_ID, validator_key_json.election_id.to_string())
-                        .with_tag(Self::KEY_EXPIRE_AT, validator_key_json.expire_at.to_string())
-                        .with_tag(Self::KEY_VALIDATOR_KEY_ID, &validator_key_json.validator_key_id);
-                if let Some(adnl_key_id) = &validator_key_json.validator_adnl_key_id {
-                    log::info!("Write metadata for ADNL key {} to the vault", &adnl_key_id);
-                    metadata = metadata.with_tag(Self::KEY_ADNL_KEY_ID, adnl_key_id);
-                }
-
-                let secret =
-                    Secret::from_raw_data(b"".as_slice(), metadata, crypto_factory.new_crypto()?)
-                        .await?;
-                secrets.push((secret, SecretStoreMode::CreateOrReplace));
-            }
-        }
-
-        if !secrets.is_empty() {
-            vault.put_vec(secrets).await?;
-        }
-
-        Ok(())
+        vault.store(&secret, SecretStoreMode::CreateOrReplace).await
     }
 }
 
@@ -417,6 +429,10 @@ pub struct TonNodeConfig {
     custom_overlays: CustomOverlaysConfigBoxed,
     #[serde(default)]
     pss_downloading_threads: usize,
+    #[serde(default = "TonNodeConfig::default_pss_cells_cache_max_count")]
+    pss_cells_cache_max_count: usize,
+    #[serde(default = "TonNodeConfig::default_pss_prev_part_max_size")]
+    pss_prev_part_max_size: usize,
 }
 
 pub struct TonNodeGlobalConfig(TonNodeGlobalConfigJson);
@@ -461,12 +477,20 @@ pub struct CollatorTestBundlesConfig {
     known_errors: Vec<String>,
     build_for_errors: bool,
     errors: Vec<String>,
+    #[serde(default)]
+    build_all: bool,
     path: String,
 }
 
 impl CollatorTestBundlesConfig {
     pub fn is_enable(&self) -> bool {
-        self.build_for_unknown_errors || (self.build_for_errors && !self.errors.is_empty())
+        self.build_all
+            || self.build_for_unknown_errors
+            || (self.build_for_errors && !self.errors.is_empty())
+    }
+
+    pub fn build_all(&self) -> bool {
+        self.build_all
     }
 
     pub fn need_to_build_for(&self, error: &str) -> bool {
@@ -739,6 +763,22 @@ impl TonNodeConfig {
         self.pss_downloading_threads
     }
 
+    const fn default_pss_cells_cache_max_count() -> usize {
+        100_000_000
+    }
+
+    const fn default_pss_prev_part_max_size() -> usize {
+        10 * 1024 * 1024 * 1024
+    }
+
+    pub fn pss_cells_cache_max_count(&self) -> usize {
+        self.pss_cells_cache_max_count
+    }
+
+    pub fn pss_prev_part_max_size(&self) -> usize {
+        self.pss_prev_part_max_size
+    }
+
     pub fn load_global_config(&self) -> Result<TonNodeGlobalConfig> {
         let name = self
             .ton_global_config_name
@@ -889,10 +929,6 @@ impl TonNodeConfig {
     async fn save_to_file(&self, file_name: &str) -> Result<()> {
         let config_file_path = self.build_config_path(file_name);
         std::fs::write(config_file_path, serde_json::to_string_pretty(&self)?)?;
-
-        // Temporary workaround: save secrets from config into the vault
-        SecretsVaultConfig::on_save(&self).await?;
-
         Ok(())
     }
 
@@ -1462,6 +1498,14 @@ impl NodeConfigHandler {
         config.save_to_file(config_name).await?;
 
         let id = base64_encode(key_id);
+        let key_json = config.validator_key_ring.as_ref().and_then(|r| r.get(&id)).cloned();
+        if let Some(key_json) = key_json {
+            try_n_times(3, Duration::from_millis(150), || {
+                SecretsVaultConfig::save_private_key(&id, &key_json)
+            })
+            .await?;
+        }
+
         log::info!("finish generate key (type: {key_type}), key_id: {id}");
         key_ring.insert(id, public_key.clone());
         Ok(key_id)
@@ -1478,6 +1522,14 @@ impl NodeConfigHandler {
         config.save_to_file(config_name).await?;
 
         let id = base64_encode(key_id);
+        let key_json = config.validator_key_ring.as_ref().and_then(|r| r.get(&id)).cloned();
+        if let Some(key_json) = key_json {
+            try_n_times(3, Duration::from_millis(150), || {
+                SecretsVaultConfig::save_private_key(&id, &key_json)
+            })
+            .await?;
+        }
+
         key_ring.insert(id, public_key.clone());
         log::info!("finish import private key, key_id: {}", base64_encode(key_id));
         Ok(key_id)
@@ -1510,6 +1562,9 @@ impl NodeConfigHandler {
         let Some(adnl_key_id) = &oldest_key.validator_adnl_key_id else {
             return Ok(());
         };
+        // Stable-adnl-key rotations: share one ADNL key across several
+        // ValidatorKeysJson entries. Keyring and ADNL/QUIC teardown must wait
+        // until the LAST entry referencing this ADNL key is pruned.
         let still_used = config
             .validator_keys
             .as_ref()
@@ -1524,7 +1579,9 @@ impl NodeConfigHandler {
             );
         } else {
             config.remove_key_from_key_ring(adnl_key_id).await?;
-            // Notify subscribers to clean up ADNL/QUIC/DHT state
+            // Notify subscribers to clean up ADNL/QUIC/DHT state for the
+            // removed election entry, only when the ADNL key is actually torn
+            // down (avoids spurious removals while the key is still in use).
             let adnl_key_bytes = base64_decode(adnl_key_id)?;
             let adnl_key_id = KeyId::from_data(
                 adnl_key_bytes[..]
@@ -1555,10 +1612,9 @@ impl NodeConfigHandler {
     ) -> Result<()> {
         let key = config.add_validator_adnl_key(validator_key_hash, validator_adnl_key_hash)?;
         let election_id = key.election_id;
-        //if key.validator_adnl_key_id.is_some() {
-        validator_keys.add(key)?;
-        //}
-
+        validator_keys.add(key.clone())?;
+        try_n_times(3, Duration::from_millis(150), || SecretsVaultConfig::save_validator_key(&key))
+            .await?;
         let adnl_key_id = KeyId::from_data(*validator_adnl_key_hash);
 
         for subscriber in subscribers.iter() {
@@ -1588,8 +1644,10 @@ impl NodeConfigHandler {
         expire_at: i32,
     ) -> Result<()> {
         let key = config.add_validator_key(key_id, election_id, expire_at)?;
-        validator_keys.add(key)?;
+        validator_keys.add(key.clone())?;
         config.save_to_file(&config.file_name).await?;
+        try_n_times(3, Duration::from_millis(150), || SecretsVaultConfig::save_validator_key(&key))
+            .await?;
         Ok(())
     }
 

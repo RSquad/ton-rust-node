@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -31,6 +32,17 @@ cpp_src_path: Path
 rust_src_path: Path
 cpp_log_level: int
 cpp_build_command: str
+
+# Validator permanent key lifetime used by `addpermkey` in this harness.
+# `addpermkey {key} {start} {expire}` takes Unix timestamps. A hard-coded
+# constant in the past silently produces an already-expired key — fine
+# today only because enforcement is lenient, fragile if it tightens. Derive
+# the expiry from wall-clock time so the harness stays valid over time.
+VALIDATOR_KEY_LIFETIME_SECONDS = 365 * 24 * 3600
+
+
+def validator_key_expire_at() -> int:
+    return int(time.time()) + VALIDATOR_KEY_LIFETIME_SECONDS
 
 
 def load_config() -> bool:
@@ -170,6 +182,11 @@ def run_command(
     check: bool = True,
     capture_output: bool = True,
 ):
+    if cwd:
+       print(f"$ (in {cwd}) {shlex.join(cmd)}")
+    else:
+       print(f"$ {shlex.join(cmd)}")
+
     try:
         result = subprocess.run(
             cmd,
@@ -304,8 +321,16 @@ def run_rust_node(
     stderr_path = logs_path / f"stderr_{node_index}.log"
     working_dir = build_node_work_path(node_index)
     node_bin_path = bins_path / (node_proc_name + "_" + rust_proc_suffix)
+    cmd = [str(node_bin_path)] + params
+    print(shlex.join(cmd))
     if start_new_session:
         print(f"Starting node {node_index}...")
+
+    node_env = os.environ.copy()
+    per_node_url = node_env.get(f"VAULT_URL_NODE_{node_index}")
+    if per_node_url:
+        node_env["VAULT_URL"] = per_node_url
+
     with stdout_path.open("w") as out_log, stderr_path.open("w") as err_log:
         proc = subprocess.Popen(
             [str(node_bin_path)] + params,
@@ -313,6 +338,7 @@ def run_rust_node(
             stdout=out_log,
             stderr=err_log,
             start_new_session=start_new_session,
+            env=node_env,
         )
     return proc
 
@@ -394,7 +420,7 @@ def generate_validator_key(node_index: int, console_config_path: str | Path) -> 
 
 def import_validator_key(node_index: int, console_config_path: str | Path, key: str):
     print(f"Adding validator key for node {node_index}...", end="")
-    params = ["-c", f"addpermkey {key} {str(int(time.time()))} 1610000000"]
+    params = ["-c", f"addpermkey {key} {int(time.time())} {validator_key_expire_at()}"]
     run_console(params, node_index, console_config_path)
     print(" done")
 

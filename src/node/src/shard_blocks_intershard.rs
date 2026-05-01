@@ -228,18 +228,22 @@ impl ShardBlocksPool {
         log::trace!("get_shard_blocks last_mc_seq_no {}", last_mc_seq_no);
 
         let mut check_mc_seqno_updated = || {
-            let mc_seqno = self.last_mc_seq_no.load(Ordering::Acquire);
+            let actual_mc_seqno = self.last_mc_seq_no.load(Ordering::Acquire);
             if let Some(actual_last_mc_seqno) = actual_last_mc_seqno.as_mut() {
-                **actual_last_mc_seqno = mc_seqno;
+                **actual_last_mc_seqno = actual_mc_seqno;
             }
 
-            if last_mc_seq_no != mc_seqno {
+            if last_mc_seq_no < actual_mc_seqno {
                 log::debug!(
-                    "get_shard_blocks: Given last_mc_seq_no {} is not actual {}",
+                    "get_shard_blocks: Taken last_mc_seq_no {} is smaller than the actual {}",
                     last_mc_seq_no,
-                    mc_seqno
+                    actual_mc_seqno
                 );
-                fail!("Given last_mc_seq_no {} is not actual {}", last_mc_seq_no, mc_seqno);
+                fail!(
+                    "Taken last_mc_seq_no {} is smaller than the actual {}",
+                    last_mc_seq_no,
+                    actual_mc_seqno
+                );
             }
 
             Result::Ok(())

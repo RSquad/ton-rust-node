@@ -11,16 +11,12 @@
 use crate::{
     block::{BlockIdExtExtention, BlockStuff},
     internal_db::{
-        BlockHandle, InternalDb, ARCHIVES_GC_BLOCK, DESTROYED_VALIDATOR_SESSIONS,
-        LAST_APPLIED_MC_BLOCK, LAST_ROTATION_MC_BLOCK, PSS_KEEPER_MC_BLOCK, SHARD_CLIENT_MC_BLOCK,
+        InternalDb, ARCHIVES_GC_BLOCK, LAST_APPLIED_MC_BLOCK, LAST_ROTATION_MC_BLOCK,
+        PSS_KEEPER_MC_BLOCK, SHARD_CLIENT_MC_BLOCK,
     },
-    shard_state::ShardStateStuff,
 };
 use std::{
-    borrow::Cow,
-    collections::HashMap,
     fs::{remove_file, write},
-    ops::Deref,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -28,13 +24,8 @@ use std::{
     },
     time::Duration,
 };
-use storage::{
-    cell_db::BROKEN_CELL_BEACON_FILE, shardstate_db_async::SsNotificationCallback,
-    traits::Serializable,
-};
-use ton_block::{
-    error, fail, AccountIdPrefixFull, BlockIdExt, Cell, Error, Result, MASTERCHAIN_ID,
-};
+use storage::{cell_db::BROKEN_CELL_BEACON_FILE, traits::Serializable};
+use ton_block::{error, fail, BlockIdExt, Error, Result, MASTERCHAIN_ID};
 
 const UNEXPECTED_TERMINATION_BEACON_FILE: &str = "ton_node.running";
 const RESTORING_BEACON_FILE: &str = "ton_node.restoring";
@@ -68,23 +59,15 @@ pub async fn check_db(
 
     let unexpected_termination = check_unexpected_termination(&db.config.db_directory);
     let restoring = check_restoring(&db.config.db_directory);
-    let broken_cell = check_broken_cell(&db.config.db_directory);
 
-    if unexpected_termination || restoring || force || broken_cell {
+    if unexpected_termination || restoring || force {
         if force {
             log::info!("Starting check & restore db process forcedly (with cells db refilling)");
         } else if restore_db_enabled {
-            if broken_cell {
-                log::warn!(
-                    "Previous node run was terminated because of broken cell, \
-                starting check & restore process with cells db refilling..."
-                );
-            } else {
-                log::warn!(
-                    "Previous node run was unexpectedly terminated, \
-                starting fast check & restore process (without cells check)..."
-                );
-            }
+            log::warn!(
+                "Previous node run was unexpectedly terminated, \
+                starting check & restore process..."
+            );
         } else {
             if unexpected_termination {
                 log::warn!(
@@ -112,16 +95,7 @@ pub async fn check_db(
                     check_stop,
                 )
                 .await?;
-                db = match restore(
-                    db,
-                    &last_applied_mc_block,
-                    &shard_client_mc_block,
-                    processed_wc,
-                    check_stop,
-                    broken_cell || force,
-                )
-                .await
-                {
+                db = match restore(db, &last_applied_mc_block, &shard_client_mc_block).await {
                     Ok(db) => db,
                     Err(err) => force_db_reset(err, check_stop, is_broken).await,
                 };
@@ -174,10 +148,6 @@ fn reset_restoring(db_dir: &str) -> Result<()> {
 
 fn check_restoring(db_dir: &str) -> bool {
     Path::new(db_dir).join(RESTORING_BEACON_FILE).as_path().exists()
-}
-
-fn check_broken_cell(db_dir: &str) -> bool {
-    Path::new(db_dir).join(BROKEN_CELL_BEACON_FILE).as_path().exists()
 }
 
 fn set_restoring(db_dir: &str) -> Result<()> {
@@ -296,12 +266,9 @@ async fn restore_shard_client_mc_block(
 }
 
 async fn restore(
-    mut db: InternalDb,
+    db: InternalDb,
     last_applied_mc_block: &BlockStuff,
     shard_client_mc_block: &BlockStuff,
-    processed_wc: i32,
-    check_stop: &(dyn Fn() -> Result<()> + Sync),
-    refill_cells_db: bool,
 ) -> Result<InternalDb> {
     let last_mc_block = if last_applied_mc_block.id().seq_no() > shard_client_mc_block.id().seq_no()
     {
@@ -345,80 +312,6 @@ async fn restore(
             db.save_full_node_state(ARCHIVES_GC_BLOCK, last_mc_block.id())?;
         }
     }
-
-    if !refill_cells_db {
-        log::info!("Fast restore successfully finished");
-        return Ok(db);
-    }
-    if db.config.archival_mode.is_some() {
-        fail!("Refilling cells db is not supported in archival mode");
-    }
-
-    // If there was broken cell or special flag set - check blocks and restore cells db
-    log::info!("Checking blocks...");
-    let min_mc_state_id = calc_min_mc_state_id(&db, last_mc_block.id()).await?;
-    let mut mc_block = Cow::Borrowed(last_mc_block);
-    let mut persistent_state_handle = None;
-    loop {
-        check_stop()?;
-
-        check_shard_client_mc_block(
-            &db,
-            &mc_block,
-            processed_wc,
-            persistent_state_handle.is_none(),
-            check_stop,
-        )
-        .await?;
-
-        if persistent_state_handle.is_some() {
-            break;
-        }
-
-        // check prev master block
-        let prev_id = mc_block.construct_prev_id()?.0;
-
-        // if prev is zerostate - exit cycle
-        if prev_id.seq_no() == 0 {
-            persistent_state_handle = Some(
-                db.load_block_handle(&prev_id)?
-                    .ok_or_else(|| error!("there is no handle for zerostate {}", prev_id))?,
-            );
-            break;
-        }
-
-        // if this mc block has persistent state - end cycle
-        let prev_handle = db
-            .load_block_handle(&prev_id)?
-            .ok_or_else(|| error!("there is no handle for block {}", prev_id))?;
-        if prev_handle.has_persistent_state() && prev_handle.id().seq_no <= min_mc_state_id.seq_no()
-        {
-            persistent_state_handle = Some(prev_handle);
-        }
-
-        mc_block = Cow::Owned(
-            check_one_block(&db, &prev_id, true, persistent_state_handle.is_none()).await?,
-        );
-        log::debug!("restore: mc block looks good {}", prev_id);
-    }
-
-    log::warn!(
-        "Shard states db will be clear and restored from persistent \
-        states and blocks. It will take some time..."
-    );
-    db.reset_unapplied_handles()?;
-    db.clean_shard_state_dynamic_db()?;
-    log::debug!("Shard states db was cleaned");
-    restore_states(
-        &db,
-        persistent_state_handle
-            .ok_or_else(|| error!("INTERNAL ERROR: persistent_state_handle is None"))?
-            .deref(),
-        &min_mc_state_id,
-        processed_wc,
-        check_stop,
-    )
-    .await?;
 
     log::info!("Restore successfully finished");
 
@@ -653,294 +546,4 @@ async fn check_one_block(
     }
 
     Ok(block)
-}
-
-async fn calc_min_mc_state_id(
-    db: &InternalDb,
-    shard_client_mc_block_id: &BlockIdExt,
-) -> Result<BlockIdExt> {
-    log::trace!("calc_min_mc_state_id");
-
-    let pss_keeper = db
-        .load_full_node_state(PSS_KEEPER_MC_BLOCK)?
-        .ok_or_else(|| error!("INTERNAL ERROR: No PSS keeper MC block id when apply block"))?;
-    let mut min_id: &BlockIdExt = if shard_client_mc_block_id.seq_no() < pss_keeper.seq_no() {
-        shard_client_mc_block_id
-    } else {
-        &pss_keeper
-    };
-    let last_rotation_block_id = db.load_validator_state(LAST_ROTATION_MC_BLOCK)?;
-    if let Some(id) = &last_rotation_block_id {
-        if id.seq_no() < min_id.seq_no() {
-            if min_id.seq_no() - id.seq_no() < 10000 {
-                min_id = id;
-            } else {
-                db.drop_validator_state(LAST_ROTATION_MC_BLOCK)?;
-                db.drop_validator_state_raw(DESTROYED_VALIDATOR_SESSIONS)?;
-            }
-        }
-    }
-    let archives_gc = db
-        .load_full_node_state(ARCHIVES_GC_BLOCK)?
-        .ok_or_else(|| error!("INTERNAL ERROR: No archives GC block id"))?;
-    if archives_gc.seq_no() < min_id.seq_no() {
-        min_id = &archives_gc;
-    }
-
-    let handle = db
-        .load_block_handle(min_id)?
-        .ok_or_else(|| error!("there is no handle for block {}", min_id))?;
-    let block = db.load_block_data(&handle).await?;
-    let min_ref_mc_seqno = block.block()?.read_info()?.min_ref_mc_seqno();
-    let (min_ref_mc_id, _) = db
-        .lookup_block_by_seqno(&AccountIdPrefixFull::any_masterchain(), min_ref_mc_seqno)
-        .await?
-        .ok_or_else(|| {
-            error!("there is no block with seqno {} in masterchain", min_ref_mc_seqno)
-        })?;
-
-    log::trace!("calc_min_mc_state_id: {}", min_ref_mc_id);
-    Ok(min_ref_mc_id.clone())
-}
-
-async fn restore_states(
-    db: &InternalDb,
-    persistent_state_handle: &BlockHandle,
-    min_mc_state_id: &BlockIdExt,
-    processed_wc: i32,
-    check_stop: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<()> {
-    log::trace!("restore_states");
-
-    if persistent_state_handle.id().seq_no() > min_mc_state_id.seq_no() {
-        fail!("restore_states: min mc state can't be older persistent state");
-    }
-
-    // create list of mc and shard ids by min_mc_state_id
-    let min_mc_handle = db
-        .load_block_handle(min_mc_state_id)?
-        .ok_or_else(|| error!("there is no handle for block {}", min_mc_state_id))?;
-    let min_mc_block = db.load_block_data(&min_mc_handle).await?;
-    let mut min_stored_states = min_mc_block.shard_hashes()?.top_blocks(&[processed_wc])?;
-    min_stored_states.push(min_mc_state_id.clone());
-
-    let abort = || check_stop().is_err();
-
-    // master chain
-    let mc_state = db.load_shard_state_persistent(persistent_state_handle.id(), &abort).await?;
-    let next_id = db.load_block_next1(mc_state.block_id())?;
-    restore_chain(db, mc_state.root_cell().clone(), next_id, &min_stored_states, false, check_stop)
-        .await?;
-
-    // shards
-    let mut after_merge = HashMap::new();
-    for id in mc_state.top_blocks(processed_wc)? {
-        let pers_root = db.load_shard_state_persistent(&id, &abort).await?.root_cell().clone();
-
-        if let Ok(Some(next_id2)) = db.load_block_next2(&id) {
-            run_chain_restore(
-                db,
-                pers_root.clone(),
-                next_id2,
-                &min_stored_states,
-                //&max_stored_states,
-                &mut after_merge,
-                check_stop,
-            )
-            .await?;
-        }
-
-        let next_id1 = db.load_block_next1(&id)?;
-        run_chain_restore(
-            db,
-            pers_root,
-            next_id1,
-            &min_stored_states,
-            //&max_stored_states,
-            &mut after_merge,
-            check_stop,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-// Calls restore_chain for given states and it processes merges next way:
-// - if we have other child (in after_merge map) - call restore_chain for merged root
-// - if not - add first child's root into after_merge map
-async fn run_chain_restore(
-    db: &InternalDb,
-    mut prev_state_root: Cell,
-    mut block_id: BlockIdExt,
-    min_stored_states: &[BlockIdExt],
-    //max_stored_states: &[BlockIdExt],
-    after_merge: &mut HashMap<BlockIdExt, Cell>,
-    check_stop: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<()> {
-    let mut store_states = false;
-    loop {
-        match restore_chain(
-            db,
-            prev_state_root.clone(),
-            block_id,
-            min_stored_states,
-            //max_stored_states,
-            store_states,
-            check_stop,
-        )
-        .await?
-        {
-            None => break,
-            Some((root1, store_states1, block_id1, next_block_id1)) => {
-                if let Some(other) = after_merge.remove(&next_block_id1) {
-                    prev_state_root = if block_id1.shard().is_left_child() {
-                        ShardStateStuff::construct_split_root(root1, other)?
-                    } else {
-                        ShardStateStuff::construct_split_root(other, root1)?
-                    };
-                    block_id = next_block_id1;
-                    store_states = store_states1;
-                } else {
-                    after_merge.insert(next_block_id1, root1);
-                    return Ok(());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-// Restores all states from prev_state_root by merkle updates in blocks.
-// Processes splits by recurdion.
-// Returns None if there is no next block, and Some in a merge.
-#[async_recursion::async_recursion]
-async fn restore_chain(
-    db: &InternalDb,
-    mut prev_state_root: Cell,
-    mut block_id: BlockIdExt,
-    min_stored_states: &[BlockIdExt],
-    //max_stored_states: &[BlockIdExt],
-    mut store_states: bool,
-    check_stop: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<Option<(Cell, bool, BlockIdExt, BlockIdExt)>> {
-    log::trace!("restore_chain: {}, store_states {}", block_id, store_states);
-    loop {
-        check_stop()?;
-        // load block
-        let block_handle = db
-            .load_block_handle(&block_id)?
-            .ok_or_else(|| error!("Cannot load handle {}", block_id))?;
-        let block = db.load_block_data(&block_handle).await?;
-
-        // apply merkle update
-        let merkle_update = block.block()?.read_state_update()?;
-        let cf = db.cells_factory()?;
-        let cl = db.cells_loader()?;
-        let block_id_ = block_id.clone();
-        let state_root = tokio::task::spawn_blocking(move || -> Result<Cell> {
-            let now = std::time::Instant::now();
-            let (root, _) = merkle_update.apply_for_ex(&prev_state_root, &cf, cl.deref())?;
-            log::trace!(
-                "TIME: restore_chain: applied Merkle update {}ms   {}",
-                now.elapsed().as_millis(),
-                block_id_
-            );
-            metrics::histogram!("ton_node_db_restore_merkle_update_seconds").record(now.elapsed());
-            Ok(root)
-        })
-        .await??;
-
-        // store state if need
-        if min_stored_states.iter().any(|id| *id == block_id) {
-            log::debug!("restore_chain {}, store_states becomes true", block_id);
-            store_states = true;
-        }
-        if store_states {
-            let callback = SsNotificationCallback::new();
-
-            db.store_shard_state_dynamic_raw_force(
-                &block_handle,
-                state_root.clone(),
-                Some(callback.clone()),
-            )
-            .await?;
-
-            callback.wait().await;
-        }
-
-        // if max_stored_states.contains(&block_id) {
-        //     log::trace!("restore_chain: max stored state achived {}, return", block_id);
-        //     return Ok(None);
-        // }
-
-        // analyze next block...
-        match (db.load_block_next1(&block_id), db.load_block_next2(&block_id)) {
-            (Ok(next_id_1), Ok(Some(next_id_2))) => {
-                // before split, create two cycles recursively
-                let r1 = restore_chain(
-                    db,
-                    state_root.clone(),
-                    next_id_1,
-                    min_stored_states,
-                    //max_stored_states,
-                    store_states,
-                    check_stop,
-                )
-                .await?;
-                let r2 = restore_chain(
-                    db,
-                    state_root.clone(),
-                    next_id_2,
-                    min_stored_states,
-                    //max_stored_states,
-                    store_states,
-                    check_stop,
-                )
-                .await?;
-
-                match (r1, r2) {
-                    (
-                        Some((root1, store_states1, _, block_id1)),
-                        Some((root2, store_states2, _, block_id2)),
-                    ) => {
-                        store_states = store_states1 | store_states2;
-
-                        // afrer merge - check ids and continue this loop
-
-                        if block_id1 != block_id2 {
-                            fail!("restore_chain: after merge there are two different blocks {} and {}",
-                                block_id1, block_id2);
-                        }
-
-                        block_id = block_id1;
-                        prev_state_root = ShardStateStuff::construct_split_root(root1, root2)?
-                    }
-                    (None, None) => return Ok(None),
-                    (r1, r2) => {
-                        fail!("restore_chain: recursive calls returned {:?} and {:?}", r1, r2)
-                    }
-                }
-            }
-            (Ok(next_id), next2_id) => {
-                if let Err(e) = next2_id {
-                    log::warn!("restore_chain: error reading next2 block for {}, {}", block_id, e)
-                }
-                if next_id.shard() == block_id.shard() {
-                    // next block is not afrer split or merge - continue this loop
-                    prev_state_root = state_root;
-                    block_id = next_id;
-                    continue;
-                } else {
-                    // next block is after split, return to before split loop (see below)
-                    log::debug!("restore_chain: returns - after merge block {}", next_id);
-                    return Ok(Some((state_root, store_states, block_id, next_id)));
-                }
-            }
-            _ => {
-                log::debug!("restore_chain: returns - no next block for {}", block_id);
-                return Ok(None);
-            }
-        }
-    }
 }

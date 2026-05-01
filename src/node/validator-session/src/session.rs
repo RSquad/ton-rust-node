@@ -34,7 +34,7 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-use ton_block::{fail, Result};
+use ton_block::{fail, BlockIdExt, Result};
 
 /*
     Constants
@@ -440,7 +440,7 @@ pub(crate) struct SessionImpl {
 */
 
 impl consensus_common::Session for SessionImpl {
-    fn start(&self, _initial_block_seqno: u32) {
+    fn start(&self, _prev_blocks: Vec<BlockIdExt>, _min_masterchain_block_id: BlockIdExt) {
         log::trace!("CatchainSession::start() called (no-op for catchain)");
     }
 

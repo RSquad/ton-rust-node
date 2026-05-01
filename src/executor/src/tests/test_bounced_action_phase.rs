@@ -187,10 +187,10 @@ fn test_message_with_anycast_output_address_bounced_action() {
     let mut test_case = TransactionTestCase {
         bounce: Some(TrBouncePhase::Ok(TrBouncePhaseOk {
             msg_size: StorageUsed::default(),
-            msg_fees: Coins::from(333_328),
-            fwd_fees: Coins::from(666_672),
+            msg_fees: Coins::from(133_331),
+            fwd_fees: Coins::from(266_669),
         })),
-        gas_fees: Some(583_000),
+        gas_fees: Some(233_200),
         gas_limit: Some(1_000_000),
         gas_used: 583,
         lt_delta: 3,
@@ -201,7 +201,7 @@ fn test_message_with_anycast_output_address_bounced_action() {
         ..Default::default()
     };
     test_case.expect_compute_vm_success(4);
-    test_case.expect_total_fees(916332);
+    test_case.expect_total_fees(366535);
     test_case.expect_end_balance(test_case.start_balance - test_case.storage_fee);
 
     test_case.phase_action.success = false;
@@ -257,9 +257,9 @@ fn test_message_with_anycast_output_address_bounced_action() {
             MsgAddressInt::with_standart(None, 0, SENDER_ACCOUNT.clone()).unwrap(),
         ),
         dst: MsgAddressInt::with_standart(None, 0, THIRD_ACCOUNT.clone()).unwrap(),
-        value: CurrencyCollection::with_coins(99_998_417_000),
+        value: CurrencyCollection::with_coins(99_999_366_800),
         extra_flags: Default::default(),
-        fwd_fee: Coins::from(666_672),
+        fwd_fee: Coins::from(266_669),
         created_lt: 2000000002,
         created_at: BLOCK_UT.into(),
     });

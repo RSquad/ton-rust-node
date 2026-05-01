@@ -7,10 +7,10 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    define_HashmapE, error, fail, AccountStorage, BuilderData, Cell, Deserializable, HashmapType,
-    IBitstring, Result, Serializable, SliceData, StateInit, StorageUsed, UInt256,
+    define_HashmapE, dictionary::FixedBitsKey, error, fail, AccountStorage, BuilderData, Cell,
+    Deserializable, HashmapType, IBitstring, Result, Serializable, SliceData, StateInit,
+    StorageUsed, UInt256,
 };
-use std::{collections::BTreeMap, ops::Not};
 
 #[cfg(test)]
 #[path = "tests/test_storage_stat.rs"]
@@ -51,7 +51,7 @@ pub struct AccountStorageStat {
     roots: Vec<Cell>,
     total_cells: u64,
     total_bits: u64,
-    cache: BTreeMap<UInt256, StorageStatCellInfo>,
+    cache: ahash::AHashMap<UInt256, StorageStatCellInfo>,
     dict_updated: bool,
 }
 
@@ -101,24 +101,32 @@ impl AccountStorageStat {
         })
     }
 
-    pub fn dict_root(&mut self) -> Result<Option<&Cell>> {
+    pub fn calc_dict(&mut self) -> Result<Option<&Cell>> {
         if !self.dict_updated {
-            let values = self.cache.iter_mut().filter(|(_, data)| data.ref_count_diff != 0).map(
-                |(hash, data)| {
-                    data.ref_count_diff = 0;
-                    if data.ref_count == 0 {
-                        (SliceData::from(hash), None)
-                    } else {
-                        (SliceData::from(hash), data.write_to_bitstring().ok())
-                    }
-                },
-            );
+            fn map_entry<'a>(
+                (hash, data): (&'a UInt256, &mut StorageStatCellInfo),
+            ) -> (FixedBitsKey<'a>, Option<SliceData>) {
+                data.ref_count_diff = 0;
+                // Safe to unwrap: UInt256 always contains 32 bytes = 256 bits.
+                let key = FixedBitsKey::new(hash.as_slice());
+                if data.ref_count == 0 {
+                    (key, None)
+                } else {
+                    (key, data.write_to_bitstring().ok())
+                }
+            }
 
-            #[cfg(not(target_family = "wasm"))]
-            let now = std::time::Instant::now();
-            self.dict.0.hashmap_multiset(values)?;
-            #[cfg(not(target_family = "wasm"))]
-            log::debug!("TIME Storage stat dict update {:?}", now.elapsed());
+            if self.dict.is_empty() {
+                // no filter when dict is filled from scratch - `collect` will use size hint for allocation
+                self.dict.0.hashmap_multiset(self.cache.iter_mut().map(map_entry))?;
+            } else {
+                self.dict.0.hashmap_multiset(
+                    self.cache
+                        .iter_mut()
+                        .filter(|(_, data)| data.ref_count_diff != 0)
+                        .map(map_entry),
+                )?;
+            }
 
             self.dict_updated = true;
         }
@@ -126,12 +134,8 @@ impl AccountStorageStat {
         Ok(self.dict.root())
     }
 
-    pub fn update(&mut self, storage: &AccountStorage) -> Result<StorageUsed> {
-        #[cfg(not(target_family = "wasm"))]
-        let now = std::time::Instant::now();
+    pub fn calc_stat(&mut self, storage: &AccountStorage) -> Result<StorageUsed> {
         self.replace_roots(Self::get_roots(storage.state_init()))?;
-        #[cfg(not(target_family = "wasm"))]
-        log::debug!("TIME Storage stat replace roots {:?}", now.elapsed());
 
         let cell = storage.serialize()?;
         StorageUsed::with_values_checked(
@@ -181,7 +185,7 @@ impl AccountStorageStat {
     }
 
     fn add_cell(&mut self, cell: &Cell) -> Result<u8> {
-        let hash = cell.repr_hash();
+        let hash = cell.repr_hash().clone();
         let mut max_merkle_depth = 0;
         if let Some(data) = self.cache.get_mut(&hash) {
             data.ref_count += 1;
@@ -195,9 +199,7 @@ impl AccountStorageStat {
                 self.total_cells += 1;
                 self.total_bits += cell.bit_length() as u64;
             }
-        } else if let Some(Ok(Some(data))) =
-            self.dict.is_empty().not().then(|| self.dict.get(&hash))
-        {
+        } else if let Some(data) = self.dict.get(&hash)? {
             max_merkle_depth = data.max_merkle_depth;
             self.cache.insert(
                 hash,
@@ -224,7 +226,7 @@ impl AccountStorageStat {
     }
 
     fn remove_cell(&mut self, cell: &Cell) -> Result<()> {
-        let hash = cell.repr_hash();
+        let hash = cell.repr_hash().clone();
         let removed = if let Some(data) = self.cache.get_mut(&hash) {
             data.ref_count -= 1;
             data.ref_count_diff -= 1;
@@ -266,11 +268,11 @@ impl AccountStorageStat {
     pub fn max_merkle_depth(&self) -> Result<u8> {
         let mut result = 0;
         for root in &self.roots {
-            let depth = if let Some(data) = self.cache.get(&root.repr_hash()) {
+            let depth = if let Some(data) = self.cache.get(root.repr_hash()) {
                 data.max_merkle_depth
             } else {
                 self.dict
-                    .get(&root.repr_hash())?
+                    .get(root.repr_hash())?
                     .ok_or_else(|| {
                         error!("Root {} not found in storage stat dictionary", root.repr_hash())
                     })?

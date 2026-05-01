@@ -47,8 +47,6 @@ use crate::{
     internal_db::restore::set_graceful_termination,
     validating_utils::supported_version,
 };
-#[cfg(target_os = "linux")]
-use std::os::raw::c_void;
 use std::sync::Arc;
 #[cfg(feature = "trace_alloc")]
 use std::{
@@ -72,20 +70,15 @@ use ton_block::UnixTime;
 #[path = "tests/test_helper.rs"]
 pub mod test_helper;
 
-#[cfg(target_os = "linux")]
-#[link(name = "tcmalloc_minimal", kind = "dylib")]
-extern "C" {
-    pub fn tc_memalign(alignment: usize, size: usize) -> *mut c_void;
-    pub fn tc_free(ptr: *mut c_void);
-}
+#[cfg(all(feature = "jemalloc", not(feature = "trace_alloc"), not(windows)))]
+#[global_allocator]
+static GLOBAL_JEMALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(target_os = "linux")]
-fn check_tcmalloc() {
-    unsafe {
-        let ptr = tc_memalign(10, 10);
-        tc_free(ptr);
-    }
-}
+#[cfg(feature = "jemalloc")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static _rjem_malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
 #[cfg(feature = "trace_alloc")]
 struct TracingAllocator {
@@ -312,9 +305,6 @@ fn check_debug_build() {
 
 fn main() {
     check_debug_build();
-
-    #[cfg(target_os = "linux")]
-    check_tcmalloc();
 
     println!("{}", get_build_info());
     let version = get_version();

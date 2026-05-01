@@ -403,27 +403,27 @@ export async function printTransactionChain(chain: MessageChain, startTxTs: numb
 }
 
 /*
-Берем адрес Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk и ищетм транзакцию 64325205f7eddd9099c5e9fbf0ca1fbbf135e461727d99df562342f146a1d311:
+Take the address Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk and look up the transaction 64325205f7eddd9099c5e9fbf0ca1fbbf135e461727d99df562342f146a1d311:
 {"id":"1","jsonrpc":"2.0","method":"getTransactions","params":{"address":"Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk","lt":"62355000003","hash":"64325205f7eddd9099c5e9fbf0ca1fbbf135e461727d99df562342f146a1d311","limit":1}}
 
-Ответ:
+Response:
 {"ok":true,"result":[{"@type":"raw.transaction","address":{"@type":"accountAddress","account_address":"Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk"},"utime":1762797356,"data":"te6cckECCgEAAjwAA698rzi1TiTv7uzX0F5ib+p1I8OSOBKJlSl/pz3EwVmgHMAAAADoSlysOqnsRVo8P/O+kGDrsbjrJa+rp2Mxq/Pu5PjkTWpbp2bwAAAA6EaMHDaRInLAADQIAQIDAgHgBAUAgnIRSaK4B/MGTv/y2QsBn6QkVAb4YKDW5V4FvbigQHTHkFgv1aAdtvLJI1N5KcSAvY7iOfoC1nqrtt6tw/dCykBMAgcMBgRACAkB34n/lecWqcSd/d2a+gvMTf1OpHhyRwJRMqUv9Oe4mCs0A5gFJ1lTlcS1/fpRrKAsTPXicV/PS9yiPoySCXe39jJuKzRSp00XytovwnvQaMbQCYisXQSAHOI/kEl6FR0sJ2IAEAAAAVNIkTtAAAAAKAwGAQHfBwBqQgBsnT5LwW+251RM0XADLzmTXSH/c5OgnJDB0EoDVagwFag34R1gAAAAAAAAAAAAAAAAAAAArUn/lecWqcSd/d2a+gvMTf1OpHhyRwJRMqUv9Oe4mCs0A5kANk6fJeC323OqJmi4AZecya6Q/7nJ0E5IYOglAarUGArUG/COsAAAAAAAHQlLlYjSJE5YQAClQXZQELB2AxOIAAAAAAAAAAAQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAYcAAAAAAAAIAAAAAAANCgxyf9BPqeGgQHcSUpljidRCNY9Z5iPYOqJQbD/jA8EBQFYwzYJQq","transaction_id":{"@type":"internal.transactionId","lt":"62355000003","hash":"ZDJSBfft3ZCZxen78Mofu/E15GFyfZnfViNC8Uah0xE="},"fee":"0","storage_fee":"0","other_fee":"0","in_msg":{"@type":"raw.message","hash":"iIRuSn5rTit7Byfv/gUkH+K5wNaMX1GLTthavSoa7Zc=","source":"","destination":"Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk","value":"0","extra_currencies":[],"fwd_fee":"0","ihr_fee":"0","created_lt":"0","body_hash":"NQeD2SsYOdhIz8qKrNRkaivhn0w4tjoeCuyxwWag66A=","msg_data":{"@type":"msg.dataRaw","body":"te6cckEBAgEAhwABmqTrKnK4lr+/SjWUBYmevE4r+el7lEfRkkEu9v7GTcVmilTpovlbRfhPeg0Y2gExFYugkAOcR/IJL0KjpYTsQAIAAAAqaRInaAAAAAUBAQBqQgBsnT5LwW+251RM0XADLzmTXSH/c5OgnJDB0EoDVagwFag34R1gAAAAAAAAAAAAAAAAAACda51K","init_state":""},"message":"pOsqcriWv79KNZQFiZ68Tiv56XuUR9GSQS72/sZNxWaKVOmi+VtF+E96DRjaATEVi6CQA5xH8gkv\nQqOlhOxAAgAAACppEidoAAAABQE=\n"},"out_msgs":[{"@type":"raw.message","hash":"uoN1xZt/SlSSjHzBeq7aNZHzeL3RveG+5FuGVKJlgeY=","source":"Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk","destination":"EQDZOnyXgt9tzqiZouAGXnMmukP-5ydBOSGDoJQGq1BgKx2y","value":"30000000000","extra_currencies":[],"fwd_fee":"0","ihr_fee":"0","created_lt":"62355000004","body_hash":"lqKW0iTyhcZ77pPDD4owkVfw2qNdxbh+QQt4YwoJz8c=","msg_data":{"@type":"msg.dataRaw","body":"te6cckEBAQEAAgAAAEysuc0=","init_state":""},"message":""}]}],"jsonrpc":"2.0","id":"1"}
 
-Ищем блок:
+Look up the block:
 /lookupBlock?workchain=0&shard=-4035225266123964416&lt=62355000003
 
-Ответ:
+Response:
 {"ok":true,"result":{"@type":"ton.blockIdExt","workchain":0,"shard":"-2305843009213693952","seqno":19783,"root_hash":"Vr/Jjyl2CnN68Rl0HpHxVOEq9E3fGS3HGfBx87BI6W0=","file_hash":"8+0/Q8I/TVTmquoFsRmO4l1uBzaO2B/HQ3jYGHr5+F8=","@extra":"1762802307.2277544:2:0.23902926815413095"}}
 
-Ищем шард пруф:
+Look up the shard proof:
 /getShardBlockProof?workchain=0&shard=-2305843009213693952&seqno=19783
 
-Ответ:
+Response:
 ..."mc_id":{"@type":"ton.blockIdExt","workchain":-1,"shard":"-9223372036854775808","seqno":49345,"root_hash":"F8krddIymchlD6iXFP92hzgczT4nB24On3RW7lav/8E=","file_hash":"VM+/xa3yXzf9veXRm8kT243ke60sx73ZyWWEd21p2mY="},"links":[{"@type":"blocks.shardBlockLink","id":{"@type":"ton.blockIdExt","workchain":0,"shard":"-2305843009213693952","seqno":19785,"root_hash":"bLyR+KJoqWTH+BNnTcQChDWMyDf/hEZvfzh8mo0Gp0Q=","file_hash":"SjNF6VtJpRKFSQcHYZfna0WAhCdto5q5MHSnXCx0Q/g="}.........
 
-Видно что "seqno":49345
+We can see that "seqno":49345
 
-Ищем мастер блок:
+Look up the master block:
 /getBlockHeader?workchain=-1&shard=-9223372036854775808&seqno=49345&root_hash=F8krddIymchlD6iXFP92hzgczT4nB24On3RW7lav%2F8E%3D&file_hash=VM%2B%2Fxa3yXzf9veXRm8kT243ke60sx73ZyWWEd21p2mY%3D
 
 

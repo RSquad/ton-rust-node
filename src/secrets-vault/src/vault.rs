@@ -12,7 +12,7 @@ use crate::{
         event_types::{Event, EventType},
         handler::EventHandler,
     },
-    storage::storage_trait::Storage,
+    storage::storage_trait::{ListMode, Storage},
     types::{
         metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
         store_mode::StoreMode,
@@ -50,13 +50,14 @@ impl SecretVault {
         Ok(secret)
     }
 
-    pub async fn get(&self, secret_id: &SecretId) -> anyhow::Result<Secret> {
+    pub async fn load(&self, secret_id: &SecretId) -> anyhow::Result<Secret> {
         self.storage.load(secret_id).await
     }
 
     pub async fn exists(&self, secret_id: &SecretId) -> anyhow::Result<bool> {
-        match self.storage.load(secret_id).await {
-            Ok(_) => Ok(true),
+        match self.storage.load_metadata(secret_id).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
             Err(e) => {
                 if e.downcast_ref::<VaultError>()
                     .is_some_and(|ve| ve.code() == VaultError::NOT_FOUND)
@@ -69,19 +70,8 @@ impl SecretVault {
         }
     }
 
-    pub async fn put(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
+    pub async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
         self.storage.store(secret, mode).await
-    }
-
-    pub async fn put_vec(&self, secrets: Vec<(Secret, StoreMode)>) -> anyhow::Result<()> {
-        let mut secrets_data = Vec::with_capacity(secrets.len());
-
-        for (secret, mode) in secrets {
-            let data = secret.serialize().await?;
-            secrets_data.push((data, secret.metadata().clone(), mode));
-        }
-
-        self.storage.store_vec(secrets_data).await
     }
 
     pub async fn delete(&self, secret_id: &SecretId) -> anyhow::Result<()> {
@@ -96,7 +86,16 @@ impl SecretVault {
         Ok(meta)
     }
 
-    pub async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
-        self.storage.list_metadata().await
+    pub async fn list_metadata(&self, mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
+        self.storage.list_metadata(mode).await
+    }
+}
+
+impl std::fmt::Debug for SecretVault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretVault")
+            .field("storage", &"<dyn Storage>")
+            .field("event_handler", &"<dyn EventHandler>")
+            .finish()
     }
 }

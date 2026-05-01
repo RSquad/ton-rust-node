@@ -111,6 +111,7 @@ fn test_conflict_reason_descriptions() {
         "notarize and finalize for different blocks"
     );
     assert_eq!(ConflictReason::FinalizeAfterSkip.description(), "finalize after skip");
+    assert_eq!(ConflictReason::SkipAfterFinalize.description(), "skip after finalize");
 }
 
 #[test]
@@ -347,6 +348,27 @@ fn test_misbehavior_proof_display_conflicting_types() {
     assert!(display.contains("existing=skip"), "got: {}", display);
     // New vote is formatted with hash prefix
     assert!(display.contains("new=finalize:"), "got: {}", display);
+    assert!(display.contains(&finalize_hash.to_hex_string()[..8]), "got: {}", display);
+}
+
+#[test]
+fn test_misbehavior_proof_display_conflicting_types_skip_after_finalize() {
+    let finalize_hash = UInt256::rand();
+    let proof = MisbehaviorProof::conflicting_types(
+        SlotIndex::new(101),
+        ValidatorIndex(4),
+        VoteDescriptor::Finalize(finalize_hash.clone()),
+        VoteDescriptor::Skip,
+        RawVoteData::default(),
+        RawVoteData::default(),
+        ConflictReason::SkipAfterFinalize,
+    );
+    let display = proof.to_string();
+    assert!(display.contains("skip after finalize"), "got: {}", display);
+    assert!(display.contains("v004"), "got: {}", display);
+    assert!(display.contains("slot 101"), "got: {}", display);
+    assert!(display.contains("existing=finalize:"), "got: {}", display);
+    assert!(display.contains("new=skip"), "got: {}", display);
     assert!(display.contains(&finalize_hash.to_hex_string()[..8]), "got: {}", display);
 }
 

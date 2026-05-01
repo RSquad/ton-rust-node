@@ -12,7 +12,7 @@ use crate::{
     cell::{BuilderData, Cell, CellType, LevelMask, SmallData},
     error, fail, parse_slice_base,
     types::{bits_to_bytes, UInt256},
-    ExceptionCode, Result,
+    ExceptionCode, Result, MAX_HASHES_COUNT,
 };
 use std::{
     cmp, fmt, hash, mem,
@@ -47,8 +47,11 @@ impl PartialOrd for SliceData {
 impl hash::Hash for SliceData {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.get_bytestring(0).hash(state);
-        for i in 0..self.remaining_references() {
-            state.write(self.reference(i).unwrap().repr_hash().as_slice());
+        if let InternalData::Cell(cell) = &self.data {
+            for i in 0..self.remaining_references() {
+                // reference_repr_hash returns error in case of incorrect index only
+                state.write(cell.reference_repr_hash(i).unwrap_or_default().as_slice());
+            }
         }
     }
 }
@@ -67,8 +70,10 @@ impl PartialEq for SliceData {
             return false;
         }
         for i in 0..refs_count {
-            let ref1 = self.reference(i).unwrap();
-            let ref2 = other.reference(i).unwrap();
+            // Only one case reference_repr_hash may fail is an incorrect index,
+            // here we guarantee it is correct
+            let ref1 = self.reference_repr_hash(i).unwrap();
+            let ref2 = other.reference_repr_hash(i).unwrap();
             if ref1 != ref2 {
                 return false;
             }
@@ -105,23 +110,16 @@ impl SliceData {
     };
 
     pub fn load_builder(builder: BuilderData) -> Result<SliceData> {
-        if builder.cell_type() == CellType::PrunedBranch {
-            fail!(ExceptionCode::PrunedCellAccess)
-        }
         // if no references we can load bitstring
         SliceData::load_cell(builder.into_cell()?)
     }
 
     pub fn load_cell(cell: Cell) -> Result<SliceData> {
-        if cell.is_pruned() {
-            fail!(ExceptionCode::PrunedCellAccess)
-        } else {
-            Ok(SliceData {
-                references_window: 0..cell.references_count(),
-                data_window: 0..cell.bit_length(),
-                data: InternalData::Cell(cell),
-            })
-        }
+        Ok(SliceData {
+            references_window: 0..cell.references_count(),
+            data_window: 0..cell.bit_length(),
+            data: InternalData::Cell(cell),
+        })
     }
 
     pub fn load_cell_with_window(
@@ -129,27 +127,23 @@ impl SliceData {
         data_window: Range<usize>,
         references_window: Range<usize>,
     ) -> Result<SliceData> {
-        if cell.is_pruned() {
-            fail!(ExceptionCode::PrunedCellAccess)
-        } else {
-            let bits = cell.bit_length();
-            let refs = cell.references_count();
-            if data_window.end > bits {
-                fail!(
-                    ExceptionCode::CellUnderflow,
-                    "data window end {} exceeds cell bits {bits}",
-                    data_window.end
-                )
-            }
-            if references_window.end > refs {
-                fail!(
-                    ExceptionCode::CellUnderflow,
-                    "references window end {} exceeds cell references {refs}",
-                    references_window.end
-                )
-            }
-            Ok(SliceData { references_window, data_window, data: InternalData::Cell(cell) })
+        let bits = cell.bit_length();
+        let refs = cell.references_count();
+        if data_window.end > bits {
+            fail!(
+                ExceptionCode::CellUnderflow,
+                "data window end {} exceeds cell bits {bits}",
+                data_window.end
+            )
         }
+        if references_window.end > refs {
+            fail!(
+                ExceptionCode::CellUnderflow,
+                "references window end {} exceeds cell references {refs}",
+                references_window.end
+            )
+        }
+        Ok(SliceData { references_window, data_window, data: InternalData::Cell(cell) })
     }
 
     pub fn with_bitstring(data: impl Into<SmallData>, length_in_bits: usize) -> Self {
@@ -346,7 +340,7 @@ impl SliceData {
     }
 
     /// shrinks references_window: range - subrange of current window, returns shrinked references
-    pub fn shrink_references<T: RangeBounds<usize>>(&mut self, range: T) -> Vec<Cell> {
+    pub fn shrink_references<T: RangeBounds<usize>>(&mut self, range: T) -> Result<Vec<Cell>> {
         let mut vec = vec![];
         if let InternalData::Cell(cell) = &self.data {
             let refs_count = self.remaining_references();
@@ -362,13 +356,17 @@ impl SliceData {
             };
 
             if (start <= end) && (end <= refs_count) {
-                (0..start).for_each(|i| vec.push(cell.reference(i).unwrap()));
-                (end..refs_count).for_each(|i| vec.push(cell.reference(i).unwrap()));
+                for i in 0..start {
+                    vec.push(cell.reference(i)?);
+                }
+                for i in end..refs_count {
+                    vec.push(cell.reference(i)?);
+                }
                 self.references_window.end = self.references_window.start + end;
                 self.references_window.start += start;
             }
         }
-        vec
+        Ok(vec)
     }
 
     pub fn clear_all_bits(&mut self) {
@@ -473,6 +471,20 @@ impl SliceData {
         )
     }
 
+    pub fn reference_repr_hash(&self, i: usize) -> Result<UInt256> {
+        if self.references_window.start + i < self.references_window.end {
+            if let InternalData::Cell(cell) = &self.data {
+                return cell.reference_repr_hash(self.references_window.start + i);
+            }
+        }
+        fail!(
+            ExceptionCode::CellUnderflow,
+            "not enough references to read {} max: {}",
+            i + 1,
+            self.remaining_references()
+        )
+    }
+
     pub fn reference_opt(&self, i: usize) -> Option<Cell> {
         if self.references_window.start + i < self.references_window.end {
             if let InternalData::Cell(cell) = &self.data {
@@ -526,8 +538,10 @@ impl SliceData {
     pub fn into_builder(self) -> Result<BuilderData> {
         let cell_type = self.cell_type();
         let slice = &self;
-        let refs =
-            (0..self.remaining_references()).map(|index| slice.reference(index).unwrap()).collect();
+        let mut refs = smallvec::SmallVec::new();
+        for i in 0..self.remaining_references() {
+            refs.push(slice.reference(i)?);
+        }
         let mut builder = self.remaining_data()?;
         builder.cell_type = cell_type;
         builder.references = refs;
@@ -545,7 +559,7 @@ impl SliceData {
                 return cell.reference(self.references_window.start - 1);
             }
         }
-        fail!(ExceptionCode::CellUnderflow)
+        fail!(ExceptionCode::CellUnderflow, "not enough references to drain")
     }
 
     pub fn get_references(&self) -> Range<usize> {
@@ -553,14 +567,23 @@ impl SliceData {
     }
 
     /// Returns subslice of current slice
-    pub fn get_slice(&self, bits: usize) -> Result<SliceData> {
-        self.check_remaining_bits(bits)?;
-        let start = self.data_window.start;
-        Ok(SliceData {
-            data: self.data.clone(),
-            data_window: start..start + bits,
-            references_window: 0..0,
-        })
+    pub fn get_slice(&self, offset: usize, bits: usize) -> Result<SliceData> {
+        // Use `checked_add` so a wraparound on `offset + bits` (defined as
+        // wrapping in release) cannot bypass `check_remaining_bits` and
+        // produce a `start..end` range that points outside the window.
+        let end_offset = offset
+            .checked_add(bits)
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "bit range overflow"))?;
+        self.check_remaining_bits(end_offset)?;
+        let start = self
+            .data_window
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| error!(ExceptionCode::RangeCheckError, "bit range overflow"))?;
+        let end = start
+            .checked_add(bits)
+            .ok_or_else(|| error!(ExceptionCode::RangeCheckError, "bit range overflow"))?;
+        Ok(SliceData { data: self.data.clone(), data_window: start..end, references_window: 0..0 })
     }
 
     pub fn get_bit_opt(&self, offset: usize) -> Option<bool> {
@@ -575,16 +598,81 @@ impl SliceData {
     }
 
     pub fn get_bit(&self, offset: usize) -> Result<bool> {
-        self.get_bit_opt(offset).ok_or_else(|| error!(ExceptionCode::CellUnderflow))
+        self.get_bit_opt(offset)
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "no bits to read"))
+    }
+
+    /// Check whether all `len` bits starting at `offset` (relative to window start)
+    /// have the same value as `bit`
+    pub fn are_bits_same(&self, bit: bool, offset: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        // `checked_add` here mirrors `get_slice`: a wraparound on `offset + len`
+        // or `data_window.start + offset` must reject the input rather than
+        // silently fall through to indexing logic with a corrupt range.
+        let Some(end_offset) = offset.checked_add(len) else {
+            return false;
+        };
+        if end_offset > self.remaining_bits() {
+            return false;
+        }
+        let data = self.storage();
+        let Some(start) = self.data_window.start.checked_add(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let expected = if bit { 0xFFu8 } else { 0x00u8 };
+        let first_byte = start / 8;
+        let last_byte = (end - 1) / 8;
+
+        // Full bytes between head and tail
+        for i in first_byte + 1..last_byte {
+            if data[i] != expected {
+                return false;
+            }
+        }
+
+        // Build combined mask for first and last byte:
+        // head_mask covers bits [head_shift..8) of first byte
+        // tail_mask covers bits [0..tail_bits) of last byte
+        let head_mask = 0xFFu8 >> start % 8;
+        let tail_bits = ((end - 1) % 8) + 1; // used high bits in last byte
+        let tail_mask = 0xFFu8 << (8 - tail_bits);
+        // Check first+last (they may be the same byte)
+        let boundary_check = if first_byte == last_byte {
+            (data[first_byte] ^ expected) & head_mask & tail_mask
+        } else {
+            ((data[first_byte] ^ expected) & head_mask) | ((data[last_byte] ^ expected) & tail_mask)
+        };
+        if boundary_check != 0 {
+            return false;
+        }
+
+        true
     }
 
     pub fn get_bits(&self, offset: usize, bits: usize) -> Result<u8> {
-        self.check_remaining_bits(bits)?;
         if bits == 0 || bits > 8 {
             fail!(ExceptionCode::RangeCheckError, "bits should be in range 1..=8 but it is {bits}")
         }
+        // The two-byte fast path below (`data[q + 1]`) can read past the slice
+        // window when `offset > 0`. Validate `offset + bits` against the
+        // available remainder via `checked_add` so a wraparound cannot bypass
+        // the bounds check — matches the `get_slice(offset, bits)` and
+        // `are_bits_same(bit, offset, len)` style in this file.
+        let end_offset = offset
+            .checked_add(bits)
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "bit range overflow"))?;
+        self.check_remaining_bits(end_offset)?;
         let data = self.storage();
-        let index = self.data_window.start + offset;
+        let index = self
+            .data_window
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| error!(ExceptionCode::RangeCheckError, "bit range overflow"))?;
         let q = index / 8;
         let r = index % 8;
         if r == 0 {
@@ -625,7 +713,8 @@ impl SliceData {
     }
 
     pub fn get_next_bit_int(&mut self) -> Result<usize> {
-        Ok(self.get_next_bit_opt().ok_or(ExceptionCode::CellUnderflow)?)
+        self.get_next_bit_opt()
+            .ok_or_else(|| error!(ExceptionCode::CellUnderflow, "no bits to read"))
     }
 
     pub fn get_next_bit_opt(&mut self) -> Option<usize> {
@@ -775,13 +864,13 @@ impl SliceData {
         Ok(())
     }
 
-    pub fn get_bytestring(&self, offset: usize) -> Vec<u8> {
+    pub fn get_bytestring(&self, offset: usize) -> SmallData {
         if self.remaining_bits() <= offset {
-            return vec![];
+            return SmallData::new();
         }
         let bits = self.remaining_bits() - offset;
         let bytes = bits_to_bytes(bits);
-        let mut buffer = vec![0; bytes];
+        let mut buffer = SmallData::from_elem(0, bytes);
         self.get_bits_to_slice(&mut buffer, Some((offset, bits)));
         buffer
     }
@@ -938,18 +1027,18 @@ impl SliceData {
     }
 
     /// Returns cell's higher hash for given index (last one - representation hash)
-    pub fn hash(&self, index: usize) -> UInt256 {
+    pub fn hash(&self, index: usize) -> &UInt256 {
         match &self.data {
             InternalData::Cell(cell) => Cell::hash(cell, index),
-            _ => Default::default(),
+            _ => &UInt256::ZERO,
         }
     }
 
     /// Returns cell's representation hash
-    pub fn repr_hash(&self) -> UInt256 {
+    pub fn repr_hash(&self) -> &UInt256 {
         match &self.data {
             InternalData::Cell(cell) => cell.repr_hash(),
-            _ => Default::default(),
+            _ => &UInt256::ZERO,
         }
     }
 
@@ -962,7 +1051,7 @@ impl SliceData {
     }
 
     /// Returns cell's hashes (representation and highers)
-    pub fn hashes(&self) -> Vec<UInt256> {
+    pub fn hashes(&self) -> smallvec::SmallVec<[&UInt256; MAX_HASHES_COUNT]> {
         match &self.data {
             InternalData::Cell(cell) => cell.hashes(),
             _ => Default::default(),
@@ -970,7 +1059,7 @@ impl SliceData {
     }
 
     /// Returns cell's depth (for current state and each level)
-    pub fn depths(&self) -> Vec<u16> {
+    pub fn depths(&self) -> smallvec::SmallVec<[u16; MAX_HASHES_COUNT]> {
         match &self.data {
             InternalData::Cell(cell) => cell.depths(),
             _ => Default::default(),
@@ -1041,7 +1130,8 @@ impl SliceData {
 /// it used from other repos
 /// need task
 impl SliceData {
-    pub fn new(data: Vec<u8>) -> SliceData {
+    pub fn new(data: impl Into<SmallData>) -> SliceData {
+        let data = data.into();
         match crate::find_tag(data.as_slice()) {
             0 => SliceData::default(),
             length_in_bits => SliceData::from_raw(data, length_in_bits),

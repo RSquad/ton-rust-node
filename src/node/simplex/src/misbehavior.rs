@@ -162,6 +162,10 @@ pub enum ConflictReason {
     /// Validator sent both Finalize and Skip for the same slot.
     /// C++: `finalize_.has_value() && skip_.has_value()`
     FinalizeAfterSkip,
+
+    /// Validator sent both Skip and Finalize for the same slot.
+    /// C++: `finalize_.has_value() && skip_.has_value()`
+    SkipAfterFinalize,
 }
 
 /// Report of misbehavior with validator identity and slot context.
@@ -464,6 +468,7 @@ impl ConflictReason {
         match self {
             Self::NotarizeFinalizeHashMismatch => "notarize and finalize for different blocks",
             Self::FinalizeAfterSkip => "finalize after skip",
+            Self::SkipAfterFinalize => "skip after finalize",
         }
     }
 }

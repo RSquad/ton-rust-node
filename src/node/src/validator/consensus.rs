@@ -67,13 +67,14 @@ pub use consensus_common::{
     serialize_tl_bare_object, serialize_tl_boxed_object,
     utils::{get_elapsed_time, get_hash, get_hash_from_block_payload},
     AsyncRequest, AsyncRequestPtr, BlockCandidatePriority, BlockHash, BlockPayloadPtr,
-    BlockSignature, BlockSourceInfo, CollationParentHint, ConsensusCommonFactory, ConsensusNode,
-    ConsensusOverlay, ConsensusOverlayListener, ConsensusOverlayListenerPtr,
-    ConsensusOverlayLogReplayListener, ConsensusOverlayLogReplayListenerPtr,
-    ConsensusOverlayManager, ConsensusOverlayManagerPtr, ConsensusOverlayPtr,
-    ConsensusReplayListener, ConsensusReplayListenerPtr, LogPlayer, LogPlayerPtr, LogReplayOptions,
-    OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash, RawBuffer, Result, Session,
-    SessionId, SessionListener, SessionListenerPtr, SessionNode, SessionPtr, SessionStats,
+    BlockSignature, BlockSourceInfo, CandidateObservedFlags, CollationParentHint,
+    ConsensusCommonFactory, ConsensusNode, ConsensusOverlay, ConsensusOverlayListener,
+    ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListener,
+    ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
+    ConsensusOverlayPtr, ConsensusReplayListener, ConsensusReplayListenerPtr,
+    EnsureCandidateAvailabilityOptions, LogPlayer, LogPlayerPtr, LogReplayOptions,
+    OverlayTransportType, PrivateKey, PublicKey, PublicKeyHash, RawBuffer, ResolverPurpose, Result,
+    Session, SessionId, SessionListener, SessionListenerPtr, SessionNode, SessionPtr, SessionStats,
     ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback, ValidatorBlockCandidatePtr, ValidatorWeight,
 };
@@ -157,12 +158,12 @@ impl ConsensusOptions {
     /// Check if pipeline context updates are enabled.
     ///
     /// Pipeline context keeps recently collated block states so that subsequent
-    /// collations can chain on top of them (precollation).  Simplex always needs
-    /// this; for Catchain it mirrors the accelerated-consensus flag.
+    /// collations can chain on top of them (precollation). It is used only
+    /// for accelerated Catchain consensus.
     pub fn is_pipeline_context_enabled(&self) -> bool {
         match self {
             ConsensusOptions::Catchain(opts) => opts.accelerated_consensus_enabled,
-            ConsensusOptions::Simplex(_) => true,
+            ConsensusOptions::Simplex(_) => false,
         }
     }
 }
@@ -279,8 +280,8 @@ impl SessionHolder {
 // Implement consensus_common::Session for SessionHolder
 // Delegates to the common Session interface of the inner session
 impl consensus_common::Session for SessionHolder {
-    fn start(&self, initial_block_seqno: u32) {
-        self.inner.as_common_session().start(initial_block_seqno);
+    fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt) {
+        self.inner.as_common_session().start(prev_blocks, min_masterchain_block_id);
     }
 
     fn stop(&self) {

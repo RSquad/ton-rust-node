@@ -19,11 +19,13 @@ use super::{
 use crate::{
     block::BlockStuff,
     collator_test_bundle::CollatorTestBundle,
+    config::CollatorTestBundlesConfig,
     engine_traits::EngineOperations,
     shard_state::ShardStateStuff,
     validating_utils::fmt_next_block_descr,
     validator::{
         collator::{CollateResult, Collator},
+        state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
         validator_group::PipelineContext,
         validator_utils::PrevBlockHistory,
@@ -33,13 +35,14 @@ use crate::{
 use std::{sync::Arc, time::SystemTime};
 use ton_block::{
     Block, BlockIdExt, BlockSignaturesVariant, Cell, Deserializable, Result, ShardIdent, UInt256,
-    ValidatorSet,
+    UsageTree, ValidatorSet,
 };
 
 pub async fn run_validate_query_any_candidate(
     block_candidate: BlockCandidate,
     engine: Arc<dyn EngineOperations>,
     pipeline_context: PipelineContext,
+    state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     is_simplex: bool,
 ) -> Result<SystemTime> {
     let block_id = block_candidate.block_id.clone();
@@ -79,6 +82,7 @@ pub async fn run_validate_query_any_candidate(
         min_mc_seqno,
         prev_blocks_ids,
         pipeline_context,
+        if is_simplex { Some(state_resolver_cache.clone()) } else { None },
         block_candidate,
         validator_set,
         engine.clone(),
@@ -91,8 +95,14 @@ pub async fn run_validate_query_any_candidate(
     metrics::gauge!("ton_node_validator_active", &labels).decrement(1.0);
 
     match validator_result {
-        Ok(_next_state) => {
+        Ok(next_state_opt) => {
             metrics::counter!("ton_node_validator_successes_total", &labels).increment(1);
+
+            if is_simplex {
+                if let Some(next_state) = next_state_opt {
+                    state_resolver_cache.lock().await.store_validated_state(&block_id, next_state);
+                }
+            }
 
             // Store block data so accept_block_routine can find it without a network download.
             // Note: download_and_apply_block_worker also requires a proof/link on the handle
@@ -175,6 +185,7 @@ pub async fn run_validate_query(
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
             Default::default(),
+            None,
             block,
             set,
             engine.clone(),
@@ -190,6 +201,7 @@ pub async fn run_validate_query(
             min_masterchain_block_id.seq_no(),
             prev.get_prevs().to_vec(),
             Default::default(),
+            None,
             block.clone(),
             set,
             engine.clone(),
@@ -289,6 +301,7 @@ pub async fn run_collate_query(
     min_mc_seqno: u32,
     prev: &PrevBlockHistory,
     pipeline_context: PipelineContext,
+    state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     collator_id: PublicKey,
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
@@ -304,6 +317,7 @@ pub async fn run_collate_query(
         min_mc_seqno,
         prev,
         pipeline_context,
+        state_resolver_cache,
         set,
         UInt256::from(collator_id.pub_key()?),
         engine.clone(),
@@ -322,9 +336,10 @@ pub async fn run_collate_query(
     let labels = [("shard", shard.to_string())];
     metrics::gauge!("ton_node_collator_active", &labels).decrement(1.0);
     let mut usage_tree_opt = None;
+    let test_bundles_config = &engine.test_bundles_config().collator;
 
     let err = match collate_result {
-        Ok(CollateResult::Ok { candidate, new_state, new_block, block_root, .. }) => {
+        Ok(CollateResult::Ok { candidate, new_state, new_block, block_root, usage_tree }) => {
             let new_state = ShardStateStuff::from_state(
                 candidate.block_id.clone(),
                 new_state,
@@ -333,6 +348,20 @@ pub async fn run_collate_query(
                 engine.engine_allocated(),
             )?;
             metrics::counter!("ton_node_collator_successes_total", &labels).increment(1);
+
+            if test_bundles_config.build_all() {
+                spawn_build_test_bundle(
+                    Some(candidate.clone()),
+                    test_bundles_config,
+                    &candidate.block_id,
+                    prev.get_prevs().to_vec(),
+                    Some(usage_tree),
+                    None,
+                    next_block_descr.clone(),
+                    engine.clone(),
+                );
+            }
+
             return Ok((
                 validator_query_candidate_to_validator_block_candidate(collator_id, candidate),
                 new_state,
@@ -349,7 +378,6 @@ pub async fn run_collate_query(
 
     let labels = [("shard", shard.to_string())];
     metrics::counter!("ton_node_collator_failures_total", &labels).increment(1);
-    let test_bundles_config = &engine.test_bundles_config().collator;
     let err_str = if test_bundles_config.is_enable() { err.to_string() } else { String::default() };
 
     #[cfg(feature = "telemetry")]
@@ -357,41 +385,71 @@ pub async fn run_collate_query(
 
     if test_bundles_config.is_enable() && test_bundles_config.need_to_build_for(&err_str) {
         let id = prev.get_next_block_id(&UInt256::default(), &UInt256::default());
-        let prev_vec = prev.get_prevs().to_vec();
+        spawn_build_test_bundle(
+            None,
+            test_bundles_config,
+            &id,
+            prev.get_prevs().to_vec(),
+            usage_tree_opt,
+            Some(err_str),
+            next_block_descr,
+            engine.clone(),
+        );
+    }
+    Err(err)
+}
 
-        if !CollatorTestBundle::exists(test_bundles_config.path(), &id) {
-            let path = test_bundles_config.path().to_string();
-            let engine = engine.clone();
-            tokio::spawn(async move {
-                match CollatorTestBundle::build_for_collating_block(
-                    &engine,
-                    prev_vec.to_vec(),
-                    usage_tree_opt,
-                )
+fn spawn_build_test_bundle(
+    candidate: Option<BlockCandidate>,
+    config: &CollatorTestBundlesConfig,
+    id: &BlockIdExt,
+    prev_blocks_ids: Vec<BlockIdExt>,
+    usage_tree: Option<UsageTree>,
+    notes: Option<String>,
+    next_block_descr: String,
+    engine: Arc<dyn EngineOperations>,
+) {
+    if CollatorTestBundle::exists(config.path(), id) {
+        return;
+    }
+    let path = config.path().to_string();
+    let id = id.clone();
+
+    tokio::spawn(async move {
+        let result = if let Some(candidate) = candidate {
+            CollatorTestBundle::build_for_validating_block(
+                &engine,
+                &PrevBlockHistory::with_prevs(id.shard(), prev_blocks_ids),
+                candidate,
+            )
+            .await
+        } else {
+            CollatorTestBundle::build_for_collating_block(&engine, prev_blocks_ids, usage_tree)
                 .await
-                {
-                    Err(e) => log::error!(
-                        "({}): Error while test bundle for {} building: {}",
+        };
+
+        match result {
+            Err(e) => log::error!(
+                "({}): Error while test bundle for {} building: {}",
+                next_block_descr,
+                id,
+                e
+            ),
+            Ok(mut b) => {
+                if let Some(notes) = notes {
+                    b.set_notes(notes);
+                }
+                if let Err(e) = b.save(&path) {
+                    log::error!(
+                        "({}): Error while test bundle for {} saving: {}",
                         next_block_descr,
                         id,
                         e
-                    ),
-                    Ok(mut b) => {
-                        b.set_notes(err_str.to_string());
-                        if let Err(e) = b.save(&path) {
-                            log::error!(
-                                "({}): Error while test bundle for {} saving: {}",
-                                next_block_descr,
-                                id,
-                                e
-                            );
-                        } else {
-                            log::info!("({}): Built test bundle for {}", next_block_descr, id);
-                        }
-                    }
+                    );
+                } else {
+                    log::info!("({}): Built test bundle for {}", next_block_descr, id);
                 }
-            });
+            }
         }
-    }
-    Err(err)
+    });
 }

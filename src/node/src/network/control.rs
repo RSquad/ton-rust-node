@@ -270,9 +270,9 @@ impl ControlQuerySubscriber {
         Ok(match shard_account {
             Some((shard_account, _state_guard)) => {
                 let account = shard_account.read_account()?;
-                let code = account.get_code().map(|cell| cell.repr_hash());
-                let data = account.get_data().map(|cell| cell.repr_hash());
-                let libs = account.libraries().root().map(|cell| cell.repr_hash());
+                let code = account.get_code().map(|cell| cell.repr_hash().clone());
+                let data = account.get_data().map(|cell| cell.repr_hash().clone());
+                let libs = account.libraries().root().map(|cell| cell.repr_hash().clone());
 
                 let cell = shard_account.account_cell();
                 let proof = MerkleProof::create(&cell, |hash| {

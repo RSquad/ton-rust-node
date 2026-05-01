@@ -28,6 +28,7 @@ use crate::{
     validator::{
         accept_block::create_top_shard_block_description,
         collator::{CollateResult, Collator},
+        state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
         validator_group::PipelineContext,
         validator_utils::{compute_validator_set_cc, PrevBlockHistory},
@@ -413,7 +414,7 @@ pub fn gen_master_state(
         BlockIdExt::with_params(
             ShardIdent::masterchain(),
             0,
-            cell.repr_hash(),
+            cell.repr_hash().clone(),
             UInt256::calc_file_hash(&bytes),
         )
     });
@@ -478,7 +479,7 @@ pub fn gen_shard_state(
         let shard_state_id = BlockIdExt::with_params(
             ShardIdent::full(0),
             0,
-            cell.repr_hash(),
+            cell.repr_hash().clone(),
             UInt256::calc_file_hash(&bytes),
         );
         let shard_state = ShardStateStuff::deserialize_zerostate(
@@ -573,6 +574,7 @@ impl TestEngine {
                 false,
                 false,
                 false,
+                None,
                 &|| Ok(()),
                 None,
                 Arc::new(AtomicU8::new(0)),
@@ -812,6 +814,7 @@ impl TestEngine {
             min_mc_seqno,
             prev_blocks_ids.clone(),
             Default::default(),
+            None,
             block_candidate,
             validator_set.clone(),
             self.clone(),
@@ -854,6 +857,7 @@ impl TestEngine {
             min_mc_seqno,
             prev_blocks_ids.clone(),
             Default::default(),
+            None,
             block_candidate,
             validator_set.clone(),
             self.clone(),
@@ -871,6 +875,7 @@ impl TestEngine {
             min_mc_seqno,
             &prev,
             PipelineContext::new(),
+            Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             validator_set.clone(),
             extra.created_by().clone(),
             self.clone(),
@@ -965,6 +970,7 @@ impl TestEngine {
             min_mc_seqno,
             prev_blocks_ids,
             Default::default(),
+            None,
             block_candidate.clone(),
             validator_set,
             self.clone(),

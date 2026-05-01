@@ -17,6 +17,9 @@ use ton_block::Result;
 pub trait ArchiveDbProvider: Send + Sync {
     /// Get the root path and RocksDb instance for the archive slice
     async fn db_for_archive(&self, archive_id: u32) -> Result<(Arc<RocksDb>, Arc<PathBuf>)>;
+
+    /// Summed approximate RocksDB memory usage across all managed instances.
+    fn memory_usage(&self) -> crate::RocksDbMemoryUsage;
 }
 
 /// Single shared RocksDb, single root path.
@@ -36,6 +39,10 @@ impl SingleDbProvider {
 impl ArchiveDbProvider for SingleDbProvider {
     async fn db_for_archive(&self, _archive_id: u32) -> Result<(Arc<RocksDb>, Arc<PathBuf>)> {
         Ok((self.db.clone(), self.db_root_path.clone()))
+    }
+
+    fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        self.db.memory_usage()
     }
 }
 
@@ -59,5 +66,9 @@ impl ArchiveDbProvider for EpochDbProvider {
     async fn db_for_archive(&self, archive_id: u32) -> Result<(Arc<RocksDb>, Arc<PathBuf>)> {
         let epoch_db = self.router.resolve_or_create(archive_id).await?;
         Ok((epoch_db.db().clone(), epoch_db.path().clone()))
+    }
+
+    fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        self.router.memory_usage()
     }
 }

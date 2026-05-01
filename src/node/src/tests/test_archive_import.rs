@@ -84,6 +84,7 @@ async fn open_db(dir: &Path) -> Result<InternalDb> {
         false,
         false,
         false,
+        None,
         &|| Ok(()),
         None,
         Arc::new(AtomicU8::new(0)),
@@ -132,11 +133,11 @@ async fn check_imported_block(
     assert_eq!(loaded_state.root_cell().repr_hash(), deserialized_state.repr_hash());
     if block_id.seq_no() > 0 {
         assert_eq!(
-            deserialized_state.repr_hash(),
+            *deserialized_state.repr_hash(),
             block_stuff.as_ref().unwrap().block()?.read_state_update()?.new_hash
         );
     } else {
-        assert_eq!(&deserialized_state.repr_hash(), block_id.root_hash());
+        assert_eq!(deserialized_state.repr_hash(), block_id.root_hash());
     }
 
     Ok(block_stuff)

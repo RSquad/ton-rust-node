@@ -107,7 +107,7 @@ fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Statu
         if engine.cmd.var(2).as_slice()?.remaining_bits() % 8 != 0 {
             fail!(ExceptionCode::CellUnderflow)
         }
-        engine.cmd.var(2).as_slice()?.get_bytestring(0)
+        engine.cmd.var(2).as_slice()?.get_bytestring(0).into_vec()
     };
     let Ok(pub_key) = Ed25519PublicKey::from_bytes(pub_key.as_slice().try_into()?) else {
         engine.cc.stack.push(boolean!(false));
@@ -156,7 +156,7 @@ fn check_p256_signature(engine: &mut Engine, name: &'static str, hash: bool) -> 
                 "Slice does not consist of an integer number of bytes"
             )
         }
-        engine.cmd.var(2).as_slice()?.get_bytestring(0)
+        engine.cmd.var(2).as_slice()?.get_bytestring(0).into_vec()
     };
     if signature.remaining_bits() < P256_SIGNATURE_LENGTH * 8 {
         fail!(ExceptionCode::CellUnderflow, "P256 signature must contain at least 512 data bits")

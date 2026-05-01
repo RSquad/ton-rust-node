@@ -22,9 +22,12 @@ use crate::{
 };
 use adnl::common::add_unbound_object_to_map_with_update;
 use std::{
-    io::Cursor,
+    collections::HashSet,
     ops::Deref,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 use storage::{
@@ -35,9 +38,9 @@ use storage::{
     types::PersistentStatePartId,
 };
 use ton_block::{
-    error, fail, BlockIdExt, BocReader, Cell, Deserializable, HashmapSubtree, MerkleProof, Result,
-    Serializable, ShardAccounts, ShardIdent, ShardStateUnsplit, SliceData, UInt256, UnixTime,
-    UsageTree, BASE_WORKCHAIN_ID,
+    error, fail, BlockIdExt, BocReader, Cell, CellsArena, Deserializable, HashmapSubtree,
+    MerkleProof, OldMcBlocksInfo, Result, Serializable, ShardAccounts, ShardIdent,
+    ShardStateUnsplit, SliceData, UInt256, UnixTime, UsageTree, BASE_WORKCHAIN_ID,
 };
 pub struct PinnedShardStateGuard {
     state: Arc<ShardStateStuff>,
@@ -94,6 +97,8 @@ pub struct ShardStatesKeeper {
     stopper: Arc<Stopper>,
     max_catch_up_depth: u32,
     skip_saving_pss: bool,
+    pss_cells_cache_max_count: usize,
+    pss_prev_part_max_size: usize,
     states_cache_mode: ShardStatesCacheMode,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<EngineTelemetry>,
@@ -106,6 +111,8 @@ impl ShardStatesKeeper {
         db: Arc<InternalDb>,
         enable_shard_state_persistent_gc: bool,
         skip_saving_pss: bool,
+        pss_cells_cache_max_count: usize,
+        pss_prev_part_max_size: usize,
         states_cache_mode: ShardStatesCacheMode,
         cells_lifetime_sec: u64,
         stopper: Arc<Stopper>,
@@ -127,6 +134,8 @@ impl ShardStatesKeeper {
             stopper,
             max_catch_up_depth,
             skip_saving_pss,
+            pss_cells_cache_max_count,
+            pss_prev_part_max_size,
             states_cache_mode,
             #[cfg(feature = "telemetry")]
             telemetry,
@@ -150,12 +159,18 @@ impl ShardStatesKeeper {
         tokio::spawn(async move {
             engine_.acquire_stop(Engine::MASK_SERVICE_PSS_KEEPER);
             while let Err(e) = self_.pss_worker(&engine_, &ss_keeper_block).await {
-                log::error!("CRITICAL!!! Unexpected error in persistent states worker: {:?}", e);
+                if engine_.check_stop() {
+                    break;
+                }
+                log::error!("pss worker: CRITICAL!!! Unexpected error: {:?}", e);
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 ss_keeper_block = 'a: loop {
                     match engine_.load_pss_keeper_mc_block_id() {
                         Err(e) => {
-                            log::error!("CRITICAL!!! load_pss_keeper_mc_block_id: {:?}", e);
+                            log::error!(
+                                "pss worker: CRITICAL!!! load_pss_keeper_mc_block_id: {:?}",
+                                e
+                            );
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                         Ok(None) => {
@@ -319,7 +334,7 @@ impl ShardStatesKeeper {
                 let mut fast_cell_storage = ssk.db.create_fast_cell_storage(cells_index)?;
                 let r = BocReader::new()
                     .set_abort(&|| ssk.stopper.check_stop())
-                    .read_inmem_to_storage(data, &mut fast_cell_storage)?
+                    .read_to_storage(data.as_slice(), &mut fast_cell_storage)?
                     .withdraw_single_root()?;
                 Ok((r, fast_cell_storage))
             })
@@ -354,10 +369,9 @@ impl ShardStatesKeeper {
         let ssk = self.clone();
         let data_clone = header_boc.clone();
         let proof_root = tokio::task::spawn_blocking(move || -> Result<Cell> {
-            // Do not use read_inmem here because data buffer must be released soon after this call.
             BocReader::new()
                 .set_abort(&|| ssk.stopper.check_stop())
-                .read(&mut Cursor::new(&data_clone[..]))?
+                .read(&data_clone[..])?
                 .withdraw_single_root()
         })
         .await??;
@@ -384,7 +398,7 @@ impl ShardStatesKeeper {
 
         // check and save result
         let state_root = state.serialize()?;
-        if state_root.repr_hash() != *root_hash {
+        if state_root.repr_hash() != root_hash {
             fail!("Invalid state hash {:x} != {:x}", state_root.repr_hash(), root_hash);
         }
         let state_stuff = ShardStateStuff::from_state(
@@ -430,14 +444,14 @@ impl ShardStatesKeeper {
                 let mut fast_cell_storage = ssk.db.create_fast_cell_storage(cells_index)?;
                 let r = BocReader::new()
                     .set_abort(&|| ssk.stopper.check_stop())
-                    .read_inmem_to_storage(data_, &mut fast_cell_storage)?
+                    .read_to_storage(data_.as_slice(), &mut fast_cell_storage)?
                     .withdraw_single_root()?;
                 Ok((r, fast_cell_storage))
             })
             .await??;
         let cells_index = fast_cell_storage.finish().await?;
 
-        if state_root.repr_hash() != *root_hash {
+        if state_root.repr_hash() != root_hash {
             fail!("Invalid state hash {:x} != {:x}", state_root.repr_hash(), root_hash);
         }
 
@@ -627,10 +641,9 @@ impl ShardStatesKeeper {
             let id = block.id().clone();
             let keeper = self.clone();
             let cf = self.db.cells_factory()?;
-            let cl = self.db.cells_loader()?;
             let state = tokio::task::spawn_blocking(move || -> Result<Arc<ShardStateStuff>> {
                 let now = std::time::Instant::now();
-                let (root, _) = merkle_update.apply_for_ex(&prev_root, &cf, cl.deref())?;
+                let (root, _) = merkle_update.apply_with_factory(&prev_root, &cf)?;
                 log::trace!(
                     "TIME: restore_state_recursive: applied Merkle update {}ms   {}",
                     now.elapsed().as_millis(),
@@ -663,71 +676,6 @@ impl ShardStatesKeeper {
                 return Ok(state);
             }
         }
-    }
-
-    pub async fn save_persistent_state(
-        &self,
-        engine: &Arc<Engine>,
-        handle: Arc<BlockHandle>,
-    ) -> Result<()> {
-        if self.skip_saving_pss {
-            log::trace!("Persistent state is skipped due to config {}", handle.id());
-        } else {
-            let mc_state = engine.load_state(handle.id()).await?;
-            let split_depth =
-                mc_state.config_params()?.base_workchain()?.persistent_state_split_depth;
-            let e = engine.clone();
-            let abort = Arc::new(move || e.check_stop());
-
-            log::trace!("states_keeper: saving {}", handle.id());
-            let now = std::time::Instant::now();
-
-            self.wait_and_store_persistent_state(engine.deref(), handle.clone(), 0, abort.clone())
-                .await;
-
-            let shard_blocks = mc_state.shard_hashes()?.top_blocks_all()?;
-            for block_id in &shard_blocks {
-                let split_depth = if block_id.shard().workchain_id() == BASE_WORKCHAIN_ID {
-                    split_depth
-                } else {
-                    mc_state
-                        .config_params()?
-                        .workchains()?
-                        .get(&block_id.shard().workchain_id())?
-                        .map_or(0, |wc| wc.persistent_state_split_depth)
-                };
-                log::trace!("saving {}", block_id);
-                let handle = 'a: loop {
-                    match engine.wait_applied_block(block_id, Some(1000)).await {
-                        Ok(h) => break 'a h,
-                        Err(e) => {
-                            if engine.check_stop() {
-                                return Ok(());
-                            }
-                            log::debug!(
-                                "states_keeper: haven't got shard block handle {} yet: {:?}",
-                                block_id,
-                                e
-                            );
-                        }
-                    }
-                };
-                self.wait_and_store_persistent_state(
-                    engine.deref(),
-                    handle,
-                    split_depth,
-                    abort.clone(),
-                )
-                .await;
-            }
-
-            log::info!(
-                "saved mc state {} and all related shards, TIME: {:#?}",
-                handle.id().seq_no(),
-                now.elapsed()
-            );
-        }
-        Ok(())
     }
 
     async fn clean_cache_worker(&self, engine: &Arc<Engine>, id: &BlockIdExt) -> Result<()> {
@@ -812,12 +760,23 @@ impl ShardStatesKeeper {
 
             if is_persistent_state {
                 if self.skip_saving_pss {
-                    log::trace!("Persistent state is skipped due to config {}", handle.id());
+                    log::trace!("pss worker: state is skipped due to config {}", handle.id());
                 } else {
                     // store states
-                    self.save_persistent_state(engine, handle.clone()).await?;
-
+                    let storer = PssStorer::new(
+                        self.db.clone(),
+                        engine.clone(),
+                        handle.clone(),
+                        self.pss_cells_cache_max_count,
+                        self.pss_prev_part_max_size,
+                    )
+                    .await?;
+                    storer.store().await?;
                     // gc iteration for persistent/stored states
+
+                    if engine.check_stop() {
+                        return Ok(());
+                    }
 
                     if self.enable_persistent_gc {
                         let calc_ttl = |t| {
@@ -829,7 +788,7 @@ impl ShardStatesKeeper {
                         if let Err(e) =
                             self.db.shard_state_persistent_gc(calc_ttl, zerostate_id).await
                         {
-                            log::warn!("persistent states gc: {}", e);
+                            log::warn!("pss worker: gc: {}", e);
                         }
                     }
 
@@ -880,42 +839,381 @@ impl ShardStatesKeeper {
 
         Ok(min_id.clone())
     }
+}
 
-    pub async fn wait_fully_stored_state(
-        &self,
-        engine: &Engine,
-        id: &BlockIdExt,
-    ) -> Result<Arc<ShardStateStuff>> {
-        // We need to load state from storage (not from cache) with special flag - not to use cache.
-        // It allows not to store cells in cache for a long time. So it improves memory consumption.
-        //
-        // Polling is not a bad scenario here, because it is much easier all other variants
-        // and we do not need super speed.
-        loop {
-            match self.db.load_shard_state_dynamic(id) {
-                Ok(ss) => break Ok(ss),
-                Err(_) => {
-                    if engine.check_stop() {
-                        fail!("Stopped");
+pub fn calc_pss_split_parts(
+    shard: ShardIdent,
+    split_depth: u8,
+    parts: &mut Vec<ShardIdent>,
+) -> Result<()> {
+    if shard.prefix_len() >= split_depth {
+        parts.push(shard);
+    } else {
+        let (s1, s2) = shard.split()?;
+        calc_pss_split_parts(s1, split_depth, parts)?;
+        calc_pss_split_parts(s2, split_depth, parts)?;
+    }
+    Ok(())
+}
+
+pub async fn find_prev_pss(
+    db: &InternalDb,
+    mut handle: Arc<BlockHandle>,
+    prev_blocks: &OldMcBlocksInfo,
+) -> Result<Option<(Arc<BlockHandle>, Vec<BlockIdExt>)>> {
+    let mut iter = 100;
+    loop {
+        let Some(prev_key_block_id) = prev_blocks
+            .get_prev_key_block(handle.id().seq_no() - 1)?
+            .map(|id| id.master_block_id().1)
+        else {
+            return Ok(None);
+        };
+
+        log::trace!("find_prev_pss: prev key block is {}", prev_key_block_id);
+
+        let Some(prev_handle) = db.load_block_handle(&prev_key_block_id)? else {
+            log::warn!(
+                "Cannot load handle for prev key block {} when searching prev pss",
+                prev_key_block_id
+            );
+            return Ok(None);
+        };
+        if prev_handle.has_persistent_state() {
+            let block = db.load_block_data(&prev_handle).await?;
+            let top_blocks = block.top_blocks(0)?;
+            let mut all_have_persistent = true;
+            for prev_id in &top_blocks {
+                let Some(prev_handle) = db.load_block_handle(&prev_id)? else {
+                    log::warn!(
+                        "Cannot load handle for prev block {} when searching prev pss",
+                        prev_id
+                    );
+                    return Ok(None);
+                };
+                if !prev_handle.has_persistent_state() {
+                    log::trace!(
+                        "find_prev_pss: prev block {} has no persistent state, continue searching",
+                        prev_id
+                    );
+                    all_have_persistent = false;
+                    break;
+                }
+            }
+            if all_have_persistent {
+                return Ok(Some((prev_handle, top_blocks)));
+            }
+        }
+        log::trace!(
+            "find_prev_pss: prev key block {} has no persistent state, continue searching",
+            prev_key_block_id
+        );
+        handle = prev_handle;
+        iter -= 1;
+        if iter == 0 {
+            log::warn!(
+                "Too many iterations while searching for prev PSS block, something is wrong"
+            );
+            return Ok(None);
+        }
+    }
+}
+
+// This cache is designed to work in non-concurrent (single thread) environment.
+// It uses spin::Mutex for synchronization and assumes the mutex is not locked any other thread.
+struct CellsCache {
+    // Cache is split into 256 maps to use smaller hash maps.
+    // Hash maps reallocations (when map grows) needs x2 memory any time.
+    // The first byte of the hash is used as a map index.
+    cache: spin::Mutex<Vec<ahash::HashMap<[u8; 32 - 1], Cell>>>,
+    arena: spin::Mutex<Arc<CellsArena>>,
+    db_loader: Arc<dyn Fn(&UInt256) -> Result<Cell> + Send + Sync>,
+    cache_loader: OnceLock<Arc<dyn Fn(&UInt256) -> Result<Cell> + Send + Sync>>,
+    loaded_from_db: AtomicU64,
+    cache_size: AtomicUsize,
+    cells_max_count: usize,
+}
+impl CellsCache {
+    const ARENA_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 4 MB
+    const ARENA_BYTES_PER_CELL: usize = 2048; // conservative estimate
+
+    pub fn new(
+        load_cell_callback: Arc<dyn Fn(&UInt256) -> Result<Cell> + Send + Sync>,
+        cells_max_count: usize,
+    ) -> Arc<Self> {
+        let mut cache = Vec::new();
+        for _ in 0..256 {
+            cache.push(ahash::HashMap::default());
+        }
+        let cache = Arc::new(Self {
+            cache: spin::Mutex::new(cache),
+            arena: spin::Mutex::new(Self::create_arena(cells_max_count)),
+            db_loader: load_cell_callback,
+            cache_loader: OnceLock::new(),
+            loaded_from_db: AtomicU64::new(0),
+            cache_size: AtomicUsize::new(0),
+            cells_max_count,
+        });
+        let cache_weak = Arc::downgrade(&cache);
+        let _ = cache.cache_loader.set(Arc::new(move |hash| {
+            let cache =
+                cache_weak.upgrade().ok_or_else(|| error!("CellsCache has been dropped"))?;
+            cache.get(hash)
+        }));
+        cache
+    }
+    pub fn arena(&self) -> Arc<CellsArena> {
+        self.arena.lock().clone()
+    }
+
+    fn create_arena(cells_max_count: usize) -> Arc<CellsArena> {
+        Arc::new(CellsArena::new(
+            Self::ARENA_CHUNK_SIZE,
+            cells_max_count * Self::ARENA_BYTES_PER_CELL,
+        ))
+    }
+
+    pub fn get(self: &Arc<Self>, hash: &UInt256) -> Result<Cell> {
+        let arena = self.arena.lock().clone();
+        let part = hash.as_slice()[0] as usize;
+        let key = hash.as_slice()[1..].try_into().unwrap();
+        match self.cache.lock()[part].entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(e.get().clone()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                if let Ok(storage_cell) = (self.db_loader)(hash) {
+                    let loader = self.cache_loader.get().unwrap();
+                    let cached_cell =
+                        Cell::with_cell_and_loader(storage_cell, loader, Some(arena))?;
+                    if self.cache_size() < self.cells_max_count {
+                        e.insert(cached_cell.clone());
+                        self.cache_size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    futures_timer::Delay::new(Duration::from_millis(500)).await;
+                    self.loaded_from_db.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(cached_cell)
+                } else {
+                    fail!("Failed to load cell with hash {:x}", hash);
                 }
             }
         }
     }
+    pub fn insert(&self, cell: Cell, ignore_limit: bool) -> bool {
+        if ignore_limit || self.cache_size() < self.cells_max_count {
+            let hash = cell.repr_hash();
+            let part = hash.as_slice()[0] as usize;
+            let key = hash.as_slice()[1..].try_into().unwrap();
+            self.cache_size.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.cache.lock()[part].insert(key, cell);
+            true
+        } else {
+            false
+        }
+    }
+    pub fn loaded_from_db(&self) -> u64 {
+        self.loaded_from_db.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn cache_size(&self) -> usize {
+        self.cache_size.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn clear(&self) {
+        for m in self.cache.lock().iter_mut() {
+            m.clear();
+        }
+        let mut arena = self.arena.lock();
+        let strong = Arc::strong_count(&arena);
+        if strong > 1 {
+            log::warn!("pss worker: CellsCache: arena strong count is {}!!!", strong);
+        }
+        *arena = Self::create_arena(self.cells_max_count);
+        self.loaded_from_db.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.cache_size.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
-    async fn wait_and_store_persistent_state_attempt(
+struct PssStorerPrevStuff {
+    mc_id: BlockIdExt,
+    top_blocks: Vec<BlockIdExt>,
+    split_depth: u8,
+    cells_cache: Arc<CellsCache>,
+    cached_states: HashSet<PersistentStatePartId>,
+    prev_part_max_size: usize,
+}
+
+impl PssStorerPrevStuff {
+    fn needed_parts(
         &self,
-        engine: &Engine,
-        handle: &Arc<BlockHandle>,
-        split_depth: u8,
-        abort: Arc<dyn Fn() -> bool + Send + Sync>,
-    ) -> Result<()> {
+        part_id: &PersistentStatePartId,
+    ) -> Result<HashSet<PersistentStatePartId>> {
+        let mut result = HashSet::new();
+
+        // Masterchain is always saved as WholeState
+        if part_id.block_id().shard().is_masterchain() {
+            result.insert(PersistentStatePartId::WholeState(self.mc_id.clone()));
+            return Ok(result);
+        }
+
+        let workchain = part_id.block_id().shard().workchain_id();
+        let curr_part_shard = match part_id {
+            PersistentStatePartId::WholeState(id) => id.shard().clone(),
+            PersistentStatePartId::Part(_, prefix) => {
+                ShardIdent::with_tagged_prefix(workchain, *prefix)?
+            }
+            PersistentStatePartId::Head(_) => {
+                fail!("INTERNAL ERROR: Head part should not be used in needed_parts()")
+            }
+        };
+
+        for prev_block in &self.top_blocks {
+            if prev_block.shard().workchain_id() != workchain {
+                continue;
+            }
+            if !curr_part_shard.intersect_with(prev_block.shard()) {
+                continue;
+            }
+            if prev_block.shard().prefix_len() >= self.split_depth {
+                // Prev shard is not split — stored as WholeState
+                result.insert(PersistentStatePartId::WholeState(prev_block.clone()));
+            } else {
+                // Prev shard is split — enumerate its parts and keep those that intersect
+                let mut prev_part_shards = Vec::new();
+                calc_pss_split_parts(
+                    prev_block.shard().clone(),
+                    self.split_depth,
+                    &mut prev_part_shards,
+                )?;
+                for prev_part_shard in prev_part_shards {
+                    if curr_part_shard.intersect_with(&prev_part_shard) {
+                        result.insert(PersistentStatePartId::Part(
+                            prev_block.clone(),
+                            prev_part_shard.shard_prefix_with_tag(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+pub struct PssStorer {
+    db: Arc<InternalDb>,
+    engine: Arc<dyn EngineOperations>,
+    mc_handle: Arc<BlockHandle>,
+    top_blocks: Vec<BlockIdExt>,
+    split_depth: u8,
+    prev_stuff: Option<PssStorerPrevStuff>,
+    abort: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl PssStorer {
+    async fn new(
+        db: Arc<InternalDb>,
+        engine: Arc<dyn EngineOperations>,
+        handle: Arc<BlockHandle>,
+        calls_max_count: usize,
+        prev_part_max_size: usize,
+    ) -> Result<Self> {
+        let mc_state = engine.load_state(handle.id()).await?;
+        let split_depth = mc_state.config_params()?.base_workchain()?.persistent_state_split_depth;
+        let prev_blocks_dict = &mc_state.shard_state_extra()?.prev_blocks;
+        let prev_stuff = if let Some((prev_handle, tops)) =
+            find_prev_pss(&db, handle.clone(), prev_blocks_dict).await?
+        {
+            let prev_block = db.load_block_data(&prev_handle).await?;
+            let prev_split_depth =
+                prev_block.read_config_params()?.base_workchain()?.persistent_state_split_depth;
+            let db_ = db.clone();
+            let load_cell_callback = Arc::new(move |hash: &UInt256| db_.load_cell(hash));
+            let cells_cache = CellsCache::new(load_cell_callback, calls_max_count);
+            Some(PssStorerPrevStuff {
+                mc_id: prev_handle.id().clone(),
+                top_blocks: tops,
+                split_depth: prev_split_depth,
+                cells_cache,
+                cached_states: HashSet::new(),
+                prev_part_max_size,
+            })
+        } else {
+            None
+        };
+        let top_blocks = mc_state.shard_hashes()?.top_blocks(&[BASE_WORKCHAIN_ID])?;
+        let engine_ = engine.clone();
+        let abort = Arc::new(move || engine_.check_stop()) as Arc<dyn Fn() -> bool + Send + Sync>;
+        Ok(Self { db, engine, mc_handle: handle, top_blocks, split_depth, prev_stuff, abort })
+    }
+
+    pub async fn store(mut self) -> Result<()> {
+        let started_at = Instant::now();
+        log::debug!("pss worker: saving {}", self.mc_handle.id());
+
+        let mc_handle = self.mc_handle.clone();
+        self.store_one_shard_attempts(mc_handle).await?;
+
+        let top_blocks = self.top_blocks.clone();
+        for block_id in top_blocks {
+            log::debug!("pss worker: saving {}", block_id);
+            let handle = 'a: loop {
+                match self.engine.wait_applied_block(&block_id, Some(1000)).await {
+                    Ok(h) => break 'a h,
+                    Err(e) => {
+                        if self.engine.check_stop() {
+                            return Ok(());
+                        }
+                        log::debug!(
+                            "pss worker: haven't got shard block handle {} yet: {:?}",
+                            block_id,
+                            e
+                        );
+                    }
+                }
+            };
+            self.store_one_shard_attempts(handle).await?;
+        }
+
+        let total_time = started_at.elapsed();
+        metrics::histogram!("ton_node_db_persistent_state_write_seconds").record(total_time);
+        log::info!(
+            "pss worker: saved mc state {} and all related shards, TIME: {:#?}",
+            self.mc_handle.id().seq_no(),
+            total_time
+        );
+        Ok(())
+    }
+
+    async fn store_one_shard_attempts(&mut self, handle: Arc<BlockHandle>) -> Result<()> {
+        if handle.has_persistent_state() {
+            log::debug!("pss worker: state for {} is already stored, skipping", handle.id());
+            return Ok(());
+        }
+        let mut attempts = 1;
+        while let Err(e) = self.store_one_shard(&handle).await {
+            if self.engine.check_stop() {
+                fail!("pss worker: stopped while saving {}", handle.id());
+            }
+            log::error!(
+                "pss worker: CRITICAL Error saving for {} (attempt: {}): {:?}",
+                handle.id(),
+                attempts,
+                e
+            );
+            attempts += 1;
+            futures_timer::Delay::new(Duration::from_millis(5000)).await;
+        }
+        Ok(())
+    }
+
+    async fn store_one_shard(&mut self, handle: &Arc<BlockHandle>) -> Result<()> {
         let id = handle.id();
-        let ss = self.wait_fully_stored_state(engine, id).await?;
+        let ss = self.engine.load_state(id).await?;
+        // masterchain is always saved as a whole regardless of split_depth
+        let split_depth = if id.shard().is_masterchain() { 0 } else { self.split_depth };
 
         if id.shard().prefix_len() >= split_depth {
-            self.db.store_shard_state_persistent(handle, ss, None, abort.clone()).await?;
+            self.store_one_part(
+                handle,
+                &PersistentStatePartId::WholeState(id.clone()),
+                ss.root_cell().clone(),
+            )
+            .await?;
         } else {
             // Calc needed parts
             let mut part_prefixes = Vec::new();
@@ -925,6 +1223,7 @@ impl ShardStatesKeeper {
             }
 
             let mut state = ss.state()?.clone();
+            let accounts_dict_nonused = state.read_accounts()?;
             let accounts_root = state.accounts_cell();
             let usage_tree = UsageTree::with_root(accounts_root.clone());
 
@@ -932,13 +1231,17 @@ impl ShardStatesKeeper {
             let accounts_dict = ShardAccounts::construct_from_cell(usage_tree.root_cell())?;
             let mut parts = vec![];
             for part_prefix in &part_prefixes {
+                // Parts mustnot be a usage cells because later it is checked by type.
                 parts.push((
                     part_prefix.shard_prefix_with_tag(),
-                    accounts_dict
+                    accounts_dict_nonused
                         .subtree_with_prefix(&part_prefix.shard_key(false), &mut 0)?
                         .write_to_new_cell()?
                         .into_cell()?,
                 ));
+                // Make same to mark cells as usage
+                let _subtree =
+                    accounts_dict.subtree_with_prefix(&part_prefix.shard_key(false), &mut 0)?;
             }
 
             // Build header
@@ -956,64 +1259,154 @@ impl ShardStatesKeeper {
             // Store all parts
             for (part_prefix, part_root) in parts {
                 let part_id = PersistentStatePartId::Part(id.clone(), part_prefix);
-                self.db
-                    .store_shard_state_persistent_part(
-                        handle,
-                        &part_id,
-                        part_root,
-                        None,
-                        abort.clone(),
-                    )
-                    .await?;
+                self.store_one_part(handle, &part_id, part_root).await?;
             }
 
             // Store the header
-            self.db
-                .store_shard_state_persistent_part(
-                    handle,
-                    &PersistentStatePartId::Head(id.clone()),
-                    header,
-                    None,
-                    abort.clone(),
-                )
-                .await?;
+            self.store_one_part(handle, &PersistentStatePartId::Head(id.clone()), header).await?;
         }
         Ok(())
     }
 
-    async fn wait_and_store_persistent_state(
-        &self,
-        engine: &Engine,
-        handle: Arc<BlockHandle>,
-        split_depth: u8,
-        abort: Arc<dyn Fn() -> bool + Send + Sync>,
-    ) {
-        let mut attempts = 1;
-        while let Err(e) = self
-            .wait_and_store_persistent_state_attempt(engine, &handle, split_depth, abort.clone())
-            .await
-        {
-            if engine.check_stop() {
-                break;
+    async fn store_one_part(
+        &mut self,
+        handle: &Arc<BlockHandle>,
+        part_id: &PersistentStatePartId,
+        root: Cell,
+    ) -> Result<()> {
+        if !part_id.is_head() {
+            if let Some(prev_stuff) = &mut self.prev_stuff {
+                if let Err(e) = Self::store_one_part_fast(
+                    prev_stuff,
+                    &self.db,
+                    handle,
+                    part_id,
+                    root.clone(),
+                    self.abort.clone(),
+                )
+                .await
+                {
+                    log::warn!(
+                        "pss worker: fast PSS saving failed for {}, falling back to slow: {}",
+                        part_id,
+                        e
+                    );
+                    if self.engine.check_stop() {
+                        fail!("pss worker: stopped while saving {}", handle.id());
+                    }
+                } else {
+                    return Ok(());
+                }
             }
-            log::error!("CRITICAL Error saving persistent state (attempt: {}): {:?}", attempts, e);
-            attempts += 1;
-            futures_timer::Delay::new(Duration::from_millis(5000)).await;
         }
+        self.db
+            .store_shard_state_persistent_part(handle, part_id, root, None, self.abort.clone())
+            .await
+    }
+
+    async fn store_one_part_fast(
+        prev_stuff: &mut PssStorerPrevStuff,
+        db: &Arc<InternalDb>,
+        handle: &Arc<BlockHandle>,
+        part_id: &PersistentStatePartId,
+        root: Cell,
+        abort: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<()> {
+        log::info!("pss worker: starting fast attempt for {}", part_id);
+        let started_at = Instant::now();
+
+        // 1. Determine which prev PSS parts are needed
+        let needed = prev_stuff.needed_parts(part_id)?;
+
+        // 2. Reload cache if the required set changed
+        if needed != prev_stuff.cached_states {
+            log::debug!(
+                "pss worker: reloading cache for {}, needed: [{}]",
+                part_id,
+                needed.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+            );
+            prev_stuff.cells_cache.clear();
+            prev_stuff.cached_states.clear();
+            for prev_part_id in &needed {
+                let size = db.load_shard_state_persistent_size(prev_part_id).await? as usize;
+                if size > prev_stuff.prev_part_max_size {
+                    fail!(
+                        "Prev part {} is too big for fast saving ({} bytes), max allowed is {}",
+                        prev_part_id,
+                        size,
+                        prev_stuff.prev_part_max_size
+                    );
+                }
+
+                let now = Instant::now();
+                let mut read_obj = db.load_shard_state_persistent_obj(prev_part_id)?;
+
+                let cells_cache = prev_stuff.cells_cache.clone();
+                let arena = cells_cache.arena();
+                let result = BocReader::new()
+                    .set_abort(abort.deref())
+                    .set_arena(arena)
+                    .set_load_cell_callback(&|cell| cells_cache.insert(cell.clone(), false))
+                    .stream_read(&mut read_obj)?;
+                let load_time = now.elapsed();
+                log::debug!("pss worker: loaded prev {} in {:#?}", prev_part_id, load_time,);
+                prev_stuff.cached_states.insert(prev_part_id.clone());
+                if result.interrupted {
+                    log::warn!(
+                        "pss worker: cache size limit reached! Continue saving without additional caching.",
+                    );
+                    break;
+                }
+            }
+        } else {
+            log::debug!(
+                "pss worker: reusing cache for {}, cache size: {}",
+                part_id,
+                prev_stuff.cells_cache.cache_size()
+            );
+        }
+
+        let cells_cache = prev_stuff.cells_cache.clone();
+
+        // 3. Add new (non-StoredCell) cells to cache, wrapping them as CachedCell
+        let mut stack = vec![root.clone()];
+        let mut max_inmemory_cells = 100;
+        let loader = cells_cache.cache_loader.get().unwrap();
+        let arena = cells_cache.arena();
+        while let Some(cell) = stack.pop() {
+            // Newly constructed cells has loaded refs, so they don't have refs loader
+            if cell.loader_data_ptr().is_none() {
+                let cached_cell =
+                    Cell::with_cell_and_loader(cell.clone(), loader, Some(arena.clone()))?;
+
+                if cells_cache.insert(cached_cell, true) {
+                    for r in cell.clone_references()? {
+                        stack.push(r);
+                    }
+                }
+            }
+            max_inmemory_cells -= 1;
+            if max_inmemory_cells == 0 {
+                fail!("Too many cells to store in memory for fast saving");
+            }
+        }
+
+        // 4. Wrap root as CachedCell and write with BocWriter
+        let cached_root = Cell::with_cell_and_loader(root, loader, Some(arena))?;
+
+        db.store_shard_state_persistent_part_fast(handle, part_id, cached_root, abort).await?;
+
+        log::info!(
+            "pss worker: fast saving done {} in {:#?}; cache size: {}, loaded from DB: {}",
+            part_id,
+            started_at.elapsed(),
+            prev_stuff.cells_cache.cache_size(),
+            prev_stuff.cells_cache.loaded_from_db()
+        );
+        Ok(())
     }
 }
 
-pub fn calc_pss_split_parts(
-    shard: ShardIdent,
-    split_depth: u8,
-    parts: &mut Vec<ShardIdent>,
-) -> Result<()> {
-    if shard.prefix_len() >= split_depth {
-        parts.push(shard);
-    } else {
-        let (s1, s2) = shard.split()?;
-        calc_pss_split_parts(s1, split_depth, parts)?;
-        calc_pss_split_parts(s2, split_depth, parts)?;
-    }
-    Ok(())
-}
+#[cfg(test)]
+#[path = "tests/test_shard_states_keeper.rs"]
+mod tests;

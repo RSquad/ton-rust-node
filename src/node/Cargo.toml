@@ -3,7 +3,7 @@ build = '../common/build/build.rs'
 edition = '2021'
 license = 'GPL-3.0'
 name = 'node'
-version = '0.5.3'
+version = '0.6.0'
 
 [[bin]]
 name = 'adnl_resolve'
@@ -102,12 +102,15 @@ ton_vm = { path = '../vm' }
 lockfree = { path = '../lockfree' }
 secrets-vault = { path = '../secrets-vault', default-features = false, features = [
     "file-storage-json",
-    "crypto-default",
-    "crypto-block",
+    "hashicorp-storage",
+    "ton-block",
 ] }
 storage = { path = 'storage' }
 ton_api = { path = '../tl/ton_api' }
 validator_session = { path = 'validator-session' }
+
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
 
 [[bench]]
 name = "liteserver_pipeline"
@@ -124,7 +127,8 @@ reqwest = { version = "0.12.24" }
 tokio = { features = ['macros'], version = '1.40' }
 
 [features]
-default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key']
+default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key', 'jemalloc']
+jemalloc = ['tikv-jemallocator']
 cell_counter = ['ton_block/cell_counter']
 ci_run = []
 export_key = ['catchain/export_key', 'ton_block/export_key']

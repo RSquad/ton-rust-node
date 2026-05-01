@@ -6,7 +6,6 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#![cfg(feature = "secrets-vault-cli")]
 
 mod delete;
 mod generate;
@@ -37,7 +36,10 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum Commands {
     Init {},
-    List {},
+    List {
+        #[arg(long, short)]
+        full: bool,
+    },
     Delete {
         #[arg(required = true)]
         secret_ids: Vec<String>,
@@ -98,7 +100,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init {} => init::execute().await,
-        Commands::List {} => list::execute().await,
+        Commands::List { full } => list::execute(full).await,
         Commands::Delete { secret_ids } => delete::execute(&secret_ids).await,
         Commands::Import { secret_id, algorithm, extractable, overwrite, data } => {
             let algo: Algorithm = match algorithm.parse() {

@@ -31,6 +31,7 @@ p256 = "0.13.2"
 rand = '0.8'
 secp256k1 = { version = '0.30', features = [ 'recovery', 'global-context' ] }
 serde = { features = [ 'derive', 'rc' ], version = '1.0.105' }
+openssl = "0.10"
 sha2 = '0.10'
 smallvec = { features = [ 'const_new', 'union', 'write' ], version = '1.10' }
 thiserror = '1.0'

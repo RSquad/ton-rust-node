@@ -57,7 +57,7 @@ mod ctos {
         let mut lib = BuilderData::default();
         lib.append_i8(3).unwrap();
         let lib = lib.into_cell().unwrap();
-        let hash = lib.repr_hash();
+        let hash = lib.repr_hash().clone();
 
         let mut b = BuilderData::default();
         b.set_type(CellType::LibraryReference);
@@ -565,7 +565,7 @@ mod ldreftos {
         let mut lib = BuilderData::default();
         lib.append_i8(3).unwrap();
         let lib = lib.into_cell().unwrap();
-        let hash = lib.repr_hash();
+        let hash = lib.repr_hash().clone();
 
         let mut b = BuilderData::default();
         b.set_type(CellType::LibraryReference);
