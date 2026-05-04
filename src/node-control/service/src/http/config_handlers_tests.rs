@@ -19,7 +19,9 @@ use crate::{
 };
 use axum::body::Body;
 use common::{
-    app_config::{AppConfig, HttpConfig, PoolConfig, TonCoreInitParams, TonCorePoolConfig, VotingConfig},
+    app_config::{
+        AppConfig, HttpConfig, PoolConfig, TonCoreInitParams, TonCorePoolConfig, VotingConfig,
+    },
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
@@ -170,7 +172,8 @@ async fn voting_proposal_add_invalid_hash_returns_400() {
 async fn voting_proposal_rm_unknown_returns_404() {
     let st = state_with_pools(HashMap::new()).await;
     let h = "cc".repeat(32);
-    let resp = routes(false, st).oneshot(delete(&format!("/v1/voting/proposals/{h}"))).await.unwrap();
+    let resp =
+        routes(false, st).oneshot(delete(&format!("/v1/voting/proposals/{h}"))).await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 

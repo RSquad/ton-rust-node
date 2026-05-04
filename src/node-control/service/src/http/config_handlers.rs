@@ -12,13 +12,15 @@ use crate::{
     runtime_config::{RuntimeConfig, open_wallet},
 };
 use adnl::common::Timeouts;
+use base64::Engine;
 use common::{
     TonWalletVersion,
     app_config::{
         AdnlConfig, BindingStatus, DEFAULT_TONCORE_MAX_NOMINATORS,
         DEFAULT_TONCORE_MIN_NOMINATOR_STAKE, DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, ElectionsConfig,
         EndpointEntry, KeyConfig, LogConfig, LogOutput, LogRotation, NodeBinding, PoolConfig,
-        StakePolicy, TimeoutVariant, TonCoreInitParams, TonCorePoolConfig, VotingConfig, WalletConfig,
+        StakePolicy, TimeoutVariant, TonCoreInitParams, TonCorePoolConfig, VotingConfig,
+        WalletConfig,
     },
     ton_utils::{extract_max_factor, normalize_ton_address},
 };
@@ -27,14 +29,7 @@ use contracts::{
     TonCoreNominatorWrapper, contract_provider,
 };
 use control_client::client_adnl::ControlClientAdnl;
-use base64::Engine;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    str::FromStr,
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::SystemTime};
 use ton_block::{MsgAddressInt, write_boc};
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
@@ -1025,10 +1020,8 @@ fn parse_voting_proposal_hash_hex(s: &str) -> Result<[u8; 32], AppError> {
 }
 
 fn voting_format_expires(expires: u32) -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32;
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+        as u32;
     if expires <= now {
         return "expired".to_string();
     }
@@ -1097,11 +1090,12 @@ pub async fn v1_voting_config_handler(
 ) -> axum::Json<VotingConfigResponse> {
     let config = state.runtime_cfg.get();
     let result = match config.voting.as_ref() {
-        Some(v) => VotingConfigDto {
-            proposals: v.proposals.clone(),
-            tick_interval: v.tick_interval,
-        },
-        None => VotingConfigDto { proposals: vec![], tick_interval: VOTING_TICK_INTERVAL_DEFAULT_SECS },
+        Some(v) => {
+            VotingConfigDto { proposals: v.proposals.clone(), tick_interval: v.tick_interval }
+        }
+        None => {
+            VotingConfigDto { proposals: vec![], tick_interval: VOTING_TICK_INTERVAL_DEFAULT_SECS }
+        }
     };
     axum::Json(VotingConfigResponse { ok: true, result })
 }
@@ -1133,10 +1127,8 @@ pub async fn v1_voting_proposals_list_handler(
         .list_proposals()
         .await
         .map_err(|e| AppError::internal(format!("list_proposals: {e}")))?;
-    let result: Vec<VotingProposalRowDto> = proposals
-        .iter()
-        .map(|p| voting_proposal_row_dto(p, &tracked_lower))
-        .collect();
+    let result: Vec<VotingProposalRowDto> =
+        proposals.iter().map(|p| voting_proposal_row_dto(p, &tracked_lower)).collect();
     Ok(axum::Json(VotingProposalsListResponse { ok: true, result }))
 }
 
@@ -1254,9 +1246,10 @@ pub async fn v1_voting_proposals_rm_handler(
     let hash_norm = hash.trim().to_lowercase();
 
     let cfg = state.runtime_cfg.get();
-    let in_list = cfg.voting.as_ref().is_some_and(|v| {
-        v.proposals.iter().any(|h| h.to_lowercase() == hash_norm)
-    });
+    let in_list = cfg
+        .voting
+        .as_ref()
+        .is_some_and(|v| v.proposals.iter().any(|h| h.to_lowercase() == hash_norm));
     if !in_list {
         return Err(AppError::not_found(format!(
             "proposal '{hash_norm}' is not in the voting tracked list"
@@ -1274,10 +1267,7 @@ pub async fn v1_voting_proposals_rm_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
-    Ok(axum::Json(EntityRefResponse {
-        ok: true,
-        result: EntityRefDto { name: hash_norm },
-    }))
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: hash_norm } }))
 }
 
 // ---------------------------------------------------------------------------

@@ -13,9 +13,7 @@ use crate::commands::nodectl::{
 use anyhow::Context;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
-use std::{
-    io::{IsTerminal, Write, stdin, stdout},
-};
+use std::io::{IsTerminal, Write, stdin, stdout};
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Config proposals voting (REST client; requires running nodectl service)")]
@@ -194,9 +192,7 @@ impl VoteInspectCmd {
         let body = api_get(base_url, &path, token).await?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
         let detail: ProposalDetail = serde_json::from_value(
-            v.get("result")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("inspect: missing 'result'"))?,
+            v.get("result").cloned().ok_or_else(|| anyhow::anyhow!("inspect: missing 'result'"))?,
         )?;
 
         match self.format {
@@ -306,24 +302,21 @@ impl VoteRmCmd {
             }
         };
 
-        let path = format!(
-            "/v1/voting/proposals/{}",
-            parse_proposal_hash_hex_normalized(&selected_hash)?
-        );
+        let path =
+            format!("/v1/voting/proposals/{}", parse_proposal_hash_hex_normalized(&selected_hash)?);
         api_delete(base_url, &path, token).await?;
 
-        println!(
-            "{} proposal {} removed from voting config",
-            "OK".green().bold(),
-            selected_hash
-        );
+        println!("{} proposal {} removed from voting config", "OK".green().bold(), selected_hash);
         Ok(())
     }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-async fn fetch_proposal_rows(base_url: &str, token: Option<&str>) -> anyhow::Result<Vec<ProposalRow>> {
+async fn fetch_proposal_rows(
+    base_url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<Vec<ProposalRow>> {
     let body = api_get(base_url, "/v1/voting/proposals", token).await?;
     let v: serde_json::Value = serde_json::from_str(&body)?;
     serde_json::from_value(
@@ -346,11 +339,7 @@ async fn fetch_tracked_hashes(base_url: &str, token: Option<&str>) -> anyhow::Re
 }
 
 async fn fetch_tracked_lower(base_url: &str, token: Option<&str>) -> anyhow::Result<Vec<String>> {
-    Ok(fetch_tracked_hashes(base_url, token)
-        .await?
-        .into_iter()
-        .map(|h| h.to_lowercase())
-        .collect())
+    Ok(fetch_tracked_hashes(base_url, token).await?.into_iter().map(|h| h.to_lowercase()).collect())
 }
 
 fn parse_proposal_hash_hex_normalized(s: &str) -> anyhow::Result<String> {
