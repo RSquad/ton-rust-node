@@ -25,7 +25,7 @@ use common::{
     ton_utils::{display_tons, tons_f64_to_nanotons},
 };
 use contracts::{ElectorWrapper, ElectorWrapperImpl, TonWallet, contract_provider, nominator};
-use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
+use service::elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use std::{io::Write, path::Path, str::FromStr};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
