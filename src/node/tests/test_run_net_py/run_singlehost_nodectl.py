@@ -449,10 +449,15 @@ class Bootstrap:
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read())
+                body = resp.read().decode(errors="replace")
+                return json.loads(body)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
-            self._fail(f"REST GET {path} → HTTP {e.code}: {body[:800]}")
+            self._fail(f"REST GET {path} ({url}) → HTTP {e.code}: {body[:800]}")
+        except urllib.error.URLError as e:
+            self._fail(f"REST GET {path} ({url}) failed: {e.reason}")
+        except json.JSONDecodeError as e:
+            self._fail(f"REST GET {path} ({url}) returned invalid JSON: {e.msg} at pos {e.pos}; body={body[:800]}")
 
     def _validate_voting_rest(self) -> None:
         """Smoke-test voting read endpoints (nominator+ JWT; we use the operator token from phase 8)."""
