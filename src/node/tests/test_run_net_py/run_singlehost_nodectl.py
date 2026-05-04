@@ -437,6 +437,8 @@ class Bootstrap:
             host, port = "127.0.0.1", bind
         if host in ("0.0.0.0", "::"):
             host = "127.0.0.1"
+        if ":" in host:
+            return f"http://[{host}]:{port}"
         return f"http://{host}:{port}"
 
     def _nodectl_rest_get_json(self, path: str) -> dict:
