@@ -6,8 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::traits::ElectionsProvider;
-use crate::providers::traits::{Account, ValidatorConfig, ValidatorEntry};
+use super::traits::{Account, ElectionsProvider, ValidatorConfig, ValidatorEntry};
 use adnl::client::AdnlClientConfig;
 use anyhow::Context;
 use control_client::{

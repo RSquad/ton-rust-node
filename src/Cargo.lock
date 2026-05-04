@@ -875,7 +875,6 @@ dependencies = [
  "common",
  "contracts",
  "control-client",
- "elections",
  "hex",
  "reqwest",
  "rpassword",
@@ -1600,28 +1599,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "elections"
-version = "0.4.0"
-dependencies = [
- "adnl",
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "common",
- "contracts",
- "control-client",
- "hex",
- "mockall",
- "secrets-vault",
- "serde",
- "serde_json",
- "tokio",
- "ton-http-api-client",
- "ton_block",
- "tracing",
-]
-
-[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2229,9 +2206,6 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "hex-conservative"
@@ -4935,10 +4909,10 @@ dependencies = [
  "common",
  "contracts",
  "control-client",
- "elections",
  "hex",
  "http-body-util",
  "jsonwebtoken",
+ "mockall",
  "secrets-vault",
  "serde",
  "serde_json",
