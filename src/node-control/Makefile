@@ -1,7 +1,7 @@
 CONFIG ?= nodectl-local.json
 LEVEL ?= info
 
-packages = common nodectl elections ton-http-api-client service control-client commands contracts
+packages = common nodectl ton-http-api-client service control-client commands contracts
 
 test: $(addprefix test-, $(packages))
 

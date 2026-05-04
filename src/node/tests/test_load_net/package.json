@@ -23,6 +23,7 @@
         "@ton/sandbox": "^0.36.0",
         "@ton/test-utils": "^0.10.0",
         "@ton/ton": "^15.2.1",
+        "@tonkite/highload-wallet-v3": "3.0.2",
         "@types/jest": "^29.5.14",
         "@types/node": "^22.15.24",
         "bip39": "^3.1.0",

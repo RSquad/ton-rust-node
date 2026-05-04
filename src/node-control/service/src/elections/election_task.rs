@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::{
+use super::{
     providers::{DefaultElectionsProvider, ElectionsProvider},
     runner::ElectionRunner,
 };

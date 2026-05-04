@@ -22,7 +22,6 @@ control-client = { path = "../control-client" }
 ton-http-api-client = { path = "../ton-http-api-client" }
 adnl = { features = ["client"], path = "../../adnl" }
 ton_block = { path = "../../block" }
-elections = { path = "../elections" }
 contracts = { path = "../contracts" }
 ton_block_json = { version = "0.9.41", path = "../../block-json" }
 service = { path = "../service" }

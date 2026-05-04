@@ -7,7 +7,10 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::http_server_task::{AppError, AppState};
-use crate::runtime_config::{RuntimeConfig, open_wallet};
+use crate::{
+    elections::providers::{DefaultElectionsProvider, ElectionsProvider},
+    runtime_config::{RuntimeConfig, open_wallet},
+};
 use adnl::common::Timeouts;
 use common::{
     TonWalletVersion,
@@ -24,7 +27,6 @@ use contracts::{
     TonCoreNominatorWrapper, contract_provider,
 };
 use control_client::client_adnl::ControlClientAdnl;
-use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
 use base64::Engine;
 use std::{
     collections::HashMap,
