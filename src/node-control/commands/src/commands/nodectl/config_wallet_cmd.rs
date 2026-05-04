@@ -25,9 +25,9 @@ use common::{
     ton_utils::{display_tons, tons_f64_to_nanotons},
 };
 use contracts::{ElectorWrapper, ElectorWrapperImpl, TonWallet, contract_provider, nominator};
-use service::elections::providers::{DefaultElectionsProvider, ElectionsProvider};
-use std::{io::Write, path::Path};
-use ton_block::{Cell, MsgAddressInt, write_boc};
+use elections::providers::{DefaultElectionsProvider, ElectionsProvider};
+use std::{io::Write, path::Path, str::FromStr};
+use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, Cell, MsgAddressInt, write_boc};
 use ton_http_api_client::v2::data_models::AccountState;
 
 const WALLET_SEND_GAS: u64 = 1_000_000; // 0.001 TON
@@ -204,6 +204,15 @@ struct WalletView {
     address: Option<String>,
 }
 
+/// Bounceable base64url display for wallet list.
+fn format_wallet_ls_address(addr: &Option<String>) -> Option<String> {
+    let s = addr.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    MsgAddressInt::from_str(&s)
+        .ok()
+        .and_then(|a| a.to_string_custom(ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE).ok())
+        .or(Some(s))
+}
+
 impl WalletLsCmd {
     pub async fn run(
         &self,
@@ -214,7 +223,10 @@ impl WalletLsCmd {
         let base_url = resolve_service_url(url, config_path)?;
         let body = api_get(&base_url, "/v1/wallets", token).await?;
         let resp: serde_json::Value = serde_json::from_str(&body)?;
-        let views: Vec<WalletView> = serde_json::from_value(resp["result"].clone())?;
+        let mut views: Vec<WalletView> = serde_json::from_value(resp["result"].clone())?;
+        for v in &mut views {
+            v.address = format_wallet_ls_address(&v.address);
+        }
 
         if views.is_empty() {
             match self.format {
