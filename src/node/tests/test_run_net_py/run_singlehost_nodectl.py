@@ -23,7 +23,8 @@ Phases:
   10. Top up master wallet + wait for on-chain balance
   11. Wait for validator wallets/pools to open, TONCore deposits, top them up
   12. Wait for election participants
-  13. Validate REST API: compare nodectl stake data with on-chain elector data
+  13. Validate REST API: compare nodectl stake data with on-chain elector data;
+      smoke-test voting endpoints (`GET /v1/voting/config`, `GET /v1/voting/proposals`)
   14. Observe election rounds (when OBSERVE_ROUNDS > 0)
   15. Summary and exit assertions
 
@@ -40,6 +41,7 @@ Optional env vars:
   TONCORE_MIN_VALIDATOR_STAKE_TON / TONCORE_MIN_VALIDATOR_STAKE_ODD_TON (must differ),
   TONCORE_VALIDATOR_DEPOSIT_TON (per-slot deposit-validator amount in TON),
   BUN_TOPUP_TIMEOUT_SECONDS
+  VOTING_REST_VALIDATE — set to 0 to skip voting REST smoke checks in phase 13 (default: enabled)
   TONCORE_NOMINATOR_LOAD (default 1 for SCENARIO=snp-toncore) — after validator deposit + pool top-up,
     run bun add-nominators-to-pool (default 40× min stake TON; pool.fc op=0 action=100, wc=0 nominators) on one TONCore pool; after 1 election
     transition in phase 14, run withdraw-nominators-from-pool (action 119). Set to 0 to skip.
@@ -416,6 +418,77 @@ class Bootstrap:
             stdin=subprocess.DEVNULL, timeout=timeout,
         )
         return result.stdout
+
+    def _nodectl_rest_base_url(self) -> str:
+        """HTTP URL for the nodectl control plane (for localhost curls against ``http.bind``)."""
+        cfg  = json.loads(self.paths.nodectl_config.read_text())
+        bind = str(cfg.get("http", {}).get("bind", "127.0.0.1:8080"))
+        if bind.startswith("["):
+            bracket_end = bind.find("]")
+            if bracket_end < 0:
+                host, port = "127.0.0.1", "8080"
+            else:
+                host = bind[1:bracket_end]
+                rest = bind[bracket_end + 1 :].lstrip()
+                port = rest[1:] if rest.startswith(":") else "8080"
+        elif bind.count(":") == 1:
+            host, port = bind.split(":", 1)
+        else:
+            host, port = "127.0.0.1", bind
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1"
+        return f"http://{host}:{port}"
+
+    def _nodectl_rest_get_json(self, path: str) -> dict:
+        token = os.environ.get("NODECTL_API_TOKEN")
+        if not token:
+            raise BootstrapError("NODECTL_API_TOKEN missing for REST GET " + path)
+        url = self._nodectl_rest_base_url().rstrip("/") + path
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            self._fail(f"REST GET {path} → HTTP {e.code}: {body[:800]}")
+
+    def _validate_voting_rest(self) -> None:
+        """Smoke-test voting read endpoints (nominator+ JWT; we use the operator token from phase 8)."""
+        if os.environ.get("VOTING_REST_VALIDATE", "1").strip().lower() in ("0", "false", "no"):
+            self.log.info("  VOTING_REST_VALIDATE disabled — skip voting REST checks")
+            return
+        if not os.environ.get("NODECTL_API_TOKEN"):
+            self.log.warn("  No NODECTL_API_TOKEN — skip voting REST checks")
+            return
+        self.log.info("  Voting REST: GET /v1/voting/config …")
+        cfg_body = self._nodectl_rest_get_json("/v1/voting/config")
+        if not cfg_body.get("ok"):
+            self._fail(f"/v1/voting/config: unexpected body {cfg_body!r}")
+        vres = cfg_body.get("result") or {}
+        if "tick_interval" not in vres:
+            self._fail("/v1/voting/config: missing result.tick_interval")
+        if "proposals" not in vres or not isinstance(vres["proposals"], list):
+            self._fail("/v1/voting/config: result.proposals must be a list")
+        self.log.info("  Voting REST: GET /v1/voting/proposals …")
+        pr_body = self._nodectl_rest_get_json("/v1/voting/proposals")
+        if not pr_body.get("ok"):
+            self._fail(f"/v1/voting/proposals: unexpected body {pr_body!r}")
+        rows = pr_body.get("result")
+        if not isinstance(rows, list):
+            self._fail("/v1/voting/proposals: result must be a list")
+        n = len(rows)
+        self.log.info(f"  Voting REST: OK (tracked snapshot + {n} active proposal row(s))")
+
+        self.log.info("  Voting CLI smoke: nodectl vote ls …")
+        result = subprocess.run(
+            [str(self.paths.nodectl_bin), "vote", "ls"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+        )
+        if result.returncode != 0:
+            self._fail(
+                f"nodectl vote ls failed (exit {result.returncode})"
+                + (f": {result.stderr.strip()}" if result.stderr.strip() else "")
+            )
 
     def _json_rpc(self, method: str, params: Optional[dict] = None) -> dict:
         url     = self.cfg.http_api_url.rstrip("/") + "/jsonRPC"
@@ -1113,9 +1186,12 @@ class Bootstrap:
 
         elector_map = self._fetch_elector_stake_map()
         if elector_map is None:
+            self.log.warn("  Skipping elector vs API stake comparison (elector fetch failed)")
+            self._validate_voting_rest()
             return
 
         self._compare_stakes(elections, elector_map)
+        self._validate_voting_rest()
 
     def _fetch_nodectl_elections(self) -> Optional[dict]:
         result = subprocess.run(

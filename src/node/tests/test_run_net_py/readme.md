@@ -98,3 +98,13 @@ pyright test_run_net.py
 ```bash
 black test_run_net.py
 ```
+
+# nodectl single-host E2E (`run_singlehost_nodectl.py`)
+
+Bootstrap script (same directory) builds **nodectl**, starts the **single-host** network from `test_run_net.py`, runs the **nodectl service**, configures wallets/nodes/elections via CLI, then validates REST (election stakes vs elector contract).
+
+Requires **`MASTER_WALLET_KEY`** (see `node/tests/test_load_net/.env`). CI wrapper: **`test_nodectl_ci.sh`**.
+
+After stake validation (phase 13), the script smoke-tests **voting over REST**: `GET /v1/voting/config`, `GET /v1/voting/proposals`, and **`nodectl vote ls`**. Set **`VOTING_REST_VALIDATE=0`** to skip those checks.
+
+On-chain **proposal creation** for deeper voting tests is **not** wired into this script; use **`test_load_net`** scripts (e.g. Blueprint flows that send proposals to the Config contract) when you need active proposals.
