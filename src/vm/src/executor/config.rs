@@ -260,12 +260,9 @@ pub(super) fn execute_calc_storage_fee(engine: &mut Engine) -> Status {
         engine.cc.stack.push(StackItem::int(0));
     } else {
         let prices = StoragePrices::construct_from(&mut slice.clone())?;
-        engine.cc.stack.push(StackItem::int(prices.calc_storage_fee(
-            cells,
-            bits,
-            delta,
-            is_masterchain,
-        )));
+        let fee = prices.calc_storage_fee_part(cells, bits, delta, is_masterchain);
+        let fee = (fee + 0xffffu32) >> 16;
+        engine.cc.stack.push(StackItem::int(fee));
     }
     Ok(())
 }

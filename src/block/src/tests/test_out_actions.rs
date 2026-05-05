@@ -105,7 +105,7 @@ fn test_unpack_out_action_slices_valid_list() {
     actions.push_back(OutAction::new_reserve(RESERVE_EXACTLY, CurrencyCollection::with_coins(1)));
 
     let actions_cell = actions.serialize().unwrap();
-    let slices = unpack_out_action_slices(SliceData::load_cell(actions_cell).unwrap()).unwrap();
+    let slices = unpack_out_action_slices(actions_cell).unwrap();
     assert_eq!(slices.len(), 2);
 
     let mut s0 = slices[0].clone();
@@ -115,6 +115,16 @@ fn test_unpack_out_action_slices_valid_list() {
 
     assert!(matches!(a0, OutAction::SetCode { .. }));
     assert!(matches!(a1, OutAction::ReserveCurrency { .. }));
+}
+
+/// Special (non-Ordinary) cell as action list root must be rejected.
+#[test]
+fn test_unpack_out_action_slices_rejects_special_cell() {
+    let special = Cell::default().as_library_cell();
+    assert_ne!(special.cell_type(), crate::CellType::Ordinary);
+
+    let (pos, _err) = unpack_out_action_slices(special).unwrap_err();
+    assert_eq!(pos, 0);
 }
 
 #[test]
@@ -127,14 +137,13 @@ fn test_unpack_out_action_slices_rejects_non_empty_tail() {
     OutAction::new_set(Cell::default()).write_to(&mut root).unwrap();
     let actions_cell = root.into_cell().unwrap();
 
-    assert!(unpack_out_action_slices(SliceData::load_cell(actions_cell).unwrap()).is_err());
+    assert!(unpack_out_action_slices(actions_cell).is_err());
 }
 
 #[test]
 fn test_deserialize_out_action_slices_valid_list() {
     let actions = get_out_actions();
-    let slice = SliceData::load_cell(actions.serialize().unwrap()).unwrap();
-    let slices = unpack_out_action_slices(slice).unwrap();
+    let slices = unpack_out_action_slices(actions.serialize().unwrap()).unwrap();
     assert_eq!(slices.len(), actions.len());
     for (expected, mut slice) in actions.into_iter().zip(slices.into_iter()) {
         let actual = OutAction::construct_from(&mut slice).unwrap();

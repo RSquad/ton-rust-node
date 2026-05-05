@@ -12,7 +12,7 @@ use crate::{
     error::{tvm_exception_code, tvm_exception_full, tvm_exception_or_custom_code, TvmError},
     executor::{
         continuation::{switch, switch_to_c0},
-        engine::handlers::Handlers,
+        engine::{fix_gas::check_too_short_code, handlers::Handlers},
         gas::gas_state::Gas,
         math::DivMode,
         microcode::{CTRL, VAR},
@@ -558,7 +558,6 @@ impl Engine {
             }
         }
     }
-
     pub fn execute(&mut self) -> Result<i32> {
         self.trace_info(EngineTraceInfoType::Start, 0, None);
         let result = loop {
@@ -566,11 +565,25 @@ impl Engine {
                 break result;
             }
             self.cmd_code = SliceProto::from(self.cc.code());
+            if let Some((prefix, bits, gas)) = check_too_short_code(self.cc.code_mut())? {
+                let err = match self.try_use_gas(gas as i64) {
+                    Err(err) => err,
+                    Ok(_) => error!(
+                        ExceptionCode::InvalidOpcode,
+                        "partial primitive with bits {bits} : 0x{prefix:X}",
+                    ),
+                };
+                self.step += 1;
+                self.raise_exception(err)?;
+            }
             let execution_result = match HANDLERS_CP0.get_handler(self) {
-                Err(err) => match self.basic_use_gas(8) {
-                    Err(err) => Some(err),
-                    Ok(_) => Some(err),
-                },
+                Err(err) => {
+                    self.step += 1;
+                    match self.basic_use_gas(8) {
+                        Err(err) => Some(err),
+                        Ok(_) => Some(err),
+                    }
+                }
                 Ok(Some(handler)) => {
                     match handler(self) {
                         Err(e) => {

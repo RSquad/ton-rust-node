@@ -68,7 +68,7 @@ const RESULT_CODE_LIB_BAD_CELL: i32 = 41;
 const RESULT_CODE_LIB_BAD_ACCOUNT_STATE: i32 = 42;
 const RESULT_CODE_LIB_EXCEEDED_LIMITS: i32 = 43;
 
-const MAX_ACTIONS: usize = 255;
+pub(crate) const MAX_ACTIONS: usize = 255;
 
 static SPECIAL_LIMIT_ACCOUNTS: LazyLock<HashMap<MsgAddressInt, (u32, u64)>> = LazyLock::new(|| {
     let limits = [
@@ -535,23 +535,22 @@ pub trait TransactionExecutor {
         let mut total_reserved_value = Coins::default();
         let mut bounce = false;
         phase.action_list_hash = actions_cell.repr_hash().clone();
-        let action_slices =
-            match SliceData::load_cell(actions_cell).and_then(unpack_out_action_slices) {
-                Err(err) => {
-                    log::debug!(
-                        target: "executor",
-                        "cannot parse action list: format is invalid, err: {}",
-                        err
-                    );
-                    phase.result_code = RESULT_CODE_ACTIONLIST_INVALID;
-                    return Ok(ActionPhaseResult::from_phase(phase, bounce));
-                }
-                Ok(actions) => actions,
-            };
-
+        let action_slices = match unpack_out_action_slices(actions_cell) {
+            Ok(actions) => actions,
+            Err((position, err)) => {
+                log::debug!(
+                    target: "executor",
+                    "action list invalid at position {position}: {err}"
+                );
+                phase.result_code = RESULT_CODE_ACTIONLIST_INVALID;
+                phase.result_arg = Some(position as i32);
+                return Ok(ActionPhaseResult::from_phase(phase, bounce));
+            }
+        };
         if action_slices.len() > MAX_ACTIONS {
             log::debug!(target: "executor", "too many actions: {}", action_slices.len());
             phase.result_code = RESULT_CODE_TOO_MANY_ACTIONS;
+            phase.result_arg = Some(MAX_ACTIONS as i32 + 1);
             return Ok(ActionPhaseResult::from_phase(phase, bounce));
         }
         phase.tot_actions = action_slices.len() as i16;
@@ -599,6 +598,8 @@ pub trait TransactionExecutor {
             let Some(mut slice) = slice else {
                 continue;
             };
+            // set result_arg to index of failed action in case of error
+            phase.result_arg = Some(i as i32);
             let mut init_balance = acc_remaining_balance.clone();
             let mut err_code = match OutAction::construct_from(&mut slice) {
                 Ok(OutAction::SendMsg { mode, mut out_msg }) => {
@@ -737,9 +738,6 @@ pub trait TransactionExecutor {
                 log::debug!(target: "executor", "action failed: error_code={}", err_code);
                 phase.valid = true;
                 phase.result_code = err_code;
-                if i != 0 {
-                    phase.result_arg = Some(i as i32);
-                }
                 if err_code == RESULT_CODE_NOT_ENOUGH_COINS
                     || err_code == RESULT_CODE_NOT_ENOUGH_EXTRA
                 {
@@ -803,6 +801,8 @@ pub trait TransactionExecutor {
         log::debug!(target: "executor", "Total action fees: {}", fee);
         tr.add_fee_coins(&fee)?;
 
+        // Reset result_arg on success
+        phase.result_arg = None;
         phase.success = true;
         *acc_balance = acc_remaining_balance;
         *acc = acc_copy;

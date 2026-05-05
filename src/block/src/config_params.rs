@@ -1381,7 +1381,7 @@ impl StoragePrices {
         Self::default()
     }
 
-    pub fn calc_storage_fee(
+    pub fn calc_storage_fee_part(
         &self,
         cells: u64,
         bits: u64,
@@ -1390,10 +1390,8 @@ impl StoragePrices {
     ) -> BigInt {
         let bit_price = if is_masterchain { self.mc_bit_price_ps } else { self.bit_price_ps };
         let cell_price = if is_masterchain { self.mc_cell_price_ps } else { self.cell_price_ps };
-        (BigInt::from(delta)
-            * (bits as u128 * bit_price as u128 + cells as u128 * cell_price as u128)
-            + 0xffff)
-            >> 16u8
+        let total = bits as u128 * bit_price as u128 + cells as u128 * cell_price as u128;
+        BigInt::from(delta) * total
     }
 }
 

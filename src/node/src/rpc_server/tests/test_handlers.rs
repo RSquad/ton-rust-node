@@ -25,9 +25,9 @@ use crate::{
 use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use ton_block::{
-    base64_encode, error, Account, AccountIdPrefixFull, BlockIdExt, BuilderData, ConfigParam8,
-    ConfigParamEnum, ConfigParams, GlobalVersion, LibDescr, Libraries, MsgAddressInt, Result,
-    ShardIdent, UInt256,
+    base64_decode, base64_encode, error, read_single_root_boc, Account, AccountIdPrefixFull,
+    BlockIdExt, BuilderData, ConfigParam8, ConfigParamEnum, ConfigParams, Deserializable,
+    GlobalVersion, HashmapE, LibDescr, Libraries, MsgAddressInt, Result, ShardIdent, UInt256,
 };
 use warp::Reply;
 
@@ -653,6 +653,41 @@ async fn test_get_libraries() {
     pretty_assertions::assert_eq!(response["@type"].as_str().unwrap(), "smc.libraryResult");
     let libraries = response["result"].as_array().unwrap();
     pretty_assertions::assert_eq!(libraries.len(), 0);
+}
+
+#[tokio::test]
+async fn test_get_libraries_ext() {
+    let account = gen_test_account();
+    let (registry, master_state) = build_registry(&account);
+
+    let response = call_jsonrpc(&registry, "getLibrariesExt", serde_json::json!({})).await;
+    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
+    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+
+    let result = response["result"].clone();
+    pretty_assertions::assert_eq!(result["@type"], serde_json::json!("smc.libraryResultExt"));
+    pretty_assertions::assert_eq!(result["block_id"], serialize_block_id(master_state.block_id()));
+    pretty_assertions::assert_eq!(result["libraries_count"], serde_json::json!(2));
+
+    let dict_boc = result["dict_boc"].as_str().unwrap();
+    assert!(!dict_boc.is_empty());
+
+    let root = read_single_root_boc(base64_decode(dict_boc).unwrap()).unwrap();
+    let raw_libraries = HashmapE::with_hashmap(256, Some(root));
+    let source_libraries = master_state.state().unwrap().libraries();
+
+    source_libraries
+        .iterate_slices_with_keys(|mut key, mut value| -> Result<bool> {
+            let hash = UInt256::construct_from(&mut key)?;
+            let descr = LibDescr::construct_from(&mut value)?;
+            let bucket = raw_libraries.get(hash.clone().into())?.expect("library entry must exist");
+            let lib = bucket.reference(0).expect("raw dict value must point to code");
+            pretty_assertions::assert_eq!(*lib.repr_hash(), hash);
+            pretty_assertions::assert_eq!(lib, descr.lib().clone());
+            Ok(true)
+        })
+        .unwrap();
 }
 
 #[tokio::test]

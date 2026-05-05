@@ -569,7 +569,7 @@ fn test_raw_reserve_with_flag4() {
         "real_boc/raw_reserve_with_flag4_transaction.boc",
         "real_boc/config.boc",
         "",
-        "real_boc/raw_reserve_with_flag4_libs.boc",
+        "real_boc/libs.boc",
     )
 }
 
@@ -597,13 +597,11 @@ fn test_msg_cell_fine_calc() {
 // account must be uninitialized if not enough value to compute
 #[test]
 fn test_state_init_nogas() {
-    replay_transaction_full(
+    replay_transaction_by_files(
         "real_boc/empty_account.boc",
         "real_boc/state_init_nogas_abc17907_account_new.boc",
         "real_boc/state_init_nogas_abc17907_transaction.boc",
         "real_boc/config.boc",
-        "",
-        "",
     );
 }
 
@@ -611,51 +609,87 @@ fn test_state_init_nogas() {
 // account must be uninitialized if not enough value to compute
 #[test]
 fn test_non_bounce_with_state_init_nogas() {
-    replay_transaction_full(
+    replay_transaction_by_files(
         "real_boc/empty_account.boc",
         "real_boc/non_bounce_with_state_init_nogas_account_new.boc",
         "real_boc/non_bounce_with_state_init_nogas_transaction.boc",
         "real_boc/config.boc",
-        "",
-        "",
     );
 }
 
 #[test]
 fn test_pruned_cell_load_tx() {
-    replay_transaction_full(
+    replay_transaction_by_files(
         "real_boc/pruned_cell_load_account_old.boc",
         "real_boc/pruned_cell_load_account_new.boc",
         "real_boc/pruned_cell_load_transaction.boc",
         "real_boc/config.boc",
-        "",
-        "",
     )
 }
 
 // account has anycast in address
 #[test]
 fn test_with_anycast() {
-    replay_transaction_full(
+    replay_transaction_by_files(
         "real_boc/with_anycast_account_old.boc",
         "real_boc/with_anycast_account_new.boc",
         "real_boc/with_anycast_transaction.boc",
         "real_boc/config.boc",
-        "",
-        "",
     );
 }
 
 #[test]
 fn test_with_bad_anycast() {
-    replay_transaction_full(
+    replay_transaction_by_files(
         "real_boc/with_bad_anycast_account_old.boc",
         "real_boc/with_bad_anycast_account_new.boc",
         "real_boc/with_bad_anycast_transaction.boc",
         "real_boc/config.boc",
-        "",
-        "",
     );
+}
+
+#[test]
+fn test_new_storage_prices() {
+    replay_transaction_full(
+        "real_boc/new_storage_prices_account_old.boc",
+        "real_boc/new_storage_prices_account_new.boc",
+        "real_boc/new_storage_prices_transaction.boc",
+        "real_boc/config13.boc",
+        "",
+        "real_boc/libs.boc",
+    )
+}
+
+#[test]
+fn test_storage_fee_round() {
+    replay_transaction_full(
+        "real_boc/storage_fee_round_account_old.boc",
+        "real_boc/storage_fee_round_account_new.boc",
+        "real_boc/storage_fee_round_transaction.boc",
+        "real_boc/config13.boc",
+        "",
+        "real_boc/libs.boc",
+    )
+}
+
+#[test]
+fn test_sendmsg_no_root_gas() {
+    replay_transaction_by_files(
+        "real_boc/sendmsg_no_root_gas_account_old.boc",
+        "real_boc/sendmsg_no_root_gas_account_new.boc",
+        "real_boc/sendmsg_no_root_gas_transaction.boc",
+        "real_boc/config13.boc",
+    )
+}
+
+#[test]
+fn test_action_result_arg() {
+    replay_transaction_by_files(
+        "real_boc/action_result_arg_account_old.boc",
+        "real_boc/action_result_arg_account_new.boc",
+        "real_boc/action_result_arg_transaction.boc",
+        "real_boc/config13.boc",
+    )
 }
 
 #[ignore = "test for replay transaction by message from transaction"]
@@ -762,13 +796,16 @@ fn test_bad_single() {
 fn test_bad_trans() {
     let json = "../../emulator/emulator_test.json";
     let prefix = "real_boc/bad_".to_string();
-    let libs = std::path::PathBuf::from(json).parent().unwrap().join("libs.boc");
-    let libs = libs.to_string_lossy();
+    // let libs: std::path::PathBuf = std::path::PathBuf::from(json).parent().unwrap().join("libs.boc");
+    // let libs = libs.to_string_lossy();
     let json = std::fs::read_to_string(json).unwrap();
     let json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
     let acc = json["shard_account_boc"].as_str().unwrap();
     let tr = json["tx_boc"].as_str().unwrap();
     let prev = json["prev_blocks_info_boc"].as_str().unwrap();
+    let libs = json["libs_boc"].as_str().unwrap();
+    let cfg = json["config_params_boc"].as_str().unwrap();
+    // let cfg = "real_boc/config.boc";
     let shard_acc = ShardAccount::construct_from_base64(acc).unwrap();
     BocWriter::with_root(&shard_acc.account_cell())
         .unwrap()
@@ -779,13 +816,8 @@ fn test_bad_trans() {
         .write_to_file(prefix.clone() + "account_new.boc")
         .unwrap();
     std::fs::write(prefix.clone() + "transaction.boc", base64_decode(tr).unwrap()).unwrap();
+    std::fs::write("real_boc/libs.boc", base64_decode(libs).unwrap()).unwrap();
+    std::fs::write("real_boc/config13.boc", base64_decode(cfg).unwrap()).unwrap();
 
-    replay_transaction_full(
-        acc,
-        &(prefix + "account_new.boc"),
-        tr,
-        "real_boc/config.boc",
-        prev,
-        &libs,
-    );
+    replay_transaction_full(acc, &(prefix + "account_new.boc"), tr, cfg, prev, &libs);
 }

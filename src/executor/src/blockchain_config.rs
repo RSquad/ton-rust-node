@@ -93,13 +93,12 @@ impl AccStoragePrices {
 
             if end >= last_paid {
                 let delta = end - prices.utime_since.max(last_paid);
-                fee += prices.calc_storage_fee(cells, bits, delta as u64, is_masterchain);
+                fee += prices.calc_storage_fee_part(cells, bits, delta as u64, is_masterchain);
                 last_paid = end;
             }
         }
-
-        let fee = fee.try_into()?;
-        Ok(fee)
+        fee = (fee + 0xffffu32) >> 16;
+        Ok(fee.try_into()?)
     }
 
     fn with_config(config: &ConfigParam18) -> Result<Self> {
@@ -137,6 +136,37 @@ impl DefaultConfig for GasLimitsPrices {
             delete_due_limit: 1000000000,
             max_gas_threshold: 1000000000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calc_storage_fees_rounds_after_summing_intervals() {
+        let prices = AccStoragePrices {
+            prices: vec![
+                StoragePrices {
+                    utime_since: 1,
+                    bit_price_ps: 0,
+                    cell_price_ps: 1,
+                    mc_bit_price_ps: 0,
+                    mc_cell_price_ps: 1,
+                },
+                StoragePrices {
+                    utime_since: 2,
+                    bit_price_ps: 0,
+                    cell_price_ps: 1,
+                    mc_bit_price_ps: 0,
+                    mc_cell_price_ps: 1,
+                },
+            ],
+        };
+
+        let fee = prices.calc_storage_fees(1, 0, 1, 65_537, false).unwrap();
+
+        assert_eq!(fee, 1);
     }
 }
 

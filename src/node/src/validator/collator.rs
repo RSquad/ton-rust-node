@@ -256,6 +256,7 @@ struct CollatorData {
     accepted_ext_messages: Vec<(UInt256, i32)>, // message id and wokchain id
     rejected_ext_messages: Vec<(UInt256, String)>, // message id and reject reason
     usage_tree: UsageTree,
+    external_messages: Vec<(Arc<Message>, UInt256)>, // for bundle in case of error
     imported_visited: HashSet<UInt256>,
     last_dispatch_queue_emitted_lt: HashMap<AccountId, u64>,
     unprocessed_deferred_messages: HashMap<AccountId, usize>, // number of messages from dispatch queue in new_msgs
@@ -336,6 +337,7 @@ impl CollatorData {
             accepted_ext_messages: Default::default(),
             rejected_ext_messages: Default::default(),
             usage_tree,
+            external_messages: Vec::new(),
             imported_visited: HashSet::new(),
             unprocessed_deferred_messages: HashMap::new(),
             sender_generated_messages_count: HashMap::new(),
@@ -758,6 +760,10 @@ impl CollatorData {
         Ok(self.has_unprocessed_deferred_messages(account_id)
             || self.has_dispatch_queue(account_id)?)
     }
+
+    fn reject_ext_message(&mut self, msg_id: UInt256, reason: impl ToString) {
+        self.rejected_ext_messages.push((msg_id, reason.to_string()));
+    }
 }
 
 type MessageSender = tokio::sync::mpsc::UnboundedSender<(Arc<AsyncMessage>, Option<MsgMetadata>)>;
@@ -860,9 +866,14 @@ impl ExecutionManager {
             let shard_acc = if let Some(shard_acc) = prev_data.accounts().account(&account_id)? {
                 shard_acc
             } else if let AsyncMessage::Ext(_, _, msg_id) = msg {
+                log::trace!(
+                    "{}: account {:x} not found for external message {:x}, rejecting",
+                    self.collated_block_descr,
+                    account_id,
+                    msg_id
+                );
                 collator_data
-                    .rejected_ext_messages
-                    .push((msg_id, format!("account {:x} not found", account_id)));
+                    .reject_ext_message(msg_id, format!("account {:x} not found", account_id));
                 return Ok(true); // skip external messages for unexisting accounts
             } else {
                 ShardAccount::default()
@@ -1065,6 +1076,7 @@ impl ExecutionManager {
                 collator_data
                     .accepted_ext_messages
                     .push((msg_id.clone(), msg.dst_workchain_id().unwrap_or_default()));
+                collator_data.external_messages.push((msg.clone(), msg_id.clone()));
             }
         }
         let tr = transaction_res?;
@@ -1250,6 +1262,7 @@ pub enum CollateResult {
     },
     Err {
         usage_tree: UsageTree,
+        external_messages: Vec<(Arc<Message>, UInt256)>,
         err: Error,
     },
 }
@@ -1454,8 +1467,11 @@ impl Collator {
                         error_attempt += 1;
                         continue;
                     } else {
-                        let collate_result =
-                            CollateResult::Err { usage_tree: collator_data.usage_tree, err };
+                        let collate_result = CollateResult::Err {
+                            usage_tree: collator_data.usage_tree,
+                            external_messages: collator_data.external_messages,
+                            err,
+                        };
                         return Ok(collate_result);
                     }
                 }

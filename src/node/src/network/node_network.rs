@@ -330,6 +330,14 @@ impl NodeNetwork {
         }
     }
 
+    pub(crate) fn start_periodic_store_ip_addr(
+        dht: Arc<DhtNode>,
+        node_key: Arc<dyn KeyOption>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) {
+        Self::periodic_store_ip_addr(dht, node_key, None, cancellation_token);
+    }
+
     fn periodic_store_ip_addr(
         dht: Arc<DhtNode>,
         node_key: Arc<dyn KeyOption>,
