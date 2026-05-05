@@ -258,15 +258,13 @@ impl VoteAddCmd {
             }
         };
 
-        if fetch_tracked_lower(base_url, token).await?.contains(&selected_hash.to_lowercase()) {
-            println!("Proposal {selected_hash} is already tracked");
-            return Ok(());
-        }
-
         let body = serde_json::json!({ "hash": selected_hash });
         api_post(base_url, "/v1/voting/proposals", token, &body).await?;
 
-        println!("{} proposal {selected_hash} added to voting config", "OK".green().bold());
+        println!(
+            "{} proposal {selected_hash} tracked (newly added or already in config)",
+            "OK".green().bold()
+        );
         Ok(())
     }
 }
@@ -302,8 +300,7 @@ impl VoteRmCmd {
             }
         };
 
-        let path =
-            format!("/v1/voting/proposals/{}", parse_proposal_hash_hex_normalized(&selected_hash)?);
+        let path = format!("/v1/voting/proposals/{selected_hash}");
         api_delete(base_url, &path, token).await?;
 
         println!("{} proposal {} removed from voting config", "OK".green().bold(), selected_hash);
@@ -336,10 +333,6 @@ async fn fetch_tracked_hashes(base_url: &str, token: Option<&str>) -> anyhow::Re
         .and_then(|p| p.as_array())
         .ok_or_else(|| anyhow::anyhow!("voting config: missing result.proposals"))?;
     Ok(arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-}
-
-async fn fetch_tracked_lower(base_url: &str, token: Option<&str>) -> anyhow::Result<Vec<String>> {
-    Ok(fetch_tracked_hashes(base_url, token).await?.into_iter().map(|h| h.to_lowercase()).collect())
 }
 
 fn parse_proposal_hash_hex_normalized(s: &str) -> anyhow::Result<String> {

@@ -1186,7 +1186,7 @@ pub async fn v1_voting_proposals_add_handler(
     let already = cfg
         .voting
         .as_ref()
-        .is_some_and(|v| v.proposals.iter().any(|h| h.to_lowercase() == hash_hex));
+        .is_some_and(|v| v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)));
     drop(cfg);
     if already {
         return Ok(axum::Json(EntityRefResponse {
@@ -1197,11 +1197,12 @@ pub async fn v1_voting_proposals_add_handler(
 
     let rpc = state.runtime_cfg.rpc_client();
     let config_contract = ConfigContractImpl::new(contract_provider!(rpc));
-    let proposals = config_contract
-        .list_proposals()
+    let exists = config_contract
+        .get_proposal(hash_bytes)
         .await
-        .map_err(|e| AppError::internal(format!("list_proposals: {e}")))?;
-    if !proposals.iter().any(|p| p.hash == hash_bytes) {
+        .map_err(|e| AppError::internal(format!("get_proposal: {e}")))?
+        .is_some();
+    if !exists {
         return Err(AppError::bad_request(format!(
             "proposal {hash_hex} is not among active on-chain proposals"
         )));
@@ -1209,13 +1210,13 @@ pub async fn v1_voting_proposals_add_handler(
 
     state
         .runtime_cfg
-        .update_and_save(|cfg| match cfg.voting.as_mut() {
-            Some(v) => v.proposals.push(hash_hex.clone()),
-            None => {
-                cfg.voting = Some(VotingConfig {
-                    proposals: vec![hash_hex.clone()],
-                    tick_interval: VOTING_TICK_INTERVAL_DEFAULT_SECS,
-                });
+        .update_and_save(|cfg| {
+            let v = cfg.voting.get_or_insert_with(|| VotingConfig {
+                proposals: vec![],
+                tick_interval: VOTING_TICK_INTERVAL_DEFAULT_SECS,
+            });
+            if !v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)) {
+                v.proposals.push(hash_hex.clone());
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -1242,17 +1243,17 @@ pub async fn v1_voting_proposals_rm_handler(
     state: axum::extract::State<AppState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
-    let _ = parse_voting_proposal_hash_hex(&hash)?;
-    let hash_norm = hash.trim().to_lowercase();
+    let hash_bytes = parse_voting_proposal_hash_hex(&hash)?;
+    let hash_hex = hex::encode(hash_bytes);
 
     let cfg = state.runtime_cfg.get();
     let in_list = cfg
         .voting
         .as_ref()
-        .is_some_and(|v| v.proposals.iter().any(|h| h.to_lowercase() == hash_norm));
+        .is_some_and(|v| v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)));
     if !in_list {
         return Err(AppError::not_found(format!(
-            "proposal '{hash_norm}' is not in the voting tracked list"
+            "proposal '{hash_hex}' is not in the voting tracked list"
         )));
     }
     drop(cfg);
@@ -1261,13 +1262,13 @@ pub async fn v1_voting_proposals_rm_handler(
         .runtime_cfg
         .update_and_save(|cfg| {
             if let Some(v) = cfg.voting.as_mut() {
-                v.proposals.retain(|h| h.to_lowercase() != hash_norm);
+                v.proposals.retain(|h| !h.eq_ignore_ascii_case(&hash_hex));
             }
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
-    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: hash_norm } }))
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: hash_hex } }))
 }
 
 // ---------------------------------------------------------------------------
