@@ -58,7 +58,7 @@ use ton_api::{
 };
 use ton_block::{
     base64_encode, error, AccountIdPrefixFull, BlockIdExt, BlockSignaturesVariant, Cell,
-    ConfigParams, ImportedMsgQueueLimits, KeyOption, Result, ShardIdent, ValidatorDescr,
+    ConfigParams, ImportedMsgQueueLimits, KeyId, KeyOption, Result, ShardIdent, ValidatorDescr,
     ValidatorSet, BASE_WORKCHAIN_ID,
 };
 
@@ -89,6 +89,7 @@ pub struct FullNodeOverlaysRouter {
     last_known_keyblock_id: tokio::sync::Mutex<BlockIdExt>,
     actual_monitor_min_split: AtomicU8,
     monitor_min_split_worker_started: AtomicBool,
+    fast_sync_peer_resolver: tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 impl FullNodeOverlaysRouter {
@@ -119,6 +120,7 @@ impl FullNodeOverlaysRouter {
             last_known_keyblock_id: tokio::sync::Mutex::new(BlockIdExt::default()),
             actual_monitor_min_split,
             monitor_min_split_worker_started: AtomicBool::new(false),
+            fast_sync_peer_resolver: tokio::sync::Mutex::new(None),
         });
         futures::try_join!(
             overlays_router.overlay_client(&ShardIdent::MASTERCHAIN),
@@ -345,10 +347,10 @@ impl FullNodeOverlaysRouter {
             let mut last_known_id = self.last_known_keyblock_id.lock().await;
             if last_known_id.seq_no >= keyblock_id.seq_no {
                 log::info!(
-                "Skipping monitor min split update for key block {}: last known key block is {}",
-                keyblock_id,
-                *last_known_id
-            );
+                    "Skipping monitor min split update for key block {}: last known key block is {}",
+                    keyblock_id,
+                    *last_known_id
+                );
                 return Ok(());
             }
             *last_known_id = keyblock_id.clone();
@@ -389,7 +391,13 @@ impl FullNodeOverlaysRouter {
         let prev_vset = config.prev_validator_set()?;
         let this_vset = config.validator_set()?;
         let next_vset = config.next_validator_set()?;
-        let key = self.try_get_our_key(&this_vset)?;
+        let key = if let Some(k) = self.try_get_our_key(&this_vset)? {
+            Some(k)
+        } else if let Some(k) = self.try_get_our_key(&prev_vset)? {
+            Some(k)
+        } else {
+            self.try_get_our_key(&next_vset)?
+        };
         let mc_use_quic = config.get_mc_simplex_config()?.map_or(false, |c| c.use_quic);
         let shard_use_quic = config.get_shard_simplex_config()?.map_or(false, |c| c.use_quic);
         self.update_fast_sync_overlays(
@@ -540,11 +548,57 @@ impl FullNodeOverlaysRouter {
             update_monitor_min_split(old_monitor_min_split, false).await?;
         }
 
-        if key.is_none() {
+        let Some(local_key) = key else {
             self.monitor_min_split_for_fast_sync.store(new_monitor_min_split, Ordering::Relaxed);
             log::info!("We are not a validator");
             *cur_validators = this_validators.clone();
+            if let Some(prev) = self.fast_sync_peer_resolver.lock().await.take() {
+                prev.cancel();
+            }
             return Ok(());
+        };
+
+        // Resolve ADNL addresses for fastsync root members (prev/this/next union)
+        // OverlayNode::pending_peers retry promotes peers automatically as soon
+        // as they appear in ADNL.
+        let local_key_id = local_key.id().clone();
+        let adnl = &self.network.context().stack.adnl;
+        let mut to_resolve: Vec<Arc<KeyId>> = Vec::new();
+        let mut seen: HashSet<Arc<KeyId>> = HashSet::new();
+        for vd in &validators {
+            let adnl_id = vd.adnl_addr();
+            if !seen.insert(adnl_id.clone()) {
+                continue;
+            }
+            if adnl_id == local_key_id {
+                continue;
+            }
+            if matches!(adnl.peer_ip_address(&local_key_id, &adnl_id), Ok(Some(_))) {
+                continue;
+            }
+            to_resolve.push(adnl_id);
+        }
+        {
+            let mut slot = self.fast_sync_peer_resolver.lock().await;
+            if let Some(prev) = slot.take() {
+                prev.cancel();
+            }
+            if !to_resolve.is_empty() {
+                log::info!(
+                    "fastsync: scheduling DHT resolve for {} peers under {local_key_id}",
+                    to_resolve.len()
+                );
+                let token = self.network.cancellation_token().child_token();
+                NodeNetwork::spawn_overlay_peer_resolver(
+                    local_key_id.clone(),
+                    to_resolve,
+                    self.network.context().stack.dht.clone(),
+                    self.network.context().stack.overlay.clone(),
+                    token.clone(),
+                    "fastsync".to_string(),
+                );
+                *slot = Some(token);
+            }
         }
 
         // Update masterchain overlay

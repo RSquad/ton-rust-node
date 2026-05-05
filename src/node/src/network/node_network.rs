@@ -419,6 +419,87 @@ impl NodeNetwork {
         });
     }
 
+    /// Spawn a background task that DHT-resolves ADNL addresses for a list of
+    /// overlay peer KeyIds and registers them under `local_key_id` via
+    /// `OverlayNode::add_private_peers_to_adnl`. The task retries unresolved
+    /// peers with a fixed 1-second backoff and exits when all are resolved or
+    /// `cancellation_token` fires. Empty input is a no-op.
+    ///
+    /// `label` prefixes log lines so callers can disambiguate (overlay short
+    /// id, "fastsync", etc.).
+    pub fn spawn_overlay_peer_resolver(
+        local_key_id: Arc<KeyId>,
+        peers: Vec<Arc<KeyId>>,
+        dht: Arc<DhtNode>,
+        overlay: Arc<OverlayNode>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        label: String,
+    ) {
+        if peers.is_empty() {
+            return;
+        }
+        spawn_cancelable(cancellation_token, async move {
+            let mut peers = peers;
+            loop {
+                match Self::resolve_overlay_peers_round(&local_key_id, &dht, &overlay, peers).await
+                {
+                    Ok(unresolved) => peers = unresolved,
+                    Err(e) => {
+                        log::warn!("{label}: UNEXPECTED ERROR while resolving peers: {e}");
+                        break;
+                    }
+                }
+                if peers.is_empty() {
+                    log::info!("{label} resolve_peers: finished.");
+                    break;
+                } else {
+                    log::debug!("{label} resolve_peers: {} peers still unresolved.", peers.len());
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    async fn resolve_overlay_peers_round(
+        local_key_id: &Arc<KeyId>,
+        dht: &Arc<DhtNode>,
+        overlay: &Arc<OverlayNode>,
+        peers: Vec<Arc<KeyId>>,
+    ) -> Result<Vec<Arc<KeyId>>> {
+        let mut unresolved = Vec::new();
+        for peer in peers {
+            match dht
+                .find_address(&mut AddressSearchContext::with_params(
+                    &peer,
+                    DhtSearchPolicy::default(),
+                )?)
+                .await
+            {
+                Ok(Some((adnl_addr, quic_addr, key))) => {
+                    match &quic_addr {
+                        Some(q) => log::info!(
+                            "peer {peer}: resolved adnl {adnl_addr} quic {q}, key {key:x?}"
+                        ),
+                        None => log::info!("peer {peer}: resolved adnl {adnl_addr}, key {key:x?}"),
+                    }
+                    overlay.add_private_peers_to_adnl(
+                        local_key_id,
+                        vec![(adnl_addr, quic_addr, key)],
+                    )?;
+                }
+                Ok(None) => {
+                    log::warn!("find address for {peer} failed");
+                    unresolved.push(peer);
+                }
+                Err(e) => {
+                    log::warn!("find address for {peer} failed: {e}");
+                    unresolved.push(peer);
+                }
+            }
+        }
+        Ok(unresolved)
+    }
+
     async fn search_validator_keys_round<'a>(
         local_adnl_id: Arc<KeyId>,
         adnl: &'a AdnlNode,

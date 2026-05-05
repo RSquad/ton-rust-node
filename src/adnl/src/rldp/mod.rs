@@ -1092,6 +1092,7 @@ impl RldpNode {
         };
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
+        let mut last_diag_ms = start_ms;
         let mut updates = recv_state.updates();
         loop {
             match tokio::time::timeout(Duration::from_millis(Self::SPINNER_MS), pong.recv()).await {
@@ -1112,6 +1113,20 @@ impl RldpNode {
                     target: TARGET,
                     "Recv updates {updates} -> {new_updates} in {transfer_str}"
                 );
+                let timestamp_ms = peer.stats.v1.timestamp_ms();
+                let elapsed_ms = timestamp_ms - start_ms;
+                let timeout = peer.stats.v1.timeout();
+                if (timeout > 0)
+                    && (elapsed_ms / timeout > 10)
+                    && (timestamp_ms - last_diag_ms > Self::TIMEOUT_WARN_MS)
+                {
+                    log::warn!(
+                        target: TARGET,
+                        "RLDP query recv {transfer_str} masked timeout: \
+                         elapsed {elapsed_ms} ms > 10*{timeout} ms, updates {new_updates}"
+                    );
+                    last_diag_ms = timestamp_ms;
+                }
                 peer.stats.v1.update(self.min_timeout_ms);
                 updates = new_updates;
             } else if peer.stats.v1.try_timeout(start_ms) {
@@ -1140,7 +1155,21 @@ impl RldpNode {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "from");
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
         let spin = Duration::from_millis(Self::ACK_DELAY_MS);
+        let start = std::time::Instant::now();
+        let mut last_diag = start;
         loop {
+            if (start.elapsed() > Duration::from_millis(Self::TIMEOUT_MAX_MS))
+                && (last_diag.elapsed() > Duration::from_millis(Self::TIMEOUT_WARN_MS))
+            {
+                let received = context.recv_transfer.data.len();
+                let total = context.recv_transfer.total_size.unwrap_or(0);
+                log::warn!(
+                    target: TARGET,
+                    "{rldp} receive_loop {transfer_str} running {} ms, {received}/{total} bytes",
+                    start.elapsed().as_millis()
+                );
+                last_diag = std::time::Instant::now();
+            }
             let job = match tokio::time::timeout(spin, context.queue_reader.recv()).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
@@ -1206,6 +1235,7 @@ impl RldpNode {
         };
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
+        let mut last_diag_ms = start_ms;
         #[cfg(feature = "debug")]
         let mut last_seqno = 0;
         #[cfg(any(feature = "debug", feature = "telemetry"))]
@@ -1291,6 +1321,20 @@ impl RldpNode {
                         &transfer_str,
                         "RLDPv1 send",
                     );
+                    let timestamp_ms = peer.stats.v1.timestamp_ms();
+                    let elapsed_ms = timestamp_ms - start_ms;
+                    let timeout = peer.stats.v1.timeout();
+                    if (timeout > 0)
+                        && (elapsed_ms / timeout > 10)
+                        && (timestamp_ms - last_diag_ms > Self::TIMEOUT_WARN_MS)
+                    {
+                        log::warn!(
+                            target: TARGET,
+                            "RLDPv1 send {transfer_str} masked timeout: \
+                             elapsed {elapsed_ms} ms > 10*{timeout} ms, recv_seqno {new_recv_seqno}"
+                        );
+                        last_diag_ms = timestamp_ms;
+                    }
                     peer.stats.v1.update(min_timeout_ms);
                     recv_seqno = new_recv_seqno;
                 } else if peer.stats.v1.try_timeout(start_ms) {
@@ -1448,6 +1492,7 @@ impl RldpNode {
         let mut updates = 0;
         let mut new_received = 0;
         let mut last_warn_ms = context.peer.stats.v1.timestamp_ms();
+        let mut last_diag_ms = last_warn_ms;
         transfer.start()?;
         let ok = loop {
             if let Some(ok) = transfer.state().is_finished() {
@@ -1466,6 +1511,22 @@ impl RldpNode {
                     &context.transfer_str,
                     "RLDPv2 send",
                 );
+                let timestamp_ms = context.peer.stats.v1.timestamp_ms();
+                let elapsed_ms = timestamp_ms - start_ms;
+                let timeout = context.peer.stats.v1.timeout();
+                if (timeout > 0)
+                    && (elapsed_ms / timeout > 10)
+                    && (timestamp_ms - last_diag_ms > Self::TIMEOUT_WARN_MS)
+                {
+                    log::warn!(
+                        target: TARGET,
+                        "RLDPv2 send {} part {part} masked timeout: \
+                         elapsed {elapsed_ms} ms > 10*{timeout} ms, updates {}",
+                        context.transfer_str,
+                        updates + new_received
+                    );
+                    last_diag_ms = timestamp_ms;
+                }
                 context.peer.stats.v1.update(min_timeout_ms);
                 updates += new_received
             } else if context.peer.stats.v1.try_timeout(start_ms) {
