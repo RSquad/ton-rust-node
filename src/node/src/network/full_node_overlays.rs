@@ -19,7 +19,7 @@ use crate::{
         node_network::NodeNetwork, overlay_client::OverlayClient, pack_block_signatures,
     },
     types::{awaiters_pool::AwaitersPool, top_block_descr::TopBlockDescrStuff},
-    validator::validator_utils::compute_validator_list_id,
+    validator::validator_utils::{compute_validator_list_id, get_adnl_id, sigpubkey_to_publickey},
 };
 #[cfg(feature = "xp25")]
 use adnl::OverlayNode;
@@ -30,6 +30,7 @@ use adnl::{
 };
 use std::{
     collections::HashSet,
+    net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
@@ -382,6 +383,158 @@ impl FullNodeOverlaysRouter {
         }
         self.actual_monitor_min_split.store(new_mms, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub(crate) async fn special_update_fastsync_overlays(self: &Arc<Self>) -> Result<()> {
+        // Special case: create fast sync overlays when we are a validator from the
+        // previous set. The normal flow (update_validator_lists in validator_manager)
+        // only processes current and next sets, so the prev set ADNL key is never
+        // loaded and fast sync overlays are not created at startup.
+
+        // 0) Load last master state and config
+        let mc_state = self.engine.load_last_applied_mc_state().await?;
+        let config = mc_state.config_params()?;
+
+        // 1) Read prev validator set
+        let prev_vset = config.prev_validator_set()?;
+        let cur_vset = config.validator_set()?;
+        let next_vset = config.next_validator_set()?;
+
+        if prev_vset.list().is_empty() {
+            return Ok(());
+        }
+
+        // 2) Check if keyring (not ADNL) contains a key from the prev set
+        //    and doesn't contain anyone from current/next
+        let config_handler = self.network.config_handler();
+        let validator_key_ids = config_handler.get_actual_validator_key_ids()?;
+        if validator_key_ids.is_empty() {
+            return Ok(());
+        }
+
+        let matched = prev_vset.list().iter().find(|descr| {
+            let pubkey = sigpubkey_to_publickey(&descr.public_key);
+            validator_key_ids.iter().any(|kid| kid == pubkey.id())
+        });
+        let Some(matched_descr) = matched else {
+            log::info!("special_update_fastsync: not a validator in prev set");
+            return Ok(());
+        };
+        if cur_vset.list().iter().chain(next_vset.list().iter()).any(|descr| {
+            let pubkey = sigpubkey_to_publickey(&descr.public_key);
+            validator_key_ids.iter().any(|kid| kid == pubkey.id())
+        }) {
+            log::info!("special_update_fastsync: is a validator in current or next set - skipping");
+            return Ok(());
+        }
+
+        let pubkey = sigpubkey_to_publickey(&matched_descr.public_key);
+        let adnl_id = get_adnl_id(matched_descr);
+        let (_, election_id) = config_handler
+            .get_validator_key(pubkey.id())
+            .await
+            .ok_or_else(|| error!("special_update_fastsync: validator key not found in keyring"))?;
+
+        // Build ADNL key candidates: adnl_id from descriptor, pubkey as fallback
+        let mut candidates = vec![adnl_id.clone()];
+        if *pubkey.id() != adnl_id {
+            candidates.push(pubkey.id().clone());
+        }
+
+        let adnl = &self.network.context().stack.adnl;
+
+        // Check if ADNL key is already loaded
+        let mut adnl_key = None;
+        for cid in &candidates {
+            if let Ok(key) = adnl.key_by_id(cid) {
+                adnl_key = Some(key);
+                break;
+            }
+        }
+
+        // 3) Load the key to ADNL
+        if adnl_key.is_none() {
+            for cid in &candidates {
+                let Some((key, _)) = config_handler.get_validator_key(cid).await else {
+                    continue;
+                };
+                if let Err(e) = adnl.add_key(key.clone(), election_id as usize) {
+                    log::warn!("special_update_fastsync: cannot add ADNL key {cid}: {e}");
+                    continue;
+                }
+
+                // Add to QUIC if available
+                if let Some(quic) = &self.network.context().stack.quic {
+                    let adnl_ip = adnl.ip_address_adnl();
+                    let quic_addr = if let Some(addr) = self.network.context().quic_address {
+                        addr
+                    } else if let Some(port) =
+                        adnl_ip.port().checked_add(adnl::QuicNode::OFFSET_PORT)
+                    {
+                        SocketAddr::new(Ipv4Addr::from(adnl_ip.ip()).into(), port)
+                    } else {
+                        log::warn!(
+                            "special_update_fastsync: QUIC port overflow for ADNL port {}",
+                            adnl_ip.port()
+                        );
+                        adnl_key = Some(key);
+                        break;
+                    };
+                    let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_addr.port());
+                    match key.pvt_key() {
+                        Ok(pvt_key) => {
+                            if let Err(e) = quic.add_key(pvt_key, cid, bind_addr) {
+                                log::warn!(
+                                    "special_update_fastsync: cannot add QUIC key {cid}: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "special_update_fastsync: cannot get private key for {cid}: {e}"
+                            );
+                        }
+                    }
+                }
+
+                log::info!(
+                    "special_update_fastsync: loaded ADNL key {cid} (election_id={election_id})"
+                );
+                adnl_key = Some(key);
+                break;
+            }
+        }
+
+        let Some(adnl_key) = adnl_key else {
+            log::warn!(
+                "special_update_fastsync: matched prev set validator {} \
+                 but no ADNL key could be loaded",
+                hex::encode(pubkey.id().data())
+            );
+            return Ok(());
+        };
+
+        // 4) Start periodic_store_ip_addr to DHT
+        NodeNetwork::start_periodic_store_ip_addr(
+            self.network.context().stack.dht.clone(),
+            adnl_key.clone(),
+            self.network.cancellation_token().child_token(),
+        );
+
+        // In update_fast_sync_overlays:
+        // 5) Resolve peers and 6) create fast sync overlays
+        let mc_use_quic = config.get_mc_simplex_config()?.map_or(false, |c| c.use_quic);
+        let shard_use_quic = config.get_shard_simplex_config()?.map_or(false, |c| c.use_quic);
+        self.update_fast_sync_overlays(
+            &prev_vset,
+            &cur_vset,
+            &next_vset,
+            config.base_workchain()?.monitor_min_split(),
+            Some(&adnl_key),
+            mc_use_quic,
+            shard_use_quic,
+        )
+        .await
     }
 
     pub(crate) async fn update_private_overlays(

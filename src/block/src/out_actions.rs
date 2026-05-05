@@ -36,18 +36,24 @@ action_set_code#ad4de08e new_code:^Cell = OutAction;
 ///
 pub type OutActions = LinkedList<OutAction>;
 
-pub fn unpack_out_action_slices(mut cell: SliceData) -> Result<Vec<SliceData>> {
+pub fn unpack_out_action_slices(
+    actions_cell: Cell,
+) -> std::result::Result<Vec<SliceData>, (u32, crate::Error)> {
+    let mut cell = actions_cell;
     let mut slices_rev = Vec::new();
+    let mut n: u32 = 0;
     loop {
-        if cell.remaining_references() == 0 {
-            if cell.is_empty_cell() {
-                break;
-            }
-            fail!("cell is not empty")
+        if cell.cell_type() != crate::CellType::Ordinary {
+            return Err((n, crate::error!("special cell in action list: {:?}", cell.cell_type())));
         }
-        let prev_cell = cell.checked_drain_reference()?;
-        slices_rev.push(cell);
-        cell = SliceData::load_cell(prev_cell)?;
+        let mut slice = SliceData::load_cell(cell).map_err(|err| (n, err))?;
+        if slice.is_empty_cell() {
+            break;
+        }
+        let prev_cell = slice.checked_drain_reference().map_err(|err| (n, err))?;
+        slices_rev.push(slice);
+        cell = prev_cell;
+        n += 1;
     }
     slices_rev.reverse();
     Ok(slices_rev)
@@ -79,7 +85,9 @@ impl Serializable for OutActions {
 ///
 impl Deserializable for OutActions {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
-        let action_slices = unpack_out_action_slices(cell.clone())?;
+        let root = cell.clone().into_cell()?;
+        let action_slices = unpack_out_action_slices(root)
+            .map_err(|(pos, err)| crate::error!("action list invalid at position {pos}: {err}"))?;
         for mut action_slice in action_slices {
             self.push_back(OutAction::construct_from(&mut action_slice)?);
         }

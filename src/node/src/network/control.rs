@@ -674,8 +674,13 @@ impl ControlQuerySubscriber {
 
     async fn prepare_future_bundle(&self, prev_block_ids: Vec<BlockIdExt>) -> Result<Success> {
         if let DataSource::Engine(ref engine) = self.data_source {
-            let bundle =
-                CollatorTestBundle::build_for_collating_block(engine, prev_block_ids, None).await?;
+            let bundle = CollatorTestBundle::build_for_collating_block(
+                engine,
+                prev_block_ids,
+                None,
+                Vec::new(),
+            )
+            .await?;
             tokio::task::spawn_blocking(move || {
                 bundle.save("target/bundles").ok();
             });

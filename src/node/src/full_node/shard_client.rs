@@ -181,7 +181,7 @@ async fn load_shard_blocks_cycle(
         if engine.check_stop() {
             break Ok(());
         }
-        log::trace!("load_shard_blocks_cycle: mc block: {}", mc_handle.id());
+        log::debug!("load_shard_blocks_cycle: mc block: {}", mc_handle.id());
         let r = match engine.wait_next_applied_mc_block(&mc_handle, Some(5_000)).await {
             Err(e) => {
                 log::debug!("load_shard_blocks_cycle: no next mc block: {}", e);
@@ -193,10 +193,10 @@ async fn load_shard_blocks_cycle(
         mc_handle = r.0;
         let mc_block = r.1;
 
-        log::trace!("load_shard_blocks_cycle: waiting semaphore: {}", mc_block.id());
+        log::debug!("load_shard_blocks_cycle: waiting semaphore: {}", mc_block.id());
         let semaphore_permit = Arc::clone(&semaphore).acquire_owned().await?;
 
-        log::trace!("load_shard_blocks_cycle: process next mc block: {}", mc_block.id());
+        log::debug!("load_shard_blocks_cycle: process next mc block: {}", mc_block.id());
 
         let engine = Arc::clone(&engine);
         tokio::spawn(async move {
@@ -224,7 +224,7 @@ pub async fn load_shard_blocks(
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut attempt = 0;
-            log::trace!("load_shard_blocks_cycle: {}, applying block...", msg);
+            log::debug!("load_shard_blocks_cycle: {}, applying block...", msg);
             loop {
                 if let Err(e) = Arc::clone(&engine)
                     .download_and_apply_block(&shard_block_id, mc_seq_no, false)
@@ -243,7 +243,7 @@ pub async fn load_shard_blocks(
                         break;
                     }
                 } else {
-                    log::trace!("load_shard_blocks_cycle: {}, applied block", msg);
+                    log::debug!("load_shard_blocks_cycle: {}, applied block", msg);
                     break;
                 }
             }
@@ -283,7 +283,7 @@ pub async fn load_shard_blocks(
         return Ok(());
     }
 
-    log::trace!("load_shard_blocks_cycle: processed mc block: {}", mc_block.id());
+    log::debug!("load_shard_blocks_cycle: processed mc block: {}", mc_block.id());
     engine.save_shard_client_mc_block_id(mc_block.id())?;
     drop(semaphore_permit);
     Ok(())

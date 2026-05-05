@@ -913,8 +913,8 @@ fn test_calc_storage_fees_max() {
     };
     let max_int64 = i64::MAX as u64;
     assert_eq!(max_int64, 0x7FFF_FFFF_FFFF_FFFF);
-    let fee = sp.calc_storage_fee(max_int64, max_int64, max_int64, true);
-    assert_eq!(fee, "650335181531487160332425701902778368008".parse().unwrap());
+    let fee = sp.calc_storage_fee_part(max_int64, max_int64, max_int64, true);
+    assert_eq!(fee, "42620366456847542539545850799900483125749000".parse().unwrap());
 }
 
 #[test]

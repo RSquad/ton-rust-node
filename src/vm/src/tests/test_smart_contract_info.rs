@@ -11,7 +11,8 @@
 use super::*;
 use ton_block::{
     base64_decode, read_single_root_boc, read_single_root_boc_file, ton_method_id, Coins,
-    CurrencyCollection, InternalMessageHeader, Message, MsgAddressInt, ShardAccount,
+    ConfigParam18, ConfigParamEnum, CurrencyCollection, Deserializable, InternalMessageHeader,
+    Message, MsgAddressInt, ShardAccount, StoragePrices,
 };
 
 #[test]
@@ -62,6 +63,38 @@ fn test_smart_contract_info_internal_message_info_uses_fwd_fee() {
     assert_eq!(info[3].as_integer().unwrap().to_str_radix(10), "1408000");
     assert_eq!(info[6].as_integer().unwrap().to_str_radix(10), "10000000");
     assert_eq!(info[7].as_integer().unwrap().to_str_radix(10), "10000000");
+}
+
+#[test]
+fn test_unpacked_config_tuple_uses_latest_storage_price_by_utime_since() {
+    let mut config = ConfigParams::default();
+    let mut cp18 = ConfigParam18::default();
+    cp18.insert(&StoragePrices {
+        utime_since: 100,
+        bit_price_ps: 1,
+        cell_price_ps: 2,
+        mc_bit_price_ps: 3,
+        mc_cell_price_ps: 4,
+    })
+    .unwrap();
+    cp18.insert(&StoragePrices {
+        utime_since: 200,
+        bit_price_ps: 10,
+        cell_price_ps: 20,
+        mc_bit_price_ps: 30,
+        mc_cell_price_ps: 40,
+    })
+    .unwrap();
+    config.set_config(ConfigParamEnum::ConfigParam18(cp18)).unwrap();
+
+    let sci = SmartContractInfo { unix_time: 250, config_params: config, ..Default::default() };
+    let tuple = sci.get_unpacked_config_tuple();
+    let storage_price = tuple.tuple_item_ref(0).unwrap().as_slice().unwrap();
+    let mut storage_price = storage_price.clone();
+    let actual = StoragePrices::construct_from(&mut storage_price).unwrap();
+
+    assert_eq!(actual.utime_since, 200);
+    assert_eq!(actual.bit_price_ps, 10);
 }
 
 #[test]

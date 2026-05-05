@@ -690,6 +690,69 @@ fn test_send_msg_with_same_cells() {
 }
 
 #[test]
+fn test_send_msg_inline_vs_ref_body_gas_accounting() {
+    use ton_block::Deserializable;
+
+    // Header has empty src (1 bit) — body fits inline. After SENDMSG sets
+    // src to my_addr (~268 bits), the envelope no longer fits, and
+    // recalc_serialization_params decides to put body in a ref. This is
+    // exactly the layout transition that triggered the original bug:
+    //   parsed body_to_ref = Some(false) (inline in source cell)
+    //   recalc body_to_ref = true        (body must go to a ref now)
+    // Our fix uses parsed flag, not recalc, to decide whether the body
+    // cell is real (charge gas) or synthesized (don't charge gas).
+    let dst = MsgAddressInt::standard(0, [0x22; 32]);
+    // src = AddrNone (~2 bits) so that the source envelope is small enough
+    // to keep a moderately-sized body inline. SENDMSG later replaces src
+    // with my_addr (AddrStd, ~268 bits) which makes the envelope overflow
+    // and forces body into a ref via recalc_serialization_params.
+    let h = InternalMessageHeader {
+        ihr_disabled: true,
+        src: ton_block::MsgAddressIntOrNone::None,
+        dst,
+        value: CurrencyCollection::with_coins(6789),
+        ..Default::default()
+    };
+
+    // ~400-bit body: fits inline with empty-src header but must move to ref
+    // after SENDMSG sets src to a 267-bit AddrStd.
+    let body_inline_then_recalc_ref = SliceData::from_raw(vec![0xAA; 64], 500);
+    let msg_a = Message::with_int_header_and_body(h.clone(), body_inline_then_recalc_ref);
+    let cell_a = msg_a.serialize().unwrap();
+    let parsed_a = Message::construct_from_cell(cell_a.clone()).unwrap();
+    assert_eq!(
+        parsed_a.body_to_ref(),
+        Some(false),
+        "test setup: body must be inline in source envelope",
+    );
+
+    // Same logical message but with body forcibly placed in a ref by using
+    // a body so large that even the empty-src envelope can't hold it inline.
+    let body_always_ref = SliceData::from_raw(vec![0xAA; 128], 1000);
+    let msg_b = Message::with_int_header_and_body(h, body_always_ref);
+    let cell_b = msg_b.serialize().unwrap();
+    let parsed_b = Message::construct_from_cell(cell_b.clone()).unwrap();
+    assert_eq!(
+        parsed_b.body_to_ref(),
+        Some(true),
+        "test setup: body must already be in ref in source envelope",
+    );
+
+    // Inline body in source → SENDMSG must NOT charge root-cell load gas
+    // for the body cell, even though recalc puts the body in a ref.
+    test_case_with_ref("PUSHREF ZERO SENDMSG", cell_a)
+        .with_mc_state(MC_STATE_ROOT.clone())
+        .with_account(SHARD_ACCOUNT.clone())
+        .expect_gas_used(692);
+
+    // Body originally in ref → SENDMSG must charge a root-cell load.
+    test_case_with_ref("PUSHREF ZERO SENDMSG", cell_b)
+        .with_mc_state(MC_STATE_ROOT.clone())
+        .with_account(SHARD_ACCOUNT.clone())
+        .expect_gas_used(792);
+}
+
+#[test]
 fn test_rawreserve_with_parsing() {
     let reserved_coins = 123456789u128;
     let flags = 3u8;

@@ -3183,6 +3183,100 @@ fn test_action_phase_fields_with_unsuccess_action() {
     compare_transaction(&trans, &good_trans);
 }
 
+/// Second action in the list fails — `result_arg` must be Some(1).
+#[test]
+fn test_action_phase_result_arg_second_action_fails() {
+    // Balance covers MSG1_BALANCE (50M) but not MSG2_BALANCE (100M):
+    // action #0 succeeds, action #1 fails with NoFunds.
+    let start_balance = 100_000_000;
+    let msg_income = 1_000_000;
+
+    let code = compile_code_to_cell(
+        "
+        ACCEPT
+        PUSHROOT
+        CTOS
+        LDREF
+        PLDREF
+        PUSHINT 0
+        SENDRAWMSG
+        PUSHINT 0
+        SENDRAWMSG
+    ",
+    )
+    .unwrap();
+    let acc_id = SENDER_ACCOUNT.clone();
+    let mut acc =
+        create_test_account(start_balance, acc_id.clone(), code, create_two_messages_data());
+    acc.set_last_paid(BLOCK_UT - 100);
+    let msg = create_int_msg(
+        THIRD_ACCOUNT.clone(),
+        SENDER_ACCOUNT.clone(),
+        msg_income,
+        false,
+        PREV_BLOCK_LT,
+    );
+
+    let trans = execute(&msg, &mut acc, BLOCK_LT + 1).unwrap();
+    let descr = trans.read_description().unwrap();
+    let action = descr.action_phase_ref().unwrap();
+    assert_eq!(action.result_code, 37);
+    assert_eq!(action.result_arg, Some(1));
+    assert_eq!(action.msgs_created, 1);
+    assert_eq!(action.tot_actions, 2);
+    assert!(action.no_funds);
+}
+
+/// First action in the list fails — `result_arg` must serialize as None.
+#[test]
+fn test_action_phase_result_arg_first_action_fails() {
+    // Balance below MSG1_BALANCE (50M) → action #0 fails with NoFunds.
+    let start_balance = 30_000_000;
+    let msg_income = 1_000_000;
+
+    let code = compile_code_to_cell(
+        "
+        ACCEPT
+        PUSHROOT
+        CTOS
+        LDREF
+        PLDREF
+        PUSHINT 0
+        SENDRAWMSG
+        PUSHINT 0
+        SENDRAWMSG
+    ",
+    )
+    .unwrap();
+    let acc_id = SENDER_ACCOUNT.clone();
+    let mut acc = create_test_account(
+        start_balance,
+        acc_id.clone(),
+        code.clone(),
+        create_two_messages_data(),
+    );
+    acc.set_last_paid(BLOCK_UT - 100);
+    let msg = create_int_msg(
+        THIRD_ACCOUNT.clone(),
+        SENDER_ACCOUNT.clone(),
+        msg_income,
+        false,
+        PREV_BLOCK_LT,
+    );
+
+    let trans = execute(&msg, &mut acc, BLOCK_LT + 1).unwrap();
+    let descr = trans.read_description().unwrap();
+    let action = descr.action_phase_ref().unwrap();
+    assert_eq!(action.result_code, 37, "expected NoFunds");
+    assert_eq!(
+        action.result_arg, None,
+        "first-action failure (i=0) must encode cpp's result_arg=0 as None"
+    );
+    assert_eq!(action.msgs_created, 0, "no messages should leave the account");
+    assert_eq!(action.tot_actions, 2);
+    assert!(action.no_funds);
+}
+
 #[test]
 fn test_message_with_zero_value() {
     let mut acc = Account::default();
@@ -3870,7 +3964,9 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
             .unwrap();
     assert_eq!(trans.end_status, AccountStatus::AccStateActive);
     assert_eq!(trans.out_msgs.count(2).unwrap(), 0);
-    assert_eq!(trans.read_description().unwrap().action_phase_ref().unwrap().result_code, 50);
+    let action_phase = trans.read_description().unwrap().action_phase_ref().unwrap().clone();
+    assert_eq!(action_phase.result_code, 50);
+    assert_eq!(action_phase.result_arg, None);
 }
 
 #[test]

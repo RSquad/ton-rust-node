@@ -81,13 +81,26 @@ fn calc_storage_used_short(
     let mut calc =
         StorageUsageCalc::with_limits(limits.max_msg_cells as u64, limits.max_msg_bits as u64);
     let (body_to_ref, init_to_ref) = msg.recalc_serialization_params()?;
+    // When body/init was originally stored as a ref in
+    // the envelope (body_to_ref/init_to_ref == Some(true)), the body cell is
+    // a real ref and gas should be charged.
+    // When body/init was inline in the envelope — load only sub-refs with
+    // gas, root without.
     if let Some(body) = msg.body() {
         let root = body.clone().into_cell()?;
-        calc.append_cell(&root, body_to_ref, engine)?;
+        if msg.body_to_ref() == Some(true) {
+            calc.append_cell(&root, body_to_ref, engine)?;
+        } else {
+            calc.append_cell_no_root_gas(&root, body_to_ref, engine)?;
+        }
     }
     if let Some(init) = msg.state_init() {
         let root = init.serialize()?;
-        calc.append_cell(&root, init_to_ref, engine)?;
+        if msg.init_to_ref() == Some(true) {
+            calc.append_cell(&root, init_to_ref, engine)?;
+        } else {
+            calc.append_cell_no_root_gas(&root, init_to_ref, engine)?;
+        }
     }
     let sstat = calc.storage_used()?;
     Ok(sstat)

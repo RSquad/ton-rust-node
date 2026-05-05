@@ -9,6 +9,7 @@
 use ton_assembler::{compile_code, compile_code_to_cell, CompileError};
 use ton_block::{ExceptionCode, SliceData};
 use ton_vm::{
+    executor::{FixGasPrefix, FIX_GAS},
     int,
     stack::{continuation::ContinuationData, integer::IntegerData, Stack, StackItem},
 };
@@ -2472,5 +2473,28 @@ mod runvm {
             code,
         )
         .expect_int_stack(&[0, 777]);
+    }
+}
+
+#[test]
+fn test_cont_invalid_opcode() {
+    for (bits, fix_gas) in FIX_GAS.into_iter().enumerate() {
+        let bits = bits + 1;
+        for (prefix, gas) in fix_gas {
+            let prefix = match prefix {
+                FixGasPrefix::Number(prefix) => prefix,
+                FixGasPrefix::Range(start, ..) => start,
+            };
+
+            log::info!(target: "tvm", "Testing prefix 0x{prefix:X} with bits {bits} and gas {gas}\n");
+            let data = (*prefix as u32) << (32 - bits) | (1 << (32 - bits - 1));
+            let data = data.to_be_bytes();
+            assert_eq!(data[3], 0);
+            let code = SliceData::new(data.to_vec()).into_cell().unwrap();
+            test_case_with_bytecode(code)
+                .expect_steps(2)
+                .expect_failure(ExceptionCode::InvalidOpcode)
+                .expect_gas_used(*gas as i64 + 50);
+        }
     }
 }

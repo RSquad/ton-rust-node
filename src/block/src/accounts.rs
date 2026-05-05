@@ -201,6 +201,28 @@ impl StorageUsageCalc {
         Ok(max_merkle_depth)
     }
 
+    /// Variant of `append_cell` where the root cell is loaded WITHOUT gas
+    /// (e.g. when the root is synthesized locally and isn't part of the
+    /// source cell tree) but still counted in the storage stat. Recursive
+    /// sub-references are loaded WITH gas through `gas_consumer`. Matches
+    /// cpp behavior for outbound message storage calculation in SENDMSG,
+    /// where envelope refs are walked with gas charging but a body cell
+    /// synthesized from inline body bits isn't separately loaded.
+    pub fn append_cell_no_root_gas(
+        &mut self,
+        cell: &Cell,
+        add_root: bool,
+        gas_consumer: &mut impl GasConsumer,
+    ) -> Result<u32> {
+        if add_root
+            && (!self.hashes.insert(cell.repr_hash().clone())
+                || !self.add_checked(1, cell.bit_length() as u64))
+        {
+            return Ok(0);
+        }
+        self.append_cell(cell, false, gas_consumer)
+    }
+
     pub fn storage_used(&self) -> Result<StorageUsed> {
         StorageUsed::with_values_checked(self.cells, self.bits)
     }

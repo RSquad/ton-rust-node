@@ -1231,6 +1231,17 @@ impl Message {
         self.body.as_ref()
     }
 
+    /// Original body_to_ref flag from the parsed message (whether body was
+    /// stored inline or as a reference in the source cell).
+    pub fn body_to_ref(&self) -> Option<bool> {
+        self.body_to_ref
+    }
+
+    /// Original init_to_ref flag from the parsed message.
+    pub fn init_to_ref(&self) -> Option<bool> {
+        self.init_to_ref
+    }
+
     /// be careful, this method will reset serialize parameters
     pub fn set_body(&mut self, body: SliceData) {
         self.body_to_ref = None;

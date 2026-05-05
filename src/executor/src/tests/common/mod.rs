@@ -999,7 +999,8 @@ pub fn replay_transaction_full(
     } else if let Ok(data) = std::fs::read(libs) {
         Some(read_single_root_boc(data).unwrap())
     } else {
-        None
+        let data = base64_decode(libs).unwrap();
+        Some(read_single_root_boc(data).unwrap())
     };
     let mc_state_proof = mc_state_proof_cell_with_config(config, libs);
     replay_transaction(None, acc, acc_after, tr, prev, mc_state_proof)

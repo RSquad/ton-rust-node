@@ -608,7 +608,14 @@ impl Serializable for TrActionPhase {
         self.total_fwd_fees.write_to(cell)?; // total_fwd_fees:(Maybe Coins)
         self.total_action_fees.write_to(cell)?; // total_action_fees:(Maybe Coins)
         self.result_code.write_to(cell)?; // result_code:int32
-        self.result_arg.write_to(cell)?; // result_arg:(Maybe int32)
+
+        // result_arg is serialized as None if it is zero
+        if self.result_arg == Some(0) {
+            Option::<i32>::None.write_to(cell)?;
+        } else {
+            self.result_arg.write_to(cell)?; // result_arg:(Maybe int32)
+        }
+
         self.tot_actions.write_to(cell)?; // tot_actions:uint16
         self.spec_actions.write_to(cell)?; // spec_actions:uint16
         self.skipped_actions.write_to(cell)?; // skipped_actions: uint16
