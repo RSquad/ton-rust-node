@@ -20,7 +20,8 @@ Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.1`
 
 ### Fixed
 
-- TVM and transaction executor compatibility fixes
+- Ensure deterministic gas charging in TVM for partial-bit opcodes across all validators
+- Align ActionPhase TL-B encoding in transaction executor with the consensus-observable form (post-BOC round-trip)
 
 ## [v0.6.0] - 2026-05-01
 
