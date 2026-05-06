@@ -2296,7 +2296,7 @@ pub async fn run(
         overlays_router.update_custom_overlays(Some(&custom_overlays_config)).await?;
         engine
             .overlays_router
-            .set(overlays_router)
+            .set(overlays_router.clone())
             .map_err(|_| error!("Overlays router already set"))?;
 
         // Boot
@@ -2359,6 +2359,8 @@ pub async fn run(
 
         // top shard blocks
         resend_top_shard_blocks_worker(engine.clone());
+
+        overlays_router.special_update_fastsync_overlays().await?;
 
         // blocks download clients
         engine.set_sync_status(Engine::SYNC_STATUS_SYNC_BLOCKS);

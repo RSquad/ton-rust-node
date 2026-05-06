@@ -3415,6 +3415,47 @@ fn test_compute_collation_start_time_caps_parent_delay_to_target_rate() {
 }
 
 #[test]
+fn test_shard_collation_start_time_matches_cpp_early_dispatch() {
+    let mut fixture = TestFixture::new_shard(4);
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fixture.processor.set_time(base_time);
+
+    let parent_id = RawCandidateId { slot: SlotIndex::new(0), hash: UInt256::rand() };
+    let parent_block_id = BlockIdExt::with_params(
+        fixture.description.get_shard().clone(),
+        1,
+        UInt256::rand(),
+        UInt256::rand(),
+    );
+    let parent_gen_utime_ms =
+        base_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+
+    insert_received_candidate_with_gen_utime_ms(
+        &mut fixture.processor,
+        &parent_id,
+        parent_block_id,
+        false,
+        None,
+        Some(parent_gen_utime_ms),
+    );
+
+    let parent_info =
+        crate::block::CandidateParentInfo { slot: parent_id.slot, hash: parent_id.hash.clone() };
+    let dispatch_time = fixture.processor.compute_collation_start_time(Some(&parent_info));
+    let min_gen_time = fixture.processor.compute_collation_min_gen_time(Some(&parent_info));
+
+    assert_eq!(
+        dispatch_time, base_time,
+        "shard collation should dispatch at slot_start - target_rate"
+    );
+    assert_eq!(
+        min_gen_time,
+        base_time + fixture.description.opts().target_rate,
+        "early shard dispatch must preserve the block min generation time"
+    );
+}
+
+#[test]
 fn test_check_collation_blocks_before_earliest_time() {
     let mut fixture = TestFixture::new(4);
     let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);

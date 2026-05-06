@@ -495,6 +495,70 @@ fn test_action_phase_active_acc_with_actions_nofunds() {
     );
 }
 
+/// Special-cell action list root must produce RESULT_CODE_ACTIONLIST_INVALID
+/// with `result_arg = None` (position 0 encodes as Maybe-absent).
+#[test]
+fn test_action_phase_special_root_action_list() {
+    let actions_cell = ton_block::Cell::default().as_library_cell();
+    let phase = run_action_phase_with_cell(actions_cell);
+    assert_eq!(phase.result_code, RESULT_CODE_ACTIONLIST_INVALID);
+    assert_eq!(phase.result_arg, Some(0));
+    assert_eq!(phase.tot_actions, 0);
+    assert!(!phase.valid);
+}
+
+/// Action list with more than MAX_ACTIONS entries must produce
+/// RESULT_CODE_TOO_MANY_ACTIONS with `result_arg = Some(MAX_ACTIONS + 1)`.
+#[test]
+fn test_action_phase_too_many_actions() {
+    let mut chain = BuilderData::new().into_cell().unwrap();
+    for _ in 0..(MAX_ACTIONS + 1) {
+        let mut entry = BuilderData::new();
+        entry.checked_append_reference(chain).unwrap();
+        OutAction::new_set(Cell::default()).write_to(&mut entry).unwrap();
+        chain = entry.into_cell().unwrap();
+    }
+    let phase = run_action_phase_with_cell(chain);
+    assert_eq!(phase.result_code, RESULT_CODE_TOO_MANY_ACTIONS);
+    assert_eq!(phase.result_arg, Some(MAX_ACTIONS as i32 + 1));
+    assert!(!phase.valid);
+}
+
+fn run_action_phase_with_cell(actions_cell: Cell) -> TrActionPhase {
+    let msg = create_ext_msg(SENDER_ACCOUNT.clone());
+    let ctor_msg = create_int_msg(
+        AccountId::from([0x12; 32]),
+        SENDER_ACCOUNT.clone(),
+        1_000_000_000,
+        false,
+        5,
+        0,
+    );
+    let mut acc = test_account_from_message(&ctor_msg).unwrap();
+    let mut tr = Transaction::with_account_and_message(&acc, &msg, 1).unwrap();
+    let config = BLOCKCHAIN_CONFIG.to_owned();
+    let executor = OrdinaryTransactionExecutor::new(config);
+    let mut acc_balance = CurrencyCollection::with_coins(1_000_000_000);
+    let original = acc_balance.clone();
+    let mut msg_remaining = CurrencyCollection::with_coins(0);
+    let my_addr = acc.get_addr().unwrap().clone();
+    executor
+        .action_phase(
+            &mut tr,
+            &mut acc,
+            &original,
+            &mut acc_balance,
+            &mut msg_remaining,
+            &Coins::zero(),
+            actions_cell,
+            None,
+            &my_addr,
+            false,
+        )
+        .unwrap()
+        .phase
+}
+
 #[test]
 fn test_action_phase_active_acc_with_actions_success() {
     let fwd_config = BLOCKCHAIN_CONFIG.get_fwd_prices(true);

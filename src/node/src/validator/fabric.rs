@@ -34,8 +34,8 @@ use crate::{
 };
 use std::{sync::Arc, time::SystemTime};
 use ton_block::{
-    Block, BlockIdExt, BlockSignaturesVariant, Cell, Deserializable, Result, ShardIdent, UInt256,
-    UsageTree, ValidatorSet,
+    Block, BlockIdExt, BlockSignaturesVariant, Cell, Deserializable, Message, Result, ShardIdent,
+    UInt256, UsageTree, ValidatorSet,
 };
 
 pub async fn run_validate_query_any_candidate(
@@ -77,6 +77,10 @@ pub async fn run_validate_query_any_candidate(
     let min_mc_seqno =
         if info.shard().is_masterchain() { master_ref.seq_no() } else { info.min_ref_mc_seqno() };
 
+    let test_bundles_config = &engine.test_bundles_config().validator;
+    let bundle_block = test_bundles_config.is_enable().then(|| block_candidate.clone());
+    let bundle_prevs = bundle_block.as_ref().map(|_| prev_blocks_ids.clone());
+
     let query = ValidateQuery::new(
         info.shard().clone(),
         min_mc_seqno,
@@ -93,6 +97,24 @@ pub async fn run_validate_query_any_candidate(
     let validator_result = query.try_validate().await;
 
     metrics::gauge!("ton_node_validator_active", &labels).decrement(1.0);
+
+    if let (Err(err), Some(block), Some(prevs)) = (&validator_result, bundle_block, bundle_prevs) {
+        let err_str = err.to_string();
+        if test_bundles_config.need_to_build_for(&err_str) {
+            let id = block.block_id.clone();
+            spawn_build_test_bundle(
+                Some(block),
+                test_bundles_config,
+                &id,
+                prevs,
+                None,
+                Vec::new(),
+                Some(err_str),
+                fmt_next_block_descr(&block_id),
+                engine.clone(),
+            );
+        }
+    }
 
     match validator_result {
         Ok(next_state_opt) => {
@@ -179,79 +201,41 @@ pub async fn run_validate_query(
     metrics::gauge!("ton_node_validator_active", &labels).increment(1.0);
 
     let test_bundles_config = &engine.test_bundles_config().validator;
-    let validator_result = if !test_bundles_config.is_enable() {
-        ValidateQuery::new(
-            shard.clone(),
-            min_masterchain_block_id.seq_no(),
-            prev.get_prevs().to_vec(),
-            Default::default(),
-            None,
-            block,
-            set,
-            engine.clone(),
-            false,
-            true,
-            is_simplex,
-        )
-        .try_validate()
-        .await
-    } else {
-        let query = ValidateQuery::new(
-            shard.clone(),
-            min_masterchain_block_id.seq_no(),
-            prev.get_prevs().to_vec(),
-            Default::default(),
-            None,
-            block.clone(),
-            set,
-            engine.clone(),
-            false,
-            true,
-            is_simplex,
-        );
-        let validator_result = query.try_validate().await;
-        if let Err(err) = &validator_result {
-            let err_str = err.to_string();
-            if test_bundles_config.need_to_build_for(&err_str) {
-                let id = block.block_id.clone();
-                if !CollatorTestBundle::exists(test_bundles_config.path(), &id) {
-                    let path = test_bundles_config.path().to_string();
-                    let engine = engine.clone();
-                    let prev = prev.clone();
-                    tokio::spawn(async move {
-                        match CollatorTestBundle::build_for_validating_block(&engine, &prev, block)
-                            .await
-                        {
-                            Err(e) => log::error!(
-                                "({}): Error while test bundle for {} building: {}",
-                                next_block_descr,
-                                id,
-                                e
-                            ),
-                            Ok(mut b) => {
-                                b.set_notes(err_str);
-                                if let Err(e) = b.save(&path) {
-                                    log::error!(
-                                        "({}): Error while test bundle for {} saving: {}",
-                                        next_block_descr,
-                                        id,
-                                        e
-                                    )
-                                } else {
-                                    log::info!(
-                                        "({}): Built test bundle for {}",
-                                        next_block_descr,
-                                        id
-                                    )
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        };
-        validator_result
-    };
+    let bundle_block = test_bundles_config.is_enable().then(|| block.clone());
+
+    let validator_result = ValidateQuery::new(
+        shard.clone(),
+        min_masterchain_block_id.seq_no(),
+        prev.get_prevs().to_vec(),
+        Default::default(),
+        None,
+        block,
+        set,
+        engine.clone(),
+        false,
+        true,
+        is_simplex,
+    )
+    .try_validate()
+    .await;
+
+    if let (Err(err), Some(block)) = (&validator_result, bundle_block) {
+        let err_str = err.to_string();
+        if test_bundles_config.need_to_build_for(&err_str) {
+            let id = block.block_id.clone();
+            spawn_build_test_bundle(
+                Some(block),
+                test_bundles_config,
+                &id,
+                prev.get_prevs().to_vec(),
+                None,
+                Vec::new(),
+                Some(err_str),
+                next_block_descr.clone(),
+                engine.clone(),
+            );
+        }
+    }
 
     metrics::gauge!("ton_node_validator_active", &labels).decrement(1.0);
 
@@ -336,6 +320,7 @@ pub async fn run_collate_query(
     let labels = [("shard", shard.to_string())];
     metrics::gauge!("ton_node_collator_active", &labels).decrement(1.0);
     let mut usage_tree_opt = None;
+    let mut accepted_external_messages = Vec::new();
     let test_bundles_config = &engine.test_bundles_config().collator;
 
     let err = match collate_result {
@@ -356,6 +341,7 @@ pub async fn run_collate_query(
                     &candidate.block_id,
                     prev.get_prevs().to_vec(),
                     Some(usage_tree),
+                    Vec::new(),
                     None,
                     next_block_descr.clone(),
                     engine.clone(),
@@ -369,8 +355,9 @@ pub async fn run_collate_query(
                 block_root,
             ));
         }
-        Ok(CollateResult::Err { usage_tree, err }) => {
+        Ok(CollateResult::Err { usage_tree, external_messages, err }) => {
             usage_tree_opt = Some(usage_tree);
+            accepted_external_messages = external_messages;
             err
         }
         Err(err) => err,
@@ -391,6 +378,7 @@ pub async fn run_collate_query(
             &id,
             prev.get_prevs().to_vec(),
             usage_tree_opt,
+            accepted_external_messages,
             Some(err_str),
             next_block_descr,
             engine.clone(),
@@ -405,6 +393,7 @@ fn spawn_build_test_bundle(
     id: &BlockIdExt,
     prev_blocks_ids: Vec<BlockIdExt>,
     usage_tree: Option<UsageTree>,
+    external_messages: Vec<(Arc<Message>, UInt256)>,
     notes: Option<String>,
     next_block_descr: String,
     engine: Arc<dyn EngineOperations>,
@@ -424,8 +413,13 @@ fn spawn_build_test_bundle(
             )
             .await
         } else {
-            CollatorTestBundle::build_for_collating_block(&engine, prev_blocks_ids, usage_tree)
-                .await
+            CollatorTestBundle::build_for_collating_block(
+                &engine,
+                prev_blocks_ids,
+                usage_tree,
+                external_messages,
+            )
+            .await
         };
 
         match result {

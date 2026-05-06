@@ -442,6 +442,55 @@ fn compare_with_fift(
     }
 }
 
+// this function is used to prepare data for fixing the bug with incorrect gas for short codes in C++ implementation of TVM
+pub fn prepare_gas_fix() {
+    #[cfg(windows)]
+    let lib_name = "../../ton/build/crypto/vm_run_shared.dll";
+    #[cfg(not(windows))]
+    let lib_name = "../../ton-node-cpp/build/crypto/libvm_run_shared.so";
+    assert!(std::fs::exists(lib_name).unwrap());
+    let lib = libloading::Library::new(lib_name).expect("no shared dll found");
+    let mut result = Vec::new();
+    let time = UnixTime::now() as i32;
+    let mut count = 0;
+    let log_mask = 0;
+    unsafe {
+        let run_boc: libloading::Symbol<
+            unsafe extern "C" fn(*const u8, i32, i32, i32, i32, i32) -> *mut c_char,
+        > = lib.get(b"run_vm_boc").unwrap();
+        let free_mem: libloading::Symbol<unsafe extern "C" fn(*const c_char) -> *mut c_char> =
+            lib.get(b"free_mem").unwrap();
+        for bits in 1..=23 {
+            for bytes in 0..1u32 << bits {
+                let data = bytes << (32 - bits) | (1 << (32 - bits - 1));
+                let data = data.to_be_bytes();
+                assert_eq!(data[3], 0);
+                let code_cell = SliceData::new(data.to_vec()).into_cell().unwrap();
+                let data = ton_block::write_boc(&code_cell).unwrap();
+                let size = data.len() * 8;
+                let res = run_boc(data.as_ptr(), size as i32, time, 300, 13, log_mask);
+                assert!(!res.is_null(), "Fift execution failed, check fift logs");
+                let fift_result =
+                    std::ffi::CStr::from_ptr(res).to_string_lossy().trim().to_string();
+                println!("    (0x{bytes:X}, {bits}, {fift_result}),");
+                result.push((bytes, bits, fift_result));
+                free_mem(res);
+                count += 1;
+                if count % 1_000_000 == 0 {
+                    println!("Checked {count} cases bits: {bits} bytes: {bytes}");
+                }
+            }
+        }
+    }
+    for (bytes, bits, line) in result {
+        let mut res = line.split_whitespace();
+        if res.next() == Some("0") && res.next() == Some("6") {
+            let gas = res.next().unwrap().parse::<usize>().unwrap() - 50;
+            println!("(0x{bytes:X}, {bits}, {gas}),");
+        }
+    }
+}
+
 impl TestCase {
     pub(super) fn new(mut args: TestCaseInputs) -> TestCase {
         let code = args.code.unwrap_or_default();

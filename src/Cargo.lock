@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "adnl",
  "ahash",
