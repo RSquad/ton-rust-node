@@ -6,6 +6,22 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.6.1] - 2026-05-06
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.1`
+
+### Added
+
+- CLI tool for copying node secrets to HashiCorp Vault
+
+### Changed
+
+- ADNL key management for fast sync overlay
+
+### Fixed
+
+- TVM and transaction executor compatibility fixes
+
 ## [v0.6.0] - 2026-05-01
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.0`
