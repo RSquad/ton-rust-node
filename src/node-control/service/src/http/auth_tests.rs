@@ -180,6 +180,15 @@ fn post_bearer(uri: &str, body: &impl serde::Serialize, token: &str) -> axum::ht
         .unwrap()
 }
 
+fn delete_bearer(uri: &str, token: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 // --- Login flow ---
 
 #[tokio::test]
@@ -344,6 +353,95 @@ async fn nominator_forbidden_on_operator_route() {
     let body = serde_json::json!({ "policy": "minimum" });
     let resp = app(st).oneshot(post_bearer("/v1/elections/settings", &body, &tok)).await.unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn nominator_forbidden_on_entity_crud_routes() {
+    let st = state_with_auth().await;
+    let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
+    let app = app(st);
+
+    let pubkey = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+    let node_body = serde_json::json!({
+        "name": "n",
+        "control_server_endpoint": "127.0.0.1:1",
+        "control_server_pubkey": pubkey,
+        "control_client_secret": "s",
+    });
+    let wallet_body = serde_json::json!({
+        "name": "w",
+        "secret": "sec",
+        "version": "V4R2",
+        "subwallet_id": 0,
+        "workchain": -1,
+    });
+    let pool_body = serde_json::json!({
+        "name": "p",
+        "address": "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea",
+        "owner": serde_json::Value::Null,
+    });
+    let binding_body = serde_json::json!({
+        "node": "n",
+        "wallet": "w",
+        "pool": serde_json::Value::Null,
+    });
+
+    assert_eq!(
+        app.clone().oneshot(post_bearer("/v1/nodes", &node_body, &tok)).await.unwrap().status(),
+        403
+    );
+    assert_eq!(
+        app.clone().oneshot(delete_bearer("/v1/nodes/any", &tok)).await.unwrap().status(),
+        403
+    );
+    assert_eq!(
+        app.clone().oneshot(post_bearer("/v1/wallets", &wallet_body, &tok)).await.unwrap().status(),
+        403
+    );
+    assert_eq!(
+        app.clone().oneshot(delete_bearer("/v1/wallets/any", &tok)).await.unwrap().status(),
+        403
+    );
+    assert_eq!(
+        app.clone().oneshot(post_bearer("/v1/pools", &pool_body, &tok)).await.unwrap().status(),
+        403
+    );
+    assert_eq!(
+        app.clone().oneshot(delete_bearer("/v1/pools/any", &tok)).await.unwrap().status(),
+        403
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(post_bearer("/v1/bindings", &binding_body, &tok))
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        app.clone().oneshot(delete_bearer("/v1/bindings/any", &tok)).await.unwrap().status(),
+        403
+    );
+}
+
+#[tokio::test]
+async fn operator_can_mutate_entity_crud_when_auth_enabled() {
+    let st = state_with_auth().await;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
+    let app = app(st);
+
+    let pubkey = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+    let node_body = serde_json::json!({
+        "name": "op_node",
+        "control_server_endpoint": "127.0.0.1:3039",
+        "control_server_pubkey": pubkey,
+        "control_client_secret": "op_sec",
+    });
+    let resp = app.clone().oneshot(post_bearer("/v1/nodes", &node_body, &tok)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = app.oneshot(delete_bearer("/v1/nodes/op_node", &tok)).await.unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]

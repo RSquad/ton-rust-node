@@ -228,6 +228,18 @@ impl RuntimeConfigStore {
         }
     }
 
+    /// Same as [`Self::from_app_config`], but writes persisted config to `config_path`
+    /// (for tests that assert on-disk config after `update_and_save`).
+    #[cfg(test)]
+    pub fn from_app_config_with_path(
+        app_config: Arc<AppConfig>,
+        config_path: impl Into<String>,
+    ) -> Self {
+        let mut store = Self::from_app_config(app_config);
+        store.config_path = config_path.into();
+        store
+    }
+
     pub fn updated_at(&self) -> u64 {
         self.updated_at.load(Ordering::Relaxed)
     }
