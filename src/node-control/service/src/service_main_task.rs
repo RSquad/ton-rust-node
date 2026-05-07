@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    elections::election_task::BindingStatusCallback,
     http::http_server_task,
     runtime_config::RuntimeConfigStore,
     task::{ContractsTask, ElectionsTask, VotingTask, task_manager::TaskController},
@@ -16,7 +17,6 @@ use common::{
     app_config::AppConfig, log::setup_log, snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
-use elections::election_task::BindingStatusCallback;
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub async fn run(cancellation_ctx: CancellationCtx, config_path: String) {
