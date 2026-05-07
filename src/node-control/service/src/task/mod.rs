@@ -9,9 +9,11 @@
 pub mod task_macro;
 pub mod task_manager;
 
-use crate::{runtime_config::RuntimeConfig, task, task::task_manager::ServiceTask};
+use crate::{
+    elections::election_task::BindingStatusCallback, runtime_config::RuntimeConfig, task,
+    task::task_manager::ServiceTask,
+};
 use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
-use elections::election_task::BindingStatusCallback;
 use std::sync::Arc;
 
 task!(VotingTask, crate::voting::voting_task::run {
@@ -23,11 +25,6 @@ task!(ContractsTask, crate::contracts::contracts_task::run {
     store: Arc<SnapshotStore>
 });
 
-// Since the elections task is placed in a separate crate, we cannot pass
-// RuntimeConfigStore directly to it. This is because RuntimeConfigStore is
-// defined in the service crate. Instead, we pass the required dependencies to
-// the task as arguments. When the elections task is moved to this crate, we can
-// pass the RuntimeConfigStore directly.
 pub struct ElectionsTask {
     runtime_cfg: Arc<dyn RuntimeConfig>,
     store: Arc<SnapshotStore>,
@@ -51,7 +48,7 @@ impl ServiceTask for ElectionsTask {
         cancellation_ctx: CancellationCtx,
         _app_config: Arc<AppConfig>,
     ) -> anyhow::Result<()> {
-        elections::election_task::run(
+        crate::elections::election_task::run(
             cancellation_ctx,
             self.runtime_cfg.get(),
             self.runtime_cfg.rpc_client(),

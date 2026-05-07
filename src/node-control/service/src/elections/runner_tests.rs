@@ -113,7 +113,7 @@ mock! {
         async fn election_parameters(&mut self) -> anyhow::Result<ConfigParam15>;
         async fn send_boc(&mut self, msg_boc: &[u8]) -> anyhow::Result<()>;
         async fn sign(&mut self, key_hash: Vec<u8>, data: Vec<u8>) -> anyhow::Result<Vec<u8>>;
-        async fn account(&mut self, address: &str) -> anyhow::Result<crate::providers::Account>;
+        async fn account(&mut self, address: &str) -> anyhow::Result<super::super::providers::Account>;
         async fn export_public_key(&mut self, key_id: &[u8]) -> anyhow::Result<Vec<u8>>;
         async fn get_current_vset(&mut self) -> anyhow::Result<ValidatorSet>;
         async fn config_param_16(&mut self) -> anyhow::Result<ton_block::config_params::ConfigParam16>;
@@ -213,8 +213,8 @@ mock! {
 
 // ---- Fake Account using control_client ----
 
-fn fake_account(balance: u64) -> crate::providers::Account {
-    crate::providers::Account::new(control_client::client_api::Account::ShardAccountState(
+fn fake_account(balance: u64) -> super::super::providers::Account {
+    super::super::providers::Account::new(control_client::client_api::Account::ShardAccountState(
         control_client::client_api::ShardAccountState {
             balance: balance as u128,
             ..Default::default()
@@ -3005,7 +3005,7 @@ async fn test_validator_snapshot_uses_vset_data() {
         let mut keys = HashMap::new();
         keys.insert(
             ELECTION_ID,
-            crate::providers::ValidatorEntry {
+            super::super::providers::ValidatorEntry {
                 key_id: KEY_ID.to_vec(),
                 public_key: vec![],
                 adnl_addrs: vec![(ADNL_ADDR.to_vec(), ELECTION_ID + 7200)],
