@@ -707,8 +707,10 @@ fn merge_toncore_slot_config_fallbacks(dto: &mut TonCorePoolSlotDto, slot_cfg: &
 /// parameters. RPC failures are encoded into the slot DTO so a single
 /// unreachable slot does not break the whole `/v1/pools` response.
 ///
-/// Deploy parameters from `slot_cfg.params` are merged whenever on-chain
-/// fields are missing (undeployed slot, RPC error, or uninitialized account).
+/// Deploy parameters from `slot_cfg.params` are merged only for non-active
+/// accounts (undeployed/uninitialized/error). For active accounts we trust
+/// `get_pool_data`; if it fails, on-chain fields stay empty to avoid showing
+/// potentially stale local config as if it were on-chain state.
 async fn fetch_toncore_slot_dto(
     rpc_client: Arc<ClientJsonRpc>,
     slot_idx: usize,
@@ -754,6 +756,7 @@ async fn fetch_toncore_slot_dto(
         },
     };
 
+    let merge_fallback = dto.state != "active";
     if dto.state == "active" {
         if let Some(addr) = addr_opt {
             let wrapper = cached.unwrap_or_else(|| {
@@ -784,7 +787,9 @@ async fn fetch_toncore_slot_dto(
         }
     }
 
-    merge_toncore_slot_config_fallbacks(&mut dto, &slot_cfg);
+    if merge_fallback {
+        merge_toncore_slot_config_fallbacks(&mut dto, &slot_cfg);
+    }
     dto
 }
 

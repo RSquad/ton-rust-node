@@ -585,7 +585,7 @@ fn display_toncore_contract_state(state: i32) -> ColoredString {
 /// Row "State" for TONCore table: account / deployment state wins for undeployed accounts; then
 /// on-chain pool lifecycle from `pool_state` when present.
 fn display_toncore_slot_row(s: &TonCorePoolSlotView) -> ColoredString {
-    if matches!(s.state.as_str(), "not deployed" | "uninit") {
+    if matches!(s.state.as_str(), "not deployed") {
         return "not deployed".yellow();
     }
     if let Some(ps) = s.pool_state {

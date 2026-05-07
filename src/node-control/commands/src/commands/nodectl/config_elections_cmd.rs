@@ -12,7 +12,7 @@ use crate::commands::nodectl::{
 };
 use colored::Colorize;
 use common::{
-    app_config::{BindingStatus, ElectionsConfig, StakePolicy},
+    app_config::{BindingStatus, StakePolicy},
     ton_utils::tons_f64_to_nanotons,
 };
 use std::collections::HashMap;
@@ -35,8 +35,10 @@ pub enum ElectionsAction {
     /// Set the max-factor
     MaxFactor(MaxFactorCmd),
     /// Set AdaptiveSplit50 minimum wait fraction (`sleep_period_pct` in config, 0.0–1.0, must be ≤ waiting period)
+    #[command(alias = "sleep-pct", alias = "adaptive-sleep")]
     AdaptiveSleepPeriodPct(AdaptiveSleepPeriodPctCmd),
     /// Set AdaptiveSplit50 maximum wait fraction (`waiting_period_pct` in config, 0.0–1.0, must be ≥ sleep period)
+    #[command(alias = "wait-pct", alias = "adaptive-wait")]
     AdaptiveWaitingPeriodPct(AdaptiveWaitingPeriodPctCmd),
     /// Enable elections for binding(s)
     Enable(EnableCmd),
@@ -192,9 +194,9 @@ struct BindingElectionView {
 
 fn print_elections_settings_table(view: &ElectionsSettingsView) {
     println!("\n{} {}\n", "OK".green().bold(), "Elections Configuration".green());
-    println!("  {:<20} {}", "Stake Policy:".cyan().bold(), view.stake_policy);
-    println!("  {:<20} {}", "Max Factor:".cyan().bold(), view.max_factor);
-    println!("  {:<20} {}s", "Tick Interval:".cyan().bold(), view.tick_interval);
+    println!("  {:<28} {}", "Stake Policy:".cyan().bold(), view.stake_policy);
+    println!("  {:<28} {}", "Max Factor:".cyan().bold(), view.max_factor);
+    println!("  {:<28} {}s", "Tick Interval:".cyan().bold(), view.tick_interval);
     println!("  {:<28} {}", "adaptive_sleep_period_pct:".cyan().bold(), view.sleep_period_pct);
     println!("  {:<28} {}", "adaptive_waiting_period_pct:".cyan().bold(), view.waiting_period_pct);
 
@@ -316,15 +318,14 @@ async fn fetch_adaptive_timing_percentages(
 }
 
 fn validate_sleep_waiting_pair(sleep: f64, waiting: f64) -> anyhow::Result<()> {
-    let mut ec = ElectionsConfig::default();
-    ec.sleep_period_pct = sleep;
-    ec.waiting_period_pct = waiting;
-    ec.validate_timing_fields()
-}
-
-fn validate_adaptive_pct_range(v: f64) -> anyhow::Result<()> {
-    if !(0.0..=1.0).contains(&v) {
-        anyhow::bail!("value must be in range [0.0, 1.0]");
+    if !(0.0..=1.0).contains(&sleep) {
+        anyhow::bail!("sleep_period_pct must be in range [0.0..1.0]");
+    }
+    if !(0.0..=1.0).contains(&waiting) {
+        anyhow::bail!("waiting_period_pct must be in range [0.0..1.0]");
+    }
+    if sleep > waiting {
+        anyhow::bail!("sleep_period_pct must be <= waiting_period_pct");
     }
     Ok(())
 }
@@ -435,7 +436,6 @@ impl AdaptiveSleepPeriodPctCmd {
         token: Option<&str>,
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
-        validate_adaptive_pct_range(self.value)?;
         let base_url = resolve_service_url(url, config_path)?;
         let (_cur_sleep, cur_waiting) = fetch_adaptive_timing_percentages(&base_url, token).await?;
         validate_sleep_waiting_pair(self.value, cur_waiting)?;
@@ -462,7 +462,6 @@ impl AdaptiveWaitingPeriodPctCmd {
         token: Option<&str>,
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
-        validate_adaptive_pct_range(self.value)?;
         let base_url = resolve_service_url(url, config_path)?;
         let (cur_sleep, _cur_waiting) = fetch_adaptive_timing_percentages(&base_url, token).await?;
         validate_sleep_waiting_pair(cur_sleep, self.value)?;
