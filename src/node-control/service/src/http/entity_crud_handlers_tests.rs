@@ -26,7 +26,15 @@ use common::{
     task_cancellation::CancellationCtx,
 };
 use http_body_util::BodyExt;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tower::ServiceExt;
 
 struct Noop;
@@ -102,14 +110,27 @@ fn sample_snp_pool(name: &str) -> (String, PoolConfig) {
     )
 }
 
+fn unique_test_config_path() -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let unique_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    std::env::temp_dir().join(format!(
+        "node-control-entity-crud-tests-{}-{}-{}.json",
+        std::process::id(),
+        nanos,
+        unique_id
+    ))
+}
+
+/// Builds [`AppState`] for router tests. Uses a unique temp config path so parallel tests never
+/// share `save_to_file` output (the default `from_app_config` `"noop"` path is unsuitable under
+/// `cargo test -- --test-threads=N`).
 async fn app_state(cfg: Arc<AppConfig>, config_path: Option<PathBuf>) -> AppState {
-    let rt: Arc<RuntimeConfigStore> = match config_path {
-        Some(p) => Arc::new(RuntimeConfigStore::from_app_config_with_path(
-            cfg,
-            p.to_string_lossy().into_owned(),
-        )),
-        None => Arc::new(RuntimeConfigStore::from_app_config(cfg)),
-    };
+    let path = config_path.unwrap_or_else(unique_test_config_path);
+    let rt = Arc::new(RuntimeConfigStore::from_app_config_with_path(
+        cfg,
+        path.to_string_lossy().into_owned(),
+    ));
     let jwt_auth = Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap());
     AppState {
         store: Arc::new(SnapshotStore::new()),

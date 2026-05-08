@@ -21,7 +21,15 @@ use common::{
     task_cancellation::CancellationCtx,
 };
 use http_body_util::BodyExt;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tower::ServiceExt;
 
 struct Noop;
@@ -109,13 +117,29 @@ fn elections_task(rt: Arc<RuntimeConfigStore>) -> Arc<TaskController> {
 
 const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
 
+/// Unique path under the system temp dir so parallel auth tests never share `save_to_file` output.
+fn unique_test_config_path() -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let unique_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    std::env::temp_dir().join(format!(
+        "node-control-auth-tests-{}-{}-{}.json",
+        std::process::id(),
+        nanos,
+        unique_id
+    ))
+}
+
 async fn test_jwt_auth() -> Arc<JwtAuth> {
     Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap())
 }
 
 async fn state_with_auth() -> AppState {
     let cfg = auth_config();
-    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(cfg.clone())));
+    let rt = Arc::new(RuntimeConfigStore::from_app_config_with_path(
+        app_cfg_with_auth(cfg.clone()),
+        unique_test_config_path().to_string_lossy().into_owned(),
+    ));
     AppState {
         store: Arc::new(SnapshotStore::new()),
         runtime_cfg: rt.clone(),
@@ -128,7 +152,10 @@ async fn state_with_auth() -> AppState {
 }
 
 async fn state_no_auth() -> AppState {
-    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_no_auth()));
+    let rt = Arc::new(RuntimeConfigStore::from_app_config_with_path(
+        app_cfg_no_auth(),
+        unique_test_config_path().to_string_lossy().into_owned(),
+    ));
     AppState {
         store: Arc::new(SnapshotStore::new()),
         runtime_cfg: rt.clone(),
