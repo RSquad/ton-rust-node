@@ -9,7 +9,7 @@
 //! REST mutation tests for `/v1/nodes`, `/v1/wallets`, `/v1/pools`, `/v1/bindings`.
 use crate::{
     auth::{jwt::JwtAuth, user_store::UserStore},
-    http::http_server_task::*,
+    http::{config_handlers::ADNL_PUBKEY_TYPE_ID, http_server_task::*},
     runtime_config::{RuntimeConfig, RuntimeConfigStore},
     task::task_manager::{ServiceTask, TaskController},
 };
@@ -49,9 +49,6 @@ impl ServiceTask for Noop {
 }
 
 const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
-
-/// ADNL server key type id (must match `config_handlers::ADNL_PUBKEY_TYPE_ID`).
-const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
 
 fn empty_app_cfg() -> Arc<AppConfig> {
     Arc::new(AppConfig {
@@ -203,7 +200,7 @@ fn binding_add_json(node: &str, wallet: &str, pool: Option<&str>) -> serde_json:
 // --- POST /v1/nodes ---
 
 #[tokio::test]
-async fn nodes_post_happy_path() {
+async fn nodes_post_succeeds() {
     let st = app_state(empty_app_cfg(), None).await;
     let app = routes(false, st);
     let resp = app.clone().oneshot(post_json("/v1/nodes", &node_add_json("node_a"))).await.unwrap();
@@ -254,7 +251,7 @@ async fn nodes_post_invalid_pubkey_base64() {
 }
 
 #[tokio::test]
-async fn nodes_delete_happy_and_not_found() {
+async fn nodes_delete_succeeds_then_not_found() {
     let st = app_state(empty_app_cfg(), None).await;
     let app = routes(false, st);
     let body = node_add_json("to_rm");
@@ -290,7 +287,7 @@ async fn nodes_delete_referenced_by_binding() {
 // --- POST/DELETE /v1/wallets ---
 
 #[tokio::test]
-async fn wallets_post_happy_path() {
+async fn wallets_post_succeeds() {
     let st = app_state(empty_app_cfg(), None).await;
     let app = routes(false, st);
     let resp =
@@ -332,7 +329,7 @@ async fn wallets_post_duplicate() {
 }
 
 #[tokio::test]
-async fn wallets_delete_happy_and_referenced_by_binding() {
+async fn wallets_delete_rejected_when_bound_then_succeeds_when_orphan() {
     let mut cfg = (*empty_app_cfg()).clone();
     let (nname, ncfg) = sample_node_adnl("w_del");
     cfg.nodes.insert(nname.clone(), ncfg);
@@ -374,7 +371,7 @@ async fn wallets_delete_not_found() {
 // --- POST/DELETE /v1/pools (SNP) ---
 
 #[tokio::test]
-async fn pools_post_happy_and_missing_address_owner() {
+async fn pools_post_succeeds_missing_address_owner_rejected() {
     let st = app_state(empty_app_cfg(), None).await;
     let app = routes(false, st);
 
@@ -416,7 +413,7 @@ async fn pools_post_duplicate() {
 }
 
 #[tokio::test]
-async fn pools_delete_happy_and_referenced_by_binding() {
+async fn pools_delete_rejected_when_bound_then_succeeds_when_orphan() {
     let mut cfg = (*empty_app_cfg()).clone();
     let (nname, ncfg) = sample_node_adnl("p_del");
     cfg.nodes.insert(nname.clone(), ncfg);
@@ -458,7 +455,7 @@ async fn pools_delete_not_found() {
 // --- POST/DELETE /v1/bindings ---
 
 #[tokio::test]
-async fn bindings_post_happy_path_and_duplicate() {
+async fn bindings_post_succeeds_duplicate_rejected() {
     let mut cfg = (*empty_app_cfg()).clone();
     let (nname, ncfg) = sample_node_adnl("bind");
     cfg.nodes.insert(nname.clone(), ncfg);
@@ -519,7 +516,7 @@ async fn bindings_post_missing_refs() {
 }
 
 #[tokio::test]
-async fn bindings_delete_happy_and_non_idle() {
+async fn bindings_delete_succeeds_when_idle_non_idle_rejected() {
     let mut cfg = (*empty_app_cfg()).clone();
     let (nname, ncfg) = sample_node_adnl("idle_rm");
     cfg.nodes.insert(nname.clone(), ncfg.clone());
