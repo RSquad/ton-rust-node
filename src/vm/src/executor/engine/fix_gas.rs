@@ -1150,7 +1150,7 @@ static FIX_GAS16: [(FixGasPrefix, u8); 26] = [
     (FixGasPrefix::Number(0x686C), 28),
 ];
 
-pub fn check_too_short_code(code: &mut SliceData) -> Result<Option<(u16, u8, u8)>> {
+pub fn check_too_short_code(code: &SliceData) -> Result<Option<(u16, u8, u8)>> {
     let bits = code.remaining_bits();
     if bits == 0 || bits > 16 {
         return Ok(None);
@@ -1172,7 +1172,6 @@ pub fn check_too_short_code(code: &mut SliceData) -> Result<Option<(u16, u8, u8)
     });
     if let Ok(index) = result {
         let (_, gas) = fix_gas[index];
-        code.move_by(bits as usize)?;
         Ok(Some((cmd, bits, gas)))
     } else {
         Ok(None)

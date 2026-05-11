@@ -58,11 +58,12 @@ use storage::{
     shardstate_db_async::{AllowStateGcResolver, CellsDbConfig, Job, ShardStateDb},
     traits::Serializable,
     types::{BlockMeta, PersistentStatePartId, PersistentStatePartKey},
-    StorageAlloc, TimeChecker,
+    StorageAlloc,
 };
 use ton_block::{
-    error, fail, AccountIdPrefixFull, BigBocWriter, Block, BlockIdExt, BocFlags, BocWriter, Cell,
-    CellsFactory, CellsStorage, Result, ShardIdent, UInt256, INVALID_WORKCHAIN_ID, MAX_SAFE_DEPTH,
+    error, fail, time_checker, AccountIdPrefixFull, BigBocWriter, Block, BlockIdExt, BocFlags,
+    BocWriter, Cell, CellsFactory, CellsStorage, Result, ShardIdent, UInt256, INVALID_WORKCHAIN_ID,
+    MAX_SAFE_DEPTH,
 };
 
 /// Full node state keys
@@ -522,7 +523,7 @@ impl InternalDb {
         handle: &Arc<BlockHandle>,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(format!("store_block_handle {}", handle.id()), 30);
+        let _tc = time_checker!(|| format!("store_block_handle {}", handle.id()), 30);
         self.block_handle_storage.save_handle(handle, callback)
     }
 
@@ -532,7 +533,7 @@ impl InternalDb {
         db: &BlockInfoDb,
         msg: &str,
     ) -> Result<Option<BlockIdExt>> {
-        let _tc = TimeChecker::new(format!("{} {}", msg, id), 30);
+        let _tc = time_checker!(|| format!("{} {}", msg, id), 30);
         let Some(bytes) = db.try_get(id)? else { return Ok(None) };
         Ok(Some(BlockIdExt::deserialize(&bytes)?))
     }
@@ -548,7 +549,7 @@ impl InternalDb {
         check_set: impl Fn(&Arc<BlockHandle>) -> bool,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(format!("{} {}", msg, handle.id()), 30);
+        let _tc = time_checker!(|| format!("{} {}", msg, handle.id()), 30);
         if !check_has(handle) {
             db.put(handle.id(), &linkage.serialize())?;
             if check_set(handle) {
@@ -565,7 +566,7 @@ impl InternalDb {
         utime: Option<u32>,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<BlockResult> {
-        let _tc = TimeChecker::new(format!("create_or_load_block_handle {id}"), 30);
+        let _tc = time_checker!(|| format!("create_or_load_block_handle {id}"), 30);
 
         if let Some(handle) = self.load_block_handle(id)? {
             return Ok(BlockResult::with_status(handle, DataStatus::Fetched));
@@ -591,7 +592,7 @@ impl InternalDb {
     }
 
     pub fn load_block_handle(&self, id: &BlockIdExt) -> Result<Option<Arc<BlockHandle>>> {
-        let _tc = TimeChecker::new(format!("load_block_handle {}", id), 30);
+        let _tc = time_checker!(|| format!("load_block_handle {}", id), 30);
         self.block_handle_storage.load_handle_by_id(id)
     }
 
@@ -600,7 +601,7 @@ impl InternalDb {
         block: &BlockStuff,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<BlockResult> {
-        let _tc = TimeChecker::new(format!("store_block_data {}", block.id()), 100);
+        let _tc = time_checker!(|| format!("store_block_data {}", block.id()), 100);
         let mut result = self.create_or_load_block_handle(
             block.id(),
             Some(block.block()?),
@@ -629,13 +630,13 @@ impl InternalDb {
     }
 
     pub async fn load_block_data(&self, handle: &BlockHandle) -> Result<BlockStuff> {
-        let _tc = TimeChecker::new(format!("load_block_data {}", handle.id()), 100);
+        let _tc = time_checker!(|| format!("load_block_data {}", handle.id()), 100);
         let raw_block = self.load_block_data_raw(handle).await?;
         BlockStuff::deserialize_block(handle.id().clone(), Arc::new(raw_block))
     }
 
     pub async fn load_block_data_raw(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
-        let _tc = TimeChecker::new(format!("load_block_data_raw {}", handle.id()), 100);
+        let _tc = time_checker!(|| format!("load_block_data_raw {}", handle.id()), 100);
         if !handle.has_data() {
             fail!("This block is not stored yet: {:?}", handle);
         }
@@ -648,7 +649,7 @@ impl InternalDb {
         prefix: &AccountIdPrefixFull,
         seqno: u32,
     ) -> Result<Option<(BlockIdExt, Vec<u8>)>> {
-        let _tc = TimeChecker::new(format!("lookup_block_by_seqno {} {}", prefix, seqno), 20);
+        let _tc = time_checker!(|| format!("lookup_block_by_seqno {} {}", prefix, seqno), 20);
         self.archive_manager.lookup_block_by_seqno(prefix, seqno).await
     }
 
@@ -657,7 +658,7 @@ impl InternalDb {
         prefix: &AccountIdPrefixFull,
         lt: u64,
     ) -> Result<Option<(BlockIdExt, Vec<u8>)>> {
-        let _tc = TimeChecker::new(format!("lookup_block_by_lt {} {}", prefix, lt), 20);
+        let _tc = time_checker!(|| format!("lookup_block_by_lt {} {}", prefix, lt), 20);
         self.archive_manager.lookup_block_by_lt(prefix, lt).await
     }
 
@@ -667,7 +668,7 @@ impl InternalDb {
         utime: u32,
         f: Box<dyn FnMut(BlockIdExt, Vec<u8>) -> Result<bool> + Send + 'a>,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(format!("lookup_blocks_by_utime {} {}", prefix, utime), 20);
+        let _tc = time_checker!(|| format!("lookup_blocks_by_utime {} {}", prefix, utime), 20);
         self.archive_manager.lookup_blocks_by_utime(prefix, utime, f).await
     }
 
@@ -678,7 +679,7 @@ impl InternalDb {
         proof: &BlockProofStuff,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<BlockResult> {
-        let _tc = TimeChecker::new(format!("store_block_proof {}", proof.id()), 100);
+        let _tc = time_checker!(|| format!("store_block_proof {}", proof.id()), 100);
 
         if let Some(handle) = &handle {
             if handle.id() != id {
@@ -734,9 +735,9 @@ impl InternalDb {
         handle: &BlockHandle,
         is_link: bool,
     ) -> Result<BlockProofStuff> {
-        let _tc = TimeChecker::new(
-            format!("load_block_proof {} {}", if is_link { "link" } else { "" }, handle.id()),
-            100,
+        let _tc = time_checker!(
+            || format!("load_block_proof{} {}", if is_link { " link" } else { "" }, handle.id()),
+            100
         );
         let raw_proof = self.load_block_proof_raw_(handle, is_link).await?;
         BlockProofStuff::deserialize(handle.id(), raw_proof, is_link)
@@ -747,9 +748,13 @@ impl InternalDb {
         handle: &BlockHandle,
         is_link: bool,
     ) -> Result<Vec<u8>> {
-        let _tc = TimeChecker::new(
-            format!("load_block_proof_raw {} {}", if is_link { "link" } else { "" }, handle.id()),
-            100,
+        let _tc = time_checker!(
+            || format!(
+                "load_block_proof_raw{} {}",
+                if is_link { " link" } else { "" },
+                handle.id()
+            ),
+            100
         );
         self.load_block_proof_raw_(handle, is_link).await
     }
@@ -780,7 +785,7 @@ impl InternalDb {
     ) -> Result<(Arc<ShardStateStuff>, bool)> {
         let timeout = 30;
         let _tc =
-            TimeChecker::new(format!("store_shard_state_dynamic {}", state.block_id()), timeout);
+            time_checker!(|| format!("store_shard_state_dynamic {}", state.block_id()), timeout);
 
         if handle.id() != state.block_id() {
             fail!(NodeError::InvalidArg("`state` and `handle` mismatch".to_string()))
@@ -829,7 +834,7 @@ impl InternalDb {
         state_update: Cell,
     ) -> Result<()> {
         let timeout = 30;
-        let _tc = TimeChecker::new(format!("store_state_update {}", handle.id()), timeout);
+        let _tc = time_checker!(|| format!("store_state_update {}", handle.id()), timeout);
 
         let _lock = handle.saving_state_lock().lock().await;
         if !handle.has_saved_state() {
@@ -852,7 +857,7 @@ impl InternalDb {
     }
 
     pub fn load_shard_state_dynamic(&self, id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
-        let _tc = TimeChecker::new(format!("load_shard_state_dynamic {}", id), 30);
+        let _tc = time_checker!(|| format!("load_shard_state_dynamic {}", id), 30);
 
         let handle = self
             .load_block_handle(id)?
@@ -874,7 +879,7 @@ impl InternalDb {
     }
 
     pub fn load_cell(&self, id: &UInt256) -> Result<Cell> {
-        let _tc = TimeChecker::new(format!("load_cell {}", id), 30);
+        let _tc = time_checker!(|| format!("load_cell {}", id), 30);
         self.state_db.get_cell(id)
     }
 
@@ -1035,9 +1040,9 @@ impl InternalDb {
         state_data: &[u8],
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(
-            format!("store_shard_state_persistent_raw {}", handle.id()),
-            state_data.len() as u64 / 1000 + 10,
+        let _tc = time_checker!(
+            || format!("store_shard_state_persistent_raw {}", handle.id()),
+            state_data.len() as u64 / 1000 + 10
         );
         if !handle.has_persistent_state() {
             self.shard_state_persistent_db.write_whole_file(handle.id(), state_data).await?;
@@ -1055,7 +1060,7 @@ impl InternalDb {
         length: u64,
     ) -> Result<Vec<u8>> {
         let key: PersistentStatePartKey = id.into();
-        let _tc = TimeChecker::new(format!("load_shard_state_persistent_slice {}", id), 200);
+        let _tc = time_checker!(|| format!("load_shard_state_persistent_slice {}", id), 200);
         let full_lenth = self.load_shard_state_persistent_size(id).await?;
         if offset > full_lenth {
             fail!("offset is greater than full length");
@@ -1074,7 +1079,7 @@ impl InternalDb {
         id: &PersistentStatePartId,
         dest: &mut Vec<u8>,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(format!("load_shard_state_persistent_to {}", id), 1000);
+        let _tc = time_checker!(|| format!("load_shard_state_persistent_to {}", id), 1000);
         let id: PersistentStatePartKey = id.into();
         self.shard_state_persistent_db.read_whole_file_to(&id, dest).await
     }
@@ -1083,7 +1088,7 @@ impl InternalDb {
         &self,
         id: &PersistentStatePartId,
     ) -> Result<impl Read + Seek> {
-        let _tc = TimeChecker::new(format!("load_shard_state_persistent_obj {}", id), 10);
+        let _tc = time_checker!(|| format!("load_shard_state_persistent_obj {}", id), 10);
         let key: PersistentStatePartKey = id.into();
         self.shard_state_persistent_db.get_read_object(&key)
     }
@@ -1092,13 +1097,13 @@ impl InternalDb {
         &self,
         id: &PersistentStatePartId,
     ) -> Result<u64> {
-        let _tc = TimeChecker::new(format!("load_shard_state_persistent_size {}", id), 50);
+        let _tc = time_checker!(|| format!("load_shard_state_persistent_size {}", id), 50);
         let id: PersistentStatePartKey = id.into();
         self.shard_state_persistent_db.get_file_size(&id).await
     }
 
     pub async fn cleanup_shard_states_persistent(&self) -> Result<()> {
-        let _tc = TimeChecker::new("shard_state_persistent_gc".to_string(), 5000);
+        let _tc = time_checker!(|| "shard_state_persistent_gc", 5000);
         self.shard_state_persistent_db.cleanup_tmp()?;
         Ok(())
     }
@@ -1108,7 +1113,7 @@ impl InternalDb {
         calc_ttl: impl Fn(u32) -> (u32, bool),
         zerostate_id: &BlockIdExt,
     ) -> Result<()> {
-        let _tc = TimeChecker::new("shard_state_persistent_gc".to_string(), 5000);
+        let _tc = time_checker!(|| "shard_state_persistent_gc", 5000);
         let mut for_delete = HashSet::new();
         self.shard_state_persistent_db.for_each_key(&mut |key| {
             let root_hash = UInt256::from(&key[..32]);
@@ -1256,7 +1261,7 @@ impl InternalDb {
         handle: &Arc<BlockHandle>,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<bool> {
-        let _tc = TimeChecker::new(format!("store_block_applied {}", handle.id()), 30);
+        let _tc = time_checker!(|| format!("store_block_applied {}", handle.id()), 30);
         if handle.set_block_applied() {
             self.store_block_handle(handle, callback)?;
             Ok(true)
@@ -1270,7 +1275,7 @@ impl InternalDb {
         id: &BlockIdExt,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(format!("archive_block {}", id), 200);
+        let _tc = time_checker!(|| format!("archive_block {}", id), 200);
         let handle = self
             .load_block_handle(id)?
             .ok_or_else(|| error!("Cannot load handle for archiving block {}", id))?;
@@ -1290,52 +1295,52 @@ impl InternalDb {
 
     #[allow(dead_code)]
     pub fn drop_full_node_state(&self, key: &'static str) -> Result<()> {
-        let _tc = TimeChecker::new(format!("drop_full_node_state {}", key), 30);
+        let _tc = time_checker!(|| format!("drop_full_node_state {}", key), 30);
         self.block_handle_storage.drop_full_node_state(key.to_string())
     }
 
     pub fn load_full_node_state(&self, key: &'static str) -> Result<Option<Arc<BlockIdExt>>> {
-        let _tc = TimeChecker::new(format!("load_full_node_state {}", key), 30);
+        let _tc = time_checker!(|| format!("load_full_node_state {}", key), 30);
         self.block_handle_storage.load_full_node_state(key)
     }
 
     pub fn save_full_node_state(&self, key: &'static str, block_id: &BlockIdExt) -> Result<()> {
-        let _tc = TimeChecker::new(format!("save_full_node_state {}", key), 30);
+        let _tc = time_checker!(|| format!("save_full_node_state {}", key), 30);
         self.block_handle_storage.save_full_node_state(key.to_string(), block_id)
     }
 
     pub fn drop_validator_state(&self, key: &'static str) -> Result<()> {
-        let _tc = TimeChecker::new(format!("drop_validator_state {}", key), 30);
+        let _tc = time_checker!(|| format!("drop_validator_state {}", key), 30);
         self.block_handle_storage.drop_validator_state(key.to_string())
     }
 
     pub fn load_validator_state(&self, key: &'static str) -> Result<Option<Arc<BlockIdExt>>> {
-        let _tc = TimeChecker::new(format!("load_validator_state {}", key), 30);
+        let _tc = time_checker!(|| format!("load_validator_state {}", key), 30);
         self.block_handle_storage.load_validator_state(key)
     }
 
     pub fn save_validator_state(&self, key: &'static str, block_id: &BlockIdExt) -> Result<()> {
-        let _tc = TimeChecker::new(format!("save_validator_state {}", key), 30);
+        let _tc = time_checker!(|| format!("save_validator_state {}", key), 30);
         self.block_handle_storage.save_validator_state(key.to_string(), block_id)
     }
 
     pub fn drop_validator_state_raw(&self, key: &'static str) -> Result<()> {
-        let _tc = TimeChecker::new(format!("drop_validator_state_raw {}", key), 30);
+        let _tc = time_checker!(|| format!("drop_validator_state_raw {}", key), 30);
         self.block_handle_storage.drop_validator_state_raw(key)
     }
 
     pub fn load_validator_state_raw(&self, key: &'static str) -> Result<Option<Vec<u8>>> {
-        let _tc = TimeChecker::new(format!("load_validator_state_raw {}", key), 30);
+        let _tc = time_checker!(|| format!("load_validator_state_raw {}", key), 30);
         self.block_handle_storage.load_validator_state_raw(key)
     }
 
     pub fn save_validator_state_raw(&self, key: &'static str, data: &[u8]) -> Result<()> {
-        let _tc = TimeChecker::new(format!("save_validator_state_raw {}", key), 30);
+        let _tc = time_checker!(|| format!("save_validator_state_raw {}", key), 30);
         self.block_handle_storage.save_validator_state_raw(key, data)
     }
 
     pub async fn get_archive_id(&self, mc_seq_no: u32, shard: &ShardIdent) -> Option<u64> {
-        let _tc = TimeChecker::new(format!("get_archive_id {mc_seq_no} {shard}"), 30);
+        let _tc = time_checker!(|| format!("get_archive_id {mc_seq_no} {shard}"), 30);
         self.archive_manager.get_archive_id(mc_seq_no, shard).await
     }
 
@@ -1345,20 +1350,20 @@ impl InternalDb {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<u8>> {
-        let _tc = TimeChecker::new(
-            format!("get_archive_slice id: {}, offset: {}, limit: {}", archive_id, offset, limit),
-            300,
+        let _tc = time_checker!(
+            || format!("get_archive_slice id: {archive_id}, offset: {offset}, limit: {limit}"),
+            300
         );
         self.archive_manager.get_archive_slice(archive_id, offset, limit).await
     }
 
     pub async fn clean_unapplied_files(&self, ids: &[BlockIdExt]) {
-        let _tc = TimeChecker::new("clean_unapplied_files".to_owned(), 300);
+        let _tc = time_checker!(|| "clean_unapplied_files", 300);
         self.archive_manager.clean_unapplied_files(ids).await;
     }
 
     pub async fn archive_gc(&self, last_unneeded_key_block: &BlockIdExt) -> Result<()> {
-        let _tc = TimeChecker::new(format!("archive_gc {}", last_unneeded_key_block), 300);
+        let _tc = time_checker!(|| format!("archive_gc {}", last_unneeded_key_block), 300);
         self.archive_manager.gc(last_unneeded_key_block).await;
         self.save_full_node_state(LAST_UNNEEDED_KEY_BLOCK, last_unneeded_key_block)
     }
@@ -1369,7 +1374,7 @@ impl InternalDb {
         mc_seq_no: u32,
         callback: Option<Arc<dyn block_handle_db::Callback>>,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(format!("assign_mc_ref_seq_no {}", handle.id()), 30);
+        let _tc = time_checker!(|| format!("assign_mc_ref_seq_no {}", handle.id()), 30);
         if handle.set_masterchain_ref_seq_no(mc_seq_no)? {
             self.store_block_handle(handle, callback)?;
         }
@@ -1381,14 +1386,14 @@ impl InternalDb {
         id: &TopBlockDescrId,
         tsb: &TopBlockDescrStuff,
     ) -> Result<()> {
-        let _tc = TimeChecker::new(format!("save_top_shard_block {}", id), 50);
+        let _tc = time_checker!(|| format!("save_top_shard_block {}", id), 50);
         self.shard_top_blocks_db.put(&id.to_bytes()?, &tsb.to_bytes()?)
     }
 
     pub fn load_all_top_shard_blocks(
         &self,
     ) -> Result<HashMap<TopBlockDescrId, TopBlockDescrStuff>> {
-        let _tc = TimeChecker::new("load_all_top_shard_blocks".to_string(), 100);
+        let _tc = time_checker!(|| "load_all_top_shard_blocks", 100);
         let mut result = HashMap::<TopBlockDescrId, TopBlockDescrStuff>::new();
 
         let mut invalid_entries = Vec::new();
@@ -1422,7 +1427,7 @@ impl InternalDb {
 
     #[cfg(test)]
     pub fn load_all_top_shard_blocks_raw(&self) -> Result<HashMap<TopBlockDescrId, Vec<u8>>> {
-        let _tc = TimeChecker::new("load_all_top_shard_blocks_raw".to_string(), 100);
+        let _tc = time_checker!(|| "load_all_top_shard_blocks_raw", 100);
         let mut result = HashMap::<TopBlockDescrId, Vec<u8>>::new();
         self.shard_top_blocks_db.for_each(&mut |id_bytes, tsb_bytes| {
             let id = TopBlockDescrId::from_bytes(id_bytes)?;
@@ -1433,7 +1438,7 @@ impl InternalDb {
     }
 
     pub fn remove_top_shard_block(&self, id: &TopBlockDescrId) -> Result<()> {
-        let _tc = TimeChecker::new(format!("remove_top_shard_block {}", id), 50);
+        let _tc = time_checker!(|| format!("remove_top_shard_block {}", id), 50);
         self.shard_top_blocks_db.delete(&id.to_bytes()?)
     }
 

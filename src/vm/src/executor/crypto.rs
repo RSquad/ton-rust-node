@@ -395,11 +395,21 @@ pub(super) fn execute_ristretto_255_mul<T: OperationBehavior>(engine: &mut Engin
     engine.cmd.var(1).as_integer()?;
     engine.try_use_gas(Gas::ristretto_255_mul_gas_price())?;
 
-    let (_y, n) =
-        engine.cmd.var(0).as_integer()?.div::<Quiet>(&RISTRETTO_255_L, Round::FloorToZero)?;
+    let (_y, n) = engine
+        .cmd
+        .var(0)
+        .as_integer()?
+        .div::<Quiet>(&RISTRETTO_255_L, Round::FloorToNegativeInfinity)?;
+    if n.is_zero() {
+        engine.cc.stack.push(StackItem::integer(IntegerData::zero()));
+        if T::quiet() {
+            engine.cc.stack.push(boolean!(true));
+        }
+        return Ok(());
+    }
     let x = engine.cmd.var(1).as_integer()?;
     if let Ok(x) = x.as_u256() {
-        if let Ok(n) = n.as_vec(256, true, false) {
+        if let Ok(n) = n.as_vec(256, false, false) {
             if let Some(r) =
                 ton_block::ristretto_255_mul(x.as_slice().try_into()?, n.as_slice().try_into()?)
             {
@@ -430,9 +440,12 @@ pub(super) fn execute_ristretto_255_mulbase<T: OperationBehavior>(engine: &mut E
     engine.cmd.var(0).as_integer()?;
     engine.try_use_gas(Gas::ristretto_255_mulbase_gas_price())?;
 
-    let (_, n) =
-        engine.cmd.var(0).as_integer()?.div::<Quiet>(&RISTRETTO_255_L, Round::FloorToZero)?;
-    if let Ok(n) = n.as_vec(256, true, false) {
+    let (_, n) = engine
+        .cmd
+        .var(0)
+        .as_integer()?
+        .div::<Quiet>(&RISTRETTO_255_L, Round::FloorToNegativeInfinity)?;
+    if let Ok(n) = n.as_vec(256, false, false) {
         let r = ton_block::ristretto_255_mulbase(n.as_slice().try_into()?);
         let r = IntegerData::from_unsigned_bytes_be(r);
         engine.cc.stack.push(StackItem::integer(r));

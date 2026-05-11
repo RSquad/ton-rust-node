@@ -41,7 +41,7 @@ impl ShardAccounts {
         match account.get_id() {
             Some(acc_id) => {
                 let depth_balance_info =
-                    DepthBalanceInfo::new(split_depth, account.get_balance().unwrap())?;
+                    DepthBalanceInfo::new(split_depth as u32, account.get_balance().unwrap())?;
                 let sh_account =
                     ShardAccount::with_params(account, last_trans_hash, last_trans_lt)?;
                 self.set_builder_serialized(
@@ -78,10 +78,7 @@ impl ShardAccounts {
 
 impl Augmentation<DepthBalanceInfo> for ShardAccount {
     fn aug(&self) -> Result<DepthBalanceInfo> {
-        let account = self.read_account()?;
-        let balance = account.balance().cloned().unwrap_or_default();
-        let split_depth = account.fixed_prefix_length().unwrap_or_default();
-        Ok(DepthBalanceInfo { split_depth, balance })
+        self.read_account()?.aug()
     }
 }
 
@@ -93,15 +90,13 @@ pub struct DepthBalanceInfo {
 }
 
 impl DepthBalanceInfo {
-    pub fn new(split_depth: u8, balance: &CurrencyCollection) -> Result<Self> {
-        Ok(Self {
-            split_depth: Number5::new_checked(split_depth as u32, 30)?,
-            balance: balance.clone(),
-        })
+    pub fn new(split_depth: u32, balance: &CurrencyCollection) -> Result<Self> {
+        Ok(Self { split_depth: Number5::new_checked(split_depth, 30)?, balance: balance.clone() })
     }
 
-    pub fn set_split_depth(&mut self, split_depth: Number5) {
-        self.split_depth = split_depth
+    pub fn set_split_depth(&mut self, split_depth: u32) -> Result<()> {
+        self.split_depth = Number5::new_checked(split_depth, 30)?;
+        Ok(())
     }
 
     pub fn set_balance(&mut self, balance: CurrencyCollection) {

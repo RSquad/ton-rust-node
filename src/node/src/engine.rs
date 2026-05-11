@@ -1159,7 +1159,7 @@ impl Engine {
                 let handle = handle.to_non_created().ok_or_else(|| {
                     error!("INTERNAL ERROR: bad result for store block {} proof", id)
                 })?;
-                log::trace!(
+                log::debug!(
                     "Downloaded block for {}apply {} TIME download: {}ms, check & save: {}",
                     if pre_apply { "pre-" } else { "" },
                     block.id(),
@@ -1699,7 +1699,7 @@ impl Engine {
             limit,
             30,
             "download_next_block_worker",
-            Some((50, 11, 1000)),
+            Some((25, 11, 500)),
         )
         .await?
         .download()

@@ -782,14 +782,17 @@ impl FullNodeOverlaysRouter {
         self: &Arc<Self>,
         validators: &ValidatorSet,
     ) -> Result<Option<Arc<dyn KeyOption>>> {
-        let val_list_id = compute_validator_list_id(validators.list(), None)?
-            .ok_or_else(|| error!("Cant compute validator list id"))?;
+        if validators.list().is_empty() {
+            return Ok(None);
+        }
 
+        let val_list_id = compute_validator_list_id(validators.list(), None)?
+            .ok_or_else(|| error!("Can't compute validator list id"))?;
         match self.network.try_get_validator_adnl_key(&val_list_id) {
             None => {
                 log::info!(
                     "No local validator ADNL key for list {:x} (node is either not a validator \
-                     for this list yet, or validator network context is still not ready)",
+                    for this list yet, or validator network context is still not ready)",
                     val_list_id
                 );
                 return Ok(None);

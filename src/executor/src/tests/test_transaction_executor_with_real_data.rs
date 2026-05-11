@@ -692,6 +692,16 @@ fn test_action_result_arg() {
     )
 }
 
+#[test]
+fn test_exit_arg_on_success() {
+    replay_transaction_by_files(
+        "real_boc/exit_arg_on_success_account_old.boc",
+        "real_boc/exit_arg_on_success_account_new.boc",
+        "real_boc/exit_arg_on_success_transaction.boc",
+        "real_boc/config13.boc",
+    )
+}
+
 #[ignore = "test for replay transaction by message from transaction"]
 #[test]
 fn test_replay_transaction_by_message_from_transaction() {
