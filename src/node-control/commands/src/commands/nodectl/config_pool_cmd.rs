@@ -25,10 +25,6 @@ use contracts::{TonWallet, nominator::ton_core_pool as pool_messages};
 use std::{path::Path, str::FromStr};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt, write_boc};
 
-fn skip_deploy_layout_embedded_cli(layout: &TonCoreDeployLayout) -> bool {
-    layout.is_embedded_code()
-}
-
 fn parse_cli_deploy_layout(s: &str) -> Result<TonCoreDeployLayout, String> {
     match s.trim() {
         "embedded_code" => Ok(TonCoreDeployLayout::EmbeddedCode),
@@ -291,8 +287,6 @@ struct PoolAddCoreBody<'a> {
     min_validator_stake: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_nominator_stake: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "skip_deploy_layout_embedded_cli")]
     deploy_layout: TonCoreDeployLayout,
 }
 
