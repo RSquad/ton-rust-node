@@ -628,8 +628,9 @@ pub async fn v1_pools_handler(
                     cached_router.map(|r| r.inner_pools()).unwrap_or_default();
                 let mut cached_iter = cached_inner.into_iter();
 
-                // Build (slot_index, optional config address, optional cached wrapper) for each configured slot.
-                //`inner_pools()` returns wrappers in slot order but skips empty slots,
+                // Build (slot index, full per-slot TonCorePoolConfig — address, params, deploy_layout,
+                // optional cached nominator wrapper from `inner_pools()`).
+                // `inner_pools()` returns wrappers in slot order but skips empty slots,
                 // so we iterate the config and consume the cached iterator only for `Some` entries.
                 let mut slot_jobs = Vec::new();
                 for (idx, slot_cfg) in pools.iter().enumerate() {
