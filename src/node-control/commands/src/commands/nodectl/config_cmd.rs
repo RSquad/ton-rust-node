@@ -7,10 +7,9 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::{
-    config_bind_cmd::BindCmd, config_contracts_automation_cmd::ContractsAutomationCfgCmd,
-    config_elections_cmd::ElectionsCfgCmd, config_log_cmd::LogCmd, config_node_cmd::NodeCmd,
-    config_pool_cmd::PoolCmd, config_ton_http_api_cmd::TonHttpApiCmd, config_wallet_cmd::WalletCmd,
-    master_wallet_cmd::MasterWalletCmd, utils::save_config,
+    config_bind_cmd::BindCmd, config_elections_cmd::ElectionsCfgCmd, config_log_cmd::LogCmd,
+    config_node_cmd::NodeCmd, config_pool_cmd::PoolCmd, config_ton_http_api_cmd::TonHttpApiCmd,
+    config_wallet_cmd::WalletCmd, master_wallet_cmd::MasterWalletCmd, utils::save_config,
 };
 use common::{
     TonWalletVersion,
@@ -78,9 +77,6 @@ pub enum ConfigAction {
     MasterWallet(MasterWalletCmd),
     /// Manage elections configuration
     Elections(ElectionsCfgCmd),
-    /// Manage contracts automation (auto-deploy / auto-topup) via the API
-    #[command(name = "contracts-automation")]
-    ContractsAutomation(ContractsAutomationCfgCmd),
     /// Manage log configuration
     Log(LogCmd),
 }
@@ -111,7 +107,6 @@ impl ConfigCmd {
             ConfigAction::TonHttpApi(cmd) => cmd.run(url, token, config_path).await,
             ConfigAction::MasterWallet(cmd) => cmd.run(url, token, config_path).await,
             ConfigAction::Elections(cmd) => cmd.run(config_path, url, token).await,
-            ConfigAction::ContractsAutomation(cmd) => cmd.run(config_path, url, token).await,
             ConfigAction::Log(cmd) => cmd.run(config_path, url, token).await,
         }
     }
@@ -142,7 +137,7 @@ impl GenerateCmd {
                 workchain: 0,
             }),
             tick_interval: 40,
-            contracts_automation: Default::default(),
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         };
 

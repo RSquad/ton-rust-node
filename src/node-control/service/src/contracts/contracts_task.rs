@@ -55,7 +55,7 @@ struct ContractsMonitor {
 
 impl ContractsMonitor {
     fn automation(&self) -> ContractsAutomationConfig {
-        self.runtime_cfg.get().contracts_automation.clone()
+        self.runtime_cfg.get().automation.clone()
     }
 
     async fn run_loop(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
@@ -92,6 +92,12 @@ impl ContractsMonitor {
 
     async fn run(&self) -> anyhow::Result<()> {
         let auto = self.automation();
+        // Master is only needed for deploy/top-up paths. TonCore `update_validator_set` uses the
+        // per-node validator wallet, so observe-only mode can run without a funded master.
+        if !auto.auto_deploy && !auto.auto_topup {
+            self.ensure_pool_validator_sets_updated().await?;
+            return Ok(());
+        }
         if !self.ensure_master_deployed(&auto).await? {
             return Ok(());
         }
@@ -109,7 +115,7 @@ impl ContractsMonitor {
         if !self.ensure_wallet_balances(&auto, &mut seqno).await? {
             return Ok(());
         }
-        if !self.ensure_pool_validator_sets_updated(&mut seqno).await? {
+        if !self.ensure_pool_validator_sets_updated().await? {
             return Ok(());
         }
         tracing::info!(target: "contracts", "all contracts are ready");
@@ -156,7 +162,7 @@ impl ContractsMonitor {
             AccountState::Uninitialized => {}
         }
 
-        let min_balance = auto.wallet_deploy;
+        let min_balance = auto.wallet.deploy;
         if balance < min_balance {
             return Err(Self::insufficient_master_balance_error(balance, min_balance));
         }
@@ -179,7 +185,7 @@ impl ContractsMonitor {
     /// Step 2: Deploy uninitialized wallets through the master wallet.
     ///
     /// The master wallet sends an internal message carrying the wallet's
-    /// state_init and configured `wallet_deploy` (nanotons), deploying and funding it in one go.
+    /// state_init and configured `wallet.deploy` (nanotons), deploying and funding it in one go.
     ///
     /// Returns `false` if master balance is insufficient (caller should sleep).
     async fn ensure_wallets_deployed(
@@ -245,7 +251,7 @@ impl ContractsMonitor {
             node_id, addr, balance as f64 / 1e9,
         );
 
-        let deploy_amount = auto.wallet_deploy;
+        let deploy_amount = auto.wallet.deploy;
         let master_balance = self.master_wallet.balance().await.context("master wallet balance")?;
         if master_balance < deploy_amount + WALLET_GAS {
             return Err(Self::insufficient_master_balance_error(
@@ -335,8 +341,8 @@ impl ContractsMonitor {
         );
 
         let deploy_amount = match pool.pool_kind() {
-            PoolKind::SNP => auto.pool_deploy.single_nominator,
-            PoolKind::TONCore => auto.pool_deploy.ton_core,
+            PoolKind::SNP => auto.pool.snp,
+            PoolKind::TONCore => auto.pool.ton_core,
         };
 
         let master_balance =
@@ -383,8 +389,8 @@ impl ContractsMonitor {
         if !auto.auto_topup {
             return Ok(true);
         }
-        let threshold = auto.wallet_balance_threshold;
-        let topup_amount = auto.wallet_topup;
+        let threshold = auto.wallet.threshold;
+        let topup_amount = auto.wallet.topup;
         let mut all_topped_up = true;
         let mut processed_wallets = HashSet::new();
         for (node_id, wallet) in self.wallets.iter() {
@@ -468,7 +474,11 @@ impl ContractsMonitor {
     /// Recovery is only allowed once `validator_set_changes_count >= 2`.
     /// Unlike the SNP contract, the TonCore pool does not update this counter
     /// automatically — opcode 6 must be sent explicitly (by anyone).
-    async fn ensure_pool_validator_sets_updated(&self, seqno: &mut i64) -> anyhow::Result<bool> {
+    ///
+    /// The message is sent from the **validator wallet** for the pool's node (`self.wallets[node_id]`),
+    /// not the master wallet — by staking time that wallet is deployed and typically topped up.
+    async fn ensure_pool_validator_sets_updated(&self) -> anyhow::Result<bool> {
+        let provider = contract_provider!(self.rpc_client.clone());
         let mut all_updated = true;
         tracing::info!(
             target: "contracts",
@@ -478,6 +488,22 @@ impl ContractsMonitor {
         for (node_id, pool_binding) in
             self.pools.iter().filter(|(_, b)| b.pool_kind() == PoolKind::TONCore)
         {
+            let validator_wallet = match self.wallets.get(node_id.as_str()) {
+                Some(w) => (*w).clone(),
+                None => {
+                    tracing::warn!(
+                        target: "contracts",
+                        "[{}] ensure_pool_validator_sets_updated: no validator wallet in config (skip TonCore pools)",
+                        node_id
+                    );
+                    continue;
+                }
+            };
+
+            let wallet_addr = validator_wallet.address().await?;
+            let mut seqno =
+                provider.get_method(wallet_addr.to_string(), "seqno", vec![]).await?.i64(0)?;
+
             for pool in pool_binding.inner_pools() {
                 let pool_addr = pool.address().await?;
                 let pool_data = match pool.get_pool_data().await {
@@ -504,28 +530,28 @@ impl ContractsMonitor {
 
                 tracing::info!(
                     target: "contracts",
-                    "[{}] update_validator_set: pool={}, state={}, vsc_count={}",
+                    "[{}] update_validator_set: pool={}, state={}, vsc_count={}, from_wallet={}",
                     node_id,
                     pool_addr,
                     pool_data.state,
                     pool_data.validator_set_changes_count,
+                    wallet_addr,
                 );
 
                 let body = tc_messages::update_validator_set(0)?;
-                let msg = self
-                    .master_wallet
+                let msg = validator_wallet
                     .build_message(
                         pool_addr,
                         POOL_OP_GAS,
                         body,
                         true,
-                        Some(u32::try_from(*seqno)?),
+                        Some(u32::try_from(seqno)?),
                         None,
                         None,
                     )
                     .await?;
                 self.broadcast(&msg).await?;
-                *seqno += 1;
+                seqno += 1;
                 all_updated = false;
             }
         }
@@ -599,7 +625,7 @@ mod tests {
             http: HttpConfig { auth: None, ..Default::default() },
             master_wallet: None,
             tick_interval: 30,
-            contracts_automation: Default::default(),
+            automation: Default::default(),
             log: None,
         })
     }

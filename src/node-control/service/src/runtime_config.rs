@@ -73,6 +73,33 @@ impl std::fmt::Display for RuntimeConfigError {
 
 impl std::error::Error for RuntimeConfigError {}
 
+/// Error from [`RuntimeConfigStore::try_update_and_save`]: validation rejected the mutation (HTTP 400)
+/// or persistence / lock failure (HTTP 500).
+#[derive(Debug)]
+pub enum TryUpdateSaveError {
+    /// Closure rejected the update (e.g. merged config failed validation).
+    Rejected(String),
+    Persist(anyhow::Error),
+}
+
+impl std::fmt::Display for TryUpdateSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryUpdateSaveError::Rejected(s) => f.write_str(s),
+            TryUpdateSaveError::Persist(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for TryUpdateSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TryUpdateSaveError::Persist(e) => Some(e.as_ref()),
+            TryUpdateSaveError::Rejected(_) => None,
+        }
+    }
+}
+
 // Public API for the runtime config
 pub trait RuntimeConfig: Send + Sync {
     fn get(&self) -> Arc<AppConfig>;
@@ -304,21 +331,21 @@ impl RuntimeConfigStore {
         Ok(())
     }
 
-    /// Atomically applies the mutation and persists the resulting config.
-    /// Disk write happens before the in-memory swap, so if persistence fails
-    /// the live runtime state is left unchanged (and the error is returned).
-    pub fn update_and_save<F>(&self, f: F) -> anyhow::Result<()>
+    /// Like [`Self::update_and_save`], but the mutation can abort without persisting or swapping
+    /// state. Use this when merging partial REST patches so concurrent readers see a consistent
+    /// baseline under the config lock (avoids lost-update races).
+    pub fn try_update_and_save<F>(&self, f: F) -> Result<(), TryUpdateSaveError>
     where
-        F: FnOnce(&mut AppConfig),
+        F: FnOnce(&mut AppConfig) -> Result<(), String> + Send,
     {
-        let mut guard =
-            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+        let mut guard = self.state.write().map_err(|e| {
+            TryUpdateSaveError::Persist(anyhow::anyhow!("state lock poisoned: {e}"))
+        })?;
         let old = Arc::clone(&guard);
         let mut cfg = (*old.config).clone();
-        f(&mut cfg);
+        f(&mut cfg).map_err(TryUpdateSaveError::Rejected)?;
 
-        // Persist first — if this fails, the in-memory state is not touched.
-        self.save_to_file(&cfg)?;
+        self.save_to_file(&cfg).map_err(TryUpdateSaveError::Persist)?;
 
         *guard = Arc::new(RuntimeState {
             config: Arc::new(cfg),
@@ -330,6 +357,25 @@ impl RuntimeConfigStore {
         });
         self.updated_at.store(time_format::now(), Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Atomically applies the mutation and persists the resulting config.
+    /// Disk write happens before the in-memory swap, so if persistence fails
+    /// the live runtime state is left unchanged (and the error is returned).
+    pub fn update_and_save<F>(&self, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut AppConfig) + Send,
+    {
+        match self.try_update_and_save(move |cfg| {
+            f(cfg);
+            Ok(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(TryUpdateSaveError::Rejected(msg)) => Err(anyhow::anyhow!(
+                "unexpected rejection from infallible update_and_save closure: {msg}"
+            )),
+            Err(TryUpdateSaveError::Persist(e)) => Err(e),
+        }
     }
 
     /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
@@ -513,7 +559,16 @@ impl RuntimeConfig for RuntimeConfigStore {
     }
 
     fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
-        RuntimeConfigStore::update_and_save(self, f)
+        match RuntimeConfigStore::try_update_and_save(self, move |cfg| {
+            f(cfg);
+            Ok(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(TryUpdateSaveError::Rejected(msg)) => Err(anyhow::anyhow!(
+                "unexpected rejection from infallible update_and_save closure: {msg}"
+            )),
+            Err(TryUpdateSaveError::Persist(e)) => Err(e),
+        }
     }
 }
 

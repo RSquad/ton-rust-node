@@ -74,7 +74,8 @@ nodectl <cmd>
 There are several types of commands:
 
 - **TON HTTP API commands** — retrieve blockchain data
-- **Configuration commands** — generate and manage config files (nodes, wallets, pools, bindings, elections, [contracts automation](./docs/contracts-automation.md))
+- **Configuration commands** — generate and manage config files (nodes, wallets, pools, bindings, elections)
+- **Automation** — contracts task (auto-deploy / auto-topup): top-level `nodectl automation` talks to the service API; see **[Contracts automation](./docs/contracts-automation.md)**
 - **Key management commands** — generate, import, and manage vault keys
 - **Deploy commands** — deploy wallets and nominator pools
 - **Service API commands** — interact with a running nodectl daemon
@@ -126,9 +127,40 @@ To enable detailed logging output, use the RUST_LOG environment variable (availa
 RUST_LOG=debug nodectl ...
 ```
 
+### Automation command
+
+REST client for **`/v1/automation/settings`**. Uses the same URL / JWT / `--config` resolution as [`config`](#configuration-commands) (`--url` / `-u`, `NODECTL_URL`, `--token`, `NODECTL_API_TOKEN`, `--config`, `CONFIG_PATH`).
+
+| Subcommand | Purpose |
+|------------|---------|
+| `ls` | Show settings (`--format table` or `json`) |
+| `tick <SEC>` | Contracts task tick interval (seconds) |
+| `wallet` | Wallet deploy / top-up / threshold in **TON**: `--deploy`, `--topup`, `--threshold` (at least one required) |
+| `pool` | Pool deploy amounts in **TON**: `--deploy` applies to both SNP and TONCore; `--snp` / `--ton-core` override that kind (at least one flag required) |
+| `enable deploy` \| `enable topup` | Turn auto-deploy or auto-topup **on** |
+| `disable deploy` \| `disable topup` | Turn auto-deploy or auto-topup **off** |
+
+```bash
+nodectl automation ls
+nodectl automation ls --format json
+nodectl automation tick 60
+nodectl automation wallet --deploy 1.1 --topup 10 --threshold 5
+nodectl automation pool --deploy 1.5
+nodectl automation pool --deploy 1.5 --ton-core 2
+nodectl automation pool --snp 1.1 --ton-core 2
+nodectl automation enable deploy
+nodectl automation enable topup
+nodectl automation disable deploy
+nodectl automation disable topup
+```
+
+Full REST and on-disk **`automation`** block: **[Contracts automation](./docs/contracts-automation.md)**.
+
+---
+
 ### Configuration Commands
 
-Commands for managing nodectl configuration. **All `config` subcommands except `config generate` are REST clients that require a running nodectl service** — they talk to the daemon over the HTTP API. The service URL is resolved (in order) from `--url` / `-u` (or the `NODECTL_URL` env var), or from `http.bind` inside `--config` (default `nodectl-config.json`, env `CONFIG_PATH`). Protected endpoints require an `operator` JWT token passed via `--token` (or the `NODECTL_API_TOKEN` env var) — see the [Authentication Commands](#authentication-commands) section for how to obtain one.
+Commands for managing nodectl configuration. **All `config` subcommands except `config generate` are REST clients that require a running nodectl service** — they talk to the daemon over the HTTP API. The top-level **`automation`** command uses the same rules. The service URL is resolved (in order) from `--url` / `-u` (or the `NODECTL_URL` env var), or from `http.bind` inside `--config` (default `nodectl-config.json`, env `CONFIG_PATH`). Protected endpoints require an `operator` JWT token passed via `--token` (or the `NODECTL_API_TOKEN` env var) — see the [Authentication Commands](#authentication-commands) section for how to obtain one.
 
 #### `config generate`
 
@@ -540,36 +572,6 @@ nodectl config log set --output file --path /var/log/nodectl/node.log --rotation
 
 # Update multiple settings at once
 nodectl config log set --level warn --max-size-mb 100 --max-files 5
-```
-
----
-
-#### `config contracts-automation`
-
-Manage the **contracts monitor** settings: auto-deploy of validator wallets and pools, auto-topup of validator wallets, per-pool deploy amounts, tick interval, and on/off flags. All operations call the service REST API; the on-disk config is updated by the service. Full reference: **[Contracts automation](./docs/contracts-automation.md)**.
-
-##### `config contracts-automation ls`
-
-| Flag | Description |
-|------|-------------|
-| `--format` | `table` (default) or `json` |
-
-```bash
-nodectl config contracts-automation ls
-nodectl config contracts-automation ls --format json
-```
-
-##### `config contracts-automation set`
-
-Set one or more fields. Amounts are in **TON** (not nanotons). Requires a running service; with authentication enabled, use an **operator** JWT. See `nodectl config contracts-automation set --help` for all flags.
-
-```bash
-# Examples (combine flags as needed)
-nodectl config contracts-automation set --tick-interval-sec 60
-nodectl config contracts-automation set --wallet-deploy 1.1 --wallet-topup 10 --wallet-threshold 5
-nodectl config contracts-automation set --pool-deploy-snp 1.1 --pool-deploy-ton-core 2
-nodectl config contracts-automation set --auto-deploy false
-nodectl config contracts-automation set --auto-topup true
 ```
 
 ---
@@ -1151,8 +1153,8 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | POST | `/v1/elections/include` | O | Enable elections for given bindings |
 | GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, per-binding status) |
 | POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor) |
-| GET | `/v1/contracts-automation/settings` | N | Contracts monitor settings (auto-deploy, auto-topup, amounts, tick) |
-| POST | `/v1/contracts-automation/settings` | O | Update contracts monitor settings (partial body, nanotons) |
+| GET | `/v1/automation/settings` | N | Contracts task settings (auto-deploy, auto-topup, amounts, tick) |
+| POST | `/v1/automation/settings` | O | Update contracts task settings (partial JSON: tick/toggles and nested `wallet` / `pool`, nanotons) |
 | POST | `/v1/elections/static-adnl` | O | Generate and assign a persistent ADNL address for a node |
 | GET | `/v1/validators` | N | Validators snapshot for controlled nodes |
 | POST | `/v1/task/elections` | O | Enable / disable / restart the elections background task |
@@ -1384,16 +1386,16 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
 
 ---
 
-#### `GET /v1/contracts-automation/settings`
+#### `GET /v1/automation/settings`
 
-Returns the **contracts automation** block: `tick_interval_sec`, `auto_deploy`, `auto_topup`, `wallet_deploy`, `pool_deploy` (with `single_nominator` and `ton_core`), `wallet_topup`, `wallet_balance_threshold`. All monetary fields are in **nanotons**. See [Contracts automation](./docs/contracts-automation.md).
+Returns the **`automation`** settings as JSON: `tick_interval_sec`, `auto_deploy`, `auto_topup`, nested **`wallet`** (`deploy`, `topup`, `threshold`) and **`pool`** (`snp`, `ton_core`). All monetary fields are in **nanotons**. See [Contracts automation](./docs/contracts-automation.md).
 
-#### `POST /v1/contracts-automation/settings`
+#### `POST /v1/automation/settings`
 
-**Operator only.** Partial update: include only keys to change (same names as in `result` of `GET`, plus nested `pool_deploy` with any subset of `single_nominator` / `ton_core`). Legacy `*_nanotons` keys are still accepted. At least one field required. Invalid combinations are rejected with `400` (e.g. tick out of range, zero amounts). Example:
+**Operator only.** Partial update: include only keys to change (same shape as `GET` `result`, including nested `wallet` / `pool` objects with any subset of their fields). At least one field required. Invalid combinations are rejected with `400` (e.g. tick out of range, zero amounts). Example:
 
 ```json
-{ "tick_interval_sec": 60, "auto_topup": false, "pool_deploy": { "ton_core": 2000000000 } }
+{ "tick_interval_sec": 60, "auto_topup": false, "pool": { "ton_core": 2000000000 } }
 ```
 
 ---
@@ -1908,9 +1910,9 @@ Automatic elections task configuration:
 - `waiting_period_pct` — AdaptiveSplit50 maximum wait for enough participants as a fraction of election duration. Default `0.4`. Must be in `[0.0, 1.0]` and ≥ `sleep_period_pct`.
 - `static_adnls` — pre-generated persistent ADNL addresses keyed by node name (base64-encoded). When a node has an entry here, the runner reuses this ADNL address each election cycle instead of generating a fresh one. Managed via `config elections static-adnl` or `POST /v1/elections/static-adnl`. Example: `{ "node0": "oRvD1E5F..." }`
 
-#### `contracts_automation` (optional)
+#### `automation` (optional)
 
-Settings for the **contracts monitor** (auto-deploy of validator wallets and nominator pools, auto-topup of validator wallets, separate deploy amounts for SNP vs TONCore pools, monitor tick interval, toggles). All amounts are in **nanotons**. Omitted fields use the built-in defaults. Full field list, REST examples, and CLI: **[Contracts automation](./docs/contracts-automation.md)**. Managed with `config contracts-automation` or `GET`/`POST /v1/contracts-automation/settings`.
+Settings for the **contracts task** (auto-deploy of validator wallets and nominator pools, auto-topup of validator wallets, separate deploy amounts for SNP vs TONCore pools, contracts task tick interval, toggles). Amounts are **nanotons**, grouped under **`wallet`** (`deploy`, `topup`, `threshold`) and **`pool`** (`snp`, `ton_core`). Omitted fields use the built-in defaults. Full reference: **[Contracts automation](./docs/contracts-automation.md)**. Managed with **`nodectl automation`** or `GET`/`POST /v1/automation/settings`.
 
 #### `voting` (optional)
 
@@ -2375,5 +2377,5 @@ curl -X POST http://127.0.0.1:8080/v1/task/elections \
 
 - [Hashicorp Vault Dedicated Setup](./docs/hcp-vault-setup.md)
 - [Node Control Service Setup](./docs/nodectl-setup.md)
-- [Contracts automation (auto-deploy / auto-topup)](./docs/contracts-automation.md) — `contracts_automation` config, REST and CLI
+- [Contracts automation (auto-deploy / auto-topup)](./docs/contracts-automation.md) — `automation` config (legacy key `contracts_automation`), REST and CLI
 - [Security Guide](./docs/nodectl-security.md) — roles, token lifecycle, rate limiting, monitoring

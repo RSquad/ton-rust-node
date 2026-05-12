@@ -9,7 +9,7 @@
 use super::http_server_task::{AppError, AppState};
 use crate::{
     elections::providers::{DefaultElectionsProvider, ElectionsProvider},
-    runtime_config::{RuntimeConfig, open_wallet},
+    runtime_config::{RuntimeConfig, TryUpdateSaveError, open_wallet},
 };
 use adnl::common::Timeouts;
 use common::{
@@ -199,9 +199,19 @@ pub struct ContractsAutomationSettingsResponse {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct PoolDeployAmountsPatch {
+pub struct WalletAmountsPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub single_nominator: Option<u64>,
+    pub deploy: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topup: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PoolAmountsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snp: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ton_core: Option<u64>,
 }
@@ -214,14 +224,10 @@ pub struct ContractsAutomationSettingsUpdateRequest {
     pub auto_deploy: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_topup: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "wallet_deploy_nanotons")]
-    pub wallet_deploy: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "pool_deploy_nanotons")]
-    pub pool_deploy: Option<PoolDeployAmountsPatch>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "wallet_topup_nanotons")]
-    pub wallet_topup: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "wallet_balance_threshold_nanotons")]
-    pub wallet_balance_threshold: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<WalletAmountsPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<PoolAmountsPatch>,
 }
 
 impl ContractsAutomationSettingsUpdateRequest {
@@ -229,13 +235,11 @@ impl ContractsAutomationSettingsUpdateRequest {
         self.tick_interval_sec.is_some()
             || self.auto_deploy.is_some()
             || self.auto_topup.is_some()
-            || self.wallet_deploy.is_some()
-            || self.wallet_topup.is_some()
-            || self.wallet_balance_threshold.is_some()
             || self
-                .pool_deploy
+                .wallet
                 .as_ref()
-                .is_some_and(|p| p.single_nominator.is_some() || p.ton_core.is_some())
+                .is_some_and(|w| w.deploy.is_some() || w.topup.is_some() || w.threshold.is_some())
+            || self.pool.as_ref().is_some_and(|p| p.snp.is_some() || p.ton_core.is_some())
     }
 }
 
@@ -875,7 +879,7 @@ fn build_binding_election_status(
 
 #[utoipa::path(
     get,
-    path = "/v1/contracts-automation/settings",
+    path = "/v1/automation/settings",
     responses(
         (status = 200, description = "Contracts automation settings", body = ContractsAutomationSettingsResponse),
         (status = 401, description = "Not authenticated", body = ApiErrorResponse)
@@ -886,10 +890,14 @@ pub async fn v1_contracts_automation_settings_handler(
     state: axum::extract::State<AppState>,
 ) -> axum::Json<ContractsAutomationSettingsResponse> {
     let config = state.runtime_cfg.get();
-    axum::Json(ContractsAutomationSettingsResponse {
-        ok: true,
-        result: config.contracts_automation.clone(),
-    })
+    axum::Json(ContractsAutomationSettingsResponse { ok: true, result: config.automation.clone() })
+}
+
+fn map_try_update_save(err: TryUpdateSaveError) -> AppError {
+    match err {
+        TryUpdateSaveError::Rejected(msg) => AppError::bad_request(msg),
+        TryUpdateSaveError::Persist(e) => AppError::internal(e.to_string()),
+    }
 }
 
 fn merge_contracts_automation_update(
@@ -906,21 +914,23 @@ fn merge_contracts_automation_update(
     if let Some(v) = req.auto_topup {
         next.auto_topup = v;
     }
-    if let Some(v) = req.wallet_deploy {
-        next.wallet_deploy = v;
+    if let Some(ref patch) = req.wallet {
+        if let Some(v) = patch.deploy {
+            next.wallet.deploy = v;
+        }
+        if let Some(v) = patch.topup {
+            next.wallet.topup = v;
+        }
+        if let Some(v) = patch.threshold {
+            next.wallet.threshold = v;
+        }
     }
-    if let Some(v) = req.wallet_topup {
-        next.wallet_topup = v;
-    }
-    if let Some(v) = req.wallet_balance_threshold {
-        next.wallet_balance_threshold = v;
-    }
-    if let Some(ref patch) = req.pool_deploy {
-        if let Some(v) = patch.single_nominator {
-            next.pool_deploy.single_nominator = v;
+    if let Some(ref patch) = req.pool {
+        if let Some(v) = patch.snp {
+            next.pool.snp = v;
         }
         if let Some(v) = patch.ton_core {
-            next.pool_deploy.ton_core = v;
+            next.pool.ton_core = v;
         }
     }
     next
@@ -928,7 +938,7 @@ fn merge_contracts_automation_update(
 
 #[utoipa::path(
     post,
-    path = "/v1/contracts-automation/settings",
+    path = "/v1/automation/settings",
     request_body = ContractsAutomationSettingsUpdateRequest,
     responses(
         (status = 200, description = "Contracts automation settings updated", body = ContractsAutomationSettingsResponse),
@@ -947,24 +957,22 @@ pub async fn v1_contracts_automation_settings_update_handler(
         return Err(AppError::bad_request("at least one setting is required"));
     }
 
-    let cfg = state.runtime_cfg.get();
-    let next = merge_contracts_automation_update(&cfg.contracts_automation, &req);
-    next.validate().map_err(|e| AppError::bad_request(e.to_string()))?;
-    drop(cfg);
-
     state
         .runtime_cfg
-        .update_and_save(|cfg| {
-            cfg.contracts_automation = next;
+        .try_update_and_save(move |cfg| {
+            let next = merge_contracts_automation_update(&cfg.automation, &req);
+            next.validate().map_err(|e| e.to_string())?;
+            cfg.automation = next;
+            Ok(())
         })
-        .map_err(|e| AppError::internal(e.to_string()))?;
+        .map_err(map_try_update_save)?;
 
     state.config_changed.notify_one();
 
     let config = state.runtime_cfg.get();
     Ok(axum::Json(ContractsAutomationSettingsResponse {
         ok: true,
-        result: config.contracts_automation.clone(),
+        result: config.automation.clone(),
     }))
 }
 
@@ -1619,26 +1627,6 @@ pub async fn v1_elections_settings_update_handler(
         return Err(AppError::bad_request("at least one setting is required"));
     }
 
-    let cfg = state.runtime_cfg.get();
-    let elections = cfg
-        .elections
-        .as_ref()
-        .ok_or_else(|| AppError::bad_request("elections are not configured"))?;
-
-    // --- Validate max_factor against network param 17 (best-effort) ---
-    if let Some(value) = req.max_factor {
-        let network_limit = state
-            .runtime_cfg
-            .rpc_client()
-            .get_config_param(17)
-            .await
-            .ok()
-            .and_then(|p| extract_max_factor(p).ok());
-
-        let probe = ElectionsConfig { max_factor: value, ..elections.clone() };
-        probe.validate(network_limit).map_err(|e| AppError::bad_request(e.to_string()))?;
-    }
-
     // --- Validate policy ---
     if let Some(ref policy) = req.policy {
         if !req.reset && matches!(policy, StakePolicy::Fixed(0)) {
@@ -1648,9 +1636,16 @@ pub async fn v1_elections_settings_update_handler(
     if req.reset && req.node.is_none() {
         return Err(AppError::bad_request("reset requires 'node' to be set"));
     }
-    drop(cfg);
 
-    // --- Apply all changes in a single update ---
+    // Best-effort bound for max_factor (same interpretation as load-time validation).
+    let network_limit = state
+        .runtime_cfg
+        .rpc_client()
+        .get_config_param(17)
+        .await
+        .ok()
+        .and_then(|p| extract_max_factor(p).ok());
+
     let policy = req.policy;
     let node = req.node;
     let reset = req.reset;
@@ -1659,30 +1654,33 @@ pub async fn v1_elections_settings_update_handler(
 
     state
         .runtime_cfg
-        .update_and_save(|cfg| {
-            if let Some(elections) = &mut cfg.elections {
-                // Stake policy
-                if reset {
-                    if let Some(ref node_id) = node {
-                        elections.policy_overrides.remove(node_id);
-                    }
-                } else if let Some(policy) = policy {
-                    if let Some(ref node_id) = node {
-                        elections.policy_overrides.insert(node_id.clone(), policy);
-                    } else {
-                        elections.policy = policy;
-                    }
-                }
+        .try_update_and_save(move |cfg| {
+            let elections =
+                cfg.elections.as_mut().ok_or_else(|| "elections are not configured".to_string())?;
 
-                if let Some(seconds) = tick_interval {
-                    elections.tick_interval = seconds;
+            if reset {
+                if let Some(ref node_id) = node {
+                    elections.policy_overrides.remove(node_id);
                 }
-                if let Some(value) = max_factor {
-                    elections.max_factor = value;
+            } else if let Some(policy) = policy {
+                if let Some(ref node_id) = node {
+                    elections.policy_overrides.insert(node_id.clone(), policy);
+                } else {
+                    elections.policy = policy;
                 }
             }
+
+            if let Some(seconds) = tick_interval {
+                elections.tick_interval = seconds;
+            }
+            if let Some(value) = max_factor {
+                elections.max_factor = value;
+            }
+
+            elections.validate(network_limit).map_err(|e| e.to_string())?;
+            Ok(())
         })
-        .map_err(|e| AppError::internal(e.to_string()))?;
+        .map_err(map_try_update_save)?;
 
     // Restart elections task so changes take effect immediately.
     let task = state.elections_task.clone();

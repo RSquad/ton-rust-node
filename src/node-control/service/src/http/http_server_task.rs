@@ -162,7 +162,7 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
         .route("/v1/pools", axum::routing::get(v1_pools_handler))
         .route("/v1/bindings", axum::routing::get(v1_bindings_handler))
         .route(
-            "/v1/contracts-automation/settings",
+            "/v1/automation/settings",
             axum::routing::get(v1_contracts_automation_settings_handler),
         )
         .route("/v1/log", axum::routing::get(v1_log_handler))
@@ -181,7 +181,7 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
             axum::routing::post(super::config_handlers::v1_elections_settings_update_handler),
         )
         .route(
-            "/v1/contracts-automation/settings",
+            "/v1/automation/settings",
             axum::routing::post(
                 super::config_handlers::v1_contracts_automation_settings_update_handler,
             ),
@@ -889,9 +889,11 @@ impl utoipa::Modify for BearerAuthAddon {
         super::config_handlers::ContractsAutomationSettingsResponse,
         super::config_handlers::ContractsAutomationSettingsUpdateRequest,
         super::config_handlers::ElectionsSettingsUpdateRequest,
-        super::config_handlers::PoolDeployAmountsPatch,
+        super::config_handlers::WalletAmountsPatch,
+        super::config_handlers::PoolAmountsPatch,
         common::app_config::ContractsAutomationConfig,
-        common::app_config::PoolDeployAmounts,
+        common::app_config::WalletAmounts,
+        common::app_config::PoolAmounts,
         ElectionsTaskAction,
         ElectionsTaskControlRequest,
         TaskStatusDto,
@@ -1037,7 +1039,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
-            contracts_automation: Default::default(),
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         })
     }
@@ -1054,7 +1056,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
-            contracts_automation: Default::default(),
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         })
     }
@@ -1180,7 +1182,7 @@ mod tests {
         let elections_task = test_elections_task();
         let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
-        let resp = app.oneshot(get_request("/v1/contracts-automation/settings")).await.unwrap();
+        let resp = app.oneshot(get_request("/v1/automation/settings")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
@@ -1199,7 +1201,7 @@ mod tests {
 
         let resp = app
             .oneshot(post_json(
-                "/v1/contracts-automation/settings",
+                "/v1/automation/settings",
                 &serde_json::json!({ "tick_interval_sec": 60 }),
             ))
             .await
@@ -1208,7 +1210,7 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
         assert_eq!(v["result"]["tick_interval_sec"], 60);
-        assert_eq!(runtime_cfg.get().contracts_automation.tick_interval_sec, 60);
+        assert_eq!(runtime_cfg.get().automation.tick_interval_sec, 60);
     }
 
     #[tokio::test]
@@ -1220,7 +1222,7 @@ mod tests {
         let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
 
         let resp = app
-            .oneshot(post_json("/v1/contracts-automation/settings", &serde_json::json!({})))
+            .oneshot(post_json("/v1/automation/settings", &serde_json::json!({})))
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
@@ -1236,7 +1238,7 @@ mod tests {
 
         let resp = app
             .oneshot(post_json(
-                "/v1/contracts-automation/settings",
+                "/v1/automation/settings",
                 &serde_json::json!({ "tick_interval_sec": 0 }),
             ))
             .await
@@ -1254,9 +1256,9 @@ mod tests {
 
         let resp = app
             .oneshot(post_json(
-                "/v1/contracts-automation/settings",
+                "/v1/automation/settings",
                 &serde_json::json!({
-                    "wallet_deploy": 2_000_000_000u64,
+                    "wallet": { "deploy": 2_000_000_000u64 },
                     "auto_deploy": false,
                     "auto_topup": false,
                 }),
@@ -1266,14 +1268,14 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
-        assert_eq!(v["result"]["wallet_deploy"], 2_000_000_000);
+        assert_eq!(v["result"]["wallet"]["deploy"].as_u64().unwrap(), 2_000_000_000);
         assert_eq!(v["result"]["auto_deploy"], false);
         assert_eq!(v["result"]["auto_topup"], false);
 
         let cfg = runtime_cfg.get();
-        assert_eq!(cfg.contracts_automation.wallet_deploy, 2_000_000_000);
-        assert!(!cfg.contracts_automation.auto_deploy);
-        assert!(!cfg.contracts_automation.auto_topup);
+        assert_eq!(cfg.automation.wallet.deploy, 2_000_000_000);
+        assert!(!cfg.automation.auto_deploy);
+        assert!(!cfg.automation.auto_topup);
     }
 
     #[tokio::test]
@@ -1284,13 +1286,13 @@ mod tests {
         let elections_task = test_elections_task();
         let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
 
-        let snp_before = runtime_cfg.get().contracts_automation.pool_deploy.single_nominator;
+        let snp_before = runtime_cfg.get().automation.pool.snp;
 
         let resp = app
             .oneshot(post_json(
-                "/v1/contracts-automation/settings",
+                "/v1/automation/settings",
                 &serde_json::json!({
-                    "pool_deploy": { "ton_core": 3_000_000_000u64 },
+                    "pool": { "ton_core": 3_000_000_000u64 },
                 }),
             ))
             .await
@@ -1298,16 +1300,16 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
-        assert_eq!(v["result"]["pool_deploy"]["single_nominator"], snp_before);
-        assert_eq!(v["result"]["pool_deploy"]["ton_core"].as_u64().unwrap(), 3_000_000_000u64);
+        assert_eq!(v["result"]["pool"]["snp"].as_u64().unwrap(), snp_before);
+        assert_eq!(v["result"]["pool"]["ton_core"].as_u64().unwrap(), 3_000_000_000u64);
 
         let cfg = runtime_cfg.get();
-        assert_eq!(cfg.contracts_automation.pool_deploy.single_nominator, snp_before);
-        assert_eq!(cfg.contracts_automation.pool_deploy.ton_core, 3_000_000_000);
+        assert_eq!(cfg.automation.pool.snp, snp_before);
+        assert_eq!(cfg.automation.pool.ton_core, 3_000_000_000);
     }
 
     #[tokio::test]
-    async fn contracts_automation_settings_post_accepts_legacy_wallet_topup_alias() {
+    async fn contracts_automation_settings_post_updates_wallet_topup() {
         let store = Arc::new(SnapshotStore::new());
         let runtime_cfg =
             Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
@@ -1316,17 +1318,17 @@ mod tests {
 
         let resp = app
             .oneshot(post_json(
-                "/v1/contracts-automation/settings",
-                &serde_json::json!({ "wallet_topup_nanotons": 9_500_000_000u64 }),
+                "/v1/automation/settings",
+                &serde_json::json!({ "wallet": { "topup": 9_500_000_000u64 } }),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
-        assert_eq!(v["result"]["wallet_topup"].as_u64().unwrap(), 9_500_000_000u64);
+        assert_eq!(v["result"]["wallet"]["topup"].as_u64().unwrap(), 9_500_000_000u64);
 
-        assert_eq!(runtime_cfg.get().contracts_automation.wallet_topup, 9_500_000_000);
+        assert_eq!(runtime_cfg.get().automation.wallet.topup, 9_500_000_000);
     }
 
     #[tokio::test]
@@ -1626,7 +1628,7 @@ mod tests {
         assert!(v["paths"].as_object().unwrap().contains_key("/health"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/elections"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/validators"));
-        assert!(v["paths"].as_object().unwrap().contains_key("/v1/contracts-automation/settings"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/automation/settings"));
         let schemas = v["components"]["schemas"].as_object().unwrap();
         assert!(schemas.contains_key("ElectionsStatus"));
         assert!(schemas.contains_key("NodeListRequest"));
