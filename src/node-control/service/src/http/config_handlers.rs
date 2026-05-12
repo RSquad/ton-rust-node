@@ -18,7 +18,8 @@ use common::{
         AdnlConfig, BindingStatus, DEFAULT_TONCORE_MAX_NOMINATORS,
         DEFAULT_TONCORE_MIN_NOMINATOR_STAKE, DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, ElectionsConfig,
         EndpointEntry, KeyConfig, LogConfig, LogOutput, LogRotation, NodeBinding, PoolConfig,
-        StakePolicy, TimeoutVariant, TonCoreInitParams, TonCorePoolConfig, WalletConfig,
+        StakePolicy, TimeoutVariant, TonCoreDeployLayout, TonCoreInitParams, TonCorePoolConfig,
+        WalletConfig,
     },
     ton_utils::{extract_max_factor, normalize_ton_address},
 };
@@ -110,6 +111,9 @@ pub struct TonCorePoolSlotDto {
     /// Last election id the pool staked at (`stake_at` in pool storage).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_election_id: Option<u32>,
+    /// Deploy layout stored for this slot (`embedded_code` by default).
+    #[serde(default)]
+    pub deploy_layout: TonCoreDeployLayout,
 }
 
 /// Pool entry returned by `GET /v1/pools`.
@@ -291,6 +295,10 @@ pub struct PoolAddCoreRequest {
     /// Minimum nominator stake in nanotons (default: [`DEFAULT_TONCORE_MIN_NOMINATOR_STAKE`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_nominator_stake: Option<u64>,
+    /// [`TonCoreDeployLayout::EmbeddedCode`] — full pool bytecode in `StateInit.code`.
+    /// [`TonCoreDeployLayout::ActivateUpgrade`] — bootstrap `code` plus `SETCODE` when the contract runs.
+    #[serde(default)]
+    pub deploy_layout: TonCoreDeployLayout,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -627,16 +635,16 @@ pub async fn v1_pools_handler(
                 for (idx, slot_cfg) in pools.iter().enumerate() {
                     let Some(cfg) = slot_cfg.as_ref() else { continue };
                     let cached = cached_iter.next();
-                    slot_jobs.push((idx, cfg.address.clone(), cached));
+                    slot_jobs.push((idx, cfg.clone(), cached));
                 }
 
                 // Fetch per-slot data in parallel; per-slot RPC errors are encoded into
                 // the slot DTO (state="error") rather than failing the whole response.
                 let mut set = tokio::task::JoinSet::new();
-                for (idx, addr, cached) in slot_jobs {
+                for (idx, cfg_slot, cached) in slot_jobs {
                     let rpc_client = rpc_client.clone();
                     set.spawn(async move {
-                        fetch_toncore_slot_dto(rpc_client, idx, addr, cached).await
+                        fetch_toncore_slot_dto(rpc_client, idx, cfg_slot, cached).await
                     });
                 }
                 let mut slots: Vec<TonCorePoolSlotDto> = Vec::new();
@@ -678,10 +686,12 @@ pub async fn v1_pools_handler(
 async fn fetch_toncore_slot_dto(
     rpc_client: Arc<ClientJsonRpc>,
     slot_idx: usize,
-    config_address: Option<String>,
+    slot_cfg: TonCorePoolConfig,
     cached: Option<Arc<dyn NominatorWrapper>>,
 ) -> TonCorePoolSlotDto {
     let slot_name = if slot_idx == 0 { "even" } else { "odd" };
+    let deploy_layout = slot_cfg.deploy_layout;
+    let config_address = slot_cfg.address.clone();
     let address = match &cached {
         Some(w) => w.address().await.ok(),
         _ => None,
@@ -694,6 +704,7 @@ async fn fetch_toncore_slot_dto(
             slot: slot_name.to_string(),
             address: address_str,
             state: "not deployed".to_string(),
+            deploy_layout,
             ..Default::default()
         };
     };
@@ -709,6 +720,7 @@ async fn fetch_toncore_slot_dto(
         address: address_str,
         state: state_str,
         balance,
+        deploy_layout,
         ..Default::default()
     };
 
@@ -1270,7 +1282,7 @@ pub async fn v1_pools_add_core_handler(
     }
 
     let name = req.name.clone();
-    let slot_cfg = TonCorePoolConfig { address, params };
+    let slot_cfg = TonCorePoolConfig { address, params, deploy_layout: req.deploy_layout };
     state
         .runtime_cfg
         .update_and_save(|cfg| {

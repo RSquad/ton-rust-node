@@ -17,13 +17,27 @@ use crate::commands::nodectl::{
 };
 use colored::{ColoredString, Colorize};
 use common::{
-    app_config::PoolConfig,
+    app_config::{PoolConfig, TonCoreDeployLayout},
     task_cancellation::CancellationCtx,
     ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
 use contracts::{TonWallet, nominator::ton_core_pool as pool_messages};
 use std::{path::Path, str::FromStr};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt, write_boc};
+
+fn skip_deploy_layout_embedded_cli(layout: &TonCoreDeployLayout) -> bool {
+    layout.is_embedded_code()
+}
+
+fn parse_cli_deploy_layout(s: &str) -> Result<TonCoreDeployLayout, String> {
+    match s.trim() {
+        "embedded_code" => Ok(TonCoreDeployLayout::EmbeddedCode),
+        "activate_upgrade" => Ok(TonCoreDeployLayout::ActivateUpgrade),
+        other => Err(format!(
+            "invalid deploy-layout '{other}': expected 'embedded_code' or 'activate_upgrade'"
+        )),
+    }
+}
 
 #[derive(clap::Args, Clone)]
 #[command(about = "Manage pools in the configuration")]
@@ -122,6 +136,12 @@ pub struct PoolAddCoreCmd {
         help = "Configure/deploy TONCore slot 1 (odd rounds)"
     )]
     odd: bool,
+    #[arg(
+        long = "deploy-layout",
+        value_parser = parse_cli_deploy_layout,
+        help = "StateInit.code layout: embedded_code (default) or activate_upgrade (bootstrap + SETCODE on run)",
+    )]
+    deploy_layout: Option<TonCoreDeployLayout>,
 }
 
 #[derive(clap::Args, Clone)]
@@ -271,6 +291,9 @@ struct PoolAddCoreBody<'a> {
     min_validator_stake: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_nominator_stake: Option<u64>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "skip_deploy_layout_embedded_cli")]
+    deploy_layout: TonCoreDeployLayout,
 }
 
 impl PoolAddCoreCmd {
@@ -298,6 +321,7 @@ impl PoolAddCoreCmd {
             self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
 
         let base_url = resolve_service_url(url, config_path)?;
+        let deploy_layout = self.deploy_layout.unwrap_or_default();
         let body = PoolAddCoreBody {
             name: &self.name,
             slot: slot_name,
@@ -307,6 +331,7 @@ impl PoolAddCoreCmd {
             // CLI flags accept TON (f64) — convert to nanotons for the API.
             min_validator_stake: self.min_validator_stake.map(tons_f64_to_nanotons),
             min_nominator_stake: self.min_nominator_stake.map(tons_f64_to_nanotons),
+            deploy_layout,
         };
         api_post(&base_url, "/v1/pools/core", token, &body).await?;
 
@@ -316,6 +341,9 @@ impl PoolAddCoreCmd {
         }
         if let Some(a) = &address {
             info_parts.push(format!("address='{a}'"));
+        }
+        if !deploy_layout.is_embedded_code() {
+            info_parts.push("deploy_layout=activate_upgrade".to_string());
         }
 
         println!(
@@ -369,6 +397,8 @@ struct TonCorePoolSlotView {
     pool_state: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_election_id: Option<u32>,
+    #[serde(default)]
+    deploy_layout: TonCoreDeployLayout,
 }
 
 impl PoolLsCmd {
@@ -870,6 +900,7 @@ mod tests {
                     validator_amount: Some(0),
                     pool_state: Some(0),
                     last_election_id: Some(1_700_000_000),
+                    ..Default::default()
                 },
                 TonCorePoolSlotView {
                     slot: "odd".into(),

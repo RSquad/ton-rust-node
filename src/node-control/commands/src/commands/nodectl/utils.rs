@@ -84,8 +84,12 @@ pub fn resolve_pool_address_from_config(
             match (&slot.address, &slot.params) {
                 (Some(addr), None) => addr.parse::<MsgAddressInt>().context("invalid pool address"),
                 (addr, Some(params)) => {
-                    let resolved =
-                        resolve_toncore_pool(validator_addr, addr.as_deref(), params.clone())?;
+                    let resolved = resolve_toncore_pool(
+                        validator_addr,
+                        addr.as_deref(),
+                        params.clone(),
+                        slot.deploy_layout,
+                    )?;
                     Ok(resolved.address)
                 }
                 (None, None) => {

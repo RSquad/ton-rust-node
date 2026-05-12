@@ -13,10 +13,11 @@ use crate::{
     },
 };
 use anyhow::Context;
-use common::app_config::TonCoreInitParams;
+use common::app_config::{TonCoreDeployLayout, TonCoreInitParams};
 use std::sync::Arc;
 use ton_block::{
-    BuilderData, Coins, IBitstring, MsgAddressInt, Serializable, StateInit, read_single_root_boc,
+    BuilderData, Cell, Coins, IBitstring, MsgAddressInt, Serializable, StateInit,
+    read_single_root_boc,
 };
 
 /// Compiled code of the nominator-pool contract.
@@ -34,19 +35,25 @@ fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Resul
     Ok(addr)
 }
 
-/// Build the `StateInit` for deploying a new TONCore nominator pool.
-///
-/// Data layout follows `save_data` / `load_data` in pool.fc:
-/// ```text
-/// state:8 nominators_count:16 stake_amount_sent:coins validator_amount:coins
-/// config:^Cell nominators:dict withdraw_requests:dict
-/// stake_at:32 saved_validator_set_hash:256 validator_set_changes_count:8
-/// validator_set_change_time:32 stake_held_for:32 config_proposal_votings:dict
-/// ```
-fn build_toncore_pool_state_init(
+fn toncore_pool_full_code_cell() -> anyhow::Result<Cell> {
+    Ok(read_single_root_boc(hex::decode(CODE).expect("nominator pool code hex is invalid"))?)
+}
+
+/// Small bootstrap code cell (`SETCP0` · `ACCEPT` · `PUSHREF` pool bytecode · `SETCODE`).
+fn build_toncore_pool_stub_code(full_pool_code: &Cell) -> anyhow::Result<Cell> {
+    let mut b = BuilderData::new();
+    b.append_raw(&[0xff, 0x00], 16)?; // SETCP0
+    b.append_raw(&[0xf8, 0x00], 16)?; // ACCEPT
+    b.append_raw(&[0x88], 8)?; // PUSHREF
+    b.checked_append_reference(full_pool_code.clone())?;
+    b.append_raw(&[0xfb, 0x04], 16)?; // SETCODE
+    Ok(b.into_cell()?)
+}
+
+fn build_toncore_pool_initial_data(
     validator_address: &MsgAddressInt,
     params: &TonCoreInitParams,
-) -> anyhow::Result<StateInit> {
+) -> anyhow::Result<Cell> {
     let mut config = BuilderData::new();
     let validator_hash = validator_address.address().get_bytestring(0);
     anyhow::ensure!(validator_hash.len() == 32, "validator address must be 256 bits");
@@ -72,17 +79,54 @@ fn build_toncore_pool_state_init(
     data.append_u32(0)?;
     data.append_bit_zero()?;
 
-    let code =
-        read_single_root_boc(hex::decode(CODE).expect("nominator pool code hex is invalid"))?;
-    Ok(StateInit::with_code_and_data(code, data.into_cell()?))
+    Ok(data.into_cell()?)
+}
+
+fn build_toncore_pool_state_init_embedded_code(
+    validator_address: &MsgAddressInt,
+    params: &TonCoreInitParams,
+) -> anyhow::Result<StateInit> {
+    let data = build_toncore_pool_initial_data(validator_address, params)?;
+    let code = toncore_pool_full_code_cell()?;
+    Ok(StateInit::with_code_and_data(code, data))
+}
+
+fn build_toncore_pool_state_init_activate_upgrade(
+    validator_address: &MsgAddressInt,
+    params: &TonCoreInitParams,
+) -> anyhow::Result<StateInit> {
+    let data = build_toncore_pool_initial_data(validator_address, params)?;
+    let pool_code = toncore_pool_full_code_cell()?;
+    let stub = build_toncore_pool_stub_code(&pool_code)?;
+    Ok(StateInit::with_code_and_data(stub, data))
+}
+
+fn build_toncore_pool_state_init_for_layout(
+    validator_address: &MsgAddressInt,
+    params: &TonCoreInitParams,
+    deploy_layout: TonCoreDeployLayout,
+) -> anyhow::Result<StateInit> {
+    match deploy_layout {
+        TonCoreDeployLayout::EmbeddedCode => {
+            build_toncore_pool_state_init_embedded_code(validator_address, params)
+        }
+        TonCoreDeployLayout::ActivateUpgrade => {
+            build_toncore_pool_state_init_activate_upgrade(validator_address, params)
+        }
+    }
 }
 
 /// Derive masterchain pool address and `StateInit` from deployment parameters.
 pub(crate) fn toncore_pool_address_and_state(
     ton_core_init_params: &TonCoreInitParams,
     validator_address: &MsgAddressInt,
+    deploy_layout: TonCoreDeployLayout,
 ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
-    let state_init = build_toncore_pool_state_init(validator_address, ton_core_init_params)?;
+    let state_init = build_toncore_pool_state_init_for_layout(
+        validator_address,
+        ton_core_init_params,
+        deploy_layout,
+    )?;
     let addr = toncore_pool_address_from_state_init(&state_init)?;
     Ok((addr, state_init))
 }
@@ -99,8 +143,10 @@ pub fn resolve_toncore_pool(
     validator_addr: &MsgAddressInt,
     pool_address: Option<&str>,
     params: TonCoreInitParams,
+    deploy_layout: TonCoreDeployLayout,
 ) -> anyhow::Result<ResolvedTonCorePool> {
-    let (address, state_init) = toncore_pool_address_and_state(&params, validator_addr)?;
+    let (address, state_init) =
+        toncore_pool_address_and_state(&params, validator_addr, deploy_layout)?;
     if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
@@ -137,17 +183,20 @@ impl TonCoreNominatorWrapper {
         provider: Arc<dyn ContractProvider>,
         validator_address: &MsgAddressInt,
         init_params: &TonCoreInitParams,
+        deploy_layout: TonCoreDeployLayout,
     ) -> anyhow::Result<Self> {
         let (pool_addr, state_init) =
-            toncore_pool_address_and_state(&init_params, validator_address)?;
+            toncore_pool_address_and_state(init_params, validator_address, deploy_layout)?;
         Ok(Self { provider, pool_addr, state_init: Some(state_init) })
     }
 
     pub fn calculate_address(
         validator_address: &MsgAddressInt,
         params: &TonCoreInitParams,
+        deploy_layout: TonCoreDeployLayout,
     ) -> anyhow::Result<MsgAddressInt> {
-        toncore_pool_address_and_state(&params, validator_address).map(|(addr, _)| addr)
+        toncore_pool_address_and_state(params, validator_address, deploy_layout)
+            .map(|(addr, _)| addr)
     }
 }
 
@@ -246,9 +295,45 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
 mod tests {
     use super::*;
     use crate::contract_provider;
+    use common::app_config::{TonCoreDeployLayout, TonCoreInitParams};
     use std::str::FromStr;
     use ton_block::MsgAddressInt;
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
+
+    #[test]
+    fn stub_cell_refs_full_pool_code() {
+        let pool = toncore_pool_full_code_cell().expect("pool code");
+        let stub = build_toncore_pool_stub_code(&pool).expect("stub");
+        assert_eq!(stub.references_count(), 1);
+        assert_eq!(stub.reference(0).expect("ref").repr_hash(), pool.repr_hash());
+    }
+
+    #[test]
+    fn embedded_and_activate_upgrade_addresses_differ() {
+        let validator = MsgAddressInt::from_str(
+            "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea",
+        )
+        .expect("validator");
+        let params = TonCoreInitParams {
+            validator_share: 4000,
+            max_nominators: 40,
+            min_validator_stake: 100_000_000_000_000,
+            min_nominator_stake: 10_000_000_000_000,
+        };
+        let a = TonCoreNominatorWrapper::calculate_address(
+            &validator,
+            &params,
+            TonCoreDeployLayout::EmbeddedCode,
+        )
+        .expect("embedded_code addr");
+        let b = TonCoreNominatorWrapper::calculate_address(
+            &validator,
+            &params,
+            TonCoreDeployLayout::ActivateUpgrade,
+        )
+        .expect("activate_upgrade addr");
+        assert_ne!(a, b);
+    }
 
     fn open_pool() -> Option<TonCoreNominatorWrapper> {
         let pool_addr = MsgAddressInt::from_str("kf-d42Dwn_dzfdwlV_aEeX7WWnJ-bBU_eZp6CfKoMb4vQ3t0")

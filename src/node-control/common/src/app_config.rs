@@ -332,6 +332,39 @@ fn default_toncore_min_nominator_stake() -> u64 {
     DEFAULT_TONCORE_MIN_NOMINATOR_STAKE
 }
 
+#[inline]
+fn skip_serializing_toncore_deploy_layout(layout: &TonCoreDeployLayout) -> bool {
+    layout.is_embedded_code()
+}
+
+/// How `StateInit.code` is shaped when deploying a TON Core nominator pool.
+///
+/// [`TonCoreDeployLayout::EmbeddedCode`] — full pool bytecode is stored in `StateInit.code` at deploy time.
+/// [`TonCoreDeployLayout::ActivateUpgrade`] — minimal bootstrap in `StateInit.code`; full pool code is applied via `SETCODE` when the contract runs (code upgrade on activation).
+///
+/// Both layouts are typically delivered by an **internal** wallet message carrying `state_init`; they differ only in how `code` is encoded before first execution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TonCoreDeployLayout {
+    #[default]
+    EmbeddedCode,
+    ActivateUpgrade,
+}
+
+impl TonCoreDeployLayout {
+    #[inline]
+    pub const fn is_embedded_code(self) -> bool {
+        matches!(self, Self::EmbeddedCode)
+    }
+}
+
+impl Default for TonCorePoolConfig {
+    fn default() -> Self {
+        Self { address: None, params: None, deploy_layout: TonCoreDeployLayout::default() }
+    }
+}
+
 /// Single TONCore pool slot config (address + optional deploy params).
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub struct TonCorePoolConfig {
@@ -341,6 +374,10 @@ pub struct TonCorePoolConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<TonCoreInitParams>,
+    /// Deploy layout for this slot (`embedded_code` when omitted in JSON).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "skip_serializing_toncore_deploy_layout")]
+    pub deploy_layout: TonCoreDeployLayout,
 }
 
 /// Deploy-time parameters for a TONCore nominator pool contract.
@@ -948,6 +985,7 @@ mod tests {
                             min_validator_stake: DEFAULT_TONCORE_MIN_VALIDATOR_STAKE,
                             min_nominator_stake: DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
                         }),
+                        ..Default::default()
                     }),
                     None,
                 ],
@@ -1003,6 +1041,7 @@ mod tests {
                             min_validator_stake: 5_000_000_000_000,
                             min_nominator_stake: 1_000_000_000_000,
                         }),
+                        ..Default::default()
                     }),
                     None,
                 ],
@@ -1030,6 +1069,45 @@ mod tests {
         assert_eq!(json["kind"], "core");
         assert_eq!(json["pools"][0]["address"], addr0);
         assert_eq!(json["pools"][1]["address"], addr1);
+    }
+
+    #[test]
+    fn test_pool_config_toncore_deploy_layout_roundtrip() {
+        let value = serde_json::json!({
+            "kind": "core",
+            "pools": [
+                {
+                    "params": { "validator_share": 50 },
+                    "deploy_layout": "activate_upgrade",
+                },
+                null,
+            ],
+        });
+        let cfg: PoolConfig = serde_json::from_value(value.clone()).unwrap();
+        match &cfg {
+            PoolConfig::TONCore { pools } => {
+                assert_eq!(
+                    pools[0].as_ref().unwrap().deploy_layout,
+                    TonCoreDeployLayout::ActivateUpgrade
+                );
+            }
+            _ => panic!("expected TONCore"),
+        }
+
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["pools"][0]["deploy_layout"], "activate_upgrade");
+
+        let embedded_default_only = serde_json::json!({
+            "kind": "core",
+            "pools": [{ "params": { "validator_share": 50 } }, null],
+        });
+        let cfg2: PoolConfig = serde_json::from_value(embedded_default_only).unwrap();
+        match &cfg2 {
+            PoolConfig::TONCore { pools } => {
+                assert!(pools[0].as_ref().unwrap().deploy_layout.is_embedded_code());
+            }
+            _ => panic!("expected TONCore"),
+        }
     }
 
     #[test]

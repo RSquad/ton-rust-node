@@ -629,8 +629,11 @@ fn open_nominator_pool(
                         if let Some(addr_str) = &cfg.address {
                             let explicit = MsgAddressInt::from_str(addr_str)
                                 .context(format!("invalid TONCore pool address: {addr_str}"))?;
-                            let derived =
-                                TonCoreNominatorWrapper::calculate_address(validator_addr, params)?;
+                            let derived = TonCoreNominatorWrapper::calculate_address(
+                                validator_addr,
+                                params,
+                                cfg.deploy_layout,
+                            )?;
                             anyhow::ensure!(
                                 explicit == derived,
                                 "TONCore pool address ({}) does not match derived address ({})",
@@ -642,6 +645,7 @@ fn open_nominator_pool(
                             provider.clone(),
                             validator_addr,
                             params,
+                            cfg.deploy_layout,
                         )?) as Arc<dyn NominatorWrapper>))
                     }
                     (None, None) => {

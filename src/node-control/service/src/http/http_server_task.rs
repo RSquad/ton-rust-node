@@ -874,6 +874,7 @@ impl utoipa::Modify for BearerAuthAddon {
         common::app_config::BindingStatus,
         common::app_config::LogRotation,
         common::app_config::LogOutput,
+        common::app_config::TonCoreDeployLayout,
         super::config_handlers::ElectionsSettingsUpdateRequest,
         ElectionsTaskAction,
         ElectionsTaskControlRequest,

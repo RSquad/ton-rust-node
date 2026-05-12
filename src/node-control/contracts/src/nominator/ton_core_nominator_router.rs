@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{ContractProvider, SmartContract};
 use anyhow::Context;
-use common::app_config::TonCoreInitParams;
+use common::app_config::{TonCoreDeployLayout, TonCoreInitParams};
 use std::sync::Arc;
 use ton_block::{MsgAddressInt, StateInit};
 
@@ -60,18 +60,24 @@ impl TonCoreNominatorRouter {
         provider: Arc<dyn ContractProvider>,
         pools: [Option<TonCoreInitParams>; 2],
         validator_address: &MsgAddressInt,
+        deploy_layouts: [TonCoreDeployLayout; 2],
     ) -> anyhow::Result<Self> {
-        let pools = pools.map(|slot| -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
-            let Some(init_params) = slot else {
-                return Ok(None);
-            };
-            let (addr, si) = toncore_pool_address_and_state(&init_params, validator_address)?;
-            Ok(Some(Arc::new(TonCoreNominatorWrapper::new_with_state_init(
-                provider.clone(),
-                addr,
-                si,
-            )) as Arc<dyn NominatorWrapper>))
-        });
+        let pools =
+            std::array::from_fn(|idx| -> anyhow::Result<Option<Arc<dyn NominatorWrapper>>> {
+                let Some(init_params) = pools[idx].clone() else {
+                    return Ok(None);
+                };
+                let (addr, si) = toncore_pool_address_and_state(
+                    &init_params,
+                    validator_address,
+                    deploy_layouts[idx],
+                )?;
+                Ok(Some(Arc::new(TonCoreNominatorWrapper::new_with_state_init(
+                    provider.clone(),
+                    addr,
+                    si,
+                )) as Arc<dyn NominatorWrapper>))
+            });
         let [p0, p1] = pools;
         Ok(Self { pools: [p0.context("slot 0")?, p1.context("slot 1")?] })
     }
