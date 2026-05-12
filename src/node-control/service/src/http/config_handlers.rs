@@ -29,7 +29,7 @@ use ton_block::MsgAddressInt;
 use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
 /// `type_id` for ADNL public keys (Ed25519).
-pub(crate) const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
+const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
 
 /// Logical name reserved for the master wallet entry; cannot be used as a regular wallet name.
 const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";

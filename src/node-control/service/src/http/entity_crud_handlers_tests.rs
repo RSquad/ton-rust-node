@@ -9,13 +9,12 @@
 //! REST mutation tests for `/v1/nodes`, `/v1/wallets`, `/v1/pools`, `/v1/bindings`.
 use crate::{
     auth::{jwt::JwtAuth, user_store::UserStore},
-    http::{config_handlers::ADNL_PUBKEY_TYPE_ID, http_server_task::*},
+    http::http_server_task::*,
     runtime_config::{RuntimeConfig, RuntimeConfigStore},
     task::task_manager::{ServiceTask, TaskController},
 };
 use adnl::common::Timeouts;
 use axum::body::Body;
-use base64::Engine;
 use common::{
     TonWalletVersion,
     app_config::{
@@ -26,16 +25,10 @@ use common::{
     task_cancellation::CancellationCtx,
 };
 use http_body_util::BodyExt;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, sync::Arc};
 use tower::ServiceExt;
+
+const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
 
 struct Noop;
 
@@ -48,10 +41,35 @@ impl ServiceTask for Noop {
     }
 }
 
-const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
+async fn json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
 
-fn empty_app_cfg() -> Arc<AppConfig> {
-    Arc::new(AppConfig {
+fn get(uri: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn post_json(uri: &str, body: &impl serde::Serialize) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap()
+}
+
+fn delete(uri: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder().method("DELETE").uri(uri).body(Body::empty()).unwrap()
+}
+
+/// Local copy of the ADNL Ed25519 type_id. Kept in sync with `config_handlers::ADNL_PUBKEY_TYPE_ID`
+/// — the value is never round-tripped through the prod code path, so a duplicate constant in tests
+/// is fine and avoids widening crate-internal visibility.
+const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
+
+fn empty_app_cfg() -> AppConfig {
+    AppConfig {
         nodes: HashMap::new(),
         wallets: HashMap::new(),
         pools: HashMap::new(),
@@ -63,10 +81,11 @@ fn empty_app_cfg() -> Arc<AppConfig> {
         master_wallet: None,
         tick_interval: 30,
         log: Some(Default::default()),
-    })
+    }
 }
 
 fn valid_control_server_pubkey_b64() -> String {
+    use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode([11u8; 32])
 }
 
@@ -107,27 +126,8 @@ fn sample_snp_pool(name: &str) -> (String, PoolConfig) {
     )
 }
 
-fn unique_test_config_path() -> PathBuf {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-    let unique_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    std::env::temp_dir().join(format!(
-        "node-control-entity-crud-tests-{}-{}-{}.json",
-        std::process::id(),
-        nanos,
-        unique_id
-    ))
-}
-
-/// Builds [`AppState`] for router tests. Uses a unique temp config path so parallel tests never
-/// share `save_to_file` output (the default `from_app_config` `"noop"` path is unsuitable under
-/// `cargo test -- --test-threads=N`).
-async fn app_state(cfg: Arc<AppConfig>, config_path: Option<PathBuf>) -> AppState {
-    let path = config_path.unwrap_or_else(unique_test_config_path);
-    let rt = Arc::new(RuntimeConfigStore::from_app_config_with_path(
-        cfg,
-        path.to_string_lossy().into_owned(),
-    ));
+async fn app_state(cfg: AppConfig) -> AppState {
+    let rt = Arc::new(RuntimeConfigStore::from_app_config(Arc::new(cfg)));
     let jwt_auth = Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap());
     AppState {
         store: Arc::new(SnapshotStore::new()),
@@ -140,27 +140,25 @@ async fn app_state(cfg: Arc<AppConfig>, config_path: Option<PathBuf>) -> AppStat
     }
 }
 
-async fn json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+/// Test-only state where mutations are persisted to `path` (TempDir-managed by caller).
+async fn app_state_with_path(cfg: AppConfig, path: std::path::PathBuf) -> AppState {
+    let rt = Arc::new(
+        RuntimeConfigStore::from_app_config(Arc::new(cfg))
+            .with_path(path.to_string_lossy().into_owned()),
+    );
+    let jwt_auth = Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap());
+    AppState {
+        store: Arc::new(SnapshotStore::new()),
+        runtime_cfg: rt.clone(),
+        elections_task: Arc::new(TaskController::new("elections", Noop, rt.clone())),
+        jwt_auth,
+        user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
+        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        config_changed: Arc::new(tokio::sync::Notify::new()),
+    }
 }
 
-fn get(uri: &str) -> axum::http::Request<Body> {
-    axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()
-}
-
-fn post_json(uri: &str, body: &impl serde::Serialize) -> axum::http::Request<Body> {
-    axum::http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(body).unwrap()))
-        .unwrap()
-}
-
-fn delete(uri: &str) -> axum::http::Request<Body> {
-    axum::http::Request::builder().method("DELETE").uri(uri).body(Body::empty()).unwrap()
-}
+const POOL_ADDR_A: &str = "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea";
 
 fn node_add_json(name: &str) -> serde_json::Value {
     serde_json::json!({
@@ -201,7 +199,7 @@ fn binding_add_json(node: &str, wallet: &str, pool: Option<&str>) -> serde_json:
 
 #[tokio::test]
 async fn nodes_post_succeeds() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
     let resp = app.clone().oneshot(post_json("/v1/nodes", &node_add_json("node_a"))).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -223,7 +221,7 @@ async fn nodes_post_succeeds() {
 
 #[tokio::test]
 async fn nodes_post_duplicate() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
     let body = node_add_json("dup_node");
     let resp = app.clone().oneshot(post_json("/v1/nodes", &body)).await.unwrap();
@@ -236,38 +234,37 @@ async fn nodes_post_duplicate() {
 
 #[tokio::test]
 async fn nodes_post_invalid_pubkey_base64() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
-    let body = serde_json::json!({
-        "name": "n_bad_pk",
-        "control_server_endpoint": "127.0.0.1:1",
-        "control_server_pubkey": "not-valid-base64!!!",
-        "control_client_secret": "sec",
-    });
+    let mut body = node_add_json("n_bad_pk");
+    body["control_server_pubkey"] = "not-valid-base64!!!".into();
     let resp = app.oneshot(post_json("/v1/nodes", &body)).await.unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
     assert!(v["error"]["message"].as_str().unwrap().contains("base64"));
 }
 
+// --- DELETE /v1/nodes ---
+
 #[tokio::test]
-async fn nodes_delete_succeeds_then_not_found() {
-    let st = app_state(empty_app_cfg(), None).await;
+async fn nodes_delete_succeeds() {
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
-    let body = node_add_json("to_rm");
-    let resp = app.clone().oneshot(post_json("/v1/nodes", &body)).await.unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let resp = app.clone().oneshot(delete("/v1/nodes/to_rm")).await.unwrap();
-    assert_eq!(resp.status(), 200);
-
+    app.clone().oneshot(post_json("/v1/nodes", &node_add_json("to_rm"))).await.unwrap();
     let resp = app.oneshot(delete("/v1/nodes/to_rm")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn nodes_delete_not_found() {
+    let st = app_state(empty_app_cfg()).await;
+    let resp = routes(false, st).oneshot(delete("/v1/nodes/missing")).await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]
-async fn nodes_delete_referenced_by_binding() {
-    let mut cfg = (*empty_app_cfg()).clone();
+async fn nodes_delete_rejected_when_referenced_by_binding() {
+    let mut cfg = empty_app_cfg();
     let (nname, ncfg) = sample_node_adnl("bound");
     cfg.nodes.insert(nname.clone(), ncfg);
     let (wname, wcfg) = sample_wallet("bw");
@@ -276,19 +273,19 @@ async fn nodes_delete_referenced_by_binding() {
         nname.clone(),
         NodeBinding { wallet: wname, pool: None, enable: false, status: BindingStatus::Idle },
     );
-    let st = app_state(Arc::new(cfg), None).await;
+    let st = app_state(cfg).await;
     let app = routes(false, st);
     let resp = app.oneshot(delete(&format!("/v1/nodes/{nname}"))).await.unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
-    assert!(v["error"]["message"].as_str().unwrap().contains("binding"));
+    assert!(v["error"]["message"].as_str().unwrap().contains("referenced by a binding"));
 }
 
-// --- POST/DELETE /v1/wallets ---
+// --- POST /v1/wallets ---
 
 #[tokio::test]
 async fn wallets_post_succeeds() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
     let resp =
         app.clone().oneshot(post_json("/v1/wallets", &wallet_add_json("w_main"))).await.unwrap();
@@ -308,7 +305,7 @@ async fn wallets_post_succeeds() {
 
 #[tokio::test]
 async fn wallets_post_reserved_master_wallet_name() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
     let body = wallet_add_json("master_wallet");
     let resp = app.oneshot(post_json("/v1/wallets", &body)).await.unwrap();
@@ -319,7 +316,7 @@ async fn wallets_post_reserved_master_wallet_name() {
 
 #[tokio::test]
 async fn wallets_post_duplicate() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
     let body = wallet_add_json("w_dup");
     let resp = app.clone().oneshot(post_json("/v1/wallets", &body)).await.unwrap();
@@ -328,9 +325,21 @@ async fn wallets_post_duplicate() {
     assert_eq!(resp.status(), 400);
 }
 
+// --- DELETE /v1/wallets ---
+
 #[tokio::test]
-async fn wallets_delete_rejected_when_bound_then_succeeds_when_orphan() {
-    let mut cfg = (*empty_app_cfg()).clone();
+async fn wallets_delete_succeeds_when_orphan() {
+    let mut cfg = empty_app_cfg();
+    let (wn, wc) = sample_wallet("w_free");
+    cfg.wallets.insert(wn, wc);
+    let st = app_state(cfg).await;
+    let resp = routes(false, st).oneshot(delete("/v1/wallets/w_free")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn wallets_delete_rejected_when_bound() {
+    let mut cfg = empty_app_cfg();
     let (nname, ncfg) = sample_node_adnl("w_del");
     cfg.nodes.insert(nname.clone(), ncfg);
     let (wname, wcfg) = sample_wallet("w_bound");
@@ -344,53 +353,46 @@ async fn wallets_delete_rejected_when_bound_then_succeeds_when_orphan() {
             status: BindingStatus::Idle,
         },
     );
-    let st = app_state(Arc::new(cfg), None).await;
-    let app = routes(false, st);
-
-    let resp = app.clone().oneshot(delete(&format!("/v1/wallets/{wname}"))).await.unwrap();
+    let st = app_state(cfg).await;
+    let resp = routes(false, st).oneshot(delete(&format!("/v1/wallets/{wname}"))).await.unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
-    assert!(v["error"]["message"].as_str().unwrap().contains("binding"));
+    assert!(v["error"]["message"].as_str().unwrap().contains("referenced by binding"));
+}
 
-    cfg = (*empty_app_cfg()).clone();
-    let (wn, wc) = sample_wallet("w_free");
-    cfg.wallets.insert(wn, wc);
-    let st = app_state(Arc::new(cfg), None).await;
-    let app = routes(false, st);
-    let resp = app.oneshot(delete("/v1/wallets/w_free")).await.unwrap();
-    assert_eq!(resp.status(), 200);
+#[tokio::test]
+async fn wallets_delete_master_wallet_rejected() {
+    let st = app_state(empty_app_cfg()).await;
+    let resp = routes(false, st).oneshot(delete("/v1/wallets/master_wallet")).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("master wallet"));
 }
 
 #[tokio::test]
 async fn wallets_delete_not_found() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let resp = routes(false, st).oneshot(delete("/v1/wallets/no_such_wallet")).await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
-// --- POST/DELETE /v1/pools (SNP) ---
+// --- POST /v1/pools (SNP) ---
 
 #[tokio::test]
-async fn pools_post_succeeds_missing_address_owner_rejected() {
-    let st = app_state(empty_app_cfg(), None).await;
-    let app = routes(false, st);
-
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/v1/pools",
-            &pool_add_json(
-                "pool_ok",
-                Some("-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea"),
-                None,
-            ),
-        ))
+async fn pools_post_succeeds() {
+    let st = app_state(empty_app_cfg()).await;
+    let resp = routes(false, st)
+        .oneshot(post_json("/v1/pools", &pool_add_json("pool_ok", Some(POOL_ADDR_A), None)))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
 
+#[tokio::test]
+async fn pools_post_missing_address_and_owner_rejected() {
+    let st = app_state(empty_app_cfg()).await;
     let body = serde_json::json!({ "name": "pool_bad", "address": null, "owner": null });
-    let resp = app.oneshot(post_json("/v1/pools", &body)).await.unwrap();
+    let resp = routes(false, st).oneshot(post_json("/v1/pools", &body)).await.unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
     let msg = v["error"]["message"].as_str().unwrap();
@@ -398,23 +400,51 @@ async fn pools_post_succeeds_missing_address_owner_rejected() {
 }
 
 #[tokio::test]
+async fn pools_post_invalid_address_rejected() {
+    let st = app_state(empty_app_cfg()).await;
+    let body = pool_add_json("p_bad_addr", Some("not-a-valid-address"), None);
+    let resp = routes(false, st).oneshot(post_json("/v1/pools", &body)).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("address"));
+}
+
+#[tokio::test]
+async fn pools_post_invalid_owner_rejected() {
+    let st = app_state(empty_app_cfg()).await;
+    let body = pool_add_json("p_bad_owner", None, Some("definitely-not-an-address"));
+    let resp = routes(false, st).oneshot(post_json("/v1/pools", &body)).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("owner"));
+}
+
+#[tokio::test]
 async fn pools_post_duplicate() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let app = routes(false, st);
-    let body = pool_add_json(
-        "pool_dup",
-        Some("-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea"),
-        None,
-    );
+    let body = pool_add_json("pool_dup", Some(POOL_ADDR_A), None);
     let resp = app.clone().oneshot(post_json("/v1/pools", &body)).await.unwrap();
     assert_eq!(resp.status(), 200);
     let resp = app.oneshot(post_json("/v1/pools", &body)).await.unwrap();
     assert_eq!(resp.status(), 400);
 }
 
+// --- DELETE /v1/pools ---
+
 #[tokio::test]
-async fn pools_delete_rejected_when_bound_then_succeeds_when_orphan() {
-    let mut cfg = (*empty_app_cfg()).clone();
+async fn pools_delete_succeeds_when_orphan() {
+    let mut cfg = empty_app_cfg();
+    let (pn, pc) = sample_snp_pool("p_free");
+    cfg.pools.insert(pn, pc);
+    let st = app_state(cfg).await;
+    let resp = routes(false, st).oneshot(delete("/v1/pools/p_free")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn pools_delete_rejected_when_bound() {
+    let mut cfg = empty_app_cfg();
     let (nname, ncfg) = sample_node_adnl("p_del");
     cfg.nodes.insert(nname.clone(), ncfg);
     let (wname, wcfg) = sample_wallet("pw");
@@ -430,41 +460,79 @@ async fn pools_delete_rejected_when_bound_then_succeeds_when_orphan() {
             status: BindingStatus::Idle,
         },
     );
-    let st = app_state(Arc::new(cfg), None).await;
-    let app = routes(false, st);
-
-    let resp = app.clone().oneshot(delete(&format!("/v1/pools/{pname}"))).await.unwrap();
+    let st = app_state(cfg).await;
+    let resp = routes(false, st).oneshot(delete(&format!("/v1/pools/{pname}"))).await.unwrap();
     assert_eq!(resp.status(), 400);
-
-    let mut cfg = (*empty_app_cfg()).clone();
-    let (pn, pc) = sample_snp_pool("p_free");
-    cfg.pools.insert(pn, pc);
-    let st = app_state(Arc::new(cfg), None).await;
-    let app = routes(false, st);
-    let resp = app.oneshot(delete("/v1/pools/p_free")).await.unwrap();
-    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
 async fn pools_delete_not_found() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let resp = routes(false, st).oneshot(delete("/v1/pools/no_such_pool")).await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
-// --- POST/DELETE /v1/bindings ---
+// --- POST /v1/bindings ---
 
 #[tokio::test]
-async fn bindings_post_succeeds_duplicate_rejected() {
-    let mut cfg = (*empty_app_cfg()).clone();
+async fn bindings_post_succeeds() {
+    let mut cfg = empty_app_cfg();
     let (nname, ncfg) = sample_node_adnl("bind");
     cfg.nodes.insert(nname.clone(), ncfg);
     let (bw, bwc) = sample_wallet("bind_w");
     cfg.wallets.insert(bw.clone(), bwc);
 
-    let st = app_state(Arc::new(cfg), None).await;
+    let st = app_state(cfg).await;
     let app = routes(false, st);
+    let resp = app
+        .clone()
+        .oneshot(post_json("/v1/bindings", &binding_add_json(&nname, &bw, None)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
 
+#[tokio::test]
+async fn bindings_post_succeeds_with_pool() {
+    let mut cfg = empty_app_cfg();
+    let (nname, ncfg) = sample_node_adnl("bind_p");
+    cfg.nodes.insert(nname.clone(), ncfg);
+    let (wn, wc) = sample_wallet("bind_p_w");
+    cfg.wallets.insert(wn.clone(), wc);
+    let (pn, pc) = sample_snp_pool("bind_p_pool");
+    cfg.pools.insert(pn.clone(), pc);
+
+    let st = app_state(cfg).await;
+    let app = routes(false, st);
+    let resp = app
+        .clone()
+        .oneshot(post_json("/v1/bindings", &binding_add_json(&nname, &wn, Some(&pn))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Verify the pool reference round-trips via GET /v1/bindings.
+    let resp = app.oneshot(get("/v1/bindings")).await.unwrap();
+    let v = json(resp).await;
+    let entry = v["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["node"].as_str() == Some(&nname))
+        .expect("binding should be listed");
+    assert_eq!(entry["pool"].as_str(), Some(pn.as_str()));
+}
+
+#[tokio::test]
+async fn bindings_post_duplicate_rejected() {
+    let mut cfg = empty_app_cfg();
+    let (nname, ncfg) = sample_node_adnl("dup");
+    cfg.nodes.insert(nname.clone(), ncfg);
+    let (bw, bwc) = sample_wallet("dup_w");
+    cfg.wallets.insert(bw.clone(), bwc);
+
+    let st = app_state(cfg).await;
+    let app = routes(false, st);
     let body = binding_add_json(&nname, &bw, None);
     let resp = app.clone().oneshot(post_json("/v1/bindings", &body)).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -477,7 +545,7 @@ async fn bindings_post_succeeds_duplicate_rejected() {
 
 #[tokio::test]
 async fn bindings_post_missing_refs() {
-    let mut cfg = (*empty_app_cfg()).clone();
+    let mut cfg = empty_app_cfg();
     let (nname, ncfg) = sample_node_adnl("mr");
     cfg.nodes.insert(nname.clone(), ncfg);
     let (mwn, mwc) = sample_wallet("mr_w");
@@ -485,7 +553,7 @@ async fn bindings_post_missing_refs() {
     let (pname, pcfg) = sample_snp_pool("mr_p");
     cfg.pools.insert(pname.clone(), pcfg);
 
-    let st = app_state(Arc::new(cfg), None).await;
+    let st = app_state(cfg).await;
     let app = routes(false, st);
 
     let resp = app
@@ -495,7 +563,7 @@ async fn bindings_post_missing_refs() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
-    assert!(v["error"]["message"].as_str().unwrap().contains("node"));
+    assert!(v["error"]["message"].as_str().unwrap().contains("node 'no_such_node' not found"));
 
     let resp = app
         .clone()
@@ -504,7 +572,7 @@ async fn bindings_post_missing_refs() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
-    assert!(v["error"]["message"].as_str().unwrap().contains("wallet"));
+    assert!(v["error"]["message"].as_str().unwrap().contains("wallet 'no_wallet' not found"));
 
     let resp = app
         .oneshot(post_json("/v1/bindings", &binding_add_json(&nname, &mwn, Some("no_pool"))))
@@ -512,50 +580,82 @@ async fn bindings_post_missing_refs() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
-    assert!(v["error"]["message"].as_str().unwrap().contains("pool"));
+    assert!(v["error"]["message"].as_str().unwrap().contains("pool 'no_pool' not found"));
 }
 
 #[tokio::test]
-async fn bindings_delete_succeeds_when_idle_non_idle_rejected() {
-    let mut cfg = (*empty_app_cfg()).clone();
-    let (nname, ncfg) = sample_node_adnl("idle_rm");
-    cfg.nodes.insert(nname.clone(), ncfg.clone());
-    let (idle_wn, idle_wc) = sample_wallet("idle_w");
-    cfg.wallets.insert(idle_wn.clone(), idle_wc);
+async fn bindings_post_pool_already_bound() {
+    let mut cfg = empty_app_cfg();
+    let (n1, n1c) = sample_node_adnl("ab1");
+    let (n2, n2c) = sample_node_adnl("ab2");
+    cfg.nodes.insert(n1.clone(), n1c);
+    cfg.nodes.insert(n2.clone(), n2c);
+    let (w, wc) = sample_wallet("ab_w");
+    cfg.wallets.insert(w.clone(), wc);
+    let (p, pc) = sample_snp_pool("ab_p");
+    cfg.pools.insert(p.clone(), pc);
     cfg.bindings.insert(
-        nname.clone(),
-        NodeBinding { wallet: idle_wn, pool: None, enable: false, status: BindingStatus::Idle },
-    );
-
-    let st = app_state(Arc::new(cfg), None).await;
-    let app = routes(false, st);
-    let resp = app.oneshot(delete(&format!("/v1/bindings/{nname}"))).await.unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let mut cfg = (*empty_app_cfg()).clone();
-    cfg.nodes.insert(nname.clone(), ncfg);
-    let (busy_wn, busy_wc) = sample_wallet("busy_w");
-    cfg.wallets.insert(busy_wn.clone(), busy_wc);
-    cfg.bindings.insert(
-        nname.clone(),
+        n1.clone(),
         NodeBinding {
-            wallet: busy_wn,
-            pool: None,
+            wallet: w.clone(),
+            pool: Some(p.clone()),
             enable: false,
-            status: BindingStatus::Validating,
+            status: BindingStatus::Idle,
         },
     );
-    let st = app_state(Arc::new(cfg), None).await;
-    let app = routes(false, st);
-    let resp = app.oneshot(delete(&format!("/v1/bindings/{nname}"))).await.unwrap();
+
+    let st = app_state(cfg).await;
+    let resp = routes(false, st)
+        .oneshot(post_json("/v1/bindings", &binding_add_json(&n2, &w, Some(&p))))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
-    assert!(v["error"]["message"].as_str().unwrap().contains("idle"));
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("already bound"), "unexpected error message: {msg}");
+}
+
+// --- DELETE /v1/bindings ---
+
+#[tokio::test]
+async fn bindings_delete_succeeds_when_idle() {
+    let mut cfg = empty_app_cfg();
+    let (nname, ncfg) = sample_node_adnl("idle_rm");
+    cfg.nodes.insert(nname.clone(), ncfg);
+    let (wn, wc) = sample_wallet("idle_w");
+    cfg.wallets.insert(wn.clone(), wc);
+    cfg.bindings.insert(
+        nname.clone(),
+        NodeBinding { wallet: wn, pool: None, enable: false, status: BindingStatus::Idle },
+    );
+
+    let st = app_state(cfg).await;
+    let resp = routes(false, st).oneshot(delete(&format!("/v1/bindings/{nname}"))).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn bindings_delete_rejected_when_non_idle() {
+    let mut cfg = empty_app_cfg();
+    let (nname, ncfg) = sample_node_adnl("busy_rm");
+    cfg.nodes.insert(nname.clone(), ncfg);
+    let (wn, wc) = sample_wallet("busy_w");
+    cfg.wallets.insert(wn.clone(), wc);
+    cfg.bindings.insert(
+        nname.clone(),
+        NodeBinding { wallet: wn, pool: None, enable: false, status: BindingStatus::Validating },
+    );
+
+    let st = app_state(cfg).await;
+    let resp = routes(false, st).oneshot(delete(&format!("/v1/bindings/{nname}"))).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let v = json(resp).await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("must be 'idle'"));
 }
 
 #[tokio::test]
 async fn bindings_delete_not_found() {
-    let st = app_state(empty_app_cfg(), None).await;
+    let st = app_state(empty_app_cfg()).await;
     let resp = routes(false, st).oneshot(delete("/v1/bindings/no_such_node")).await.unwrap();
     assert_eq!(resp.status(), 404);
 }
@@ -566,7 +666,7 @@ async fn bindings_delete_not_found() {
 async fn mutation_persists_config_to_disk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cfg.json");
-    let st = app_state(empty_app_cfg(), Some(path.clone())).await;
+    let st = app_state_with_path(empty_app_cfg(), path.clone()).await;
     let app = routes(false, st);
 
     let resp = app

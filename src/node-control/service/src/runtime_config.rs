@@ -39,8 +39,9 @@ pub struct RuntimeConfigStore {
     state: RwLock<Arc<RuntimeState>>,
     /// Unix timestamp of the last config mutation (seconds).
     updated_at: AtomicU64,
-    /// Path to the config file on disk, used for save/reload.
-    config_path: String,
+    /// Path to the config file on disk, used for save/reload. `None` in tests
+    /// that construct an in-memory store via [`Self::from_app_config`].
+    config_path: Option<String>,
     /// Hash of the last config file content we loaded, to detect external changes.
     last_file_hash: Mutex<Option<u64>>,
 }
@@ -115,7 +116,7 @@ impl RuntimeConfigStore {
                 master_wallet,
             })),
             updated_at: AtomicU64::new(time_format::now()),
-            config_path,
+            config_path: Some(config_path),
             last_file_hash: Mutex::new(hash),
         })
     }
@@ -223,21 +224,17 @@ impl RuntimeConfigStore {
                 rpc_client,
             })),
             updated_at: AtomicU64::new(time_format::now()),
-            config_path: "noop".to_string(),
+            config_path: None,
             last_file_hash: Mutex::new(None),
         }
     }
 
-    /// Same as [`Self::from_app_config`], but writes persisted config to `config_path`
-    /// (for tests that assert on-disk config after `update_and_save`).
+    /// Test-only: enable on-disk persistence for an in-memory store. Use when a test
+    /// needs to assert the saved JSON after `update_and_save`.
     #[cfg(test)]
-    pub fn from_app_config_with_path(
-        app_config: Arc<AppConfig>,
-        config_path: impl Into<String>,
-    ) -> Self {
-        let mut store = Self::from_app_config(app_config);
-        store.config_path = config_path.into();
-        store
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.config_path = Some(path.into());
+        self
     }
 
     pub fn updated_at(&self) -> u64 {
@@ -299,7 +296,10 @@ impl RuntimeConfigStore {
     /// differs from the last write. Called from `update_and_save` so
     /// the disk write happens before the in-memory swap.
     fn save_to_file(&self, cfg: &AppConfig) -> anyhow::Result<()> {
-        let path = Path::new(&self.config_path);
+        let Some(path) = self.config_path.as_deref() else {
+            return Ok(());
+        };
+        let path = Path::new(path);
         let json = serde_json::to_string_pretty(cfg)
             .map_err(|e| anyhow::anyhow!("serialize config error: {e}"))?;
         let current_hash = Self::hash_bytes(json.as_bytes());
@@ -365,14 +365,17 @@ impl RuntimeConfigStore {
 
     /// Reload config from the file if it has changed externally.
     pub async fn reload_from_file(&self) -> bool {
-        let current_hash = Self::hash_file(&Path::new(&self.config_path));
+        let Some(path) = self.config_path.as_deref() else {
+            return false;
+        };
+        let current_hash = Self::hash_file(Path::new(path));
         let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
         if current_hash == last_hash {
             return false;
         }
 
-        tracing::info!("config changed, reloading from '{}'", self.config_path);
-        match AppConfig::load(Path::new(&self.config_path)) {
+        tracing::info!("config changed, reloading from '{}'", path);
+        match AppConfig::load(Path::new(path)) {
             Ok(file_cfg) => match self.reload(file_cfg).await {
                 Ok(()) => {
                     *self.last_file_hash.lock().expect("last_file_hash lock") = current_hash;
@@ -384,7 +387,7 @@ impl RuntimeConfigStore {
                 }
             },
             Err(e) => {
-                tracing::error!("reload config error: path='{}' error={:#}", self.config_path, e);
+                tracing::error!("reload config error: path='{}' error={:#}", path, e);
                 false
             }
         }
