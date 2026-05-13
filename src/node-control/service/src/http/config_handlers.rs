@@ -285,6 +285,28 @@ pub struct VotingProposalDetailResponse {
     pub result: VotingProposalDetailDto,
 }
 
+impl From<&ConfigProposal> for VotingProposalDetailDto {
+    fn from(p: &ConfigProposal) -> Self {
+        Self {
+            hash: hex::encode(p.hash),
+            param_id: p.param.id,
+            param_hash: p.param.hash.map(hex::encode),
+            param_cell_boc: p.param.cell.as_ref().and_then(|c| {
+                write_boc(c).ok().map(|boc| base64::engine::general_purpose::STANDARD.encode(boc))
+            }),
+            is_critical: p.is_critical,
+            expires: p.expires,
+            expires_in: voting_format_expires(p.expires),
+            voters: p.voters.clone(),
+            weight_remaining: p.weight_remaining,
+            vset_id: hex::encode(p.vset_id),
+            rounds_remaining: p.rounds_remaining,
+            wins: p.wins,
+            losses: p.losses,
+        }
+    }
+}
+
 // --- Master wallet ---
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -1001,22 +1023,16 @@ async fn extract_public_key(state: &AppState) -> Option<String> {
 // `config_changed.notify_one()` like CRUD handlers below.
 // ---------------------------------------------------------------------------
 
-/// Default `tick_interval` when the `voting` section is absent (matches `VotingConfig` serde default).
-const VOTING_TICK_INTERVAL_DEFAULT_SECS: u64 = 40;
-
 fn parse_voting_proposal_hash_hex(s: &str) -> Result<[u8; 32], AppError> {
-    let s = s.trim().to_lowercase();
+    let s = s.trim();
     let bytes =
-        hex::decode(&s).map_err(|_| AppError::bad_request("proposal hash must be valid hex"))?;
-    if bytes.len() != 32 {
-        return Err(AppError::bad_request(format!(
+        hex::decode(s).map_err(|_| AppError::bad_request("proposal hash must be valid hex"))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        AppError::bad_request(format!(
             "proposal hash must be 32 bytes (64 hex digits), got {} bytes",
-            bytes.len()
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+            v.len()
+        ))
+    })
 }
 
 fn voting_format_expires(expires: u32) -> String {
@@ -1038,7 +1054,7 @@ fn voting_format_expires(expires: u32) -> String {
     }
 }
 
-fn voting_proposal_row_dto(p: &ConfigProposal, tracked_lower: &[String]) -> VotingProposalRowDto {
+fn row_dto(p: &ConfigProposal, tracked_lower: &[String]) -> VotingProposalRowDto {
     let hash = hex::encode(p.hash);
     let tracked = tracked_lower.iter().any(|t| t == &hash);
     VotingProposalRowDto {
@@ -1053,26 +1069,6 @@ fn voting_proposal_row_dto(p: &ConfigProposal, tracked_lower: &[String]) -> Voti
         wins: p.wins,
         losses: p.losses,
         tracked,
-    }
-}
-
-fn voting_proposal_detail_dto(p: &ConfigProposal) -> VotingProposalDetailDto {
-    VotingProposalDetailDto {
-        hash: hex::encode(p.hash),
-        param_id: p.param.id,
-        param_hash: p.param.hash.map(hex::encode),
-        param_cell_boc: p.param.cell.as_ref().and_then(|c| {
-            write_boc(c).ok().map(|boc| base64::engine::general_purpose::STANDARD.encode(boc))
-        }),
-        is_critical: p.is_critical,
-        expires: p.expires,
-        expires_in: voting_format_expires(p.expires),
-        voters: p.voters.clone(),
-        weight_remaining: p.weight_remaining,
-        vset_id: hex::encode(p.vset_id),
-        rounds_remaining: p.rounds_remaining,
-        wins: p.wins,
-        losses: p.losses,
     }
 }
 
@@ -1093,9 +1089,10 @@ pub async fn v1_voting_config_handler(
         Some(v) => {
             VotingConfigDto { proposals: v.proposals.clone(), tick_interval: v.tick_interval }
         }
-        None => {
-            VotingConfigDto { proposals: vec![], tick_interval: VOTING_TICK_INTERVAL_DEFAULT_SECS }
-        }
+        None => VotingConfigDto {
+            proposals: vec![],
+            tick_interval: VotingConfig::default().tick_interval,
+        },
     };
     axum::Json(VotingConfigResponse { ok: true, result })
 }
@@ -1119,8 +1116,6 @@ pub async fn v1_voting_proposals_list_handler(
         .as_ref()
         .map(|v| v.proposals.iter().map(|h| h.to_lowercase()).collect())
         .unwrap_or_default();
-    drop(cfg);
-
     let rpc = state.runtime_cfg.rpc_client();
     let config_contract = ConfigContractImpl::new(contract_provider!(rpc));
     let proposals = config_contract
@@ -1128,7 +1123,7 @@ pub async fn v1_voting_proposals_list_handler(
         .await
         .map_err(|e| AppError::internal(format!("list_proposals: {e}")))?;
     let result: Vec<VotingProposalRowDto> =
-        proposals.iter().map(|p| voting_proposal_row_dto(p, &tracked_lower)).collect();
+        proposals.iter().map(|p| row_dto(p, &tracked_lower)).collect();
     Ok(axum::Json(VotingProposalsListResponse { ok: true, result }))
 }
 
@@ -1157,7 +1152,7 @@ pub async fn v1_voting_proposals_inspect_handler(
         .await
         .map_err(|e| AppError::internal(format!("get_proposal: {e}")))?
         .ok_or_else(|| AppError::not_found("proposal not found on-chain"))?;
-    let dto = voting_proposal_detail_dto(&proposal);
+    let dto = VotingProposalDetailDto::from(&proposal);
     Ok(axum::Json(VotingProposalDetailResponse { ok: true, result: dto }))
 }
 
@@ -1187,7 +1182,6 @@ pub async fn v1_voting_proposals_add_handler(
         .voting
         .as_ref()
         .is_some_and(|v| v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)));
-    drop(cfg);
     if already {
         return Ok(axum::Json(EntityRefResponse {
             ok: true,
@@ -1211,10 +1205,7 @@ pub async fn v1_voting_proposals_add_handler(
     state
         .runtime_cfg
         .update_and_save(|cfg| {
-            let v = cfg.voting.get_or_insert_with(|| VotingConfig {
-                proposals: vec![],
-                tick_interval: VOTING_TICK_INTERVAL_DEFAULT_SECS,
-            });
+            let v = cfg.voting.get_or_insert_with(VotingConfig::default);
             if !v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)) {
                 v.proposals.push(hash_hex.clone());
             }
@@ -1253,11 +1244,9 @@ pub async fn v1_voting_proposals_rm_handler(
         .is_some_and(|v| v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)));
     if !in_list {
         return Err(AppError::not_found(format!(
-            "proposal '{hash_hex}' is not in the voting tracked list"
+            "proposal {hash_hex} is not in the voting tracked list"
         )));
     }
-    drop(cfg);
-
     state
         .runtime_cfg
         .update_and_save(|cfg| {
@@ -1356,8 +1345,6 @@ pub async fn v1_nodes_rm_handler(
             "cannot remove node '{name}': referenced by a binding"
         )));
     }
-    drop(cfg);
-
     let target = name.clone();
     state
         .runtime_cfg
@@ -1451,8 +1438,6 @@ pub async fn v1_wallets_rm_handler(
             "cannot remove wallet '{name}': referenced by binding for node '{node}'"
         )));
     }
-    drop(cfg);
-
     let target = name.clone();
     state
         .runtime_cfg
@@ -1679,8 +1664,6 @@ pub async fn v1_pools_rm_handler(
             "cannot remove pool '{name}': referenced by binding for node '{node}'"
         )));
     }
-    drop(cfg);
-
     let target = name.clone();
     state
         .runtime_cfg
@@ -1738,8 +1721,6 @@ pub async fn v1_bindings_add_handler(
             )));
         }
     }
-    drop(cfg);
-
     let binding = NodeBinding {
         wallet: req.wallet,
         pool: req.pool,
@@ -1789,8 +1770,6 @@ pub async fn v1_bindings_rm_handler(
             binding.status
         )));
     }
-    drop(cfg);
-
     let target = node.clone();
     state
         .runtime_cfg
@@ -1859,8 +1838,6 @@ pub async fn v1_elections_settings_update_handler(
     if req.reset && req.node.is_none() {
         return Err(AppError::bad_request("reset requires 'node' to be set"));
     }
-    drop(cfg);
-
     // --- Apply all changes in a single update ---
     let policy = req.policy;
     let node = req.node;
@@ -2085,8 +2062,6 @@ pub async fn v1_elections_static_adnl_handler(
     if !cfg.nodes.contains_key(&node_name) {
         return Err(AppError::bad_request(format!("node '{}' not found", node_name)));
     }
-    drop(cfg);
-
     let mut adnl_configs = state.runtime_cfg.node_adnl_configs().await;
     let adnl_config = adnl_configs
         .remove(&node_name)

@@ -12,7 +12,7 @@ use crate::commands::nodectl::{
 };
 use anyhow::Context;
 use colored::Colorize;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{IsTerminal, Write, stdin, stdout};
 
 #[derive(clap::Args, Clone)]
@@ -102,12 +102,7 @@ struct ProposalRow {
 impl VoteLsCmd {
     async fn run(&self, base_url: &str, token: Option<&str>) -> anyhow::Result<()> {
         let body = api_get(base_url, "/v1/voting/proposals", token).await?;
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        let rows: Vec<ProposalRow> = serde_json::from_value(
-            v.get("result")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("voting proposals: missing 'result'"))?,
-        )?;
+        let rows: Vec<ProposalRow> = parse_ok_json_result(&body, "voting proposals")?;
 
         if rows.is_empty() {
             println!("No active proposals");
@@ -187,13 +182,9 @@ struct ProposalDetail {
 
 impl VoteInspectCmd {
     async fn run(&self, base_url: &str, token: Option<&str>) -> anyhow::Result<()> {
-        let h = parse_proposal_hash_hex_normalized(&self.hash)?;
-        let path = format!("/v1/voting/proposals/{h}");
+        let path = format!("/v1/voting/proposals/{}", self.hash.trim());
         let body = api_get(base_url, &path, token).await?;
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        let detail: ProposalDetail = serde_json::from_value(
-            v.get("result").cloned().ok_or_else(|| anyhow::anyhow!("inspect: missing 'result'"))?,
-        )?;
+        let detail: ProposalDetail = parse_ok_json_result(&body, "inspect proposal")?;
 
         match self.format {
             OutputFormat::Json => {
@@ -247,10 +238,11 @@ struct VoteAddCmd {
 impl VoteAddCmd {
     async fn run(&self, base_url: &str, token: Option<&str>) -> anyhow::Result<()> {
         let selected_hash = match &self.hash {
-            Some(h) => parse_proposal_hash_hex_normalized(h)?,
+            Some(h) => h.trim().to_string(),
             None => {
                 require_interactive()?;
-                let rows = fetch_proposal_rows(base_url, token).await?;
+                let body = api_get(base_url, "/v1/voting/proposals", token).await?;
+                let rows: Vec<ProposalRow> = parse_ok_json_result(&body, "voting proposals")?;
                 if rows.is_empty() {
                     anyhow::bail!("no active proposals on-chain");
                 }
@@ -287,13 +279,7 @@ impl VoteRmCmd {
         }
 
         let selected_hash = match &self.hash {
-            Some(h) => {
-                let normalized = parse_proposal_hash_hex_normalized(h)?;
-                if !tracked.iter().any(|t| t.eq_ignore_ascii_case(&normalized)) {
-                    anyhow::bail!("proposal {h} is not in voting config");
-                }
-                normalized
-            }
+            Some(h) => h.trim().to_string(),
             None => {
                 require_interactive()?;
                 select_tracked_proposal(&tracked)?
@@ -310,37 +296,27 @@ impl VoteRmCmd {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-async fn fetch_proposal_rows(
-    base_url: &str,
-    token: Option<&str>,
-) -> anyhow::Result<Vec<ProposalRow>> {
-    let body = api_get(base_url, "/v1/voting/proposals", token).await?;
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    serde_json::from_value(
-        v.get("result")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("voting proposals: missing 'result'"))?,
-    )
-    .context("parse proposal rows")
+/// `{ "ok": true?, "result": T }` — extra fields (e.g. `ok`) are ignored by serde.
+#[derive(Debug, Deserialize)]
+struct ApiOk<T> {
+    result: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct VotingConfigSnapshot {
+    proposals: Vec<String>,
+}
+
+fn parse_ok_json_result<T: DeserializeOwned>(body: &str, ctx: &'static str) -> anyhow::Result<T> {
+    let ApiOk { result } =
+        serde_json::from_str::<ApiOk<T>>(body).with_context(|| format!("parse {ctx}"))?;
+    Ok(result)
 }
 
 async fn fetch_tracked_hashes(base_url: &str, token: Option<&str>) -> anyhow::Result<Vec<String>> {
     let body = api_get(base_url, "/v1/voting/config", token).await?;
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    let arr = v
-        .get("result")
-        .and_then(|r| r.get("proposals"))
-        .and_then(|p| p.as_array())
-        .ok_or_else(|| anyhow::anyhow!("voting config: missing result.proposals"))?;
-    Ok(arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-}
-
-fn parse_proposal_hash_hex_normalized(s: &str) -> anyhow::Result<String> {
-    let bytes = hex::decode(s.trim()).context("invalid hex")?;
-    if bytes.len() != 32 {
-        anyhow::bail!("proposal hash must be 32 bytes, got {}", bytes.len());
-    }
-    Ok(hex::encode(bytes))
+    let snap: VotingConfigSnapshot = parse_ok_json_result(&body, "voting config")?;
+    Ok(snap.proposals)
 }
 
 fn require_interactive() -> anyhow::Result<()> {

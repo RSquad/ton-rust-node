@@ -24,7 +24,8 @@ Phases:
   11. Wait for validator wallets/pools to open, TONCore deposits, top them up
   12. Wait for election participants
   13. Validate REST API: compare nodectl stake data with on-chain elector data;
-      smoke-test voting endpoints (`GET /v1/voting/config`, `GET /v1/voting/proposals`)
+      smoke-test voting: REST GET /v1/voting/config + nodectl vote ls (CLI → GET /v1/voting/proposals).
+      Optionally CREATE_VOTING_PROPOSAL=1 runs Blueprint create-proposal then nodectl vote add before smoke checks.
   14. Observe election rounds (when OBSERVE_ROUNDS > 0)
   15. Summary and exit assertions
 
@@ -41,7 +42,15 @@ Optional env vars:
   TONCORE_MIN_VALIDATOR_STAKE_TON / TONCORE_MIN_VALIDATOR_STAKE_ODD_TON (must differ),
   TONCORE_VALIDATOR_DEPOSIT_TON (per-slot deposit-validator amount in TON),
   BUN_TOPUP_TIMEOUT_SECONDS
-  VOTING_REST_VALIDATE — set to 0 to skip voting REST smoke checks in phase 13 (default: enabled)
+  VOTING_REST_VALIDATE — set to 0 to skip voting smoke checks in phase 13 (default: enabled)
+  CREATE_VOTING_PROPOSAL — set to 1 to run Blueprint create-proposal (config param 15) after stakes check,
+      then nodectl vote add for the new proposal (default: disabled). Needs bun deps (phase 9).
+      Template: test_load_net/scripts/singlehost-config-proposal-p15.json (matches elections zerostate p15 + 1s).
+  VOTING_PROPOSAL_EXPIRES_SECS — expiry window forwarded to create-proposal (default: 86400)
+  BLUEPRINT_WALLET_MNEMONIC — optional; Blueprint --mnemonic requires WALLET_MNEMONIC env even though
+      create-proposal.ts signs with MASTER_WALLET_KEY only. Default is the public BIP39 test vector
+      ("abandon abandon … about"). Override only if your Blueprint/tooling rejects it.
+  BLUEPRINT_WALLET_VERSION — optional mnemonic wallet version for Blueprint (default: v3r2)
   TONCORE_NOMINATOR_LOAD (default 1 for SCENARIO=snp-toncore) — after validator deposit + pool top-up,
     run bun add-nominators-to-pool (default 40× min stake TON; pool.fc op=0 action=100, wc=0 nominators) on one TONCore pool; after 1 election
     transition in phase 14, run withdraw-nominators-from-pool (action 119). Set to 0 to skip.
@@ -138,6 +147,8 @@ class Config:
     toncore_nominator_withdraw_ton:      str  = "0.2"
     toncore_nominator_pool_slot:         int  = 0
     toncore_nominator_load_node:         str  = ""  # empty → node{first_core_node}
+    create_voting_proposal:              bool = False
+    voting_proposal_expires_secs:        int  = 86400
 
     @property
     def snp_count(self) -> int:
@@ -217,6 +228,8 @@ class Config:
             toncore_nominator_withdraw_ton  = os.environ.get("TONCORE_NOMINATOR_WITHDRAW_TON", "0.2"),
             toncore_nominator_pool_slot     = int(os.environ.get("TONCORE_NOMINATOR_POOL_SLOT", "0")),
             toncore_nominator_load_node     = os.environ.get("TONCORE_NOMINATOR_LOAD_NODE", "").strip(),
+            create_voting_proposal          = _env_bool("CREATE_VOTING_PROPOSAL", False),
+            voting_proposal_expires_secs    = int(os.environ.get("VOTING_PROPOSAL_EXPIRES_SECS", "86400")),
         )
         cfg._validate()
         return cfg
@@ -420,8 +433,8 @@ class Bootstrap:
         return result.stdout
 
     def _nodectl_rest_base_url(self) -> str:
-        """HTTP URL for the nodectl control plane (for localhost curls against ``http.bind``)."""
-        cfg  = json.loads(self.paths.nodectl_config.read_text())
+        """HTTP URL for the nodectl control plane (from ``http.bind`` in nodectl-config.json)."""
+        cfg = json.loads(self.paths.nodectl_config.read_text())
         bind = str(cfg.get("http", {}).get("bind", "127.0.0.1:8080"))
         if bind.startswith("["):
             bracket_end = bind.find("]")
@@ -447,6 +460,7 @@ class Bootstrap:
             raise BootstrapError("NODECTL_API_TOKEN missing for REST GET " + path)
         url = self._nodectl_rest_base_url().rstrip("/") + path
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        body = ""
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 body = resp.read().decode(errors="replace")
@@ -457,16 +471,19 @@ class Bootstrap:
         except urllib.error.URLError as e:
             self._fail(f"REST GET {path} ({url}) failed: {e.reason}")
         except json.JSONDecodeError as e:
-            self._fail(f"REST GET {path} ({url}) returned invalid JSON: {e.msg} at pos {e.pos}; body={body[:800]}")
+            self._fail(
+                f"REST GET {path} ({url}) returned invalid JSON: {e.msg} at pos {e.pos}; body={body[:800]}"
+            )
 
-    def _validate_voting_rest(self) -> None:
-        """Smoke-test voting read endpoints (nominator+ JWT; we use the operator token from phase 8)."""
+    def _validate_voting_smoke(self) -> None:
+        """REST: voting config snapshot; CLI: vote ls (thin client over GET /v1/voting/proposals)."""
         if os.environ.get("VOTING_REST_VALIDATE", "1").strip().lower() in ("0", "false", "no"):
-            self.log.info("  VOTING_REST_VALIDATE disabled — skip voting REST checks")
+            self.log.info("  VOTING_REST_VALIDATE disabled — skip voting smoke checks")
             return
         if not os.environ.get("NODECTL_API_TOKEN"):
-            self.log.warn("  No NODECTL_API_TOKEN — skip voting REST checks")
+            self.log.warn("  No NODECTL_API_TOKEN — skip voting smoke checks")
             return
+
         self.log.info("  Voting REST: GET /v1/voting/config …")
         cfg_body = self._nodectl_rest_get_json("/v1/voting/config")
         if not cfg_body.get("ok"):
@@ -476,26 +493,149 @@ class Bootstrap:
             self._fail("/v1/voting/config: missing result.tick_interval")
         if "proposals" not in vres or not isinstance(vres["proposals"], list):
             self._fail("/v1/voting/config: result.proposals must be a list")
-        self.log.info("  Voting REST: GET /v1/voting/proposals …")
-        pr_body = self._nodectl_rest_get_json("/v1/voting/proposals")
-        if not pr_body.get("ok"):
-            self._fail(f"/v1/voting/proposals: unexpected body {pr_body!r}")
-        rows = pr_body.get("result")
-        if not isinstance(rows, list):
-            self._fail("/v1/voting/proposals: result must be a list")
-        n = len(rows)
-        self.log.info(f"  Voting REST: OK (tracked snapshot + {n} active proposal row(s))")
 
-        self.log.info("  Voting CLI smoke: nodectl vote ls …")
+        self.log.info("  Voting CLI: nodectl vote ls --format json …")
         result = subprocess.run(
-            [str(self.paths.nodectl_bin), "vote", "ls"],
+            [str(self.paths.nodectl_bin), "vote", "ls", "--format", "json"],
             capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+            env=os.environ,
         )
         if result.returncode != 0:
             self._fail(
-                f"nodectl vote ls failed (exit {result.returncode})"
+                f"nodectl vote ls --format json failed (exit {result.returncode})"
                 + (f": {result.stderr.strip()}" if result.stderr.strip() else "")
             )
+        raw = result.stdout.strip()
+        if raw == "No active proposals":
+            rows = []
+        else:
+            try:
+                rows = json.loads(raw)
+            except json.JSONDecodeError as e:
+                self._fail(f"vote ls JSON: {e}; stdout={raw[:800]!r}")
+        if not isinstance(rows, list):
+            self._fail("vote ls: expected JSON array (or empty list when no proposals)")
+        n = len(rows)
+        self.log.info(f"  Voting smoke: OK (REST config + CLI ls → {n} proposal row(s))")
+
+        self.log.info("  Voting CLI (table): nodectl vote ls …")
+        self._nctl("vote", "ls")
+
+        if self.cfg.create_voting_proposal and n < 1:
+            self._fail("CREATE_VOTING_PROPOSAL enabled but vote ls shows no on-chain proposals")
+
+    def _maybe_create_onchain_voting_proposal(self) -> None:
+        """Optional: submit a config-proposal via Blueprint and track it with nodectl vote add."""
+        if not self.cfg.create_voting_proposal:
+            return
+        template = self.paths.load_net_dir / "scripts" / "singlehost-config-proposal-p15.json"
+        if not template.is_file():
+            self._fail(f"CREATE_VOTING_PROPOSAL: missing template {template}")
+        params_dst = self.paths.load_net_dir / "config-params.json"
+        rpc_url = self.cfg.http_api_url.rstrip("/") + "/jsonRPC"
+        mk = os.environ.get("MASTER_WALLET_KEY", "").strip()
+        if not mk:
+            self._fail("CREATE_VOTING_PROPOSAL requires MASTER_WALLET_KEY")
+
+        self.log.info("  CREATE_VOTING_PROPOSAL: Blueprint create-proposal (param p15) …")
+        # Blueprint CLI always picks a "send provider"; create-proposal.ts ignores it and signs with
+        # MASTER_WALLET_KEY. Mnemonic mode requires these env vars even though sends use the hex key.
+        _dummy_mnemonic = (
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        )
+        env = {
+            **os.environ,
+            "MASTER_WALLET_KEY": mk,
+            "EXPIRES_IN_SECS": str(self.cfg.voting_proposal_expires_secs),
+            "WALLET_VERSION": os.environ.get("BLUEPRINT_WALLET_VERSION", "v3r2"),
+            "WALLET_MNEMONIC": os.environ.get("BLUEPRINT_WALLET_MNEMONIC", _dummy_mnemonic),
+        }
+        try:
+            shutil.copyfile(template, params_dst)
+            try:
+                proc = subprocess.run(
+                    [
+                        "bun", "blueprint", "run", "create-proposal",
+                        "--custom", rpc_url,
+                        "--mnemonic",
+                    ],
+                    cwd=self.paths.load_net_dir,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=180,
+                    env=env,
+                )
+            finally:
+                params_dst.unlink(missing_ok=True)
+
+            if proc.returncode != 0:
+                self._fail(
+                    "CREATE_VOTING_PROPOSAL: blueprint create-proposal failed "
+                    f"(exit {proc.returncode})\n"
+                    f"stdout:\n{proc.stdout[-4000:]}\nstderr:\n{proc.stderr[-4000:]}"
+                )
+            tail = (proc.stdout + "\n" + proc.stderr)[-2500:]
+            self.log.info(f"  create-proposal output (tail):\n{tail}")
+
+            prop_hash = self._wait_vote_ls_first_hash()
+            self.log.info(f"  Tracking proposal via nodectl vote add --hash {prop_hash[:24]}…")
+            va = subprocess.run(
+                [str(self.paths.nodectl_bin), "vote", "add", "--hash", prop_hash],
+                cwd=str(self.paths.tmp_dir),
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=60,
+                env=os.environ,
+            )
+            if va.returncode != 0:
+                self._fail(
+                    f"vote add failed (exit {va.returncode}): "
+                    f"{(va.stderr or va.stdout or '').strip()[-1200:]}"
+                )
+
+            cfg_body = self._nodectl_rest_get_json("/v1/voting/config")
+            tracked = (cfg_body.get("result") or {}).get("proposals") or []
+            want = prop_hash.strip().lower()
+            if not any(str(h).strip().lower() == want for h in tracked):
+                self._fail(f"vote add OK but /v1/voting/config does not list hash {prop_hash}")
+            self.log.info("  CREATE_VOTING_PROPOSAL: proposal on-chain and tracked in nodectl config")
+        except BootstrapError:
+            raise
+        except Exception as e:
+            self._fail(f"CREATE_VOTING_PROPOSAL: {type(e).__name__}: {e}")
+
+    def _wait_vote_ls_first_hash(self, timeout_sec: int = 120) -> str:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            result = subprocess.run(
+                [str(self.paths.nodectl_bin), "vote", "ls", "--format", "json"],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=35,
+                env=os.environ,
+            )
+            if result.returncode != 0:
+                self.log.warn(f"vote ls (wait proposal) exit {result.returncode}; retry…")
+                time.sleep(4)
+                continue
+            raw = result.stdout.strip()
+            if raw == "No active proposals":
+                time.sleep(4)
+                continue
+            try:
+                rows = json.loads(raw)
+            except json.JSONDecodeError:
+                time.sleep(4)
+                continue
+            if isinstance(rows, list) and rows:
+                h = rows[0].get("hash")
+                if isinstance(h, str) and len(h.strip()) >= 64:
+                    return h.strip()
+            time.sleep(4)
+        self._fail(f"timed out ({timeout_sec}s) waiting for vote ls to show an on-chain proposal")
 
     def _json_rpc(self, method: str, params: Optional[dict] = None) -> dict:
         url     = self.cfg.http_api_url.rstrip("/") + "/jsonRPC"
@@ -1195,11 +1335,13 @@ class Bootstrap:
         elector_map = self._fetch_elector_stake_map()
         if elector_map is None:
             self.log.warn("  Skipping elector vs API stake comparison (elector fetch failed)")
-            self._validate_voting_rest()
+            self._maybe_create_onchain_voting_proposal()
+            self._validate_voting_smoke()
             return
 
         self._compare_stakes(elections, elector_map)
-        self._validate_voting_rest()
+        self._maybe_create_onchain_voting_proposal()
+        self._validate_voting_smoke()
 
     def _fetch_nodectl_elections(self) -> Optional[dict]:
         result = subprocess.run(
@@ -1423,6 +1565,10 @@ def main() -> None:
         )
     if cfg.stake_policy:
         log.info(f"  STAKE_POLICY={cfg.stake_policy}")
+    if cfg.create_voting_proposal:
+        log.info(
+            f"  CREATE_VOTING_PROPOSAL=1, VOTING_PROPOSAL_EXPIRES_SECS={cfg.voting_proposal_expires_secs}"
+        )
     if cfg.toncore_nominator_scenario_enabled:
         log.info(
             f"  TONCore nominator load: {cfg.toncore_nominator_count}× "
