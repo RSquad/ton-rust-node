@@ -80,6 +80,7 @@ fn empty_app_cfg() -> AppConfig {
         voting: None,
         master_wallet: None,
         tick_interval: 30,
+        automation: Default::default(),
         log: Some(Default::default()),
     }
 }

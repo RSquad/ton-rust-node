@@ -496,13 +496,13 @@ impl ContractsMonitor {
                         "[{}] ensure_pool_validator_sets_updated: no validator wallet in config (skip TonCore pools)",
                         node_id
                     );
+                    all_updated = false;
                     continue;
                 }
             };
 
             let wallet_addr = validator_wallet.address().await?;
-            let mut seqno =
-                provider.get_method(wallet_addr.to_string(), "seqno", vec![]).await?.i64(0)?;
+            let mut seqno: Option<i64> = None;
 
             for pool in pool_binding.inner_pools() {
                 let pool_addr = pool.address().await?;
@@ -528,6 +528,14 @@ impl ContractsMonitor {
                     continue;
                 }
 
+                let current_seqno = match seqno {
+                    Some(s) => s,
+                    None => provider
+                        .get_method(wallet_addr.to_string(), "seqno", vec![])
+                        .await?
+                        .i64(0)?,
+                };
+
                 tracing::info!(
                     target: "contracts",
                     "[{}] update_validator_set: pool={}, state={}, vsc_count={}, from_wallet={}",
@@ -545,13 +553,13 @@ impl ContractsMonitor {
                         POOL_OP_GAS,
                         body,
                         true,
-                        Some(u32::try_from(seqno)?),
+                        Some(u32::try_from(current_seqno)?),
                         None,
                         None,
                     )
                     .await?;
                 self.broadcast(&msg).await?;
-                seqno += 1;
+                seqno = Some(current_seqno + 1);
                 all_updated = false;
             }
         }

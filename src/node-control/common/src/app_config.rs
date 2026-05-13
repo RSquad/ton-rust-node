@@ -886,7 +886,7 @@ pub struct AppConfig {
     /// Default interval for all tasks in seconds
     #[serde(default = "default_tick_interval")]
     pub tick_interval: u64,
-    #[serde(default, alias = "contracts_automation")]
+    #[serde(default)]
     pub automation: ContractsAutomationConfig,
     pub log: Option<LogConfig>,
 }
@@ -1431,26 +1431,5 @@ mod tests {
         assert_eq!(c.wallet.topup, 10_000_000_000);
         assert_eq!(c.wallet.threshold, 5_000_000_000);
         assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn app_config_deserializes_legacy_root_key_contracts_automation() {
-        let json = r#"{
-            "nodes": {},
-            "wallets": {},
-            "pools": {},
-            "bindings": {},
-            "ton_http_api": {
-                "urls": ["http://127.0.0.1:3301/"],
-                "api_key": null
-            },
-            "http": {},
-            "tick_interval": 40,
-            "contracts_automation": { "tick_interval_sec": 99 }
-        }"#;
-        let mut cfg: AppConfig = serde_json::from_str(json).unwrap();
-        cfg.ton_http_api.normalize();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.automation.tick_interval_sec, 99);
     }
 }

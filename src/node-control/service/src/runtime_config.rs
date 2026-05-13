@@ -574,16 +574,7 @@ impl RuntimeConfig for RuntimeConfigStore {
     }
 
     fn update_and_save(&self, f: Box<dyn FnOnce(&mut AppConfig) + Send>) -> anyhow::Result<()> {
-        match RuntimeConfigStore::try_update_and_save(self, move |cfg| {
-            f(cfg);
-            Ok(())
-        }) {
-            Ok(()) => Ok(()),
-            Err(TryUpdateSaveError::Rejected(msg)) => Err(anyhow::anyhow!(
-                "unexpected rejection from infallible update_and_save closure: {msg}"
-            )),
-            Err(TryUpdateSaveError::Persist(e)) => Err(e),
-        }
+        RuntimeConfigStore::update_and_save(self, f)
     }
 }
 
