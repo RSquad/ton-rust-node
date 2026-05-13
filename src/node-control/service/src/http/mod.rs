@@ -16,3 +16,5 @@ pub use http_server_task::run;
 mod auth_tests;
 #[cfg(test)]
 mod config_handlers_tests;
+#[cfg(test)]
+mod entity_crud_handlers_tests;
