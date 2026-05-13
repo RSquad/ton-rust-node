@@ -24,6 +24,8 @@ use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use tower::ServiceExt;
 
+const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
+
 struct Noop;
 
 #[async_trait::async_trait]
@@ -37,6 +39,51 @@ impl ServiceTask for Noop {
         let _ = c.changed().await;
         Ok(())
     }
+}
+
+async fn json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn get(uri: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn get_bearer(uri: &str, token: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn post_json(uri: &str, body: &impl serde::Serialize) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap()
+}
+
+fn post_bearer(uri: &str, body: &impl serde::Serialize, token: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap()
+}
+
+fn delete_bearer(uri: &str, token: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn hash_test_password(password: &[u8]) -> String {
@@ -109,8 +156,6 @@ fn elections_task(rt: Arc<RuntimeConfigStore>) -> Arc<TaskController> {
     Arc::new(TaskController::new("elections", Noop, rt))
 }
 
-const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
-
 async fn test_jwt_auth() -> Arc<JwtAuth> {
     Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap())
 }
@@ -146,40 +191,67 @@ fn app(st: AppState) -> axum::Router {
     routes(false, st)
 }
 
-async fn json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+/// Method + path + optional JSON body. Used by the role-gating tables below.
+fn entity_crud_routes() -> Vec<(&'static str, &'static str, Option<serde_json::Value>)> {
+    let pubkey = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+    vec![
+        (
+            "POST",
+            "/v1/nodes",
+            Some(serde_json::json!({
+                "name": "n",
+                "control_server_endpoint": "127.0.0.1:1",
+                "control_server_pubkey": pubkey,
+                "control_client_secret": "s",
+            })),
+        ),
+        ("DELETE", "/v1/nodes/any", None),
+        (
+            "POST",
+            "/v1/wallets",
+            Some(serde_json::json!({
+                "name": "w",
+                "secret": "sec",
+                "version": "V4R2",
+                "subwallet_id": 0,
+                "workchain": -1,
+            })),
+        ),
+        ("DELETE", "/v1/wallets/any", None),
+        (
+            "POST",
+            "/v1/pools",
+            Some(serde_json::json!({
+                "name": "p",
+                "address": "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea",
+                "owner": serde_json::Value::Null,
+            })),
+        ),
+        ("DELETE", "/v1/pools/any", None),
+        (
+            "POST",
+            "/v1/bindings",
+            Some(serde_json::json!({
+                "node": "n",
+                "wallet": "w",
+                "pool": serde_json::Value::Null,
+            })),
+        ),
+        ("DELETE", "/v1/bindings/any", None),
+    ]
 }
 
-fn get(uri: &str) -> axum::http::Request<Body> {
-    axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()
-}
-
-fn get_bearer(uri: &str, token: &str) -> axum::http::Request<Body> {
-    axum::http::Request::builder()
-        .uri(uri)
-        .header("Authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
-fn post_json(uri: &str, body: &impl serde::Serialize) -> axum::http::Request<Body> {
-    axum::http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(body).unwrap()))
-        .unwrap()
-}
-
-fn post_bearer(uri: &str, body: &impl serde::Serialize, token: &str) -> axum::http::Request<Body> {
-    axum::http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header("Authorization", format!("Bearer {token}"))
-        .body(Body::from(serde_json::to_string(body).unwrap()))
-        .unwrap()
+fn request_bearer(
+    method: &str,
+    uri: &str,
+    body: Option<&serde_json::Value>,
+    token: &str,
+) -> axum::http::Request<Body> {
+    match (method, body) {
+        ("POST", Some(b)) => post_bearer(uri, b, token),
+        ("DELETE", None) => delete_bearer(uri, token),
+        _ => panic!("unsupported request: method={method} body={}", body.is_some()),
+    }
 }
 
 // --- Login flow ---
@@ -346,6 +418,35 @@ async fn nominator_forbidden_on_operator_route() {
     let body = serde_json::json!({ "policy": "minimum" });
     let resp = app(st).oneshot(post_bearer("/v1/elections/settings", &body, &tok)).await.unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn nominator_forbidden_on_entity_crud_routes() {
+    let st = state_with_auth().await;
+    let tok = st.jwt_auth.generate("nom", Role::Nominator, 3600).unwrap().0;
+    let app = app(st);
+
+    for (method, path, body) in entity_crud_routes() {
+        let req = request_bearer(method, path, body.as_ref(), &tok);
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        assert_eq!(status, 403, "endpoint {method} {path} leaked to nominator");
+    }
+}
+
+#[tokio::test]
+async fn operator_allowed_on_entity_crud_routes() {
+    // Auth-gate check: every entity-CRUD route must let an operator token through.
+    // The handler may then return 200/400/404 depending on state — we only care
+    // that the role middleware does not return 403.
+    let st = state_with_auth().await;
+    let tok = st.jwt_auth.generate("op", Role::Operator, 3600).unwrap().0;
+    let app = app(st);
+
+    for (method, path, body) in entity_crud_routes() {
+        let req = request_bearer(method, path, body.as_ref(), &tok);
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        assert_ne!(status, 403, "endpoint {method} {path} blocked operator (status={status})");
+    }
 }
 
 #[tokio::test]
