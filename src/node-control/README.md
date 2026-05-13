@@ -550,7 +550,7 @@ nodectl config log set --level warn --max-size-mb 100 --max-files 5
 
 #### `config elections`
 
-Manage elections configuration, including stake policies, tick intervals, AdaptiveSplit50 timing fractions, and per-binding election participation.
+Manage elections configuration, including stake policies, tick intervals, AdaptiveSplit50 wait-window fractions (`config elections wait-pct`), and per-binding election participation.
 
 ##### `config elections show`
 
@@ -619,28 +619,25 @@ Set the maximum stake factor for elections. The value must be between **1.0** an
 nodectl config elections max-factor 2.5
 ```
 
-##### `config elections adaptive-sleep-period-pct`
+##### `config elections wait-pct`
 
-Set **AdaptiveSplit50** minimum wait as a fraction of election duration. Stored in config as `sleep_period_pct`. Value must be in **[0.0, 1.0]** and must not exceed the current `waiting_period_pct` (raise the waiting fraction first if needed).
+Set the **AdaptiveSplit50 staking window**: earliest stake submission and latest deadline for waiting on peers (fractions of the election duration, **[0.0, 1.0]**). These map to `sleep_period_pct` (`--min`) and `waiting_period_pct` (`--max`) in config.
 
-| Argument | Description |
-|----------|-------------|
-| `<VALUE>` | Fraction in `[0.0, 1.0]` |
+They apply **only** when the stake policy is **adaptive_split50**; for `minimum`, `split50`, and `fixed` the values are stored but unused.
 
-```bash
-nodectl config elections adaptive-sleep-period-pct 0.15
-```
+The service merges with current settings and validates the pair (**min ≤ max**) on **each** update — partial updates are fine (`--min` only, `--max` only, or both).
 
-##### `config elections adaptive-waiting-period-pct`
+| Flag | Config field | Description |
+|------|----------------|-------------|
+| `--min <FRAC>` | `sleep_period_pct` | Earliest fraction at which staking may proceed |
+| `--max <FRAC>` | `waiting_period_pct` | Latest fraction for waiting on peers |
 
-Set **AdaptiveSplit50** maximum wait for enough participants as a fraction of election duration. Stored in config as `waiting_period_pct`. Value must be in **[0.0, 1.0]** and must be **≥** the current `sleep_period_pct`.
-
-| Argument | Description |
-|----------|-------------|
-| `<VALUE>` | Fraction in `[0.0, 1.0]` |
+At least one flag is required. Run `nodectl config elections wait-pct --help` for full semantics.
 
 ```bash
-nodectl config elections adaptive-waiting-period-pct 0.45
+nodectl config elections wait-pct --min 0.15 --max 0.45
+nodectl config elections wait-pct --min 0.15
+nodectl config elections wait-pct --max 0.45
 ```
 
 ##### `config elections enable`
@@ -2120,8 +2117,7 @@ nodectl config elections tick-interval 60
 nodectl config elections max-factor 2.5
 
 # AdaptiveSplit50 timing (fractions of election duration, [0.0, 1.0])
-nodectl config elections adaptive-sleep-period-pct 0.15
-nodectl config elections adaptive-waiting-period-pct 0.45
+nodectl config elections wait-pct --min 0.15 --max 0.45
 ```
 
 ### Authentication Setup

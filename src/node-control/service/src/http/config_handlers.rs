@@ -75,6 +75,18 @@ pub struct WalletsResponse {
 
 // --- Pools ---
 
+/// Source of deploy-style pool parameters in [`TonCorePoolSlotDto`] (`validator_share`,
+/// stake thresholds). Live counters (`nominators_count`, `validator_amount`, …) are only
+/// populated from chain when RPC succeeds.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TonCorePoolSlotDataSource {
+    Chain,
+    Config,
+}
+
 /// Per-slot data for a TONCore nominator pool (one of two physical contracts).
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct TonCorePoolSlotDto {
@@ -90,6 +102,9 @@ pub struct TonCorePoolSlotDto {
     /// On-chain balance in nanotons.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<u64>,
+    /// Whether deploy-style fields came from `get_pool_data` or from local config merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_source: Option<TonCorePoolSlotDataSource>,
     /// Validator reward share in basis points.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validator_share: Option<u16>,
@@ -681,18 +696,17 @@ fn merge_toncore_slot_config_fallbacks(dto: &mut TonCorePoolSlotDto, slot_cfg: &
     let Some(p) = slot_cfg.params.as_ref() else {
         return;
     };
-    if dto.validator_share.is_none() {
-        dto.validator_share = Some(p.validator_share);
-    }
-    if dto.max_nominators.is_none() {
-        dto.max_nominators = Some(p.max_nominators);
-    }
-    if dto.min_validator_stake.is_none() {
-        dto.min_validator_stake = Some(p.min_validator_stake);
-    }
-    if dto.min_nominator_stake.is_none() {
-        dto.min_nominator_stake = Some(p.min_nominator_stake);
-    }
+    dto.validator_share.get_or_insert(p.validator_share);
+    dto.max_nominators.get_or_insert(p.max_nominators);
+    dto.min_validator_stake.get_or_insert(p.min_validator_stake);
+    dto.min_nominator_stake.get_or_insert(p.min_nominator_stake);
+}
+
+fn toncore_slot_deploy_params_present(dto: &TonCorePoolSlotDto) -> bool {
+    dto.validator_share.is_some()
+        || dto.max_nominators.is_some()
+        || dto.min_validator_stake.is_some()
+        || dto.min_nominator_stake.is_some()
 }
 
 /// Fetch on-chain data for a single TONCore pool slot.
@@ -707,10 +721,11 @@ fn merge_toncore_slot_config_fallbacks(dto: &mut TonCorePoolSlotDto, slot_cfg: &
 /// parameters. RPC failures are encoded into the slot DTO so a single
 /// unreachable slot does not break the whole `/v1/pools` response.
 ///
-/// Deploy parameters from `slot_cfg.params` are merged only for non-active
-/// accounts (undeployed/uninitialized/error). For active accounts we trust
-/// `get_pool_data`; if it fails, on-chain fields stay empty to avoid showing
-/// potentially stale local config as if it were on-chain state.
+/// Deploy parameters from `slot_cfg.params` are merged whenever those DTO
+/// fields are still unset (`get_or_insert`), including active accounts where
+/// `get_pool_data` failed, so operators still see config defaults. The
+/// [`TonCorePoolSlotDto::data_source`] field records whether deploy-style fields
+/// ultimately came from chain (`get_pool_data`) or from config.
 async fn fetch_toncore_slot_dto(
     rpc_client: Arc<ClientJsonRpc>,
     slot_idx: usize,
@@ -726,70 +741,89 @@ async fn fetch_toncore_slot_dto(
 
     let address_str = addr_opt.as_ref().map(|a| a.to_string()).or_else(|| slot_cfg.address.clone());
 
-    let mut dto = match &addr_opt {
-        None => TonCorePoolSlotDto {
-            slot: slot_name.to_string(),
-            address: address_str,
-            state: "not deployed".to_string(),
-            ..Default::default()
-        },
-        Some(addr) => match rpc_client.get_address_information(addr).await {
-            Ok(info) => {
-                let state_str = match info.state {
-                    AccountState::Uninitialized => "not deployed".to_string(),
-                    s => s.to_string(),
-                };
+    let (mut dto, addr_for_active): (TonCorePoolSlotDto, Option<MsgAddressInt>) =
+        match addr_opt.as_ref() {
+            None => (
                 TonCorePoolSlotDto {
                     slot: slot_name.to_string(),
                     address: address_str,
-                    state: state_str,
-                    balance: Some(info.balance),
+                    state: "not deployed".to_string(),
                     ..Default::default()
+                },
+                None,
+            ),
+            Some(addr) => match rpc_client.get_address_information(addr).await {
+                Ok(info) => {
+                    let account_state = info.state;
+                    let addr_for_active =
+                        matches!(account_state, AccountState::Active).then(|| addr.clone());
+                    let state_str = match account_state {
+                        AccountState::Uninitialized => "not deployed".to_string(),
+                        s => s.to_string(),
+                    };
+                    (
+                        TonCorePoolSlotDto {
+                            slot: slot_name.to_string(),
+                            address: address_str,
+                            state: state_str,
+                            balance: Some(info.balance),
+                            ..Default::default()
+                        },
+                        addr_for_active,
+                    )
                 }
-            }
-            Err(_) => TonCorePoolSlotDto {
-                slot: slot_name.to_string(),
-                address: address_str,
-                state: "error".to_string(),
-                ..Default::default()
+                Err(_) => (
+                    TonCorePoolSlotDto {
+                        slot: slot_name.to_string(),
+                        address: address_str,
+                        state: "error".to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                ),
             },
-        },
-    };
+        };
 
-    let merge_fallback = dto.state != "active";
-    if dto.state == "active" {
-        if let Some(addr) = addr_opt {
-            let wrapper = cached.unwrap_or_else(|| {
-                Arc::new(TonCoreNominatorWrapper::new(contract_provider!(rpc_client.clone()), addr))
-                    as Arc<dyn NominatorWrapper>
-            });
-            match wrapper.get_pool_data().await {
-                Ok(d) => {
-                    dto.validator_share = Some(d.pool_config.validator_reward_share);
-                    dto.max_nominators = Some(d.pool_config.max_nominators_count);
-                    dto.min_validator_stake = Some(d.pool_config.min_validator_stake);
-                    dto.min_nominator_stake = Some(d.pool_config.nominator_stake_threshold);
-                    dto.nominators_count = Some(d.nominators_count);
-                    dto.stake_amount_sent = Some(d.stake_amount_sent);
-                    dto.validator_amount = Some(d.validator_amount);
-                    dto.pool_state = Some(d.state);
-                    dto.last_election_id = Some(d.stake_at);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        slot = slot_name,
-                        address = dto.address.as_deref().unwrap_or("-"),
-                        error = %e,
-                        "get_pool_data failed on active account — on-chain fields will be empty",
-                    );
-                }
+    let mut deploy_params_from_chain = false;
+    if let Some(addr) = addr_for_active {
+        let wrapper = cached.unwrap_or_else(|| {
+            Arc::new(TonCoreNominatorWrapper::new(contract_provider!(rpc_client.clone()), addr))
+                as Arc<dyn NominatorWrapper>
+        });
+        match wrapper.get_pool_data().await {
+            Ok(d) => {
+                dto.validator_share = Some(d.pool_config.validator_reward_share);
+                dto.max_nominators = Some(d.pool_config.max_nominators_count);
+                dto.min_validator_stake = Some(d.pool_config.min_validator_stake);
+                dto.min_nominator_stake = Some(d.pool_config.nominator_stake_threshold);
+                dto.nominators_count = Some(d.nominators_count);
+                dto.stake_amount_sent = Some(d.stake_amount_sent);
+                dto.validator_amount = Some(d.validator_amount);
+                dto.pool_state = Some(d.state);
+                dto.last_election_id = Some(d.stake_at);
+                deploy_params_from_chain = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slot = slot_name,
+                    address = dto.address.as_deref().unwrap_or("-"),
+                    error = %e,
+                    "get_pool_data failed on active account — filling deploy params from config when available",
+                );
             }
         }
     }
 
-    if merge_fallback {
-        merge_toncore_slot_config_fallbacks(&mut dto, &slot_cfg);
-    }
+    merge_toncore_slot_config_fallbacks(&mut dto, &slot_cfg);
+
+    dto.data_source = if deploy_params_from_chain {
+        Some(TonCorePoolSlotDataSource::Chain)
+    } else if toncore_slot_deploy_params_present(&dto) {
+        Some(TonCorePoolSlotDataSource::Config)
+    } else {
+        None
+    };
+
     dto
 }
 

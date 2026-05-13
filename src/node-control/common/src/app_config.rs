@@ -508,13 +508,13 @@ fn default_tick_interval() -> u64 {
     40
 }
 
-/// Default `waiting_period_pct` for [`ElectionsConfig`] and API DTOs that omit the field.
-pub fn default_waiting_pct() -> f64 {
+/// Default `waiting_period_pct` when the field is omitted from serialized [`ElectionsConfig`].
+fn default_waiting_pct() -> f64 {
     0.4
 }
 
-/// Default `sleep_period_pct` for [`ElectionsConfig`] and API DTOs that omit the field.
-pub fn default_sleep_pct() -> f64 {
+/// Default `sleep_period_pct` when the field is omitted from serialized [`ElectionsConfig`].
+fn default_sleep_pct() -> f64 {
     0.2
 }
 
