@@ -46,7 +46,10 @@ Optional env vars:
   CREATE_VOTING_PROPOSAL — set to 1 to run Blueprint create-proposal (config param 15) after stakes check,
       then nodectl vote add for the new proposal (default: disabled). Needs bun deps (phase 9).
       Template: test_load_net/scripts/singlehost-config-proposal-p15.json (matches elections zerostate p15 + 1s).
-  VOTING_PROPOSAL_EXPIRES_SECS — expiry window forwarded to create-proposal (default: 86400)
+  VOTING_PROPOSAL_EXPIRES_SECS — expiry (seconds) forwarded to create-proposal as EXPIRES_IN_SECS.
+      For critical proposals the chain requires expiresIn ≥ config minStoreSec (~5_000_000s on default
+      singlehost). When CREATE_VOTING_PROPOSAL=1 and this var is unset, the bootstrap uses a safe default
+      (~5_100_000); otherwise default is 86400 (unused unless you set CREATE_VOTING_PROPOSAL manually).
   BLUEPRINT_WALLET_MNEMONIC — optional; Blueprint --mnemonic requires WALLET_MNEMONIC env even though
       create-proposal.ts signs with MASTER_WALLET_KEY only. Default is the public BIP39 test vector
       ("abandon abandon … about"). Override only if your Blueprint/tooling rejects it.
@@ -81,6 +84,9 @@ from typing import Optional
 # ── Constants ──────────────────────────────────────────────────────────────────
 ELECTOR_ADDR    = "-1:3333333333333333333333333333333333333333333333333333333333333333"
 WALLET_VERSIONS = ["V1R3", "V3R2", "V4R2", "V5R1", "V3R2", "V3R2"]
+# Config param 11 `minStoreSec` for *critical* proposals on default singlehost zerostate is 5_000_000.
+# create-proposal calls proposal_storage_price(expiresIn); price < 0 if expiresIn < minStoreSec.
+_DEFAULT_CREATE_VOTING_PROPOSAL_EXPIRES_SEC = 5_100_000
 
 _STRIP_ANSI_CSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -191,6 +197,13 @@ class Config:
             return v.strip().lower() in ("1", "true", "yes")
 
         nom_load_default = scenario == "snp-toncore"
+        create_vp = _env_bool("CREATE_VOTING_PROPOSAL", False)
+        expires_raw = os.environ.get("VOTING_PROPOSAL_EXPIRES_SECS")
+        if expires_raw is None:
+            voting_expires = _DEFAULT_CREATE_VOTING_PROPOSAL_EXPIRES_SEC if create_vp else 86400
+        else:
+            voting_expires = int(expires_raw)
+
         cfg = cls(
             print_sensitive                 = os.environ.get("PRINT_SENSITIVE", "1") in ("1", "true"),
             scenario                        = scenario,
@@ -228,8 +241,8 @@ class Config:
             toncore_nominator_withdraw_ton  = os.environ.get("TONCORE_NOMINATOR_WITHDRAW_TON", "0.2"),
             toncore_nominator_pool_slot     = int(os.environ.get("TONCORE_NOMINATOR_POOL_SLOT", "0")),
             toncore_nominator_load_node     = os.environ.get("TONCORE_NOMINATOR_LOAD_NODE", "").strip(),
-            create_voting_proposal          = _env_bool("CREATE_VOTING_PROPOSAL", False),
-            voting_proposal_expires_secs    = int(os.environ.get("VOTING_PROPOSAL_EXPIRES_SECS", "86400")),
+            create_voting_proposal          = create_vp,
+            voting_proposal_expires_secs    = voting_expires,
         )
         cfg._validate()
         return cfg
