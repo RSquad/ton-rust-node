@@ -74,7 +74,7 @@ pub async fn run_with_config(
         "contracts",
         Arc::new(TaskController::new(
             "contracts",
-            ContractsTask::new(runtime_cfg.clone(), store.clone()),
+            ContractsTask::new(runtime_cfg.clone()),
             runtime_cfg.clone(),
         )),
     );

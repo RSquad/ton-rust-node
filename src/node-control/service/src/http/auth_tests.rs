@@ -104,6 +104,7 @@ fn app_cfg_with_auth(auth: AuthConfig) -> Arc<common::app_config::AppConfig> {
         voting: None,
         master_wallet: None,
         tick_interval: 30,
+        automation: Default::default(),
         log: Some(Default::default()),
     })
 }
@@ -120,6 +121,7 @@ fn app_cfg_no_auth() -> Arc<common::app_config::AppConfig> {
         voting: None,
         master_wallet: None,
         tick_interval: 30,
+        automation: Default::default(),
         log: Some(Default::default()),
     })
 }

@@ -8,8 +8,9 @@
  */
 use crate::commands::{
     nodectl::{
-        auth_cmd::AuthCmd, config_cmd::ConfigCmd, deploy_cmd::DeployCmd, key_cmd::KeyCmd,
-        service_api_cmd::ApiCmd, service_cmd::ServiceCmd, vote_cmd::VoteCmd,
+        auth_cmd::AuthCmd, automation_cmd::AutomationCmd, config_cmd::ConfigCmd,
+        deploy_cmd::DeployCmd, key_cmd::KeyCmd, service_api_cmd::ApiCmd, service_cmd::ServiceCmd,
+        vote_cmd::VoteCmd,
     },
     ton_http_api::get_config_param_cmd::GetConfigParamCmd,
 };
@@ -25,6 +26,9 @@ pub enum Commands {
     // Authentication user management (vault-backed)
     #[command(name = "auth")]
     Auth(AuthCmd),
+    /// Contracts task automation (auto-deploy / auto-topup)
+    #[command(name = "automation")]
+    Automation(AutomationCmd),
     // Configuration management
     #[command(name = "config")]
     Config(ConfigCmd),

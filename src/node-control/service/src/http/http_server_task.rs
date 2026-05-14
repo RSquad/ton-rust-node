@@ -14,10 +14,10 @@ use super::{
         TonCorePoolSlotDto, VotingConfigDto, VotingConfigResponse, VotingProposalAddRequest,
         VotingProposalDetailDto, VotingProposalDetailResponse, VotingProposalRowDto,
         VotingProposalsListResponse, WalletDto, WalletsResponse, v1_bindings_handler,
-        v1_elections_settings_handler, v1_log_handler, v1_master_wallet_handler, v1_nodes_handler,
-        v1_pools_handler, v1_voting_config_handler, v1_voting_proposals_add_handler,
-        v1_voting_proposals_inspect_handler, v1_voting_proposals_list_handler,
-        v1_voting_proposals_rm_handler, v1_wallets_handler,
+        v1_contracts_automation_settings_handler, v1_elections_settings_handler, v1_log_handler,
+        v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_voting_config_handler,
+        v1_voting_proposals_add_handler, v1_voting_proposals_inspect_handler,
+        v1_voting_proposals_list_handler, v1_voting_proposals_rm_handler, v1_wallets_handler,
     },
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
@@ -165,6 +165,10 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
         .route("/v1/wallets", axum::routing::get(v1_wallets_handler))
         .route("/v1/pools", axum::routing::get(v1_pools_handler))
         .route("/v1/bindings", axum::routing::get(v1_bindings_handler))
+        .route(
+            "/v1/automation/settings",
+            axum::routing::get(v1_contracts_automation_settings_handler),
+        )
         .route("/v1/log", axum::routing::get(v1_log_handler))
         .route("/v1/voting/config", axum::routing::get(v1_voting_config_handler))
         .route("/v1/voting/proposals", axum::routing::get(v1_voting_proposals_list_handler))
@@ -185,6 +189,12 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
         .route(
             "/v1/elections/settings",
             axum::routing::post(super::config_handlers::v1_elections_settings_update_handler),
+        )
+        .route(
+            "/v1/automation/settings",
+            axum::routing::post(
+                super::config_handlers::v1_contracts_automation_settings_update_handler,
+            ),
         )
         .route(
             "/v1/elections/static-adnl",
@@ -851,6 +861,8 @@ impl utoipa::Modify for BearerAuthAddon {
         v1_validators_handler,
         v1_task_elections_handler,
         super::config_handlers::v1_elections_settings_update_handler,
+        super::config_handlers::v1_contracts_automation_settings_handler,
+        super::config_handlers::v1_contracts_automation_settings_update_handler,
         super::config_handlers::v1_elections_static_adnl_handler,
         // It won't compile without full names
         super::config_handlers::v1_nodes_handler,
@@ -891,7 +903,14 @@ impl utoipa::Modify for BearerAuthAddon {
         common::app_config::BindingStatus,
         common::app_config::LogRotation,
         common::app_config::LogOutput,
+        super::config_handlers::ContractsAutomationSettingsResponse,
+        super::config_handlers::ContractsAutomationSettingsUpdateRequest,
         super::config_handlers::ElectionsSettingsUpdateRequest,
+        super::config_handlers::WalletAmountsPatch,
+        super::config_handlers::PoolAmountsPatch,
+        common::app_config::ContractsAutomationConfig,
+        common::app_config::WalletAmounts,
+        common::app_config::PoolAmounts,
         ElectionsTaskAction,
         ElectionsTaskControlRequest,
         TaskStatusDto,
@@ -1044,6 +1063,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         })
     }
@@ -1060,6 +1080,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         })
     }
@@ -1175,6 +1196,163 @@ mod tests {
         let elections = cfg.elections.as_ref().unwrap();
         assert!(matches!(elections.policy, StakePolicy::Minimum));
         assert!(matches!(elections.policy_overrides.get("node1"), Some(StakePolicy::Fixed(500))));
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_get_returns_defaults() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app.oneshot(get_request("/v1/automation/settings")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["tick_interval_sec"], 40);
+        assert_eq!(v["result"]["auto_deploy"], true);
+        assert_eq!(v["result"]["auto_topup"], true);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_updates_tick() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({ "tick_interval_sec": 60 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["tick_interval_sec"], 60);
+        assert_eq!(runtime_cfg.get().automation.tick_interval_sec, 60);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_empty_body_400() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app
+            .oneshot(post_json("/v1/automation/settings", &serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_invalid_tick_400() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({ "tick_interval_sec": 0 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_merges_wallet_deploy_and_toggles() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({
+                    "wallet": { "deploy": 2_000_000_000u64 },
+                    "auto_deploy": false,
+                    "auto_topup": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["wallet"]["deploy"].as_u64().unwrap(), 2_000_000_000);
+        assert_eq!(v["result"]["auto_deploy"], false);
+        assert_eq!(v["result"]["auto_topup"], false);
+
+        let cfg = runtime_cfg.get();
+        assert_eq!(cfg.automation.wallet.deploy, 2_000_000_000);
+        assert!(!cfg.automation.auto_deploy);
+        assert!(!cfg.automation.auto_topup);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_partial_pool_deploy_preserves_snp() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let snp_before = runtime_cfg.get().automation.pool.snp;
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({
+                    "pool": { "ton_core": 3_000_000_000u64 },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["pool"]["snp"].as_u64().unwrap(), snp_before);
+        assert_eq!(v["result"]["pool"]["ton_core"].as_u64().unwrap(), 3_000_000_000u64);
+
+        let cfg = runtime_cfg.get();
+        assert_eq!(cfg.automation.pool.snp, snp_before);
+        assert_eq!(cfg.automation.pool.ton_core, 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn contracts_automation_settings_post_updates_wallet_topup() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg.clone(), elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/automation/settings",
+                &serde_json::json!({ "wallet": { "topup": 9_500_000_000u64 } }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["wallet"]["topup"].as_u64().unwrap(), 9_500_000_000u64);
+
+        assert_eq!(runtime_cfg.get().automation.wallet.topup, 9_500_000_000);
     }
 
     #[tokio::test]
@@ -1474,6 +1652,7 @@ mod tests {
         assert!(v["paths"].as_object().unwrap().contains_key("/health"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/elections"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/validators"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/automation/settings"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/config"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/proposals"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/proposals/{hash}"));
