@@ -2126,12 +2126,13 @@ pub async fn v1_elections_settings_update_handler(
                 } else {
                     elections.policy = policy;
                 }
-                if let Some(v) = sleep_period_pct {
-                    elections.sleep_period_pct = v;
-                }
-                if let Some(v) = waiting_period_pct {
-                    elections.waiting_period_pct = v;
-                }
+            }
+
+            if let Some(v) = sleep_period_pct {
+                elections.sleep_period_pct = v;
+            }
+            if let Some(v) = waiting_period_pct {
+                elections.waiting_period_pct = v;
             }
 
             if let Some(seconds) = tick_interval {
