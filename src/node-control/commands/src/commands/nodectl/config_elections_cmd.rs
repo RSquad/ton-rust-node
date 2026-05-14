@@ -38,7 +38,7 @@ pub enum ElectionsAction {
     ///
     /// Only used when the stake policy is `adaptive_split50`; ignored for `minimum`, `split50`,
     /// and `fixed`.
-    #[command(name = "wait-pct")]
+    #[command(alias = "wait-pct")]
     Wait(WaitCmd),
     /// Enable elections for binding(s)
     Enable(EnableCmd),

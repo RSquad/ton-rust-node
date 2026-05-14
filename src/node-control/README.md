@@ -337,8 +337,8 @@ nodectl config pool add --name pool0 --owner "-1:owner_address"
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--validator-share` | | Slot deploy: reward share in **basis points** (`10000` = 100%; e.g. `5000` = 50%). Mutually exclusive with `--validator-share-percent`. |
-| `--validator-share-percent` | | Same as share above but as a **percent** (`0`–`100`, decimals allowed, e.g. `50.4` → 5040 bp). Easier than basis points for humans. |
+| `--validator-share` | | Slot deploy: reward share in **basis points** (`100` = 1%; must be **below 10000** so nominators earn rewards, e.g. `5000` = 50%). Mutually exclusive with `--validator-share-percent`. |
+| `--validator-share-percent` | | Same as share above but as a **percent** (`[0, 100)`, not 100 — nominators need a reward share). Decimals allowed (e.g. `50.4` → 5040 bp). |
 | `--max-nominators` | | Optional; default from contract defaults |
 | `--min-validator-stake` | | Optional; minimum validator stake in **TON** |
 | `--min-nominator-stake` | | Optional; minimum nominator stake in **TON** |
@@ -379,6 +379,16 @@ nodectl config pool add core \
 ##### `config pool ls`
 
 List all configured pools. For **TONCore** slots, if the pool contract is not on-chain yet (or RPC cannot read it), the table shows **not deployed** (or **error** only for real failures) and fills **Share**, **Validator**, **Min nom. stake**, etc. from the **local slot config** when those values were set at `config pool add core` time.
+
+The TONCore table includes a **Src** column showing where deploy-style fields (validator share, stake thresholds) ultimately came from:
+
+| Value | Meaning |
+|-------|---------|
+| `chain` | Read live from the pool contract via `get_pool_data` |
+| `config` | Filled from the local slot config because `get_pool_data` was not called or failed (account not active or RPC error) |
+| `-` | Neither chain nor config provided deploy-style fields |
+
+JSON output exposes the same signal as a `data_source` field on each slot (omitted when no deploy-style fields are present).
 
 ```bash
 nodectl config pool ls
@@ -582,7 +592,7 @@ nodectl config log set --level warn --max-size-mb 100 --max-files 5
 
 #### `config elections`
 
-Manage elections configuration, including stake policies, tick intervals, AdaptiveSplit50 wait-window fractions (`config elections wait-pct`), and per-binding election participation.
+Manage elections configuration, including stake policies, tick intervals, AdaptiveSplit50 wait-window fractions (`config elections wait`, alias `wait-pct`), and per-binding election participation.
 
 ##### `config elections show`
 
@@ -651,9 +661,11 @@ Set the maximum stake factor for elections. The value must be between **1.0** an
 nodectl config elections max-factor 2.5
 ```
 
-##### `config elections wait-pct`
+##### `config elections wait`
 
 Set the **AdaptiveSplit50 staking window**: earliest stake submission and latest deadline for waiting on peers (fractions of the election duration, **[0.0, 1.0]**). These map to `sleep_period_pct` (`--min`) and `waiting_period_pct` (`--max`) in config.
+
+Subcommand alias: `wait-pct` (same flags).
 
 They apply **only** when the stake policy is **adaptive_split50**; for `minimum`, `split50`, and `fixed` the values are stored but unused.
 
@@ -664,12 +676,14 @@ The service merges with current settings and validates the pair (**min ≤ max**
 | `--min <FRAC>` | `sleep_period_pct` | Earliest fraction at which staking may proceed |
 | `--max <FRAC>` | `waiting_period_pct` | Latest fraction for waiting on peers |
 
-At least one flag is required. Run `nodectl config elections wait-pct --help` for full semantics.
+At least one flag is required. Run `nodectl config elections wait --help` for full semantics.
 
 ```bash
+nodectl config elections wait --min 0.15 --max 0.45
+nodectl config elections wait --min 0.15
+nodectl config elections wait --max 0.45
+# equivalent:
 nodectl config elections wait-pct --min 0.15 --max 0.45
-nodectl config elections wait-pct --min 0.15
-nodectl config elections wait-pct --max 0.45
 ```
 
 ##### `config elections enable`
@@ -2185,7 +2199,7 @@ nodectl config elections tick-interval 60
 nodectl config elections max-factor 2.5
 
 # AdaptiveSplit50 timing (fractions of election duration, [0.0, 1.0])
-nodectl config elections wait-pct --min 0.15 --max 0.45
+nodectl config elections wait --min 0.15 --max 0.45
 ```
 
 ### Authentication Setup
