@@ -22,7 +22,6 @@ task!(VotingTask, crate::voting::voting_task::run {
 
 task!(ContractsTask, crate::contracts::contracts_task::run {
     runtime_cfg: Arc<dyn RuntimeConfig>,
-    store: Arc<SnapshotStore>
 });
 
 pub struct ElectionsTask {

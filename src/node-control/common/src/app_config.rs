@@ -721,6 +721,158 @@ impl Default for LogConfig {
     }
 }
 
+// Defaults aligned with `service/src/contracts/contracts_task.rs` (contracts task).
+
+fn default_contracts_wallet_deploy() -> u64 {
+    1_100_000_000
+}
+
+fn default_contracts_wallet_topup() -> u64 {
+    10_000_000_000
+}
+
+fn default_contracts_wallet_balance_threshold() -> u64 {
+    5_000_000_000
+}
+
+fn default_contracts_automation_tick_interval_sec() -> u64 {
+    default_tick_interval()
+}
+
+fn default_contracts_automation_enabled() -> bool {
+    true
+}
+
+/// Wallet-related automation amounts (nanotons): deploy send value, top-up batch, balance threshold.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WalletAmounts {
+    #[serde(default = "default_contracts_wallet_deploy")]
+    pub deploy: u64,
+    #[serde(default = "default_contracts_wallet_topup")]
+    pub topup: u64,
+    #[serde(default = "default_contracts_wallet_balance_threshold")]
+    pub threshold: u64,
+}
+
+impl Default for WalletAmounts {
+    fn default() -> Self {
+        Self {
+            deploy: default_contracts_wallet_deploy(),
+            topup: default_contracts_wallet_topup(),
+            threshold: default_contracts_wallet_balance_threshold(),
+        }
+    }
+}
+
+/// Per–pool-kind deploy send values from the master wallet when deploying a pool (nanotons).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PoolAmounts {
+    #[serde(default = "default_contracts_wallet_deploy")]
+    pub snp: u64,
+    #[serde(default = "default_contracts_wallet_deploy")]
+    pub ton_core: u64,
+}
+
+impl Default for PoolAmounts {
+    fn default() -> Self {
+        Self { snp: default_contracts_wallet_deploy(), ton_core: default_contracts_wallet_deploy() }
+    }
+}
+
+/// Parameters for the contracts task (auto-deploy wallets/pools, auto-topup validator wallets).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ContractsAutomationConfig {
+    /// Poll interval for the contracts task loop in seconds.
+    #[serde(default = "default_contracts_automation_tick_interval_sec")]
+    pub tick_interval_sec: u64,
+    #[serde(default = "default_contracts_automation_enabled")]
+    pub auto_deploy: bool,
+    #[serde(default = "default_contracts_automation_enabled")]
+    pub auto_topup: bool,
+    #[serde(default)]
+    pub wallet: WalletAmounts,
+    #[serde(default)]
+    pub pool: PoolAmounts,
+}
+
+impl Default for ContractsAutomationConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval_sec: default_contracts_automation_tick_interval_sec(),
+            auto_deploy: default_contracts_automation_enabled(),
+            auto_topup: default_contracts_automation_enabled(),
+            wallet: WalletAmounts::default(),
+            pool: PoolAmounts::default(),
+        }
+    }
+}
+
+/// Maximum automation amount field (nanotons): sanity bound against typo-scale errors (~18e9 TON fits in u64).
+const AUTOMATION_MAX_AMOUNT_NANOTONS: u64 = 100_000 * 1_000_000_000;
+
+/// Minimum `wallet.deploy`: aligned with `WALLET_GAS` in `contracts_task` (0.1 TON).
+const AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS: u64 = 100_000_000;
+
+fn automation_check_bounded_positive_amount(field: &'static str, value: u64) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("automation.{} must be > 0", field);
+    }
+    if value > AUTOMATION_MAX_AMOUNT_NANOTONS {
+        anyhow::bail!(
+            "automation.{} must be <= {} nanotons ({} TON), got {}",
+            field,
+            AUTOMATION_MAX_AMOUNT_NANOTONS,
+            AUTOMATION_MAX_AMOUNT_NANOTONS / 1_000_000_000,
+            value
+        );
+    }
+    Ok(())
+}
+
+fn automation_check_wallet_deploy(value: u64) -> anyhow::Result<()> {
+    if value < AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS {
+        anyhow::bail!(
+            "automation.wallet.deploy must be >= {} nanotons (0.1 TON), got {}",
+            AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS,
+            value
+        );
+    }
+    if value > AUTOMATION_MAX_AMOUNT_NANOTONS {
+        anyhow::bail!(
+            "automation.wallet.deploy must be <= {} nanotons ({} TON), got {}",
+            AUTOMATION_MAX_AMOUNT_NANOTONS,
+            AUTOMATION_MAX_AMOUNT_NANOTONS / 1_000_000_000,
+            value
+        );
+    }
+    Ok(())
+}
+
+impl ContractsAutomationConfig {
+    /// Validates automation settings: tick interval; monetary fields positive and at most 100_000 TON each;
+    /// `wallet.deploy` at least 0.1 TON (aligned with deploy gas checks in the contracts task).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MIN_TICK_SEC: u64 = 1;
+        const MAX_TICK_SEC: u64 = 24 * 60 * 60;
+
+        if !(MIN_TICK_SEC..=MAX_TICK_SEC).contains(&self.tick_interval_sec) {
+            anyhow::bail!(
+                "automation.tick_interval_sec must be in range [{MIN_TICK_SEC}, {MAX_TICK_SEC}], got {}",
+                self.tick_interval_sec
+            );
+        }
+        automation_check_wallet_deploy(self.wallet.deploy)?;
+        automation_check_bounded_positive_amount("pool.snp", self.pool.snp)?;
+        automation_check_bounded_positive_amount("pool.ton_core", self.pool.ton_core)?;
+        automation_check_bounded_positive_amount("wallet.topup", self.wallet.topup)?;
+        automation_check_bounded_positive_amount("wallet.threshold", self.wallet.threshold)?;
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct AppConfig {
     pub nodes: HashMap<String, AdnlConfig>,
@@ -740,6 +892,8 @@ pub struct AppConfig {
     /// Default interval for all tasks in seconds
     #[serde(default = "default_tick_interval")]
     pub tick_interval: u64,
+    #[serde(default)]
+    pub automation: ContractsAutomationConfig,
     pub log: Option<LogConfig>,
 }
 
@@ -784,6 +938,7 @@ impl AppConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.elections.as_ref().map(|e| e.validate(None)).transpose()?;
+        self.automation.validate()?;
         Ok(())
     }
 }
@@ -1203,5 +1358,84 @@ mod tests {
         let parsed: TonHttpApiConfig = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.endpoints(), vec!["http://a/", "http://b/"]);
         assert_eq!(parsed.resolved_endpoints()[1].1, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn contracts_automation_default_validate_ok() {
+        let c = ContractsAutomationConfig::default();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.tick_interval_sec, default_tick_interval());
+        assert!(c.auto_deploy && c.auto_topup);
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_zero_wallet_deploy() {
+        let mut c = ContractsAutomationConfig::default();
+        c.wallet.deploy = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_wallet_deploy_below_gas() {
+        let mut c = ContractsAutomationConfig::default();
+        c.wallet.deploy = super::AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS - 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_amount_above_cap() {
+        let mut c = ContractsAutomationConfig::default();
+        c.wallet.topup = super::AUTOMATION_MAX_AMOUNT_NANOTONS + 1;
+        assert!(c.validate().is_err());
+
+        let mut c = ContractsAutomationConfig::default();
+        c.pool.snp = super::AUTOMATION_MAX_AMOUNT_NANOTONS + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_validate_accepts_amount_at_cap() {
+        let mut c = ContractsAutomationConfig::default();
+        let cap = super::AUTOMATION_MAX_AMOUNT_NANOTONS;
+        c.wallet.deploy = cap;
+        c.pool.snp = cap;
+        c.pool.ton_core = cap;
+        c.wallet.topup = cap;
+        c.wallet.threshold = cap;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_tick_out_of_range() {
+        let mut c = ContractsAutomationConfig::default();
+        c.tick_interval_sec = 0;
+        assert!(c.validate().is_err());
+        c.tick_interval_sec = 24 * 60 * 60 + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_deserializes_json_amount_fields() {
+        let json = r#"{
+            "tick_interval_sec": 40,
+            "auto_deploy": true,
+            "auto_topup": true,
+            "wallet": {
+                "deploy": 2200000000,
+                "topup": 10000000000,
+                "threshold": 5000000000
+            },
+            "pool": {
+                "snp": 1100000000,
+                "ton_core": 3300000000
+            }
+        }"#;
+        let c: ContractsAutomationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.wallet.deploy, 2_200_000_000);
+        assert_eq!(c.pool.snp, 1_100_000_000);
+        assert_eq!(c.pool.ton_core, 3_300_000_000);
+        assert_eq!(c.wallet.topup, 10_000_000_000);
+        assert_eq!(c.wallet.threshold, 5_000_000_000);
+        assert!(c.validate().is_ok());
     }
 }

@@ -44,6 +44,10 @@ impl CommandManager {
                 cmd.run().await?;
                 Ok(None)
             }
+            Commands::Automation(cmd) => {
+                cmd.run().await?;
+                Ok(None)
+            }
             // Key management
             Commands::Key(cmd) => {
                 cmd.run().await?;
