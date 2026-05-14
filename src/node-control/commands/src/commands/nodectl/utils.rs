@@ -31,9 +31,9 @@ pub const SEND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs
 pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
 /// Default timeout for establishing a TCP connection to the nodectl service.
-pub const API_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+pub(crate) const API_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 /// Default overall request timeout for nodectl service REST calls.
-pub const API_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+pub(crate) const API_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
 const API_CONNECT_TIMEOUT_ENV: &str = "NODECTL_API_CONNECT_TIMEOUT_SECS";
 const API_REQUEST_TIMEOUT_ENV: &str = "NODECTL_API_REQUEST_TIMEOUT_SECS";
@@ -45,12 +45,14 @@ const API_REQUEST_TIMEOUT_ENV: &str = "NODECTL_API_REQUEST_TIMEOUT_SECS";
 /// hanging indefinitely. Both timeouts can be overridden at runtime via
 /// `NODECTL_API_CONNECT_TIMEOUT_SECS` and `NODECTL_API_REQUEST_TIMEOUT_SECS`.
 #[must_use = "the client must be used to perform requests"]
-pub fn build_api_client() -> anyhow::Result<reqwest::Client> {
+pub(crate) fn build_api_client() -> anyhow::Result<reqwest::Client> {
     let connect = read_timeout_env(API_CONNECT_TIMEOUT_ENV, API_CONNECT_TIMEOUT);
     let request = read_timeout_env(API_REQUEST_TIMEOUT_ENV, API_REQUEST_TIMEOUT);
     build_api_client_with_timeouts(connect, request)
 }
 
+/// Build an HTTP client with explicit connect and overall request timeouts.
+/// Used internally by [`build_api_client`] and directly from tests.
 pub(crate) fn build_api_client_with_timeouts(
     connect: tokio::time::Duration,
     request: tokio::time::Duration,
