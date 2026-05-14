@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+### Added
+
+- **TONCore: process pending withdraws before each new stake** — the elections runner now sends `process_withdraw_requests` (op = 2, `limit = 100`) once per election cycle between `recover_stake` and `participate`, when the active TONCore pool has at least one pending nominator withdraw request. This frees up locked liquidity from nominators who already requested a withdrawal so it does not get re-staked, and the runner skips stake submission for that tick to give the pool time to drain its queue. A new participant status `processing_withdraws` surfaces this intermediate state in `/v1/elections` and `/v1/validators` snapshots. No-op for SNP nominator pools and direct staking.
+
 ## [0.4.0] - 2026-04-21
 
 ### Added

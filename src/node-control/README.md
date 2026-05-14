@@ -2044,6 +2044,8 @@ Each binding resolves its effective stake policy by checking for a per-node over
 
 > **TONCore nominator caveat.** `Split50` and `AdaptiveSplit50` are ignored on bindings backed by a TONCore nominator — the two pools stake in different rounds, so there is nothing to split. The runner stakes the full liquid balance of the selected pool instead (still floored at `min_stake`). Use `Fixed` or `Minimum` if you need to cap per-round exposure on TONCore.
 
+> **TONCore nominator: process pending withdraws before staking.** Each election cycle, when the active TONCore pool's `withdraw_requests` dictionary is non-empty, the elections runner sends `process_withdraw_requests` (op = 2, limit = 100) once between `recover_stake` and `participate`, then waits one tick for the pool to drain before submitting the new stake. This frees up locked liquidity from nominators who already requested withdrawal so it does not get re-staked. The corresponding participant status surfaced in the snapshot is `processing_withdraws`. The step is a no-op for SNP and direct staking.
+
 ### Logging
 
 Configure logging output and level in the config file (`log` section). Override the log level temporarily via environment variable:

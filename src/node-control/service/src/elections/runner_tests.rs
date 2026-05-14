@@ -208,6 +208,14 @@ mock! {
         fn inner_pools(&self) -> Vec<std::sync::Arc<dyn NominatorWrapper>>;
         fn storage_reserve(&self) -> u64;
         fn pool_kind(&self) -> PoolKind;
+        async fn has_pending_withdraws(&self) -> anyhow::Result<bool>;
+        async fn send_process_withdrawals(
+            &self,
+            wallet: std::sync::Arc<dyn contracts::TonWallet>,
+            query_id: u64,
+            limit: u8,
+            gas_value: u64,
+        ) -> anyhow::Result<ton_block::Cell>;
     }
 }
 
@@ -566,6 +574,23 @@ fn pool_data_with_state(state: i32) -> PoolData {
 }
 
 fn setup_toncore_nominator_slot(
+    pool: &mut MockSingleNominatorWrapper,
+    addr: MsgAddressInt,
+    state: i32,
+) {
+    pool.expect_address().returning(move || Ok(addr.clone()));
+    pool.expect_get_pool_data().returning(move || Ok(pool_data_with_state(state)));
+    pool.expect_storage_reserve().returning(|| TONCORE_STORAGE_RESERVE);
+    pool.expect_pool_kind().returning(|| PoolKind::TONCore);
+    // The runner probes pending withdraws between `recover_stake` and `participate`.
+    // Default to "no pending" so existing TONCore tests are unaffected; specific tests
+    // for the new branch use [`setup_toncore_nominator_slot_pending`] instead.
+    pool.expect_has_pending_withdraws().returning(|| Ok(false));
+}
+
+/// Same as [`setup_toncore_nominator_slot`] but lets the test wire `has_pending_withdraws`
+/// and `send_process_withdrawals` explicitly. Used by the process-withdraws branch tests.
+fn setup_toncore_nominator_slot_no_withdraw_defaults(
     pool: &mut MockSingleNominatorWrapper,
     addr: MsgAddressInt,
     state: i32,
@@ -2899,6 +2924,149 @@ async fn test_toncore_nominator_elections_finished_checks_active_pool_only() {
     // Router now resolves a single active pool address; participant from non-active slot is not matched.
     assert!(!node.stake_accepted);
     assert_eq!(node.accepted_stake_amount, None);
+}
+
+// =====================================================
+// TONCore: process_withdraw_requests (op = 2) before stake
+// =====================================================
+
+/// Happy path: pending withdraws → opcode-2 sent, flag set, stake skipped this tick.
+///
+/// Verifies the core invariant from the design: `process_withdraw_requests` precedes a new
+/// stake submission, and the runner waits one tick for the pool to drain before staking.
+#[tokio::test]
+async fn test_toncore_pending_withdraws_sends_opcode_and_skips_stake_this_tick() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot_no_withdraw_defaults(p0, pool_address(), 0);
+    p0.expect_has_pending_withdraws().returning(|| Ok(true));
+    p0.expect_send_process_withdrawals().returning(|_w, _q, _l, _g| Ok(dummy_cell()));
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert_eq!(
+        node.withdraw_processed_for_cycle,
+        Some(ELECTION_ID),
+        "flag must be set after a successful opcode-2 send"
+    );
+    assert!(
+        node.stake_submissions.is_empty(),
+        "stake must NOT be submitted in the same tick as opcode-2"
+    );
+    assert!(
+        node.participant.is_none(),
+        "participate() should be skipped this tick (continue after opcode-2)"
+    );
+}
+
+/// Once the flag matches the current cycle, the runner does not re-probe `has_pending_withdraws`
+/// and proceeds straight to `participate`. Catches accidental re-sends of opcode-2.
+#[tokio::test]
+async fn test_toncore_pending_withdraws_skipped_when_already_processed_for_cycle() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    // No `expect_has_pending_withdraws` on p0: if the runner probes it again the test panics.
+    setup_toncore_nominator_slot_no_withdraw_defaults(p0, pool_address(), 0);
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let expected_stake = POOL_BALANCE - TONCORE_STORAGE_RESERVE - EXTRA_STORAGE_FEES;
+
+    let mut runner = harness.build(node_id).await;
+    {
+        let node = runner.nodes.get_mut(node_id).unwrap();
+        node.withdraw_processed_for_cycle = Some(ELECTION_ID);
+    }
+
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.participant.is_some());
+    assert_eq!(
+        node.participant.as_ref().unwrap().stake,
+        expected_stake,
+        "stake should be submitted normally when withdraws already processed this cycle"
+    );
+}
+
+/// `send_process_withdrawals` failure must NOT set the flag (so we retry next tick) and must
+/// NOT block staking — the runner logs the error and proceeds with `participate`.
+#[tokio::test]
+async fn test_toncore_pending_withdraws_send_failure_keeps_flag_unset_and_proceeds() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot_no_withdraw_defaults(p0, pool_address(), 0);
+    p0.expect_has_pending_withdraws().returning(|| Ok(true));
+    p0.expect_send_process_withdrawals()
+        .returning(|_w, _q, _l, _g| Err(anyhow::anyhow!("simulated build failure")));
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() must succeed; opcode-2 errors are non-fatal");
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(
+        node.withdraw_processed_for_cycle.is_none(),
+        "flag must NOT be set when send_process_withdrawals fails — retry next tick"
+    );
+    assert_eq!(
+        node.stake_submissions.len(),
+        1,
+        "stake should still be submitted: opcode-2 failure must not block participation"
+    );
+    assert!(node.last_error.is_some(), "withdraw send failure should be surfaced via last_error");
 }
 
 // =====================================================
