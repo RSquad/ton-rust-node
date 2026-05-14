@@ -1014,6 +1014,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "tokio",
  "ton_api",
  "ton_block",
  "tracing",
