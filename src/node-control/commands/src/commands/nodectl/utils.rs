@@ -30,6 +30,65 @@ const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2)
 pub const SEND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
+/// Default timeout for establishing a TCP connection to the nodectl service.
+pub const API_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+/// Default overall request timeout for nodectl service REST calls.
+pub const API_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+const API_CONNECT_TIMEOUT_ENV: &str = "NODECTL_API_CONNECT_TIMEOUT_SECS";
+const API_REQUEST_TIMEOUT_ENV: &str = "NODECTL_API_REQUEST_TIMEOUT_SECS";
+
+/// Build the HTTP client used for all `nodectl` → service REST calls.
+///
+/// Applies a connect timeout and an overall request timeout so that
+/// CLI commands fail fast when the service port is unreachable instead of
+/// hanging indefinitely. Both timeouts can be overridden at runtime via
+/// `NODECTL_API_CONNECT_TIMEOUT_SECS` and `NODECTL_API_REQUEST_TIMEOUT_SECS`.
+#[must_use = "the client must be used to perform requests"]
+pub fn build_api_client() -> anyhow::Result<reqwest::Client> {
+    let connect = read_timeout_env(API_CONNECT_TIMEOUT_ENV, API_CONNECT_TIMEOUT);
+    let request = read_timeout_env(API_REQUEST_TIMEOUT_ENV, API_REQUEST_TIMEOUT);
+    build_api_client_with_timeouts(connect, request)
+}
+
+pub(crate) fn build_api_client_with_timeouts(
+    connect: tokio::time::Duration,
+    request: tokio::time::Duration,
+) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .timeout(request)
+        .build()
+        .context("failed to build HTTP client")
+}
+
+fn read_timeout_env(var: &str, default: tokio::time::Duration) -> tokio::time::Duration {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(tokio::time::Duration::from_secs)
+        .unwrap_or(default)
+}
+
+/// Map a `reqwest::Error` into an actionable user-facing error for service
+/// REST calls. Connect failures and timeouts get a dedicated message that
+/// includes the attempted URL and a hint about overriding timeouts.
+pub(crate) fn map_send_error(err: reqwest::Error, url: &str) -> anyhow::Error {
+    if err.is_timeout() {
+        anyhow::anyhow!(
+            "request to {url} timed out: check that the nodectl service is running \
+             and reachable; override with {API_CONNECT_TIMEOUT_ENV} / {API_REQUEST_TIMEOUT_ENV}"
+        )
+    } else if err.is_connect() {
+        anyhow::anyhow!(
+            "cannot reach nodectl service at {url}: {err}; check that the service \
+             is running and the URL is correct (use --url or NODECTL_URL)"
+        )
+    } else {
+        anyhow::Error::new(err).context(format!("request to {url} failed"))
+    }
+}
+
 /// Logical name for the master wallet in CLI, `get_wallet_config`, and `config wallet ls`.
 pub const MASTER_WALLET_RESERVED_NAME: &str = "master_wallet";
 
@@ -349,7 +408,7 @@ where
     B: serde::Serialize,
 {
     let url = format!("{}/{}", base_url.trim_end_matches('/'), path.trim_start_matches('/'));
-    let client = reqwest::Client::new();
+    let client = build_api_client()?;
     let mut req = client.request(method, &url);
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
@@ -357,7 +416,7 @@ where
     if let Some(b) = body {
         req = req.json(b);
     }
-    let response = req.send().await.context(format!("failed to connect to {}", url))?;
+    let response = req.send().await.map_err(|e| map_send_error(e, &url))?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
@@ -445,5 +504,65 @@ mod tests {
     fn test_normalize_base_url_trims_trailing_slash() {
         assert_eq!(normalize_base_url("http://example.com:8080/"), "http://example.com:8080");
         assert_eq!(normalize_base_url("127.0.0.1/"), "http://127.0.0.1");
+    }
+
+    /// Service is bound but never accepts: HTTP request hangs until the
+    /// overall request timeout fires. Verifies that the CLI HTTP client
+    /// honours the configured timeout and produces an actionable error.
+    #[tokio::test]
+    async fn build_api_client_times_out_when_service_does_not_respond() {
+        // Bind a listener and intentionally never accept connections.
+        // Connections sit in the OS accept backlog (ESTABLISHED from
+        // client view) and the request timeout has to kick in.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/health");
+
+        let client = build_api_client_with_timeouts(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let err = client.get(&url).send().await.expect_err("request must fail");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "expected fast fail, took {elapsed:?}"
+        );
+        assert!(err.is_timeout(), "expected timeout error, got: {err}");
+
+        let mapped = map_send_error(err, &url);
+        let msg = format!("{mapped:#}");
+        assert!(msg.contains("timed out"), "message missing timeout hint: {msg}");
+        assert!(msg.contains(&url), "message missing URL: {msg}");
+    }
+
+    /// No listener bound: connect attempt is refused (RST) almost
+    /// instantly. Verifies the actionable connect-error path.
+    #[tokio::test]
+    async fn build_api_client_reports_connection_refused() {
+        // Bind to a port, capture it, drop the listener — port is now free
+        // and the OS will RST any further connects.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{addr}/health");
+
+        let client = build_api_client_with_timeouts(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let err = client.get(&url).send().await.expect_err("request must fail");
+        assert!(err.is_connect(), "expected connect error, got: {err}");
+
+        let mapped = map_send_error(err, &url);
+        let msg = format!("{mapped:#}");
+        assert!(msg.contains("cannot reach nodectl service"), "unexpected message: {msg}");
+        assert!(msg.contains(&url), "message missing URL: {msg}");
     }
 }
