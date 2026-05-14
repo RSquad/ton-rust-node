@@ -584,7 +584,7 @@ fn setup_toncore_nominator_slot(
     pool.expect_pool_kind().returning(|| PoolKind::TONCore);
     // The runner probes pending withdraws between `recover_stake` and `participate`.
     // Default to "no pending" so existing TONCore tests are unaffected; specific tests
-    // for the new branch use [`setup_toncore_nominator_slot_pending`] instead.
+    // for the new branch use [`setup_toncore_nominator_slot_no_withdraw_defaults`] instead.
     pool.expect_has_pending_withdraws().returning(|| Ok(false));
 }
 
