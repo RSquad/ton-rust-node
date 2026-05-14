@@ -116,7 +116,7 @@ The binary will be available at `target/release/nodectl`.
 | `--help` / `-h` | Show help |
 | `--version` / `-V` | Show version |
 
-> **Note:** The `--config` (`-c`) flag is specified per subcommand (e.g. `nodectl service -c config.json`, `nodectl config-param -c config.json 34`), not globally.
+> **Note:** The `--config` (`-c`) flag is specified per subcommand (e.g. `nodectl service -c config.json`, `nodectl config-param -c config.json 34`), not globally. The **`vote`** subcommand is an exception: it also accepts global **`--url` / `-u`**, **`--token`**, and **`--config`** (same resolution rules as `nodectl config` / `nodectl api`).
 
 ---
 
@@ -1067,45 +1067,56 @@ nodectl config-param -c config.json 34
 
 ### Voting Commands
 
-On-chain config proposal voting. `nodectl vote ls` / `inspect` hit the Config contract via TON HTTP API. `nodectl vote add` / `rm` manage the local `voting.proposals` list used by the voting task — they write directly to the config file and do **not** require a running service.
+`nodectl vote` is a **REST client** to the running nodectl service. The daemon calls the **Config contract** on-chain (via the service’s configured TON HTTP API) and persists `voting.proposals` with **`update_and_save`**, like other centralised config flows.
+
+- **Service URL:** `--url` / `NODECTL_URL`, or `http.bind` from `--config` (default `nodectl-config.json`), or `http://127.0.0.1:8080`.
+- **JWT:** `--token` / `NODECTL_API_TOKEN`. **`vote ls`**, **`inspect`**, and read-only config used for interactive flows require a **nominator** (or **operator**) token. **`vote add`** and **`vote rm`** require an **operator** token.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--url <URL>` | `-u` | Service base URL (overrides config; env: `NODECTL_URL`) |
+| `--token <TOKEN>` | | Bearer JWT (env: `NODECTL_API_TOKEN`) |
+| `--config <FILE>` | `-c` | Config path for `http.bind` when `--url` is not set (env: `CONFIG_PATH`) |
 
 #### `vote ls`
 
-List active config proposals on-chain. Proposals already tracked by the voting task are marked with `*`.
+List active config proposals (from the network). Proposals already tracked in `voting.proposals` are marked with `*`.
 
 | Flag | Description |
 |------|-------------|
 | `--format <FORMAT>` | `table` (default) or `json` |
 
 ```bash
+export NODECTL_API_TOKEN="..."   # nominator or operator
 nodectl vote ls
+nodectl vote ls --url http://127.0.0.1:8080 --token "$NODECTL_API_TOKEN"
 ```
 
 #### `vote inspect`
 
-Show full details (expires-in, voters, weight remaining, param cell BOC, param hash) for a proposal by hex hash.
+Details for a proposal: `expires_in`, voters, weight remaining, param cell BOC (base64), param hash. Hash: **64 hex characters** (32 bytes).
 
 ```bash
-nodectl vote inspect <HEX_HASH>
-nodectl vote inspect <HEX_HASH> --format json
+nodectl vote inspect <HEX64>
+nodectl vote inspect <HEX64> --format json
 ```
 
 #### `vote add`
 
-Add a proposal to the voting task's tracked list. Pass `--hash <HEX_HASH>` or invoke interactively to pick one from the list of active proposals.
+Track a proposal (must exist among **active** on-chain proposals). Use `--hash` or run interactively (select from the list). Idempotent: if the hash is already tracked, the command succeeds without a second write.
 
 ```bash
-nodectl vote add --hash <HEX_HASH>
-nodectl vote add   # interactive
+nodectl vote add --hash <HEX64>   # requires operator token
+nodectl vote add                 # interactive; operator token
 ```
 
 #### `vote rm`
 
-Remove a proposal from the voting task's tracked list.
+Remove a hash from the tracked list. Use `--hash` or interactive selection from the current `voting.proposals` list.
 
 ```bash
-nodectl vote rm --hash <HEX_HASH>
-nodectl vote rm    # interactive
+nodectl vote rm --hash <HEX64>
+nodectl vote rm
 ```
 
 ---
@@ -1170,6 +1181,11 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | GET | `/v1/bindings` | N | List node bindings |
 | POST | `/v1/bindings` | O | Add a binding |
 | DELETE | `/v1/bindings/{node}` | O | Remove a binding (requires `idle` status) |
+| GET | `/v1/voting/config` | N | Voting section snapshot (`proposals`, `tick_interval`) |
+| GET | `/v1/voting/proposals` | N | Active on-chain proposals with `tracked` flag |
+| GET | `/v1/voting/proposals/{hash}` | N | Single proposal details (Config contract) |
+| POST | `/v1/voting/proposals` | O | Add proposal hash to tracked list |
+| DELETE | `/v1/voting/proposals/{hash}` | O | Remove proposal hash from tracked list |
 | GET | `/v1/log` | N | Current log configuration |
 | POST | `/v1/log` | O | Update log settings |
 | POST | `/v1/ton-http-api` | O | Replace or append TON HTTP API endpoints |
@@ -1918,7 +1934,7 @@ Settings for the **contracts task** (auto-deploy of validator wallets and nomina
 
 Automatic voting task configuration:
 
-- `proposals` — list of proposal addresses to vote for
+- `proposals` — list of tracked proposal ids (**64-character hex**, 32-byte hashes). Managed via **`nodectl vote add` / `vote rm`** (REST) or **`POST` / `DELETE /v1/voting/proposals`**
 - `tick_interval` — interval between voting checks in seconds (default: `40`)
 
 #### `log` (optional)

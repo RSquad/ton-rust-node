@@ -605,6 +605,12 @@ pub struct VotingConfig {
     pub tick_interval: u64,
 }
 
+impl Default for VotingConfig {
+    fn default() -> Self {
+        Self { proposals: Vec::new(), tick_interval: default_tick_interval() }
+    }
+}
+
 /// Lifecycle status of a node binding.
 ///
 /// Transitions:
