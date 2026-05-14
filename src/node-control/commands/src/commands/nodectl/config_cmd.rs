@@ -137,6 +137,7 @@ impl GenerateCmd {
                 workchain: 0,
             }),
             tick_interval: 40,
+            automation: Default::default(),
             log: Some(LogConfig::default()),
         };
 

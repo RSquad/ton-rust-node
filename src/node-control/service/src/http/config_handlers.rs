@@ -9,23 +9,28 @@
 use super::http_server_task::{AppError, AppState};
 use crate::{
     elections::providers::{DefaultElectionsProvider, ElectionsProvider},
-    runtime_config::{RuntimeConfig, open_wallet},
+    runtime_config::{RuntimeConfig, TryUpdateSaveError, open_wallet},
 };
 use adnl::common::Timeouts;
+use base64::Engine;
 use common::{
     TonWalletVersion,
     app_config::{
-        AdnlConfig, BindingStatus, DEFAULT_TONCORE_MAX_NOMINATORS,
+        AdnlConfig, BindingStatus, ContractsAutomationConfig, DEFAULT_TONCORE_MAX_NOMINATORS,
         DEFAULT_TONCORE_MIN_NOMINATOR_STAKE, DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, ElectionsConfig,
         EndpointEntry, KeyConfig, LogConfig, LogOutput, LogRotation, NodeBinding, PoolConfig,
-        StakePolicy, TimeoutVariant, TonCoreInitParams, TonCorePoolConfig, WalletConfig,
+        StakePolicy, TimeoutVariant, TonCoreInitParams, TonCorePoolConfig, VotingConfig,
+        WalletConfig,
     },
     ton_utils::{extract_max_factor, normalize_ton_address},
 };
-use contracts::{NominatorWrapper, TonCoreNominatorWrapper, contract_provider};
+use contracts::{
+    ConfigContractImpl, ConfigContractWrapper, ConfigProposal, NominatorWrapper,
+    TonCoreNominatorWrapper, contract_provider,
+};
 use control_client::client_adnl::ControlClientAdnl;
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
-use ton_block::MsgAddressInt;
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::SystemTime};
+use ton_block::{MsgAddressInt, write_boc};
 use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
 
 /// `type_id` for ADNL public keys (Ed25519).
@@ -210,6 +215,59 @@ pub struct ElectionsSettingsResponse {
     pub result: ElectionsSettingsDto,
 }
 
+// --- Contracts automation (auto-deploy / auto-topup) ---
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ContractsAutomationSettingsResponse {
+    pub ok: bool,
+    pub result: ContractsAutomationConfig,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct WalletAmountsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topup: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PoolAmountsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ton_core: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ContractsAutomationSettingsUpdateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_interval_sec: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_deploy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_topup: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<WalletAmountsPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<PoolAmountsPatch>,
+}
+
+impl ContractsAutomationSettingsUpdateRequest {
+    fn any_field_set(&self) -> bool {
+        self.tick_interval_sec.is_some()
+            || self.auto_deploy.is_some()
+            || self.auto_topup.is_some()
+            || self
+                .wallet
+                .as_ref()
+                .is_some_and(|w| w.deploy.is_some() || w.topup.is_some() || w.threshold.is_some())
+            || self.pool.as_ref().is_some_and(|p| p.snp.is_some() || p.ton_core.is_some())
+    }
+}
+
 // --- Log ---
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -227,6 +285,99 @@ pub struct LogDto {
 pub struct LogResponse {
     pub ok: bool,
     pub result: LogDto,
+}
+
+// --- Voting (runtime config snapshot) ---
+
+/// Voting subsection as stored in app config (`voting.proposals`, `voting.tick_interval`).
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VotingConfigDto {
+    /// Hex-encoded proposal hashes (32 bytes each) tracked by the voting task.
+    pub proposals: Vec<String>,
+    /// Voting task poll interval in seconds.
+    pub tick_interval: u64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VotingConfigResponse {
+    pub ok: bool,
+    pub result: VotingConfigDto,
+}
+
+/// Body for `POST /v1/voting/proposals` — add a proposal hash to the tracked list.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VotingProposalAddRequest {
+    /// Proposal id: 64 hex characters (32 bytes), same as `nodectl vote add --hash`.
+    pub hash: String,
+}
+
+/// One active config proposal row (from chain) plus `tracked` from runtime config.
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VotingProposalRowDto {
+    pub hash: String,
+    pub param_id: i32,
+    pub is_critical: bool,
+    pub expires: u32,
+    pub expires_in: String,
+    pub voters_count: usize,
+    pub weight_remaining: i64,
+    pub rounds_remaining: u8,
+    pub wins: u8,
+    pub losses: u8,
+    pub tracked: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VotingProposalsListResponse {
+    pub ok: bool,
+    pub result: Vec<VotingProposalRowDto>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VotingProposalDetailDto {
+    pub hash: String,
+    pub param_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param_cell_boc: Option<String>,
+    pub is_critical: bool,
+    pub expires: u32,
+    pub expires_in: String,
+    pub voters: Vec<u16>,
+    pub weight_remaining: i64,
+    pub vset_id: String,
+    pub rounds_remaining: u8,
+    pub wins: u8,
+    pub losses: u8,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct VotingProposalDetailResponse {
+    pub ok: bool,
+    pub result: VotingProposalDetailDto,
+}
+
+impl From<&ConfigProposal> for VotingProposalDetailDto {
+    fn from(p: &ConfigProposal) -> Self {
+        Self {
+            hash: hex::encode(p.hash),
+            param_id: p.param.id,
+            param_hash: p.param.hash.map(hex::encode),
+            param_cell_boc: p.param.cell.as_ref().and_then(|c| {
+                write_boc(c).ok().map(|boc| base64::engine::general_purpose::STANDARD.encode(boc))
+            }),
+            is_critical: p.is_critical,
+            expires: p.expires,
+            expires_in: voting_format_expires(p.expires),
+            voters: p.voters.clone(),
+            weight_remaining: p.weight_remaining,
+            vset_id: hex::encode(p.vset_id),
+            rounds_remaining: p.rounds_remaining,
+            wins: p.wins,
+            losses: p.losses,
+        }
+    }
 }
 
 // --- Master wallet ---
@@ -911,6 +1062,105 @@ fn build_binding_election_status(
 
 #[utoipa::path(
     get,
+    path = "/v1/automation/settings",
+    responses(
+        (status = 200, description = "Contracts automation settings", body = ContractsAutomationSettingsResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_contracts_automation_settings_handler(
+    state: axum::extract::State<AppState>,
+) -> axum::Json<ContractsAutomationSettingsResponse> {
+    let config = state.runtime_cfg.get();
+    axum::Json(ContractsAutomationSettingsResponse { ok: true, result: config.automation.clone() })
+}
+
+fn map_try_update_save(err: TryUpdateSaveError) -> AppError {
+    match err {
+        TryUpdateSaveError::Rejected(msg) => AppError::bad_request(msg),
+        TryUpdateSaveError::Persist(e) => AppError::internal(e.to_string()),
+    }
+}
+
+fn merge_contracts_automation_update(
+    base: &ContractsAutomationConfig,
+    req: &ContractsAutomationSettingsUpdateRequest,
+) -> ContractsAutomationConfig {
+    let mut next = base.clone();
+    if let Some(v) = req.tick_interval_sec {
+        next.tick_interval_sec = v;
+    }
+    if let Some(v) = req.auto_deploy {
+        next.auto_deploy = v;
+    }
+    if let Some(v) = req.auto_topup {
+        next.auto_topup = v;
+    }
+    if let Some(ref patch) = req.wallet {
+        if let Some(v) = patch.deploy {
+            next.wallet.deploy = v;
+        }
+        if let Some(v) = patch.topup {
+            next.wallet.topup = v;
+        }
+        if let Some(v) = patch.threshold {
+            next.wallet.threshold = v;
+        }
+    }
+    if let Some(ref patch) = req.pool {
+        if let Some(v) = patch.snp {
+            next.pool.snp = v;
+        }
+        if let Some(v) = patch.ton_core {
+            next.pool.ton_core = v;
+        }
+    }
+    next
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/automation/settings",
+    request_body = ContractsAutomationSettingsUpdateRequest,
+    responses(
+        (status = 200, description = "Contracts automation settings updated", body = ContractsAutomationSettingsResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_contracts_automation_settings_update_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<ContractsAutomationSettingsUpdateRequest>,
+) -> Result<axum::Json<ContractsAutomationSettingsResponse>, AppError> {
+    let req = req.0;
+    if !req.any_field_set() {
+        return Err(AppError::bad_request("at least one setting is required"));
+    }
+
+    state
+        .runtime_cfg
+        .try_update_and_save(move |cfg| {
+            let next = merge_contracts_automation_update(&cfg.automation, &req);
+            next.validate().map_err(|e| e.to_string())?;
+            cfg.automation = next;
+            Ok(())
+        })
+        .map_err(map_try_update_save)?;
+
+    state.config_changed.notify_one();
+
+    let config = state.runtime_cfg.get();
+    Ok(axum::Json(ContractsAutomationSettingsResponse {
+        ok: true,
+        result: config.automation.clone(),
+    }))
+}
+
+#[utoipa::path(
+    get,
     path = "/v1/log",
     responses(
         (status = 200, description = "Log configuration", body = LogResponse),
@@ -1003,13 +1253,259 @@ async fn extract_public_key(state: &AppState) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Voting API (`/v1/voting/*`)
+//
+// GET routes use `require_nominator`; POST/DELETE use `require_operator`
+// (see `http_server_task::routes`). Mutations use `update_and_save` and
+// `config_changed.notify_one()` like CRUD handlers below.
+// ---------------------------------------------------------------------------
+
+fn parse_voting_proposal_hash_hex(s: &str) -> Result<[u8; 32], AppError> {
+    let s = s.trim();
+    let bytes =
+        hex::decode(s).map_err(|_| AppError::bad_request("proposal hash must be valid hex"))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        AppError::bad_request(format!(
+            "proposal hash must be 32 bytes (64 hex digits), got {} bytes",
+            v.len()
+        ))
+    })
+}
+
+fn voting_format_expires(expires: u32) -> String {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+        as u32;
+    if expires <= now {
+        return "expired".to_string();
+    }
+    let diff = expires - now;
+    let days = diff / 86400;
+    let hours = (diff % 86400) / 3600;
+    let mins = (diff % 3600) / 60;
+    if days > 0 {
+        format!("in {}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("in {}h {}m", hours, mins)
+    } else {
+        format!("in {}m", mins)
+    }
+}
+
+fn row_dto(p: &ConfigProposal, tracked_lower: &[String]) -> VotingProposalRowDto {
+    let hash = hex::encode(p.hash);
+    let tracked = tracked_lower.iter().any(|t| t == &hash);
+    VotingProposalRowDto {
+        hash,
+        param_id: p.param.id,
+        is_critical: p.is_critical,
+        expires: p.expires,
+        expires_in: voting_format_expires(p.expires),
+        voters_count: p.voters.len(),
+        weight_remaining: p.weight_remaining,
+        rounds_remaining: p.rounds_remaining,
+        wins: p.wins,
+        losses: p.losses,
+        tracked,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/voting/config",
+    responses(
+        (status = 200, description = "Voting config snapshot (tracked proposal hashes)", body = VotingConfigResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_voting_config_handler(
+    state: axum::extract::State<AppState>,
+) -> axum::Json<VotingConfigResponse> {
+    let config = state.runtime_cfg.get();
+    let result = match config.voting.as_ref() {
+        Some(v) => {
+            VotingConfigDto { proposals: v.proposals.clone(), tick_interval: v.tick_interval }
+        }
+        None => VotingConfigDto {
+            proposals: vec![],
+            tick_interval: VotingConfig::default().tick_interval,
+        },
+    };
+    axum::Json(VotingConfigResponse { ok: true, result })
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/voting/proposals",
+    responses(
+        (status = 200, description = "Active on-chain proposals with tracked flag", body = VotingProposalsListResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error (e.g. RPC failure)", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_voting_proposals_list_handler(
+    state: axum::extract::State<AppState>,
+) -> Result<axum::Json<VotingProposalsListResponse>, AppError> {
+    let cfg = state.runtime_cfg.get();
+    let tracked_lower: Vec<String> = cfg
+        .voting
+        .as_ref()
+        .map(|v| v.proposals.iter().map(|h| h.to_lowercase()).collect())
+        .unwrap_or_default();
+    let rpc = state.runtime_cfg.rpc_client();
+    let config_contract = ConfigContractImpl::new(contract_provider!(rpc));
+    let proposals = config_contract
+        .list_proposals()
+        .await
+        .map_err(|e| AppError::internal(format!("list_proposals: {e}")))?;
+    let result: Vec<VotingProposalRowDto> =
+        proposals.iter().map(|p| row_dto(p, &tracked_lower)).collect();
+    Ok(axum::Json(VotingProposalsListResponse { ok: true, result }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/voting/proposals/{hash}",
+    params(("hash" = String, Path, description = "Proposal hash (64 hex digits)")),
+    responses(
+        (status = 200, description = "Proposal details", body = VotingProposalDetailResponse),
+        (status = 400, description = "Invalid hash", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 404, description = "Proposal not found on-chain", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_voting_proposals_inspect_handler(
+    state: axum::extract::State<AppState>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> Result<axum::Json<VotingProposalDetailResponse>, AppError> {
+    let hash_bytes = parse_voting_proposal_hash_hex(&hash)?;
+    let rpc = state.runtime_cfg.rpc_client();
+    let config_contract = ConfigContractImpl::new(contract_provider!(rpc));
+    let proposal = config_contract
+        .get_proposal(hash_bytes)
+        .await
+        .map_err(|e| AppError::internal(format!("get_proposal: {e}")))?
+        .ok_or_else(|| AppError::not_found("proposal not found on-chain"))?;
+    let dto = VotingProposalDetailDto::from(&proposal);
+    Ok(axum::Json(VotingProposalDetailResponse { ok: true, result: dto }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/voting/proposals",
+    request_body = VotingProposalAddRequest,
+    responses(
+        (status = 200, description = "Proposal added or already tracked", body = EntityRefResponse),
+        (status = 400, description = "Invalid hash or proposal not on-chain", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 500, description = "Internal error (e.g. RPC failure)", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_voting_proposals_add_handler(
+    state: axum::extract::State<AppState>,
+    req: axum::Json<VotingProposalAddRequest>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let req = req.0;
+    let hash_bytes = parse_voting_proposal_hash_hex(&req.hash)?;
+    let hash_hex = hex::encode(hash_bytes);
+
+    let cfg = state.runtime_cfg.get();
+    let already = cfg
+        .voting
+        .as_ref()
+        .is_some_and(|v| v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)));
+    if already {
+        return Ok(axum::Json(EntityRefResponse {
+            ok: true,
+            result: EntityRefDto { name: hash_hex },
+        }));
+    }
+
+    let rpc = state.runtime_cfg.rpc_client();
+    let config_contract = ConfigContractImpl::new(contract_provider!(rpc));
+    let exists = config_contract
+        .get_proposal(hash_bytes)
+        .await
+        .map_err(|e| AppError::internal(format!("get_proposal: {e}")))?
+        .is_some();
+    if !exists {
+        return Err(AppError::bad_request(format!(
+            "proposal {hash_hex} is not among active on-chain proposals"
+        )));
+    }
+
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            let v = cfg.voting.get_or_insert_with(VotingConfig::default);
+            if !v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)) {
+                v.proposals.push(hash_hex.clone());
+            }
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: hash_hex } }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/voting/proposals/{hash}",
+    params(("hash" = String, Path, description = "Proposal hash (64 hex digits)")),
+    responses(
+        (status = 200, description = "Proposal removed from tracked list", body = EntityRefResponse),
+        (status = 400, description = "Invalid hash", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ApiErrorResponse),
+        (status = 404, description = "Proposal not in voting config", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_voting_proposals_rm_handler(
+    state: axum::extract::State<AppState>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> Result<axum::Json<EntityRefResponse>, AppError> {
+    let hash_bytes = parse_voting_proposal_hash_hex(&hash)?;
+    let hash_hex = hex::encode(hash_bytes);
+
+    let cfg = state.runtime_cfg.get();
+    let in_list = cfg
+        .voting
+        .as_ref()
+        .is_some_and(|v| v.proposals.iter().any(|h| h.eq_ignore_ascii_case(&hash_hex)));
+    if !in_list {
+        return Err(AppError::not_found(format!(
+            "proposal {hash_hex} is not in the voting tracked list"
+        )));
+    }
+    state
+        .runtime_cfg
+        .update_and_save(|cfg| {
+            if let Some(v) = cfg.voting.as_mut() {
+                v.proposals.retain(|h| !h.eq_ignore_ascii_case(&hash_hex));
+            }
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
+
+    Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: hash_hex } }))
+}
+
+// ---------------------------------------------------------------------------
 // Mutation handlers (CRUD)
 //
 // Each handler validates input against the live config, then applies the
 // change via `RuntimeConfigStore::update_and_save`, which persists to
 // disk before swapping the in-memory snapshot (so a write failure leaves the
 // live state untouched). Validation errors map to 400, missing entities to
-// 404, I/O failures to 500. All routes are mounted behind `require_operator`.
+// 404, I/O failures to 500. Routes are mounted behind `require_operator`
+// in `http_server_task::routes`.
 // ---------------------------------------------------------------------------
 
 #[utoipa::path(
@@ -1086,8 +1582,6 @@ pub async fn v1_nodes_rm_handler(
             "cannot remove node '{name}': referenced by a binding"
         )));
     }
-    drop(cfg);
-
     let target = name.clone();
     state
         .runtime_cfg
@@ -1181,8 +1675,6 @@ pub async fn v1_wallets_rm_handler(
             "cannot remove wallet '{name}': referenced by binding for node '{node}'"
         )));
     }
-    drop(cfg);
-
     let target = name.clone();
     state
         .runtime_cfg
@@ -1409,8 +1901,6 @@ pub async fn v1_pools_rm_handler(
             "cannot remove pool '{name}': referenced by binding for node '{node}'"
         )));
     }
-    drop(cfg);
-
     let target = name.clone();
     state
         .runtime_cfg
@@ -1468,8 +1958,6 @@ pub async fn v1_bindings_add_handler(
             )));
         }
     }
-    drop(cfg);
-
     let binding = NodeBinding {
         wallet: req.wallet,
         pool: req.pool,
@@ -1519,8 +2007,6 @@ pub async fn v1_bindings_rm_handler(
             binding.status
         )));
     }
-    drop(cfg);
-
     let target = node.clone();
     state
         .runtime_cfg
@@ -1606,9 +2092,16 @@ pub async fn v1_elections_settings_update_handler(
     if req.reset && req.node.is_none() {
         return Err(AppError::bad_request("reset requires 'node' to be set"));
     }
-    drop(cfg);
 
-    // --- Apply all changes in a single update ---
+    // Best-effort bound for max_factor (same interpretation as load-time validation).
+    let network_limit = state
+        .runtime_cfg
+        .rpc_client()
+        .get_config_param(17)
+        .await
+        .ok()
+        .and_then(|p| extract_max_factor(p).ok());
+
     let policy = req.policy;
     let node = req.node;
     let reset = req.reset;
@@ -1619,26 +2112,19 @@ pub async fn v1_elections_settings_update_handler(
 
     state
         .runtime_cfg
-        .update_and_save(|cfg| {
-            if let Some(elections) = &mut cfg.elections {
-                // Stake policy
-                if reset {
-                    if let Some(ref node_id) = node {
-                        elections.policy_overrides.remove(node_id);
-                    }
-                } else if let Some(policy) = policy {
-                    if let Some(ref node_id) = node {
-                        elections.policy_overrides.insert(node_id.clone(), policy);
-                    } else {
-                        elections.policy = policy;
-                    }
-                }
+        .try_update_and_save(move |cfg| {
+            let elections =
+                cfg.elections.as_mut().ok_or_else(|| "elections are not configured".to_string())?;
 
-                if let Some(seconds) = tick_interval {
-                    elections.tick_interval = seconds;
+            if reset {
+                if let Some(ref node_id) = node {
+                    elections.policy_overrides.remove(node_id);
                 }
-                if let Some(value) = max_factor {
-                    elections.max_factor = value;
+            } else if let Some(policy) = policy {
+                if let Some(ref node_id) = node {
+                    elections.policy_overrides.insert(node_id.clone(), policy);
+                } else {
+                    elections.policy = policy;
                 }
                 if let Some(v) = sleep_period_pct {
                     elections.sleep_period_pct = v;
@@ -1647,8 +2133,18 @@ pub async fn v1_elections_settings_update_handler(
                     elections.waiting_period_pct = v;
                 }
             }
+
+            if let Some(seconds) = tick_interval {
+                elections.tick_interval = seconds;
+            }
+            if let Some(value) = max_factor {
+                elections.max_factor = value;
+            }
+
+            elections.validate(network_limit).map_err(|e| e.to_string())?;
+            Ok(())
         })
-        .map_err(|e| AppError::internal(e.to_string()))?;
+        .map_err(map_try_update_save)?;
 
     // Restart elections task so changes take effect immediately.
     let task = state.elections_task.clone();
@@ -1842,8 +2338,6 @@ pub async fn v1_elections_static_adnl_handler(
     if !cfg.nodes.contains_key(&node_name) {
         return Err(AppError::bad_request(format!("node '{}' not found", node_name)));
     }
-    drop(cfg);
-
     let mut adnl_configs = state.runtime_cfg.node_adnl_configs().await;
     let adnl_config = adnl_configs
         .remove(&node_name)
