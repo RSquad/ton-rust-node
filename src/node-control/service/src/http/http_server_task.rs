@@ -11,9 +11,13 @@ use super::{
         BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
         ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
         NodeDto, NodesResponse, PoolDto, PoolsResponse, StaticAdnlDto, StaticAdnlResponse,
-        TonCorePoolSlotDto, WalletDto, WalletsResponse, v1_bindings_handler,
+        TonCorePoolSlotDto, VotingConfigDto, VotingConfigResponse, VotingProposalAddRequest,
+        VotingProposalDetailDto, VotingProposalDetailResponse, VotingProposalRowDto,
+        VotingProposalsListResponse, WalletDto, WalletsResponse, v1_bindings_handler,
         v1_elections_settings_handler, v1_log_handler, v1_master_wallet_handler, v1_nodes_handler,
-        v1_pools_handler, v1_wallets_handler,
+        v1_pools_handler, v1_voting_config_handler, v1_voting_proposals_add_handler,
+        v1_voting_proposals_inspect_handler, v1_voting_proposals_list_handler,
+        v1_voting_proposals_rm_handler, v1_wallets_handler,
     },
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
@@ -162,6 +166,12 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
         .route("/v1/pools", axum::routing::get(v1_pools_handler))
         .route("/v1/bindings", axum::routing::get(v1_bindings_handler))
         .route("/v1/log", axum::routing::get(v1_log_handler))
+        .route("/v1/voting/config", axum::routing::get(v1_voting_config_handler))
+        .route("/v1/voting/proposals", axum::routing::get(v1_voting_proposals_list_handler))
+        .route(
+            "/v1/voting/proposals/{hash}",
+            axum::routing::get(v1_voting_proposals_inspect_handler),
+        )
         .route("/v1/master-wallet", axum::routing::get(v1_master_wallet_handler))
         .route("/auth/me", axum::routing::get(me_handler))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -180,6 +190,8 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
             "/v1/elections/static-adnl",
             axum::routing::post(super::config_handlers::v1_elections_static_adnl_handler),
         )
+        .route("/v1/voting/proposals", axum::routing::post(v1_voting_proposals_add_handler))
+        .route("/v1/voting/proposals/{hash}", axum::routing::delete(v1_voting_proposals_rm_handler))
         .route("/v1/task/elections", axum::routing::post(v1_task_elections_handler))
         .route("/v1/nodes", axum::routing::post(super::config_handlers::v1_nodes_add_handler))
         .route(
@@ -858,6 +870,11 @@ impl utoipa::Modify for BearerAuthAddon {
         super::config_handlers::v1_log_set_handler,
         super::config_handlers::v1_elections_settings_handler,
         super::config_handlers::v1_log_handler,
+        super::config_handlers::v1_voting_config_handler,
+        super::config_handlers::v1_voting_proposals_list_handler,
+        super::config_handlers::v1_voting_proposals_inspect_handler,
+        super::config_handlers::v1_voting_proposals_add_handler,
+        super::config_handlers::v1_voting_proposals_rm_handler,
         super::config_handlers::v1_master_wallet_handler,
         login_handler,
         me_handler,
@@ -911,6 +928,13 @@ impl utoipa::Modify for BearerAuthAddon {
         ElectionsSettingsResponse,
         LogDto,
         LogResponse,
+        VotingConfigDto,
+        VotingConfigResponse,
+        VotingProposalAddRequest,
+        VotingProposalRowDto,
+        VotingProposalsListResponse,
+        VotingProposalDetailDto,
+        VotingProposalDetailResponse,
         MasterWalletDto,
         MasterWalletResponse,
         LoginRequest,
@@ -1450,6 +1474,9 @@ mod tests {
         assert!(v["paths"].as_object().unwrap().contains_key("/health"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/elections"));
         assert!(v["paths"].as_object().unwrap().contains_key("/v1/validators"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/config"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/proposals"));
+        assert!(v["paths"].as_object().unwrap().contains_key("/v1/voting/proposals/{hash}"));
         let schemas = v["components"]["schemas"].as_object().unwrap();
         assert!(schemas.contains_key("ElectionsStatus"));
         assert!(schemas.contains_key("NodeListRequest"));
