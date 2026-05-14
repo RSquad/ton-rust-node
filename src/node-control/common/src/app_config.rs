@@ -437,7 +437,7 @@ impl AdnlConfig {
 
         Ok(AdnlClientConfig::new(
             Some(client_key_opt),
-            resolve_ip(&self.server_address)?,
+            resolve_ip(&self.server_address).await?,
             server_key,
             timeouts,
         ))
