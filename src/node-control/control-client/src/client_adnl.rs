@@ -523,6 +523,19 @@ mod tests {
         let probe_elapsed = probe_done.duration_since(start);
         let connect_elapsed = connect_done.duration_since(start);
 
+        // If the environment returns a near-instant connect error (e.g. a CI
+        // sandbox without a default route, giving EHOSTUNREACH), the slow
+        // path is not exercised and the starvation check is meaningless.
+        // Skip rather than fail in that case.
+        if connect_elapsed < Duration::from_millis(100) {
+            eprintln!(
+                "skipping starvation check: connect to {} returned in {:?} \
+                 (environment does not block the route)",
+                blackhole, connect_elapsed,
+            );
+            return;
+        }
+
         assert!(
             probe_elapsed < Duration::from_millis(500),
             "probe took {probe_elapsed:?}; runtime appears starved by ADNL connect"

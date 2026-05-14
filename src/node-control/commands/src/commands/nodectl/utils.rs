@@ -63,11 +63,21 @@ pub(crate) fn build_api_client_with_timeouts(
 }
 
 fn read_timeout_env(var: &str, default: tokio::time::Duration) -> tokio::time::Duration {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(tokio::time::Duration::from_secs)
-        .unwrap_or(default)
+    match std::env::var(var) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(secs) => tokio::time::Duration::from_secs(secs),
+            Err(_) => {
+                tracing::warn!(
+                    "invalid {}={:?} (expected integer seconds), falling back to default {:?}",
+                    var,
+                    raw,
+                    default,
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 /// Map a `reqwest::Error` into an actionable user-facing error for service
