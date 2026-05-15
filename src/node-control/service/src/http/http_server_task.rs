@@ -11,13 +11,14 @@ use super::{
         BindingDto, BindingElectionStatusDto, BindingsResponse, ElectionsSettingsDto,
         ElectionsSettingsResponse, LogDto, LogResponse, MasterWalletDto, MasterWalletResponse,
         NodeDto, NodesResponse, PoolDto, PoolsResponse, StaticAdnlDto, StaticAdnlResponse,
-        TonCorePoolSlotDto, VotingConfigDto, VotingConfigResponse, VotingProposalAddRequest,
-        VotingProposalDetailDto, VotingProposalDetailResponse, VotingProposalRowDto,
-        VotingProposalsListResponse, WalletDto, WalletsResponse, v1_bindings_handler,
-        v1_contracts_automation_settings_handler, v1_elections_settings_handler, v1_log_handler,
-        v1_master_wallet_handler, v1_nodes_handler, v1_pools_handler, v1_voting_config_handler,
-        v1_voting_proposals_add_handler, v1_voting_proposals_inspect_handler,
-        v1_voting_proposals_list_handler, v1_voting_proposals_rm_handler, v1_wallets_handler,
+        TonCorePoolSlotDataSource, TonCorePoolSlotDto, VotingConfigDto, VotingConfigResponse,
+        VotingProposalAddRequest, VotingProposalDetailDto, VotingProposalDetailResponse,
+        VotingProposalRowDto, VotingProposalsListResponse, WalletDto, WalletsResponse,
+        v1_bindings_handler, v1_contracts_automation_settings_handler,
+        v1_elections_settings_handler, v1_log_handler, v1_master_wallet_handler, v1_nodes_handler,
+        v1_pools_handler, v1_voting_config_handler, v1_voting_proposals_add_handler,
+        v1_voting_proposals_inspect_handler, v1_voting_proposals_list_handler,
+        v1_voting_proposals_rm_handler, v1_wallets_handler,
     },
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
@@ -924,6 +925,7 @@ impl utoipa::Modify for BearerAuthAddon {
         WalletsResponse,
         PoolDto,
         PoolsResponse,
+        TonCorePoolSlotDataSource,
         TonCorePoolSlotDto,
         BindingDto,
         BindingsResponse,
@@ -1196,6 +1198,62 @@ mod tests {
         let elections = cfg.elections.as_ref().unwrap();
         assert!(matches!(elections.policy, StakePolicy::Minimum));
         assert!(matches!(elections.policy_overrides.get("node1"), Some(StakePolicy::Fixed(500))));
+    }
+
+    #[tokio::test]
+    async fn elections_settings_adaptive_timing_invalid_returns_400() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let app = routes(false, test_state(store, runtime_cfg, elections_task).await);
+
+        let resp = app
+            .oneshot(post_json(
+                "/v1/elections/settings",
+                &serde_json::json!({ "sleep_period_pct": 0.9, "waiting_period_pct": 0.2 }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn elections_settings_adaptive_timing_update_returns_200() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let state = test_state(store, runtime_cfg.clone(), elections_task).await;
+        let app = routes(false, state);
+
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/v1/elections/settings",
+                &serde_json::json!({ "sleep_period_pct": 0.25, "waiting_period_pct": 0.75 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["sleep_period_pct"], 0.25);
+        assert_eq!(v["result"]["waiting_period_pct"], 0.75);
+
+        let cfg = runtime_cfg.get();
+        let elections = cfg.elections.as_ref().unwrap();
+        assert_eq!(elections.sleep_period_pct, 0.25);
+        assert_eq!(elections.waiting_period_pct, 0.75);
+
+        let resp = app.oneshot(get_request("/v1/elections/settings")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["result"]["sleep_period_pct"], 0.25);
+        assert_eq!(v["result"]["waiting_period_pct"], 0.75);
     }
 
     #[tokio::test]

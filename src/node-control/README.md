@@ -337,7 +337,8 @@ nodectl config pool add --name pool0 --owner "-1:owner_address"
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--validator-share` | | Slot deploy: reward share in **basis points** (e.g. `1000` = 10%). Required when adding deploy params without an existing `--address`. |
+| `--validator-share` | | Slot deploy: reward share in **basis points** (`100` = 1%; must be **below 10000** so nominators earn rewards, e.g. `5000` = 50%). Mutually exclusive with `--validator-share-percent`. |
+| `--validator-share-percent` | | Same as share above but as a **percent** (`[0, 100)`, not 100 — nominators need a reward share). Decimals allowed (e.g. `50.4` → 5040 bp). |
 | `--max-nominators` | | Optional; default from contract defaults |
 | `--min-validator-stake` | | Optional; minimum validator stake in **TON** |
 | `--min-nominator-stake` | | Optional; minimum nominator stake in **TON** |
@@ -345,21 +346,22 @@ nodectl config pool add --name pool0 --owner "-1:owner_address"
 | `--even` | | Configure slot 0 (even rounds), required unless `--odd` is set |
 | `--odd` | | Configure slot 1 (odd rounds), required unless `--even` is set |
 
-At least one of `--address` or `--validator-share` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
+At least one of `--address`, `--validator-share`, or `--validator-share-percent` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
 
 ```bash
-# TONCore: configure slot 0 (even)
+# TONCore: configure slot 0 (even) — 50% validator share via basis points or percent
 nodectl config pool add core --name pool0 --validator-share 5000 --even
+nodectl config pool add core --name pool0 --validator-share-percent 50 --even
 
 # Configure both slots with explicit separate commands
 nodectl config pool add core \
   --name pool0 \
-  --validator-share 5000 \
+  --validator-share-percent 50 \
   --min-validator-stake 10000 \
   --even
 nodectl config pool add core \
   --name pool0 \
-  --validator-share 5000 \
+  --validator-share-percent 50.4 \
   --min-validator-stake 10001 \
   --odd
 
@@ -376,7 +378,17 @@ nodectl config pool add core \
 
 ##### `config pool ls`
 
-List all configured pools.
+List all configured pools. For **TONCore** slots, if the pool contract is not on-chain yet (or RPC cannot read it), the table shows **not deployed** (or **error** only for real failures) and fills **Share**, **Validator**, **Min nom. stake**, etc. from the **local slot config** when those values were set at `config pool add core` time.
+
+The TONCore table includes a **Src** column showing where deploy-style fields (validator share, stake thresholds) ultimately came from:
+
+| Value | Meaning |
+|-------|---------|
+| `chain` | Read live from the pool contract via `get_pool_data` |
+| `config` | Filled from the local slot config because `get_pool_data` was not called or failed (account not active or RPC error) |
+| `-` | Neither chain nor config provided deploy-style fields |
+
+JSON output exposes the same signal as a `data_source` field on each slot (omitted when no deploy-style fields are present).
 
 ```bash
 nodectl config pool ls
@@ -400,10 +412,12 @@ nodectl config pool rm --name pool0
 
 Deposit validator funds into a TONCore nominator pool. Builds and sends the on-chain deposit message through the binding's configured wallet.
 
+The pool contract charges a **fixed 1 TON processing fee** on each validator deposit (the credited `validator_amount` is the message value minus that fee). nodectl sends **`--amount` + 1 TON** on-chain so the stake credited to the validator matches **`--amount`**.
+
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--binding <NAME>` | `-b` | Binding name (resolves wallet and pool) |
-| `--amount <TON>` | `-a` | Amount in TON to deposit |
+| `--amount <TON>` | `-a` | Validator stake to credit (TON); the outbound message value adds the pool’s 1 TON fee |
 | `--pool-even` | | Use the pool for even validation rounds (default if neither flag is set) |
 | `--pool-odd` | | Use the pool for odd validation rounds |
 | `--yes` | | Skip the interactive confirmation prompt |
@@ -578,7 +592,7 @@ nodectl config log set --level warn --max-size-mb 100 --max-files 5
 
 #### `config elections`
 
-Manage elections configuration, including stake policies, tick intervals, and per-binding election participation.
+Manage elections configuration, including stake policies, tick intervals, AdaptiveSplit50 wait-window fractions (`config elections wait`, alias `wait-pct`), and per-binding election participation.
 
 ##### `config elections show`
 
@@ -645,6 +659,31 @@ Set the maximum stake factor for elections. The value must be between **1.0** an
 
 ```bash
 nodectl config elections max-factor 2.5
+```
+
+##### `config elections wait`
+
+Set the **AdaptiveSplit50 staking window**: earliest stake submission and latest deadline for waiting on peers (fractions of the election duration, **[0.0, 1.0]**). These map to `sleep_period_pct` (`--min`) and `waiting_period_pct` (`--max`) in config.
+
+Subcommand alias: `wait-pct` (same flags).
+
+They apply **only** when the stake policy is **adaptive_split50**; for `minimum`, `split50`, and `fixed` the values are stored but unused.
+
+The service merges with current settings and validates the pair (**min ≤ max**) on **each** update — partial updates are fine (`--min` only, `--max` only, or both).
+
+| Flag | Config field | Description |
+|------|----------------|-------------|
+| `--min <FRAC>` | `sleep_period_pct` | Earliest fraction at which staking may proceed |
+| `--max <FRAC>` | `waiting_period_pct` | Latest fraction for waiting on peers |
+
+At least one flag is required. Run `nodectl config elections wait --help` for full semantics.
+
+```bash
+nodectl config elections wait --min 0.15 --max 0.45
+nodectl config elections wait --min 0.15
+nodectl config elections wait --max 0.45
+# equivalent:
+nodectl config elections wait-pct --min 0.15 --max 0.45
 ```
 
 ##### `config elections enable`
@@ -1162,8 +1201,8 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | GET | `/v1/elections` | N | Current elections snapshot |
 | POST | `/v1/elections/exclude` | O | Disable elections for given bindings |
 | POST | `/v1/elections/include` | O | Enable elections for given bindings |
-| GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, per-binding status) |
-| POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor) |
+| GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, adaptive sleep/wait fractions, per-binding status) |
+| POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor, `sleep_period_pct`, `waiting_period_pct`) |
 | GET | `/v1/automation/settings` | N | Contracts task settings (auto-deploy, auto-topup, amounts, tick) |
 | POST | `/v1/automation/settings` | O | Update contracts task settings (partial JSON: tick/toggles and nested `wallet` / `pool`, nanotons) |
 | POST | `/v1/elections/static-adnl` | O | Generate and assign a persistent ADNL address for a node |
@@ -1335,6 +1374,8 @@ Return the effective elections configuration plus per-binding status.
     "policy_overrides": { "node0": { "fixed": 500000000000 } },
     "max_factor": 3.0,
     "tick_interval": 40,
+    "sleep_period_pct": 0.2,
+    "waiting_period_pct": 0.4,
     "bindings": [
       {
         "name": "node0",
@@ -1360,6 +1401,8 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
 | `reset` | `bool` | Remove a per-node override (requires `node`) |
 | `tick_interval` | `u64` | Elections tick interval in seconds |
 | `max_factor` | `f32` | Validated against masterchain config param 17 |
+| `sleep_period_pct` | `f64` | AdaptiveSplit50 minimum wait as a fraction of election duration; must be in `[0.0, 1.0]` and ≤ `waiting_period_pct` |
+| `waiting_period_pct` | `f64` | AdaptiveSplit50 maximum wait for participants; must be in `[0.0, 1.0]` and ≥ `sleep_period_pct` |
 
 `StakePolicy` is `"minimum"`, `"split50"`, `"adaptive_split50"`, or `{ "fixed": <nanotons> }`.
 
@@ -1395,6 +1438,8 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
     "policy_overrides": {},
     "max_factor": 2.5,
     "tick_interval": 60,
+    "sleep_period_pct": 0.2,
+    "waiting_period_pct": 0.4,
     "bindings": []
   }
 }
@@ -2152,6 +2197,9 @@ nodectl config elections tick-interval 60
 
 # Set max factor
 nodectl config elections max-factor 2.5
+
+# AdaptiveSplit50 timing (fractions of election duration, [0.0, 1.0])
+nodectl config elections wait --min 0.15 --max 0.45
 ```
 
 ### Authentication Setup

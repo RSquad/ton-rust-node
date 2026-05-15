@@ -34,6 +34,12 @@ pub enum ElectionsAction {
     TickInterval(TickIntervalCmd),
     /// Set the max-factor
     MaxFactor(MaxFactorCmd),
+    /// Set the AdaptiveSplit50 staking window — when to start staking and how long to wait for peers.
+    ///
+    /// Only used when the stake policy is `adaptive_split50`; ignored for `minimum`, `split50`,
+    /// and `fixed`.
+    #[command(alias = "wait-pct")]
+    Wait(WaitCmd),
     /// Enable elections for binding(s)
     Enable(EnableCmd),
     /// Disable elections for binding(s)
@@ -83,6 +89,29 @@ pub struct MaxFactorCmd {
 }
 
 #[derive(clap::Args, Clone)]
+pub struct WaitCmd {
+    /// Earliest stake submission, as fraction of election duration
+    #[arg(
+        long,
+        help = "Earliest stake submission, as fraction of election duration",
+        long_help = "Defer staking until this fraction of the election window has elapsed, \
+                     even when there are already enough peers. Range [0.0, 1.0]; default 0.2. \
+                     Only applied under the adaptive_split50 stake policy."
+    )]
+    min: Option<f64>,
+    /// Latest peer-wait deadline, as fraction of election duration
+    #[arg(
+        long,
+        help = "Latest peer-wait deadline, as fraction of election duration",
+        long_help = "Keep waiting for enough peers until this fraction of the election window. \
+                     After this point, stake regardless of peer count. Range [0.0, 1.0]; \
+                     must be \u{2265} --min; default 0.4. Only applied under the adaptive_split50 \
+                     stake policy."
+    )]
+    max: Option<f64>,
+}
+
+#[derive(clap::Args, Clone)]
 pub struct EnableCmd {
     #[arg(required = true, help = "Binding name(s) to enable for elections")]
     nodes: Vec<String>,
@@ -112,6 +141,7 @@ impl ElectionsCfgCmd {
             ElectionsAction::StakePolicy(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::TickInterval(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::MaxFactor(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::Wait(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Enable(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Disable(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::StaticAdnl(cmd) => cmd.run(url, token, config_path).await,
@@ -152,6 +182,9 @@ struct ElectionsSettingsView {
     policy_overrides: HashMap<String, StakePolicy>,
     max_factor: f32,
     tick_interval: u64,
+    sleep_period_pct: f64,
+    waiting_period_pct: f64,
+    #[serde(default)]
     bindings: Vec<BindingElectionView>,
 }
 
@@ -167,9 +200,11 @@ struct BindingElectionView {
 
 fn print_elections_settings_table(view: &ElectionsSettingsView) {
     println!("\n{} {}\n", "OK".green().bold(), "Elections Configuration".green());
-    println!("  {:<20} {}", "Stake Policy:".cyan().bold(), view.stake_policy);
-    println!("  {:<20} {}", "Max Factor:".cyan().bold(), view.max_factor);
-    println!("  {:<20} {}s", "Tick Interval:".cyan().bold(), view.tick_interval);
+    println!("  {:<28} {}", "Stake Policy:".cyan().bold(), view.stake_policy);
+    println!("  {:<28} {}", "Max Factor:".cyan().bold(), view.max_factor);
+    println!("  {:<28} {}s", "Tick Interval:".cyan().bold(), view.tick_interval);
+    println!("  {:<28} {}", "Adaptive sleep fraction:".cyan().bold(), view.sleep_period_pct);
+    println!("  {:<28} {}", "Adaptive wait fraction:".cyan().bold(), view.waiting_period_pct);
 
     if !view.policy_overrides.is_empty() {
         println!("\n  {}", "Policy Overrides:".cyan().bold());
@@ -259,6 +294,10 @@ struct ElectionsSettingsBody {
     tick_interval: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_factor: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sleep_period_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_period_pct: Option<f64>,
 }
 
 const ELECTIONS_SETTINGS_PATH: &str = "/v1/elections/settings";
@@ -357,6 +396,47 @@ impl MaxFactorCmd {
         match max_factor {
             Some(v) => println!("{} Max factor set to {v}", "OK".green().bold()),
             None => println!("{} Max factor set to {}", "OK".green().bold(), self.value),
+        }
+        Ok(())
+    }
+}
+
+impl WaitCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if self.min.is_none() && self.max.is_none() {
+            anyhow::bail!("specify at least one of --min or --max");
+        }
+        let base_url = resolve_service_url(url, config_path)?;
+        api_post(
+            &base_url,
+            ELECTIONS_SETTINGS_PATH,
+            token,
+            &ElectionsSettingsBody {
+                sleep_period_pct: self.min,
+                waiting_period_pct: self.max,
+                ..Default::default()
+            },
+        )
+        .await?;
+        match (self.min, self.max) {
+            (Some(mn), Some(mx)) => println!(
+                "{} sleep_period_pct (--min)={}, waiting_period_pct (--max)={}",
+                "OK".green().bold(),
+                mn,
+                mx
+            ),
+            (Some(mn), None) => {
+                println!("{} sleep_period_pct (--min) set to {}", "OK".green().bold(), mn)
+            }
+            (None, Some(mx)) => {
+                println!("{} waiting_period_pct (--max) set to {}", "OK".green().bold(), mx)
+            }
+            (None, None) => unreachable!("validated above"),
         }
         Ok(())
     }
