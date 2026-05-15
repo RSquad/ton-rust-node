@@ -192,6 +192,10 @@ pub struct BindingElectionStatusDto {
     pub stake_policy: StakePolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_adnl: Option<String>,
+    /// When true, the node opts out of the static ADNL default and gets a fresh
+    /// ephemeral ADNL address every election cycle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub static_adnl_disabled: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -1054,6 +1058,7 @@ fn build_binding_election_status(
             status: b.status,
             stake_policy: elections.stake_policy(name).clone(),
             static_adnl: elections.static_adnls.get(name).cloned(),
+            static_adnl_disabled: elections.static_adnl_disabled.contains(name),
         })
         .collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2359,11 +2364,53 @@ pub async fn v1_elections_static_adnl_handler(
         .runtime_cfg
         .update_and_save(|cfg| {
             let elections = cfg.elections.get_or_insert_with(ElectionsConfig::default);
-            elections.static_adnls.insert(node, b64);
+            elections.static_adnls.insert(node.clone(), b64);
+            // Rotation re-enables the static ADNL default if it was previously opted out.
+            elections.static_adnl_disabled.remove(&node);
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
     tracing::info!("node [{}] static ADNL address set: {}", node_name, adnl_b64);
     Ok(axum::Json(StaticAdnlResponse { ok: true, result: StaticAdnlDto { adnl_addr: adnl_b64 } }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/elections/static-adnl/{node}",
+    params(("node" = String, Path, description = "Node name to opt out of static ADNL")),
+    responses(
+        (status = 200, description = "Static ADNL disabled for node", body = OkResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 401, description = "Not authenticated", body = ApiErrorResponse),
+        (status = 500, description = "Internal error", body = ApiErrorResponse)
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn v1_elections_static_adnl_disable_handler(
+    state: axum::extract::State<AppState>,
+    axum::extract::Path(node_name): axum::extract::Path<String>,
+) -> Result<axum::Json<OkResponse>, AppError> {
+    let cfg = state.runtime_cfg.get();
+    if cfg.elections.is_none() {
+        return Err(AppError::bad_request("elections are not configured"));
+    }
+    if !cfg.nodes.contains_key(&node_name) {
+        return Err(AppError::bad_request(format!("node '{}' not found", node_name)));
+    }
+    drop(cfg);
+
+    let node = node_name.clone();
+    state
+        .runtime_cfg
+        .update_and_save(move |cfg| {
+            let elections = cfg.elections.get_or_insert_with(ElectionsConfig::default);
+            elections.static_adnls.remove(&node);
+            elections.static_adnl_disabled.insert(node);
+        })
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.config_changed.notify_one();
+
+    tracing::info!("node [{}] static ADNL disabled (ephemeral per cycle)", node_name);
+    Ok(axum::Json(OkResponse { ok: true }))
 }
