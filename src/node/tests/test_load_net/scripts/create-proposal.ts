@@ -91,7 +91,7 @@ export async function run(provider: NetworkProvider) {
             refs + 2, // from config-code.fc
         );
         if (price < 0) {
-            throw new Error(`proposal expiresIn is les then minimum`);
+            throw new Error(`proposal expiresIn is less than minimum (see config param 11 minStoreSec)`);
         }
         console.log(`proposal price: ${fromNano(price)} TON`);
 

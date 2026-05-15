@@ -21,7 +21,7 @@ use axum::body::Body;
 use common::{
     app_config::{
         AppConfig, HttpConfig, PoolConfig, TonCoreDeployLayout, TonCoreInitParams,
-        TonCorePoolConfig,
+        TonCorePoolConfig, VotingConfig,
     },
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
@@ -57,13 +57,12 @@ fn empty_app_cfg() -> Arc<AppConfig> {
         voting: None,
         master_wallet: None,
         tick_interval: 30,
+        automation: Default::default(),
         log: Some(Default::default()),
     })
 }
 
-async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
-    let mut cfg = (*empty_app_cfg()).clone();
-    cfg.pools = pools;
+async fn state_from_cfg(cfg: AppConfig) -> AppState {
     let rt = Arc::new(RuntimeConfigStore::from_app_config(Arc::new(cfg)));
     let jwt_auth = Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap());
     AppState {
@@ -77,6 +76,12 @@ async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
     }
 }
 
+async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
+    let mut cfg = (*empty_app_cfg()).clone();
+    cfg.pools = pools;
+    state_from_cfg(cfg).await
+}
+
 async fn json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -84,6 +89,10 @@ async fn json(resp: axum::response::Response) -> serde_json::Value {
 
 fn get(uri: &str) -> axum::http::Request<Body> {
     axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn delete(uri: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder().method("DELETE").uri(uri).body(Body::empty()).unwrap()
 }
 
 fn post_json(uri: &str, body: &impl serde::Serialize) -> axum::http::Request<Body> {
@@ -103,6 +112,89 @@ async fn pools_empty() {
     let v = json(resp).await;
     assert_eq!(v["ok"], true);
     assert_eq!(v["result"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn voting_config_empty_when_voting_section_absent() {
+    let st = state_with_pools(HashMap::new()).await;
+    let resp = routes(false, st).oneshot(get("/v1/voting/config")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let v = json(resp).await;
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["proposals"], serde_json::json!([]));
+    assert_eq!(v["result"]["tick_interval"], 40);
+}
+
+#[tokio::test]
+async fn voting_config_reflects_runtime_section() {
+    let mut cfg = (*empty_app_cfg()).clone();
+    let hash_hex = "aa".repeat(32);
+    cfg.voting = Some(VotingConfig { proposals: vec![hash_hex.clone()], tick_interval: 77 });
+    let st = state_from_cfg(cfg).await;
+    let resp = routes(false, st).oneshot(get("/v1/voting/config")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let v = json(resp).await;
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["proposals"], serde_json::json!([hash_hex]));
+    assert_eq!(v["result"]["tick_interval"], 77);
+}
+
+#[tokio::test]
+async fn voting_proposal_add_already_tracked_returns_200_without_chain() {
+    let mut cfg = (*empty_app_cfg()).clone();
+    let h = "bb".repeat(32);
+    cfg.voting = Some(VotingConfig { proposals: vec![h.clone()], tick_interval: 40 });
+    let st = state_from_cfg(cfg).await;
+    let body = serde_json::json!({ "hash": h });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/voting/proposals")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = routes(false, st).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn voting_proposal_add_invalid_hash_returns_400() {
+    let st = state_with_pools(HashMap::new()).await;
+    let body = serde_json::json!({ "hash": "not_hex" });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/voting/proposals")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = routes(false, st).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn voting_proposal_rm_unknown_returns_404() {
+    let st = state_with_pools(HashMap::new()).await;
+    let h = "cc".repeat(32);
+    let resp =
+        routes(false, st).oneshot(delete(&format!("/v1/voting/proposals/{h}"))).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn voting_proposal_rm_removes_tracked_hash() {
+    let mut cfg = (*empty_app_cfg()).clone();
+    let h1 = "dd".repeat(32);
+    let h2 = "ee".repeat(32);
+    cfg.voting = Some(VotingConfig { proposals: vec![h1.clone(), h2.clone()], tick_interval: 40 });
+    let st = state_from_cfg(cfg).await;
+    let app = routes(false, st.clone());
+    let resp = app.oneshot(delete(&format!("/v1/voting/proposals/{h1}"))).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp2 = routes(false, st).oneshot(get("/v1/voting/config")).await.unwrap();
+    let v = json(resp2).await;
+    let proposals = v["result"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0], h2);
 }
 
 #[tokio::test]
@@ -136,10 +228,11 @@ async fn pools_snp_shape_preserved() {
 }
 
 #[tokio::test]
-async fn pools_toncore_slot_with_no_address_is_not_deployed() {
+async fn pools_toncore_slot_with_no_address_is_not_deployed_with_config_fallback() {
     // Slot configured with params but no address and no binding → pool isn't
     // on-chain yet. Handler should emit a "not deployed" slot entry rather
-    // than failing or guessing an address.
+    // than failing or guessing an address, and merge deploy params from config
+    // (validator_share, max_nominators, etc.) into the response.
     let mut pools = HashMap::new();
     pools.insert(
         "core1".to_string(),
@@ -174,7 +267,9 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed() {
     assert_eq!(slots[0]["state"], "not deployed");
     assert!(slots[0].get("address").is_none());
     assert!(slots[0].get("balance").is_none());
-    assert!(slots[0].get("validator_share").is_none());
+    assert_eq!(slots[0]["validator_share"], 4000);
+    assert_eq!(slots[0]["max_nominators"], 40);
+    assert_eq!(slots[0]["data_source"], "config");
     assert_eq!(slots[0]["deploy_layout"], "embedded_code");
 }
 
@@ -192,7 +287,12 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
                         "-1:0000000000000000000000000000000000000000000000000000000000000001"
                             .into(),
                     ),
-                    params: None,
+                    params: Some(TonCoreInitParams {
+                        validator_share: 4000,
+                        max_nominators: 40,
+                        min_validator_stake: 10_000_000_000_000,
+                        min_nominator_stake: 10_000_000_000_000,
+                    }),
                     ..Default::default()
                 }),
                 Some(TonCorePoolConfig {
@@ -217,11 +317,16 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
     assert_eq!(slots[0]["slot"], "even");
     assert_eq!(slots[1]["slot"], "odd");
     for slot in slots {
-        // RPC failed → state encoded into DTO, not bubbled up.
-        assert_eq!(slot["state"], "error");
-        assert!(slot.get("balance").is_none());
+        // RPC may fail entirely (`error`) or return success with an uninitialized account
+        // (`not deployed`) depending on local ton-http-api — both mean no live pool view.
+        let st = slot["state"].as_str().unwrap();
+        assert!(matches!(st, "error" | "not deployed"), "unexpected state {st:?}");
         assert!(slot["address"].is_string());
     }
+    // Even slot had deploy params in config — still exposed when RPC is down.
+    assert_eq!(slots[0]["validator_share"], 4000);
+    assert_eq!(slots[0]["data_source"], "config");
+    assert!(slots[1].get("data_source").is_none());
 }
 
 // ---------------------------------------------------------------------------

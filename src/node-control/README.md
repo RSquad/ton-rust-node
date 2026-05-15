@@ -75,6 +75,7 @@ There are several types of commands:
 
 - **TON HTTP API commands** — retrieve blockchain data
 - **Configuration commands** — generate and manage config files (nodes, wallets, pools, bindings, elections)
+- **Automation** — contracts task (auto-deploy / auto-topup): top-level `nodectl automation` talks to the service API; see **[Contracts automation](./docs/contracts-automation.md)**
 - **Key management commands** — generate, import, and manage vault keys
 - **Deploy commands** — deploy wallets and nominator pools
 - **Service API commands** — interact with a running nodectl daemon
@@ -115,7 +116,7 @@ The binary will be available at `target/release/nodectl`.
 | `--help` / `-h` | Show help |
 | `--version` / `-V` | Show version |
 
-> **Note:** The `--config` (`-c`) flag is specified per subcommand (e.g. `nodectl service -c config.json`, `nodectl config-param -c config.json 34`), not globally.
+> **Note:** The `--config` (`-c`) flag is specified per subcommand (e.g. `nodectl service -c config.json`, `nodectl config-param -c config.json 34`), not globally. The **`vote`** subcommand is an exception: it also accepts global **`--url` / `-u`**, **`--token`**, and **`--config`** (same resolution rules as `nodectl config` / `nodectl api`).
 
 ---
 
@@ -126,9 +127,40 @@ To enable detailed logging output, use the RUST_LOG environment variable (availa
 RUST_LOG=debug nodectl ...
 ```
 
+### Automation command
+
+REST client for **`/v1/automation/settings`**. Uses the same URL / JWT / `--config` resolution as [`config`](#configuration-commands) (`--url` / `-u`, `NODECTL_URL`, `--token`, `NODECTL_API_TOKEN`, `--config`, `CONFIG_PATH`).
+
+| Subcommand | Purpose |
+|------------|---------|
+| `ls` | Show settings (`--format table` or `json`) |
+| `tick <SEC>` | Contracts task tick interval (seconds) |
+| `wallet` | Wallet deploy / top-up / threshold in **TON**: `--deploy`, `--topup`, `--threshold` (at least one required) |
+| `pool` | Pool deploy amounts in **TON**: `--deploy` applies to both SNP and TONCore; `--snp` / `--ton-core` override that kind (at least one flag required) |
+| `enable deploy` \| `enable topup` | Turn auto-deploy or auto-topup **on** |
+| `disable deploy` \| `disable topup` | Turn auto-deploy or auto-topup **off** |
+
+```bash
+nodectl automation ls
+nodectl automation ls --format json
+nodectl automation tick 60
+nodectl automation wallet --deploy 1.1 --topup 10 --threshold 5
+nodectl automation pool --deploy 1.5
+nodectl automation pool --deploy 1.5 --ton-core 2
+nodectl automation pool --snp 1.1 --ton-core 2
+nodectl automation enable deploy
+nodectl automation enable topup
+nodectl automation disable deploy
+nodectl automation disable topup
+```
+
+Full REST and on-disk **`automation`** block: **[Contracts automation](./docs/contracts-automation.md)**.
+
+---
+
 ### Configuration Commands
 
-Commands for managing nodectl configuration. **All `config` subcommands except `config generate` are REST clients that require a running nodectl service** — they talk to the daemon over the HTTP API. The service URL is resolved (in order) from `--url` / `-u` (or the `NODECTL_URL` env var), or from `http.bind` inside `--config` (default `nodectl-config.json`, env `CONFIG_PATH`). Protected endpoints require an `operator` JWT token passed via `--token` (or the `NODECTL_API_TOKEN` env var) — see the [Authentication Commands](#authentication-commands) section for how to obtain one.
+Commands for managing nodectl configuration. **All `config` subcommands except `config generate` are REST clients that require a running nodectl service** — they talk to the daemon over the HTTP API. The top-level **`automation`** command uses the same rules. The service URL is resolved (in order) from `--url` / `-u` (or the `NODECTL_URL` env var), or from `http.bind` inside `--config` (default `nodectl-config.json`, env `CONFIG_PATH`). Protected endpoints require an `operator` JWT token passed via `--token` (or the `NODECTL_API_TOKEN` env var) — see the [Authentication Commands](#authentication-commands) section for how to obtain one.
 
 #### `config generate`
 
@@ -305,7 +337,8 @@ nodectl config pool add --name pool0 --owner "-1:owner_address"
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Pool name (unique identifier) |
-| `--validator-share` | | Slot deploy: reward share in **basis points** (e.g. `1000` = 10%). Required when adding deploy params without an existing `--address`. |
+| `--validator-share` | | Slot deploy: reward share in **basis points** (`100` = 1%; must be **below 10000** so nominators earn rewards, e.g. `5000` = 50%). Mutually exclusive with `--validator-share-percent`. |
+| `--validator-share-percent` | | Same as share above but as a **percent** (`[0, 100)`, not 100 — nominators need a reward share). Decimals allowed (e.g. `50.4` → 5040 bp). |
 | `--max-nominators` | | Optional; default from contract defaults |
 | `--min-validator-stake` | | Optional; minimum validator stake in **TON** |
 | `--min-nominator-stake` | | Optional; minimum nominator stake in **TON** |
@@ -313,21 +346,22 @@ nodectl config pool add --name pool0 --owner "-1:owner_address"
 | `--even` | | Configure slot 0 (even rounds), required unless `--odd` is set |
 | `--odd` | | Configure slot 1 (odd rounds), required unless `--even` is set |
 
-At least one of `--address` or `--validator-share` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
+At least one of `--address`, `--validator-share`, or `--validator-share-percent` must be set for the selected slot. Use the same pool name with two commands to configure both slots.
 
 ```bash
-# TONCore: configure slot 0 (even)
+# TONCore: configure slot 0 (even) — 50% validator share via basis points or percent
 nodectl config pool add core --name pool0 --validator-share 5000 --even
+nodectl config pool add core --name pool0 --validator-share-percent 50 --even
 
 # Configure both slots with explicit separate commands
 nodectl config pool add core \
   --name pool0 \
-  --validator-share 5000 \
+  --validator-share-percent 50 \
   --min-validator-stake 10000 \
   --even
 nodectl config pool add core \
   --name pool0 \
-  --validator-share 5000 \
+  --validator-share-percent 50.4 \
   --min-validator-stake 10001 \
   --odd
 
@@ -344,7 +378,17 @@ nodectl config pool add core \
 
 ##### `config pool ls`
 
-List all configured pools.
+List all configured pools. For **TONCore** slots, if the pool contract is not on-chain yet (or RPC cannot read it), the table shows **not deployed** (or **error** only for real failures) and fills **Share**, **Validator**, **Min nom. stake**, etc. from the **local slot config** when those values were set at `config pool add core` time.
+
+The TONCore table includes a **Src** column showing where deploy-style fields (validator share, stake thresholds) ultimately came from:
+
+| Value | Meaning |
+|-------|---------|
+| `chain` | Read live from the pool contract via `get_pool_data` |
+| `config` | Filled from the local slot config because `get_pool_data` was not called or failed (account not active or RPC error) |
+| `-` | Neither chain nor config provided deploy-style fields |
+
+JSON output exposes the same signal as a `data_source` field on each slot (omitted when no deploy-style fields are present).
 
 ```bash
 nodectl config pool ls
@@ -368,10 +412,12 @@ nodectl config pool rm --name pool0
 
 Deposit validator funds into a TONCore nominator pool. Builds and sends the on-chain deposit message through the binding's configured wallet.
 
+The pool contract charges a **fixed 1 TON processing fee** on each validator deposit (the credited `validator_amount` is the message value minus that fee). nodectl sends **`--amount` + 1 TON** on-chain so the stake credited to the validator matches **`--amount`**.
+
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--binding <NAME>` | `-b` | Binding name (resolves wallet and pool) |
-| `--amount <TON>` | `-a` | Amount in TON to deposit |
+| `--amount <TON>` | `-a` | Validator stake to credit (TON); the outbound message value adds the pool’s 1 TON fee |
 | `--pool-even` | | Use the pool for even validation rounds (default if neither flag is set) |
 | `--pool-odd` | | Use the pool for odd validation rounds |
 | `--yes` | | Skip the interactive confirmation prompt |
@@ -546,7 +592,7 @@ nodectl config log set --level warn --max-size-mb 100 --max-files 5
 
 #### `config elections`
 
-Manage elections configuration, including stake policies, tick intervals, and per-binding election participation.
+Manage elections configuration, including stake policies, tick intervals, AdaptiveSplit50 wait-window fractions (`config elections wait`, alias `wait-pct`), and per-binding election participation.
 
 ##### `config elections show`
 
@@ -613,6 +659,31 @@ Set the maximum stake factor for elections. The value must be between **1.0** an
 
 ```bash
 nodectl config elections max-factor 2.5
+```
+
+##### `config elections wait`
+
+Set the **AdaptiveSplit50 staking window**: earliest stake submission and latest deadline for waiting on peers (fractions of the election duration, **[0.0, 1.0]**). These map to `sleep_period_pct` (`--min`) and `waiting_period_pct` (`--max`) in config.
+
+Subcommand alias: `wait-pct` (same flags).
+
+They apply **only** when the stake policy is **adaptive_split50**; for `minimum`, `split50`, and `fixed` the values are stored but unused.
+
+The service merges with current settings and validates the pair (**min ≤ max**) on **each** update — partial updates are fine (`--min` only, `--max` only, or both).
+
+| Flag | Config field | Description |
+|------|----------------|-------------|
+| `--min <FRAC>` | `sleep_period_pct` | Earliest fraction at which staking may proceed |
+| `--max <FRAC>` | `waiting_period_pct` | Latest fraction for waiting on peers |
+
+At least one flag is required. Run `nodectl config elections wait --help` for full semantics.
+
+```bash
+nodectl config elections wait --min 0.15 --max 0.45
+nodectl config elections wait --min 0.15
+nodectl config elections wait --max 0.45
+# equivalent:
+nodectl config elections wait-pct --min 0.15 --max 0.45
 ```
 
 ##### `config elections enable`
@@ -1035,45 +1106,56 @@ nodectl config-param -c config.json 34
 
 ### Voting Commands
 
-On-chain config proposal voting. `nodectl vote ls` / `inspect` hit the Config contract via TON HTTP API. `nodectl vote add` / `rm` manage the local `voting.proposals` list used by the voting task — they write directly to the config file and do **not** require a running service.
+`nodectl vote` is a **REST client** to the running nodectl service. The daemon calls the **Config contract** on-chain (via the service’s configured TON HTTP API) and persists `voting.proposals` with **`update_and_save`**, like other centralised config flows.
+
+- **Service URL:** `--url` / `NODECTL_URL`, or `http.bind` from `--config` (default `nodectl-config.json`), or `http://127.0.0.1:8080`.
+- **JWT:** `--token` / `NODECTL_API_TOKEN`. **`vote ls`**, **`inspect`**, and read-only config used for interactive flows require a **nominator** (or **operator**) token. **`vote add`** and **`vote rm`** require an **operator** token.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--url <URL>` | `-u` | Service base URL (overrides config; env: `NODECTL_URL`) |
+| `--token <TOKEN>` | | Bearer JWT (env: `NODECTL_API_TOKEN`) |
+| `--config <FILE>` | `-c` | Config path for `http.bind` when `--url` is not set (env: `CONFIG_PATH`) |
 
 #### `vote ls`
 
-List active config proposals on-chain. Proposals already tracked by the voting task are marked with `*`.
+List active config proposals (from the network). Proposals already tracked in `voting.proposals` are marked with `*`.
 
 | Flag | Description |
 |------|-------------|
 | `--format <FORMAT>` | `table` (default) or `json` |
 
 ```bash
+export NODECTL_API_TOKEN="..."   # nominator or operator
 nodectl vote ls
+nodectl vote ls --url http://127.0.0.1:8080 --token "$NODECTL_API_TOKEN"
 ```
 
 #### `vote inspect`
 
-Show full details (expires-in, voters, weight remaining, param cell BOC, param hash) for a proposal by hex hash.
+Details for a proposal: `expires_in`, voters, weight remaining, param cell BOC (base64), param hash. Hash: **64 hex characters** (32 bytes).
 
 ```bash
-nodectl vote inspect <HEX_HASH>
-nodectl vote inspect <HEX_HASH> --format json
+nodectl vote inspect <HEX64>
+nodectl vote inspect <HEX64> --format json
 ```
 
 #### `vote add`
 
-Add a proposal to the voting task's tracked list. Pass `--hash <HEX_HASH>` or invoke interactively to pick one from the list of active proposals.
+Track a proposal (must exist among **active** on-chain proposals). Use `--hash` or run interactively (select from the list). Idempotent: if the hash is already tracked, the command succeeds without a second write.
 
 ```bash
-nodectl vote add --hash <HEX_HASH>
-nodectl vote add   # interactive
+nodectl vote add --hash <HEX64>   # requires operator token
+nodectl vote add                 # interactive; operator token
 ```
 
 #### `vote rm`
 
-Remove a proposal from the voting task's tracked list.
+Remove a hash from the tracked list. Use `--hash` or interactive selection from the current `voting.proposals` list.
 
 ```bash
-nodectl vote rm --hash <HEX_HASH>
-nodectl vote rm    # interactive
+nodectl vote rm --hash <HEX64>
+nodectl vote rm
 ```
 
 ---
@@ -1119,8 +1201,10 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | GET | `/v1/elections` | N | Current elections snapshot |
 | POST | `/v1/elections/exclude` | O | Disable elections for given bindings |
 | POST | `/v1/elections/include` | O | Enable elections for given bindings |
-| GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, per-binding status) |
-| POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor) |
+| GET | `/v1/elections/settings` | N | Elections configuration (policy, overrides, tick, max-factor, adaptive sleep/wait fractions, per-binding status) |
+| POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor, `sleep_period_pct`, `waiting_period_pct`) |
+| GET | `/v1/automation/settings` | N | Contracts task settings (auto-deploy, auto-topup, amounts, tick) |
+| POST | `/v1/automation/settings` | O | Update contracts task settings (partial JSON: tick/toggles and nested `wallet` / `pool`, nanotons) |
 | POST | `/v1/elections/static-adnl` | O | Generate and assign a persistent ADNL address for a node |
 | GET | `/v1/validators` | N | Validators snapshot for controlled nodes |
 | POST | `/v1/task/elections` | O | Enable / disable / restart the elections background task |
@@ -1136,6 +1220,11 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | GET | `/v1/bindings` | N | List node bindings |
 | POST | `/v1/bindings` | O | Add a binding |
 | DELETE | `/v1/bindings/{node}` | O | Remove a binding (requires `idle` status) |
+| GET | `/v1/voting/config` | N | Voting section snapshot (`proposals`, `tick_interval`) |
+| GET | `/v1/voting/proposals` | N | Active on-chain proposals with `tracked` flag |
+| GET | `/v1/voting/proposals/{hash}` | N | Single proposal details (Config contract) |
+| POST | `/v1/voting/proposals` | O | Add proposal hash to tracked list |
+| DELETE | `/v1/voting/proposals/{hash}` | O | Remove proposal hash from tracked list |
 | GET | `/v1/log` | N | Current log configuration |
 | POST | `/v1/log` | O | Update log settings |
 | POST | `/v1/ton-http-api` | O | Replace or append TON HTTP API endpoints |
@@ -1285,6 +1374,8 @@ Return the effective elections configuration plus per-binding status.
     "policy_overrides": { "node0": { "fixed": 500000000000 } },
     "max_factor": 3.0,
     "tick_interval": 40,
+    "sleep_period_pct": 0.2,
+    "waiting_period_pct": 0.4,
     "bindings": [
       {
         "name": "node0",
@@ -1310,6 +1401,8 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
 | `reset` | `bool` | Remove a per-node override (requires `node`) |
 | `tick_interval` | `u64` | Elections tick interval in seconds |
 | `max_factor` | `f32` | Validated against masterchain config param 17 |
+| `sleep_period_pct` | `f64` | AdaptiveSplit50 minimum wait as a fraction of election duration; must be in `[0.0, 1.0]` and ≤ `waiting_period_pct` |
+| `waiting_period_pct` | `f64` | AdaptiveSplit50 maximum wait for participants; must be in `[0.0, 1.0]` and ≥ `sleep_period_pct` |
 
 `StakePolicy` is `"minimum"`, `"split50"`, `"adaptive_split50"`, or `{ "fixed": <nanotons> }`.
 
@@ -1345,9 +1438,25 @@ Unified endpoint for updating elections settings. Replaces the pre-0.4 `POST /v1
     "policy_overrides": {},
     "max_factor": 2.5,
     "tick_interval": 60,
+    "sleep_period_pct": 0.2,
+    "waiting_period_pct": 0.4,
     "bindings": []
   }
 }
+```
+
+---
+
+#### `GET /v1/automation/settings`
+
+Returns the **`automation`** settings as JSON: `tick_interval_sec`, `auto_deploy`, `auto_topup`, nested **`wallet`** (`deploy`, `topup`, `threshold`) and **`pool`** (`snp`, `ton_core`). All monetary fields are in **nanotons**. See [Contracts automation](./docs/contracts-automation.md).
+
+#### `POST /v1/automation/settings`
+
+**Operator only.** Partial update: include only keys to change (same shape as `GET` `result`, including nested `wallet` / `pool` objects with any subset of their fields). At least one field required. Invalid combinations are rejected with `400` (e.g. tick out of range, zero amounts). Example:
+
+```json
+{ "tick_interval_sec": 60, "auto_topup": false, "pool": { "ton_core": 2000000000 } }
 ```
 
 ---
@@ -1863,11 +1972,15 @@ Automatic elections task configuration:
 - `waiting_period_pct` — AdaptiveSplit50 maximum wait for enough participants as a fraction of election duration. Default `0.4`. Must be in `[0.0, 1.0]` and ≥ `sleep_period_pct`.
 - `static_adnls` — pre-generated persistent ADNL addresses keyed by node name (base64-encoded). When a node has an entry here, the runner reuses this ADNL address each election cycle instead of generating a fresh one. Managed via `config elections static-adnl` or `POST /v1/elections/static-adnl`. Example: `{ "node0": "oRvD1E5F..." }`
 
+#### `automation` (optional)
+
+Settings for the **contracts task** (auto-deploy of validator wallets and nominator pools, auto-topup of validator wallets, separate deploy amounts for SNP vs TONCore pools, contracts task tick interval, toggles). Amounts are **nanotons**, grouped under **`wallet`** (`deploy`, `topup`, `threshold`) and **`pool`** (`snp`, `ton_core`). Omitted fields use the built-in defaults. Full reference: **[Contracts automation](./docs/contracts-automation.md)**. Managed with **`nodectl automation`** or `GET`/`POST /v1/automation/settings`.
+
 #### `voting` (optional)
 
 Automatic voting task configuration:
 
-- `proposals` — list of proposal addresses to vote for
+- `proposals` — list of tracked proposal ids (**64-character hex**, 32-byte hashes). Managed via **`nodectl vote add` / `vote rm`** (REST) or **`POST` / `DELETE /v1/voting/proposals`**
 - `tick_interval` — interval between voting checks in seconds (default: `40`)
 
 #### `log` (optional)
@@ -2085,6 +2198,9 @@ nodectl config elections tick-interval 60
 
 # Set max factor
 nodectl config elections max-factor 2.5
+
+# AdaptiveSplit50 timing (fractions of election duration, [0.0, 1.0])
+nodectl config elections wait --min 0.15 --max 0.45
 ```
 
 ### Authentication Setup
@@ -2326,4 +2442,5 @@ curl -X POST http://127.0.0.1:8080/v1/task/elections \
 
 - [Hashicorp Vault Dedicated Setup](./docs/hcp-vault-setup.md)
 - [Node Control Service Setup](./docs/nodectl-setup.md)
+- [Contracts automation (auto-deploy / auto-topup)](./docs/contracts-automation.md) — `automation` config, REST and CLI
 - [Security Guide](./docs/nodectl-security.md) — roles, token lifecycle, rate limiting, monitoring

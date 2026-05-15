@@ -145,6 +145,45 @@ impl AdnlClient {
         Ok(Self { crypto, stream })
     }
 
+    /// Connect to server using async-native TCP connect with a timeout.
+    ///
+    /// Unlike [`Self::connect`], which performs a synchronous `connect(2)` via
+    /// `socket2::Socket::connect_timeout` and parks the tokio worker thread
+    /// until the kernel returns (up to the configured write timeout), this
+    /// variant uses `tokio::net::TcpStream::connect` wrapped in
+    /// `tokio::time::timeout`. The runtime worker stays free to drive other
+    /// futures while the kernel is performing the TCP handshake or waiting on
+    /// an unresponsive peer.
+    ///
+    /// The address family of the resulting socket is selected from
+    /// `config.server_address` (IPv4 or IPv6). The original `SO_LINGER 0`
+    /// option is preserved.
+    pub async fn timeout_connect(config: &AdnlClientConfig) -> Result<Self> {
+        let connect_timeout = config.timeouts.write();
+        let tcp = tokio::time::timeout(
+            connect_timeout,
+            tokio::net::TcpStream::connect(config.server_address),
+        )
+        .await
+        .map_err(|_| {
+            error!(
+                "ADNL TCP connect to {} timed out after {:?}",
+                config.server_address, connect_timeout,
+            )
+        })?
+        .map_err(|e| error!("ADNL TCP connect to {} failed: {}", config.server_address, e))?;
+
+        socket2::SockRef::from(&tcp).set_linger(Some(Duration::from_secs(0)))?;
+
+        let mut stream = AdnlStream::from_stream_with_timeouts(tcp, config.timeouts());
+
+        let mut crypto = Self::send_init_packet(&mut stream, config).await?;
+        if let Some(client_key) = &config.client_key {
+            Self::tcp_auth_handshake(&mut crypto, &mut stream, client_key).await?;
+        }
+        Ok(Self { crypto, stream })
+    }
+
     /// Ping server
     pub async fn ping(&mut self) -> Result<u64> {
         let now = Instant::now();
