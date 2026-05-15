@@ -9,7 +9,7 @@
 use crate::{
     errors::error::VaultError,
     memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
-    storage::hashicorp_token_provider::{create_token_provider, AuthConfig, TokenProvider},
+    storage::hashicorp_token_provider::{AuthConfig, TokenProvider, create_token_provider},
     types::{metadata::Metadata, secret::Secret, store_mode::StoreMode},
 };
 use rand::RngCore;
@@ -833,7 +833,7 @@ impl Client {
 /// Reads VAULT_CACERT, VAULT_CLIENT_CERT, VAULT_CLIENT_KEY from environment.
 /// If not set, returns a default client.
 fn build_http_client() -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().use_rustls_tls();
 
     if let Ok(ca_path) = std::env::var("VAULT_CACERT") {
         let ca_pem = std::fs::read(&ca_path)
