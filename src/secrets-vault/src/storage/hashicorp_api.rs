@@ -9,13 +9,13 @@
 use crate::{
     errors::error::VaultError,
     memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
-    storage::hashicorp_token_provider::{AuthConfig, TokenProvider, create_token_provider},
+    storage::hashicorp_token_provider::{create_token_provider, AuthConfig, TokenProvider},
     types::{metadata::Metadata, secret::Secret, store_mode::StoreMode},
 };
 use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
 use std::{collections::HashMap, sync::Arc};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[allow(dead_code)]
 pub enum KeyMode {
@@ -847,14 +847,15 @@ fn build_http_client() -> anyhow::Result<reqwest::Client> {
             let cert_pem = std::fs::read(&cert_path).map_err(|e| {
                 anyhow::anyhow!("Failed to read VAULT_CLIENT_CERT ({cert_path}): {e}")
             })?;
-            let key_pem = std::fs::read(&key_path).map_err(|e| {
+            let key_pem = Zeroizing::new(std::fs::read(&key_path).map_err(|e| {
                 anyhow::anyhow!("Failed to read VAULT_CLIENT_KEY ({key_path}): {e}")
-            })?;
-            let mut identity_pem = cert_pem;
-            if !identity_pem.ends_with(b"\n") {
-                identity_pem.push(b'\n');
+            })?);
+            let mut identity_pem_buf = cert_pem;
+            if !identity_pem_buf.ends_with(b"\n") {
+                identity_pem_buf.push(b'\n');
             }
-            identity_pem.extend_from_slice(&key_pem);
+            identity_pem_buf.extend_from_slice(&key_pem);
+            let identity_pem = Zeroizing::new(identity_pem_buf);
             let identity = reqwest::Identity::from_pem(&identity_pem)?;
             builder = builder.identity(identity);
         }
