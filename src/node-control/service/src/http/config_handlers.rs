@@ -31,7 +31,7 @@ use contracts::{
 use control_client::client_adnl::ControlClientAdnl;
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::SystemTime};
 use ton_block::{MsgAddressInt, write_boc};
-use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
+use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
 
 /// `type_id` for ADNL public keys (Ed25519).
 const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
@@ -80,6 +80,18 @@ pub struct WalletsResponse {
 
 // --- Pools ---
 
+/// Source of deploy-style pool parameters in [`TonCorePoolSlotDto`] (`validator_share`,
+/// stake thresholds). Live counters (`nominators_count`, `validator_amount`, …) are only
+/// populated from chain when RPC succeeds.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TonCorePoolSlotDataSource {
+    Chain,
+    Config,
+}
+
 /// Per-slot data for a TONCore nominator pool (one of two physical contracts).
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct TonCorePoolSlotDto {
@@ -89,11 +101,15 @@ pub struct TonCorePoolSlotDto {
     /// config has an address for this slot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// Account state: "active", "uninit", "frozen", "not deployed", or "error".
+    /// Account / deployment state: `"active"`, `"frozen"`, `"not deployed"` (includes
+    /// uninitialized accounts), `"error"`, etc.
     pub state: String,
     /// On-chain balance in nanotons.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<u64>,
+    /// Whether deploy-style fields came from `get_pool_data` or from local config merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_source: Option<TonCorePoolSlotDataSource>,
     /// Validator reward share in basis points.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validator_share: Option<u16>,
@@ -185,6 +201,10 @@ pub struct ElectionsSettingsDto {
     pub policy_overrides: HashMap<String, StakePolicy>,
     pub max_factor: f32,
     pub tick_interval: u64,
+    /// AdaptiveSplit50: minimum wait as a fraction of election duration (`sleep_period_pct` in config).
+    pub sleep_period_pct: f64,
+    /// AdaptiveSplit50: maximum wait for participants (`waiting_period_pct` in config).
+    pub waiting_period_pct: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingElectionStatusDto>,
 }
@@ -507,6 +527,12 @@ pub struct ElectionsSettingsUpdateRequest {
     /// Max stake factor (validated against network param 17).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_factor: Option<f32>,
+    /// AdaptiveSplit50 minimum wait fraction (config `sleep_period_pct`, 0.0–1.0, ≤ `waiting_period_pct`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep_period_pct: Option<f64>,
+    /// AdaptiveSplit50 maximum wait fraction (config `waiting_period_pct`, 0.0–1.0, ≥ `sleep_period_pct`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_period_pct: Option<f64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -771,23 +797,23 @@ pub async fn v1_pools_handler(
                     cached_router.map(|r| r.inner_pools()).unwrap_or_default();
                 let mut cached_iter = cached_inner.into_iter();
 
-                // Build (slot_index, optional config address, optional cached wrapper) for each configured slot.
+                // Build (slot_index, full slot config, optional cached wrapper) for each configured slot.
                 //`inner_pools()` returns wrappers in slot order but skips empty slots,
                 // so we iterate the config and consume the cached iterator only for `Some` entries.
                 let mut slot_jobs = Vec::new();
                 for (idx, slot_cfg) in pools.iter().enumerate() {
                     let Some(cfg) = slot_cfg.as_ref() else { continue };
                     let cached = cached_iter.next();
-                    slot_jobs.push((idx, cfg.address.clone(), cached));
+                    slot_jobs.push((idx, cfg.clone(), cached));
                 }
 
                 // Fetch per-slot data in parallel; per-slot RPC errors are encoded into
                 // the slot DTO (state="error") rather than failing the whole response.
                 let mut set = tokio::task::JoinSet::new();
-                for (idx, addr, cached) in slot_jobs {
+                for (idx, slot_cfg, cached) in slot_jobs {
                     let rpc_client = rpc_client.clone();
                     set.spawn(async move {
-                        fetch_toncore_slot_dto(rpc_client, idx, addr, cached).await
+                        fetch_toncore_slot_dto(rpc_client, idx, slot_cfg, cached).await
                     });
                 }
                 let mut slots: Vec<TonCorePoolSlotDto> = Vec::new();
@@ -815,6 +841,25 @@ pub async fn v1_pools_handler(
     Ok(axum::Json(PoolsResponse { ok: true, result: views }))
 }
 
+/// When on-chain `get_pool_data` is unavailable, copy deploy parameters from local config
+/// into the DTO so `GET /v1/pools` still lists validator share / stake thresholds.
+fn merge_toncore_slot_config_fallbacks(dto: &mut TonCorePoolSlotDto, slot_cfg: &TonCorePoolConfig) {
+    let Some(p) = slot_cfg.params.as_ref() else {
+        return;
+    };
+    dto.validator_share.get_or_insert(p.validator_share);
+    dto.max_nominators.get_or_insert(p.max_nominators);
+    dto.min_validator_stake.get_or_insert(p.min_validator_stake);
+    dto.min_nominator_stake.get_or_insert(p.min_nominator_stake);
+}
+
+fn toncore_slot_deploy_params_present(dto: &TonCorePoolSlotDto) -> bool {
+    dto.validator_share.is_some()
+        || dto.max_nominators.is_some()
+        || dto.min_validator_stake.is_some()
+        || dto.min_nominator_stake.is_some()
+}
+
 /// Fetch on-chain data for a single TONCore pool slot.
 ///
 /// Resolution order for the contract address:
@@ -826,45 +871,72 @@ pub async fn v1_pools_handler(
 /// when the account is active — call `get_pool_data()` for on-chain pool
 /// parameters. RPC failures are encoded into the slot DTO so a single
 /// unreachable slot does not break the whole `/v1/pools` response.
+///
+/// Deploy parameters from `slot_cfg.params` are merged whenever those DTO
+/// fields are still unset (`get_or_insert`), including active accounts where
+/// `get_pool_data` failed, so operators still see config defaults. The
+/// [`TonCorePoolSlotDto::data_source`] field records whether deploy-style fields
+/// ultimately came from chain (`get_pool_data`) or from config.
 async fn fetch_toncore_slot_dto(
     rpc_client: Arc<ClientJsonRpc>,
     slot_idx: usize,
-    config_address: Option<String>,
+    slot_cfg: TonCorePoolConfig,
     cached: Option<Arc<dyn NominatorWrapper>>,
 ) -> TonCorePoolSlotDto {
     let slot_name = if slot_idx == 0 { "even" } else { "odd" };
-    let address = match &cached {
+    let addr_opt: Option<MsgAddressInt> = match &cached {
         Some(w) => w.address().await.ok(),
         _ => None,
     }
-    .or_else(|| config_address.as_deref().and_then(|a| MsgAddressInt::from_str(a).ok()));
-    let address_str = address.as_ref().map(|a| a.to_string()).or_else(|| config_address.clone());
+    .or_else(|| slot_cfg.address.as_deref().and_then(|a| MsgAddressInt::from_str(a).ok()));
 
-    let Some(addr) = address else {
-        return TonCorePoolSlotDto {
-            slot: slot_name.to_string(),
-            address: address_str,
-            state: "not deployed".to_string(),
-            ..Default::default()
+    let address_str = addr_opt.as_ref().map(|a| a.to_string()).or_else(|| slot_cfg.address.clone());
+
+    let (mut dto, addr_for_active): (TonCorePoolSlotDto, Option<MsgAddressInt>) =
+        match addr_opt.as_ref() {
+            None => (
+                TonCorePoolSlotDto {
+                    slot: slot_name.to_string(),
+                    address: address_str,
+                    state: "not deployed".to_string(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            Some(addr) => match rpc_client.get_address_information(addr).await {
+                Ok(info) => {
+                    let account_state = info.state;
+                    let addr_for_active =
+                        matches!(account_state, AccountState::Active).then(|| addr.clone());
+                    let state_str = match account_state {
+                        AccountState::Uninitialized => "not deployed".to_string(),
+                        s => s.to_string(),
+                    };
+                    (
+                        TonCorePoolSlotDto {
+                            slot: slot_name.to_string(),
+                            address: address_str,
+                            state: state_str,
+                            balance: Some(info.balance),
+                            ..Default::default()
+                        },
+                        addr_for_active,
+                    )
+                }
+                Err(_) => (
+                    TonCorePoolSlotDto {
+                        slot: slot_name.to_string(),
+                        address: address_str,
+                        state: "error".to_string(),
+                        ..Default::default()
+                    },
+                    None,
+                ),
+            },
         };
-    };
 
-    let info = rpc_client.get_address_information(&addr).await;
-    let (state_str, balance) = match &info {
-        Ok(info) => (info.state.to_string(), Some(info.balance)),
-        Err(_) => ("error".to_string(), None),
-    };
-
-    let mut dto = TonCorePoolSlotDto {
-        slot: slot_name.to_string(),
-        address: address_str,
-        state: state_str,
-        balance,
-        ..Default::default()
-    };
-
-    // Only query pool data when the contract is active
-    if dto.state == "active" {
+    let mut deploy_params_from_chain = false;
+    if let Some(addr) = addr_for_active {
         let wrapper = cached.unwrap_or_else(|| {
             Arc::new(TonCoreNominatorWrapper::new(contract_provider!(rpc_client.clone()), addr))
                 as Arc<dyn NominatorWrapper>
@@ -880,17 +952,28 @@ async fn fetch_toncore_slot_dto(
                 dto.validator_amount = Some(d.validator_amount);
                 dto.pool_state = Some(d.state);
                 dto.last_election_id = Some(d.stake_at);
+                deploy_params_from_chain = true;
             }
             Err(e) => {
                 tracing::warn!(
                     slot = slot_name,
                     address = dto.address.as_deref().unwrap_or("-"),
                     error = %e,
-                    "get_pool_data failed on active account — on-chain fields will be empty",
+                    "get_pool_data failed on active account — filling deploy params from config when available",
                 );
             }
         }
     }
+
+    merge_toncore_slot_config_fallbacks(&mut dto, &slot_cfg);
+
+    dto.data_source = if deploy_params_from_chain {
+        Some(TonCorePoolSlotDataSource::Chain)
+    } else if toncore_slot_deploy_params_present(&dto) {
+        Some(TonCorePoolSlotDataSource::Config)
+    } else {
+        None
+    };
 
     dto
 }
@@ -951,6 +1034,8 @@ pub async fn v1_elections_settings_handler(
         policy_overrides: elections.policy_overrides.clone(),
         max_factor: elections.max_factor,
         tick_interval: elections.tick_interval,
+        sleep_period_pct: elections.sleep_period_pct,
+        waiting_period_pct: elections.waiting_period_pct,
         bindings,
     };
 
@@ -1956,9 +2041,46 @@ pub async fn v1_elections_settings_update_handler(
 ) -> Result<axum::Json<ElectionsSettingsResponse>, AppError> {
     let req = req.0;
 
-    if req.policy.is_none() && !req.reset && req.tick_interval.is_none() && req.max_factor.is_none()
+    if req.policy.is_none()
+        && !req.reset
+        && req.tick_interval.is_none()
+        && req.max_factor.is_none()
+        && req.sleep_period_pct.is_none()
+        && req.waiting_period_pct.is_none()
     {
         return Err(AppError::bad_request("at least one setting is required"));
+    }
+
+    let cfg = state.runtime_cfg.get();
+    let elections = cfg
+        .elections
+        .as_ref()
+        .ok_or_else(|| AppError::bad_request("elections are not configured"))?;
+
+    // --- Validate adaptive timing (merged with current config) ---
+    if req.sleep_period_pct.is_some() || req.waiting_period_pct.is_some() {
+        let mut merged = elections.clone();
+        if let Some(v) = req.sleep_period_pct {
+            merged.sleep_period_pct = v;
+        }
+        if let Some(v) = req.waiting_period_pct {
+            merged.waiting_period_pct = v;
+        }
+        merged.validate_timing_fields().map_err(|e| AppError::bad_request(e.to_string()))?;
+    }
+
+    // --- Validate max_factor against network param 17 (best-effort) ---
+    if let Some(value) = req.max_factor {
+        let network_limit = state
+            .runtime_cfg
+            .rpc_client()
+            .get_config_param(17)
+            .await
+            .ok()
+            .and_then(|p| extract_max_factor(p).ok());
+
+        let probe = ElectionsConfig { max_factor: value, ..elections.clone() };
+        probe.validate(network_limit).map_err(|e| AppError::bad_request(e.to_string()))?;
     }
 
     // --- Validate policy ---
@@ -1985,6 +2107,8 @@ pub async fn v1_elections_settings_update_handler(
     let reset = req.reset;
     let tick_interval = req.tick_interval;
     let max_factor = req.max_factor;
+    let sleep_period_pct = req.sleep_period_pct;
+    let waiting_period_pct = req.waiting_period_pct;
 
     state
         .runtime_cfg
@@ -2002,6 +2126,13 @@ pub async fn v1_elections_settings_update_handler(
                 } else {
                     elections.policy = policy;
                 }
+            }
+
+            if let Some(v) = sleep_period_pct {
+                elections.sleep_period_pct = v;
+            }
+            if let Some(v) = waiting_period_pct {
+                elections.waiting_period_pct = v;
             }
 
             if let Some(seconds) = tick_interval {
@@ -2030,6 +2161,8 @@ pub async fn v1_elections_settings_update_handler(
         policy_overrides: elections.policy_overrides.clone(),
         max_factor: elections.max_factor,
         tick_interval: elections.tick_interval,
+        sleep_period_pct: elections.sleep_period_pct,
+        waiting_period_pct: elections.waiting_period_pct,
         bindings: vec![],
     };
 

@@ -227,10 +227,11 @@ async fn pools_snp_shape_preserved() {
 }
 
 #[tokio::test]
-async fn pools_toncore_slot_with_no_address_is_not_deployed() {
+async fn pools_toncore_slot_with_no_address_is_not_deployed_with_config_fallback() {
     // Slot configured with params but no address and no binding → pool isn't
     // on-chain yet. Handler should emit a "not deployed" slot entry rather
-    // than failing or guessing an address.
+    // than failing or guessing an address, and merge deploy params from config
+    // (validator_share, max_nominators, etc.) into the response.
     let mut pools = HashMap::new();
     pools.insert(
         "core1".to_string(),
@@ -264,7 +265,9 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed() {
     assert_eq!(slots[0]["state"], "not deployed");
     assert!(slots[0].get("address").is_none());
     assert!(slots[0].get("balance").is_none());
-    assert!(slots[0].get("validator_share").is_none());
+    assert_eq!(slots[0]["validator_share"], 4000);
+    assert_eq!(slots[0]["max_nominators"], 40);
+    assert_eq!(slots[0]["data_source"], "config");
 }
 
 #[tokio::test]
@@ -281,7 +284,12 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
                         "-1:0000000000000000000000000000000000000000000000000000000000000001"
                             .into(),
                     ),
-                    params: None,
+                    params: Some(TonCoreInitParams {
+                        validator_share: 4000,
+                        max_nominators: 40,
+                        min_validator_stake: 10_000_000_000_000,
+                        min_nominator_stake: 10_000_000_000_000,
+                    }),
                 }),
                 Some(TonCorePoolConfig {
                     address: Some(
@@ -304,11 +312,16 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
     assert_eq!(slots[0]["slot"], "even");
     assert_eq!(slots[1]["slot"], "odd");
     for slot in slots {
-        // RPC failed → state encoded into DTO, not bubbled up.
-        assert_eq!(slot["state"], "error");
-        assert!(slot.get("balance").is_none());
+        // RPC may fail entirely (`error`) or return success with an uninitialized account
+        // (`not deployed`) depending on local ton-http-api — both mean no live pool view.
+        let st = slot["state"].as_str().unwrap();
+        assert!(matches!(st, "error" | "not deployed"), "unexpected state {st:?}");
         assert!(slot["address"].is_string());
     }
+    // Even slot had deploy params in config — still exposed when RPC is down.
+    assert_eq!(slots[0]["validator_share"], 4000);
+    assert_eq!(slots[0]["data_source"], "config");
+    assert!(slots[1].get("data_source").is_none());
 }
 
 // ---------------------------------------------------------------------------

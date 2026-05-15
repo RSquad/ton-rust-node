@@ -437,7 +437,7 @@ impl AdnlConfig {
 
         Ok(AdnlClientConfig::new(
             Some(client_key_opt),
-            resolve_ip(&self.server_address)?,
+            resolve_ip(&self.server_address).await?,
             server_key,
             timeouts,
         ))
@@ -508,10 +508,12 @@ fn default_tick_interval() -> u64 {
     40
 }
 
+/// Default `waiting_period_pct` when the field is omitted from serialized [`ElectionsConfig`].
 fn default_waiting_pct() -> f64 {
     0.4
 }
 
+/// Default `sleep_period_pct` when the field is omitted from serialized [`ElectionsConfig`].
 fn default_sleep_pct() -> f64 {
     0.2
 }
@@ -569,7 +571,7 @@ impl ElectionsConfig {
         Ok(())
     }
 
-    fn validate_timing_fields(&self) -> anyhow::Result<()> {
+    pub fn validate_timing_fields(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.sleep_period_pct) {
             anyhow::bail!("sleep_period_pct must be in range [0.0..1.0]");
         }
