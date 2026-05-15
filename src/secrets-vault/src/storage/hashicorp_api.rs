@@ -842,17 +842,29 @@ fn build_http_client() -> anyhow::Result<reqwest::Client> {
         builder = builder.add_root_certificate(cert);
     }
 
-    if let (Ok(cert_path), Ok(key_path)) =
-        (std::env::var("VAULT_CLIENT_CERT"), std::env::var("VAULT_CLIENT_KEY"))
-    {
-        let cert_pem = std::fs::read(&cert_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read VAULT_CLIENT_CERT ({cert_path}): {e}"))?;
-        let key_pem = std::fs::read(&key_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read VAULT_CLIENT_KEY ({key_path}): {e}"))?;
-        let mut identity_pem = cert_pem;
-        identity_pem.extend_from_slice(&key_pem);
-        let identity = reqwest::Identity::from_pem(&identity_pem)?;
-        builder = builder.identity(identity);
+    match (std::env::var("VAULT_CLIENT_CERT").ok(), std::env::var("VAULT_CLIENT_KEY").ok()) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(&cert_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read VAULT_CLIENT_CERT ({cert_path}): {e}")
+            })?;
+            let key_pem = std::fs::read(&key_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read VAULT_CLIENT_KEY ({key_path}): {e}")
+            })?;
+            let mut identity_pem = cert_pem;
+            if !identity_pem.ends_with(b"\n") {
+                identity_pem.push(b'\n');
+            }
+            identity_pem.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&identity_pem)?;
+            builder = builder.identity(identity);
+        }
+        (None, None) => {}
+        (Some(_), None) => anyhow::bail!(
+            "VAULT_CLIENT_CERT is set but VAULT_CLIENT_KEY is not; both must be set or both unset"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "VAULT_CLIENT_KEY is set but VAULT_CLIENT_CERT is not; both must be set or both unset"
+        ),
     }
 
     Ok(builder.build()?)
