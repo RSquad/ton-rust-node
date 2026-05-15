@@ -123,27 +123,30 @@ fn test_xchg_si_only() {
                         1 => {
                             // continuation
                             code += "PUSHCONT  { NOP }\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
                             );
                         }
                         2 => {
                             // slice
                             code += "PUSHSLICE  x4_\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
                             );
                         }
                         3 => {
                             // cell
                             code += "NEWC ENDC\n";
-                            bytecode
-                                .append(&mut compile_code("NEWC ENDC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC ENDC").unwrap().get_bytestring(0),
+                            );
                         }
                         4 => {
                             // builder
                             code += "NEWC\n";
-                            bytecode.append(&mut compile_code("NEWC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC").unwrap().get_bytestring(0),
+                            );
                         }
                         _ => {}
                     }
@@ -231,27 +234,30 @@ fn test_xchg_s0_si() {
                         1 => {
                             // continuation
                             code += "PUSHCONT  { NOP }\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
                             );
                         }
                         2 => {
                             // slice
                             code += "PUSHSLICE  x4_\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
                             );
                         }
                         3 => {
                             // cell
                             code += "NEWC ENDC\n";
-                            bytecode
-                                .append(&mut compile_code("NEWC ENDC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC ENDC").unwrap().get_bytestring(0),
+                            );
                         }
                         4 => {
                             // builder
                             code += "NEWC\n";
-                            bytecode.append(&mut compile_code("NEWC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC").unwrap().get_bytestring(0),
+                            );
                         }
                         _ => {}
                     }
@@ -335,27 +341,30 @@ fn test_xchg_s1_si() {
                         1 => {
                             // continuation
                             code += "PUSHCONT  { NOP }\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
                             );
                         }
                         2 => {
                             // slice
                             code += "PUSHSLICE  x4_\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
                             );
                         }
                         3 => {
                             // cell
                             code += "NEWC ENDC\n";
-                            bytecode
-                                .append(&mut compile_code("NEWC ENDC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC ENDC").unwrap().get_bytestring(0),
+                            );
                         }
                         4 => {
                             // builder
                             code += "NEWC\n";
-                            bytecode.append(&mut compile_code("NEWC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC").unwrap().get_bytestring(0),
+                            );
                         }
                         _ => {}
                     }
@@ -439,31 +448,30 @@ fn test_xchg_si_sj() {
                             1 => {
                                 // continuation
                                 code += "PUSHCONT  { NOP }\n";
-                                bytecode.append(
-                                    &mut compile_code("PUSHCONT  { NOP }")
-                                        .unwrap()
-                                        .get_bytestring(0),
+                                bytecode.extend_from_slice(
+                                    &compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
                                 );
                             }
                             2 => {
                                 // slice
                                 code += "PUSHSLICE  x4_\n";
-                                bytecode.append(
-                                    &mut compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
+                                bytecode.extend_from_slice(
+                                    &compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
                                 );
                             }
                             3 => {
                                 // cell
                                 code += "NEWC ENDC\n";
-                                bytecode.append(
-                                    &mut compile_code("NEWC ENDC").unwrap().get_bytestring(0),
+                                bytecode.extend_from_slice(
+                                    &compile_code("NEWC ENDC").unwrap().get_bytestring(0),
                                 );
                             }
                             4 => {
                                 // builder
                                 code += "NEWC\n";
-                                bytecode
-                                    .append(&mut compile_code("NEWC").unwrap().get_bytestring(0));
+                                bytecode.extend_from_slice(
+                                    &compile_code("NEWC").unwrap().get_bytestring(0),
+                                );
                             }
                             _ => {}
                         }
@@ -670,30 +678,33 @@ fn test_push_si() {
                                 compile_code("NOP").unwrap(),
                             ));
                             code += "PUSHCONT  { NOP }\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
                             );
                         }
                         2 => {
                             // slice
                             stack.push(create::slice([0x40]));
                             code += "PUSHSLICE  x4_\n";
-                            bytecode.append(
-                                &mut compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
+                            bytecode.extend_from_slice(
+                                &compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
                             );
                         }
                         3 => {
                             // cell
                             stack.push(create::cell([0x80]));
                             code += "NEWC ENDC\n";
-                            bytecode
-                                .append(&mut compile_code("NEWC ENDC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC ENDC").unwrap().get_bytestring(0),
+                            );
                         }
                         4 => {
                             // builder
                             stack.push(create::builder([0x80]));
                             code += "NEWC\n";
-                            bytecode.append(&mut compile_code("NEWC").unwrap().get_bytestring(0));
+                            bytecode.extend_from_slice(
+                                &compile_code("NEWC").unwrap().get_bytestring(0),
+                            );
                         }
                         _ => {}
                     }
@@ -839,23 +850,27 @@ fn test_pop_si() {
                 1 => {
                     // continuation
                     code += "PUSHCONT  { NOP }\n";
-                    bytecode
-                        .append(&mut compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0));
+                    bytecode.extend_from_slice(
+                        &compile_code("PUSHCONT  { NOP }").unwrap().get_bytestring(0),
+                    );
                 }
                 2 => {
                     // slice
                     code += "PUSHSLICE  x4_\n";
-                    bytecode.append(&mut compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0));
+                    bytecode.extend_from_slice(
+                        &compile_code("PUSHSLICE  x4_").unwrap().get_bytestring(0),
+                    );
                 }
                 3 => {
                     // cell
                     code += "NEWC ENDC\n";
-                    bytecode.append(&mut compile_code("NEWC ENDC").unwrap().get_bytestring(0));
+                    bytecode
+                        .extend_from_slice(&compile_code("NEWC ENDC").unwrap().get_bytestring(0));
                 }
                 4 => {
                     // builder
                     code += "NEWC\n";
-                    bytecode.append(&mut compile_code("NEWC").unwrap().get_bytestring(0));
+                    bytecode.extend_from_slice(&compile_code("NEWC").unwrap().get_bytestring(0));
                 }
                 _ => {}
             }

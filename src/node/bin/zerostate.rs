@@ -97,7 +97,7 @@ fn transform_mc_state(
         wc_state.set_min_ref_mc_seqno(u32::MAX);
 
         let wc_cell = wc_state.serialize()?;
-        wc_descr.zerostate_root_hash = wc_cell.repr_hash();
+        wc_descr.zerostate_root_hash = wc_cell.repr_hash().clone();
         let wc_boc = write_boc(&wc_cell)?;
         wc_descr.zerostate_file_hash = UInt256::calc_file_hash(&wc_boc);
         wc_map.set(&wc_id, &wc_descr)?;

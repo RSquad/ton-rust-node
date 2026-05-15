@@ -12,15 +12,16 @@ use crate::{
     memory::protected_memory::ProtectedMemory,
     types::{metadata::Metadata, secret::KeyPair, secret_id::SecretId},
 };
+use std::sync::Arc;
 
 pub struct KeyPairInMemory {
     metadata: Metadata,
     key_material: KeyMaterial,
-    crypto: Box<dyn Crypto>,
+    crypto: Arc<dyn Crypto>,
 }
 
 impl KeyPairInMemory {
-    pub fn new(metadata: &Metadata, key_material: KeyMaterial, crypto: Box<dyn Crypto>) -> Self {
+    pub fn new(metadata: &Metadata, key_material: KeyMaterial, crypto: Arc<dyn Crypto>) -> Self {
         Self { metadata: metadata.clone(), key_material, crypto }
     }
 }
@@ -35,30 +36,44 @@ impl KeyPair for KeyPairInMemory {
         &self.metadata
     }
 
-    async fn extractable(&self) -> anyhow::Result<bool> {
-        Ok(self.metadata.extractable)
+    fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
     }
 
-    async fn public_key(&self) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(self.key_material.public_key.clone())
+    fn extractable(&self) -> bool {
+        self.metadata.extractable
     }
 
-    async fn private_key(&self) -> anyhow::Result<ProtectedMemory> {
+    fn public_key(&self) -> Option<&[u8]> {
+        self.key_material.public_key.as_deref()
+    }
+
+    fn private_key(&self) -> anyhow::Result<&ProtectedMemory> {
         if !self.metadata.extractable {
             anyhow::bail!(VaultError::not_extractable(self.metadata.secret_id.as_ref()))
         }
 
-        let secret_key = self
+        let pvt_key = self
             .key_material
             .secret_key
             .as_ref()
-            .ok_or_else(|| VaultError::empty_secret_key("Secret key is not set"))?;
+            .ok_or_else(|| VaultError::empty_secret_key("Private key is not set"))?;
 
-        secret_key.clone().await
+        Ok(pvt_key)
+    }
+
+    fn expanded_key(&self) -> anyhow::Result<ProtectedMemory> {
+        let pvt_key = self.private_key()?;
+
+        let crypto = self.crypto.as_ref();
+        let lock = &pvt_key.lock()?;
+        let exp_key = crypto.exp_key_from_pvt(self.metadata.algorithm, lock)?;
+
+        Ok(exp_key)
     }
 
     async fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.crypto.sign(&self.key_material, data, self.metadata.algorithm).await
+        self.crypto.sign(&self.key_material, data, self.metadata.algorithm)
     }
 
     async fn verify(&self, data: &[u8], signature: &[u8]) -> anyhow::Result<()> {
@@ -66,10 +81,10 @@ impl KeyPair for KeyPairInMemory {
             anyhow::anyhow!(VaultError::empty_public_key("Failed to verify signature"))
         })?;
 
-        self.crypto.verify(pub_key, data, signature, self.metadata.algorithm).await
+        self.crypto.verify(pub_key, data, signature, self.metadata.algorithm)
     }
 
-    async fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
-        self.key_material.serialize().await
+    fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
+        self.key_material.serialize()
     }
 }

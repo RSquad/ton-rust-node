@@ -28,7 +28,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Weak,
+        Arc, Mutex, Weak,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -715,12 +715,12 @@ impl Drop for Peer {
 */
 
 struct PeerStorage {
-    peers: Arc<std::sync::Mutex<HashMap<(Arc<KeyId>, Arc<KeyId>), Weak<Peer>>>>,
+    peers: Arc<Mutex<HashMap<(Arc<KeyId>, Arc<KeyId>), Weak<Peer>>>>,
 }
 
 impl PeerStorage {
     fn new() -> Self {
-        Self { peers: Arc::new(std::sync::Mutex::new(HashMap::new())) }
+        Self { peers: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     /// Get or create peer for given src/dst ADNL addresses

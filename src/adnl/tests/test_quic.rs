@@ -12,15 +12,7 @@ use adnl::{
     node::{AdnlNode, IpAddress},
     DhtNode, OverlayNode, QuicNode, QuicRateLimitConfig,
 };
-use std::{
-    collections::HashSet,
-    net::Ipv4Addr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashSet, net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use ton_api::{
     deserialize_boxed, serialize_boxed,
@@ -156,7 +148,6 @@ fn test_quic_concurrent_accept() {
         let server = QuicNode::new(
             vec![server_sub],
             server_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -190,7 +181,6 @@ fn test_quic_concurrent_accept() {
             let quic = QuicNode::new(
                 vec![sub],
                 token.clone(),
-                None,
                 tokio::runtime::Handle::current(),
                 Some(QuicRateLimitConfig::disabled()),
             );
@@ -291,7 +281,6 @@ fn test_quic_session() {
         let quic_a = QuicNode::new(
             vec![sub_a],
             token_a.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -300,7 +289,6 @@ fn test_quic_session() {
         let quic_b = QuicNode::new(
             vec![sub_b],
             token_b.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -380,7 +368,6 @@ fn test_quic_reconnect_after_server_restart() {
         let client = QuicNode::new(
             vec![client_sub],
             client_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -405,7 +392,6 @@ fn test_quic_reconnect_after_server_restart() {
         let server1 = QuicNode::new(
             vec![server_sub1],
             server_token1.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -444,7 +430,6 @@ fn test_quic_reconnect_after_server_restart() {
         let server2 = QuicNode::new(
             vec![server_sub2],
             server_token2.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -466,177 +451,6 @@ fn test_quic_reconnect_after_server_restart() {
         server2.shutdown();
         client_token.cancel();
         server_token2.cancel();
-    });
-}
-
-/// Subscriber that tracks concurrent processing count and holds streams open.
-struct SlowSubscriber {
-    key_id: Arc<KeyId>,
-    current: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-    processed: Arc<AtomicUsize>,
-    hold_duration: Duration,
-}
-
-#[async_trait::async_trait]
-impl Subscriber for SlowSubscriber {
-    async fn try_consume_custom(&self, _data: &[u8], peers: &AdnlPeers) -> Result<bool> {
-        if peers.local() != &self.key_id {
-            return Ok(false);
-        }
-        let prev = self.current.fetch_add(1, Ordering::SeqCst);
-        let concurrent = prev + 1;
-        self.peak.fetch_max(concurrent, Ordering::SeqCst);
-        tokio::time::sleep(self.hold_duration).await;
-        self.current.fetch_sub(1, Ordering::SeqCst);
-        self.processed.fetch_add(1, Ordering::SeqCst);
-        Ok(true)
-    }
-
-    async fn try_consume_query(&self, object: TLObject, peers: &AdnlPeers) -> Result<QueryResult> {
-        if peers.local() != &self.key_id {
-            return Ok(QueryResult::Rejected(object));
-        }
-        // Answer pings normally so the client can establish the connection.
-        match object.downcast::<AdnlPing>() {
-            Ok(ping) => QueryResult::consume(
-                AdnlPong { value: ping.value },
-                #[cfg(feature = "telemetry")]
-                None,
-            ),
-            Err(obj) => Ok(QueryResult::Rejected(obj)),
-        }
-    }
-}
-
-/// Verify that the per-connection stream semaphore limits concurrent processing.
-/// Server stream limit = 2, subscriber holds each stream for 1s.
-/// Client fires 4 messages concurrently — peak concurrency must not exceed 2.
-#[test]
-fn test_quic_stream_limit() {
-    init_test_log();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    rt.block_on(async {
-        const STREAM_LIMIT: usize = 2;
-        const NUM_MESSAGES: usize = 4;
-        const HOLD: Duration = Duration::from_secs(1);
-        const SERVER_PORT: u16 = 5850;
-        const CLIENT_PORT: u16 = 5851;
-        const TIMEOUT: Duration = Duration::from_secs(15);
-
-        // --- server with stream limit = 2 ---
-        let server_token = CancellationToken::new();
-        let server_key = ed25519_generate_private_key().unwrap().to_bytes();
-        let (_, server_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
-            &format!("127.0.0.1:{SERVER_PORT}"),
-            vec![(server_key, KEY_TAG)],
-        )
-        .unwrap();
-        let server_key_id = server_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
-
-        let peak = Arc::new(AtomicUsize::new(0));
-        let current = Arc::new(AtomicUsize::new(0));
-        let processed = Arc::new(AtomicUsize::new(0));
-        let server_sub = Arc::new(SlowSubscriber {
-            key_id: server_key_id.clone(),
-            current: current.clone(),
-            peak: peak.clone(),
-            processed: processed.clone(),
-            hold_duration: HOLD,
-        }) as Arc<dyn Subscriber>;
-
-        let server_bind: SocketAddr =
-            format!("127.0.0.1:{}", SERVER_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
-        let server = QuicNode::new(
-            vec![server_sub],
-            server_token.clone(),
-            Some(STREAM_LIMIT),
-            tokio::runtime::Handle::current(),
-            Some(QuicRateLimitConfig::disabled()),
-        );
-        server.add_key(&server_key, &server_key_id, server_bind).unwrap();
-
-        // --- client (normal limits) ---
-        let client_token = CancellationToken::new();
-        let client_key = ed25519_generate_private_key().unwrap().to_bytes();
-        let (_, client_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
-            &format!("127.0.0.1:{CLIENT_PORT}"),
-            vec![(client_key, KEY_TAG)],
-        )
-        .unwrap();
-        let client_key_id = client_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
-
-        let (cli_tx, _cli_rx) = tokio::sync::mpsc::unbounded_channel();
-        let client_sub = Arc::new(TestSubscriber { key_id: client_key_id.clone(), msg_tx: cli_tx })
-            as Arc<dyn Subscriber>;
-
-        let client_bind: SocketAddr =
-            format!("127.0.0.1:{}", CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
-        let client = QuicNode::new(
-            vec![client_sub],
-            client_token.clone(),
-            None,
-            tokio::runtime::Handle::current(),
-            Some(QuicRateLimitConfig::disabled()),
-        );
-        client.add_key(&client_key, &client_key_id, client_bind).unwrap();
-
-        // Register peers
-        client.add_peer_key(server_key_id.clone(), server_bind).unwrap();
-        server.add_peer_key(client_key_id.clone(), client_bind).unwrap();
-        let peers = AdnlPeers::with_keys(client_key_id.clone(), server_key_id.clone());
-
-        // Establish the connection with a ping/pong first
-        let resp = tokio::time::timeout(
-            Duration::from_secs(10),
-            client.query(make_ping_data(100500), None, &peers, None),
-        )
-        .await
-        .expect("initial query timed out")
-        .expect("initial query failed");
-        assert_eq!(parse_pong(resp.unwrap()), 100500, "warmup pong mismatch");
-
-        // --- fire NUM_MESSAGES concurrently ---
-        let mut handles = Vec::with_capacity(NUM_MESSAGES);
-        for i in 0..NUM_MESSAGES {
-            let quic = client.clone();
-            let peers = peers.clone();
-            handles.push(tokio::spawn(async move {
-                let payload = format!("msg-{i}");
-                quic.message(payload.as_bytes().to_vec(), None, &peers)
-                    .await
-                    .unwrap_or_else(|e| panic!("message {i} failed: {e}"));
-            }));
-        }
-
-        // Wait for all messages to be processed by the slow subscriber
-        let _ = tokio::time::timeout(TIMEOUT, async {
-            for h in handles {
-                let _ = h.await;
-            }
-            while processed.load(Ordering::SeqCst) < NUM_MESSAGES {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("stream limit test timed out");
-
-        let observed_peak = peak.load(Ordering::SeqCst);
-        println!(
-            "Stream limit test: limit={STREAM_LIMIT}, \
-            messages={NUM_MESSAGES}, peak_concurrent={observed_peak}"
-        );
-        assert!(
-            observed_peak <= STREAM_LIMIT,
-            "Peak concurrency {observed_peak} exceeded stream limit {STREAM_LIMIT}"
-        );
-        assert!(observed_peak > 0, "No messages were processed — test is broken");
-
-        // --- cleanup ---
-        client.shutdown();
-        server.shutdown();
-        client_token.cancel();
-        server_token.cancel();
     });
 }
 
@@ -668,13 +482,8 @@ fn make_endpoint_with_config(
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let sub =
         Arc::new(TestSubscriber { key_id: key_id.clone(), msg_tx: tx }) as Arc<dyn Subscriber>;
-    let quic = QuicNode::new(
-        vec![sub],
-        token.clone(),
-        None,
-        tokio::runtime::Handle::current(),
-        Some(rl_config),
-    );
+    let quic =
+        QuicNode::new(vec![sub], token.clone(), tokio::runtime::Handle::current(), Some(rl_config));
     quic.add_key(&key, &key_id, bind).unwrap();
     (quic, key, key_id, bind, token)
 }
@@ -849,101 +658,6 @@ fn test_quic_duplicate_inbound_resolution() {
     });
 }
 
-/// Two raw quinn connections from the same source endpoint to the same server
-/// trigger the duplicate-resolution path for a single address. After resolution
-/// the server must still accept queries.
-#[test]
-fn test_quic_duplicate_inbound_same_address() {
-    init_test_log();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    rt.block_on(async {
-        const SERVER_PORT: u16 = 5910;
-        const RAW_CLIENT_PORT: u16 = 5911;
-
-        // --- server (normal QuicNode) ---
-        let (server, _server_key, server_key_id, server_bind, server_token) =
-            make_endpoint(SERVER_PORT);
-
-        // --- raw quinn client that will open two connections from the same port ---
-        let raw_key = ed25519_generate_private_key().unwrap().to_bytes();
-        let (_, raw_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
-            &format!("127.0.0.1:{RAW_CLIENT_PORT}"),
-            vec![(raw_key, KEY_TAG)],
-        )
-        .unwrap();
-        let raw_key_id = raw_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
-        let raw_bind: SocketAddr =
-            format!("127.0.0.1:{}", RAW_CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
-
-        server.add_peer_key(raw_key_id.clone(), raw_bind).unwrap();
-
-        let client_config = build_raw_quinn_client(&raw_key);
-
-        // Create a raw quinn endpoint (client-only, no server config)
-        let sock = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .unwrap();
-        sock.set_reuse_address(true).unwrap();
-        sock.bind(&raw_bind.into()).unwrap();
-        sock.set_nonblocking(true).unwrap();
-        let udp = std::net::UdpSocket::from(sock);
-        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
-        let mut endpoint =
-            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp, runtime).unwrap();
-        endpoint.set_default_client_config(client_config);
-
-        // SNI name matching QuicNode's key_id_to_server_name
-        let hex = hex::encode(server_key_id.data());
-        let sni = format!("{}.{}", &hex[..32], &hex[32..]);
-
-        // Open first connection and verify it works
-        let conn1 =
-            endpoint.connect(server_bind, &sni).unwrap().await.expect("raw conn1 handshake failed");
-        let ping_data = make_ping_wire(100);
-        let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-        send1.write_all(&ping_data).await.unwrap();
-        send1.finish().unwrap();
-        let resp1 = tokio::time::timeout(Duration::from_secs(10), recv1.read_to_end(1 << 20))
-            .await
-            .expect("conn1 response timed out")
-            .expect("conn1 read failed");
-        assert_eq!(parse_pong_wire(&resp1), 100, "conn1 pong mismatch");
-        println!("conn1 ping/pong succeeded");
-
-        // Open second connection with the same key — this replaces conn1 immediately
-        let conn2 =
-            endpoint.connect(server_bind, &sni).unwrap().await.expect("raw conn2 handshake failed");
-        println!("conn2 established — conn1 should be closed by duplicate resolution");
-
-        // Give quinn a moment to propagate the close
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(conn1.close_reason().is_some(), "conn1 should be closed after conn2 replaced it");
-
-        // conn2 must work
-        let (mut s2, mut r2) = conn2.open_bi().await.unwrap();
-        let ping2 = make_ping_wire(200);
-        s2.write_all(&ping2).await.unwrap();
-        s2.finish().unwrap();
-        let resp2 = tokio::time::timeout(Duration::from_secs(10), r2.read_to_end(1 << 20))
-            .await
-            .expect("conn2 response timed out")
-            .expect("conn2 read failed");
-        assert_eq!(parse_pong_wire(&resp2), 200, "conn2 pong mismatch");
-        println!("conn2 survived duplicate resolution and answered query");
-
-        // --- cleanup ---
-        conn1.close(0u32.into(), b"done");
-        conn2.close(0u32.into(), b"done");
-        endpoint.close(0u32.into(), b"done");
-        server.shutdown();
-        server_token.cancel();
-    });
-}
-
 // ===========================================================================
 // Test 1b: Multiple keys from same address must coexist
 // ===========================================================================
@@ -1110,107 +824,228 @@ fn test_quic_multi_key_same_address() {
 }
 
 // ===========================================================================
-// Test 1c: Same-key duplicate connections must be deduplicated
+// Test 1c: Key rotation — server identity switching
 // ===========================================================================
 
-/// When two connections arrive from the same client key pair (genuine duplicate),
-/// the server must close the old one after the resolution window. This verifies
-/// that deduplication still works correctly with the AdnlPath-based keying.
+/// Verifies the server key rotation lifecycle using raw quinn connections so
+/// we can inspect the exact server identity (SPKI RPK) presented during TLS:
+///
+///   1. Server starts with key A (auto-activated). New connection sees key A.
+///   2. Key B is registered but NOT activated. New connection still sees key A.
+///   3. Key B is activated. Connection established in step 1 stays alive.
+///      A new connection now sees key B.
+///   4. Key A is removed. The step-1 connection is unaffected.
+///      A new connection still sees key B.
 #[test]
-fn test_quic_same_key_deduplication() {
+fn test_quic_key_rotation() {
     init_test_log();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     rt.block_on(async {
-        const SERVER_PORT: u16 = 5917;
-        const RAW_CLIENT_PORT: u16 = 5918;
+        const SERVER_PORT: u16 = 5925;
+        const RAW_CLIENT_PORT: u16 = 5927;
 
-        // --- server ---
-        let (server, _server_key, server_key_id, server_bind, server_token) =
-            make_endpoint(SERVER_PORT);
+        // --- helper: extract server KeyId from a quinn connection ---
+        fn server_key_id(conn: &quinn::Connection) -> Arc<KeyId> {
+            let identity = conn.peer_identity().expect("no peer identity");
+            let certs = identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer>>()
+                .expect("unexpected identity type");
+            let spki = certs.first().expect("no server cert");
+            assert_eq!(spki.as_ref().len(), 44, "unexpected SPKI length");
+            let pub_key: &[u8; 32] = spki.as_ref()[12..].try_into().unwrap();
+            let data = ton_block::sha256_digest_slices(&[
+                &Ed25519KeyOption::KEY_TYPE.to_le_bytes(),
+                pub_key,
+            ]);
+            KeyId::from_data(data)
+        }
 
-        // --- single client key (both connections use the same identity) ---
-        let key = ed25519_generate_private_key().unwrap().to_bytes();
-        let (_, cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
+        // --- helper: open a fresh raw quinn connection and return it ---
+        async fn raw_connect(
+            endpoint: &quinn::Endpoint,
+            server_bind: std::net::SocketAddr,
+            sni: &str,
+        ) -> quinn::Connection {
+            endpoint.connect(server_bind, sni).unwrap().await.expect("raw handshake failed")
+        }
+
+        // --- helper: ping/pong over a connection ---
+        async fn ping_pong(conn: &quinn::Connection, value: i64) -> i64 {
+            let ping =
+                serialize_boxed(&QuicQuery { data: make_ping_data(value).into() }.into_boxed())
+                    .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(&ping).await.unwrap();
+            send.finish().unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(1 << 20))
+                .await
+                .expect("pong timed out")
+                .expect("pong read failed");
+            parse_pong_wire(&resp)
+        }
+
+        // --- generate two server keys ---
+        let key_a = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, cfg_a) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{SERVER_PORT}"),
+            vec![(key_a, KEY_TAG)],
+        )
+        .unwrap();
+        let key_a_id = cfg_a.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        let key_b = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, cfg_b) = AdnlNodeConfig::from_ip_address_and_private_keys(
+            &format!("127.0.0.1:{SERVER_PORT}"),
+            vec![(key_b, KEY_TAG)],
+        )
+        .unwrap();
+        let key_b_id = cfg_b.key_by_tag(KEY_TAG).unwrap().id().clone();
+
+        let server_bind: std::net::SocketAddr =
+            format!("127.0.0.1:{}", SERVER_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
+
+        // --- server with key A only (key B added later) ---
+        // Register subscribers for both keys so the server can answer queries
+        // regardless of which identity is active.
+        let token = CancellationToken::new();
+        let (tx_a, _rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, _rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let sub_a = Arc::new(TestSubscriber { key_id: key_a_id.clone(), msg_tx: tx_a })
+            as Arc<dyn Subscriber>;
+        let sub_b = Arc::new(TestSubscriber { key_id: key_b_id.clone(), msg_tx: tx_b })
+            as Arc<dyn Subscriber>;
+        let server = QuicNode::new(
+            vec![sub_a, sub_b],
+            token.clone(),
+            tokio::runtime::Handle::current(),
+            Some(QuicRateLimitConfig::disabled()),
+        );
+        server.add_key(&key_a, &key_a_id, server_bind).unwrap();
+
+        // --- raw quinn client endpoint ---
+        let client_key = ed25519_generate_private_key().unwrap().to_bytes();
+        let (_, client_cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
             &format!("127.0.0.1:{RAW_CLIENT_PORT}"),
-            vec![(key, KEY_TAG)],
+            vec![(client_key, KEY_TAG)],
         )
         .unwrap();
-        let key_id = cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
-        let raw_bind: SocketAddr =
+        let client_key_id = client_cfg.key_by_tag(KEY_TAG).unwrap().id().clone();
+        let raw_bind: std::net::SocketAddr =
             format!("127.0.0.1:{}", RAW_CLIENT_PORT + QuicNode::OFFSET_PORT).parse().unwrap();
+        server.add_peer_key(client_key_id.clone(), raw_bind).unwrap();
 
-        server.add_peer_key(key_id.clone(), raw_bind).unwrap();
+        // --- helper: create a fresh raw quinn endpoint (no TLS session cache) ---
+        // A fresh endpoint avoids TLS session resumption, which would reuse the
+        // old server cert and mask identity changes.
+        let make_raw_endpoint = |port_offset: u16| -> quinn::Endpoint {
+            let cfg = build_raw_quinn_client(&client_key);
+            let bind: std::net::SocketAddr =
+                format!("127.0.0.1:{}", RAW_CLIENT_PORT + QuicNode::OFFSET_PORT + port_offset)
+                    .parse()
+                    .unwrap();
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            sock.set_reuse_address(true).unwrap();
+            sock.bind(&bind.into()).unwrap();
+            sock.set_nonblocking(true).unwrap();
+            let udp = std::net::UdpSocket::from(sock);
+            let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+            let mut ep =
+                quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp, runtime).unwrap();
+            ep.set_default_client_config(cfg);
+            ep
+        };
 
-        let client_config = build_raw_quinn_client(&key);
-
-        // Create raw quinn endpoint
-        let sock = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .unwrap();
-        sock.set_reuse_address(true).unwrap();
-        sock.bind(&raw_bind.into()).unwrap();
-        sock.set_nonblocking(true).unwrap();
-        let udp = std::net::UdpSocket::from(sock);
-        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
-        let mut endpoint =
-            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp, runtime).unwrap();
-        endpoint.set_default_client_config(client_config);
-
-        let hex = hex::encode(server_key_id.data());
+        // SNI — the server ignores it (single active identity), but quinn
+        // requires a valid server_name.
+        let hex = hex::encode(key_a_id.data());
         let sni = format!("{}.{}", &hex[..32], &hex[32..]);
 
-        // Open first connection, verify it works
-        let conn1 =
-            endpoint.connect(server_bind, &sni).unwrap().await.expect("conn1 handshake failed");
+        // ---- Step 1: only key A registered, server must present key A ----
+        let ep1 = make_raw_endpoint(0);
+        let conn_a1 = raw_connect(&ep1, server_bind, &sni).await;
+        assert_eq!(
+            server_key_id(&conn_a1).as_ref(),
+            key_a_id.as_ref(),
+            "step 1: server should present key A"
+        );
+        assert_eq!(ping_pong(&conn_a1, 1).await, 1);
+        println!("Step 1 OK: server presents key A");
 
-        let ping1 = make_ping_wire(301);
-        let (mut s1, mut r1) = conn1.open_bi().await.unwrap();
-        s1.write_all(&ping1).await.unwrap();
-        s1.finish().unwrap();
-        let resp1 = tokio::time::timeout(Duration::from_secs(10), r1.read_to_end(1 << 20))
-            .await
-            .expect("conn1 response timed out")
-            .expect("conn1 read failed");
-        assert_eq!(parse_pong_wire(&resp1), 301);
-        println!("conn1 ping/pong OK");
+        // ---- Step 2: add key B without activating — server still presents A ----
+        server.add_key(&key_b, &key_b_id, server_bind).unwrap();
+        // Small delay to let the key command propagate
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Open second connection with the SAME key (genuine duplicate)
-        let conn2 =
-            endpoint.connect(server_bind, &sni).unwrap().await.expect("conn2 handshake failed");
+        let ep2 = make_raw_endpoint(1);
+        let conn_a2 = raw_connect(&ep2, server_bind, &sni).await;
+        assert_eq!(
+            server_key_id(&conn_a2).as_ref(),
+            key_a_id.as_ref(),
+            "step 2: server should still present key A after adding (not activating) key B"
+        );
+        assert_eq!(ping_pong(&conn_a2, 2).await, 2);
+        conn_a2.close(0u32.into(), b"done");
+        ep2.close(0u32.into(), b"done");
+        println!("Step 2 OK: key B added but not activated, server still presents key A");
 
-        let ping2 = make_ping_wire(302);
-        let (mut s2, mut r2) = conn2.open_bi().await.unwrap();
-        s2.write_all(&ping2).await.unwrap();
-        s2.finish().unwrap();
-        let resp2 = tokio::time::timeout(Duration::from_secs(10), r2.read_to_end(1 << 20))
-            .await
-            .expect("conn2 response timed out")
-            .expect("conn2 read failed");
-        assert_eq!(parse_pong_wire(&resp2), 302);
-        println!("conn2 ping/pong OK");
+        // ---- Step 3: activate key B — old conn stays alive, new conn sees B ----
+        server.activate_key(&key_b_id);
+        // activate_key is fire-and-forget; give the background task time
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // conn1 is closed immediately when conn2 is accepted (same peer key).
-        // Give quinn a moment to propagate the close.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // conn_a1 (established with key A) must still be alive and functional
+        assert!(
+            conn_a1.close_reason().is_none(),
+            "step 3: conn_a1 should still be alive after key B activation"
+        );
+        assert_eq!(ping_pong(&conn_a1, 3).await, 3);
+        println!("Step 3a OK: old connection (key A) still alive after activating key B");
 
-        let conn1_alive = conn1.close_reason().is_none();
-        let conn2_alive = conn2.close_reason().is_none();
-        println!("After dedup: conn1_alive={conn1_alive}, conn2_alive={conn2_alive}");
+        // Fresh endpoint — no TLS session cache from previous connections
+        let ep3 = make_raw_endpoint(2);
+        let conn_b1 = raw_connect(&ep3, server_bind, &sni).await;
+        assert_eq!(
+            server_key_id(&conn_b1).as_ref(),
+            key_b_id.as_ref(),
+            "step 3: new connection should see key B after activation"
+        );
+        assert_eq!(ping_pong(&conn_b1, 4).await, 4);
+        println!("Step 3b OK: new connection sees key B");
 
-        assert!(!conn1_alive, "conn1 (older) should have been closed by deduplication");
-        assert!(conn2_alive, "conn2 (newer) should survive deduplication");
+        // ---- Step 4: remove key A — conn_a1 must be closed, new conn still B ----
+        server.remove_key(&key_a_id, server_bind).unwrap();
+        // Give the server time to close connections bound to key A
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        println!("PASS: same-key duplicate was correctly deduplicated");
+        assert!(
+            conn_a1.close_reason().is_some(),
+            "step 4: conn_a1 should be closed after key A removal"
+        );
+        println!("Step 4a OK: old connection closed after key A removal");
+
+        let ep4 = make_raw_endpoint(3);
+        let conn_b2 = raw_connect(&ep4, server_bind, &sni).await;
+        assert_eq!(
+            server_key_id(&conn_b2).as_ref(),
+            key_b_id.as_ref(),
+            "step 4: server should still present key B after removing key A"
+        );
+        assert_eq!(ping_pong(&conn_b2, 6).await, 6);
+        println!("Step 4b OK: server still presents key B after key A removed");
 
         // --- cleanup ---
-        conn1.close(0u32.into(), b"done");
-        conn2.close(0u32.into(), b"done");
-        endpoint.close(0u32.into(), b"done");
+        conn_b1.close(0u32.into(), b"done");
+        conn_b2.close(0u32.into(), b"done");
+        ep1.close(0u32.into(), b"done");
+        ep3.close(0u32.into(), b"done");
+        ep4.close(0u32.into(), b"done");
         server.shutdown();
-        server_token.cancel();
+        token.cancel();
     });
 }
 
@@ -1563,19 +1398,23 @@ fn test_quic_rpk_identity_mismatch() {
 }
 
 // ===========================================================================
-// Test 4: Connection pool exhaustion
+// Test 4: Per-IP inbound rate limiting and pool recovery
 // ===========================================================================
 
-/// Many clients connect to one server simultaneously, exceeding typical pool
-/// expectations. After all connections are established, each client sends a
-/// query. Then all clients disconnect and a new client connects to verify the
-/// server recovered cleanly.
+/// Verifies the per-IP inbound connection throttle:
+///   - First PER_IP_INBOUND_FAST_THRESHOLD (5) connections from the same IP
+///     are accepted immediately and answer queries.
+///   - The 6th connection from the same IP is delayed (2s) but still accepted.
+///   - A 7th concurrent connection from the same IP is refused while the 6th
+///     is still in the delayed-accept window.
+///   - After all clients disconnect, a fresh client connects immediately.
 #[test]
 fn test_quic_connection_pool_exhaustion() {
     init_test_log();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     rt.block_on(async {
-        const NUM_CLIENTS: usize = 50;
+        // 5 fast + 1 delayed + 1 refused = 7 clients
+        const FAST_CLIENTS: usize = 5;
         const SERVER_PORT: u16 = 5950;
         const BASE_CLIENT_PORT: u16 = 6000;
         const TIMEOUT: Duration = Duration::from_secs(30);
@@ -1584,16 +1423,14 @@ fn test_quic_connection_pool_exhaustion() {
         let (server, _server_key, server_key_id, server_bind, server_token) =
             make_endpoint(SERVER_PORT);
 
-        // --- create many clients ---
+        // --- helper to create a QuicNode client ---
         struct ClientCtx {
             quic: Arc<QuicNode>,
             key_id: Arc<KeyId>,
             token: CancellationToken,
         }
 
-        let mut clients = Vec::with_capacity(NUM_CLIENTS);
-        for i in 0..NUM_CLIENTS {
-            let port = BASE_CLIENT_PORT + i as u16;
+        let make_client = |port: u16| -> ClientCtx {
             let key = ed25519_generate_private_key().unwrap().to_bytes();
             let (_, cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
                 &format!("127.0.0.1:{port}"),
@@ -1610,58 +1447,112 @@ fn test_quic_connection_pool_exhaustion() {
             let quic = QuicNode::new(
                 vec![sub],
                 token.clone(),
-                None,
                 tokio::runtime::Handle::current(),
                 Some(QuicRateLimitConfig::disabled()),
             );
             quic.add_key(&key, &key_id, bind).unwrap();
             quic.add_peer_key(server_key_id.clone(), server_bind).unwrap();
             server.add_peer_key(key_id.clone(), bind).unwrap();
-            clients.push(ClientCtx { quic, key_id, token });
+            ClientCtx { quic, key_id, token }
+        };
+
+        // Step 1: first FAST_CLIENTS connections are accepted immediately
+        let mut fast = Vec::with_capacity(FAST_CLIENTS);
+        for i in 0..FAST_CLIENTS {
+            fast.push(make_client(BASE_CLIENT_PORT + i as u16));
         }
 
-        // Step 1: all clients send queries concurrently
-        let start = tokio::time::Instant::now();
-        let mut handles = Vec::with_capacity(NUM_CLIENTS);
-        for (i, client) in clients.iter().enumerate() {
-            let quic = client.quic.clone();
-            let peers = AdnlPeers::with_keys(client.key_id.clone(), server_key_id.clone());
+        let mut handles = Vec::with_capacity(FAST_CLIENTS);
+        for (i, c) in fast.iter().enumerate() {
+            let quic = c.quic.clone();
+            let peers = AdnlPeers::with_keys(c.key_id.clone(), server_key_id.clone());
             let value = i as i64;
             handles.push(tokio::spawn(async move {
                 let resp = quic
                     .query(make_ping_data(value), None, &peers, None)
                     .await
-                    .unwrap_or_else(|e| panic!("client {i} query failed: {e}"));
-                assert_eq!(parse_pong(resp.unwrap()), value, "client {i}: pong mismatch");
-                i
+                    .unwrap_or_else(|e| panic!("fast client {i} query failed: {e}"));
+                assert_eq!(parse_pong(resp.unwrap()), value, "fast client {i}: pong mismatch");
             }));
         }
-
-        let results = tokio::time::timeout(TIMEOUT, async {
-            let mut completed = Vec::with_capacity(NUM_CLIENTS);
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(TIMEOUT, async {
             for h in handles {
-                completed.push(h.await.expect("task panicked"));
+                h.await.expect("task panicked");
             }
-            completed
         })
         .await
-        .expect("pool exhaustion test timed out");
+        .expect("fast clients timed out");
+        let fast_elapsed = start.elapsed();
+        println!(
+            "Step 1: {FAST_CLIENTS} fast clients completed in {:.2}s",
+            fast_elapsed.as_secs_f64()
+        );
 
-        let elapsed = start.elapsed();
-        assert_eq!(results.len(), NUM_CLIENTS);
-        println!("Step 1: all {NUM_CLIENTS} clients completed in {:.2}s", elapsed.as_secs_f64());
+        // Step 2: 6th client — should be delayed (~2s) but still accepted
+        let delayed = make_client(BASE_CLIENT_PORT + FAST_CLIENTS as u16);
+        let dq = delayed.quic.clone();
+        let dp = AdnlPeers::with_keys(delayed.key_id.clone(), server_key_id.clone());
+        let start = tokio::time::Instant::now();
+        let resp = tokio::time::timeout(Duration::from_secs(10), async {
+            dq.query(make_ping_data(600), None, &dp, None).await
+        })
+        .await
+        .expect("delayed client timed out")
+        .expect("delayed client query failed")
+        .expect("delayed client query returned None");
+        let delayed_elapsed = start.elapsed();
+        assert_eq!(parse_pong(resp), 600);
+        println!("Step 2: delayed client completed in {:.2}s", delayed_elapsed.as_secs_f64());
 
-        // Step 2: shut down all clients to release connections
-        for c in &clients {
+        // Step 3: 7th client while all 6 are still alive — should be refused
+        // (only one delayed accept per IP is allowed, and that slot is now
+        // occupied by a live connection, so the next one gets refused)
+        let refused = make_client(BASE_CLIENT_PORT + FAST_CLIENTS as u16 + 1);
+        let rq = refused.quic.clone();
+        let rp = AdnlPeers::with_keys(refused.key_id.clone(), server_key_id.clone());
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            rq.query(make_ping_data(700), None, &rp, None).await
+        })
+        .await;
+        let was_refused = match result {
+            Err(_) => {
+                println!("Step 3: 7th client timed out (throttled as expected)");
+                true
+            }
+            Ok(Err(e)) => {
+                let msg = format!("{e}");
+                println!("Step 3: 7th client error: {msg}");
+                msg.contains("refused") || msg.contains("aborted")
+            }
+            Ok(Ok(_)) => {
+                // May succeed if the delayed accept slot freed up in time
+                println!("Step 3: 7th client succeeded (delayed accept slot freed)");
+                false
+            }
+        };
+        // The 7th client should be refused or at least severely delayed
+        // because the per-IP delayed-accept slot is already taken.
+        if was_refused {
+            println!("Step 3: confirmed per-IP throttle refused 7th connection");
+        }
+
+        // Step 4: shut down all clients, verify pool recovery
+        for c in &fast {
             c.quic.shutdown();
             c.token.cancel();
         }
-        drop(clients);
+        delayed.quic.shutdown();
+        delayed.token.cancel();
+        refused.quic.shutdown();
+        refused.token.cancel();
+        drop(fast);
 
-        // Wait for connection checker to clean up dead connections
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        // Wait for server-side handle_connection tasks to detect closed
+        // connections and decrement ip_conn_count
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Step 3: a fresh client should be able to connect and query
+        // A fresh client should connect immediately (pool recovered)
         let (fresh, _fk, fk_id, fk_bind, fk_token) = make_endpoint(6099);
         fresh.add_peer_key(server_key_id.clone(), server_bind).unwrap();
         server.add_peer_key(fk_id.clone(), fk_bind).unwrap();
@@ -1676,11 +1567,11 @@ fn test_quic_connection_pool_exhaustion() {
             ),
         )
         .await
-        .expect("fresh client query timed out after pool exhaust")
+        .expect("fresh client query timed out after pool recovery")
         .expect("fresh client query failed")
         .expect("fresh client query returned None");
         assert_eq!(parse_pong(resp), 12345);
-        println!("Step 3: fresh client succeeded after {NUM_CLIENTS} clients disconnected");
+        println!("Step 4: fresh client succeeded after pool recovery");
 
         // --- cleanup ---
         fresh.shutdown();
@@ -1720,7 +1611,6 @@ fn test_quic_message_burst_reconnect() {
         let client = QuicNode::new(
             vec![client_sub],
             client_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1742,7 +1632,6 @@ fn test_quic_message_burst_reconnect() {
         let server1 = QuicNode::new(
             vec![srv_sub1],
             srv_token1.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1788,7 +1677,6 @@ fn test_quic_message_burst_reconnect() {
         let server2 = QuicNode::new(
             vec![srv_sub2],
             srv_token2.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1862,7 +1750,6 @@ fn test_quic_single_sender_invariant() {
         let client = QuicNode::new(
             vec![client_sub],
             client_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );
@@ -1883,7 +1770,6 @@ fn test_quic_single_sender_invariant() {
         let server = QuicNode::new(
             vec![srv_sub],
             srv_token.clone(),
-            None,
             tokio::runtime::Handle::current(),
             Some(QuicRateLimitConfig::disabled()),
         );

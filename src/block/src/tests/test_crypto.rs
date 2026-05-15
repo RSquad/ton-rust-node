@@ -60,7 +60,7 @@ fn test_p256_signature() {
         "979e54eb9b3a942243effbd39ccdb309f4bd2973e77c31b92d04150c169e9e3597b666d6d2fd084c38e1eb1ed828e11c3e4fbdc74c18b0d466375e4304673be7"
     );
 
-    let hash = sha2::Sha256::digest(msg);
+    let hash = sha256_digest(msg);
     println!("hash: {}", hex::encode(hash.as_slice()));
     let signature: p256::ecdsa::Signature = secret_key.sign(hash.as_slice());
     println!("signature: {}", hex::encode(signature.to_bytes()));
@@ -71,7 +71,7 @@ fn test_p256_signature() {
 #[test]
 fn test_secp256k1_signature() {
     let msg = b"Hello, world!";
-    let hash = sha2::Sha256::digest(msg);
+    let hash = sha256_digest(msg);
     assert_eq!(
         hex::encode(hash.as_slice()),
         "315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3"
@@ -144,7 +144,7 @@ fn test_secp256k1_signature() {
 #[test]
 fn test_ristretto_255_from_hash() {
     let msg = "Ristretto points on curve";
-    let hash = sha2::Sha512::digest(msg.as_bytes());
+    let hash = sha512_digest(msg.as_bytes());
     println!("{}", hex::encode(hash.as_slice()));
     let point = RistrettoPoint::from_uniform_bytes(hash.as_slice().try_into().unwrap());
     let compressed = point.compress().to_bytes();

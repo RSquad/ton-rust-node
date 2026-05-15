@@ -979,6 +979,10 @@ impl ValidatorManagerImpl {
     /// - masterchain simplex sessions receive the applied masterchain block id
     /// - shard simplex sessions receive the shard top currently registered in masterchain
     ///
+    /// This is an applied-top signal, not a session-local finalization signal.
+    /// Current MC sessions use it to track accepted/applied head ordering, while
+    /// local finalized progression remains owned by the Simplex session itself.
+    ///
     /// Delivery is enqueued into each validator group's ordered action queue without
     /// blocking the manager's hot path.
     ///

@@ -29,9 +29,7 @@ use secrets_vault::{
     types::{algorithm::Algorithm, secret_spec::SecretSpec},
 };
 
-let vault = SecretVaultBuilder::from_url(
-    "file:///path/to/vault.json?master_key=abcdef...64hex"
-).await?;
+let vault = SecretVaultBuilder::from_url("file:///path/to/vault.json?master_key=abcdef...64hex", DefaultCryptoFactory {}.new_crypto()?).await?;
 
 // Generate an Ed25519 key pair
 let spec = SecretSpec::new(Algorithm::Ed25519).extractable(true);
@@ -39,7 +37,7 @@ let secret = vault.generate_secret(&spec, &"my_key".into()).await?;
 vault.flush().await?;
 
 // Sign and verify
-let keypair = vault.get(&"my_key".into()).await?;
+let keypair = vault.load(&"my_key".into()).await?;
 let sig = keypair.as_keypair()?.sign(b"hello").await?;
 keypair.as_keypair()?.verify(b"hello", &sig).await?;
 ```
@@ -49,7 +47,7 @@ keypair.as_keypair()?.verify(b"hello", &sig).await?;
 Set `VAULT_URL` and open the vault:
 
 ```rust
-let vault = SecretVaultBuilder::from_env().await?;
+let vault = SecretVaultBuilder::from_env(DefaultCryptoFactory {}.new_crypto()?).await?;
 ```
 
 ## Vault URL Schemes
@@ -73,13 +71,43 @@ Secrets are encrypted with AES-256-GCM under the master key and stored in a hier
 hashicorp://<vault_address>?api_key=<token>[&namespace=<ns>][&prefer_local_crypto=false]
 ```
 
+**Authentication** — choose one method:
+
 | Parameter   | Required | Description                                          |
 |-------------|----------|------------------------------------------------------|
-| `api_key`   | Yes      | Vault authentication token                           |
-| `namespace` | No       | Vault namespace                                      |
-| `prefer_local_crypto` | No       | Cache extractable private keys locally (default: false)|
+| `api_key`   | Yes*     | Static Vault token (`auth=token` or omit `auth`)     |
+| `auth`      | No       | Auth method: `token` (default) or `k8s`              |
+| `role`      | Yes**    | Vault role name (required when `auth=k8s`)           |
+| `auth_mount`| No       | Kubernetes auth mount path (default: `kubernetes`)   |
+| `jwt_path`  | No       | Path to service account JWT (default: `/var/run/secrets/kubernetes.io/serviceaccount/token`) |
+
+\* Required when `auth=token` or `auth` is omitted. \*\* Required when `auth=k8s`.
+
+**Vault configuration:**
+
+| Parameter             | Default    | Description                                          |
+|-----------------------|------------|------------------------------------------------------|
+| `namespace`           | —          | Vault namespace                                      |
+| `prefer_local_crypto` | `false`    | Cache extractable private keys locally               |
+| `transit_mount`       | `transit`  | Mount path for Transit secret engine                 |
+| `transit_prefix`      | —          | Path prefix within the transit mount (e.g. `mainnet` or `mainnet.validator-0`). No `/` or other URL-specific characters allowed. |
+| `kv_mount`            | `secret`   | Mount path for KV v2 secret engine                   |
+| `kv_prefix`           | —          | Path prefix within KV mount (e.g. `mainnet` or `mainnet/validator-0`) |
 
 Ed25519 keys are managed via Transit engine. Blobs are stored in KV v2 engine.
+
+**Examples:**
+
+```bash
+# Static token (default mounts)
+hashicorp://vault:8200?api_key=hvs.xxx
+
+# Kubernetes auth
+hashicorp://vault:8200?auth=k8s&role=validator-0
+
+# Custom mount paths + environment prefix
+hashicorp://vault:8200?api_key=hvs.xxx&transit_mount=ton-transit&transit_prefix=mainnet.validator_0&kv_mount=ton&kv_prefix=mainnet.validator_0
+```
 
 ## Core API
 
@@ -151,13 +179,10 @@ SecretVault
   |     +-- HashicorpStorage  [feature: hashicorp-storage]
   |
   +-- CryptoFactory (trait)
-  |     +-- AutoCryptoFactory    (selects best available)
   |     +-- DefaultCryptoFactory (ed25519-dalek)
-  |     +-- BlockCryptoFactory   (ton_block)
   |
   +-- CryptoImpl<B: Ed25519Backend>
   |     +-- DefaultEd25519  [feature: crypto-default]
-  |     +-- BlockEd25519    [feature: crypto-block]
   |
   +-- ProtectedMemory
         (mlock + mprotect + zeroize-on-drop)
@@ -169,12 +194,8 @@ SecretVault
 |----------------------|--------------------------------------------|---------|
 | `file-storage-json`  | Local encrypted JSON file storage          | Yes     |
 | `crypto-default`     | Ed25519 via `ed25519-dalek` + AES-GCM      | Yes     |
-| `with-base64`        | Base64 encoding support                    | Yes     |
-| `crypto-block`       | Ed25519 via `ton_block` (TON-compatible)   | No      |
 | `hashicorp-storage`  | HashiCorp Vault remote backend             | No      |
 | `secrets-vault-cli`  | CLI binary                                 | No      |
-
-At least one of `crypto-default` or `crypto-block` must be enabled. When both are enabled, `crypto-block` takes priority in `AutoCryptoFactory`.
 
 ## Error Codes
 

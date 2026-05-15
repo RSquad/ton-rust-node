@@ -236,7 +236,6 @@ pub(crate) fn cross_check(
                 Ok(true)
             })
             .unwrap();
-        assert_eq!(acc_after, acc_file);
 
         assert_eq!(transaction.read_description().unwrap(), tx_file.read_description().unwrap());
         transaction
@@ -247,6 +246,7 @@ pub(crate) fn cross_check(
             })
             .unwrap();
         assert_eq!(transaction, tx_file);
+        assert_eq!(acc_after, acc_file);
 
         assert_eq!(acc_after.serialize().unwrap(), acc_file_cells);
         assert_eq!(transaction.serialize().unwrap(), tx_file_cells);

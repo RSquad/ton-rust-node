@@ -7,13 +7,13 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    crypto::{crypto_trait::Crypto, factory::CryptoFactory, key_material::KeyMaterial},
+    crypto::{crypto_trait::Crypto, key_material::KeyMaterial},
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory,
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
     storage::{
-        hashicorp_api::{Client, KeyMode},
-        storage_trait::Storage,
-        utils,
+        hashicorp_api::{Client, KeyMode, VaultConfig},
+        hashicorp_token_provider::AuthConfig,
+        storage_trait::{ListMode, Storage},
     },
     types::{
         algorithm::Algorithm,
@@ -31,7 +31,7 @@ pub(crate) struct KeyPairHashicorp {
     metadata: Metadata,
     client: Arc<Client>,
     key_material: KeyMaterial,
-    crypto: Option<Box<dyn Crypto>>,
+    crypto: Arc<dyn Crypto>,
     prefer_local_crypto: bool,
 }
 
@@ -39,32 +39,28 @@ impl KeyPairHashicorp {
     pub async fn new(
         metadata: Metadata,
         client: Arc<Client>,
-        crypto: Option<Box<dyn Crypto>>,
+        crypto: Arc<dyn Crypto>,
         prefer_local_crypto: bool,
     ) -> anyhow::Result<Self> {
-        let key_material = Self::load_keys(client.as_ref(), &metadata, prefer_local_crypto).await?;
+        let key_material = Self::load_keys(client.as_ref(), &metadata).await?;
         Ok(Self { metadata, client, key_material, crypto, prefer_local_crypto })
     }
 
-    async fn load_keys(
-        client: &Client,
-        metadata: &Metadata,
-        prefer_local_crypto: bool,
-    ) -> anyhow::Result<KeyMaterial> {
+    async fn load_keys(client: &Client, metadata: &Metadata) -> anyhow::Result<KeyMaterial> {
         let secret_id = metadata
             .secret_id
             .as_ref()
             .ok_or_else(|| VaultError::empty_secret_id("Failed to load keys"))?;
         let (key_info, _) = client.get_key_info(secret_id.as_string()).await?;
-        let public_key = utils::b64::decode(key_info.public_key)?;
-        let private_key = if metadata.extractable && prefer_local_crypto {
+        let public_key = base64::decode(key_info.public_key)?;
+        let private_key = if metadata.extractable {
             let private_key = client.export_key(secret_id.as_str(), KeyMode::Signing).await?;
             Some(private_key)
         } else {
             None
         };
 
-        KeyMaterial::new(private_key, Some(public_key)).await
+        KeyMaterial::new(private_key, Some(public_key))
     }
 }
 
@@ -78,44 +74,43 @@ impl KeyPair for KeyPairHashicorp {
         &self.metadata
     }
 
-    async fn extractable(&self) -> anyhow::Result<bool> {
-        Ok(self.metadata.extractable)
+    fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
     }
 
-    async fn public_key(&self) -> anyhow::Result<Option<Vec<u8>>> {
-        let pub_key = self
-            .key_material
-            .public_key
-            .as_ref()
-            .ok_or_else(|| VaultError::empty_public_key("Failed to get public key"))?;
-        Ok(Some(pub_key.clone()))
+    fn extractable(&self) -> bool {
+        self.metadata.extractable
     }
 
-    async fn private_key(&self) -> anyhow::Result<ProtectedMemory> {
+    fn public_key(&self) -> Option<&[u8]> {
+        self.key_material.public_key.as_deref()
+    }
+
+    fn private_key(&self) -> anyhow::Result<&ProtectedMemory> {
         if !self.metadata.extractable {
             anyhow::bail!(VaultError::not_extractable(self.metadata.secret_id.as_ref()))
         }
 
-        if let Some(cached_key) = self.key_material.secret_key.as_ref() {
-            return cached_key.clone().await;
-        }
-
-        // Key not cached — fetch on demand from HashiCorp Vault
-        let secret_id = self
-            .metadata
-            .secret_id
+        let pvt_key = self
+            .key_material
+            .secret_key
             .as_ref()
-            .ok_or_else(|| VaultError::empty_secret_id("Failed to get private key"))?;
-        self.client.export_key(secret_id.as_str(), KeyMode::Signing).await
+            .ok_or_else(|| VaultError::empty_secret_key("Private key is not set"))?;
+
+        Ok(pvt_key)
+    }
+
+    fn expanded_key(&self) -> anyhow::Result<ProtectedMemory> {
+        let pvt_key = self.private_key()?;
+        let lock = &pvt_key.lock()?;
+        let exp_key = self.crypto.exp_key_from_pvt(self.metadata.algorithm, lock)?;
+
+        Ok(exp_key)
     }
 
     async fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         if self.metadata.extractable && self.prefer_local_crypto {
-            self.crypto
-                .as_ref()
-                .ok_or_else(|| VaultError::empty_crypto("Failed to sign"))?
-                .sign(&self.key_material, data, self.metadata.algorithm)
-                .await
+            self.crypto.as_ref().sign(&self.key_material, data, self.metadata.algorithm)
         } else {
             let secret_id = self
                 .metadata
@@ -129,19 +124,15 @@ impl KeyPair for KeyPairHashicorp {
 
     async fn verify(&self, data: &[u8], signature: &[u8]) -> anyhow::Result<()> {
         if self.metadata.extractable && self.prefer_local_crypto {
-            self.crypto
-                .as_ref()
-                .ok_or_else(|| VaultError::empty_crypto("Failed to verify"))?
-                .verify(
-                    self.key_material
-                        .public_key
-                        .as_ref()
-                        .ok_or_else(|| VaultError::empty_public_key("Failed to verify"))?,
-                    data,
-                    signature,
-                    self.metadata.algorithm,
-                )
-                .await
+            self.crypto.verify(
+                self.key_material
+                    .public_key
+                    .as_ref()
+                    .ok_or_else(|| VaultError::empty_public_key("Failed to verify"))?,
+                data,
+                signature,
+                self.metadata.algorithm,
+            )
         } else {
             let secret_id = self
                 .metadata
@@ -153,23 +144,33 @@ impl KeyPair for KeyPairHashicorp {
         }
     }
 
-    async fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
+    fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
         anyhow::bail!("Serialization is not supported for HashiCorp-backed secrets");
     }
 }
 
 pub struct BlobHashicorp {
     metadata: Metadata,
-    client: Arc<Client>,
+    data: ProtectedMemory,
 }
 
 impl BlobHashicorp {
-    pub fn new(metadata: Metadata, client: Arc<Client>) -> Self {
-        Self { metadata, client }
+    pub async fn new(metadata: Metadata, client: &Client) -> anyhow::Result<Self> {
+        let data = Self::load_data(client, &metadata).await?;
+        Ok(Self { metadata, data })
+    }
+
+    async fn load_data(client: &Client, metadata: &Metadata) -> anyhow::Result<ProtectedMemory> {
+        let secret_id = metadata
+            .secret_id
+            .as_ref()
+            .ok_or_else(|| VaultError::empty_secret_id("Failed to read blob data"))?;
+        let blob_data = client.read_blob(secret_id.as_str()).await?;
+        let bytes = base64::decode(&blob_data.data)?;
+        Ok(ProtectedMemoryInner::from_slice(&bytes)?.into())
     }
 }
 
-#[async_trait::async_trait]
 impl Blob for BlobHashicorp {
     fn id(&self) -> Option<&SecretId> {
         self.metadata.secret_id.as_ref()
@@ -179,41 +180,31 @@ impl Blob for BlobHashicorp {
         &self.metadata
     }
 
-    async fn data(&self) -> anyhow::Result<ProtectedMemory> {
-        let secret_id = self
-            .metadata
-            .secret_id
-            .as_ref()
-            .ok_or_else(|| VaultError::empty_secret_id("Failed to read blob data"))?;
-        let blob_data = self.client.read_blob(secret_id.as_str()).await?;
-        let bytes = utils::b64::decode(&blob_data.data)?;
-        ProtectedMemory::from_slice(&bytes).await
+    fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+
+    fn data(&self) -> &ProtectedMemory {
+        &self.data
     }
 }
 
 pub struct HashicorpStorage {
     client: Arc<Client>,
-    crypto_factory: Box<dyn CryptoFactory>,
+    crypto: Arc<dyn Crypto>,
     prefer_local_crypto: bool,
 }
 
 impl HashicorpStorage {
-    pub async fn new(
-        api_key: ProtectedMemory,
+    pub fn new(
+        auth: AuthConfig,
         url: &str,
-        namespace: Option<&str>,
-        crypto_factory: Box<dyn CryptoFactory>,
         prefer_local_crypto: bool,
+        crypto: Arc<dyn Crypto>,
+        config: VaultConfig,
     ) -> anyhow::Result<Self> {
-        let mut client = Client::new(url, api_key)?;
-        if let Some(namespace) = namespace {
-            client = client.with_namespace(namespace);
-        }
-        Ok(Self { client: Arc::new(client), crypto_factory, prefer_local_crypto })
-    }
-
-    pub async fn migrate() -> anyhow::Result<()> {
-        Ok(())
+        let client = Client::new(url, auth, config)?;
+        Ok(Self { client: Arc::new(client), crypto, prefer_local_crypto })
     }
 
     fn algorithm_to_key_type(algorithm: Algorithm) -> anyhow::Result<String> {
@@ -245,6 +236,7 @@ impl Storage for HashicorpStorage {
             }
             Algorithm::Ed25519 => {
                 let key_type = HashicorpStorage::algorithm_to_key_type(spec.algorithm)?;
+                // TODO: fix non-atomic create_key + set_metadata
                 // create_key() atomically rejects duplicates via the transit backend
                 self.client.create_key(secret_id.as_string(), &key_type, spec.extractable).await?;
                 // cas=0: only write metadata if it doesn't exist yet
@@ -252,19 +244,16 @@ impl Storage for HashicorpStorage {
                 self.load(secret_id).await
             }
             Algorithm::None => {
-                let key_material = KeyMaterial::generate_new(
-                    spec.algorithm,
-                    spec.size,
-                    self.crypto_factory.new_crypto()?.as_ref(),
-                )
-                .await?;
+                let key_material =
+                    KeyMaterial::generate_new(spec.algorithm, spec.size, self.crypto.as_ref())?;
 
                 let pvt_key = key_material
                     .secret_key
                     .as_ref()
                     .ok_or_else(|| VaultError::empty_secret_key("Failed to generate secret"))?;
 
-                let data_b64 = utils::b64::encode(&pvt_key.lock().await?);
+                let data_b64 = base64::encode(&pvt_key.lock()?);
+                // TODO: fix non-atomic write_blob + set_metadata
                 // write_blob() with NewOnly uses cas=0 internally for atomic create
                 self.client
                     .write_blob(secret_id.as_str(), &data_b64, StoreMode::NewOnly, None)
@@ -277,7 +266,7 @@ impl Storage for HashicorpStorage {
     }
 
     async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
-        let metadata = secret.metadata();
+        let metadata = secret.metadata().clone();
         let secret_id = metadata
             .secret_id
             .as_ref()
@@ -286,17 +275,21 @@ impl Storage for HashicorpStorage {
 
         match metadata.algorithm {
             Algorithm::None => {
-                let blob = secret.as_blob()?;
-                let data = blob.data().await?;
-                let lock = data.lock().await?;
-                let data_b64 = utils::b64::encode(&*lock);
+                let data_b64 = {
+                    let blob = secret.as_blob()?;
+                    let data = blob.data();
+                    let lock = data.lock()?;
+                    base64::encode(&*lock)
+                };
 
+                // TODO: fix non-atomic write_blob + set_metadata
                 self.client.write_blob(&secret_id, &data_b64, mode, None).await?;
-                self.client.set_metadata(&secret_id, metadata, None).await?;
+                self.client.set_metadata(&secret_id, &metadata, None).await?;
             }
             Algorithm::Ed25519 => {
+                // TODO: fix non-atomic import_secret_ed25519 + set_metadata
                 self.client.import_secret_ed25519(secret, mode).await?;
-                self.client.set_metadata(&secret_id, metadata, None).await?;
+                self.client.set_metadata(&secret_id, &metadata, None).await?;
             }
             _ => {
                 anyhow::bail!(VaultError::unsupported_algorithm(metadata.algorithm));
@@ -306,41 +299,25 @@ impl Storage for HashicorpStorage {
         Ok(())
     }
 
-    async fn store_vec(
-        &self,
-        _secrets: Vec<(ProtectedMemory, Metadata, StoreMode)>,
-    ) -> anyhow::Result<()> {
-        // TODO: implement
-        anyhow::bail!("store_vec is not implemented")
-    }
-
     async fn load(&self, secret_id: &SecretId) -> anyhow::Result<Secret> {
         let metadata = self.load_metadata(secret_id).await?.ok_or_else(|| {
             VaultError::not_found(format!("Metadata with id '{}' not found", secret_id))
         })?;
         let secret = match metadata.algorithm.payload_type() {
-            PayloadType::Blob => {
-                Secret::Blob { blob: Box::new(BlobHashicorp::new(metadata, self.client.clone())) }
-            }
-            PayloadType::KeyPair => {
-                let crypto = if metadata.extractable && self.prefer_local_crypto {
-                    Some(self.crypto_factory.new_crypto()?)
-                } else {
-                    None
-                };
-
-                Secret::KeyPair {
-                    keypair: Box::new(
-                        KeyPairHashicorp::new(
-                            metadata,
-                            self.client.clone(),
-                            crypto,
-                            self.prefer_local_crypto,
-                        )
-                        .await?,
-                    ),
-                }
-            }
+            PayloadType::Blob => Secret::Blob {
+                blob: Box::new(BlobHashicorp::new(metadata, self.client.as_ref()).await?),
+            },
+            PayloadType::KeyPair => Secret::KeyPair {
+                keypair: Box::new(
+                    KeyPairHashicorp::new(
+                        metadata,
+                        self.client.clone(),
+                        self.crypto.clone(),
+                        self.prefer_local_crypto,
+                    )
+                    .await?,
+                ),
+            },
             PayloadType::SymmetricKey => {
                 anyhow::bail!(VaultError::unsupported_algorithm(metadata.algorithm))
             }
@@ -368,16 +345,18 @@ impl Storage for HashicorpStorage {
         Ok(())
     }
 
-    async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
+    async fn list_metadata(&self, mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
         let mut metas = Vec::new();
 
         // Transit keys
-        let transit_keys = self.client.list_keys().await?;
-        for secret_id in transit_keys {
-            let meta = self.load_metadata(&secret_id.as_str().into()).await?;
+        if mode == ListMode::All {
+            let transit_keys = self.client.list_keys().await?;
+            for secret_id in transit_keys {
+                let meta = self.load_metadata(&secret_id.as_str().into()).await?;
 
-            if let Some(m) = meta {
-                metas.push(m);
+                if let Some(m) = meta {
+                    metas.push(m);
+                }
             }
         }
 

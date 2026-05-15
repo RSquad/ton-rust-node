@@ -16,8 +16,8 @@ use common::{
 };
 use contracts::{SingleNominatorWrapper, WalletContract, contract_provider, resolve_toncore_pool};
 use secrets_vault::{
-    errors::error::VaultError, types::secret::Secret, vault::SecretVault,
-    vault_builder::SecretVaultBuilder,
+    crypto::factory::CryptoFactory, errors::error::VaultError, types::secret::Secret,
+    vault::SecretVault, vault_block::BlockCryptoFactory, vault_builder::SecretVaultBuilder,
 };
 use std::{collections::HashMap, fs, io::Write, path::Path, sync::Arc};
 use ton_block::MsgAddressInt;
@@ -199,7 +199,7 @@ pub async fn load_config_vault(
     config_path: &Path,
 ) -> anyhow::Result<(AppConfig, Arc<SecretVault>)> {
     let config = AppConfig::load(config_path)?;
-    let vault = SecretVaultBuilder::from_env().await?;
+    let vault = SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?).await?;
 
     Ok((config, vault))
 }
@@ -228,7 +228,6 @@ pub async fn wallet_address(
 
     let pub_key = keypair
         .public_key()
-        .await?
         .ok_or_else(|| anyhow::anyhow!(VaultError::empty_public_key("Empty public key")))?;
 
     let address = calculate_wallet_address(wallet_cfg, &pub_key).context("calculate_address")?;
@@ -448,8 +447,17 @@ where
 /// AND the secret is definitely absent. Any other outcome (no vault, lookup
 /// error) is treated as "unknown" and produces no warning.
 pub async fn vault_secret_missing(secret_name: &str) -> bool {
-    match SecretVaultBuilder::from_env().await {
-        Ok(vault) => vault.exists(&secret_name.into()).await.ok() == Some(false),
+    let crypto = BlockCryptoFactory {}.new_crypto();
+    let crypto = match crypto {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    match SecretVaultBuilder::from_env(crypto).await {
+        Ok(vault) => {
+            let key = secret_name.into();
+            vault.exists(&key).await.ok() == Some(false)
+        }
         Err(_) => false,
     }
 }

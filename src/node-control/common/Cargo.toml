@@ -26,9 +26,8 @@ num = "0.4"
 chrono = "0.4"
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
-    "crypto-default",
     "hashicorp-storage",
-    "with-base64",
+    "ton-block",
 ] }
 argon2 = "0.5.3"
 

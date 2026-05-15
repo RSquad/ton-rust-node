@@ -6,8 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#![cfg(feature = "secrets-vault-cli")]
 
+mod copy;
 mod delete;
 mod generate;
 mod get;
@@ -37,7 +37,10 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum Commands {
     Init {},
-    List {},
+    List {
+        #[arg(long, short)]
+        full: bool,
+    },
     Delete {
         #[arg(required = true)]
         secret_ids: Vec<String>,
@@ -90,6 +93,23 @@ enum Commands {
         signature: HexBytes,
     },
     Migrate {},
+    Copy {
+        /// Conflict policy when destination already has a secret with the same id
+        #[arg(long, default_value = "fail")]
+        on_conflict: String,
+
+        /// Source list mode: only-needed (default) or all
+        #[arg(long, default_value = "only-needed")]
+        list_mode: String,
+
+        /// Print plan without writing to destination
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Continue on per-secret errors instead of aborting
+        #[arg(long)]
+        continue_on_error: bool,
+    },
 }
 
 #[tokio::main]
@@ -98,7 +118,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init {} => init::execute().await,
-        Commands::List {} => list::execute().await,
+        Commands::List { full } => list::execute(full).await,
         Commands::Delete { secret_ids } => delete::execute(&secret_ids).await,
         Commands::Import { secret_id, algorithm, extractable, overwrite, data } => {
             let algo: Algorithm = match algorithm.parse() {
@@ -128,6 +148,23 @@ async fn main() {
             verify::execute(&secret_id, data.0.as_slice(), signature.0.as_slice()).await
         }
         Commands::Migrate {} => migrate::execute().await,
+        Commands::Copy { on_conflict, list_mode, dry_run, continue_on_error } => {
+            let on_conflict: copy::OnConflict = match on_conflict.parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            };
+            let list_mode: copy::ListModeArg = match list_mode.parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            };
+            copy::execute(on_conflict, list_mode, dry_run, continue_on_error).await
+        }
     };
 
     if let Err(e) = result {

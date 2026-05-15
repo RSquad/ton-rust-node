@@ -74,7 +74,7 @@ fn test_trexecutor_active_acc_with_rawreserve_and_sendmsg() {
     new_acc.set_last_tr_time(tr_lt + 3);
     new_acc.set_last_paid(BLOCK_UT);
     let trans = execute_c(&msg, &mut acc, tr_lt, new_acc.balance().unwrap().coins, 2).unwrap();
-    acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
 
     assert_eq!(acc, new_acc);
     let mut good_trans = Transaction::with_account_and_message(&acc, &msg, tr_lt).unwrap();

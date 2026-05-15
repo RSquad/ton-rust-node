@@ -102,7 +102,7 @@ fn create_test_account(amount: u64, address: AccountId, code: Cell, data: Cell) 
     );
     account.set_code(code);
     account.set_data(data);
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     account
 }
 
@@ -159,7 +159,7 @@ fn test_tick_tock_executor_active_acc_with_code1() {
     vm_phase.msg_state_used = false;
     vm_phase.account_activated = false;
     vm_phase.gas_used = used.into();
-    vm_phase.gas_limit = 10000000.into();
+    vm_phase.gas_limit = 70000000.into();
     vm_phase.gas_fees = gas_fees.into();
     vm_phase.vm_steps = 10;
     description.compute_ph = TrComputePhase::Vm(vm_phase);

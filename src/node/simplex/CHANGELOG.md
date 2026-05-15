@@ -4,6 +4,274 @@ All notable changes to the Simplex Consensus Protocol implementation will be doc
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-21
+
+Major release: **state resolver for ghost-parent collation**, **certificate
+durability + ordering parity with C++**, **bootstrap-deadlock fixes**,
+**bad-signature peer-ban DoS hardening**, **per-session Prometheus
+republishing**, and a battery of C++ collation/timeout parity work. ~60
+non-merge commits since v0.6.0.
+
+**C++ baseline**: upstream [ton-blockchain/ton](https://github.com/ton-blockchain/ton)
+`testnet/validator/consensus/simplex` at local mirror commit `5cbcc5d3`
+("Update changelogs", 2026-04-06). This is the snapshot the
+`validator-engine` binary was built from for the mixed Rust/C++ 5x5
+simplex network acceptance test that gates the v0.7.0 release (see
+`node/tests/test_run_net_py/run_test_mixed_5x5_simplex.sh`).
+
+**Milestones**
+- Validator-side `StateResolverCache` eliminates the MC collation deadlock
+  on a notarized-but-unfinalized parent by materializing parent states
+  from cached candidate Merkle updates and racing them against
+  `engine.wait_state()`.
+- Certificate persistence is now ordered before state transitions and the
+  cert-DB schema is unified under `db.key.vote` + `db.cert` matching the
+  C++ `simplex-work` model.
+- Bootstrap genesis flow no longer deadlocks on the speculative MC
+  parent: explicit Simplex session parents, empty-block parity with the
+  parent state, MC seqno-lag tolerance.
+- `BadSignatureBanState` mirrors C++ `pool.cpp::ban` end-to-end: ingress
+  drop for vote/cert/broadcast from banned peers and cert-verify-failure
+  -> ban.
+- New `prometheus_publisher` module bridges per-session `MetricsHandle`
+  dumps to the global `metrics_exporter_prometheus` recorder, with
+  selectable label cardinality via `PrometheusLabels`.
+
+### Added
+
+#### State resolver bridge (validator-side `StateResolverCache`)
+
+- `SimplexSession::ensure_candidate_available(block_id, opts)`:
+  resolver-driven repair entry point. Posts to the main task queue so
+  the body / parent chain can be requested without blocking the
+  validator side.
+- `SessionListener::on_candidate_observed(block_id, data, collated_data,
+  flags)` (in `consensus-common`): every observed candidate is forwarded
+  to the validator side so the resolver cache can populate parent
+  chains and serve collation/validation without waiting for the engine
+  to apply the parent.
+- `EnsureCandidateAvailabilityOptions` + `ResolverPurpose`
+  (in `consensus-common`): typed contract for resolver probes
+  (`SimplexCollationParent` / `SimplexValidationParent`), with
+  `include_parent_chain` to fan out the request through the cached
+  parent chain.
+- `CandidateObservedFlags { body_present, parent_ready, local_collated }`
+  re-exported at the crate root for resolver consumers; the simplex
+  side sets these whenever a candidate is observed.
+- `simplex_resolver` log target for end-to-end resolver tracing
+  (debug-level by default; promoted to info on cache misses with state
+  changes).
+
+#### Bad-signature peer-ban
+
+- `BadSignatureBanState` in `Receiver`: tracks per-peer ban expiry,
+  drops vote / cert / broadcast / requestCandidate ingress from banned
+  peers, and fires `Receiver::ban_source_for_bad_signature` on cert
+  signature verification failure (mirrors C++ `pool.cpp::ban`).
+- `SessionOptions::bad_signature_ban_duration` (default 5 s) plumbed
+  through `ReceiverWrapper::create` and surfaced in
+  `simplex_config_v2` so the on-chain noncritical-params block can
+  tune it without a node restart.
+
+#### Per-session Prometheus republisher
+
+- New `prometheus_publisher` module: walks each session's local
+  `MetricsHandle` snapshot and republishes the
+  `ton_node_simplex_*` series to the global recorder backing the
+  node's `/metrics` endpoint. `*.speed` derivative keys are dropped
+  (Prometheus computes rates with `rate()` / `irate()`).
+- `SessionOptions::prometheus_labels`: `PrometheusLabels::ShardOnly`
+  (default, lowest cardinality) or `PrometheusLabels::ShardAndSessionId`
+  (per-session breakdown using the `sid8` prefix from log dumps).
+- Wired into the existing 15 s / 30 s metrics dump cadence so the
+  warmup-aware first-dump suppression carries over.
+
+#### Collation flow + self-collation metrics
+
+- Per-window collation flow logs at info: leader identity, slot phase,
+  collation entry/exit, and self-collation hit/miss counters.
+- `simplex_self_collated_*` counter family for tracking when the
+  local validator served as the collation source (vs accepting a
+  remote candidate) — drives the simnet "self-only collation" health
+  finding.
+
+#### MC finalization parity
+
+- Recursive MC finalization parity with C++ `pool.cpp::handle_finalized_block_recursive`.
+- ValidatorGroup timeouts surfaced through `SessionOptions` so the
+  validator manager can cap collation waits and fall back cleanly.
+
+### Changed
+
+#### Cert order + durability
+
+- All certificate handlers (`set_notarize_certificate`,
+  `set_finalize_certificate`, `set_skip_certificate` and their
+  observed/saved variants) now wait for the cert to be persisted to
+  the DB before triggering any state transition or network side effect
+  (broadcast vote, FSM transition). Matches C++ PR #2201
+  (`1194034a`): "persist certificates before acting on them".
+- The cert DB layout was unified under the `db.key.vote` + `db.cert`
+  schema mirroring C++ `simplex-work` previews (`c53c2af8`,
+  `8e79a230`). `notarCert`/`finalCert`/`skipCert` records are now a
+  single `Certificate` schema; bootstrap recovery walks the unified
+  cert table once.
+- Wait-for-store semantics added to vote replay during startup: the
+  pool will not transition past a slot until every persisted vote /
+  cert for it is materialised.
+- Standstill replay: receiver cert dedup, vote prefilter, tighter
+  replay range against the C++ tracked-slot interval.
+
+#### Collation / timeout C++ parity
+
+- Window-scoped collation cancellation (mid-window leader change no
+  longer leaves orphaned collation futures running).
+- Skip-safe precollation: precollated candidate is dropped when the
+  slot it anchors is skipped via FSM, preventing post-skip publish.
+- Progress-anchored timeouts: alarm rearming uses
+  `first_non_progressed_slot` as the anchor, matching C++
+  `consensus.cpp::set_timeouts`.
+- Late same-window candidate publish: candidates produced after the
+  initial window deadline but still within the leader window are
+  published instead of dropped (C++ `pool.cpp` behaviour).
+- Suppress stale finalized rebroadcasts (don't re-broadcast a
+  finalization we already applied locally).
+- Drop legacy timeout backoff knobs (`timeout_increase_factor`,
+  `max_backoff_delay`) from `SessionOptions`; behaviour is now driven
+  by `first_block_timeout_multiplier` + `_cap` from
+  `simplex_config_v2`.
+
+#### RequestCandidate hardening
+
+- Pacing + parity checks on the receiver-side `requestCandidate`
+  retry driver: backoff, peer rotation, partial-update forwarding
+  through the resolver bridge.
+- Per-peer 1-second sliding-window rate limit
+  (`candidate_resolve_rate_limit`) on inbound `requestCandidate`
+  queries.
+
+#### Bootstrap deadlock
+
+- Explicit Simplex session parents replace the implicit
+  `pipeline_context` dependency: `SimplexState::add_explicit_parent`
+  on session start so the genesis flow never has to back-derive
+  parents from a half-applied MC state.
+- Empty-block generation is resolved from the parent state
+  (`should_generate_empty_block`/`create_empty_block_desc` consult
+  the parent's normal tip via `SimplexState`), not from a
+  pipeline-level cache.
+- MC applied-top vs local-finalized progress cleanly separated:
+  MC `seqno=1` no longer suppresses empty-block recovery for MC
+  `seqno=2`.
+- Tolerate bootstrap MC seqno lag in the speculative parent flow:
+  `Engine::get_shard_blocks` returns the actual MC seqno via
+  `Option<&mut u32>` and the collator falls back to an empty
+  shard-blocks view when the speculative parent is ahead of the
+  applied MC.
+
+#### Resolver hot-path log discipline
+
+- `StateResolverCache::upsert_observed_candidate`,
+  `SimplexSession::ensure_candidate_available`, and
+  `ValidatorSessionListener::on_candidate_observed` are all `debug`
+  now (were `info` during the simnet investigation). Per the
+  workspace investigation-restore rule.
+
+### Fixed
+
+- **MC collation deadlock** on notarized-but-unfinalized parent — the
+  resolver cache materializes the missing state in-process instead of
+  waiting for the engine to apply the parent.
+- **Resolver `materializing` marker leak**: every early-return path
+  out of `try_materialize_prev_state_from_cache` now releases the
+  marker via `StateResolverCache::finish_materializing` (idempotent).
+  Without this, a single failed materialization permanently disabled
+  the resolver for a target until pruning.
+- **Resolver multi-parent walk**:
+  `StateResolverCache::collect_unresolved_chain` no longer silently
+  picks `parent_ids[0]` for shard-merge blocks — it now bails out on
+  any `parent_ids.len() != 1` and lets the caller fall through to
+  `engine.wait_state()`.
+- **Resolver body wipe on flag-only upsert**:
+  `upsert_observed_candidate` only overwrites `entry.data` /
+  `entry.collated_data` when the new observation actually carries a
+  body, so a later flag-only callback (e.g. `parent_ready=true` with
+  empty payloads) cannot wipe a previously-cached body while
+  OR-merging `flags.body_present=true`.
+- Genesis collation/validation alignment with C++: zerostate bootstrap
+  validation flow no longer blocks waiting for a notarized parent that
+  will never arrive.
+- Hold progress until skip base is known: `propagate_base_after_skip_cert`
+  now defers the `advance_present()` equivalent until the
+  `available_base` for the skipped slot is observable, matching C++
+  `pool.cpp` behaviour.
+- Quick fix for bad election ID on first elections.
+- Suppress t0 `low_activity` health finding by delaying the first
+  metric dump and health check past the warmup window.
+- Stale `wait_state()` reference in the `state_resolver_cache` module
+  docs replaced with the actual `subscribe_state()` →
+  `tokio::sync::watch::Receiver` flow.
+
+### Removed
+
+- Legacy timeout backoff knobs (`timeout_increase_factor`,
+  `max_backoff_delay`) from `SessionOptions`. Replaced by the
+  noncritical-params `first_block_timeout_multiplier` +
+  `first_block_timeout_cap`.
+
+### Tests
+
+- `test_simplex_consensus_ghost_parent_resolver_probe`: ghost-parent
+  integration probe driving the resolver cache through Simplex →
+  validator → collation.
+- `test_state_resolver_cache.rs`: full unit suite for
+  `StateResolverCache` covering upsert flag merging, body-wipe
+  prevention, multi-parent bail, materializing marker idempotency,
+  unresolved-chain walking, and shard-scoped pruning.
+- `test_validator_group.rs`: extracted from `test_collator.rs` into
+  its own file; resolver cache wiring + backend bridge tests added.
+- `test_prometheus_publisher.rs`: snapshot republishing with mocked
+  global recorder, parallel-safe (test-local recorder via thread
+  storage), label strategy assertions for both `ShardOnly` and
+  `ShardAndSessionId`.
+- `test_simplex_state.rs` extended for skip-interval bookkeeping,
+  cursor + base alignment, conflicting-vote handling.
+- `test_session_processor.rs` heavily extended (~2.7k new lines)
+  for cert-order, db-wait-order, bootstrap-deadlock, MC
+  finalization, and standstill parity.
+
+### Upstream merges
+
+- `feature-boc-speedup-2` (`3df0ea8b6` + `b532d9086` + `7757f86e5`):
+  optimised `BocReader` / `BocWriter` and `Cell`, switched SHA to
+  `openssl`, off-by-one fix in `Cell::read_boc_draft`, env-var
+  hygiene in `test_boc.rs`, redundant `openssl-sys` direct dep
+  removed.
+- Two `master` merges pulled in `Remove append_builder usage`
+  (PR #815) and `Node build with native flag (action)` (PR #821).
+
+### Documentation
+
+- README updated: version bumped to 0.7.0, `Current semantics` section
+  refreshed for the resolver bridge + bad-signature ban, parity gap
+  list trimmed (state-resolver / ghost-parent / cert-order / db-wait-
+  order / DOS-hardening moved to `Resolved`).
+- Crate-level `lib.rs` doc clarifies the new `on_candidate_observed`
+  callback in the `SessionListener` integration list.
+- `state_resolver_cache.rs` module doc rewritten to describe
+  `subscribe_state()` → `watch::Receiver` (the previously-described
+  `wait_state()` API never existed in this crate).
+- `prometheus_publisher.rs` module doc explains why republishing is
+  used instead of switching every increment site to the global
+  recorder.
+
+### Follow-ups
+
+- Secondary index for `SimplexDb` cert lookups by `candidate_id` /
+  `slot` to keep `load_*_by_id` / `load_skip_cert_by_slot` O(1) after
+  the cert-storage consolidation (currently O(n) prefix-scan +
+  per-entry deserialize).
+
 ## [0.6.0] - 2026-04-08
 
 Major release: **finalized-driven delivery**, **C++ parity overhaul**, **legacy mode removal**,
@@ -590,6 +858,7 @@ Major release focusing on candidate resolution, certificate system, and operatio
 
 | Version | Date | Tag | Description |
 |---------|------|-----|-------------|
+| 0.7.0 | 2026-04-21 | `simplex-0.7.0` | State resolver for ghost-parent collation, cert order + DB-wait-order durability, bootstrap-deadlock fixes, bad-signature peer-ban DoS hardening, per-session Prometheus republishing |
 | 0.6.0 | 2026-04-08 | `simplex-0.6.0` | Finalized-driven delivery, C++ parity overhaul, legacy mode removal, stall diagnostics |
 | 0.5.0 | 2026-03-20 | `simplex-0.5.0` | Committed-block proof recovery, restart gremlin fix, requestCandidate2 removal, parity docs update |
 | 0.4.0 | 2026-02-01 | `simplex-0.4.0` | Block signature types, C++ compatibility, restart resilience |

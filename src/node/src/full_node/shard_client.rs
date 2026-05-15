@@ -103,10 +103,15 @@ async fn load_next_master_block(
     engine: &Arc<dyn EngineOperations>,
     prev_id: &BlockIdExt,
 ) -> Result<BlockIdExt> {
-    log::trace!("load_next_master_block: prev block: {}", prev_id);
+    log::debug!("load_next_master_block: prev block: {}", prev_id);
     if let Some(prev_handle) = engine.load_block_handle(prev_id)? {
         if prev_handle.has_next1() {
             let next_id = engine.load_block_next1(prev_id)?;
+            log::debug!(
+                "load_next_master_block: has_next1, will download_and_apply_block {}, prev: {}",
+                next_id,
+                prev_id
+            );
             engine.clone().download_and_apply_block(&next_id, next_id.seq_no(), false).await?;
             return Ok(next_id);
         }
@@ -114,14 +119,16 @@ async fn load_next_master_block(
         fail!("Cannot load handle for prev block {}", prev_id)
     };
 
-    log::trace!("load_next_master_block: downloading next block... prev: {}", prev_id);
+    log::debug!("load_next_master_block: downloading next block... prev: {}", prev_id);
     let (block, proof) = engine.download_next_block(prev_id).await?;
-    log::trace!("load_next_master_block: got next block: {}", prev_id);
+    log::debug!("load_next_master_block: downloaded next block {}, prev: {}", block.id(), prev_id);
     if block.id().seq_no != prev_id.seq_no + 1 {
         fail!("Invalid next master block got: {}, prev: {}", block.id(), prev_id);
     }
 
+    log::debug!("load_next_master_block: waiting for prev state {}", prev_id);
     let prev_state = engine.clone().wait_state(prev_id, None, true).await?;
+    log::debug!("load_next_master_block: got prev state, checking proof for {}", block.id());
     proof.check_with_master_state(&prev_state)?;
     let mut next_handle = loop {
         if let Some(next_handle) = engine.load_block_handle(block.id())? {
@@ -152,6 +159,7 @@ async fn load_next_master_block(
                 )
             })?;
     }
+    log::debug!("load_next_master_block: applying block {}", block.id());
     engine.clone().apply_block(&next_handle, &block, next_handle.id().seq_no(), false).await?;
     Ok(block.id().clone())
 }
@@ -173,7 +181,7 @@ async fn load_shard_blocks_cycle(
         if engine.check_stop() {
             break Ok(());
         }
-        log::trace!("load_shard_blocks_cycle: mc block: {}", mc_handle.id());
+        log::debug!("load_shard_blocks_cycle: mc block: {}", mc_handle.id());
         let r = match engine.wait_next_applied_mc_block(&mc_handle, Some(5_000)).await {
             Err(e) => {
                 log::debug!("load_shard_blocks_cycle: no next mc block: {}", e);
@@ -185,10 +193,10 @@ async fn load_shard_blocks_cycle(
         mc_handle = r.0;
         let mc_block = r.1;
 
-        log::trace!("load_shard_blocks_cycle: waiting semaphore: {}", mc_block.id());
+        log::debug!("load_shard_blocks_cycle: waiting semaphore: {}", mc_block.id());
         let semaphore_permit = Arc::clone(&semaphore).acquire_owned().await?;
 
-        log::trace!("load_shard_blocks_cycle: process next mc block: {}", mc_block.id());
+        log::debug!("load_shard_blocks_cycle: process next mc block: {}", mc_block.id());
 
         let engine = Arc::clone(&engine);
         tokio::spawn(async move {
@@ -216,7 +224,7 @@ pub async fn load_shard_blocks(
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut attempt = 0;
-            log::trace!("load_shard_blocks_cycle: {}, applying block...", msg);
+            log::debug!("load_shard_blocks_cycle: {}, applying block...", msg);
             loop {
                 if let Err(e) = Arc::clone(&engine)
                     .download_and_apply_block(&shard_block_id, mc_seq_no, false)
@@ -235,7 +243,7 @@ pub async fn load_shard_blocks(
                         break;
                     }
                 } else {
-                    log::trace!("load_shard_blocks_cycle: {}, applied block", msg);
+                    log::debug!("load_shard_blocks_cycle: {}, applied block", msg);
                     break;
                 }
             }
@@ -275,7 +283,7 @@ pub async fn load_shard_blocks(
         return Ok(());
     }
 
-    log::trace!("load_shard_blocks_cycle: processed mc block: {}", mc_block.id());
+    log::debug!("load_shard_blocks_cycle: processed mc block: {}", mc_block.id());
     engine.save_shard_client_mc_block_id(mc_block.id())?;
     drop(semaphore_permit);
     Ok(())

@@ -9,12 +9,17 @@
 use anyhow::Context;
 use colored::Colorize;
 use secrets_vault::{
-    crypto::factory::{AutoCryptoFactory, CryptoFactory},
+    crypto::factory::CryptoFactory,
+    storage::storage_trait::ListMode,
     types::{
-        algorithm::Algorithm, metadata::Metadata, secret::Secret, secret_spec::SecretSpec,
+        algorithm::Algorithm,
+        metadata::Metadata,
+        secret::{Secret, SecretDataType, SecretInMemoryFactory},
+        secret_spec::SecretSpec,
         store_mode::StoreMode,
     },
     vault::SecretVault,
+    vault_block::BlockCryptoFactory,
     vault_builder::SecretVaultBuilder,
 };
 
@@ -103,7 +108,7 @@ async fn print_secret(secret: &Secret) -> anyhow::Result<()> {
     let secret_id =
         metadata.secret_id.as_ref().ok_or_else(|| anyhow::anyhow!("Secret has no ID"))?;
     let public_key =
-        if let Secret::KeyPair { keypair } = secret { keypair.public_key().await? } else { None };
+        if let Secret::KeyPair { keypair } = secret { keypair.public_key() } else { None };
 
     println!(
         "  {:<30} {:<12} {:<12} {:<20} {}",
@@ -112,7 +117,7 @@ async fn print_secret(secret: &Secret) -> anyhow::Result<()> {
         if metadata.extractable { "Yes".green() } else { "No".red() },
         metadata.created_at.format("%Y-%m-%d %H:%M"),
         if let Some(pk) = public_key {
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pk.as_slice())
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pk)
         } else {
             "".to_string()
         }
@@ -123,7 +128,7 @@ async fn print_secret(secret: &Secret) -> anyhow::Result<()> {
 
 impl KeyCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
-        let vault = SecretVaultBuilder::from_env().await?;
+        let vault = SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?).await?;
         match &self.action {
             KeyAction::Add(cmd) => cmd.run(&vault).await,
             KeyAction::Import(cmd) => cmd.run(&vault).await,
@@ -140,7 +145,7 @@ impl KeyAddCmd {
         let spec = SecretSpec::new(algo).extractable(self.extractable);
         vault.generate_secret(&spec, &secret_id).await?;
         vault.flush().await?;
-        let secret = vault.get(&secret_id).await?;
+        let secret = vault.load(&secret_id).await?;
 
         println!("\n{} {}\n", "OK".green().bold(), "Key generated successfully".green());
 
@@ -159,12 +164,15 @@ impl KeyImportCmd {
                 .context("Invalid base64 private key")?;
         let secret_id = self.name.as_str().into();
         let metadata = Metadata::new(Some(&secret_id), algo, self.extractable);
-        let secret =
-            Secret::from_raw_data(&private_key_bytes, metadata, AutoCryptoFactory {}.new_crypto()?)
-                .await?;
-        vault.put(&secret, StoreMode::CreateOrReplace).await?;
+        let secret = SecretInMemoryFactory::from_raw_data(
+            &private_key_bytes,
+            SecretDataType::from_algo(algo),
+            metadata,
+            BlockCryptoFactory {}.new_crypto()?,
+        )?;
+        vault.store(&secret, StoreMode::CreateOrReplace).await?;
         vault.flush().await?;
-        let secret = vault.get(&secret_id).await?;
+        let secret = vault.load(&secret_id).await?;
 
         println!("\n{} {}\n", "OK".green().bold(), "Key imported successfully".green());
 
@@ -177,7 +185,7 @@ impl KeyImportCmd {
 
 impl KeyLsCmd {
     pub async fn run(&self, vault: &SecretVault) -> anyhow::Result<()> {
-        let records = vault.list_metadata().await?;
+        let records = vault.list_metadata(ListMode::OnlyNeeded).await?;
 
         if records.is_empty() {
             println!("\n{}\n", "No keys found".yellow());
@@ -191,7 +199,7 @@ impl KeyLsCmd {
         for meta in &records {
             let secret_id =
                 meta.secret_id.as_ref().ok_or_else(|| anyhow::anyhow!("Secret has no ID"))?;
-            let secret = vault.get(secret_id).await?;
+            let secret = vault.load(secret_id).await?;
             print_secret(&secret).await?;
         }
 

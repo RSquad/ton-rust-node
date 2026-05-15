@@ -196,7 +196,7 @@ fn generate_test_account(big: bool, options: AccountTestOptions) -> Account {
     let mut account = Account::with_storage(&addr, &st_info, &acc_st);
     // TODO: use proper DICT_HASH_MIN_CELLS constant when `include` macros are removed -
     // `crate::DICT_HASH_MIN_CELLS` vs `block::DICT_HASH_MIN_CELLS` collision now
-    account.update_storage_stat(26).unwrap();
+    account.calc_storage_stat_dict(26).unwrap();
     account
 }
 

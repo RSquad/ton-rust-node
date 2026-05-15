@@ -16,7 +16,12 @@ function find_block {
             if [ "$2" != "LOOP" ] ; then
                 echo "ERROR: Can't find applied block ($1) on node #$N!"
                 PID="$(ps ax | grep configs_$N | grep -v grep | awk '{print $1}')"
-                gdb -p "$PID" -ex "thread apply all bt" -ex "detach" -ex "quit" > "$TEST_ROOT/tmp/output_trace_$N.log"
+                if command -v gdb &>/dev/null && [ -n "$PID" ]; then
+                    gdb -p "$PID" -ex "thread apply all bt" -ex "detach" -ex "quit" > "$TEST_ROOT/tmp/output_trace_$N.log" 2>&1 || true
+                else
+                    echo "gdb not available or no PID — dumping last 50 log lines for node #$N"
+                    tail -50 "$TEST_ROOT/tmp/output_$N.log" 2>/dev/null || true
+                fi
                 ./stop_network.sh
                 exit 1
             fi

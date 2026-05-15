@@ -76,7 +76,7 @@ fn generate_boc(path: &str, need_cells: usize) -> Result<()> {
 
             total_cells += 1;
             let cell = builder.into_cell().unwrap();
-            hashes.insert(cell.repr_hash());
+            hashes.insert(cell.repr_hash().clone());
             next_level_cells.push(cell);
         }
         bottom_level = false;
@@ -121,7 +121,6 @@ async fn apply_boc(boc_path: &str, db_path: &str, cleanup: bool) -> Result<()> {
         "shardstate_db",
         "cells",
         "counters",
-        db_path,
         CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
         Arc::new(StorageTelemetry::default()),
@@ -138,7 +137,7 @@ async fn apply_boc(boc_path: &str, db_path: &str, cleanup: bool) -> Result<()> {
     boc_file.read_to_end(&mut data)?;
     let now = Instant::now();
     tokio::task::spawn_blocking(move || -> Result<_> {
-        let result = BocReader::new().read_inmem_to_storage(Arc::new(data), &mut cs)?;
+        let result = BocReader::new().read_to_storage(data.as_slice(), &mut cs)?;
 
         let elapsed = now.elapsed();
         let cells = result.header.cells_count;

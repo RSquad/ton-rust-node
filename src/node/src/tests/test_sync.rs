@@ -225,13 +225,12 @@ async fn test_sync() -> Result<()> {
             if let Some(state) = self.states.get(handle.id().shard()) {
                 Ok((state.val().clone(), cells_index))
             } else {
-                let state = ShardStateStuff::deserialize_state_inmem(
+                let state = ShardStateStuff::deserialize_state(
                     handle.id().clone(),
-                    data,
+                    &data,
                     #[cfg(feature = "telemetry")]
                     &self.telemetry,
                     &self.allocated,
-                    &|| false,
                 )?;
                 self.states.insert(handle.id().shard().clone(), state.clone());
                 Ok((state, cells_index))

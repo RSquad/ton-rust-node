@@ -166,7 +166,7 @@ Events:
         - Side effect:
             - Several **catchain.blockUpdate** events are sent back to the validator-requester before response.
     3. **catchain.getDifference** (mandatory)
-        - This is the initial request sent by one validator to another one to receive absent blocks. The validator-requester sends а list of delivered heights to the counter-party and expects to get back blocks that were not delivered (difference). Initially, the validator-requester may send a list of zero heights to the counter-party to initiate  synchronization of blocks. Also, the `catchain.getDifference` request should be regularly made to neighbor validators to synchronize with them.
+        - This is the initial request sent by one validator to another one to receive absent blocks. The validator-requester sends a list of delivered heights to the counter-party and expects to get back blocks that were not delivered (difference). Initially, the validator-requester may send a list of zero heights to the counter-party to initiate  synchronization of blocks. Also, the `catchain.getDifference` request should be regularly made to neighbor validators to synchronize with them.
         - Request:
             - `rt` : `vector int` -  the list of heights of blocks already delivered to a validator-requester.
         - Response - **catchain.Difference** (variadic):

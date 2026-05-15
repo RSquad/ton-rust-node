@@ -1018,7 +1018,8 @@ fn test_baseline_lz4_roundtrip() {
     let cell = build_simple_tree();
     let compressed = boc_compress_baseline_lz4(vec![cell.clone()]).unwrap();
     let decompressed_bytes = boc_decompress_baseline_lz4(compressed, 1024 * 1024).unwrap();
-    let decompressed = BocReader::new().read(&mut Cursor::new(&decompressed_bytes)).unwrap().roots;
+    let decompressed =
+        BocReader::new().stream_read(&mut Cursor::new(&decompressed_bytes)).unwrap().roots;
     assert_eq!(decompressed.len(), 1);
     assert_eq!(decompressed[0], cell);
 }

@@ -285,7 +285,8 @@ impl FullNodeOverlayClient {
                 fail!("Got `TonNode_NotFound` from {}", peer.id())
             }
             Prepared::TonNode_Prepared => {
-                let data_full: DataFull = self
+                log::debug!("download_block_full: sending RLDP to peer {}, id: {}", peer.id(), id);
+                let result = self
                     .client
                     .send_rldp_query_typed(
                         &TaggedObject {
@@ -297,7 +298,14 @@ impl FullNodeOverlayClient {
                         0,
                         true,
                     )
-                    .await?;
+                    .await;
+                log::debug!(
+                    "download_block_full: got {}, peer {}, id: {}",
+                    if result.is_ok() { "OK" } else { "ERR" },
+                    peer.id(),
+                    id
+                );
+                let data_full: DataFull = result?;
                 let (block_data, proof_data, is_link) = match data_full {
                     DataFull::TonNode_DataFull(data_full) => {
                         if id != &data_full.id {
@@ -519,9 +527,19 @@ impl FullNodeOverlayClient {
                 fail!("neighbour is not found!")
             }
         };
-        log::trace!("USE PEER {}, REQUEST {:?}", peer, request.object);
-        let data_full: DataFull =
-            self.client.send_rldp_query_typed(&request, &peer, 0, true).await?;
+        log::debug!(
+            "download_next_block_full: sending RLDP to peer {}, prev: {}",
+            peer.id(),
+            prev_id
+        );
+        let result = self.client.send_rldp_query_typed(&request, &peer, 0, true).await;
+        log::debug!(
+            "download_next_block_full: got {}, peer {}, prev: {}",
+            if result.is_ok() { "OK" } else { "ERR" },
+            peer.id(),
+            prev_id
+        );
+        let data_full: DataFull = result?;
         match data_full {
             DataFull::TonNode_DataFull(data_full) => {
                 let proof = BlockProofStuff::deserialize(

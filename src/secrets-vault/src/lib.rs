@@ -18,5 +18,8 @@ pub mod utils;
 pub mod vault;
 pub mod vault_builder;
 
+#[cfg(feature = "ton-block")]
+pub mod vault_block;
+
 #[cfg(test)]
 mod tests;

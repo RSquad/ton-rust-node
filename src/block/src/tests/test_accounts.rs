@@ -389,7 +389,7 @@ fn test_account_account2() {
     assert_eq!(data, acc.get_data().unwrap());
 
     let mut lib = StateInitLib::default();
-    lib.set(&library.repr_hash(), &SimpleLib::new(library, false)).unwrap();
+    lib.set(&library.repr_hash().clone(), &SimpleLib::new(library, false)).unwrap();
     assert_eq!(lib, acc.libraries());
 
     let mut f_to_add = CurrencyCollection::with_coins(12);
@@ -489,7 +489,7 @@ fn test_account_status_serialization() {
 
 fn get_real_ton_state(filename: &str) -> (ShardStateUnsplit, Cell) {
     let root = BocReader::new()
-        .read(&mut File::open(filename).expect("Error open boc file"))
+        .stream_read(&mut File::open(filename).expect("Error open boc file"))
         .expect("Error deserializing boc file")
         .withdraw_single_root()
         .expect("Error deserializing boc - expact one root");
@@ -687,7 +687,7 @@ fn test_generate_account_and_update() {
     let cell = account.serialize().unwrap(); // serialization doesn't update storage stat
     let account2 = Account::construct_from_cell(cell).unwrap();
     assert_eq!(account, account2);
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_ne!(account, account2);
 }
 
@@ -699,6 +699,6 @@ fn test_non_usage_update() {
     let usage_tree = UsageTree::with_params(cell, true);
     let mut account = Account::construct_from_cell(usage_tree.root_cell()).unwrap();
     let visited = usage_tree.build_visited_set();
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     assert_eq!(visited, usage_tree.build_visited_set());
 }

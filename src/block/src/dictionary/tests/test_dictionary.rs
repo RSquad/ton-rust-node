@@ -103,36 +103,42 @@ fn test_merge_complex() -> Result<()> {
 
 #[test]
 fn test_multiset_random() {
-    let mut hashmap = HashmapE::with_bit_len(256);
-    let mut keys = Vec::new();
+    let mut hashmap_set = HashmapE::with_bit_len(256);
+    let mut keys: Vec<[u8; 32]> = Vec::new();
     for _ in 0..10 {
-        let key = rand::random::<[u8; 32]>().write_to_bitstring().unwrap();
-        let value = rand::random::<u8>().write_to_bitstring().unwrap();
-        println!("(\"{key:x}\", Some(0x{value:x}u8)),");
-        keys.push(key.clone());
-        hashmap.set(key, &value).unwrap();
+        let key = rand::random::<[u8; 32]>();
+        let value = rand::random::<u8>();
+        keys.push(key);
+        hashmap_set
+            .set(key.write_to_bitstring().unwrap(), &value.write_to_bitstring().unwrap())
+            .unwrap();
     }
-    println!();
-    let mut tr = HashmapTraverser::new(&hashmap);
+    let mut hashmap_multiset = hashmap_set.clone();
+
+    let mut data: Vec<([u8; 32], Option<u8>)> = Vec::new();
     for _ in 0..10 {
         if rand::random::<bool>() {
             let key = keys.swap_remove(rand::random::<usize>() % keys.len());
-            println!("(\"{key:x}\", None,");
-            hashmap.remove(key.clone()).unwrap();
-            tr.insert(key, None).unwrap();
+            hashmap_set.remove(key.write_to_bitstring().unwrap()).unwrap();
+            data.push((key, None));
         } else {
-            let key = rand::random::<[u8; 32]>().write_to_bitstring().unwrap();
-            let value = rand::random::<u8>().write_to_bitstring().unwrap();
-            println!("(\"{key:x}\", Some(0x{value:x}u8)),");
-            hashmap.set(key.clone(), &value).unwrap();
-            tr.insert(key, Some(value)).unwrap();
+            let key = rand::random::<[u8; 32]>();
+            let value = rand::random::<u8>();
+            hashmap_set
+                .set(key.write_to_bitstring().unwrap(), &value.write_to_bitstring().unwrap())
+                .unwrap();
+            data.push((key, Some(value)));
         }
     }
-    let new_root = tr.traverse().unwrap().unwrap();
-    let new_cell = format!("{new_root:#.10}");
-    let cell = format!("{:#.10}", hashmap.data().unwrap());
-    pretty_assertions::assert_eq!(new_cell, cell);
-    assert_eq!(&new_root, hashmap.data().unwrap());
+
+    hashmap_multiset
+        .hashmap_multiset(data.iter().map(|(key, value)| {
+            let fk = crate::dictionary::FixedBitsKey::new(&key[..]);
+            (fk, value.map(|v| v.write_to_bitstring().unwrap()))
+        }))
+        .unwrap();
+
+    assert_eq!(hashmap_set, hashmap_multiset);
 }
 
 #[test]
@@ -144,32 +150,42 @@ fn test_multiset_hashmap() {
         ([17u8; 32], Some(0x44u8)),
         ([128; 32], None),
     ];
-    let mut hashmap = HashmapE::with_bit_len(256);
-    hashmap
+    let mut hashmap_set = HashmapE::with_bit_len(256);
+    hashmap_set
         .set([1u8; 32].write_to_bitstring().unwrap(), &0x77u8.write_to_bitstring().unwrap())
         .unwrap();
-    hashmap
+    hashmap_set
         .set([128; 32].write_to_bitstring().unwrap(), &0x55u8.write_to_bitstring().unwrap())
         .unwrap();
+    let mut hashmap_multiset = hashmap_set.clone();
 
-    let mut tr = HashmapTraverser::new(&hashmap);
     for (key, value) in data.into_iter() {
         let key: SliceData = key.write_to_bitstring().unwrap();
         if let Some(value) = value {
             let value = value.write_to_bitstring().unwrap();
-            hashmap.set(key.clone(), &value).unwrap();
-            tr.insert(key, Some(value)).unwrap();
+            hashmap_set.set(key, &value).unwrap();
         } else {
-            hashmap.remove(key.clone()).unwrap();
-            tr.insert(key, None).unwrap();
+            hashmap_set.remove(key).unwrap();
         }
     }
 
-    println!("{:?}", tr.root);
+    hashmap_multiset
+        .hashmap_multiset(data.iter().map(|(key, value)| {
+            let fk = crate::dictionary::FixedBitsKey::new(&key[..]);
+            (fk, value.map(|v| v.write_to_bitstring().unwrap()))
+        }))
+        .unwrap();
 
-    let new_root = tr.traverse().unwrap().unwrap();
-    let new_cell = format!("{new_root:#.10}");
-    let cell = format!("{:#.10}", hashmap.data().unwrap());
-    pretty_assertions::assert_eq!(new_cell, cell);
-    assert_eq!(&new_root, hashmap.data().unwrap());
+    assert_eq!(hashmap_set, hashmap_multiset);
+}
+
+#[test]
+fn test_multiset_rejects_wrong_bit_len() {
+    let mut hashmap = HashmapE::with_bit_len(256);
+    let key_bytes = [0u8; 32];
+    // Wrong bit_len — 128 instead of 256.
+    let fk = crate::dictionary::FixedBitsKey::new(&key_bytes[..16]);
+    let value = 0x11u8.write_to_bitstring().unwrap();
+    let result = hashmap.hashmap_multiset([(fk, Some(value))].into_iter());
+    assert!(result.is_err());
 }
