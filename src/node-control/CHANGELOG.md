@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **TONCore pool deploy mode (`deploy_layout`)** — per-slot string (JSON field name unchanged). Canonical values: **`legacy`** (full pool bytecode in `StateInit.code`; same addresses as pools created with older nodectl) and **`tonscan`** (alias: `tonscan_compatible`, `tonscan-compatible` — bootstrap `StateInit.code` + `SETCODE` on first execution; explorers such as Tonscan recognise the contract). **Use `tonscan` for new pools.** Already-deployed slots must stay on the mode they were created with — address derivation differs between modes. Wired through REST (`POST /v1/pools/core`, pool slot views), JSON config, and CLI (`nodectl config pool add core --deploy-mode`, alias `--deploy-layout`). Defaults: **missing `deploy_layout` in persisted config** stays **`legacy`** so derived addresses are preserved; **`POST /v1/pools/core`** / **`nodectl config pool add core`** omitting deploy mode default to **`tonscan`**.
+
 ## [0.4.0] - 2026-04-21
 
 ### Added
