@@ -9,12 +9,12 @@
 use crate::{
     crypto::{crypto_trait::Crypto, key_material::KeyMaterial},
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory,
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
     storage::utils::{decrypt, encrypt},
     types::algorithm::Algorithm,
 };
 
-pub(crate) async fn migrate_tree_node_v1_to_v2(
+pub(crate) fn migrate_tree_node_v1_to_v2(
     node: &mut serde_json::Value,
     master_key: &KeyMaterial,
     crypto: &dyn Crypto,
@@ -26,8 +26,7 @@ pub(crate) async fn migrate_tree_node_v1_to_v2(
         .map(|s| s.to_string())
     {
         let encrypted_bytes = hex::decode(&encrypted_hex)?;
-        if let Some(new_encrypted) =
-            migrate_secret_v1_to_v2(&encrypted_bytes, master_key, crypto).await?
+        if let Some(new_encrypted) = migrate_secret_v1_to_v2(&encrypted_bytes, master_key, crypto)?
         {
             node["secret"]["encrypted_data"] =
                 serde_json::Value::String(hex::encode(&new_encrypted));
@@ -37,7 +36,7 @@ pub(crate) async fn migrate_tree_node_v1_to_v2(
     if let Some(children) = node.get_mut("children") {
         if let Some(children_map) = children.as_object_mut() {
             for (_key, child) in children_map.iter_mut() {
-                Box::pin(migrate_tree_node_v1_to_v2(child, master_key, crypto)).await?;
+                migrate_tree_node_v1_to_v2(child, master_key, crypto)?;
             }
         }
     }
@@ -45,19 +44,19 @@ pub(crate) async fn migrate_tree_node_v1_to_v2(
     Ok(())
 }
 
-async fn migrate_secret_v1_to_v2(
+fn migrate_secret_v1_to_v2(
     encrypted_data: &[u8],
     master_key: &KeyMaterial,
     crypto: &dyn Crypto,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let (data, metadata) = decrypt(master_key, encrypted_data, crypto).await?;
+    let (data, metadata) = decrypt(master_key, encrypted_data, crypto)?;
 
     if metadata.algorithm != Algorithm::Ed25519 {
         return Ok(None);
     }
 
     let new_key_bytes = {
-        let key_material = KeyMaterial::deserialize(&data.lock().await?).await?;
+        let key_material = KeyMaterial::deserialize(&data.lock()?)?;
 
         let secret_key = key_material
             .secret_key
@@ -66,12 +65,12 @@ async fn migrate_secret_v1_to_v2(
 
         // Fix Ed25519 key generation that incorrectly stored 64-byte expanded keys instead of 32-byte seeds,
         // causing pub_key_from_pvt_ed25519 to return wrong public keys for extractable keys.
-        if secret_key.len().await == 32 {
+        if secret_key.len() == 32 {
             return Ok(None);
         }
 
         // Keep first 32 bytes of Ed25519 private key
-        let secret_key_lock = secret_key.lock().await?;
+        let secret_key_lock = secret_key.lock()?;
         let secret_key_data: &[u8] = &secret_key_lock;
         let secret_key: &[u8; 32] = secret_key_data
             .get(..32)
@@ -80,14 +79,13 @@ async fn migrate_secret_v1_to_v2(
             })?
             .try_into()?;
 
-        let new_secret_key = ProtectedMemory::from_slice(secret_key).await?;
-        let new_key_material =
-            KeyMaterial::new(Some(new_secret_key), key_material.public_key).await?;
+        let new_secret_key: ProtectedMemory = ProtectedMemoryInner::from_slice(secret_key)?.into();
+        let new_key_material = KeyMaterial::new(Some(new_secret_key), key_material.public_key)?;
 
-        new_key_material.serialize().await?
+        new_key_material.serialize()?
     };
 
-    let new_encrypted = encrypt(master_key, &new_key_bytes, &metadata, crypto).await?;
+    let new_encrypted = encrypt(master_key, &new_key_bytes, &metadata, crypto)?;
 
     Ok(Some(new_encrypted))
 }

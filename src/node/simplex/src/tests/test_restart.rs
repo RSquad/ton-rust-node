@@ -195,6 +195,7 @@ enum RecoveryCall {
     CacheCandidateBytes,
     RestoreStandstillCache,
     RestoreStartupVotes,
+    FinalizeParentChain,
 }
 
 #[derive(Default)]
@@ -301,7 +302,7 @@ impl SessionStartupRecoveryListener for MockRecoveryListener {
     }
 
     fn recovery_finalize_parent_chain(&mut self) {
-        // Mock: no-op for tests
+        self.call_log.push(RecoveryCall::FinalizeParentChain);
     }
 
     fn recovery_cache_notarization_cert(
@@ -402,6 +403,8 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
         finalized_blocks: finalized_blocks.clone(),
         candidate_infos: vec![],
         notar_certs,
+        final_certs: vec![],
+        skip_certs: vec![],
         votes: votes.clone(),
         pool_state,
         candidate_payloads: vec![],
@@ -471,6 +474,38 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
     assert!(
         cert1_pos < standstill_pos,
         "Standstill cache rebuild must happen after last-finalized-cert notification"
+    );
+
+    // 5) Pool-state ordering: set first_nonannounced_window before generating restart skips.
+    let first_nonannounced_pos = listener
+        .call_log
+        .iter()
+        .position(|c| *c == RecoveryCall::SetFirstNonannouncedWindow)
+        .expect("expected SetFirstNonannouncedWindow call");
+    let generate_skip_pos = listener
+        .call_log
+        .iter()
+        .position(|c| *c == RecoveryCall::GenerateRestartSkipVotes)
+        .expect("expected GenerateRestartSkipVotes call");
+    assert!(
+        first_nonannounced_pos < generate_skip_pos,
+        "first_nonannounced_window must be restored before restart skip generation"
+    );
+
+    // 6) Parent-chain finalization must run after startup votes are restored.
+    let restore_votes_pos = listener
+        .call_log
+        .iter()
+        .position(|c| *c == RecoveryCall::RestoreStartupVotes)
+        .expect("expected RestoreStartupVotes call");
+    let finalize_parent_pos = listener
+        .call_log
+        .iter()
+        .position(|c| *c == RecoveryCall::FinalizeParentChain)
+        .expect("expected FinalizeParentChain call");
+    assert!(
+        restore_votes_pos < finalize_parent_pos,
+        "recovery_finalize_parent_chain must run after recovery_restore_startup_votes"
     );
 
     // Step 1: global replay
@@ -557,6 +592,8 @@ fn test_apply_bootstrap_seeds_persisted_empty_mc_chain_before_last_finalized_not
         finalized_blocks: finalized_blocks.clone(),
         candidate_infos: vec![],
         notar_certs: vec![],
+        final_certs: vec![],
+        skip_certs: vec![],
         votes: vec![],
         pool_state: None,
         candidate_payloads: vec![],
@@ -613,6 +650,8 @@ fn test_apply_bootstrap_does_not_generate_skip_votes_when_first_nonannounced_win
         }],
         candidate_infos: vec![],
         notar_certs: vec![],
+        final_certs: vec![],
+        skip_certs: vec![],
         votes: vec![],
         pool_state: Some(PoolStateRecord { first_nonannounced_window: WindowIndex::new(0) }),
         candidate_payloads: vec![],
@@ -847,6 +886,8 @@ fn test_restart_restore_candidate_bytes_roundtrip_empty_and_non_empty() {
         finalized_blocks: finalized_blocks.clone(),
         candidate_infos: vec![empty_info.clone(), non_empty_info.clone()],
         notar_certs: vec![],
+        final_certs: vec![],
+        skip_certs: vec![],
         votes: vec![],
         pool_state: None,
         candidate_payloads: vec![],
@@ -951,6 +992,8 @@ fn test_restart_restore_candidate_bytes_skips_non_empty_and_keeps_empty() {
         finalized_blocks,
         candidate_infos: vec![empty_info.clone(), non_empty_info],
         notar_certs: vec![],
+        final_certs: vec![],
+        skip_certs: vec![],
         votes: vec![],
         pool_state: None,
         candidate_payloads: vec![],

@@ -7,5 +7,5 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 mod secret;
-mod vault;
 mod vault_builder;
+mod vault_trait;

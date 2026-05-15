@@ -10,9 +10,14 @@ use crate::{TonWalletVersion, serde_utils, socket_utils::resolve_ip};
 use adnl::{client::AdnlClientConfig, common::Timeouts};
 use anyhow::Context;
 use secrets_vault::{
-    crypto::factory::{AutoCryptoFactory, CryptoFactory},
-    types::{algorithm::Algorithm, metadata::Metadata, secret::Secret},
+    crypto::factory::CryptoFactory,
+    types::{
+        algorithm::Algorithm,
+        metadata::Metadata,
+        secret::{Secret, SecretInMemoryFactory},
+    },
     vault::SecretVault,
+    vault_block::BlockCryptoFactory,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -157,16 +162,24 @@ impl KeyConfig {
         match self {
             KeyConfig::PrivateKey { type_id: _, pvt_key } => {
                 let metadata = Metadata::new(None, Algorithm::Ed25519, true);
-                Secret::from_raw_data(&pvt_key, metadata, AutoCryptoFactory {}.new_crypto()?).await
+                SecretInMemoryFactory::new_ed25519_pvtkey(
+                    &pvt_key,
+                    metadata,
+                    BlockCryptoFactory {}.new_crypto()?,
+                )
             }
             KeyConfig::PublicKey { type_id: _, pub_key } => {
                 let metadata = Metadata::new(None, Algorithm::None, true);
-                Secret::from_raw_data(&pub_key, metadata, AutoCryptoFactory {}.new_crypto()?).await
+                SecretInMemoryFactory::new_ed25519_pubkey(
+                    &pub_key,
+                    metadata,
+                    BlockCryptoFactory {}.new_crypto()?,
+                )
             }
             KeyConfig::VaultKey { name } => {
                 let vault =
                     vault.ok_or(anyhow::anyhow!("The secret vault is not set in the config"))?;
-                let secret = vault.get(&name.into()).await?;
+                let secret = vault.load(&name.into()).await?;
                 let algo = secret.metadata().algorithm;
 
                 if algo != Algorithm::Ed25519 {
@@ -180,8 +193,11 @@ impl KeyConfig {
             }
             KeyConfig::KeyPair(data) => {
                 let metadata = Metadata::new(None, Algorithm::Ed25519, true);
-
-                Secret::from_raw_data(&data, metadata, AutoCryptoFactory {}.new_crypto()?).await
+                SecretInMemoryFactory::new_ed25519_pvtkey(
+                    &data,
+                    metadata,
+                    BlockCryptoFactory {}.new_crypto()?,
+                )
             }
         }
     }
@@ -477,17 +493,16 @@ impl AdnlConfig {
             _ => anyhow::bail!("Unsupported secret type"),
         };
 
-        let client_pvt_key = client_keypair.private_key().await?;
-        let pvt_key = client_pvt_key.lock().await?;
+        let client_pvt_key = client_keypair.private_key()?;
+        let pvt_key = client_pvt_key.lock()?;
         if pvt_key.len() < 32 {
             anyhow::bail!("invalid client private key length");
         }
         let client_key_opt = Ed25519KeyOption::from_private_key(&pvt_key[..32].try_into()?)?;
-        let server_pub_key = blob.data().await?;
+        let server_pub_key = blob.data();
         let server_key = Ed25519KeyOption::from_public_key(
             server_pub_key
-                .lock()
-                .await?
+                .lock()?
                 .deref()
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid public key length"))?,

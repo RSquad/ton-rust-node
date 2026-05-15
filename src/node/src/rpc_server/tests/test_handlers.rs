@@ -25,9 +25,9 @@ use crate::{
 use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use ton_block::{
-    base64_encode, error, Account, AccountIdPrefixFull, BlockIdExt, BuilderData, ConfigParam8,
-    ConfigParamEnum, ConfigParams, GlobalVersion, LibDescr, Libraries, MsgAddressInt, Result,
-    ShardIdent, UInt256,
+    base64_decode, base64_encode, error, read_single_root_boc, Account, AccountIdPrefixFull,
+    BlockIdExt, BuilderData, ConfigParam8, ConfigParamEnum, ConfigParams, Deserializable,
+    GlobalVersion, HashmapE, LibDescr, Libraries, MsgAddressInt, Result, ShardIdent, UInt256,
 };
 use warp::Reply;
 
@@ -134,11 +134,11 @@ fn make_master_state(account: &Account) -> Arc<ShardStateStuff> {
     let publisher = account.get_id().unwrap().clone();
     let mut libraries = Libraries::new();
     let code = BuilderData::with_raw(vec![0x77], 1).unwrap().into_cell().unwrap(); // PUSHINT 1
-    let key = code.repr_hash();
+    let key = code.repr_hash().clone();
     println!("key1: {}", serialize_uint256(&key));
     libraries.set(&key, &LibDescr::from_lib_data_by_publisher(code, publisher.clone())).unwrap();
     let code = BuilderData::with_raw(vec![0x78], 2).unwrap().into_cell().unwrap(); // PUSHINT 2
-    let key = code.repr_hash();
+    let key = code.repr_hash().clone();
     println!("key2: {}", serialize_uint256(&key));
     libraries.set(&key, &LibDescr::from_lib_data_by_publisher(code, publisher.clone())).unwrap();
 
@@ -656,6 +656,41 @@ async fn test_get_libraries() {
 }
 
 #[tokio::test]
+async fn test_get_libraries_ext() {
+    let account = gen_test_account();
+    let (registry, master_state) = build_registry(&account);
+
+    let response = call_jsonrpc(&registry, "getLibrariesExt", serde_json::json!({})).await;
+    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
+    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+
+    let result = response["result"].clone();
+    pretty_assertions::assert_eq!(result["@type"], serde_json::json!("smc.libraryResultExt"));
+    pretty_assertions::assert_eq!(result["block_id"], serialize_block_id(master_state.block_id()));
+    pretty_assertions::assert_eq!(result["libraries_count"], serde_json::json!(2));
+
+    let dict_boc = result["dict_boc"].as_str().unwrap();
+    assert!(!dict_boc.is_empty());
+
+    let root = read_single_root_boc(base64_decode(dict_boc).unwrap()).unwrap();
+    let raw_libraries = HashmapE::with_hashmap(256, Some(root));
+    let source_libraries = master_state.state().unwrap().libraries();
+
+    source_libraries
+        .iterate_slices_with_keys(|mut key, mut value| -> Result<bool> {
+            let hash = UInt256::construct_from(&mut key)?;
+            let descr = LibDescr::construct_from(&mut value)?;
+            let bucket = raw_libraries.get(hash.clone().into())?.expect("library entry must exist");
+            let lib = bucket.reference(0).expect("raw dict value must point to code");
+            pretty_assertions::assert_eq!(*lib.repr_hash(), hash);
+            pretty_assertions::assert_eq!(lib, descr.lib().clone());
+            Ok(true)
+        })
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_parse_int() {
     let p: IntOrStr = serde_json::from_str("-9223372036854775808").unwrap();
     pretty_assertions::assert_eq!(p.as_i64().unwrap(), -9223372036854775808);
@@ -739,8 +774,8 @@ async fn test_boc_hash() {
     let boc2_b64 = "te6ccgEBAQEAcQAA3v8AIN0gggFMl7ohggEznLqxn3Gw7UTQ0x/THzHXC//jBOCk8mCDCNcYINMf0x/TH/gjE7vyY+1E0NMf0x/T/9FRMrryoVFEuvKiBPkBVBBV+RDyo/gAkyDXSpbTB9QC+wDo0QGkyMsfyx/L/8ntVA==";
     let boc1 = read_single_root_boc(base64_decode(boc1_b64).unwrap()).unwrap();
     let boc2 = read_single_root_boc(base64_decode(boc2_b64).unwrap()).unwrap();
-    let hash1: UInt256 = boc1.repr_hash();
-    let hash2 = boc2.repr_hash();
+    let hash1 = boc1.repr_hash().clone();
+    let hash2 = boc2.repr_hash().clone();
     println!("Hash1 {:?}", hash1);
     println!("Hash2 {:?}", hash2);
     pretty_assertions::assert_eq!(hash1, hash2);

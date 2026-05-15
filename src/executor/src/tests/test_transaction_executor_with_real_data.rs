@@ -12,9 +12,9 @@ use crate::blockchain_config::BlockchainConfig;
 use pretty_assertions::assert_eq;
 use std::io::{BufRead, BufReader};
 use ton_block::{
-    base64_decode, read_single_root_boc, Account, AccountStorage, Block, Cell, ConfigParams,
-    CurrencyCollection, Deserializable, Message, MsgAddressInt, Result, Serializable, ShardAccount,
-    StateInit, StorageInfo, TrComputePhase, Transaction, UnixTime,
+    base64_decode, read_single_root_boc, Account, AccountStorage, Block, BocWriter, Cell,
+    ConfigParams, CurrencyCollection, Deserializable, Message, MsgAddressInt, Result, Serializable,
+    ShardAccount, StateInit, StorageInfo, TrComputePhase, Transaction, UnixTime,
 };
 
 mod common;
@@ -130,7 +130,9 @@ fn try_replay_contract_as_transaction(
         &AccountStorage::active(0, balance, state),
     );
     account
-        .update_storage_stat(config.size_limits_config().unwrap().acc_state_cells_for_storage_dict)
+        .calc_storage_stat_dict(
+            config.size_limits_config().unwrap().acc_state_cells_for_storage_dict,
+        )
         .unwrap();
     let params = common::execute_params_simple(lt, at);
     let config = BlockchainConfig::with_config(config).unwrap();
@@ -165,7 +167,7 @@ fn test_runvm_transaction() {
         "real_boc/runvm_account_old.boc",
         "real_boc/runvm_account_new.boc",
         "real_boc/runvm_transaction.boc",
-        "real_boc/config10.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -175,7 +177,7 @@ fn test_account_exceeds_size_after_action() {
         "real_boc/size_exceeds_account_old.boc",
         "real_boc/size_exceeds_account_new.boc",
         "real_boc/size_exceeds_transaction.boc",
-        "real_boc/config10.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -465,7 +467,7 @@ fn test_storage_limit() {
         "real_boc/storage_limit_old.boc",
         "real_boc/storage_limit_new.boc",
         "real_boc/storage_limit_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -475,7 +477,7 @@ fn test_state_init_cell_same_in_body() {
         "real_boc/state_init_cell_same_in_body_account_old.boc",
         "real_boc/state_init_cell_same_in_body_account_new.boc",
         "real_boc/state_init_cell_same_in_body_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -485,7 +487,7 @@ fn test_body_with_pruned_cell() {
         "real_boc/body_with_pruned_cell_account_old.boc",
         "real_boc/body_with_pruned_cell_account_new.boc",
         "real_boc/body_with_pruned_cell_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -495,7 +497,7 @@ fn test_out_of_gas_on_commit() {
         "real_boc/out_of_gas_on_commit_account_old.boc",
         "real_boc/out_of_gas_on_commit_account_new.boc",
         "real_boc/out_of_gas_on_commit_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -505,17 +507,17 @@ fn test_init_wo_state() {
         "real_boc/init_wo_state_account_old.boc",
         "real_boc/init_wo_state_account_new.boc",
         "real_boc/init_wo_state_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
 #[test]
-fn test_bad_action() {
+fn test_bad_action_error() {
     replay_transaction_by_files(
         "real_boc/bad_action_account_old.boc",
         "real_boc/bad_action_account_new.boc",
         "real_boc/bad_action_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -525,7 +527,7 @@ fn test_bad_action_with_ignore_flag() {
         "real_boc/bad_action_with_ignore_flag_account_old.boc",
         "real_boc/bad_action_with_ignore_flag_account_new.boc",
         "real_boc/bad_action_with_ignore_flag_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -535,7 +537,7 @@ fn test_size_limits_v12() {
         "real_boc/size_limits_v12_account_old.boc",
         "real_boc/size_limits_v12_account_new.boc",
         "real_boc/size_limits_v12_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -545,7 +547,7 @@ fn test_due_payment_in_smc() {
         "real_boc/due_payment_in_smc_account_old.boc",
         "real_boc/due_payment_in_smc_account_new.boc",
         "real_boc/due_payment_in_smc_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -555,7 +557,7 @@ fn test_fwd_fee_payment_in_smc() {
         "real_boc/fwd_fee_payment_in_smc_account_old.boc",
         "real_boc/fwd_fee_payment_in_smc_account_new.boc",
         "real_boc/fwd_fee_payment_in_smc_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -565,20 +567,170 @@ fn test_raw_reserve_with_flag4() {
         "real_boc/raw_reserve_with_flag4_account_old.boc",
         "real_boc/raw_reserve_with_flag4_account_new.boc",
         "real_boc/raw_reserve_with_flag4_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
         "",
-        "real_boc/raw_reserve_with_flag4_libs.boc",
+        "real_boc/libs.boc",
     )
 }
 
-#[ignore = "test for replay transaction by files"]
 #[test]
-fn test_replay_transaction_by_files() {
+fn test_wrong_coins_serial_in_actions() {
+    replay_transaction_by_files(
+        "real_boc/wrong_coins_serial_in_actions_account_old.boc",
+        "real_boc/wrong_coins_serial_in_actions_account_new.boc",
+        "real_boc/wrong_coins_serial_in_actions_transaction.boc",
+        "real_boc/config.boc",
+    )
+}
+
+#[test]
+fn test_msg_cell_fine_calc() {
+    replay_transaction_by_files(
+        "real_boc/msg_cell_fine_calc_account_old.boc",
+        "real_boc/msg_cell_fine_calc_account_new.boc",
+        "real_boc/msg_cell_fine_calc_transaction.boc",
+        "real_boc/config.boc",
+    )
+}
+
+// bounced message with state init and value was sent to new account
+// account must be uninitialized if not enough value to compute
+#[test]
+fn test_state_init_nogas() {
+    replay_transaction_by_files(
+        "real_boc/empty_account.boc",
+        "real_boc/state_init_nogas_abc17907_account_new.boc",
+        "real_boc/state_init_nogas_abc17907_transaction.boc",
+        "real_boc/config.boc",
+    );
+}
+
+// not bounced message with state init and value was sent to new account
+// account must be uninitialized if not enough value to compute
+#[test]
+fn test_non_bounce_with_state_init_nogas() {
+    replay_transaction_by_files(
+        "real_boc/empty_account.boc",
+        "real_boc/non_bounce_with_state_init_nogas_account_new.boc",
+        "real_boc/non_bounce_with_state_init_nogas_transaction.boc",
+        "real_boc/config.boc",
+    );
+}
+
+#[test]
+fn test_pruned_cell_load_tx() {
+    replay_transaction_by_files(
+        "real_boc/pruned_cell_load_account_old.boc",
+        "real_boc/pruned_cell_load_account_new.boc",
+        "real_boc/pruned_cell_load_transaction.boc",
+        "real_boc/config.boc",
+    )
+}
+
+// account has anycast in address
+#[test]
+fn test_with_anycast() {
+    replay_transaction_by_files(
+        "real_boc/with_anycast_account_old.boc",
+        "real_boc/with_anycast_account_new.boc",
+        "real_boc/with_anycast_transaction.boc",
+        "real_boc/config.boc",
+    );
+}
+
+#[test]
+fn test_with_bad_anycast() {
+    replay_transaction_by_files(
+        "real_boc/with_bad_anycast_account_old.boc",
+        "real_boc/with_bad_anycast_account_new.boc",
+        "real_boc/with_bad_anycast_transaction.boc",
+        "real_boc/config.boc",
+    );
+}
+
+#[test]
+fn test_new_storage_prices() {
+    replay_transaction_full(
+        "real_boc/new_storage_prices_account_old.boc",
+        "real_boc/new_storage_prices_account_new.boc",
+        "real_boc/new_storage_prices_transaction.boc",
+        "real_boc/config13.boc",
+        "",
+        "real_boc/libs.boc",
+    )
+}
+
+#[test]
+fn test_storage_fee_round() {
+    replay_transaction_full(
+        "real_boc/storage_fee_round_account_old.boc",
+        "real_boc/storage_fee_round_account_new.boc",
+        "real_boc/storage_fee_round_transaction.boc",
+        "real_boc/config13.boc",
+        "",
+        "real_boc/libs.boc",
+    )
+}
+
+#[test]
+fn test_sendmsg_no_root_gas() {
+    replay_transaction_by_files(
+        "real_boc/sendmsg_no_root_gas_account_old.boc",
+        "real_boc/sendmsg_no_root_gas_account_new.boc",
+        "real_boc/sendmsg_no_root_gas_transaction.boc",
+        "real_boc/config13.boc",
+    )
+}
+
+#[test]
+fn test_action_result_arg() {
+    replay_transaction_by_files(
+        "real_boc/action_result_arg_account_old.boc",
+        "real_boc/action_result_arg_account_new.boc",
+        "real_boc/action_result_arg_transaction.boc",
+        "real_boc/config13.boc",
+    )
+}
+
+#[ignore = "test for replay transaction by message from transaction"]
+#[test]
+fn test_replay_transaction_by_message_from_transaction() {
+    let prefix = "real_boc/bad_";
+    let transaction =
+        Transaction::construct_from_file(prefix.to_owned() + "transaction.boc").unwrap();
+    let mut hash_update = transaction.read_state_update().unwrap();
+    let mut message = transaction.read_in_msg().unwrap().unwrap();
+    message.int_header_mut().unwrap().bounce = true;
+    let mut account = Account::construct_from_file(prefix.to_owned() + "account_old.boc").unwrap();
+    let addr = account.get_addr().unwrap().clone();
+    let rewrite_pfx = ton_block::SliceData::new(vec![0x01, 0x20, 0x80]);
+    let anycast = ton_block::AnycastInfo::with_rewrite_pfx(rewrite_pfx).ok();
+    let addr = MsgAddressInt::with_standart(anycast, 0, addr.address().clone()).unwrap();
+    account.set_addr(addr);
+    account.set_due_payment(Some(100.into()));
+    account.write_to_file(prefix.to_owned() + "account_old.boc").unwrap();
+    hash_update.old_hash = account.serialize().unwrap().repr_hash().clone();
+
+    let at = transaction.now();
+    let lt = transaction.logical_time();
+    let params = common::execute_params_simple(lt, at);
+    let config = ConfigParams::construct_from_file("real_boc/config.boc").unwrap();
+    let config = BlockchainConfig::with_config(config).unwrap();
+    let mut transaction =
+        try_replay_transaction(&mut account, Some(&message), config, &params).unwrap();
+    account.calc_storage_stat_dict(1 << 31).unwrap();
+    hash_update.new_hash = account.serialize().unwrap().repr_hash().clone();
+    transaction.write_state_update(&hash_update).unwrap();
+    transaction.write_to_file(prefix.to_owned() + "transaction.boc").unwrap();
+    account.write_to_file(prefix.to_owned() + "account_new.boc").unwrap();
+}
+
+#[ignore = "test for replay transaction by message from file"]
+#[test]
+fn test_replay_transaction_by_message_from_file() {
     let mut account = Account::construct_from_file("real_boc/account_old.boc").unwrap();
     let message = Message::construct_from_file("real_boc/message.boc").unwrap();
-    let key_block = Block::construct_from_file("real_boc/config.boc").unwrap();
-    let config =
-        key_block.read_extra().unwrap().read_custom().unwrap().unwrap().config().unwrap().clone();
+    let config = read_config("real_boc/config.boc").unwrap();
     let config = BlockchainConfig::with_config(config).unwrap();
     let at = match message.int_header() {
         Some(hdr) => hdr.created_at,
@@ -635,7 +787,7 @@ fn test_bad_single() {
         "real_boc/bad_account_old.boc",
         "real_boc/bad_account_new.boc",
         "real_boc/bad_transaction.boc",
-        "real_boc/config12.boc",
+        "real_boc/config.boc",
     )
 }
 
@@ -644,24 +796,28 @@ fn test_bad_single() {
 fn test_bad_trans() {
     let json = "../../emulator/emulator_test.json";
     let prefix = "real_boc/bad_".to_string();
-    let libs = std::path::PathBuf::from(json).parent().unwrap().join("libs.boc");
-    let libs = libs.to_string_lossy();
+    // let libs: std::path::PathBuf = std::path::PathBuf::from(json).parent().unwrap().join("libs.boc");
+    // let libs = libs.to_string_lossy();
     let json = std::fs::read_to_string(json).unwrap();
     let json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
     let acc = json["shard_account_boc"].as_str().unwrap();
     let tr = json["tx_boc"].as_str().unwrap();
     let prev = json["prev_blocks_info_boc"].as_str().unwrap();
+    let libs = json["libs_boc"].as_str().unwrap();
+    let cfg = json["config_params_boc"].as_str().unwrap();
+    // let cfg = "real_boc/config.boc";
     let shard_acc = ShardAccount::construct_from_base64(acc).unwrap();
-    shard_acc.account_cell().write_to_file(prefix.clone() + "account_old.boc");
-    shard_acc.account_cell().write_to_file(prefix.clone() + "account_new.boc");
+    BocWriter::with_root(&shard_acc.account_cell())
+        .unwrap()
+        .write_to_file(prefix.clone() + "account_old.boc")
+        .unwrap();
+    BocWriter::with_root(&shard_acc.account_cell())
+        .unwrap()
+        .write_to_file(prefix.clone() + "account_new.boc")
+        .unwrap();
     std::fs::write(prefix.clone() + "transaction.boc", base64_decode(tr).unwrap()).unwrap();
+    std::fs::write("real_boc/libs.boc", base64_decode(libs).unwrap()).unwrap();
+    std::fs::write("real_boc/config13.boc", base64_decode(cfg).unwrap()).unwrap();
 
-    replay_transaction_full(
-        acc,
-        &(prefix + "account_new.boc"),
-        tr,
-        "real_boc/config12.boc",
-        prev,
-        &libs,
-    );
+    replay_transaction_full(acc, &(prefix + "account_new.boc"), tr, cfg, prev, &libs);
 }

@@ -23,7 +23,8 @@
 //! | Type | Purpose | TL Key | TL Value |
 //! |------|---------|--------|----------|
 //! | Finalized Block | Track finalization chain | `consensus.simplex.db.key.finalizedBlock` | `consensus.simplex.db.finalizedBlock` |
-//! | Notar Cert | Certificate cache | `consensus.simplex.db.key.candidateResolver.notarCert` | `consensus.simplex.db.candidateResolver.notarCert` |
+//! | Certificates (notar/final/skip) | Bootstrap certificate cache | `consensus.simplex.db.key.vote` | `consensus.simplex.db.cert` |
+//! | Vote | Replay ordering recovery | `consensus.simplex.db.key.vote` | `consensus.simplex.db.vote` |
 //! | Candidate Info | Candidate metadata | `consensus.simplex.db.key.candidateResolver.candidateInfo` | `consensus.simplex.db.candidateResolver.candidateInfo` |
 //!
 //! ## C++ Reference
@@ -35,12 +36,14 @@
 
 use crate::{
     block::{RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
-    certificate::NotarCert,
+    certificate::{FinalCert, NotarCert, SkipCert},
 };
 use consensus_common::{
     AsyncKeyValueStorageOptions, AsyncKeyValueStoragePtr, ConsensusCommonFactory, RawBuffer,
     StorageAsyncResultPtr,
 };
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     path::Path,
     sync::{
@@ -56,19 +59,18 @@ use ton_api::{
             candidateid::CandidateId,
             candidateparent::CandidateParent,
             simplex::{
+                certificate::Certificate as TlCertificate,
                 db::{
                     candidate_resolver::{
                         candidateinfo::CandidateInfo as CandidateInfoValue,
-                        notarcert::NotarCert as NotarCertValue,
-                        CandidateInfo as CandidateInfoValueBoxed, NotarCert as NotarCertValueBoxed,
+                        CandidateInfo as CandidateInfoValueBoxed,
                     },
                     finalizedblock::FinalizedBlock as FinalizedBlockValue,
                     key::{
                         candidate::Candidate as CandidatePayloadKey,
                         candidate_resolver::{
                             candidateinfo::CandidateInfo as CandidateInfoKey,
-                            notarcert::NotarCert as NotarCertKey,
-                            CandidateInfo as CandidateInfoKeyBoxed, NotarCert as NotarCertKeyBoxed,
+                            CandidateInfo as CandidateInfoKeyBoxed,
                         },
                         finalizedblock::FinalizedBlock as FinalizedBlockKey,
                         vote::Vote as VoteKey,
@@ -77,12 +79,11 @@ use ton_api::{
                         Vote as VoteKeyBoxed,
                     },
                     poolstate::PoolState as PoolStateValue,
-                    vote::Vote as VoteValue,
+                    vote::{Cert as CertValue, Vote as VoteValue},
                     FinalizedBlock as FinalizedBlockValueBoxed, PoolState as PoolStateValueBoxed,
                     Vote as VoteValueBoxed,
                 },
-                votesignatureset::VoteSignatureSet,
-                VoteSignature as VoteSignatureBoxed,
+                Certificate as TlCertificateBoxed,
             },
             CandidateHashData, CandidateParent as CandidateParentBoxed,
         },
@@ -90,7 +91,7 @@ use ton_api::{
     },
     BoxedSerialize, Constructor, IntoBoxed,
 };
-use ton_block::{error, BlockIdExt, Result, UInt256};
+use ton_block::{error, sha256_digest, BlockIdExt, Result, UInt256};
 
 // ============================================================================
 // Constants
@@ -114,11 +115,6 @@ fn prefix_finalized_block() -> u32 {
 /// Get key prefix for candidate info
 fn prefix_candidate_info() -> u32 {
     CandidateInfoKey::constructor_const()
-}
-
-/// Get key prefix for notar certs
-fn prefix_notar_cert() -> u32 {
-    NotarCertKey::constructor_const()
 }
 
 /// Get key prefix for votes
@@ -178,6 +174,26 @@ pub struct NotarCertRecord {
     pub notar_cert_bytes: RawBuffer,
 }
 
+/// Finalization certificate record loaded from DB.
+#[derive(Debug, Clone)]
+pub struct FinalCertRecord {
+    /// Candidate ID (slot + hash)
+    pub candidate_id: RawCandidateId,
+    /// Serialized TL `consensus.simplex.certificate` bytes
+    #[allow(dead_code)] // Used by tests now; reserved for receiver/recovery restoration flow.
+    pub cert_bytes: RawBuffer,
+}
+
+/// Skip certificate record loaded from DB.
+#[derive(Debug, Clone)]
+pub struct SkipCertRecord {
+    /// Slot index for this skip certificate
+    pub slot: SlotIndex,
+    /// Serialized TL `consensus.simplex.certificate` bytes
+    #[allow(dead_code)] // Used by tests now; reserved for receiver/recovery restoration flow.
+    pub cert_bytes: RawBuffer,
+}
+
 /// Vote record for restart support
 ///
 /// Stores votes by their hash for standstill recovery.
@@ -224,6 +240,10 @@ pub struct Bootstrap {
     pub candidate_infos: Vec<CandidateInfoRecord>,
     /// Notarization certificates (for receiver cache)
     pub notar_certs: Vec<NotarCertRecord>,
+    /// Finalization certificates (for receiver cache)
+    pub final_certs: Vec<FinalCertRecord>,
+    /// Skip certificates (for receiver cache)
+    pub skip_certs: Vec<SkipCertRecord>,
     /// Votes (for standstill recovery)
     pub votes: Vec<VoteRecord>,
     /// Pool state (for skip vote generation)
@@ -246,11 +266,17 @@ pub struct SessionBootstrap {
     pub pool_state: Option<PoolStateRecord>,
 }
 
-/// Bootstrap data for Receiver (notar cert cache)
+/// Bootstrap data for Receiver certificate cache.
 #[derive(Debug, Clone, Default)]
 pub struct ReceiverBootstrap {
     /// Notarization certificates for cache population
     pub notar_certs: Vec<NotarCertRecord>,
+    /// Finalization certificates for cache population
+    #[allow(dead_code)] // Reserved for receiver recovery parity lane.
+    pub final_certs: Vec<FinalCertRecord>,
+    /// Skip certificates for cache population
+    #[allow(dead_code)] // Reserved for receiver recovery parity lane.
+    pub skip_certs: Vec<SkipCertRecord>,
 }
 
 impl Bootstrap {
@@ -265,7 +291,11 @@ impl Bootstrap {
                 votes: self.votes,
                 pool_state: self.pool_state,
             },
-            ReceiverBootstrap { notar_certs: self.notar_certs },
+            ReceiverBootstrap {
+                notar_certs: self.notar_certs,
+                final_certs: self.final_certs,
+                skip_certs: self.skip_certs,
+            },
             self.candidate_payloads,
         )
     }
@@ -275,6 +305,8 @@ impl Bootstrap {
         self.finalized_blocks.is_empty()
             && self.candidate_infos.is_empty()
             && self.notar_certs.is_empty()
+            && self.final_certs.is_empty()
+            && self.skip_certs.is_empty()
             && self.votes.is_empty()
             && self.pool_state.is_none()
             && self.candidate_payloads.is_empty()
@@ -374,29 +406,6 @@ fn deserialize_candidate_payload_key(key_bytes: &[u8]) -> Result<RawCandidateId>
     Ok(raw_candidate_id_from_tl(key.candidateId))
 }
 
-fn serialize_notar_cert_key(candidate_id: &RawCandidateId) -> Result<Vec<u8>> {
-    let key = NotarCertKey { candidateId: raw_candidate_id_to_tl(candidate_id) };
-    serialize_boxed(&key.into_boxed()).map_err(|e| error!("serialization failed: {}", e))
-}
-
-fn serialize_notar_cert_value(cert: &NotarCert) -> Result<Vec<u8>> {
-    let tl_sigs: Vec<VoteSignatureBoxed> = cert.signatures.iter().map(|sig| sig.to_tl()).collect();
-    let value = NotarCertValue { notar: VoteSignatureSet { votes: tl_sigs.into() } };
-    serialize_boxed(&value.into_boxed()).map_err(|e| error!("serialization failed: {}", e))
-}
-
-fn deserialize_notar_cert(key_bytes: &[u8], value_bytes: &[u8]) -> Result<NotarCertRecord> {
-    let key: NotarCertKey = deserialize_typed::<NotarCertKeyBoxed>(key_bytes)?.only();
-    let candidate_id = raw_candidate_id_from_tl(key.candidateId);
-    let value: NotarCertValue = deserialize_typed::<NotarCertValueBoxed>(value_bytes)?.only();
-
-    // Receiver expects boxed bytes of `consensus.simplex.voteSignatureSet` (matches C++).
-    let notar_cert_bytes = serialize_boxed(&value.notar.into_boxed())
-        .map_err(|e| error!("Failed to serialize VoteSignatureSet: {}", e))?;
-
-    Ok(NotarCertRecord { candidate_id, notar_cert_bytes })
-}
-
 fn serialize_vote_key(vote_hash: &UInt256) -> Result<Vec<u8>> {
     let key = VoteKey { vote_hash: vote_hash.clone().into() };
     serialize_boxed(&key.into_boxed()).map_err(|e| error!("serialization failed: {}", e))
@@ -411,15 +420,106 @@ fn serialize_vote_value(record: &VoteRecord) -> Result<Vec<u8>> {
     serialize_boxed(&value.into_boxed()).map_err(|e| error!("serialization failed: {}", e))
 }
 
-fn deserialize_vote(key_bytes: &[u8], value_bytes: &[u8]) -> Result<VoteRecord> {
+fn serialize_cert_vote_entry(cert_tl: TlCertificateBoxed) -> Result<(Vec<u8>, Vec<u8>)> {
+    let cert = cert_tl.only();
+    let cert_boxed = cert.clone().into_boxed();
+    let cert_bytes = serialize_boxed(&cert_boxed)
+        .map_err(|e| error!("Failed to serialize certificate: {}", e))?;
+    let cert_hash = UInt256::from_slice(&sha256_digest(&cert_bytes));
+    let key = serialize_vote_key(&cert_hash)?;
+    let value = CertValue { cert };
+    let value_bytes = serialize_boxed(&value.into_boxed())
+        .map_err(|e| error!("Failed to serialize db.cert value: {}", e))?;
+    Ok((key, value_bytes))
+}
+
+enum VoteStorageEntry {
+    Vote(VoteRecord),
+    NotarCert(NotarCertRecord),
+    FinalCert(FinalCertRecord),
+    SkipCert(SkipCertRecord),
+}
+
+fn deserialize_cert_vote_entry(cert_tl: TlCertificate) -> Result<VoteStorageEntry> {
+    let cert_boxed = cert_tl.clone().into_boxed();
+    let cert_bytes = serialize_boxed(&cert_boxed)
+        .map_err(|e| error!("Failed to serialize certificate: {}", e))?;
+
+    match crate::utils::tl_unsigned_to_vote(cert_boxed.vote())? {
+        crate::simplex_state::Vote::Notarize(vote) => {
+            let notar_cert_bytes = serialize_boxed(cert_boxed.signatures())
+                .map_err(|e| error!("Failed to serialize notar signatures: {}", e))?;
+            Ok(VoteStorageEntry::NotarCert(NotarCertRecord {
+                candidate_id: RawCandidateId { slot: vote.slot, hash: vote.block_hash },
+                notar_cert_bytes: notar_cert_bytes.into(),
+            }))
+        }
+        crate::simplex_state::Vote::Finalize(vote) => {
+            Ok(VoteStorageEntry::FinalCert(FinalCertRecord {
+                candidate_id: RawCandidateId { slot: vote.slot, hash: vote.block_hash },
+                cert_bytes: cert_bytes.into(),
+            }))
+        }
+        crate::simplex_state::Vote::Skip(vote) => Ok(VoteStorageEntry::SkipCert(SkipCertRecord {
+            slot: vote.slot,
+            cert_bytes: cert_bytes.into(),
+        })),
+    }
+}
+
+fn deserialize_vote_storage_entry(
+    key_bytes: &[u8],
+    value_bytes: &[u8],
+) -> Result<VoteStorageEntry> {
     let key: VoteKey = deserialize_typed::<VoteKeyBoxed>(key_bytes)?.only();
-    let value: VoteValue = deserialize_typed::<VoteValueBoxed>(value_bytes)?.only();
-    Ok(VoteRecord {
-        vote_hash: key.vote_hash.clone(),
-        data: value.data,
-        node_idx: ValidatorIndex::new(value.node_idx as u32),
-        seqno: value.seqno,
-    })
+    let value: VoteValueBoxed = deserialize_typed::<VoteValueBoxed>(value_bytes)?;
+    match value {
+        VoteValueBoxed::Consensus_Simplex_Db_Vote(value) => {
+            Ok(VoteStorageEntry::Vote(VoteRecord {
+                vote_hash: key.vote_hash.clone(),
+                data: value.data,
+                node_idx: ValidatorIndex::new(value.node_idx as u32),
+                seqno: value.seqno,
+            }))
+        }
+        VoteValueBoxed::Consensus_Simplex_Db_Cert(value) => deserialize_cert_vote_entry(value.cert),
+    }
+}
+
+fn deserialize_vote(key_bytes: &[u8], value_bytes: &[u8]) -> Result<Option<VoteRecord>> {
+    match deserialize_vote_storage_entry(key_bytes, value_bytes)? {
+        VoteStorageEntry::Vote(vote) => Ok(Some(vote)),
+        VoteStorageEntry::NotarCert(_)
+        | VoteStorageEntry::FinalCert(_)
+        | VoteStorageEntry::SkipCert(_) => Ok(None),
+    }
+}
+
+fn deserialize_notar_cert(key_bytes: &[u8], value_bytes: &[u8]) -> Result<Option<NotarCertRecord>> {
+    match deserialize_vote_storage_entry(key_bytes, value_bytes)? {
+        VoteStorageEntry::NotarCert(record) => Ok(Some(record)),
+        VoteStorageEntry::Vote(_)
+        | VoteStorageEntry::FinalCert(_)
+        | VoteStorageEntry::SkipCert(_) => Ok(None),
+    }
+}
+
+fn deserialize_final_cert(key_bytes: &[u8], value_bytes: &[u8]) -> Result<Option<FinalCertRecord>> {
+    match deserialize_vote_storage_entry(key_bytes, value_bytes)? {
+        VoteStorageEntry::FinalCert(record) => Ok(Some(record)),
+        VoteStorageEntry::Vote(_)
+        | VoteStorageEntry::NotarCert(_)
+        | VoteStorageEntry::SkipCert(_) => Ok(None),
+    }
+}
+
+fn deserialize_skip_cert(key_bytes: &[u8], value_bytes: &[u8]) -> Result<Option<SkipCertRecord>> {
+    match deserialize_vote_storage_entry(key_bytes, value_bytes)? {
+        VoteStorageEntry::SkipCert(record) => Ok(Some(record)),
+        VoteStorageEntry::Vote(_)
+        | VoteStorageEntry::NotarCert(_)
+        | VoteStorageEntry::FinalCert(_) => Ok(None),
+    }
 }
 
 fn serialize_pool_state_key() -> Result<Vec<u8>> {
@@ -501,6 +601,12 @@ pub struct SimplexDb {
     storage_id: String,
     /// Monotonic vote seqno counter (C++ parity: db.cpp next_seqno_)
     next_vote_seqno: AtomicI64,
+    #[cfg(test)]
+    /// Fail-next hook for notar cert save path (tests only).
+    fail_next_notar_cert_save: AtomicBool,
+    #[cfg(test)]
+    /// Fail-next hook for finalized block save path (tests only).
+    fail_next_finalized_block_save: AtomicBool,
 }
 
 impl SimplexDb {
@@ -549,7 +655,27 @@ impl SimplexDb {
             db_path.display()
         );
 
-        Ok(Arc::new(Self { storage, storage_id, next_vote_seqno: AtomicI64::new(0) }))
+        Ok(Arc::new(Self {
+            storage,
+            storage_id,
+            next_vote_seqno: AtomicI64::new(0),
+            #[cfg(test)]
+            fail_next_notar_cert_save: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_finalized_block_save: AtomicBool::new(false),
+        }))
+    }
+
+    #[cfg(test)]
+    /// Inject one-shot failure for `save_notar_cert_async`.
+    pub fn fail_next_notar_cert_save_for_test(&self) {
+        self.fail_next_notar_cert_save.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    /// Inject one-shot failure for `save_finalized_block_async`.
+    pub fn fail_next_finalized_block_save_for_test(&self) {
+        self.fail_next_finalized_block_save.store(true, Ordering::SeqCst);
     }
 
     // =========================================================================
@@ -563,6 +689,14 @@ impl SimplexDb {
         &self,
         record: &FinalizedBlockRecord,
     ) -> Result<StorageAsyncResultPtr<()>> {
+        #[cfg(test)]
+        if self.fail_next_finalized_block_save.swap(false, Ordering::SeqCst) {
+            return Err(error!(
+                "SimplexDb {}: injected finalized block save failure",
+                self.storage_id
+            ));
+        }
+
         let key = serialize_finalized_block_key(&record.candidate_id)?;
         let value = serialize_finalized_block_value(record)?;
         Ok(self.storage.set(key, value, None))
@@ -614,11 +748,16 @@ impl SimplexDb {
     /// Save notarization certificate (async result).
     pub fn save_notar_cert_async(
         &self,
-        candidate_id: &RawCandidateId,
+        _candidate_id: &RawCandidateId,
         cert: &NotarCert,
     ) -> Result<StorageAsyncResultPtr<()>> {
-        let key = serialize_notar_cert_key(candidate_id)?;
-        let value = serialize_notar_cert_value(cert)?;
+        #[cfg(test)]
+        if self.fail_next_notar_cert_save.swap(false, Ordering::SeqCst) {
+            return Err(error!("SimplexDb {}: injected notar cert save failure", self.storage_id));
+        }
+
+        let cert_tl = cert.to_tl()?;
+        let (key, value) = serialize_cert_vote_entry(cert_tl)?;
         Ok(self.storage.set(key, value, None))
     }
 
@@ -636,6 +775,56 @@ impl SimplexDb {
         );
 
         self.save_notar_cert_async(candidate_id, cert)?;
+        Ok(())
+    }
+
+    /// Save finalization certificate (async result).
+    pub fn save_final_cert_async(
+        &self,
+        _candidate_id: &RawCandidateId,
+        cert: &FinalCert,
+    ) -> Result<StorageAsyncResultPtr<()>> {
+        let cert_tl = cert.to_tl()?;
+        let (key, value) = serialize_cert_vote_entry(cert_tl)?;
+        Ok(self.storage.set(key, value, None))
+    }
+
+    /// Save finalization certificate.
+    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
+    pub fn save_final_cert(&self, candidate_id: &RawCandidateId, cert: &FinalCert) -> Result<()> {
+        log::trace!(
+            target: TARGET,
+            "SimplexDb {}: save_final_cert slot={} signatures={}",
+            self.storage_id,
+            candidate_id.slot.value(),
+            cert.signatures.len()
+        );
+        self.save_final_cert_async(candidate_id, cert)?;
+        Ok(())
+    }
+
+    /// Save skip certificate (async result).
+    pub fn save_skip_cert_async(
+        &self,
+        _slot: SlotIndex,
+        cert: &SkipCert,
+    ) -> Result<StorageAsyncResultPtr<()>> {
+        let cert_tl = cert.to_tl()?;
+        let (key, value) = serialize_cert_vote_entry(cert_tl)?;
+        Ok(self.storage.set(key, value, None))
+    }
+
+    /// Save skip certificate.
+    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
+    pub fn save_skip_cert(&self, slot: SlotIndex, cert: &SkipCert) -> Result<()> {
+        log::trace!(
+            target: TARGET,
+            "SimplexDb {}: save_skip_cert slot={} signatures={}",
+            self.storage_id,
+            slot.value(),
+            cert.signatures.len()
+        );
+        self.save_skip_cert_async(slot, cert)?;
         Ok(())
     }
 
@@ -775,16 +964,93 @@ impl SimplexDb {
         candidate_id: &RawCandidateId,
         timeout: Duration,
     ) -> Result<Option<NotarCertRecord>> {
-        let key = serialize_notar_cert_key(candidate_id)?;
-        let result = self.storage.get(key.clone(), None);
+        let result = self.storage.get_by_prefix_u32(prefix_vote(), None);
         match result.wait_timeout(timeout) {
-            Some(Ok(Some(value))) => {
-                let record = deserialize_notar_cert(&key, &value)?;
-                Ok(Some(record))
+            Some(Ok(entries)) => {
+                for (key, value) in entries {
+                    match deserialize_notar_cert(&key, &value) {
+                        Ok(Some(record)) if record.candidate_id == *candidate_id => {
+                            return Ok(Some(record));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::debug!(
+                                target: TARGET,
+                                "SimplexDb {}: skipping malformed cert vote entry: {}",
+                                self.storage_id,
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(None)
             }
-            Some(Ok(None)) => Ok(None),
             Some(Err(e)) => Err(e),
             None => Err(error!("SimplexDb: timeout loading notar cert by id")),
+        }
+    }
+
+    /// Look up a single final cert record by candidate ID (blocking).
+    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_session_processor.rs`.
+    pub fn load_final_cert_by_id(
+        &self,
+        candidate_id: &RawCandidateId,
+        timeout: Duration,
+    ) -> Result<Option<FinalCertRecord>> {
+        let result = self.storage.get_by_prefix_u32(prefix_vote(), None);
+        match result.wait_timeout(timeout) {
+            Some(Ok(entries)) => {
+                for (key, value) in entries {
+                    match deserialize_final_cert(&key, &value) {
+                        Ok(Some(record)) if record.candidate_id == *candidate_id => {
+                            return Ok(Some(record));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::debug!(
+                                target: TARGET,
+                                "SimplexDb {}: skipping malformed cert vote entry: {}",
+                                self.storage_id,
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(error!("SimplexDb: timeout loading final cert by id")),
+        }
+    }
+
+    /// Look up a single skip cert record by slot (blocking).
+    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_session_processor.rs`.
+    pub fn load_skip_cert_by_slot(
+        &self,
+        slot: SlotIndex,
+        timeout: Duration,
+    ) -> Result<Option<SkipCertRecord>> {
+        let result = self.storage.get_by_prefix_u32(prefix_vote(), None);
+        match result.wait_timeout(timeout) {
+            Some(Ok(entries)) => {
+                for (key, value) in entries {
+                    match deserialize_skip_cert(&key, &value) {
+                        Ok(Some(record)) if record.slot == slot => return Ok(Some(record)),
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::debug!(
+                                target: TARGET,
+                                "SimplexDb {}: skipping malformed cert vote entry: {}",
+                                self.storage_id,
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(error!("SimplexDb: timeout loading skip cert by slot")),
         }
     }
 
@@ -822,7 +1088,27 @@ impl SimplexDb {
             "SimplexDb {}: load_notar_certs_async",
             self.storage_id
         );
-        self.storage.get_by_prefix_u32(prefix_notar_cert(), None)
+        self.storage.get_by_prefix_u32(prefix_vote(), None)
+    }
+
+    /// Load all final certs asynchronously.
+    pub fn load_final_certs_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
+        log::debug!(
+            target: TARGET,
+            "SimplexDb {}: load_final_certs_async",
+            self.storage_id
+        );
+        self.storage.get_by_prefix_u32(prefix_vote(), None)
+    }
+
+    /// Load all skip certs asynchronously.
+    pub fn load_skip_certs_async(&self) -> StorageAsyncResultPtr<Vec<(Vec<u8>, Vec<u8>)>> {
+        log::debug!(
+            target: TARGET,
+            "SimplexDb {}: load_skip_certs_async",
+            self.storage_id
+        );
+        self.storage.get_by_prefix_u32(prefix_vote(), None)
     }
 
     /// Load all votes asynchronously.
@@ -957,14 +1243,15 @@ impl SimplexDb {
 
         let result = self
             .storage
-            .get_by_prefix_u32(prefix_notar_cert(), None)
+            .get_by_prefix_u32(prefix_vote(), None)
             .wait_timeout(DEFAULT_SYNC_TIMEOUT)
             .ok_or_else(|| error!("SimplexDb: timeout loading notar certs"))??;
 
         let mut records = Vec::with_capacity(result.len());
         for (key_bytes, value_bytes) in result {
             match deserialize_notar_cert(&key_bytes, &value_bytes) {
-                Ok(record) => records.push(record),
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
                 Err(e) => {
                     log::error!(
                         target: TARGET,
@@ -975,6 +1262,7 @@ impl SimplexDb {
                 }
             }
         }
+        records.sort_by_key(|r| r.candidate_id.slot);
 
         log::info!(
             target: TARGET,
@@ -983,6 +1271,88 @@ impl SimplexDb {
             records.len()
         );
 
+        Ok(records)
+    }
+
+    /// Load all finalization certificates from DB.
+    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
+    pub fn load_final_certs(&self) -> Result<Vec<FinalCertRecord>> {
+        log::debug!(
+            target: TARGET,
+            "SimplexDb {}: load_final_certs",
+            self.storage_id
+        );
+
+        let result = self
+            .storage
+            .get_by_prefix_u32(prefix_vote(), None)
+            .wait_timeout(DEFAULT_SYNC_TIMEOUT)
+            .ok_or_else(|| error!("SimplexDb: timeout loading final certs"))??;
+
+        let mut records = Vec::with_capacity(result.len());
+        for (key_bytes, value_bytes) in result {
+            match deserialize_final_cert(&key_bytes, &value_bytes) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(e) => {
+                    log::error!(
+                        target: TARGET,
+                        "SimplexDb {}: failed to deserialize final cert: {}",
+                        self.storage_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        records.sort_by_key(|r| r.candidate_id.slot);
+        log::info!(
+            target: TARGET,
+            "SimplexDb {}: loaded {} final certs",
+            self.storage_id,
+            records.len()
+        );
+        Ok(records)
+    }
+
+    /// Load all skip certificates from DB.
+    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
+    pub fn load_skip_certs(&self) -> Result<Vec<SkipCertRecord>> {
+        log::debug!(
+            target: TARGET,
+            "SimplexDb {}: load_skip_certs",
+            self.storage_id
+        );
+
+        let result = self
+            .storage
+            .get_by_prefix_u32(prefix_vote(), None)
+            .wait_timeout(DEFAULT_SYNC_TIMEOUT)
+            .ok_or_else(|| error!("SimplexDb: timeout loading skip certs"))??;
+
+        let mut records = Vec::with_capacity(result.len());
+        for (key_bytes, value_bytes) in result {
+            match deserialize_skip_cert(&key_bytes, &value_bytes) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(e) => {
+                    log::error!(
+                        target: TARGET,
+                        "SimplexDb {}: failed to deserialize skip cert: {}",
+                        self.storage_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        records.sort_by_key(|r| r.slot);
+        log::info!(
+            target: TARGET,
+            "SimplexDb {}: loaded {} skip certs",
+            self.storage_id,
+            records.len()
+        );
         Ok(records)
     }
 
@@ -1006,7 +1376,8 @@ impl SimplexDb {
         let mut records = Vec::with_capacity(result.len());
         for (key_bytes, value_bytes) in result {
             match deserialize_vote(&key_bytes, &value_bytes) {
-                Ok(record) => records.push(record),
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
                 Err(e) => {
                     log::error!(
                         target: TARGET,
@@ -1092,6 +1463,8 @@ impl SimplexDb {
     /// - Finalized blocks
     /// - Candidate infos
     /// - Notarization certificates
+    /// - Finalization certificates
+    /// - Skip certificates
     /// - Votes
     /// - Pool state
     ///
@@ -1107,6 +1480,8 @@ impl SimplexDb {
         let finalized_blocks = self.load_finalized_blocks()?;
         let candidate_infos = self.load_candidate_infos()?;
         let notar_certs = self.load_notar_certs()?;
+        let final_certs = self.load_final_certs()?;
+        let skip_certs = self.load_skip_certs()?;
         let votes = self.load_votes()?;
         let pool_state = self.load_pool_state()?;
 
@@ -1129,6 +1504,8 @@ impl SimplexDb {
             finalized_blocks,
             candidate_infos,
             notar_certs,
+            final_certs,
+            skip_certs,
             votes,
             pool_state,
             candidate_payloads,
@@ -1136,12 +1513,14 @@ impl SimplexDb {
 
         log::info!(
             target: TARGET,
-            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} certs, {} votes, \
-            {} payloads, pool_state={}",
+            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} notar certs, {} \
+            final certs, {} skip certs, {} votes, {} payloads, pool_state={}",
             self.storage_id,
             bootstrap.finalized_blocks.len(),
             bootstrap.candidate_infos.len(),
             bootstrap.notar_certs.len(),
+            bootstrap.final_certs.len(),
+            bootstrap.skip_certs.len(),
             bootstrap.votes.len(),
             bootstrap.candidate_payloads.len(),
             bootstrap.pool_state.is_some()
@@ -1171,7 +1550,9 @@ impl SimplexDb {
         // Start all async loads in parallel
         let finalized_async = self.load_finalized_blocks_async();
         let candidates_async = self.load_candidate_infos_async();
-        let certs_async = self.load_notar_certs_async();
+        let notar_certs_async = self.load_notar_certs_async();
+        let final_certs_async = self.load_final_certs_async();
+        let skip_certs_async = self.load_skip_certs_async();
         let votes_async = self.load_votes_async();
         let pool_state_async = self.load_pool_state_async();
         let payloads_async = self.load_candidate_payloads_async();
@@ -1179,7 +1560,9 @@ impl SimplexDb {
         // Wait with cancellation support
         let finalized_raw = finalized_async.wait_cancellable(cancel, step)?;
         let candidates_raw = candidates_async.wait_cancellable(cancel, step)?;
-        let certs_raw = certs_async.wait_cancellable(cancel, step)?;
+        let notar_certs_raw = notar_certs_async.wait_cancellable(cancel, step)?;
+        let final_certs_raw = final_certs_async.wait_cancellable(cancel, step)?;
+        let skip_certs_raw = skip_certs_async.wait_cancellable(cancel, step)?;
         let votes_raw = votes_async.wait_cancellable(cancel, step)?;
         let pool_state_raw = pool_state_async.wait_cancellable(cancel, step)?;
         let payloads_raw = payloads_async.wait_cancellable(cancel, step)?;
@@ -1216,18 +1599,41 @@ impl SimplexDb {
             }
         }
 
-        let mut notar_certs = Vec::with_capacity(certs_raw.len());
-        for (k, v) in certs_raw {
+        let mut notar_certs = Vec::with_capacity(notar_certs_raw.len());
+        for (k, v) in notar_certs_raw {
             match deserialize_notar_cert(&k, &v) {
-                Ok(r) => notar_certs.push(r),
+                Ok(Some(r)) => notar_certs.push(r),
+                Ok(None) => {}
                 Err(e) => log::error!(target: TARGET, "SimplexDb: skip bad notar cert: {e}"),
             }
         }
+        notar_certs.sort_by_key(|r| r.candidate_id.slot);
+
+        let mut final_certs = Vec::with_capacity(final_certs_raw.len());
+        for (k, v) in final_certs_raw {
+            match deserialize_final_cert(&k, &v) {
+                Ok(Some(r)) => final_certs.push(r),
+                Ok(None) => {}
+                Err(e) => log::error!(target: TARGET, "SimplexDb: skip bad final cert: {e}"),
+            }
+        }
+        final_certs.sort_by_key(|r| r.candidate_id.slot);
+
+        let mut skip_certs = Vec::with_capacity(skip_certs_raw.len());
+        for (k, v) in skip_certs_raw {
+            match deserialize_skip_cert(&k, &v) {
+                Ok(Some(r)) => skip_certs.push(r),
+                Ok(None) => {}
+                Err(e) => log::error!(target: TARGET, "SimplexDb: skip bad skip cert: {e}"),
+            }
+        }
+        skip_certs.sort_by_key(|r| r.slot);
 
         let mut votes = Vec::with_capacity(votes_raw.len());
         for (k, v) in votes_raw {
             match deserialize_vote(&k, &v) {
-                Ok(r) => votes.push(r),
+                Ok(Some(r)) => votes.push(r),
+                Ok(None) => {}
                 Err(e) => log::error!(target: TARGET, "SimplexDb: skip bad vote: {e}"),
             }
         }
@@ -1267,6 +1673,8 @@ impl SimplexDb {
             finalized_blocks,
             candidate_infos,
             notar_certs,
+            final_certs,
+            skip_certs,
             votes,
             pool_state,
             candidate_payloads,
@@ -1274,12 +1682,14 @@ impl SimplexDb {
 
         log::info!(
             target: TARGET,
-            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} certs, {} votes, \
-            {} payloads, pool_state={}",
+            "SimplexDb {}: bootstrap loaded: {} finalized, {} candidates, {} notar certs, {} \
+            final certs, {} skip certs, {} votes, {} payloads, pool_state={}",
             self.storage_id,
             bootstrap.finalized_blocks.len(),
             bootstrap.candidate_infos.len(),
             bootstrap.notar_certs.len(),
+            bootstrap.final_certs.len(),
+            bootstrap.skip_certs.len(),
             bootstrap.votes.len(),
             bootstrap.candidate_payloads.len(),
             bootstrap.pool_state.is_some()

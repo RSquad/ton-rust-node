@@ -36,7 +36,7 @@ fn test_libraries() {
 
     let lib_code = SliceData::new(vec![0x75, 0x80]).into_cell().unwrap();
     let mut lib2 = LibDescr::from_lib_data_by_publisher(lib_code, my_id);
-    lib2.publishers_mut().set(&your_id, &()).unwrap();
+    lib2.publishers_mut().set(&your_id, &EmptyValue).unwrap();
 
     let mut data = HashmapE::with_bit_len(256);
     let key = SliceData::load_builder(acc_id.write_to_new_cell().unwrap()).unwrap();

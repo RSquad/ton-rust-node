@@ -32,6 +32,26 @@ use ton_block::{
 
 include!("../../../common/src/info.rs");
 
+fn session_start_args(
+    shard: &ShardIdent,
+    initial_block_seqno: u32,
+) -> (Vec<BlockIdExt>, BlockIdExt) {
+    (
+        vec![BlockIdExt::with_params(
+            shard.clone(),
+            initial_block_seqno.saturating_sub(1),
+            UInt256::default(),
+            UInt256::default(),
+        )],
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+    )
+}
+
 /*
     Test constants
 */
@@ -106,9 +126,11 @@ impl SessionListener for CollationTestListener {
 
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                self.max_finalized_seqno.load(Ordering::SeqCst)
+                panic!("Simplex collation test must not receive implicit parent hints")
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
+            consensus_common::CollationParentHint::Explicit(parent_ids) => {
+                parent_ids.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1
+            }
         };
 
         // Generate dummy candidate with proper hashes
@@ -366,7 +388,8 @@ fn run_collation_test() {
         Arc::downgrade(&session_listener),
     )
     .expect("Failed to create session");
-    session.start(initial_block_seqno);
+    let (prev_blocks, min_masterchain_block_id) = session_start_args(&shard, initial_block_seqno);
+    session.start(prev_blocks, min_masterchain_block_id);
 
     log::info!("Session created, waiting for collation callback...");
 

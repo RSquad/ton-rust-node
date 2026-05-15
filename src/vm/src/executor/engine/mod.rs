@@ -10,11 +10,12 @@
  */
 mod core;
 pub(in crate::executor) mod data;
+mod fix_gas;
 mod handlers;
 #[macro_use]
 pub(in crate::executor) mod storage;
 
-pub use self::core::*;
+pub use self::{core::*, fix_gas::*};
 
 #[cfg(test)]
 #[path = "../../tests/test_microfunctions.rs"]

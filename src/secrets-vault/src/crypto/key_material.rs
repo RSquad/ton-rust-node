@@ -7,17 +7,22 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    crypto::crypto_trait::Crypto, errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory, types::algorithm::Algorithm,
+    crypto::crypto_trait::Crypto,
+    errors::error::VaultError,
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
+    types::algorithm::Algorithm,
 };
 
 pub struct KeyMaterial {
     pub secret_key: Option<ProtectedMemory>,
     pub public_key: Option<Vec<u8>>,
+    pub tags: Option<Vec<String>>,
 }
 
 impl KeyMaterial {
-    pub async fn new(
+    pub const TAG_EXPANDED_KEY: &str = "expanded";
+
+    pub fn new(
         secret_key: Option<ProtectedMemory>,
         public_key: Option<Vec<u8>>,
     ) -> anyhow::Result<Self> {
@@ -26,7 +31,7 @@ impl KeyMaterial {
         }
 
         if let Some(s) = secret_key.as_ref() {
-            if s.is_empty().await {
+            if s.is_empty() {
                 anyhow::bail!(VaultError::empty_secret_key("Failed to create key material"));
             }
         }
@@ -37,101 +42,126 @@ impl KeyMaterial {
             }
         }
 
-        Ok(Self { secret_key, public_key })
+        Ok(Self { secret_key, public_key, tags: None })
     }
 
-    pub async fn new_blob(data: ProtectedMemory) -> anyhow::Result<Self> {
-        Ok(Self { secret_key: Some(data), public_key: None })
+    pub fn new_blob(data: ProtectedMemory) -> anyhow::Result<Self> {
+        Ok(Self { secret_key: Some(data), public_key: None, tags: None })
     }
 
-    pub async fn new_keypair(
-        private_key: ProtectedMemory,
-        public_key: Vec<u8>,
-    ) -> anyhow::Result<Self> {
-        if private_key.is_empty().await {
-            anyhow::bail!(VaultError::empty_secret_key("Private key is empty in new_keypair"));
+    pub fn new_pvt_pub(private_key: ProtectedMemory, public_key: Vec<u8>) -> anyhow::Result<Self> {
+        if private_key.is_empty() {
+            anyhow::bail!(VaultError::empty_secret_key("Private key is empty"));
         }
 
         if public_key.is_empty() {
-            anyhow::bail!(VaultError::empty_public_key("Public key is empty in new_keypair"));
+            anyhow::bail!(VaultError::empty_public_key("Public key is empty"));
         }
 
-        Ok(Self { secret_key: Some(private_key), public_key: Some(public_key) })
+        Ok(Self { secret_key: Some(private_key), public_key: Some(public_key), tags: None })
     }
 
-    pub async fn new_symmetric_key(key: ProtectedMemory) -> anyhow::Result<Self> {
-        if key.is_empty().await {
+    pub fn new_exp_pub(expanded_key: ProtectedMemory, public_key: Vec<u8>) -> anyhow::Result<Self> {
+        if expanded_key.is_empty() {
+            anyhow::bail!(VaultError::empty_secret_key("Expanded key is empty"));
+        }
+
+        if public_key.is_empty() {
+            anyhow::bail!(VaultError::empty_public_key("Public key is empty"));
+        }
+
+        Ok(Self {
+            secret_key: Some(expanded_key),
+            public_key: Some(public_key),
+            tags: Some(vec![Self::TAG_EXPANDED_KEY.to_string()]),
+        })
+    }
+
+    pub fn new_pub_key(public_key: Vec<u8>) -> anyhow::Result<Self> {
+        if public_key.is_empty() {
+            anyhow::bail!(VaultError::empty_public_key("Public key is empty"));
+        }
+
+        Ok(Self { secret_key: None, public_key: Some(public_key), tags: None })
+    }
+
+    pub fn new_symmetric_key(key: ProtectedMemory) -> anyhow::Result<Self> {
+        if key.is_empty() {
             anyhow::bail!(VaultError::empty_secret_key("Symmetric key is empty"));
         }
 
-        Ok(Self { secret_key: Some(key), public_key: None })
+        Ok(Self { secret_key: Some(key), public_key: None, tags: None })
     }
 
-    pub async fn generate_new(
+    pub fn generate_new(
         algorithm: Algorithm,
         size: Option<usize>,
         crypto: &dyn Crypto,
     ) -> anyhow::Result<Self> {
         let key_material = match algorithm {
             Algorithm::None => {
-                let blob = crypto.generate_rnd(algorithm, size).await?;
-                Self::new_blob(blob).await?
+                let blob = crypto.generate_rnd(algorithm, size)?;
+                Self::new_blob(blob)?
             }
             Algorithm::Aes256Gcm => {
-                let key = crypto.generate_rnd(algorithm, size).await?;
-                Self::new_symmetric_key(key).await?
+                let key = crypto.generate_rnd(algorithm, size)?;
+                Self::new_symmetric_key(key)?
             }
             Algorithm::Ed25519 => {
-                let private_key = crypto.generate_rnd(algorithm, size).await?;
-                let public_key =
-                    crypto.pub_key_from_pvt(algorithm, &private_key.lock().await?).await?;
-                Self::new_keypair(private_key, public_key).await?
+                let private_key = crypto.generate_rnd(algorithm, size)?;
+                let public_key = crypto.pub_key_from_pvt(algorithm, &private_key.lock()?)?;
+                Self::new_pvt_pub(private_key, public_key)?
             }
         };
 
         Ok(key_material)
     }
 
-    pub async fn clone(&self) -> anyhow::Result<Self> {
+    pub fn try_clone(&self) -> anyhow::Result<Self> {
         let secret_key = match self.secret_key.as_ref() {
-            Some(pm) => Some(pm.clone().await?),
+            Some(pm) => Some(pm.try_clone()?),
             None => None,
         };
 
-        Ok(KeyMaterial { secret_key, public_key: self.public_key.clone() })
+        Ok(KeyMaterial { secret_key, public_key: self.public_key.clone(), tags: self.tags.clone() })
     }
 
-    pub async fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
+    pub fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
+        if self.tags.as_ref().is_some_and(|t| !t.is_empty()) {
+            anyhow::bail!(VaultError::invalid_key_material(
+                "Tags are only supported at runtime and can't be serialized"
+            ))
+        }
+
         // Format: [secret_key_len: u32][public_key_len: u32][secret_key][public_key]
         let secret_key_guard = match &self.secret_key {
-            Some(secret_key) => Some(secret_key.lock().await?),
+            Some(secret_key) => Some(secret_key.lock()?),
             None => None,
         };
 
         let secret_key_len = secret_key_guard.as_ref().map_or(0, |guard| guard.len());
         let public_key_len = self.public_key.as_ref().map_or(0, |pk| pk.len());
 
-        let mut serialized_data = ProtectedMemory::new(0)?;
-
+        let mut serialized = ProtectedMemoryInner::new(0)?;
         {
-            let mut write_lock = serialized_data.lock_mut().await?;
+            let mut handle = serialized.write_handle()?;
 
-            write_lock.extend_from_slice(&(secret_key_len as u32).to_le_bytes())?;
-            write_lock.extend_from_slice(&(public_key_len as u32).to_le_bytes())?;
+            handle.extend_from_slice(&(secret_key_len as u32).to_le_bytes())?;
+            handle.extend_from_slice(&(public_key_len as u32).to_le_bytes())?;
 
             if let Some(ref guard) = secret_key_guard {
-                write_lock.extend_from_slice(guard)?;
+                handle.extend_from_slice(guard)?;
             }
 
             if let Some(ref public_key) = self.public_key {
-                write_lock.extend_from_slice(public_key)?;
+                handle.extend_from_slice(public_key)?;
             }
         }
 
-        Ok(serialized_data)
+        Ok(serialized.into())
     }
 
-    pub async fn deserialize(source_data: &[u8]) -> anyhow::Result<Self> {
+    pub fn deserialize(source_data: &[u8]) -> anyhow::Result<Self> {
         // Format: [secret_key_len: u32][public_key_len: u32][secret_key][public_key]
         if source_data.len() < 8 {
             anyhow::bail!(VaultError::invalid_key_material(
@@ -167,7 +197,7 @@ impl KeyMaterial {
             let secret_key = &source_data[offset..offset + secret_key_len];
             offset += secret_key_len;
 
-            Some(ProtectedMemory::from_slice(secret_key).await?)
+            Some(ProtectedMemoryInner::from_slice(secret_key)?.into())
         } else {
             None
         };
@@ -178,12 +208,12 @@ impl KeyMaterial {
             None
         };
 
-        Self::new(secret_key, public_key).await
+        Self::new(secret_key, public_key)
     }
 
-    pub async fn eq_km(&self, other: &KeyMaterial) -> anyhow::Result<bool> {
+    pub fn eq_km(&self, other: &KeyMaterial) -> anyhow::Result<bool> {
         let secret_keys_equal = match (&self.secret_key, &other.secret_key) {
-            (Some(a), Some(b)) => a.eq_pm(b).await?,
+            (Some(a), Some(b)) => a.eq_pm(b)?,
             (None, None) => true,
             _ => false,
         };

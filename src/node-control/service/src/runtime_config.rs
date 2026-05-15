@@ -18,8 +18,10 @@ use contracts::{
     TonWallet, WalletContract, contract_provider,
 };
 use secrets_vault::{
+    crypto::factory::CryptoFactory,
     types::{algorithm::Algorithm, secret_id::SecretId, secret_spec::SecretSpec},
     vault::SecretVault,
+    vault_block::BlockCryptoFactory,
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -123,7 +125,7 @@ impl RuntimeConfigStore {
     pub async fn initialize(app_cfg: Arc<AppConfig>, config_path: String) -> anyhow::Result<Self> {
         let hash = Self::hash_file(&Path::new(&config_path));
 
-        let vault = Some(SecretVaultBuilder::from_env().await?);
+        let vault = Some(SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?).await?);
         let rpc_client = Self::load_rpc_client(&app_cfg).await?;
         if let Some(elections) = app_cfg.elections.as_ref() {
             Self::validate_max_factor(&rpc_client, elections).await?;
@@ -150,7 +152,9 @@ impl RuntimeConfigStore {
 
     async fn reload_state(&self) -> anyhow::Result<()> {
         let cfg = self.get();
-        let vault = SecretVaultBuilder::from_env().await.context("failed to reopen vault")?;
+        let vault = SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?)
+            .await
+            .context("failed to reopen vault")?;
         let rpc_client = Self::load_rpc_client(&cfg).await?;
         if let Some(elections) = cfg.elections.as_ref() {
             Self::validate_max_factor(&rpc_client, elections).await?;

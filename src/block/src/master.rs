@@ -22,8 +22,8 @@ use crate::{
     signature::CryptoSignaturePair,
     types::{ChildCell, CurrencyCollection, InRefValue},
     validators::ValidatorInfo,
-    AccountId, Augmentation, BuilderData, Cell, Deserializable, IBitstring, Result, Serializable,
-    SliceData, UInt256,
+    AccountId, Augmentation, BuilderData, Cell, Deserializable, EmptyValue, IBitstring, Result,
+    Serializable, SliceData, UInt256,
 };
 use std::fmt;
 
@@ -1428,7 +1428,7 @@ impl Serializable for BlkMasterInfo {
     }
 }
 
-define_HashmapE!(Publishers, 256, ());
+define_HashmapE!(Publishers, 256, EmptyValue);
 /*
 shared_lib_descr$00 lib:^Cell publishers:(Hashmap 256 True) = LibDescr;
 */
@@ -1444,7 +1444,7 @@ impl LibDescr {
     }
     pub fn from_lib_data_by_publisher(lib: Cell, publisher: AccountId) -> Self {
         let mut publishers = Publishers::default();
-        publishers.set(&publisher, &()).unwrap();
+        publishers.set(&publisher, &EmptyValue).unwrap();
         Self { lib, publishers }
     }
     pub fn publishers(&self) -> &Publishers {
@@ -1467,20 +1467,20 @@ impl Deserializable for LibDescr {
                 s: std::any::type_name::<Self>().to_string()
             })
         }
-        self.lib.read_from(slice)?;
+        self.lib = slice.checked_drain_reference()?;
         self.publishers.read_hashmap_root(slice)?;
         Ok(())
     }
 }
 
 impl Serializable for LibDescr {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
         if self.publishers.is_empty() {
             fail!(BlockError::InvalidData("self.publishers is empty".to_string()))
         }
-        cell.append_bits(0, 2)?;
-        self.lib.write_to(cell)?;
-        self.publishers.write_hashmap_root(cell)?;
+        builder.append_bits(0, 2)?;
+        builder.checked_append_reference(self.lib().clone())?;
+        self.publishers.write_hashmap_root(builder)?;
         Ok(())
     }
 }

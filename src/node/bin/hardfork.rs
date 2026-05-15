@@ -19,6 +19,7 @@ use node::{
     types::top_block_descr::TopBlockDescrStuff,
     validator::{
         collator::{CollateResult, Collator},
+        state_resolver_cache::StateResolverCache,
         validator_group::PipelineContext,
         validator_utils::{calc_subset_for_masterchain, PrevBlockHistory},
         CollatorSettings,
@@ -75,6 +76,7 @@ impl MockEngine {
                 false,
                 false,
                 false,
+                None,
                 &|| Ok(()),
                 None,
                 Arc::new(AtomicU8::new(0)),
@@ -326,6 +328,7 @@ async fn run(args: clap::ArgMatches) -> Result<()> {
             seqno,
             &prev,
             PipelineContext::new(),
+            Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             v_set,
             UInt256::default(),
             engine,

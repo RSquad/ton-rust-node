@@ -261,11 +261,12 @@ impl SmartContractInfo {
     fn get_unpacked_config_tuple(&self) -> StackItem {
         let mut storage_price = StackItem::None;
         if let Ok(storage_prices) = self.config_params.storage_prices() {
+            let mut best_utime_since = 0u32;
             let _ = storage_prices.map.iterate_slices_with_keys(|mut key, slice| {
                 let utime_since = key.get_next_u32()?;
-                if self.unix_time >= utime_since {
+                if (utime_since <= self.unix_time) && (utime_since >= best_utime_since) {
+                    best_utime_since = utime_since;
                     storage_price = StackItem::slice(slice);
-                    return Ok(false);
                 }
                 Ok(true)
             });

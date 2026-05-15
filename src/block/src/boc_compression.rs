@@ -124,7 +124,7 @@ pub fn boc_decompress(compressed: impl AsRef<[u8]>, max_size: usize) -> Result<V
     match compressed.as_ref()[0] {
         0 => {
             let decompressed = boc_decompress_baseline_lz4(compressed_data, max_size)?;
-            Ok(BocReader::new().read(&mut Cursor::new(&decompressed))?.roots)
+            Ok(BocReader::new().stream_read(&mut Cursor::new(&decompressed))?.roots)
         }
         1 => boc_decompress_improved_structure_lz4(compressed_data, max_size),
         any => Err(anyhow::format_err!("Invalid compression algorithm {}", any)),
@@ -1494,13 +1494,13 @@ fn build_graph_recursive(
 ) -> Result<usize> {
     // Check if already visited (DAG deduplication)
     let cell_hash = cell.repr_hash();
-    if let Some(&id) = visited.get(&cell_hash) {
+    if let Some(&id) = visited.get(cell_hash) {
         return Ok(id);
     }
 
     // Assign new node ID
     let current_cell_id = graph.len();
-    visited.insert(cell_hash, current_cell_id);
+    visited.insert(cell_hash.clone(), current_cell_id);
 
     let data = cell.data();
     let bit_len = cell.bit_length();

@@ -37,7 +37,7 @@ use std::{
     fs::create_dir_all,
     hash::Hash,
     io::SeekFrom,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, OnceLock,
@@ -237,7 +237,7 @@ impl ArchiveSlice {
         Ok(())
     }
 
-    pub fn db_root_path(&self) -> &std::path::Path {
+    pub fn db_root_path(&self) -> &Path {
         self.db_root_path.as_path()
     }
 
@@ -812,8 +812,6 @@ impl ArchiveSlice {
             return Ok(());
         }
 
-        self.package_status_db.put_value(&PackageStatusKey::TotalSlices, &(upto as u32))?;
-
         // Delete unneeded entries from package by repack.
         // 1) read all items from package and write it (with condition) into "new" package
         //      write new offsets and indexes into correspond dbs by the way
@@ -821,6 +819,10 @@ impl ArchiveSlice {
         // while old package is not deleted repack might be replay many times
         // (it doesn't use offsets db), but read form package will fail
         // (offsets db points new package)
+
+        // TotalSlices is written after the loop because the effective count may be less than
+        // upto if all entries in the boundary package(s) are deleted.
+        let mut effective_total = mc_index;
 
         for i in mc_index..upto {
             let mut package_info = self
@@ -833,6 +835,7 @@ impl ArchiveSlice {
             let new_package = Package::open(new_name.into(), false, true).await?;
             let mut old_reader = read_package_from(old_package.open_file().await?).await?;
 
+            let mut any_kept = false;
             while let Some(entry) = old_reader.next().await? {
                 let entry_id = PackageEntryId::from_filename(entry.filename())?;
                 let id = match &entry_id {
@@ -843,15 +846,6 @@ impl ArchiveSlice {
                 };
                 if delete_condition(id) {
                     log::trace!(target: TARGET, "repack package: delete {entry_id}");
-                    let index = package_info.index();
-                    let key = index.into();
-                    if let Err(e) = self.entry_db.delete(&key) {
-                        log::warn!(
-                            target: TARGET,
-                            "Can't delete {index} from index db (slice: {}): {e}",
-                            self.archive_id
-                        )
-                    }
                     if let Err(e) = self.offsets_db.delete(&(&entry_id).into()) {
                         log::warn!(
                             target: TARGET,
@@ -880,6 +874,24 @@ impl ArchiveSlice {
                             self.offsets_db.put_value(&(&entry_id).into(), &offset)
                         })
                         .await?;
+                    any_kept = true;
+                }
+            }
+            if any_kept {
+                effective_total = i + 1;
+            } else {
+                log::debug!(
+                    target: TARGET,
+                    "All entries deleted from package #{i} in slice {}: \
+                    not counting it towards TotalSlices",
+                    self.archive_id
+                );
+                if let Err(e) = self.entry_db.delete(&i.into()) {
+                    log::warn!(
+                        target: TARGET,
+                        "Can't delete #{i} from entry_db (slice: {}): {e}",
+                        self.archive_id
+                    );
                 }
             }
 
@@ -895,6 +907,9 @@ impl ArchiveSlice {
             self.package_store.insert(entry.clone(), OnceLock::from(Arc::new(package_info)));
             self.package_index.insert(i, entry);
         }
+
+        self.package_status_db
+            .put_value(&PackageStatusKey::TotalSlices, &(effective_total as u32))?;
 
         Ok(())
     }

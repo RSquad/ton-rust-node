@@ -6,6 +6,53 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.6.1] - 2026-05-06
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.1`
+
+### Added
+
+- CLI tool for copying node secrets to HashiCorp Vault
+
+### Changed
+
+- ADNL key management for fast sync overlay
+
+### Fixed
+
+- Ensure deterministic gas charging in TVM for partial-bit opcodes across all validators
+- Align ActionPhase TL-B encoding in transaction executor with the consensus-observable form (post-BOC round-trip)
+
+## [v0.6.0] - 2026-05-01
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.0`
+
+### Added
+
+- Support of HashiCorp vault for node secrets storing
+
+### Changed
+
+- Improved performance of operations with cell data representation
+- Improved performance and stability of collator
+- Improved performance of Simplex consensus protocols
+- Improved performance of node cells database
+
+### Fixed
+
+- Compatibility issues for transaction executor and TVM
+- Fix for anycast addresses in old transactions
+- Proper archive truncation after node hard reboots
+
+## [v0.5.3] - 2026-04-23
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.3`
+
+### Changed
+
+- Optimize QUIC for high latency links
+- Keep permanent ADNL validator keys
+
 ## [v0.5.2] - 2026-04-21
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.5.2`

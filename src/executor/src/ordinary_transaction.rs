@@ -103,18 +103,48 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let (bounce, is_ext_msg, account_address) = match in_msg.header() {
             CommonMsgInfo::ExtOutMsgInfo(_) => fail!(ExecutorError::InvalidExtMessage),
             CommonMsgInfo::IntMsgInfo(hdr) => {
+                log::debug!(target: "executor", "internal message, bounce: {}", hdr.bounce);
                 msg_balance = hdr.value.clone();
                 (hdr.bounce, false, &hdr.dst)
             }
-            CommonMsgInfo::ExtInMsgInfo(hdr) => (false, true, &hdr.dst),
+            CommonMsgInfo::ExtInMsgInfo(hdr) => {
+                log::debug!(target: "executor", "external message");
+                (false, true, &hdr.dst)
+            }
         };
+        if let Some(state_init) = in_msg.state_init() {
+            log::debug!(target: "executor", "message has state init");
+            if let Some(fixed_prefix_length) = state_init.fixed_prefix_length() {
+                log::debug!(target: "executor", "message fixed prefix length: {}", fixed_prefix_length);
+            }
+        }
 
         let (wc_id, account_id) = account_address.extract_std_address(true)?;
         let is_masterchain = wc_id == MASTERCHAIN_ID;
-        log::debug!(target: "executor", "Account = {}:{:x}", wc_id,account_id);
+        log::debug!(target: "executor", "Account = {}:{:x}", wc_id, account_id);
+        if let Some(address) = account.get_addr() {
+            if let Some(anyacast) = address.rewrite_pfx() {
+                let (_, id) = address.extract_std_address(true)?;
+                if id != account_id {
+                    log::warn!(target: "executor", "Account address has anycast prefix, but anycast id: {:x} does not match account id: {:x}",
+                        anyacast.rewrite_pfx, account_id);
+                    *account = Default::default();
+                } else {
+                    log::warn!(target: "executor", "Account address has anycast prefix, anycast id: {:x} with address: {:x}",
+                        anyacast.rewrite_pfx, address.address());
+                }
+            }
+        }
         if let Some(hash) = account.frozen_hash() {
             log::debug!(target: "executor", "Account is frozen, hash = {:x}", hash);
+        } else if account.is_uninit() {
+            log::debug!(target: "executor", "Account is uninitialized");
+        } else if account.is_none() {
+            log::debug!(target: "executor", "Account does not exist");
+        } else {
+            log::debug!(target: "executor", "Account is active");
         }
+        let was_not_exist = account.is_none();
         let mut acc_balance = account.balance().cloned().unwrap_or_default();
         let mut original_acc_balance = acc_balance.clone();
         let is_special = self.config.is_special_account(is_masterchain, &account_id)?;
@@ -196,11 +226,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         if description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
                 Ok(credit_ph) => Some(credit_ph),
-                Err(e) => fail!(
-                    ExecutorError::TrExecutorError(
-                        format!("cannot create credit phase of a new transaction for smart contract for reason {}", e)
-                    )
-                )
+                Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                    "cannot create credit phase of a new transaction for smart contract for reason {e}"
+                ))),
             };
         }
         let storage_fees_collected;
@@ -218,8 +246,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 Some(storage_ph)
             }
             Err(e) => fail!(ExecutorError::TrExecutorError(format!(
-                "cannot create storage phase of a new transaction for smart contract for reason {}",
-                e
+                "cannot create storage phase of a new transaction for smart contract for reason {e}"
             ))),
         };
 
@@ -237,11 +264,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         if !description.credit_first && !is_ext_msg {
             description.credit_ph = match self.credit_phase(&msg_balance, &mut acc_balance) {
                 Ok(credit_ph) => Some(credit_ph),
-                Err(e) => fail!(
-                    ExecutorError::TrExecutorError(
-                        format!("cannot create credit phase of a new transaction for smart contract for reason {}", e)
-                    )
-                )
+                Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                    "cannot create credit phase of a new transaction for smart contract for reason {e}",
+                ))),
             };
         }
         log::debug!(target: "executor",
@@ -256,28 +281,6 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         }
 
         let config_params = self.config.raw_config().clone();
-        let mut smc_info = SmartContractInfo {
-            myself: account_address.write_to_bitstring()?,
-            block_lt: params.block_lt,
-            trans_lt: lt,
-            unix_time: params.block_unixtime,
-            balance: acc_balance.clone(),
-            in_msg: Some(in_msg.clone()),
-            incoming_value: msg_balance.clone(),
-            storage_fees_collected,
-            due_payment: account.due_payment().map_or(0, Coins::as_u128),
-            config_params,
-            prev_blocks_info: params.prev_blocks_info.clone(),
-            ..Default::default()
-        };
-        smc_info.calc_rand_seed(params.seed_block.clone(), &account_id.get_bytestring(0));
-        let mut stack = Stack::new();
-        stack
-            .push(int!(acc_balance.coins.as_u128()))
-            .push(int!(msg_balance.coins.as_u128()))
-            .push(StackItem::Cell(in_msg_cell))
-            .push(StackItem::Slice(in_msg.body().cloned().unwrap_or_default()))
-            .push(boolean!(is_ext_msg));
         log::debug!(target: "executor", "compute_phase");
         let mut bad_state = false;
         if account.is_none() && !is_ext_msg && !was_deleted_or_frozen {
@@ -286,7 +289,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 &in_msg,
                 &account_address,
                 &msg_balance,
-                if !is_special { smc_info.unix_time() } else { 0 },
+                if !is_special { params.block_unixtime } else { 0 },
                 true,
             ) {
                 if check_account_size_limits(self.config().size_limits_config(), &mut new_acc)? {
@@ -300,6 +303,28 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let (compute_ph, actions, new_data) = if bad_state {
             (TrComputePhase::skipped(ComputeSkipReason::BadState), None, None)
         } else {
+            let mut smc_info = SmartContractInfo {
+                myself: account_address.write_to_bitstring()?,
+                block_lt: params.block_lt,
+                trans_lt: lt,
+                unix_time: params.block_unixtime,
+                balance: acc_balance.clone(),
+                in_msg: Some(in_msg.clone()),
+                incoming_value: msg_balance.clone(),
+                storage_fees_collected,
+                due_payment: account.due_payment().map_or(0, Coins::as_u128),
+                config_params,
+                prev_blocks_info: params.prev_blocks_info.clone(),
+                ..Default::default()
+            };
+            smc_info.calc_rand_seed(params.seed_block.clone(), &account_id.get_bytestring(0));
+            let mut stack = Stack::new();
+            stack
+                .push(int!(acc_balance.coins.as_u128()))
+                .push(int!(msg_balance.coins.as_u128()))
+                .push(StackItem::Cell(in_msg_cell))
+                .push(StackItem::Slice(in_msg.body().cloned().unwrap_or_default()))
+                .push(boolean!(is_ext_msg));
             match self.compute_phase(
                 Some(&in_msg),
                 account,
@@ -341,18 +366,16 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                         actions.unwrap_or_default(),
                         new_data,
                         &account_address,
-                        is_special
+                        is_special,
                     ) {
-                        Ok(ActionPhaseResult{phase, messages, bounce}) => {
+                        Ok(ActionPhaseResult { phase, messages, bounce }) => {
                             need_bounce = bounce;
                             out_msgs = messages;
                             Some(phase)
                         }
-                        Err(e) => fail!(
-                            ExecutorError::TrExecutorError(
-                                format!("cannot create action phase of a new transaction for smart contract for reason {}", e)
-                            )
-                        )
+                        Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                            "cannot create action phase of a new transaction for smart contract for reason {e}",
+                        ))),
                     }
                 } else {
                     log::debug!(target: "executor", "compute_phase: failed");
@@ -364,6 +387,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 log::debug!(target: "executor", "compute_phase: skipped reason {:?}", skipped.reason);
                 if is_ext_msg {
                     fail!(ExecutorError::ExtMsgComputeSkipped(skipped.reason))
+                } else if was_not_exist && account.is_active() {
+                    log::debug!(target: "executor", "compute_phase skipped for non-existing account, uninit account");
+                    account.uninit_account();
                 }
                 need_bounce = true;
                 None
@@ -404,18 +430,16 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 description.action.as_ref(),
                 &in_msg,
                 &mut tr,
-                &account_address
+                &account_address,
             ) {
                 Ok((bounce_ph, Some(bounce_msg))) => {
                     out_msgs.push(bounce_msg);
                     Some(bounce_ph)
                 }
                 Ok((bounce_ph, None)) => Some(bounce_ph),
-                Err(e) => fail!(
-                    ExecutorError::TrExecutorError(
-                        format!("cannot create bounce phase of a new transaction for smart contract for reason {}", e)
-                    )
-                )
+                Err(e) => fail!(ExecutorError::TrExecutorError(format!(
+                    "cannot create bounce phase of a new transaction for smart contract for reason {e}"
+                ))),
             };
             // TODO: check here
             // if money can be returned to sender
@@ -429,12 +453,14 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             log::debug!(target: "executor", "delete uninitialized account with zero balance");
             *account = Account::default();
         } else if account.is_none() && !acc_balance.is_zero()? {
-            // if tr.orig_status != ton_block::AccountStatus::AccStateNonexist {
+            // if !was_not_exist {
             //     fail!("cannot delete account with non-zero balance")
             // } else {
             log::debug!(target: "executor", "balance is not zero, so make uninit account");
             *account = Account::uninit(account_address, acc_balance.clone(), 0, last_paid);
             // }
+        } else {
+            account.set_addr(account_address);
         }
         tr.set_end_status(account.status());
         if let Some(hash) = account.frozen_hash() {

@@ -55,6 +55,7 @@ async fn create_db(test_name: &str, monitor_min_split: u8) -> Result<InternalDb>
             false,
             false,
             false,
+            None,
             &|| Ok(()),
             None,
             Arc::new(AtomicU8::new(monitor_min_split)),
@@ -379,9 +380,10 @@ async fn test_store_ss_persistent_impl() -> Result<()> {
     db.store_shard_state_dynamic(&block_handle, &ss, Some(wait.clone()), Some(cb.clone()), false)
         .await?;
     cb.wait().await;
-    db.store_shard_state_persistent(
+    db.store_shard_state_persistent_part(
         &block_handle,
-        ss.clone(),
+        &PersistentStatePartId::WholeState(ss.block_id().clone()),
+        ss.root_cell().clone(),
         Some(wait.clone()),
         Arc::new(|| false),
     )

@@ -11,10 +11,13 @@
 use crate::engine_traits::EngineOperations;
 use std::sync::Arc;
 use ton_block::{
-    fail, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell, HashUpdate,
-    HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries, Result, Serializable,
-    ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions, UInt256, UsageTree,
+    fail, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell, EmptyValue,
+    HashUpdate, HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries, Result,
+    Serializable, ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions, UInt256,
+    UsageTree,
 };
+
+const STAT_UPDATE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub struct ShardAccountStuff {
     account: Account,
@@ -47,11 +50,26 @@ impl ShardAccountStuff {
         let mut storage_dict = if let Some(dict_hash) = account.dict_hash() {
             if let Some(dict) = engine.get_account_storage_dict(dict_hash) {
                 Some(dict)
-            } else {
+            } else if full_collated_data {
                 let now = std::time::Instant::now();
-                let result = account.init_storage_stat(dict_hash_min_cells)?;
-                log::debug!("TIME account {:x} init_storage_stat {:?}", account_id, now.elapsed());
+                let result = account.calc_and_check_storage_stat_dict(dict_hash_min_cells)?;
+                let elapsed = now.elapsed();
+                if elapsed > STAT_UPDATE_THRESHOLD {
+                    log::warn!(
+                        "TIME account {:x} calc_and_check_storage_stat_dict {:?}",
+                        account_id,
+                        elapsed
+                    );
+                } else {
+                    log::debug!(
+                        "TIME account {:x} calc_and_check_storage_stat_dict {:?}",
+                        account_id,
+                        elapsed
+                    );
+                }
                 result
+            } else {
+                None
             }
         } else {
             None
@@ -139,7 +157,16 @@ impl ShardAccountStuff {
         transaction.set_prev_trans_lt(self.shard_acc.last_trans_lt());
         // log::trace!("{} {}", self.collated_block_descr, debug_transaction(transaction.clone())?);
         self.account = account;
-        self.storage_dict = self.account.update_storage_stat(self.dict_hash_min_cells)?;
+
+        let now = std::time::Instant::now();
+        self.storage_dict = self.account.calc_storage_stat_dict(self.dict_hash_min_cells)?;
+        let elapsed = now.elapsed();
+        if elapsed > STAT_UPDATE_THRESHOLD {
+            log::warn!("TIME account {:x} calc_storage_stat_dict {:?}", self.account_id, elapsed);
+        } else {
+            log::debug!("TIME account {:x} calc_storage_stat_dict {:?}", self.account_id, elapsed);
+        }
+
         self.account_updates.extend(AccountStorageStat::get_roots(self.account.state_init()));
         self.shard_acc.write_account(&self.account)?;
         let new_hash = self.shard_acc.account_hash();
@@ -147,7 +174,7 @@ impl ShardAccountStuff {
         let state_update = HashUpdate::with_hashes(old_hash, new_hash);
         transaction.write_state_update(&state_update)?;
         let tr_root = transaction.serialize()?;
-        *self.shard_acc.last_trans_hash_mut() = tr_root.repr_hash();
+        *self.shard_acc.last_trans_hash_mut() = tr_root.repr_hash().clone();
         *self.shard_acc.last_trans_lt_mut() = transaction.logical_time();
         self.lt = transaction.logical_time() + transaction.out_msgs.len()? as u64 + 1;
         if self.lt_compatible {
@@ -184,7 +211,7 @@ impl ShardAccountStuff {
                 self.account_id
             ),
         };
-        if lib_descr.lib().repr_hash() != key {
+        if *lib_descr.lib().repr_hash() != key {
             fail!(
                 "Cannot remove public library {key:x} of account {:x} because this public \
                 library LibDescr record does not contain a library root cell with required hash",
@@ -214,7 +241,7 @@ impl ShardAccountStuff {
         libraries: &mut Libraries,
     ) -> Result<()> {
         log::trace!("Adding public library {key:x} of account {:x}", self.account_id);
-        if key != library.repr_hash() {
+        if key != *library.repr_hash() {
             fail!(
                 "Can't add library {:x} because it mismatch given key {key:x}",
                 library.repr_hash()
@@ -237,7 +264,7 @@ impl ShardAccountStuff {
                     self.account_id
                 )
             }
-            old_lib_descr.publishers_mut().set(&self.account_id, &())?;
+            old_lib_descr.publishers_mut().set(&self.account_id, &EmptyValue)?;
             old_lib_descr
         } else {
             LibDescr::from_lib_data_by_publisher(library, self.account_id.clone())

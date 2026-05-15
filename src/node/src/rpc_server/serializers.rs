@@ -140,14 +140,15 @@ fn serialize_message(
     dst: Option<&str>,
     testnet: bool,
 ) -> JsonResult {
-    let hash = msg_cell.repr_hash();
+    let hash = msg_cell.repr_hash().clone();
     let msg = Message::construct_from_cell(msg_cell).unwrap_or_default();
     let int_header = msg.int_header().cloned().unwrap_or_default();
     let (body, body_hash, body_opt) = if let Some(body) = msg.body() {
         let body_cell = body.clone().into_cell().unwrap_or_default();
-        (serialize_cell_opt(Some(&body_cell)), body_cell.repr_hash(), Some(body))
+        let bh = body_cell.repr_hash().clone();
+        (serialize_cell_opt(Some(&body_cell)), bh, Some(body))
     } else {
-        (String::new(), Cell::default().repr_hash(), None)
+        (String::new(), Cell::default().repr_hash().clone(), None)
     };
     let init_state =
         serialize_cell_opt(msg.state_init().and_then(|init| init.serialize().ok()).as_ref());

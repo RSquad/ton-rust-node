@@ -799,7 +799,7 @@ fn get_config_param7() -> ConfigParam7 {
 fn get_config_param9() -> ConfigParam9 {
     let mut mp = MandatoryParams::default();
     for _ in 1..100 {
-        mp.set(&rand::random::<u32>(), &()).unwrap();
+        mp.set(&rand::random::<u32>(), &EmptyValue).unwrap();
     }
     ConfigParam9 { mandatory_params: mp }
 }
@@ -807,7 +807,7 @@ fn get_config_param9() -> ConfigParam9 {
 fn get_config_param10() -> ConfigParam10 {
     let mut cp = MandatoryParams::default();
     for _ in 1..100 {
-        cp.set(&rand::random::<u32>(), &()).unwrap();
+        cp.set(&rand::random::<u32>(), &EmptyValue).unwrap();
     }
     ConfigParam10 { critical_params: cp }
 }
@@ -913,8 +913,8 @@ fn test_calc_storage_fees_max() {
     };
     let max_int64 = i64::MAX as u64;
     assert_eq!(max_int64, 0x7FFF_FFFF_FFFF_FFFF);
-    let fee = sp.calc_storage_fee(max_int64, max_int64, max_int64, true);
-    assert_eq!(fee, "650335181531487160332425701902778368008".parse().unwrap());
+    let fee = sp.calc_storage_fee_part(max_int64, max_int64, max_int64, true);
+    assert_eq!(fee, "42620366456847542539545850799900483125749000".parse().unwrap());
 }
 
 #[test]

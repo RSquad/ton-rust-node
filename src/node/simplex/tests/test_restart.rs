@@ -41,6 +41,26 @@ use ton_block::{
 
 include!("../../../common/src/info.rs");
 
+fn session_start_args(
+    shard: &ShardIdent,
+    initial_block_seqno: u32,
+) -> (Vec<BlockIdExt>, BlockIdExt) {
+    (
+        vec![BlockIdExt::with_params(
+            shard.clone(),
+            initial_block_seqno.saturating_sub(1),
+            UInt256::default(),
+            UInt256::default(),
+        )],
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+    )
+}
+
 /*
     Test constants
 */
@@ -175,10 +195,11 @@ impl SessionListener for RestartSingleSessionListener {
 
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                // Genesis only — no parent block exists yet.
-                self.max_finalized_seqno.load(Ordering::SeqCst)
+                panic!("Simplex restart test must not receive implicit parent hints")
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
+            consensus_common::CollationParentHint::Explicit(parent_ids) => {
+                parent_ids.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1
+            }
         };
 
         log::info!(
@@ -451,7 +472,9 @@ fn run_single_node_restart_test(test_name: &str) {
         Arc::downgrade(&session_listener),
     )
     .expect("Failed to create session (phase 1)");
-    session_1.start(initial_block_seqno);
+    let (prev_blocks_1, min_masterchain_block_id_1) =
+        session_start_args(&shard, initial_block_seqno);
+    session_1.start(prev_blocks_1, min_masterchain_block_id_1);
 
     let rounds_before_restart: u32 = 5;
     let start = Instant::now();
@@ -509,7 +532,9 @@ fn run_single_node_restart_test(test_name: &str) {
         Arc::downgrade(&session_listener),
     )
     .expect("Failed to create session (phase 2)");
-    session_2.start(restart_initial_seqno);
+    let (prev_blocks_2, min_masterchain_block_id_2) =
+        session_start_args(&shard, restart_initial_seqno);
+    session_2.start(prev_blocks_2, min_masterchain_block_id_2);
 
     // Wait for first post-restart slot generation (proof that current slot was seeded)
     let start = Instant::now();

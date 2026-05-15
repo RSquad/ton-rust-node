@@ -213,12 +213,22 @@ pub fn get_elapsed_time(from_time: &std::time::SystemTime) -> std::time::Duratio
    metrics
 */
 
-#[derive(Copy, Clone)]
-enum MetricUsage {
+/// Classification of a metric stored in [`Metric`].
+///
+/// Surfaced through [`MetricsDumper::enumerate_with_usage`] so downstream
+/// consumers (e.g. the Prometheus publisher) can route counters and gauges
+/// to the appropriate sink without re-reading the metrics registry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MetricUsage {
+    /// Monotonically non-decreasing counter (raw `u64` value).
     Counter,
+    /// Per-second derivative computed by the dumper.
     Derivative,
+    /// Percentage in `[0.0, 100.0]`.
     Percents,
+    /// Generic floating-point gauge.
     Float,
+    /// Latency expressed in seconds.
     Latency,
 }
 
@@ -398,6 +408,16 @@ impl MetricsDumper {
     where
         F: Fn(String, f64),
     {
+        self.enumerate_with_usage(|key, value, _kind| handler(key, value));
+    }
+
+    /// Like [`Self::enumerate_as_f64`] but also yields the metric's
+    /// [`MetricUsage`], so consumers (e.g. the Prometheus publisher) can
+    /// distinguish counters from gauges without re-reading the registry.
+    pub fn enumerate_with_usage<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, f64, MetricUsage),
+    {
         for (key, metric) in &self.prev_metrics {
             use MetricUsage::*;
 
@@ -409,7 +429,7 @@ impl MetricsDumper {
                 Latency => (metric.value as f64) / Self::METRIC_FLOAT_MULTIPLIER,
             };
 
-            handler(key.clone(), value);
+            handler(key.clone(), value, metric.usage);
         }
     }
 

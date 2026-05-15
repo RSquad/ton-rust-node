@@ -140,14 +140,14 @@ pub async fn calc_and_store_state(
             let cl = engine_cloned.db_cells_loader()?;
             let mut fast_attempt = true;
             let (ss_root, _metrics) =
-                match merkle_update.apply_for_ex(&prev_ss_root, &cf, cl.deref()) {
+                match merkle_update.apply_with_loader(&prev_ss_root, &cf, cl.deref()) {
                     Err(e) => {
                         log::debug!(
                             "Failed the fast attempt of Merkle update applying for block {}: {}. Trying classic approach...",
                             block_id, e
                         );
                         fast_attempt = false;
-                        merkle_update.apply_for(&prev_ss_root).map_err(|e| {
+                        merkle_update.apply_with_factory(&prev_ss_root, &cf).map_err(|e| {
                             error!(
                                 "Error applying Merkle update for block {}: {}\
                                 prev_ss_root: {:#.2}\
