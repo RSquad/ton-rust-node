@@ -543,8 +543,13 @@ pub struct ElectionsConfig {
     /// Pre-generated ADNL addresses, keyed by node name (base64-encoded).
     /// When a node has an entry here, the runner attaches this existing ADNL address
     /// to the validator key each election instead of generating a fresh one.
+    /// Auto-populated on first election for nodes not in `static_adnl_disabled`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub static_adnls: HashMap<String, String>,
+    /// Nodes that opt out of the static ADNL default: the runner generates a fresh
+    /// ephemeral ADNL address every cycle for them (pre-v0.5 behavior).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub static_adnl_disabled: HashSet<String>,
 }
 
 impl ElectionsConfig {
@@ -595,6 +600,7 @@ impl Default for ElectionsConfig {
             sleep_period_pct: default_sleep_pct(),
             waiting_period_pct: default_waiting_pct(),
             static_adnls: HashMap::new(),
+            static_adnl_disabled: HashSet::new(),
         }
     }
 }
