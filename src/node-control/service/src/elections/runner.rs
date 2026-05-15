@@ -1252,33 +1252,25 @@ impl ElectionRunner {
 
     /// Generate and persist static ADNL addresses for any node that is missing one
     /// and not explicitly opted out. After the first successful tick this is a no-op.
-    /// Per-node failures are logged and retried on the next tick; successful
-    /// generations are persisted in a single config write at the end.
+    ///
+    /// Per-node generation failures are logged and retried on the next tick. The
+    /// in-memory `Node.static_adnl_addr` is only committed once `persist` succeeds,
+    /// so a failed persist leaves the node looking "missing" on the next tick and it
+    /// retries cleanly.
     async fn ensure_static_adnls(&mut self) {
-        let missing: Vec<String> = self
-            .nodes
-            .iter()
-            .filter(|(_, n)| !n.static_adnl_disabled && n.static_adnl_addr.is_none())
-            .map(|(id, _)| id.clone())
-            .collect();
-        if missing.is_empty() {
-            return;
-        }
-        tracing::info!(
-            "static-adnl: generating addresses for {} node(s): {}",
-            missing.len(),
-            missing.join(", ")
-        );
-        let mut generated: HashMap<String, String> = HashMap::new();
-        for node_id in &missing {
-            let Some(node) = self.nodes.get_mut(node_id) else { continue };
+        let mut generated: HashMap<String, Vec<u8>> = HashMap::new();
+        for (node_id, node) in self.nodes.iter_mut() {
+            if node.static_adnl_disabled || node.static_adnl_addr.is_some() {
+                continue;
+            }
             match node.api.generate_adnl_addr().await {
                 Ok(key_id) => {
-                    let b64 =
-                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key_id);
-                    tracing::info!("node [{}] static adnl address generated: {}", node_id, b64);
-                    node.static_adnl_addr = Some(key_id);
-                    generated.insert(node_id.clone(), b64);
+                    tracing::info!(
+                        "node [{}] static adnl address generated: {}",
+                        node_id,
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key_id,)
+                    );
+                    generated.insert(node_id.clone(), key_id);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1292,9 +1284,28 @@ impl ElectionRunner {
         if generated.is_empty() {
             return;
         }
+        // Persist first; only commit in-memory state if the disk write succeeded.
         if let Some(persist) = &self.persist_static_adnls {
-            if let Err(e) = persist(generated) {
-                tracing::error!("static-adnl: failed to persist generated addresses: {:#}", e);
+            let payload = generated
+                .iter()
+                .map(|(id, key)| {
+                    (
+                        id.clone(),
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key),
+                    )
+                })
+                .collect();
+            if let Err(e) = persist(payload) {
+                tracing::error!(
+                    "static-adnl: persist failed, dropping generated addresses (will retry next tick): {:#}",
+                    e
+                );
+                return;
+            }
+        }
+        for (node_id, key_id) in generated {
+            if let Some(node) = self.nodes.get_mut(&node_id) {
+                node.static_adnl_addr = Some(key_id);
             }
         }
     }
