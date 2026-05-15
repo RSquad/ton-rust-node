@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Static ADNL address is now the default across elections.** Previously nodectl generated a fresh ADNL key every election cycle, which broke Rust-node fastsync for peers that still knew the validator by its previous ADNL. Now nodectl auto-generates and persists a static ADNL per node on the first election cycle and reuses it thereafter. Existing `elections.static_adnls` entries are honored unchanged. To opt out for a node and revert to per-cycle ephemeral ADNL, run `nodectl config elections static-adnl --node <name> --disable` (or `DELETE /v1/elections/static-adnl/{node}`). The opt-out is stored in the new `elections.static_adnl_disabled` set. Running the existing rotate command (`nodectl config elections static-adnl --node <name>`) re-enables the static default if it was previously disabled.
+
+### Added
+
+- **`DELETE /v1/elections/static-adnl/{node}`** — opt the node out of static ADNL; the runner will generate a fresh ephemeral ADNL each cycle.
+- **`--disable` flag on `nodectl config elections static-adnl`** — CLI counterpart of the DELETE endpoint.
+- **`static_adnl_disabled` field on `BindingElectionStatusDto`** — surfaced by `GET /v1/elections/settings` and the `elections show` CLI output ("disabled" marker in the Static ADNL column).
+
 ## [0.4.0] - 2026-04-21
 
 ### Added

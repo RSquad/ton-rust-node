@@ -712,14 +712,26 @@ nodectl config elections disable node0
 
 ##### `config elections static-adnl`
 
-Generate a persistent ADNL address for a node and save it to the `elections.static_adnls` config. The ADNL key is created on the validator node via its control server. Once set, the election runner reuses this address every cycle instead of generating a fresh one.
+Manage the persistent ADNL address for a node.
+
+By default (since v0.5.0) nodectl generates and persists a static ADNL per node automatically on the first election cycle, so peers keep finding the validator across rotations. Use this command to:
+
+- **Rotate** the static ADNL (replace the stored key with a fresh one): run without `--disable`.
+- **Opt out** for a node (revert to per-cycle ephemeral ADNL): run with `--disable`.
+
+Rotating again on a previously disabled node re-enables the static default.
 
 | Flag | Short form | Description |
 |------|------------|-------------|
 | `--node <NAME>` | `-n` | Node name (must exist in `nodes`) |
+| `--disable`     |      | Opt out of static ADNL for this node |
 
 ```bash
+# Rotate (or initialize) the static ADNL for node0
 nodectl config elections static-adnl --node node0
+
+# Opt out — fresh ADNL each election cycle (legacy behavior)
+nodectl config elections static-adnl --node node0 --disable
 ```
 
 ---
@@ -1205,7 +1217,8 @@ Role columns use the following shorthand: **P** = public (no token), **N** = `no
 | POST | `/v1/elections/settings` | O | Update elections settings (policy, per-node override, tick, max-factor, `sleep_period_pct`, `waiting_period_pct`) |
 | GET | `/v1/automation/settings` | N | Contracts task settings (auto-deploy, auto-topup, amounts, tick) |
 | POST | `/v1/automation/settings` | O | Update contracts task settings (partial JSON: tick/toggles and nested `wallet` / `pool`, nanotons) |
-| POST | `/v1/elections/static-adnl` | O | Generate and assign a persistent ADNL address for a node |
+| POST | `/v1/elections/static-adnl` | O | Generate and assign (or rotate) a persistent ADNL address for a node |
+| DELETE | `/v1/elections/static-adnl/{node}` | O | Opt out of static ADNL for a node (fresh ADNL each cycle) |
 | GET | `/v1/validators` | N | Validators snapshot for controlled nodes |
 | POST | `/v1/task/elections` | O | Enable / disable / restart the elections background task |
 | GET | `/v1/nodes` | N | List configured nodes with control-server status |
@@ -1463,7 +1476,9 @@ Returns the **`automation`** settings as JSON: `tick_interval_sec`, `auto_deploy
 
 #### `POST /v1/elections/static-adnl`
 
-Generate a persistent ADNL address on the validator node and save it to the `elections.static_adnls` config map. The election runner will reuse this address every cycle instead of generating a fresh ephemeral one.
+Generate (or rotate) a persistent ADNL address on the validator node and save it to the `elections.static_adnls` config map. The election runner reuses this address every cycle instead of generating a fresh ephemeral one.
+
+Since v0.5.0 nodectl auto-generates a static ADNL for each node on its first election cycle, so this endpoint is only needed to rotate an existing address or re-enable a previously disabled node.
 
 **Request:**
 
@@ -1482,7 +1497,19 @@ Generate a persistent ADNL address on the validator node and save it to the `ele
 }
 ```
 
-Calling this endpoint again for the same node generates a **new** key and overwrites the previous one.
+Calling this endpoint again for the same node generates a **new** key, overwrites the previous one, and clears any opt-out state.
+
+---
+
+#### `DELETE /v1/elections/static-adnl/{node}`
+
+Opt the node out of the static ADNL default: removes the entry from `elections.static_adnls` and adds the node to `elections.static_adnl_disabled`. The runner will generate a fresh ephemeral ADNL each election cycle (pre-v0.5 behavior). To re-enable, call `POST /v1/elections/static-adnl` again.
+
+**Response:**
+
+```json
+{ "ok": true }
+```
 
 ---
 
@@ -1853,7 +1880,8 @@ Configuration is specified in JSON format.
     "tick_interval": 40,
     "sleep_period_pct": 0.2,
     "waiting_period_pct": 0.4,
-    "static_adnls": { "<node_name>": "<base64_adnl_key_hash>" }
+    "static_adnls": { "<node_name>": "<base64_adnl_key_hash>" },
+    "static_adnl_disabled": ["<node_name>"]
   },
   // optional
   "voting": {
@@ -1969,7 +1997,8 @@ Automatic elections task configuration:
 - `tick_interval` — interval between election checks in seconds (default: `40`)
 - `sleep_period_pct` — AdaptiveSplit50 minimum wait as a fraction of election duration. Default `0.2`. Must be in `[0.0, 1.0]` and ≤ `waiting_period_pct`.
 - `waiting_period_pct` — AdaptiveSplit50 maximum wait for enough participants as a fraction of election duration. Default `0.4`. Must be in `[0.0, 1.0]` and ≥ `sleep_period_pct`.
-- `static_adnls` — pre-generated persistent ADNL addresses keyed by node name (base64-encoded). When a node has an entry here, the runner reuses this ADNL address each election cycle instead of generating a fresh one. Managed via `config elections static-adnl` or `POST /v1/elections/static-adnl`. Example: `{ "node0": "oRvD1E5F..." }`
+- `static_adnls` — pre-generated persistent ADNL addresses keyed by node name (base64-encoded). When a node has an entry here, the runner reuses this ADNL address each election cycle instead of generating a fresh one. Since v0.5.0 nodectl auto-populates this map on the first election cycle for every node that is not in `static_adnl_disabled`. Managed via `config elections static-adnl` or `POST /v1/elections/static-adnl`. Example: `{ "node0": "oRvD1E5F..." }`
+- `static_adnl_disabled` — set of node names that opt out of the static ADNL default; the runner generates a fresh ephemeral ADNL address each cycle for these nodes (pre-v0.5 behavior). Managed via `config elections static-adnl --node <name> --disable` or `DELETE /v1/elections/static-adnl/{node}`. Example: `["node1"]`
 
 #### `automation` (optional)
 
