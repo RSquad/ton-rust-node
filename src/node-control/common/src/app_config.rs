@@ -363,7 +363,6 @@ pub enum TonCoreDeployMode {
 
 /// Default [`TonCoreDeployMode`] when **creating** a pool slot (`POST /v1/pools/core`, `nodectl config pool add core`)
 /// without specifying deploy mode — tonscan-friendly.
-#[inline]
 pub fn default_new_pool_deploy_mode() -> TonCoreDeployMode {
     TonCoreDeployMode::TonscanCompatible
 }
