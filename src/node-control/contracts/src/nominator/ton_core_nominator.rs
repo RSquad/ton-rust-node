@@ -13,7 +13,7 @@ use crate::{
     },
 };
 use anyhow::Context;
-use common::app_config::{TonCoreDeployLayout, TonCoreInitParams};
+use common::app_config::{TonCoreDeployMode, TonCoreInitParams};
 use std::sync::Arc;
 use ton_block::{
     BuilderData, Cell, Coins, IBitstring, MsgAddressInt, Serializable, StateInit,
@@ -39,14 +39,21 @@ fn toncore_pool_full_code_cell() -> anyhow::Result<Cell> {
     Ok(read_single_root_boc(hex::decode(CODE).expect("nominator pool code hex is invalid"))?)
 }
 
+/// TVM opcodes used by the deploy bootstrap stub ([`TonCoreDeployMode::TonscanCompatible`]).
+/// See <https://docs.ton.org/v3/documentation/tvm/instructions>.
+const OP_SETCP0: [u8; 2] = [0xFF, 0x00];
+const OP_ACCEPT: [u8; 2] = [0xF8, 0x00];
+const OP_PUSHREF: u8 = 0x88;
+const OP_SETCODE: [u8; 2] = [0xFB, 0x04];
+
 /// Small bootstrap code cell (`SETCP0` · `ACCEPT` · `PUSHREF` pool bytecode · `SETCODE`).
 fn build_toncore_pool_stub_code(full_pool_code: &Cell) -> anyhow::Result<Cell> {
     let mut b = BuilderData::new();
-    b.append_raw(&[0xff, 0x00], 16)?; // SETCP0
-    b.append_raw(&[0xf8, 0x00], 16)?; // ACCEPT
-    b.append_raw(&[0x88], 8)?; // PUSHREF
+    b.append_raw(&OP_SETCP0, 16)?;
+    b.append_raw(&OP_ACCEPT, 16)?;
+    b.append_raw(&[OP_PUSHREF], 8)?;
     b.checked_append_reference(full_pool_code.clone())?;
-    b.append_raw(&[0xfb, 0x04], 16)?; // SETCODE
+    b.append_raw(&OP_SETCODE, 16)?;
     Ok(b.into_cell()?)
 }
 
@@ -101,18 +108,19 @@ fn build_toncore_pool_state_init_activate_upgrade(
     Ok(StateInit::with_code_and_data(stub, data))
 }
 
-fn build_toncore_pool_state_init_for_layout(
+fn build_toncore_pool_state_init_for_deploy_mode(
     validator_address: &MsgAddressInt,
     params: &TonCoreInitParams,
-    deploy_layout: TonCoreDeployLayout,
+    deploy_mode: TonCoreDeployMode,
 ) -> anyhow::Result<StateInit> {
-    match deploy_layout {
-        TonCoreDeployLayout::EmbeddedCode => {
+    match deploy_mode {
+        TonCoreDeployMode::Legacy => {
             build_toncore_pool_state_init_embedded_code(validator_address, params)
         }
-        TonCoreDeployLayout::ActivateUpgrade => {
+        TonCoreDeployMode::TonscanCompatible => {
             build_toncore_pool_state_init_activate_upgrade(validator_address, params)
         }
+        _ => anyhow::bail!("unsupported TonCore deploy_mode {deploy_mode:?}"),
     }
 }
 
@@ -120,12 +128,12 @@ fn build_toncore_pool_state_init_for_layout(
 pub(crate) fn toncore_pool_address_and_state(
     ton_core_init_params: &TonCoreInitParams,
     validator_address: &MsgAddressInt,
-    deploy_layout: TonCoreDeployLayout,
+    deploy_mode: TonCoreDeployMode,
 ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
-    let state_init = build_toncore_pool_state_init_for_layout(
+    let state_init = build_toncore_pool_state_init_for_deploy_mode(
         validator_address,
         ton_core_init_params,
-        deploy_layout,
+        deploy_mode,
     )?;
     let addr = toncore_pool_address_from_state_init(&state_init)?;
     Ok((addr, state_init))
@@ -143,10 +151,10 @@ pub fn resolve_toncore_pool(
     validator_addr: &MsgAddressInt,
     pool_address: Option<&str>,
     params: TonCoreInitParams,
-    deploy_layout: TonCoreDeployLayout,
+    deploy_mode: TonCoreDeployMode,
 ) -> anyhow::Result<ResolvedTonCorePool> {
     let (address, state_init) =
-        toncore_pool_address_and_state(&params, validator_addr, deploy_layout)?;
+        toncore_pool_address_and_state(&params, validator_addr, deploy_mode)?;
     if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
@@ -183,20 +191,19 @@ impl TonCoreNominatorWrapper {
         provider: Arc<dyn ContractProvider>,
         validator_address: &MsgAddressInt,
         init_params: &TonCoreInitParams,
-        deploy_layout: TonCoreDeployLayout,
+        deploy_mode: TonCoreDeployMode,
     ) -> anyhow::Result<Self> {
         let (pool_addr, state_init) =
-            toncore_pool_address_and_state(init_params, validator_address, deploy_layout)?;
+            toncore_pool_address_and_state(init_params, validator_address, deploy_mode)?;
         Ok(Self { provider, pool_addr, state_init: Some(state_init) })
     }
 
     pub fn calculate_address(
         validator_address: &MsgAddressInt,
         params: &TonCoreInitParams,
-        deploy_layout: TonCoreDeployLayout,
+        deploy_mode: TonCoreDeployMode,
     ) -> anyhow::Result<MsgAddressInt> {
-        toncore_pool_address_and_state(params, validator_address, deploy_layout)
-            .map(|(addr, _)| addr)
+        toncore_pool_address_and_state(params, validator_address, deploy_mode).map(|(addr, _)| addr)
     }
 }
 
@@ -295,7 +302,7 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
 mod tests {
     use super::*;
     use crate::contract_provider;
-    use common::app_config::{TonCoreDeployLayout, TonCoreInitParams};
+    use common::app_config::{TonCoreDeployMode, TonCoreInitParams};
     use std::str::FromStr;
     use ton_block::MsgAddressInt;
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
@@ -309,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_and_activate_upgrade_addresses_differ() {
+    fn legacy_and_tonscan_compatible_addresses_differ() {
         let validator = MsgAddressInt::from_str(
             "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea",
         )
@@ -323,15 +330,15 @@ mod tests {
         let a = TonCoreNominatorWrapper::calculate_address(
             &validator,
             &params,
-            TonCoreDeployLayout::EmbeddedCode,
+            TonCoreDeployMode::Legacy,
         )
-        .expect("embedded_code addr");
+        .expect("legacy addr");
         let b = TonCoreNominatorWrapper::calculate_address(
             &validator,
             &params,
-            TonCoreDeployLayout::ActivateUpgrade,
+            TonCoreDeployMode::TonscanCompatible,
         )
-        .expect("activate_upgrade addr");
+        .expect("tonscan_compatible addr");
         assert_ne!(a, b);
     }
 

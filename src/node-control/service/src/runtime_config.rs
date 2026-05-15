@@ -693,7 +693,7 @@ fn open_nominator_pool(
                             let derived = TonCoreNominatorWrapper::calculate_address(
                                 validator_addr,
                                 params,
-                                cfg.deploy_layout,
+                                cfg.deploy_mode,
                             )?;
                             anyhow::ensure!(
                                 explicit == derived,
@@ -706,7 +706,7 @@ fn open_nominator_pool(
                             provider.clone(),
                             validator_addr,
                             params,
-                            cfg.deploy_layout,
+                            cfg.deploy_mode,
                         )?) as Arc<dyn NominatorWrapper>))
                     }
                     (None, None) => {

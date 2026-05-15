@@ -332,56 +332,78 @@ fn default_toncore_min_nominator_stake() -> u64 {
     DEFAULT_TONCORE_MIN_NOMINATOR_STAKE
 }
 
-#[inline]
-fn skip_serializing_toncore_deploy_layout(layout: &TonCoreDeployLayout) -> bool {
-    layout.is_embedded_code()
+fn skip_serializing_toncore_deploy_mode(mode: &TonCoreDeployMode) -> bool {
+    mode.is_legacy()
 }
 
-/// How `StateInit.code` is shaped when deploying a TON Core nominator pool.
+/// How a TON Core nominator pool slot is deployed — **operator-facing** choice (JSON key remains `deploy_layout`).
 ///
-/// [`TonCoreDeployLayout::EmbeddedCode`] — full pool bytecode is stored in `StateInit.code` at deploy time.
-/// [`TonCoreDeployLayout::ActivateUpgrade`] — minimal bootstrap in `StateInit.code`; full pool code is applied via `SETCODE` when the contract runs (code upgrade on activation).
+/// - [`TonCoreDeployMode::Legacy`] — full pool bytecode in `StateInit.code` (same addresses as pools created
+///   by older nodectl).
+/// - [`TonCoreDeployMode::TonscanCompatible`] — bootstrap `code` + `SETCODE` on first run; Tonscan recognises
+///   the contract.
 ///
-/// Both layouts are typically delivered by an **internal** wallet message carrying `state_init`; they differ only in how `code` is encoded before first execution.
+/// **Defaults:** persisted config without the field stays [`Legacy`] so derived addresses stay stable. New pools
+/// from REST / CLI omitting the knob use [`default_new_pool_deploy_mode`] ([`TonscanCompatible`]).
+///
+/// **Wire strings** — canonical short forms `legacy` / `tonscan`; long alias `tonscan_compatible` (and kebab
+/// `tonscan-compatible`) is accepted for readers copying from the Rust variant name.
+///
+/// **Forwarding compatibility:** [`non_exhaustive`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum TonCoreDeployLayout {
+#[non_exhaustive]
+pub enum TonCoreDeployMode {
     #[default]
-    EmbeddedCode,
-    ActivateUpgrade,
+    #[serde(rename = "legacy")]
+    Legacy,
+    #[serde(rename = "tonscan", alias = "tonscan_compatible", alias = "tonscan-compatible")]
+    TonscanCompatible,
 }
 
-impl TonCoreDeployLayout {
+/// Default [`TonCoreDeployMode`] when **creating** a pool slot (`POST /v1/pools/core`, `nodectl config pool add core`)
+/// without specifying deploy mode — tonscan-friendly.
+#[inline]
+pub fn default_new_pool_deploy_mode() -> TonCoreDeployMode {
+    TonCoreDeployMode::TonscanCompatible
+}
+
+impl TonCoreDeployMode {
     #[inline]
-    pub const fn is_embedded_code(self) -> bool {
-        matches!(self, Self::EmbeddedCode)
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, Self::Legacy)
     }
 }
 
-impl Default for TonCorePoolConfig {
-    fn default() -> Self {
-        Self { address: None, params: None, deploy_layout: TonCoreDeployLayout::default() }
+/// CLI / `str::parse`: same accepted strings as JSON serde for [`TonCoreDeployMode`].
+impl std::str::FromStr for TonCoreDeployMode {
+    type Err = serde_json::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_owned()))
     }
 }
 
 /// Single TONCore pool slot config (address + optional deploy params).
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct TonCorePoolConfig {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<TonCoreInitParams>,
-    /// Deploy layout for this slot (`embedded_code` when omitted in JSON).
-    #[serde(default)]
-    #[serde(skip_serializing_if = "skip_serializing_toncore_deploy_layout")]
-    pub deploy_layout: TonCoreDeployLayout,
+    /// Deploy mode for this slot; JSON field name **`deploy_layout`** (historical).
+    ///
+    /// Omitted → [`TonCoreDeployMode::Legacy`] (stable addresses vs older configs).
+    #[serde(
+        rename = "deploy_layout",
+        default,
+        skip_serializing_if = "skip_serializing_toncore_deploy_mode"
+    )]
+    pub deploy_mode: TonCoreDeployMode,
 }
 
 /// Deploy-time parameters for a TONCore nominator pool contract.
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TonCoreInitParams {
     pub validator_share: u16,
     #[serde(default = "default_toncore_max_nominators")]
@@ -1235,13 +1257,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_config_toncore_deploy_layout_roundtrip() {
+    fn test_pool_config_toncore_deploy_mode_roundtrip() {
         let value = serde_json::json!({
             "kind": "core",
             "pools": [
                 {
                     "params": { "validator_share": 50 },
-                    "deploy_layout": "activate_upgrade",
+                    "deploy_layout": "tonscan",
                 },
                 null,
             ],
@@ -1250,26 +1272,52 @@ mod tests {
         match &cfg {
             PoolConfig::TONCore { pools } => {
                 assert_eq!(
-                    pools[0].as_ref().unwrap().deploy_layout,
-                    TonCoreDeployLayout::ActivateUpgrade
+                    pools[0].as_ref().unwrap().deploy_mode,
+                    TonCoreDeployMode::TonscanCompatible
                 );
             }
             _ => panic!("expected TONCore"),
         }
 
         let json = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(json["pools"][0]["deploy_layout"], "activate_upgrade");
+        assert_eq!(json["pools"][0]["deploy_layout"], "tonscan");
 
-        let embedded_default_only = serde_json::json!({
+        let legacy_default_only = serde_json::json!({
             "kind": "core",
             "pools": [{ "params": { "validator_share": 50 } }, null],
         });
-        let cfg2: PoolConfig = serde_json::from_value(embedded_default_only).unwrap();
+        let cfg2: PoolConfig = serde_json::from_value(legacy_default_only).unwrap();
         match &cfg2 {
             PoolConfig::TONCore { pools } => {
-                assert!(pools[0].as_ref().unwrap().deploy_layout.is_embedded_code());
+                assert!(pools[0].as_ref().unwrap().deploy_mode.is_legacy());
             }
             _ => panic!("expected TONCore"),
+        }
+    }
+
+    #[test]
+    fn toncore_deploy_mode_from_str_matches_serde_string_scalar() {
+        use std::str::FromStr;
+
+        let tonscan_aliases = ["tonscan", "tonscan_compatible", "tonscan-compatible"];
+        for wire in tonscan_aliases {
+            let a = TonCoreDeployMode::from_str(wire).expect("from_str");
+            let b: TonCoreDeployMode =
+                serde_json::from_value(serde_json::Value::String(wire.to_string())).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(a, TonCoreDeployMode::TonscanCompatible);
+        }
+        let a = TonCoreDeployMode::from_str("legacy").expect("from_str");
+        let b: TonCoreDeployMode =
+            serde_json::from_value(serde_json::Value::String("legacy".to_string())).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, TonCoreDeployMode::Legacy);
+
+        for dropped in ["embedded_code", "activate_upgrade", "bogus"] {
+            assert!(
+                TonCoreDeployMode::from_str(dropped).is_err(),
+                "wire form {dropped:?} must not be accepted",
+            );
         }
     }
 

@@ -158,8 +158,8 @@ pub fn resolve_pool_address_from_config(
                     let resolved = resolve_toncore_pool(
                         validator_addr,
                         addr.as_deref(),
-                        params.clone(),
-                        slot.deploy_layout,
+                        *params,
+                        slot.deploy_mode,
                     )?;
                     Ok(resolved.address)
                 }

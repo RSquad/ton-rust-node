@@ -19,9 +19,8 @@ use common::{
         AdnlConfig, BindingStatus, ContractsAutomationConfig, DEFAULT_TONCORE_MAX_NOMINATORS,
         DEFAULT_TONCORE_MIN_NOMINATOR_STAKE, DEFAULT_TONCORE_MIN_VALIDATOR_STAKE, ElectionsConfig,
         EndpointEntry, KeyConfig, LogConfig, LogOutput, LogRotation, NodeBinding, PoolConfig,
-        StakePolicy, TimeoutVariant, TonCoreDeployLayout, TonCoreInitParams, TonCorePoolConfig,
-        VotingConfig,
-        WalletConfig,
+        StakePolicy, TimeoutVariant, TonCoreDeployMode, TonCoreInitParams, TonCorePoolConfig,
+        VotingConfig, WalletConfig,
     },
     ton_utils::{extract_max_factor, normalize_ton_address},
 };
@@ -132,9 +131,9 @@ pub struct TonCorePoolSlotDto {
     /// Last election id the pool staked at (`stake_at` in pool storage).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_election_id: Option<u32>,
-    /// Deploy layout stored for this slot (`embedded_code` by default).
-    #[serde(default)]
-    pub deploy_layout: TonCoreDeployLayout,
+    /// Deploy mode stored for this slot (JSON field `deploy_layout`; [`Legacy`] by default).
+    #[serde(rename = "deploy_layout", default)]
+    pub deploy_mode: TonCoreDeployMode,
 }
 
 /// Pool entry returned by `GET /v1/pools`.
@@ -466,10 +465,17 @@ pub struct PoolAddCoreRequest {
     /// Minimum nominator stake in nanotons (default: [`DEFAULT_TONCORE_MIN_NOMINATOR_STAKE`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_nominator_stake: Option<u64>,
-    /// [`TonCoreDeployLayout::EmbeddedCode`] — full pool bytecode in `StateInit.code`.
-    /// [`TonCoreDeployLayout::ActivateUpgrade`] — bootstrap `code` plus `SETCODE` when the contract runs.
-    #[serde(default)]
-    pub deploy_layout: TonCoreDeployLayout,
+    /// Deploy mode for the new slot (JSON field `deploy_layout`). Omit uses
+    /// [`common::app_config::default_new_pool_deploy_mode`] ([`TonCoreDeployMode::TonscanCompatible`] —
+    /// recommended for new deployments).
+    ///
+    /// Omitted `deploy_layout` in persisted [`TonCorePoolConfig`] still reads as [`TonCoreDeployMode::Legacy`]
+    /// ([`TonCoreDeployMode::default`]) so already-deployed pools keep stable derived addresses.
+    #[serde(
+        rename = "deploy_layout",
+        default = "common::app_config::default_new_pool_deploy_mode"
+    )]
+    pub deploy_mode: TonCoreDeployMode,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -851,8 +857,11 @@ pub async fn v1_pools_handler(
 
 /// When on-chain `get_pool_data` is unavailable, copy deploy parameters from local config
 /// into the DTO so `GET /v1/pools` still lists validator share / stake thresholds.
-fn merge_toncore_slot_config_fallbacks(dto: &mut TonCorePoolSlotDto, slot_cfg: &TonCorePoolConfig) {
-    let Some(p) = slot_cfg.params.as_ref() else {
+fn merge_toncore_slot_config_fallbacks(
+    dto: &mut TonCorePoolSlotDto,
+    params: Option<&TonCoreInitParams>,
+) {
+    let Some(p) = params else {
         return;
     };
     dto.validator_share.get_or_insert(p.validator_share);
@@ -880,7 +889,7 @@ fn toncore_slot_deploy_params_present(dto: &TonCorePoolSlotDto) -> bool {
 /// parameters. RPC failures are encoded into the slot DTO so a single
 /// unreachable slot does not break the whole `/v1/pools` response.
 ///
-/// Deploy parameters from `slot_cfg.params` are merged whenever those DTO
+/// Deploy parameters from **`params`** are merged whenever those DTO
 /// fields are still unset (`get_or_insert`), including active accounts where
 /// `get_pool_data` failed, so operators still see config defaults. The
 /// [`TonCorePoolSlotDto::data_source`] field records whether deploy-style fields
@@ -891,16 +900,16 @@ async fn fetch_toncore_slot_dto(
     slot_cfg: TonCorePoolConfig,
     cached: Option<Arc<dyn NominatorWrapper>>,
 ) -> TonCorePoolSlotDto {
+    let TonCorePoolConfig { address: config_address, deploy_mode, params } = slot_cfg;
     let slot_name = if slot_idx == 0 { "even" } else { "odd" };
-    let deploy_layout = slot_cfg.deploy_layout;
 
     let addr_opt: Option<MsgAddressInt> = match &cached {
         Some(w) => w.address().await.ok(),
         _ => None,
     }
-    .or_else(|| slot_cfg.address.as_deref().and_then(|a| MsgAddressInt::from_str(a).ok()));
+    .or_else(|| config_address.as_deref().and_then(|a| MsgAddressInt::from_str(a).ok()));
 
-    let address_str = addr_opt.as_ref().map(|a| a.to_string()).or_else(|| slot_cfg.address.clone());
+    let address_str = addr_opt.as_ref().map(|a| a.to_string()).or(config_address);
 
     let (mut dto, addr_for_active): (TonCorePoolSlotDto, Option<MsgAddressInt>) =
         match addr_opt.as_ref() {
@@ -909,7 +918,7 @@ async fn fetch_toncore_slot_dto(
                     slot: slot_name.to_string(),
                     address: address_str,
                     state: "not deployed".to_string(),
-                    deploy_layout,
+                    deploy_mode,
                     ..Default::default()
                 },
                 None,
@@ -929,7 +938,7 @@ async fn fetch_toncore_slot_dto(
                             address: address_str,
                             state: state_str,
                             balance: Some(info.balance),
-                            deploy_layout,
+                            deploy_mode,
                             ..Default::default()
                         },
                         addr_for_active,
@@ -940,7 +949,7 @@ async fn fetch_toncore_slot_dto(
                         slot: slot_name.to_string(),
                         address: address_str,
                         state: "error".to_string(),
-                        deploy_layout,
+                        deploy_mode,
                         ..Default::default()
                     },
                     None,
@@ -978,7 +987,7 @@ async fn fetch_toncore_slot_dto(
         }
     }
 
-    merge_toncore_slot_config_fallbacks(&mut dto, &slot_cfg);
+    merge_toncore_slot_config_fallbacks(&mut dto, params.as_ref());
 
     dto.data_source = if deploy_params_from_chain {
         Some(TonCorePoolSlotDataSource::Chain)
@@ -1860,7 +1869,7 @@ pub async fn v1_pools_add_core_handler(
     }
 
     let name = req.name.clone();
-    let slot_cfg = TonCorePoolConfig { address, params, deploy_layout: req.deploy_layout };
+    let slot_cfg = TonCorePoolConfig { address, params, deploy_mode: req.deploy_mode };
     state
         .runtime_cfg
         .update_and_save(|cfg| {

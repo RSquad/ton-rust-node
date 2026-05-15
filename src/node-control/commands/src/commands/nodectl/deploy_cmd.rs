@@ -373,8 +373,8 @@ impl DeployPoolCmd {
                             let resolved = resolve_toncore_pool(
                                 &wallet_address,
                                 cfg.address.as_deref(),
-                                params.clone(),
-                                cfg.deploy_layout,
+                                *params,
+                                cfg.deploy_mode,
                             )
                             .map_err(set_err)?;
                             targets.push((resolved.address, resolved.state_init));
