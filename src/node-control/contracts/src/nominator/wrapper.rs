@@ -54,26 +54,40 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     fn storage_reserve(&self) -> u64;
     /// Pool type for routing/optimization decisions.
     fn pool_kind(&self) -> PoolKind;
-    /// Whether the pool currently has at least one pending nominator withdraw request.
+    /// Whether the pool's `withdraw_requests` dictionary is non-empty (at least one queued
+    /// nominator withdraw request). Matches on-chain naming in `pool.fc` (`has_withdraw_requests`,
+    /// `get_pool_data`).
     ///
-    /// TONCore-only signal (the pool's `withdraw_requests` dict in persistent storage). For
-    /// pools without a withdraw queue (SNP, direct staking) the default returns `Ok(false)`.
-    async fn has_pending_withdraws(&self) -> anyhow::Result<bool> {
+    /// TONCore implementations should call the contract's cheap `has_withdraw_requests` getter (one
+    /// int on the stack), not full [`get_pool_data`](Self::get_pool_data). Pools without a withdraw
+    /// queue (SNP, etc.) keep the default and return `Ok(false)` without RPC.
+    ///
+    /// # Errors
+    ///
+    /// TONCore returns an error when the getter fails (RPC unreachable, contract execution error, or
+    /// response parsing failure). The trait's default implementation always succeeds with `Ok(false)`.
+    async fn has_withdraw_requests(&self) -> anyhow::Result<bool> {
         Ok(false)
     }
     /// Build an external message that carries `process_withdraw_requests` (TONCore op = 2)
     /// to this pool. Caller is responsible for ensuring it is meaningful (e.g. checked
-    /// [`has_pending_withdraws`](Self::has_pending_withdraws) and is in the window between
+    /// [`has_withdraw_requests`](Self::has_withdraw_requests) and is in the window between
     /// stake recovery and the next stake submission). Default impl errors out for pool
     /// kinds that do not support a withdraw queue.
-    async fn send_process_withdrawals(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pool kind does not support this operation (default implementation),
+    /// if building the internal message body fails, or if sending the message through the wallet
+    /// fails. Router-style implementations may also fail when no suitable inner pool is available.
+    async fn send_process_withdraw_requests(
         &self,
         _wallet: Arc<dyn TonWallet>,
         _query_id: u64,
         _limit: u8,
         _gas_value: u64,
     ) -> anyhow::Result<Cell> {
-        anyhow::bail!("send_process_withdrawals is supported only by TONCore nominator pools")
+        anyhow::bail!("send_process_withdraw_requests is supported only by TONCore nominator pools")
     }
 }
 

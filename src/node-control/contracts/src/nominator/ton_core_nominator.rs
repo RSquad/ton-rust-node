@@ -211,7 +211,7 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
         let min_nominator_stake = stack.i64(8).context("parse min_nominator_stake")? as u64;
         // Index 9 is `nominators:dict` (not currently used). Index 10 is `withdraw_requests:dict`
         // from `pool.fc` persistent storage; `Some(_)` means at least one nominator has a
-        // pending withdraw request (see `has_pending_withdraws`).
+        // pending withdraw request (see `has_withdraw_requests`).
         let withdraw_requests = stack.cell_opt(10).context("parse withdraw_requests")?;
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {
@@ -247,11 +247,17 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
         })
     }
 
-    async fn has_pending_withdraws(&self) -> anyhow::Result<bool> {
-        Ok(self.get_pool_data().await?.withdraw_requests.is_some())
+    async fn has_withdraw_requests(&self) -> anyhow::Result<bool> {
+        // nominator-pool `pool.fc`: `int has_withdraw_requests() method_id` — one stack int, no full
+        // `get_pool_data` parse (cheaper for per-tick × N nodes probes in the elections runner).
+        let stack = self
+            .provider
+            .get_method(self.pool_addr.to_string(), "has_withdraw_requests", vec![])
+            .await?;
+        stack.bool(0).context("parse has_withdraw_requests")
     }
 
-    async fn send_process_withdrawals(
+    async fn send_process_withdraw_requests(
         &self,
         wallet: Arc<dyn TonWallet>,
         query_id: u64,

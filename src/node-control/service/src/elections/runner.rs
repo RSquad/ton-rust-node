@@ -117,10 +117,11 @@ struct Node {
     pool_addr_cache: Option<MsgAddressInt>,
     /// Last error observed for this node during the current/previous tick (stringified).
     last_error: Option<String>,
-    /// Election ID for which we already sent `process_withdraw_requests` (TONCore op = 2).
-    /// Compared by equality, so a new cycle's `election_id` automatically re-arms the step.
-    /// Cleared in [`Node::reset_participation`] (shutdown).
-    withdraw_processed_for_cycle: Option<u64>,
+    /// Last `has_withdraw_requests` probe result this tick (`true` = pool still reports a non-empty
+    /// `withdraw_requests` queue). Cleared at the start of each tick; set in
+    /// [`ElectionRunner::process_pending_withdraw_requests`]. Drives `ProcessingWithdrawRequests` in
+    /// snapshots — matches on-chain state without a separate "already sent op = 2" flag.
+    withdraw_requests_pending: bool,
     /// Pre-generated static ADNL address (32-byte key hash).
     /// When set, this address is re-registered each election instead of generating a fresh one.
     static_adnl_addr: Option<Vec<u8>>,
@@ -169,7 +170,7 @@ impl Node {
         self.stake_accepted = false;
         self.accepted_stake_amount = None;
         self.stake_submissions.clear();
-        self.withdraw_processed_for_cycle = None;
+        self.withdraw_requests_pending = false;
     }
 
     /// Minimum balance left on the staking target (pool contract or wallet) when computing
@@ -343,7 +344,7 @@ impl ElectionRunner {
                     validator_config: ValidatorConfig::new(),
                     binding_status,
                     last_recover_amount: 0,
-                    withdraw_processed_for_cycle: None,
+                    withdraw_requests_pending: false,
                 },
             );
         }
@@ -379,6 +380,7 @@ impl ElectionRunner {
                     // Clear per-node last_error at the start of the tick (best-effort).
                     for node in self.nodes.values_mut() {
                         node.last_error = None;
+                        node.withdraw_requests_pending = false;
                     }
                     self.refresh_validator_set().await;
                     self.refresh_next_validator_set().await;
@@ -556,14 +558,14 @@ impl ElectionRunner {
                 continue;
             }
 
-            // TONCore-only: drain pending nominator withdraws once per cycle before staking.
-            // On success we skip `participate` for this tick — the next tick reads the pool's
-            // updated balance and proceeds with stake submission. RPC errors here are
-            // non-fatal: they don't block participation, just retry next tick.
-            match self.process_pending_withdraws_if_needed(&node_id, election_id).await {
+            // TONCore-only: probe `has_withdraw_requests` each tick before staking; send op = 2 when
+            // the queue is non-empty and skip `participate` this tick. Next tick probes again (new
+            // withdraws can appear after op = 2). RPC/build failures log `last_error` but do not
+            // skip participation unless `Ok(true)` (opcode-2 actually sent this tick).
+            match self.process_pending_withdraw_requests(&node_id, election_id).await {
                 Ok(true) => {
                     tracing::info!(
-                        "node [{}] skip participate this tick: process_withdraw_requests sent, awaiting pool drain",
+                        "node [{}] skip participate this tick: withdraw requests sent, awaiting pool drain",
                         node_id
                     );
                     continue;
@@ -573,7 +575,7 @@ impl ElectionRunner {
                     if let Some(node) = self.nodes.get_mut(&node_id) {
                         node.last_error = Some(format!("{:#}", e));
                     }
-                    tracing::error!("node [{}] process_withdraw_requests error: {:#}", node_id, e);
+                    tracing::warn!("node [{}] withdraw requests error: {:#}", node_id, e);
                 }
             }
 
@@ -964,14 +966,15 @@ impl ElectionRunner {
         Ok(body)
     }
 
-    /// Send `process_withdraw_requests` (TONCore op = 2) once per election cycle when the pool
-    /// has at least one pending nominator withdraw. Returns `Ok(true)` only when the message
-    /// was actually broadcast (caller should skip `participate` for this tick to give the pool
-    /// time to drain its queue before computing the new stake amount).
+    /// Send `process_withdraw_requests` (TONCore op = 2) when the pool's `withdraw_requests` queue
+    /// is non-empty (per `has_withdraw_requests` on each tick). Returns `Ok(true)` only when the
+    /// message was actually broadcast (caller should skip `participate` for this tick to give the
+    /// pool time to drain before computing the new stake amount).
     ///
-    /// Non-fatal cases — pool kind is not TONCore, queue is empty, opcode already sent for
-    /// this cycle, or `has_pending_withdraws` RPC failed transiently — return `Ok(false)`.
-    async fn process_pending_withdraws_if_needed(
+    /// Non-fatal cases — `has_withdraw_requests` is false (including non-TONCore pools where the trait
+    /// default returns without an on-chain probe), the probe failed transiently, or the validator wallet
+    /// balance is below the opcode-2 fee — return `Ok(false)`.
+    async fn process_pending_withdraw_requests(
         &mut self,
         node_id: &str,
         election_id: u64,
@@ -980,42 +983,42 @@ impl ElectionRunner {
         let Some(pool) = node.pool.clone() else {
             return Ok(false);
         };
-        if pool.pool_kind() != PoolKind::TONCore {
-            return Ok(false);
-        }
-        if node.withdraw_processed_for_cycle == Some(election_id) {
-            return Ok(false);
-        }
 
         // RPC failures here are transient — log and skip without blocking participation.
-        let has_pending = match pool.has_pending_withdraws().await {
+        let has_withdraw_requests = match pool.has_withdraw_requests().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    "node [{}] has_pending_withdraws probe failed (will retry next tick): {:#}",
+                    "node [{}] withdraw requests probe failed (will retry next tick): {:#}",
                     node_id,
                     e
                 );
                 return Ok(false);
             }
         };
-        if !has_pending {
+
+        // Same-tick snapshot + next probe: queue state comes from the contract, not a "sent op" flag.
+        node.withdraw_requests_pending = has_withdraw_requests;
+
+        if !has_withdraw_requests {
             return Ok(false);
         }
 
         let fee = WITHDRAW_PROCESS_GAS + WALLET_COMPUTE_FEE;
         let wallet_balance = node.wallet_balance().await?;
         if wallet_balance < fee {
-            anyhow::bail!(
-                "low wallet balance for process_withdraw_requests: required={} TON, available={} TON",
+            tracing::warn!(
+                "node [{}] skip process_withdraw_requests: low wallet balance (required={} TON, available={} TON)",
+                node_id,
                 fee as f64 / 1_000_000_000.0,
                 wallet_balance as f64 / 1_000_000_000.0
             );
+            return Ok(false);
         }
 
         let wallet = node.wallet.clone();
         let msg = pool
-            .send_process_withdrawals(
+            .send_process_withdraw_requests(
                 wallet,
                 UnixTime::now(),
                 WITHDRAW_PROCESS_LIMIT,
@@ -1026,7 +1029,6 @@ impl ElectionRunner {
         let msg_boc = write_boc(&msg).context("encode process_withdraw_requests boc")?;
         node.api.send_boc(&msg_boc).await.context("send process_withdraw_requests boc")?;
 
-        node.withdraw_processed_for_cycle = Some(election_id);
         tracing::info!(
             "node [{}] process_withdraw_requests sent (limit={}, election_id={})",
             node_id,
@@ -1548,23 +1550,19 @@ impl ElectionRunner {
                 self.snapshot_cache.last_elections_status,
                 ElectionsStatus::Active | ElectionsStatus::Finished | ElectionsStatus::Postponed
             );
-            // `ProcessingWithdraws` reports the gap between the TONCore opcode-2 submission
-            // and the stake message that follows next tick. Anchored on the current cycle's
-            // election id so a stale flag from a previous cycle never surfaces here.
-            let current_election_id =
-                self.snapshot_cache.last_elections.as_ref().map(|s| s.election_id);
-            let processing_withdraws = elections_running
+            // `ProcessingWithdrawRequests`: elections active, stake not yet submitted, and the last
+            // on-chain probe still reports a non-empty `withdraw_requests` queue for this tick.
+            let processing_withdraw_requests = elections_running
                 && node.stake_submissions.is_empty()
-                && node.withdraw_processed_for_cycle.is_some()
-                && node.withdraw_processed_for_cycle == current_election_id;
+                && node.withdraw_requests_pending;
             let status = if node.is_next_validator {
                 ParticipationStatus::Elected
             } else if elections_running && node.stake_accepted {
                 ParticipationStatus::Accepted
             } else if elections_running && !node.stake_submissions.is_empty() {
                 ParticipationStatus::Submitted
-            } else if processing_withdraws {
-                ParticipationStatus::ProcessingWithdraws
+            } else if processing_withdraw_requests {
+                ParticipationStatus::ProcessingWithdrawRequests
             } else if elections_running && node.participant.is_some() {
                 ParticipationStatus::Participating
             } else if node.is_validator {
