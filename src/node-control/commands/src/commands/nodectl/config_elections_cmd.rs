@@ -8,7 +8,7 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_get, api_post, resolve_service_url},
+    utils::{api_delete, api_get, api_post, resolve_service_url},
 };
 use colored::Colorize;
 use common::{
@@ -127,6 +127,11 @@ pub struct DisableCmd {
 pub struct StaticAdnlCmd {
     #[arg(short = 'n', long = "node", required = true, help = "Node name")]
     node: String,
+    /// Opt out of the static ADNL default for this node: the runner will generate a fresh
+    /// ephemeral ADNL address every cycle (pre-v0.5 behavior). Run without this flag again
+    /// to rotate and re-enable the static address.
+    #[arg(long = "disable", default_value_t = false)]
+    disable: bool,
 }
 
 impl ElectionsCfgCmd {
@@ -196,6 +201,8 @@ struct BindingElectionView {
     stake_policy: StakePolicy,
     #[serde(default)]
     static_adnl: Option<String>,
+    #[serde(default)]
+    static_adnl_disabled: bool,
 }
 
 fn print_elections_settings_table(view: &ElectionsSettingsView) {
@@ -214,7 +221,8 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
     }
 
     if !view.bindings.is_empty() {
-        let has_static_adnl = view.bindings.iter().any(|b| b.static_adnl.is_some());
+        let has_static_adnl =
+            view.bindings.iter().any(|b| b.static_adnl.is_some() || b.static_adnl_disabled);
         // Column widths: stake policy strings can be long (e.g. adaptive_split50 (50% or 100%)).
         // Headers/data must pad plain text before coloring — ANSI must not count toward {:<N}.
         const W_NODE: usize = 20;
@@ -255,7 +263,11 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
             let status_cell = format!("{:<w_st$}", b.status.to_string(), w_st = W_STATUS);
             let stake_cell = format!("{:<w_sk$}", b.stake_policy.to_string(), w_sk = W_STAKE);
             if has_static_adnl {
-                let adnl = b.static_adnl.as_deref().unwrap_or("—");
+                let adnl = if b.static_adnl_disabled {
+                    "disabled"
+                } else {
+                    b.static_adnl.as_deref().unwrap_or("—")
+                };
                 let adnl_cell = format!("{:<w_ad$}", adnl, w_ad = W_ADNL);
                 println!(
                     "    {:<w$}{}{}{}{}",
@@ -490,6 +502,16 @@ impl StaticAdnlCmd {
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
         let base_url = resolve_service_url(url, config_path)?;
+        if self.disable {
+            let path = format!("/v1/elections/static-adnl/{}", self.node);
+            api_delete(&base_url, &path, token).await?;
+            println!(
+                "{} Static ADNL disabled for '{}' (fresh ADNL each cycle)",
+                "OK".green().bold(),
+                self.node
+            );
+            return Ok(());
+        }
         let resp = api_post(
             &base_url,
             "/v1/elections/static-adnl",
