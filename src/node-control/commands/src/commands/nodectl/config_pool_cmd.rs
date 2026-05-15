@@ -22,7 +22,6 @@ use common::{
     ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
 use contracts::{TonWallet, nominator::ton_core_pool as pool_messages};
-use serde::de::{self, Deserialize, Deserializer};
 use std::{path::Path, str::FromStr};
 use ton_block::{ADDR_FORMAT_BOUNCE, ADDR_FORMAT_URL_SAFE, MsgAddressInt, write_boc};
 
@@ -305,15 +304,15 @@ fn share_pct_to_bp(pct: f64) -> anyhow::Result<u16> {
 /// to **`< 10_000`**: a 100 % validator share would leave nominators with no
 /// pool rewards, which is almost always operator error rather than intent.
 fn validate_validator_share_bp(bp: u16) -> anyhow::Result<u16> {
-    anyhow::ensure!(
-        bp != 10_000,
-        "--validator-share 10000 bp is 100%: nominators would receive no pool rewards — use a value below 10000 bp"
-    );
-    anyhow::ensure!(
-        bp < 10_000,
-        "validator_share must be in 0..10000 basis points (<100%; got {bp})"
-    );
-    Ok(bp)
+    match bp {
+        10_000 => anyhow::bail!(
+            "--validator-share 10000 bp is 100%: nominators would receive no pool rewards — use a value below 10000 bp"
+        ),
+        bp if bp > 10_000 => {
+            anyhow::bail!("validator_share must be in 0..10000 basis points (<100%; got {bp})")
+        }
+        bp => Ok(bp),
+    }
 }
 
 /// Basis points → percentage for display (100 bp = 1%; inverse of [`share_pct_to_bp`]).
@@ -405,57 +404,15 @@ impl PoolAddCoreCmd {
 ///
 /// Serde shape is `rename_all = "lowercase"` with [`Self::NotDeployed`] mapped
 /// to `"not deployed"` (single multi-word token on the wire).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum TonCorePoolSlotWireState {
+    #[serde(rename = "not deployed", alias = "")]
+    #[default]
     NotDeployed,
     Active,
     Frozen,
     Error,
-}
-
-impl Default for TonCorePoolSlotWireState {
-    fn default() -> Self {
-        Self::NotDeployed
-    }
-}
-
-impl TonCorePoolSlotWireState {
-    fn as_wire(self) -> &'static str {
-        match self {
-            Self::NotDeployed => "not deployed",
-            Self::Active => "active",
-            Self::Frozen => "frozen",
-            Self::Error => "error",
-        }
-    }
-
-    fn from_wire(s: &str) -> Result<Self, ()> {
-        Ok(match s {
-            "" | "not deployed" => Self::NotDeployed,
-            "active" => Self::Active,
-            "frozen" => Self::Frozen,
-            "error" => Self::Error,
-            _ => return Err(()),
-        })
-    }
-}
-
-impl serde::Serialize for TonCorePoolSlotWireState {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_wire())
-    }
-}
-
-fn deserialize_toncore_pool_slot_wire_state<'de, D>(
-    deserializer: D,
-) -> Result<TonCorePoolSlotWireState, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let opt = Option::<String>::deserialize(deserializer)?;
-    let s = opt.unwrap_or_default();
-    TonCorePoolSlotWireState::from_wire(&s)
-        .map_err(|_| de::Error::custom(format!("unknown TONCore pool slot state: {s:?}")))
 }
 
 /// Source of deploy-style pool parameters (`validator_share`, stake thresholds) in
@@ -485,7 +442,7 @@ struct TonCorePoolSlotView {
     slot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     address: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_toncore_pool_slot_wire_state")]
+    #[serde(default)]
     state: TonCorePoolSlotWireState,
     /// Whether deploy-style fields came from chain (`get_pool_data`) or config fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
