@@ -6,50 +6,29 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#[cfg(feature = "crypto-block")]
-use crate::crypto::factory::BlockCryptoFactory;
-#[cfg(feature = "crypto-default")]
-use crate::crypto::factory::DefaultCryptoFactory;
+#[cfg(feature = "hashicorp-storage")]
+use crate::memory::protected_memory::ProtectedMemory;
 use crate::{
     crypto::{
-        crypto_trait::Crypto, factory::CryptoFactory, key_material::KeyMaterial,
+        crypto_trait::Crypto,
+        factory::{CryptoFactory, DefaultCryptoFactory},
+        key_material::KeyMaterial,
         master_key::MasterKey,
     },
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory,
-    storage::storage_trait::Storage,
-    types::{algorithm::Algorithm, metadata::Metadata, secret::Secret},
+    memory::protected_memory::ProtectedMemoryInner,
+    storage::storage_trait::{ListMode, Storage},
+    types::{
+        algorithm::Algorithm,
+        metadata::Metadata,
+        secret::{Secret, SecretDataType, SecretInMemoryFactory},
+    },
     vault::SecretVault,
     vault_builder::SecretVaultBuilder,
 };
 use core::fmt;
 use rand::RngCore;
 use std::{path::PathBuf, sync::Arc};
-
-#[derive(Clone, Copy)]
-pub enum CryptoEngineType {
-    #[cfg(feature = "crypto-default")]
-    Default,
-    #[cfg(feature = "crypto-block")]
-    Block,
-}
-
-impl CryptoEngineType {
-    pub fn variant_name(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "crypto-default")]
-            CryptoEngineType::Default { .. } => "Default",
-            #[cfg(feature = "crypto-block")]
-            CryptoEngineType::Block { .. } => "Block",
-        }
-    }
-}
-
-impl fmt::Display for CryptoEngineType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.variant_name())
-    }
-}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,11 +45,11 @@ impl StorageType {
     pub fn variant_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "file-storage-json")]
-            StorageType::FileJson { .. } => "FileJson",
+            StorageType::FileJson => "FileJson",
             #[cfg(feature = "hashicorp-storage")]
-            StorageType::HashicorpNoCache { .. } => "HashicorpNoCache",
+            StorageType::HashicorpNoCache => "HashicorpNoCache",
             #[cfg(feature = "hashicorp-storage")]
-            StorageType::HashicorpUseCache { .. } => "HashicorpUseCache",
+            StorageType::HashicorpUseCache => "HashicorpUseCache",
         }
     }
 }
@@ -82,64 +61,54 @@ impl fmt::Display for StorageType {
 }
 
 pub struct TestConfig {
-    pub crypto_type: CryptoEngineType,
     pub storage_type: StorageType,
 }
 
-pub async fn create_crypto_factory(
-    crypto_type: CryptoEngineType,
-) -> anyhow::Result<Box<dyn CryptoFactory>> {
-    let crypto_factory: Box<dyn CryptoFactory> = match &crypto_type {
-        #[cfg(feature = "crypto-default")]
-        CryptoEngineType::Default => Box::new(DefaultCryptoFactory {}),
-        #[cfg(feature = "crypto-block")]
-        CryptoEngineType::Block => Box::new(BlockCryptoFactory {}),
-    };
-
-    Ok(crypto_factory)
-}
-
 pub async fn create_test_master_key() -> anyhow::Result<MasterKey> {
-    let mut key_data = ProtectedMemory::new(32).unwrap();
+    let mut key_data = ProtectedMemoryInner::new(32).unwrap();
     {
-        let mut guard = key_data.lock_mut().await?;
+        let mut handle = key_data.write_handle()?;
         for i in 0..32 {
-            guard[i] = i as u8;
+            handle[i] = i as u8;
         }
     }
 
-    MasterKey::from_key_material(KeyMaterial::new_symmetric_key(key_data).await?).await
+    MasterKey::from_key_material(KeyMaterial::new_symmetric_key(key_data.into())?)
 }
 
 pub async fn create_secret(
     secret_data: &[u8],
+    secret_data_type: SecretDataType,
     secret_id: &str,
     algorithm: Algorithm,
-    crypto: Box<dyn Crypto>,
+    crypto: Arc<dyn Crypto>,
 ) -> anyhow::Result<Secret> {
-    create_secret_ext(secret_data, secret_id, algorithm, true, crypto).await
+    create_secret_extractable(secret_data, secret_data_type, secret_id, algorithm, true, crypto)
+        .await
 }
 
-pub async fn create_secret_ext(
+pub async fn create_secret_extractable(
     secret_data: &[u8],
+    secret_data_type: SecretDataType,
     secret_id: &str,
     algorithm: Algorithm,
     extractable: bool,
-    crypto: Box<dyn Crypto>,
+    crypto: Arc<dyn Crypto>,
 ) -> anyhow::Result<Secret> {
     let secret_id = secret_id.into();
     let metadata = Metadata::new(Some(&secret_id), algorithm, extractable);
-    let secret = Secret::from_raw_data(secret_data, metadata, crypto).await?;
+    let secret =
+        SecretInMemoryFactory::from_raw_data(secret_data, secret_data_type, metadata, crypto)?;
 
     Ok(secret)
 }
 
 pub async fn create_storage(
-    crypto_type: CryptoEngineType,
     storage_type: StorageType,
     path_opt: Option<PathBuf>,
 ) -> anyhow::Result<Arc<dyn Storage>> {
-    let crypto_factory = create_crypto_factory(crypto_type).await?;
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
+
     let storage: Arc<dyn Storage> = match storage_type {
         #[cfg(feature = "file-storage-json")]
         StorageType::FileJson => {
@@ -156,41 +125,46 @@ pub async fn create_storage(
                 }
             };
             let master_key = create_test_master_key().await?;
-            let storage =
-                FileJsonStorage::new(master_key, &file_path, crypto_factory, false).await?;
+            let storage = FileJsonStorage::new(master_key, &file_path, false, crypto).await?;
 
             Arc::new(storage)
         }
         #[cfg(feature = "hashicorp-storage")]
         StorageType::HashicorpNoCache => {
             // NOTE: HashiCorp Vault must be launched in dev mode on http://127.0.0.1:8200/ (./vault server -dev -dev-root-token-id=root)
-            use crate::storage::hashicorp::HashicorpStorage;
+            use crate::storage::{
+                hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
+                hashicorp_token_provider::AuthConfig,
+            };
 
-            let api_key_data = ProtectedMemory::from_slice("root".as_bytes()).await?;
+            let api_key_data: ProtectedMemory =
+                ProtectedMemoryInner::from_slice("root".as_bytes())?.into();
             let storage = HashicorpStorage::new(
-                api_key_data,
+                AuthConfig::StaticToken(api_key_data),
                 "http://127.0.0.1:8200",
-                None,
-                crypto_factory,
                 false,
-            )
-            .await?;
+                crypto,
+                VaultConfig::default(),
+            )?;
             Arc::new(storage)
         }
         #[cfg(feature = "hashicorp-storage")]
         StorageType::HashicorpUseCache => {
             // NOTE: HashiCorp Vault must be launched in dev mode on http://127.0.0.1:8200/ (./vault server -dev -dev-root-token-id=root)
-            use crate::storage::hashicorp::HashicorpStorage;
+            use crate::storage::{
+                hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
+                hashicorp_token_provider::AuthConfig,
+            };
 
-            let api_key_data = ProtectedMemory::from_slice("root".as_bytes()).await?;
+            let api_key_data: ProtectedMemory =
+                ProtectedMemoryInner::from_slice("root".as_bytes())?.into();
             let storage = HashicorpStorage::new(
-                api_key_data,
+                AuthConfig::StaticToken(api_key_data),
                 "http://127.0.0.1:8200",
-                None,
-                crypto_factory,
                 true,
-            )
-            .await?;
+                crypto,
+                VaultConfig::default(),
+            )?;
             Arc::new(storage)
         }
     };
@@ -230,9 +204,8 @@ pub fn create_url(
 }
 
 pub async fn create_test_storage(config: &TestConfig) -> anyhow::Result<Arc<dyn Storage>> {
-    let storage = create_storage(config.crypto_type, config.storage_type, None).await?;
-    clear_store(storage.as_ref()).await?;
-
+    let storage = create_storage(config.storage_type, None).await?;
+    clear_storage(storage.as_ref()).await?;
     Ok(storage)
 }
 
@@ -249,8 +222,8 @@ pub fn make_ed25519_test_key_32() -> [u8; 32] {
     key
 }
 
-pub async fn clear_store(storage: &dyn Storage) -> anyhow::Result<()> {
-    let metas = storage.list_metadata().await?;
+pub async fn clear_storage(storage: &dyn Storage) -> anyhow::Result<()> {
+    let metas = storage.list_metadata(ListMode::All).await?;
 
     for meta in &metas {
         let secret_id = meta.secret_id.as_ref().ok_or_else(|| VaultError::empty_secret_id(""))?;
@@ -261,7 +234,7 @@ pub async fn clear_store(storage: &dyn Storage) -> anyhow::Result<()> {
 }
 
 pub async fn clear_vault(vault: &SecretVault) -> anyhow::Result<()> {
-    let metas = vault.list_metadata().await?;
+    let metas = vault.list_metadata(ListMode::All).await?;
 
     for meta in &metas {
         let secret_id = meta.secret_id.as_ref().ok_or_else(|| VaultError::empty_secret_id(""))?;
@@ -275,22 +248,13 @@ pub fn fixture() -> Vec<TestConfig> {
     let configs = vec![
         //File storage (json) + default cryptography
         #[cfg(all(feature = "crypto-default", feature = "file-storage-json"))]
-        TestConfig { crypto_type: CryptoEngineType::Default, storage_type: StorageType::FileJson },
-        // File storage (json) + block cryptography
-        #[cfg(all(feature = "crypto-block", feature = "file-storage-json"))]
-        TestConfig { crypto_type: CryptoEngineType::Block, storage_type: StorageType::FileJson },
+        TestConfig { storage_type: StorageType::FileJson },
         // Hashicorp Vault
         // TODO: setup vault in CI/CD test
-        #[cfg(all(feature = "crypto-default", feature = "hashicorp-storage"))]
-        TestConfig {
-            crypto_type: CryptoEngineType::Default,
-            storage_type: StorageType::HashicorpNoCache,
-        },
-        #[cfg(all(feature = "crypto-block", feature = "hashicorp-storage"))]
-        TestConfig {
-            crypto_type: CryptoEngineType::Block,
-            storage_type: StorageType::HashicorpUseCache,
-        },
+        //#[cfg(all(feature = "crypto-default", feature = "hashicorp-storage"))]
+        //TestConfig { storage_type: StorageType::HashicorpNoCache },
+        //#[cfg(all(feature = "crypto-default", feature = "hashicorp-storage"))]
+        //TestConfig { storage_type: StorageType::HashicorpUseCache },
     ];
 
     configs

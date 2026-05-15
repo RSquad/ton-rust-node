@@ -2174,7 +2174,7 @@ pub fn build_proofs(
         proof_size: &mut usize,
         visited: &mut ahash::AHashSet<UInt256>,
     ) -> Result<()> {
-        if visited.insert(slice.cell()?.repr_hash()) {
+        if visited.insert(slice.cell()?.repr_hash().clone()) {
             *proof_size += 12 + (slice.remaining_bits() + 7) / 8 + slice.remaining_references() * 3;
             while let Some(child) = slice.get_next_maybe_reference()? {
                 visit(SliceData::load_cell(child)?, proof_size, visited)?;

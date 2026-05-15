@@ -28,6 +28,7 @@ use std::{
 };
 
 #[derive(Clone, Default, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[repr(transparent)]
 pub struct UInt256([u8; 32]);
 
 impl UInt256 {
@@ -548,6 +549,14 @@ macro_rules! define_VarIntegerN {
                 self.0 = Self::read_from_cell(cell)?;
                 Ok(())
             }
+            fn skip(slice: &mut SliceData) -> Result<()> {
+                let len = slice.get_next_int(Self::get_len_len())? as usize;
+                if len >= $N {
+                    fail!("deserialization of {} error {} >= {}", stringify!($varname), len, $N)
+                }
+                slice.move_by(len * 8)?;
+                Ok(())
+            }
         }
 
         impl fmt::Display for $varname {
@@ -640,7 +649,16 @@ macro_rules! define_VarIntegerN {
                 let bytes = slice.get_next_int(bits as usize)? as usize;
                 let max = std::mem::size_of::<$tt>();
                 let mut buffer = [0; std::mem::size_of::<$tt>()];
-                slice.get_next_bytes_to_slice(&mut buffer[max - bytes..])?;
+                if bytes > 0 {
+                    let first = slice.get_next_byte()?;
+                    if first == 0 {
+                        fail!("non-canonical {} encoding: leading zero byte", stringify!($varname))
+                    }
+                    buffer[max - bytes] = first;
+                    if bytes > 1 {
+                        slice.get_next_bytes_to_slice(&mut buffer[max - bytes + 1..])?;
+                    }
+                }
                 self.0 = <$tt>::from_be_bytes(buffer);
                 Ok(())
             }
@@ -1012,6 +1030,10 @@ macro_rules! define_NumberN_up32bit {
         impl Deserializable for $varname {
             fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
                 self.0 = cell.get_next_int($N)? as u32;
+                Ok(())
+            }
+            fn skip(slice: &mut SliceData) -> Result<()> {
+                slice.move_by($N)?;
                 Ok(())
             }
         }
@@ -1457,8 +1479,9 @@ impl<X: Deserializable + Serializable> Deserializable for InRefValue<X> {
 }
 
 impl<X: Deserializable + Serializable> Serializable for InRefValue<X> {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
-        self.0.serialize()?.write_to(cell)
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
+        builder.checked_append_reference(self.0.serialize()?)?;
+        Ok(())
     }
 }
 
@@ -1571,8 +1594,8 @@ impl<T: Serializable + Deserializable> ChildCell<T> {
 
     pub fn hash(&self) -> UInt256 {
         match self.cell.as_ref() {
-            Some(cell) => cell.repr_hash(),
-            None => T::default().serialize().unwrap_or_default().repr_hash(),
+            Some(cell) => cell.repr_hash().clone(),
+            None => T::default().serialize().unwrap_or_default().repr_hash().clone(),
         }
     }
 
@@ -1597,11 +1620,11 @@ impl<T: Default + Serializable + Deserializable> PartialEq for ChildCell<T> {
 }
 
 impl<T: Serializable + Deserializable> Serializable for ChildCell<T> {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+    fn write_to(&self, builder: &mut BuilderData) -> Result<()> {
         if let Some(child_cell) = &self.cell {
-            child_cell.write_to(cell)?;
+            builder.checked_append_reference(child_cell.clone())?;
         } else {
-            T::default().serialize()?.write_to(cell)?;
+            builder.checked_append_reference(T::default().serialize()?)?;
         }
         Ok(())
     }

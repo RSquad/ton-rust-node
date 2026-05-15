@@ -320,17 +320,20 @@ impl OverlayClient {
         request: &TaggedTlObject,
         timeout: Option<u64>,
     ) -> Result<Option<D>> {
-        let request_str = if log::log_enabled!(log::Level::Trace) || cfg!(feature = "telemetry") {
+        let request_str = if log::log_enabled!(log::Level::Debug) || cfg!(feature = "telemetry") {
             format!("ADNL {:?}", request.object)
         } else {
             String::default()
         };
-        log::trace!("USE PEER {peer}, {request_str}");
-
+        log::debug!("send_adnl_query_to_peer sending {request_str} to {peer}");
         let now = Instant::now();
         let timeout = timeout.or(Some(AdnlNode::calc_timeout(peer.roundtrip_adnl())));
-        let answer =
-            self.ctx.overlay_node().query(peer.id(), request, &self.ctx.id, timeout).await?;
+        let result = self.ctx.overlay_node().query(peer.id(), request, &self.ctx.id, timeout).await;
+        log::debug!(
+            "send_adnl_query_to_peer: got {}, peer: {peer}, request: {request_str}",
+            if result.is_ok() { "OK" } else { "ERR" }
+        );
+        let answer = result?;
         let elapsed = now.elapsed();
         let roundtrip = elapsed.as_millis() as u64;
         let labels = [("peer", peer.id().to_string())];
@@ -597,15 +600,15 @@ impl OverlayClient {
     {
         let mut query = self.ctx.overlay_node().get_query_prefix(&self.ctx.id)?;
         serialize_boxed_append(&mut query, &request.object)?;
-        let request_str = if log::log_enabled!(log::Level::Trace) || cfg!(feature = "telemetry") {
+        let request_str = if log::log_enabled!(log::Level::Debug) || cfg!(feature = "telemetry") {
             std::any::type_name::<T>().to_string()
         } else {
             String::default()
         };
-        log::trace!("USE PEER {}, {}", peer, request_str);
+        log::debug!("send_rldp_query: sending {request_str} to {peer}");
         #[cfg(feature = "telemetry")]
         let now = Instant::now();
-        let (answer, roundtrip) = self
+        let result = self
             .ctx
             .overlay_node()
             .query_via_rldp(
@@ -620,7 +623,12 @@ impl OverlayClient {
                 v2,
                 peer.roundtrip_rldp().map(|t| t + attempt as u64 * TIMEOUT_DELTA),
             )
-            .await?;
+            .await;
+        log::debug!(
+            "send_rldp_query: got {}, peer: {peer}, request: {request_str}",
+            if result.is_ok() { "OK" } else { "ERR" }
+        );
+        let (answer, roundtrip) = result?;
         if let Some(answer) = answer {
             #[cfg(feature = "telemetry")]
             self.ctx.telemetry().consumed_query(request_str, true, now.elapsed(), answer.len());

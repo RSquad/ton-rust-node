@@ -11,7 +11,7 @@
 //! Provides LZ4 compression for block candidates, combining block data
 //! and collated data into a single compressed BOC format.
 
-use std::{io::Cursor, sync::Arc};
+use std::sync::Arc;
 use ton_block::{
     boc_compression::boc_decompress, error, fail, lz4_compress, lz4_decompress, BocFlags,
     BocReader, BocWriter, Cell, Lz4DecompressMode,
@@ -30,7 +30,7 @@ pub fn compress_candidate_data(
     block: &[u8],
     collated_data: &[u8],
 ) -> crate::Result<(Vec<u8>, usize)> {
-    let boc1 = BocReader::new().read(&mut Cursor::new(block))?;
+    let boc1 = BocReader::new().read(block)?;
 
     if boc1.roots.len() != 1 {
         fail!("block candidate should have exactly one root");
@@ -39,7 +39,7 @@ pub fn compress_candidate_data(
     let mut roots: Vec<Arc<Cell>> = vec![Arc::new(boc1.roots[0].clone())];
 
     if !collated_data.is_empty() {
-        let boc2 = BocReader::new().read(&mut Cursor::new(collated_data))?;
+        let boc2 = BocReader::new().read(collated_data)?;
 
         for i in 0..boc2.roots.len() {
             roots.push(Arc::new(boc2.roots[i].clone()));
@@ -91,7 +91,7 @@ pub fn decompress_candidate_data(
                 decompressed.len()
             );
         };
-        BocReader::new().read(&mut Cursor::new(&decompressed))?.roots
+        BocReader::new().read(&decompressed)?.roots
     } else {
         boc_decompress(compressed, decompressed_size)
             .map_err(|err| error!("Failed to decompress data: {}", err))?
@@ -147,7 +147,7 @@ pub fn canonicalize_boc(data: &[u8], flags: BocFlags) -> crate::Result<Vec<u8>> 
     if data.is_empty() {
         return Ok(Vec::new());
     }
-    let roots = BocReader::new().read(&mut Cursor::new(data))?.roots;
+    let roots = BocReader::new().read(data)?.roots;
     let mut result = Vec::new();
     if !roots.is_empty() {
         BocWriter::with_flags(roots, flags)?.write(&mut result)?;

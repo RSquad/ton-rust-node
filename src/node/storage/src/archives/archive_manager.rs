@@ -353,6 +353,10 @@ impl ArchiveManager {
         fd.archive_slice().get_slice(archive_id, offset, limit).await
     }
 
+    pub fn rocksdb_memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        self.db_provider.memory_usage()
+    }
+
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) {
         if let Err(e) = self.file_maps.files().gc(last_unneeded_key_block).await {
             log::info!(target: TARGET, "archive_manager gc is error: {:?}", e);

@@ -128,6 +128,13 @@ impl RocksDb {
 
         options.set_max_total_wal_size(1024 * 1024 * 1024);
 
+        // Let compaction and flush go through the OS page cache (the default)
+        // so that newly created SST files are already warm in cache and
+        // subsequent reads don't cause cold disk I/O. Previously direct I/O
+        // was enabled here to avoid compaction traffic evicting useful data,
+        // but with partitioned filters the metadata working set is much
+        // smaller, so the eviction pressure from compaction is acceptable.
+
         options.enable_statistics();
         options.set_dump_malloc_stats(true);
 
@@ -179,6 +186,21 @@ impl RocksDb {
 
     pub fn db(&self) -> &DBWithThreadMode<MultiThreaded> {
         self.db.as_ref().expect("rocksdb was occasionaly destroyed")
+    }
+
+    /// Returns approximate memory usage of this RocksDB instance (in bytes).
+    pub fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        let Ok(mut builder) = rocksdb::perf::MemoryUsageBuilder::new() else {
+            return Default::default();
+        };
+        builder.add_db(self.db());
+        let Ok(mu) = builder.build() else {
+            return Default::default();
+        };
+        crate::RocksDbMemoryUsage {
+            mem_tables: mu.approximate_mem_table_total(),
+            block_cache: mu.approximate_cache_total(),
+        }
     }
 
     pub fn cfs(&self) -> Option<Vec<String>> {

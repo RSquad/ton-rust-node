@@ -10,9 +10,14 @@ use crate::{TonWalletVersion, serde_utils, socket_utils::resolve_ip};
 use adnl::{client::AdnlClientConfig, common::Timeouts};
 use anyhow::Context;
 use secrets_vault::{
-    crypto::factory::{AutoCryptoFactory, CryptoFactory},
-    types::{algorithm::Algorithm, metadata::Metadata, secret::Secret},
+    crypto::factory::CryptoFactory,
+    types::{
+        algorithm::Algorithm,
+        metadata::Metadata,
+        secret::{Secret, SecretInMemoryFactory},
+    },
     vault::SecretVault,
+    vault_block::BlockCryptoFactory,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -157,16 +162,24 @@ impl KeyConfig {
         match self {
             KeyConfig::PrivateKey { type_id: _, pvt_key } => {
                 let metadata = Metadata::new(None, Algorithm::Ed25519, true);
-                Secret::from_raw_data(&pvt_key, metadata, AutoCryptoFactory {}.new_crypto()?).await
+                SecretInMemoryFactory::new_ed25519_pvtkey(
+                    &pvt_key,
+                    metadata,
+                    BlockCryptoFactory {}.new_crypto()?,
+                )
             }
             KeyConfig::PublicKey { type_id: _, pub_key } => {
                 let metadata = Metadata::new(None, Algorithm::None, true);
-                Secret::from_raw_data(&pub_key, metadata, AutoCryptoFactory {}.new_crypto()?).await
+                SecretInMemoryFactory::new_ed25519_pubkey(
+                    &pub_key,
+                    metadata,
+                    BlockCryptoFactory {}.new_crypto()?,
+                )
             }
             KeyConfig::VaultKey { name } => {
                 let vault =
                     vault.ok_or(anyhow::anyhow!("The secret vault is not set in the config"))?;
-                let secret = vault.get(&name.into()).await?;
+                let secret = vault.load(&name.into()).await?;
                 let algo = secret.metadata().algorithm;
 
                 if algo != Algorithm::Ed25519 {
@@ -180,8 +193,11 @@ impl KeyConfig {
             }
             KeyConfig::KeyPair(data) => {
                 let metadata = Metadata::new(None, Algorithm::Ed25519, true);
-
-                Secret::from_raw_data(&data, metadata, AutoCryptoFactory {}.new_crypto()?).await
+                SecretInMemoryFactory::new_ed25519_pvtkey(
+                    &data,
+                    metadata,
+                    BlockCryptoFactory {}.new_crypto()?,
+                )
             }
         }
     }
@@ -332,19 +348,77 @@ fn default_toncore_min_nominator_stake() -> u64 {
     DEFAULT_TONCORE_MIN_NOMINATOR_STAKE
 }
 
+fn skip_serializing_toncore_deploy_mode(mode: &TonCoreDeployMode) -> bool {
+    mode.is_legacy()
+}
+
+/// How a TON Core nominator pool slot is deployed — **operator-facing** choice (JSON key remains `deploy_layout`).
+///
+/// - [`TonCoreDeployMode::Legacy`] — full pool bytecode in `StateInit.code` (same addresses as pools created
+///   by older nodectl).
+/// - [`TonCoreDeployMode::TonscanCompatible`] — bootstrap `code` + `SETCODE` on first run; Tonscan recognises
+///   the contract.
+///
+/// **Defaults:** persisted config without the field stays [`Legacy`] so derived addresses stay stable. New pools
+/// from REST / CLI omitting the knob use [`default_new_pool_deploy_mode`] ([`TonscanCompatible`]).
+///
+/// **Wire strings** — canonical short forms `legacy` / `tonscan`; long alias `tonscan_compatible` (and kebab
+/// `tonscan-compatible`) is accepted for readers copying from the Rust variant name.
+///
+/// **Forwarding compatibility:** [`non_exhaustive`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[non_exhaustive]
+pub enum TonCoreDeployMode {
+    #[default]
+    #[serde(rename = "legacy")]
+    Legacy,
+    #[serde(rename = "tonscan", alias = "tonscan_compatible", alias = "tonscan-compatible")]
+    TonscanCompatible,
+}
+
+/// Default [`TonCoreDeployMode`] when **creating** a pool slot (`POST /v1/pools/core`, `nodectl config pool add core`)
+/// without specifying deploy mode — tonscan-friendly.
+pub fn default_new_pool_deploy_mode() -> TonCoreDeployMode {
+    TonCoreDeployMode::TonscanCompatible
+}
+
+impl TonCoreDeployMode {
+    #[inline]
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
+/// CLI / `str::parse`: same accepted strings as JSON serde for [`TonCoreDeployMode`].
+impl std::str::FromStr for TonCoreDeployMode {
+    type Err = serde_json::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_owned()))
+    }
+}
+
 /// Single TONCore pool slot config (address + optional deploy params).
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct TonCorePoolConfig {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<TonCoreInitParams>,
+    /// Deploy mode for this slot; JSON field name **`deploy_layout`** (historical).
+    ///
+    /// Omitted → [`TonCoreDeployMode::Legacy`] (stable addresses vs older configs).
+    #[serde(
+        rename = "deploy_layout",
+        default,
+        skip_serializing_if = "skip_serializing_toncore_deploy_mode"
+    )]
+    pub deploy_mode: TonCoreDeployMode,
 }
 
 /// Deploy-time parameters for a TONCore nominator pool contract.
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TonCoreInitParams {
     pub validator_share: u16,
     #[serde(default = "default_toncore_max_nominators")]
@@ -419,17 +493,16 @@ impl AdnlConfig {
             _ => anyhow::bail!("Unsupported secret type"),
         };
 
-        let client_pvt_key = client_keypair.private_key().await?;
-        let pvt_key = client_pvt_key.lock().await?;
+        let client_pvt_key = client_keypair.private_key()?;
+        let pvt_key = client_pvt_key.lock()?;
         if pvt_key.len() < 32 {
             anyhow::bail!("invalid client private key length");
         }
         let client_key_opt = Ed25519KeyOption::from_private_key(&pvt_key[..32].try_into()?)?;
-        let server_pub_key = blob.data().await?;
+        let server_pub_key = blob.data();
         let server_key = Ed25519KeyOption::from_public_key(
             server_pub_key
-                .lock()
-                .await?
+                .lock()?
                 .deref()
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid public key length"))?,
@@ -1111,6 +1184,7 @@ mod tests {
                             min_validator_stake: DEFAULT_TONCORE_MIN_VALIDATOR_STAKE,
                             min_nominator_stake: DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
                         }),
+                        ..Default::default()
                     }),
                     None,
                 ],
@@ -1166,6 +1240,7 @@ mod tests {
                             min_validator_stake: 5_000_000_000_000,
                             min_nominator_stake: 1_000_000_000_000,
                         }),
+                        ..Default::default()
                     }),
                     None,
                 ],
@@ -1193,6 +1268,71 @@ mod tests {
         assert_eq!(json["kind"], "core");
         assert_eq!(json["pools"][0]["address"], addr0);
         assert_eq!(json["pools"][1]["address"], addr1);
+    }
+
+    #[test]
+    fn test_pool_config_toncore_deploy_mode_roundtrip() {
+        let value = serde_json::json!({
+            "kind": "core",
+            "pools": [
+                {
+                    "params": { "validator_share": 50 },
+                    "deploy_layout": "tonscan",
+                },
+                null,
+            ],
+        });
+        let cfg: PoolConfig = serde_json::from_value(value.clone()).unwrap();
+        match &cfg {
+            PoolConfig::TONCore { pools } => {
+                assert_eq!(
+                    pools[0].as_ref().unwrap().deploy_mode,
+                    TonCoreDeployMode::TonscanCompatible
+                );
+            }
+            _ => panic!("expected TONCore"),
+        }
+
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["pools"][0]["deploy_layout"], "tonscan");
+
+        let legacy_default_only = serde_json::json!({
+            "kind": "core",
+            "pools": [{ "params": { "validator_share": 50 } }, null],
+        });
+        let cfg2: PoolConfig = serde_json::from_value(legacy_default_only).unwrap();
+        match &cfg2 {
+            PoolConfig::TONCore { pools } => {
+                assert!(pools[0].as_ref().unwrap().deploy_mode.is_legacy());
+            }
+            _ => panic!("expected TONCore"),
+        }
+    }
+
+    #[test]
+    fn toncore_deploy_mode_from_str_matches_serde_string_scalar() {
+        use std::str::FromStr;
+
+        let tonscan_aliases = ["tonscan", "tonscan_compatible", "tonscan-compatible"];
+        for wire in tonscan_aliases {
+            let a = TonCoreDeployMode::from_str(wire).expect("from_str");
+            let b: TonCoreDeployMode =
+                serde_json::from_value(serde_json::Value::String(wire.to_string())).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(a, TonCoreDeployMode::TonscanCompatible);
+        }
+        let a = TonCoreDeployMode::from_str("legacy").expect("from_str");
+        let b: TonCoreDeployMode =
+            serde_json::from_value(serde_json::Value::String("legacy".to_string())).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, TonCoreDeployMode::Legacy);
+
+        for dropped in ["embedded_code", "activate_upgrade", "bogus"] {
+            assert!(
+                TonCoreDeployMode::from_str(dropped).is_err(),
+                "wire form {dropped:?} must not be accepted",
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::commands::nodectl::{
 };
 use colored::{ColoredString, Colorize};
 use common::{
-    app_config::PoolConfig,
+    app_config::{PoolConfig, TonCoreDeployMode, default_new_pool_deploy_mode},
     task_cancellation::CancellationCtx,
     ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
@@ -130,6 +130,19 @@ pub struct PoolAddCoreCmd {
         help = "Configure/deploy TONCore slot 1 (odd rounds)"
     )]
     odd: bool,
+    /// Deploy mode for new TONCore pool slots.
+    ///
+    /// `tonscan` — deploy via stub + SETCODE; required for Tonscan to recognise the pool
+    /// (recommended for new deployments; default when omitted).
+    ///
+    /// `legacy`  — full pool code embedded directly in StateInit (kept for compatibility
+    /// with pools already deployed by older nodectl).
+    #[arg(
+        long = "deploy-mode",
+        visible_alias = "deploy-layout",
+        value_parser = clap::value_parser!(TonCoreDeployMode),
+    )]
+    deploy_mode: Option<TonCoreDeployMode>,
 }
 
 #[derive(clap::Args, Clone)]
@@ -283,6 +296,8 @@ struct PoolAddCoreBody<'a> {
     min_validator_stake: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_nominator_stake: Option<u64>,
+    #[serde(rename = "deploy_layout")]
+    deploy_mode: TonCoreDeployMode,
 }
 
 fn share_pct_to_bp(pct: f64) -> anyhow::Result<u16> {
@@ -364,6 +379,7 @@ impl PoolAddCoreCmd {
             self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
 
         let base_url = resolve_service_url(url, config_path)?;
+        let deploy_mode = self.deploy_mode.unwrap_or_else(|| default_new_pool_deploy_mode());
         let body = PoolAddCoreBody {
             name: &self.name,
             slot: slot_name,
@@ -373,6 +389,7 @@ impl PoolAddCoreCmd {
             // CLI flags accept TON (f64) — convert to nanotons for the API.
             min_validator_stake: self.min_validator_stake.map(tons_f64_to_nanotons),
             min_nominator_stake: self.min_nominator_stake.map(tons_f64_to_nanotons),
+            deploy_mode,
         };
         api_post(&base_url, "/v1/pools/core", token, &body).await?;
 
@@ -383,6 +400,9 @@ impl PoolAddCoreCmd {
         }
         if let Some(a) = &address {
             info_parts.push(format!("address='{a}'"));
+        }
+        if deploy_mode.is_legacy() {
+            info_parts.push("deploy_layout=legacy".to_string());
         }
 
         println!(
@@ -467,6 +487,8 @@ struct TonCorePoolSlotView {
     pool_state: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_election_id: Option<u32>,
+    #[serde(rename = "deploy_layout", default)]
+    deploy_mode: TonCoreDeployMode,
 }
 
 impl PoolLsCmd {
@@ -1074,6 +1096,7 @@ mod tests {
                     validator_amount: Some(0),
                     pool_state: Some(0),
                     last_election_id: Some(1_700_000_000),
+                    ..Default::default()
                 },
                 TonCorePoolSlotView {
                     slot: "odd".into(),

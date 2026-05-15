@@ -8,7 +8,8 @@
  */
 use super::*;
 use ton_block::{
-    base64_decode, base64_encode, read_single_root_boc, write_boc, Serializable, Transaction,
+    base64_decode, base64_encode, read_single_root_boc, read_single_root_boc_file, write_boc,
+    Serializable, Transaction,
 };
 
 fn cell_to_base64(cell: &Cell) -> String {
@@ -21,7 +22,7 @@ fn test_emulator() {
     let config_params = ConfigParams::construct_from_file(config).unwrap();
     let config_params_boc = cell_to_base64(config_params.root().unwrap());
     let account = "../executor/real_boc/two_messages_account_old.boc";
-    let account_root = Cell::read_from_file(account);
+    let account_root = read_single_root_boc_file(account).unwrap();
     let shard_acc = ShardAccount::with_account_root(account_root, Default::default(), 0);
     let account = shard_acc.read_account().unwrap();
     let shard_account_boc = shard_acc.write_to_base64().unwrap();
@@ -68,12 +69,14 @@ fn test_transaction() {
     let p = transaction_emulator_create(config_params_boc.as_ptr(), 5);
 
     // 6. Set block parameters
-    transaction_emulator_set_unixtime(p, 1770822950);
-    transaction_emulator_set_lt(p, 66815326000001);
+    let unixtime = json["now"].as_u64().unwrap();
+    let lt = json["lt"].as_u64().unwrap();
+    transaction_emulator_set_unixtime(p, unixtime as u32);
+    transaction_emulator_set_lt(p, lt);
 
     // rand_seed
-    let rand_seed_hex =
-        CString::new("628d5512834b482d4982d69d445da5f63e79de5f45f7ac52b25a9efc9a0db11c").unwrap();
+    let rand_seed_str = json["rand_seed"].as_str().unwrap();
+    let rand_seed_hex = CString::new(rand_seed_str).unwrap();
     transaction_emulator_set_rand_seed(p, rand_seed_hex.as_ptr());
 
     // 7. Set prev blocks info

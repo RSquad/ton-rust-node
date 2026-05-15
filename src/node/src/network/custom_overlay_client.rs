@@ -9,14 +9,14 @@
 use crate::{
     engine_traits::EngineOperations,
     network::{
-        check_block_candidate_data, decompress_and_check_candidate_data, decompress_block_broadcast,
+        check_block_candidate_data, decompress_and_check_candidate_data,
+        decompress_block_broadcast, node_network::NodeNetwork,
     },
 };
 use adnl::{
     common::{hash, spawn_cancelable, TaggedByteSlice},
     node::{AdnlNode, AdnlSendMethod},
-    AddressSearchContext, BroadcastRecvInfo, DhtNode, DhtSearchPolicy, OverlayNode, OverlayParams,
-    OverlayShortId,
+    BroadcastRecvInfo, DhtNode, OverlayNode, OverlayParams, OverlayShortId,
 };
 use std::{
     collections::HashMap,
@@ -24,7 +24,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
 };
 use ton_api::{
     deserialize_typed,
@@ -139,7 +138,14 @@ impl CustomOverlayClient {
             }
             self.is_active.store(true, Ordering::Relaxed);
             self.clone().listen_broadcasts();
-            self.clone().resolve_peers_worker(key.id().clone());
+            NodeNetwork::spawn_overlay_peer_resolver(
+                key.id().clone(),
+                self.nodes.keys().cloned().collect(),
+                self.dht_node.clone(),
+                self.overlay_node.clone(),
+                self.cancellation_token.child_token(),
+                format!("custom overlay {}", self.id),
+            );
             log::info!("Custom overlay \"{}\" with id {} activated", self.config.name, self.id);
             return Ok(true);
         }
@@ -398,66 +404,5 @@ impl CustomOverlayClient {
         let overlay_key = OverlayKey { name: hash(id_full)?.into() };
         let id_short = OverlayShortId::from_data(hash(overlay_key)?);
         Ok(id_short)
-    }
-
-    fn resolve_peers_worker(self: Arc<Self>, local_key: Arc<KeyId>) {
-        spawn_cancelable(self.cancellation_token.child_token(), async move {
-            let mut peers = self.nodes.keys().cloned().collect();
-            loop {
-                match self.resolve_peers_round(&local_key, peers).await {
-                    Ok(unresolved) => {
-                        peers = unresolved;
-                    }
-                    Err(e) => {
-                        log::warn!("{}: UNEXPECTED ERROR while resolve peers: {}", self.id, e);
-                        break;
-                    }
-                }
-                if peers.is_empty() {
-                    log::info!("{} resolve_peers: finished.", self.id);
-                    break;
-                } else {
-                    log::debug!("resolve_peers: {} peers still unresolved.", peers.len());
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    }
-
-    async fn resolve_peers_round(
-        &self,
-        local_key: &Arc<KeyId>,
-        peers: Vec<Arc<KeyId>>,
-    ) -> Result<Vec<Arc<KeyId>>> {
-        let mut unresolved = Vec::new();
-        for peer in peers {
-            match self
-                .dht_node
-                .find_address(&mut AddressSearchContext::with_params(
-                    &peer,
-                    DhtSearchPolicy::default(),
-                )?)
-                .await
-            {
-                Ok(Some((adnl_addr, quic_addr, key))) => {
-                    log::debug!(
-                        "{}: peer {}: found ip: {adnl_addr:?}, key: {key:x?}",
-                        self.id,
-                        peer
-                    );
-                    self.overlay_node
-                        .add_private_peers_to_adnl(&local_key, vec![(adnl_addr, quic_addr, key)])?;
-                }
-                Ok(None) => {
-                    log::warn!("{}: find address for {} failed", self.id, &peer);
-                    unresolved.push(peer);
-                }
-                Err(e) => {
-                    log::warn!("{}: find address for {} failed: {e:?}", self.id, &peer);
-                    unresolved.push(peer);
-                }
-            }
-        }
-        Ok(unresolved)
     }
 }

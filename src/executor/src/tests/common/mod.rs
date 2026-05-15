@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    base64_decode, read_single_root_boc, AccStatusChange, Account, AccountId, AccountStatus,
-    AccountStorage, AddSub, BuilderData, Cell, Coins, ComputeSkipReason, ConfigParam8,
-    ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable,
+    base64_decode, read_single_root_boc, read_single_root_boc_file, AccStatusChange, Account,
+    AccountId, AccountStatus, AccountStorage, AddSub, BuilderData, Cell, Coins, ComputeSkipReason,
+    ConfigParam8, ConfigParamEnum, ConfigParams, CurrencyCollection, Deserializable,
     ExternalInboundMessageHeader, GetRepresentationHash, HashmapAugType, HashmapType, InRefValue,
     InternalMessageHeader, KeyExtBlkRef, McStateExtra, MerkleProof, Message, MsgAddressInt,
     OutAction, OutActions, Result, Serializable, ShardAccount, ShardIdent, ShardStateUnsplit,
@@ -74,7 +74,7 @@ pub fn mc_state_cell_with_config(config: ConfigParams) -> ShardStateUnsplit {
 
 pub fn make_proof_cell(p: &impl Serializable) -> Cell {
     let proof = p.serialize().unwrap();
-    let proof = MerkleProof { hash: proof.hash(0), depth: proof.depth(0), proof };
+    let proof = MerkleProof { hash: proof.hash(0).clone(), depth: proof.depth(0), proof };
     proof.serialize().unwrap()
 }
 
@@ -111,7 +111,7 @@ pub fn create_config(cfg_name: &str) -> Result<ConfigParams> {
 
 #[allow(dead_code)]
 pub fn custom_config(version: Option<u32>, capabilities: Option<u64>) -> BlockchainConfig {
-    let mut config = create_config("real_boc/default_config.boc").unwrap();
+    let mut config = create_config("real_boc/config.boc").unwrap();
     let mut param8 = ConfigParam8 { global_version: config.get_global_version().unwrap() };
     if let Some(version) = version {
         param8.global_version.version = version
@@ -124,7 +124,7 @@ pub fn custom_config(version: Option<u32>, capabilities: Option<u64>) -> Blockch
 }
 
 pub fn default_config() -> BlockchainConfig {
-    BlockchainConfig::with_config(create_config("real_boc/default_config.boc").unwrap()).unwrap()
+    BlockchainConfig::with_config(create_config("real_boc/config.boc").unwrap()).unwrap()
 }
 
 #[cfg(not(feature = "cross_check"))]
@@ -278,7 +278,7 @@ pub fn create_test_account_workchain(
     );
     account.set_code(code);
     account.set_data(data);
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     account
 }
 
@@ -481,7 +481,7 @@ pub fn execute_with_params(
         if block_version < 11 {
             acc.del_storage_stat();
         } else {
-            acc.update_storage_stat(dict_hash_min_cells).unwrap();
+            acc.calc_storage_stat_dict(dict_hash_min_cells).unwrap();
         }
     }
     #[cfg(feature = "cross_check")]
@@ -777,6 +777,11 @@ pub fn get_tr_descr(tr: &Transaction) -> TransactionDescrOrdinary {
 }
 
 pub fn compare_transaction(trans: &Transaction, good_trans: &Transaction) {
+    pretty_assertions::assert_eq!(
+        trans.read_description().unwrap(),
+        good_trans.read_description().unwrap(),
+        "description mismatch"
+    );
     trans
         .out_msgs
         .scan_diff(&good_trans.out_msgs, |key: UInt15, msg1, msg2| {
@@ -795,11 +800,6 @@ pub fn compare_transaction(trans: &Transaction, good_trans: &Transaction) {
             Ok(true)
         })
         .unwrap();
-    pretty_assertions::assert_eq!(
-        trans.read_description().unwrap(),
-        good_trans.read_description().unwrap(),
-        "description mismatch"
-    );
     pretty_assertions::assert_eq!(trans, good_trans, "transaction mismatch")
 }
 
@@ -834,12 +834,12 @@ pub fn replay_transaction(
     };
     // account.write_to_file("real_boc/storage_limit_old.boc").unwrap();
     // transaction.write_to_file("real_boc/storage_limit_transaction.boc").unwrap();
-    let old_hash = account.serialize().unwrap().repr_hash();
+    let old_root = account.serialize().unwrap();
     let hash_update = transaction.read_state_update().unwrap();
-    pretty_assertions::assert_eq!(hash_update.old_hash, old_hash);
-    // dbg!(&account, &transaction, transaction.read_in_msg().unwrap());
     println!("transaction hash: {:X}", transaction.serialize().unwrap().repr_hash());
-    println!("account hash: {:X}", old_hash);
+    println!("account hash: {:X}", old_root.repr_hash());
+    pretty_assertions::assert_eq!(&hash_update.old_hash, old_root.repr_hash());
+    // dbg!(&account, &transaction, transaction.read_in_msg().unwrap());
     let message = transaction.read_in_msg().unwrap();
     let msg_cell = transaction.in_msg_cell();
     let account_after = Account::construct_from_file(acc_after).unwrap_or_else(|_| account.clone());
@@ -931,12 +931,12 @@ pub fn replay_transaction(
     );
 
     // account.write_to_file(acc_after).unwrap();
-    let new_hash = account.serialize().unwrap().repr_hash();
+    let new_root = account.serialize().unwrap();
     // let hash_update = ton_block::HashUpdate::with_hashes(old_hash.clone(), new_hash.clone());
     // our_transaction.write_state_update(&hash_update).unwrap();
     // our_transaction.write_to_file(tr).unwrap();
     // account.write_to_file(acc_after).unwrap();
-    if hash_update.new_hash == new_hash {
+    if hash_update.new_hash == *new_root.repr_hash() {
         pretty_assertions::assert_eq!(our_transaction, transaction);
         pretty_assertions::assert_eq!(account, account_after);
         return;
@@ -999,7 +999,8 @@ pub fn replay_transaction_full(
     } else if let Ok(data) = std::fs::read(libs) {
         Some(read_single_root_boc(data).unwrap())
     } else {
-        None
+        let data = base64_decode(libs).unwrap();
+        Some(read_single_root_boc(data).unwrap())
     };
     let mc_state_proof = mc_state_proof_cell_with_config(config, libs);
     replay_transaction(None, acc, acc_after, tr, prev, mc_state_proof)
@@ -1017,12 +1018,12 @@ pub fn replay_with_mc_state(mc: &str, cfg: &str, acc: &str, acc_after: &str, tr:
 }
 
 pub fn replay_with_mc_state_proof(mc: &str, acc: &str, acc_after: &str, tr: &str) {
-    let mc_state_proof = Cell::read_from_file(mc);
+    let mc_state_proof = read_single_root_boc_file(mc).unwrap();
     replay_transaction(None, acc, acc_after, tr, "", mc_state_proof)
 }
 
 pub fn replay_with_key_block_proof(mc: &str, acc: &str, acc_after: &str, tr: &str) {
-    let mc_state_proof = Cell::read_from_file(mc);
+    let mc_state_proof = read_single_root_boc_file(mc).unwrap();
     replay_transaction(None, acc, acc_after, tr, "", mc_state_proof)
 }
 
@@ -1245,9 +1246,9 @@ impl TransactionTestContext {
         let key = code.repr_hash().write_to_bitstring().unwrap();
         let value = SimpleLib::new(code, public).write_to_new_cell().unwrap();
         self.acc.library_mut().unwrap().set_raw(key.clone(), &value).unwrap();
-        self.acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+        self.acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
         self.new_acc.library_mut().unwrap().set_raw(key, &value).unwrap();
-        self.new_acc.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+        self.new_acc.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     }
 }
 
@@ -1256,12 +1257,12 @@ impl TransactionTestContext {
 pub fn append_message(storage: &mut StorageUsed, msg: &Message) -> Result<()> {
     let mut calc = StorageUsageCalc::with_limits(0, 0);
     // don't calc storage for Extra Currencies
-    let builder = if let Some(copy) = msg.copy_without_extra_currencies() {
-        copy.write_to_new_cell()?
+    let root = if let Some(copy) = msg.copy_without_extra_currencies() {
+        copy.serialize()?
     } else {
-        msg.write_to_new_cell()?
+        msg.serialize()?
     };
-    calc.append_builder(&builder, true, &mut 0)?;
+    calc.append_cell(&root, true, &mut 0)?;
     let other = calc.storage_used()?;
     storage.add_bits_and_cells(other.bits(), other.cells());
     Ok(())

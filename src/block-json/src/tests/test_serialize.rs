@@ -35,7 +35,7 @@ fn generate_sample_frozen_account() -> AccountSerializationSet {
     let mut account = generate_test_account(true, AccountTestOptions::with_default_setup(true));
     let cloned_account = account.clone();
     account.try_freeze().unwrap();
-    account.update_storage_stat(DICT_HASH_MIN_CELLS).unwrap();
+    account.calc_storage_stat_dict(DICT_HASH_MIN_CELLS).unwrap();
     let boc = account.write_to_bytes().unwrap();
     AccountSerializationSet {
         account,
@@ -396,8 +396,8 @@ fn test_frozen_account_into_json_q() {
 #[test]
 fn test_pruned_account_into_json_0() {
     let account = generate_test_account(true, AccountTestOptions::with_default_setup(true));
-    let code = account.get_code().map(|cell| cell.repr_hash());
-    let libs = account.libraries().root().map(|cell| cell.repr_hash());
+    let code = account.get_code().map(|cell| cell.repr_hash().clone());
+    let libs = account.libraries().root().map(|cell| cell.repr_hash().clone());
     let cell = account.serialize().unwrap();
     let proof = MerkleProof::create(&cell, |hash| {
         Some(hash) != code.as_ref() && Some(hash) != libs.as_ref()
@@ -1394,7 +1394,7 @@ fn check_transaction_field(
 ) {
     let boc = std::fs::read(Path::new("src/tests/data/transactions").join(file)).unwrap();
     let cell = read_single_root_boc(&boc).expect("Error deserializing single root BOC");
-    let id = cell.repr_hash();
+    let id = cell.repr_hash().clone();
     let tr = Transaction::construct_from_cell(cell).unwrap();
     let set = TransactionSerializationSet {
         block_id: None,

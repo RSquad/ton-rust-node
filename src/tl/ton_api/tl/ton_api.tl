@@ -1113,9 +1113,10 @@ consensus.simplex.candidateAndCert candidate:bytes notar:bytes = consensus.simpl
 
 // Vote storage (for bootstrap/restart recovery)
 // C++ parity: db.cpp stores votes with monotonic seqno for replay ordering.
-// Reference: C++ consensus.simplex.db.ourVote vote:UnsignedVote seqno:long
+// Reference: C++ consensus.simplex.db.{ourVote,cert} under key.vote
 consensus.simplex.db.key.vote vote_hash:int256 = consensus.simplex.db.key.Vote;
 consensus.simplex.db.vote data:bytes node_idx:int seqno:long = consensus.simplex.db.Vote;
+consensus.simplex.db.cert cert:consensus.simplex.certificate = consensus.simplex.db.Vote;
 
 // Pool state (first non-announced window for restart)
 consensus.simplex.db.key.poolState = consensus.simplex.db.key.PoolState;

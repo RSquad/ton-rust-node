@@ -7,5 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 mod aes_gcm;
+#[cfg(feature = "crypto-default")]
+mod default_impl;
 mod key_material;
 mod master_key;

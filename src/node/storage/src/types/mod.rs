@@ -58,6 +58,9 @@ impl PersistentStatePartId {
     pub fn is_head(&self) -> bool {
         matches!(self, PersistentStatePartId::Head(_))
     }
+    pub fn is_whole_state(&self) -> bool {
+        matches!(self, PersistentStatePartId::WholeState(_))
+    }
 }
 
 impl Display for PersistentStatePartId {

@@ -11,17 +11,24 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
-    cell_db::CellDb, db::rocksdb::RocksDb, shardstate_db_async::CellsDbConfig, types::StoredCell,
+    cell_db::CellDb,
+    db::rocksdb::RocksDb,
+    shardstate_db_async::CellsDbConfig,
+    types::{serialize_stored_cell, STORED_CELL_MAX_RAW_LEN},
     StorageAlloc, TARGET,
 };
-use std::{io::Cursor, ops::Deref, path::Path, sync::Arc, time::Instant};
+use std::{
+    io::Cursor,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use ton_block::{
-    error, fail, ByteOrderRead, Cell, CellData, CellsFactory, CellsTempStorage, Result, UInt256,
+    error, fail, ByteOrderRead, Cell, CellLoader, CellsFactory, CellsTempStorage, Result, UInt256,
     MAX_LEVEL, MAX_REFERENCES_COUNT,
 };
-
-// FnvHashMap is a standard HashMap with FNV hasher. This hasher is bit faster than default one.
-pub type CellsCounters = fnv::FnvHashMap<UInt256, u32>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum VisitedCell {
@@ -78,11 +85,11 @@ impl VisitedCell {
         self.parents_count().to_le_bytes()
     }
 
-    fn serialize_cell(&self) -> Result<Option<Vec<u8>>> {
+    fn serialize_cell(&self) -> Result<Option<smallvec::SmallVec<[u8; STORED_CELL_MAX_RAW_LEN]>>> {
         match self {
             VisitedCell::Updated { .. } => Ok(None),
             VisitedCell::New { cell, .. } => {
-                let data = StoredCell::serialize(cell.deref())?;
+                let data = serialize_stored_cell(cell)?;
                 Ok(Some(data))
             }
         }
@@ -99,7 +106,7 @@ impl VisitedCell {
 pub struct DynamicBocDb {
     cell_db: Arc<CellDb>,
     counters_cf_name: String,
-    cells_counters: Option<Arc<parking_lot::Mutex<CellsCounters>>>,
+    cell_counter_cache: quick_cache::sync::Cache<UInt256, Arc<AtomicU32>>,
 }
 
 impl DynamicBocDb {
@@ -107,7 +114,6 @@ impl DynamicBocDb {
         db: Arc<RocksDb>,
         cell_db_cf: &str,
         counters_cf_name: &str,
-        db_root_path: impl AsRef<Path>,
         config: &CellsDbConfig,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
@@ -115,7 +121,6 @@ impl DynamicBocDb {
         let cell_db = CellDb::with_db(
             db.clone(),
             cell_db_cf,
-            db_root_path.as_ref(),
             config,
             #[cfg(feature = "telemetry")]
             telemetry,
@@ -124,16 +129,10 @@ impl DynamicBocDb {
         if db.cf_handle(counters_cf_name).is_none() {
             db.create_cf(counters_cf_name, &Self::build_counters_cf_options(config))?;
         }
-        let cells_counters = if config.prefill_cells_counters {
-            let counters = CellsCounters::default();
-            Some(Arc::new(parking_lot::Mutex::new(counters)))
-        } else {
-            None
-        };
         Ok(Self {
             cell_db: Arc::new(cell_db),
             counters_cf_name: counters_cf_name.to_string(),
-            cells_counters,
+            cell_counter_cache: quick_cache::sync::Cache::new(config.counters_lru_cache_capacity),
         })
     }
 
@@ -149,8 +148,8 @@ impl DynamicBocDb {
         CellDb::build_cf_options(config.counters_cache_size_bytes)
     }
 
-    pub(crate) fn load_cell(&self, cell_id: &UInt256, panic: bool) -> Result<Cell> {
-        self.cell_db.load_cell(cell_id, panic)
+    pub(crate) fn load_cell(&self, cell_id: &UInt256) -> Result<Cell> {
+        self.cell_db.load_cell(cell_id)
     }
 
     #[allow(dead_code)]
@@ -177,6 +176,12 @@ impl DynamicBocDb {
         root_cell: Cell,
         check_stop: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Cell> {
+        // Ensure stored_loader OnceLock is initialized before traversal.
+        // is_stored_cell() uses stored_loader.get() (without init) to compare loader pointers.
+        // Without this, is_stored_cell() always returns false when all cell loads are cache hits,
+        // causing save_cells_recursive to traverse the entire tree instead of stopping at stored cells.
+        let _ = self.cell_db().stored_loader();
+
         let root_id = root_cell.hash(MAX_LEVEL);
         log::debug!(target: TARGET, "DynamicBocDb::save_boc  {:x}", root_id);
 
@@ -187,14 +192,6 @@ impl DynamicBocDb {
             return Ok(existing);
         }
 
-        let mut guard = self.cells_counters.as_ref().map(|m| m.lock());
-        let mut cells_counters: Option<&mut CellsCounters> = guard.as_deref_mut();
-        #[cfg(feature = "telemetry")]
-        self.cell_db
-            .telemetry()
-            .cached_cells_counters
-            .update(cells_counters.as_ref().map(|c| c.len()).unwrap_or_default() as u64);
-
         let now = std::time::Instant::now();
         let counters_cf = self.counters_cf()?;
         let mut visited = fnv::FnvHashMap::default();
@@ -203,7 +200,6 @@ impl DynamicBocDb {
             &mut visited,
             &root_id,
             check_stop,
-            &mut cells_counters,
             &counters_cf,
         )?;
         let cells_traverse_time = now.elapsed().as_micros();
@@ -243,7 +239,7 @@ impl DynamicBocDb {
             c.clone()
         } else {
             // only if the root cell was already saved (just updated counter) - we need to load it here
-            self.cell_db.load_cell(&root_id, true)?
+            self.cell_db.load_cell(&root_id)?
         };
 
         let updated = visited.len() - wrote_cells;
@@ -271,47 +267,6 @@ impl DynamicBocDb {
         Ok(saved_root)
     }
 
-    pub fn fill_counters(&self, check_stop: &dyn Fn() -> bool) -> Result<()> {
-        let mutex = self
-            .cells_counters
-            .as_ref()
-            .ok_or_else(|| error!("INTERNAL ERROR: fill_counters called without counters cache"))?;
-        let now = Instant::now();
-        let mut cells_counters = mutex.lock();
-        if !cells_counters.is_empty() {
-            fail!("INTERNAL ERROR: fill_counters called with already filled counters cache");
-        }
-        let counters_cf = self.counters_cf()?;
-        for kv in self.cell_db.db().iterator_cf(&counters_cf, rocksdb::IteratorMode::Start) {
-            let (key, value) = kv?;
-            let cell_id = UInt256::from_slice(key.as_ref());
-            let counter = Cursor::new(value).read_le_u32()?;
-            cells_counters.insert(cell_id, counter);
-            let len = cells_counters.len();
-            if len % 1_000_000 == 0 {
-                let time = now.elapsed().as_millis() as usize;
-                if time > 0 {
-                    log::info!(
-                        target: TARGET,
-                        "DynamicBocDb::fill_counters  processed {} ({} items/sec)",
-                        len, len * 1000 / time
-                    );
-                }
-            }
-            if check_stop() {
-                log::warn!(target: TARGET, "DynamicBocDb::fill_counters  STOPPED");
-                return Ok(());
-            }
-        }
-        let time = now.elapsed().as_secs();
-        log::info!(
-            target: TARGET,
-            "DynamicBocDb::fill_counters  processed {} in {} sec, speed: {} items/sec",
-            cells_counters.len(), time, cells_counters.len() / time as usize
-        );
-        Ok(())
-    }
-
     // Is not thread-safe!
     pub fn delete_boc(
         self: &Arc<Self>,
@@ -323,20 +278,7 @@ impl DynamicBocDb {
         #[cfg(feature = "telemetry")]
         let now = Instant::now();
         let mut visited = fnv::FnvHashMap::default();
-        let mut guard = self.cells_counters.as_ref().map(|m| m.lock());
-        let cells_counters: Option<&mut CellsCounters> = guard.as_deref_mut();
-        #[cfg(feature = "telemetry")]
-        self.cell_db
-            .telemetry()
-            .cached_cells_counters
-            .update(cells_counters.as_ref().map(|c| c.len()).unwrap_or_default() as u64);
-        self.delete_cells_recursive(
-            root_cell_id,
-            &mut visited,
-            root_cell_id,
-            check_stop,
-            cells_counters,
-        )?;
+        self.delete_cells_recursive(root_cell_id, &mut visited, root_cell_id, check_stop)?;
         #[cfg(feature = "telemetry")]
         let traverse_time = now.elapsed().as_micros();
 
@@ -353,7 +295,7 @@ impl DynamicBocDb {
                 // if there is no counter with the key, then it will be just ignored
                 transaction.delete_cf(&counters_cf, id.as_slice());
                 // Remove from cell_cache so that save_boc won't treat this cell
-                // as still persisted in DB (is::<StoredCell> + cache hit).
+                // as still persisted in DB
                 self.cell_db.remove_from_cache(id);
                 deleted += 1;
             } else {
@@ -414,6 +356,38 @@ impl DynamicBocDb {
             .ok_or_else(|| error!("Can't get `{}` cf handle", self.counters_cf_name))
     }
 
+    fn get_cached_counter(&self, cell_id: &UInt256) -> Option<u32> {
+        let result = self.cell_counter_cache.get(cell_id).map(|a| a.load(Ordering::Relaxed));
+        #[cfg(feature = "telemetry")]
+        if result.is_some() {
+            self.cell_db.telemetry().counter_cache_hits.update(1);
+        } else {
+            self.cell_db.telemetry().counter_cache_misses.update(1);
+        }
+        result
+    }
+
+    fn set_cached_counter(&self, cell_id: &UInt256, value: u32) {
+        use quick_cache::GuardResult;
+        match self.cell_counter_cache.get_value_or_guard(cell_id, None) {
+            GuardResult::Value(atomic) => {
+                atomic.store(value, Ordering::Relaxed);
+            }
+            GuardResult::Guard(guard) => {
+                let _ = guard.insert(Arc::new(AtomicU32::new(value)));
+            }
+            GuardResult::Timeout => unreachable!(),
+        }
+        #[cfg(feature = "telemetry")]
+        self.cell_db.telemetry().counter_cache_len.update(self.cell_counter_cache.len() as u64);
+    }
+
+    fn remove_cached_counter(&self, cell_id: &UInt256) {
+        self.cell_counter_cache.remove(cell_id);
+        #[cfg(feature = "telemetry")]
+        self.cell_db.telemetry().counter_cache_len.update(self.cell_counter_cache.len() as u64);
+    }
+
     // This method minimizes number of DB queries by checking internal cell type (storage or not).
     // Idea is the following:
     // 1) Traverse cells recursively from root to leaves
@@ -428,15 +402,43 @@ impl DynamicBocDb {
         visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>,
         root_id: &UInt256,
         check_stop: &(dyn Fn() -> Result<()> + Sync),
-        cells_counters: &mut Option<&mut CellsCounters>,
         counters_cf: &impl rocksdb::AsColumnFamilyRef,
     ) -> Result<(bool, Option<u32>)> {
+        let try_load_counter = |cell_id: &UInt256| -> Result<Option<u32>> {
+            if let Some(counter) = self.get_cached_counter(cell_id) {
+                return Ok(Some(counter));
+            }
+            #[cfg(feature = "telemetry")]
+            let now = Instant::now();
+            if let Some(raw) = self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())? {
+                // Cell is existing
+                #[cfg(feature = "telemetry")]
+                {
+                    self.cell_db
+                        .telemetry()
+                        .load_counter_time_nanos
+                        .update(now.elapsed().as_nanos() as u64);
+                    self.cell_db.telemetry().loaded_counters.update(1);
+                }
+                let mut reader = Cursor::new(raw);
+                let counter = reader.read_le_u32()?;
+                self.set_cached_counter(cell_id, counter);
+                return Ok(Some(counter));
+            }
+            Ok(None)
+        };
+
         check_stop()?;
 
         let cell_id = cell.repr_hash();
+        let mut skip_counter_check = false;
 
-        if cell.is::<StoredCell>() && self.cell_db.is_in_cache(&cell_id) {
-            return Ok((false, None));
+        if self.cell_db().is_stored_cell(cell) {
+            // This cell is possibly in DB, trying to load counter
+            if let Some(counter) = try_load_counter(cell_id)? {
+                return Ok((false, Some(counter)));
+            }
+            skip_counter_check = true; // already checked, not in DB
         }
 
         let mut is_new_cell = false;
@@ -452,7 +454,6 @@ impl DynamicBocDb {
                     visited,
                     root_id,
                     check_stop,
-                    cells_counters,
                     counters_cf,
                 )?;
                 if ref_verdicts[i].0 {
@@ -461,26 +462,10 @@ impl DynamicBocDb {
             }
         }
 
-        if !is_new_cell {
+        if !is_new_cell && !skip_counter_check {
             // This cell is possibly existing
-            if let Some(c) = cells_counters.as_ref().and_then(|c| c.get(&cell_id)) {
-                // Cell is existing
-                return Ok((false, Some(*c)));
-            }
-            #[cfg(feature = "telemetry")]
-            let now = Instant::now();
-            if let Some(raw) = self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())? {
-                // Cell is existing
-                #[cfg(feature = "telemetry")]
-                {
-                    self.cell_db
-                        .telemetry()
-                        .load_counter_time_nanos
-                        .update(now.elapsed().as_nanos() as u64);
-                    self.cell_db.telemetry().loaded_counters.update(1);
-                }
-                let mut reader = Cursor::new(raw);
-                return Ok((false, Some(reader.read_le_u32()?)));
+            if let Some(counter) = try_load_counter(cell_id)? {
+                return Ok((false, Some(counter)));
             }
         }
 
@@ -493,20 +478,19 @@ impl DynamicBocDb {
 
                 if let Some(counter) = ref_verdicts[i].1 {
                     // If we already know counter - just update, do not query DB second time.
-                    if let Some(counters) = cells_counters.as_mut() {
-                        counters.insert(ref_hash.clone(), counter + 1);
-                    }
                     match visited.entry(ref_hash.clone()) {
                         std::collections::hash_map::Entry::Occupied(mut entry) => {
-                            entry.get_mut().inc_parents_count()?;
+                            let new_counter = entry.get_mut().inc_parents_count()?;
+                            self.set_cached_counter(&ref_hash, new_counter);
                             log::trace!(
                                 target: TARGET,
                                 "DynamicBocDb::save_cells_recursive  {:x}  update visited {}  root_cell_id {:x}",
-                                ref_hash, counter + 1, root_id
+                                ref_hash, new_counter, root_id
                             );
                         }
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             entry.insert(VisitedCell::with_counter(counter + 1));
+                            self.set_cached_counter(&ref_hash, counter + 1);
                             log::trace!(
                                 target: TARGET,
                                 "DynamicBocDb::save_cells_recursive  {:x}  update counter {}  root_cell_id {:x}",
@@ -521,7 +505,6 @@ impl DynamicBocDb {
                         &ref_hash,
                         visited,
                         root_id,
-                        cells_counters,
                         |visited_cell| visited_cell.inc_parents_count(),
                         "DynamicBocDb::save_cells_recursive",
                     )?;
@@ -532,9 +515,7 @@ impl DynamicBocDb {
         // Add this cell as new
         let c = VisitedCell::with_new_cell(cell.clone());
         visited.insert(cell_id.clone(), c);
-        if let Some(counters) = cells_counters.as_mut() {
-            counters.insert(cell_id.clone(), 1);
-        }
+        self.set_cached_counter(cell_id, 1);
         log::trace!(
             target: TARGET,
             "DynamicBocDb::save_cells_recursive  {:x}  new cell  root_cell_id {:x}",
@@ -549,7 +530,6 @@ impl DynamicBocDb {
         cell: Cell,
         visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>,
         root_id: &UInt256,
-        cells_counters: &mut Option<&mut CellsCounters>,
     ) -> Result<()> {
         let counters_cf = self.counters_cf()?;
 
@@ -560,7 +540,6 @@ impl DynamicBocDb {
             &cell_id,
             visited,
             root_id,
-            cells_counters,
             |visited_cell| visited_cell.inc_parents_count(),
             "DynamicBocDb::save_cells_recursive",
         )?;
@@ -568,9 +547,7 @@ impl DynamicBocDb {
             // New cell.
             let c = VisitedCell::with_new_cell(cell.clone());
             visited.insert(cell_id.clone(), c);
-            if let Some(counters) = cells_counters.as_mut() {
-                counters.insert(cell_id.clone(), 1);
-            }
+            self.set_cached_counter(&cell_id, 1);
             log::trace!(
                 target: TARGET,
                 "DynamicBocDb::save_one_cell  {:x}  new cell  root_cell_id {:x}",
@@ -585,7 +562,6 @@ impl DynamicBocDb {
                     &ref_hash,
                     visited,
                     root_id,
-                    cells_counters,
                     |visited_cell| visited_cell.inc_parents_count(),
                     "DynamicBocDb::save_cells_recursive",
                 )?;
@@ -603,7 +579,6 @@ impl DynamicBocDb {
         visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>,
         root_id: &UInt256,
         check_stop: &(dyn Fn() -> Result<()> + Sync),
-        mut cells_counters: Option<&mut CellsCounters>,
     ) -> Result<()> {
         let counters_cf = self.counters_cf()?;
         let mut stack = vec![cell_id.clone()];
@@ -615,19 +590,16 @@ impl DynamicBocDb {
                 &cell_id,
                 visited,
                 root_id,
-                &mut cells_counters,
                 |visited_cell| visited_cell.dec_parents_count(),
                 "DynamicBocDb::delete_cells_recursive",
             )? {
                 if counter == 0 {
-                    if let Some(counters) = cells_counters.as_mut() {
-                        counters.remove(&cell_id);
-                    }
+                    self.remove_cached_counter(&cell_id);
 
                     let cell = if let Some(c) = cell {
                         c
                     } else {
-                        match self.cell_db.load_cell(&cell_id, true) {
+                        match self.cell_db.load_cell(&cell_id) {
                             Ok(cell) => cell,
                             Err(e) => {
                                 log::warn!("DynamicBocDb::delete_cells_recursive  {:?}", e);
@@ -651,28 +623,19 @@ impl DynamicBocDb {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn try_update_cell(
         self: &Arc<Self>,
         counters_cf: &impl rocksdb::AsColumnFamilyRef,
         cell_id: &UInt256,
         visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>,
         root_id: &UInt256,
-        cells_counters: &mut Option<&mut CellsCounters>,
         update_cell: impl Fn(&mut VisitedCell) -> Result<u32>,
         op_name: &str,
     ) -> Result<(Option<u32>, Option<Cell>)> {
         if let Some(visited_cell) = visited.get_mut(cell_id) {
             // Cell was already updated while this operation, just update counter
             let new_counter = update_cell(visited_cell)?;
-            if let Some(counters) = cells_counters {
-                let counter = counters.get_mut(cell_id).ok_or_else(|| {
-                    error!(
-                        "INTERNAL ERROR: cell from 'visited' is not presented in `cells_counters`"
-                    )
-                })?;
-                *counter = new_counter;
-            }
+            self.set_cached_counter(cell_id, new_counter);
             log::trace!(
                 target: TARGET,
                 "{}  {:x}  update visited {}  root_cell_id {:x}",
@@ -681,52 +644,51 @@ impl DynamicBocDb {
             return Ok((Some(new_counter), visited_cell.cell().cloned()));
         }
 
-        if let Some(counter) = cells_counters.as_mut().and_then(|cc| cc.get_mut(cell_id)) {
-            // Cell's counter is in cache - update it
-
-            let mut visited_cell = VisitedCell::with_counter(*counter);
-            *counter = update_cell(&mut visited_cell)?;
+        // Check LRU counter cache
+        if let Some(cached) = self.cell_counter_cache.get(cell_id) {
+            #[cfg(feature = "telemetry")]
+            self.cell_db.telemetry().counter_cache_hits.update(1);
+            let counter = cached.load(Ordering::Relaxed);
+            let mut visited_cell = VisitedCell::with_counter(counter);
+            let new_counter = update_cell(&mut visited_cell)?;
+            cached.store(new_counter, Ordering::Relaxed);
             visited.insert(cell_id.clone(), visited_cell);
             log::trace!(
                 target: TARGET,
-                "{}  {:x}  update counter {}  root_cell_id {:x}",
+                "{}  {:x}  update cached counter {}  root_cell_id {:x}",
+                op_name, cell_id, new_counter, root_id
+            );
+            return Ok((Some(new_counter), None));
+        }
+        #[cfg(feature = "telemetry")]
+        self.cell_db.telemetry().counter_cache_misses.update(1);
+
+        // Fallback to DB
+        #[cfg(feature = "telemetry")]
+        let now = Instant::now();
+        if let Some(counter_raw) =
+            self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())?
+        {
+            #[cfg(feature = "telemetry")]
+            {
+                self.cell_db
+                    .telemetry()
+                    .load_counter_time_nanos
+                    .update(now.elapsed().as_nanos() as u64);
+                self.cell_db.telemetry().loaded_counters.update(1);
+            }
+
+            let mut visited_cell = VisitedCell::with_raw_counter(&counter_raw)?;
+            let counter = update_cell(&mut visited_cell)?;
+            visited.insert(cell_id.clone(), visited_cell);
+            self.set_cached_counter(cell_id, counter);
+            log::trace!(
+                target: TARGET,
+                "{}  {:x}  load counter {}  root_cell_id {:x}",
                 op_name, cell_id, counter, root_id
             );
 
-            return Ok((Some(*counter), None));
-        }
-
-        if cells_counters.is_none() {
-            #[cfg(feature = "telemetry")]
-            let now = Instant::now();
-            if let Some(counter_raw) =
-                self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())?
-            {
-                // Cell's counter is in DB - load it and update
-
-                #[cfg(feature = "telemetry")]
-                {
-                    self.cell_db
-                        .telemetry()
-                        .load_counter_time_nanos
-                        .update(now.elapsed().as_nanos() as u64);
-                    self.cell_db.telemetry().loaded_counters.update(1);
-                }
-
-                let mut visited_cell = VisitedCell::with_raw_counter(&counter_raw)?;
-                let counter = update_cell(&mut visited_cell)?;
-                visited.insert(cell_id.clone(), visited_cell);
-                if let Some(counters) = cells_counters.as_mut() {
-                    counters.insert(cell_id.clone(), counter);
-                }
-                log::trace!(
-                    target: TARGET,
-                    "{}  {:x}  load counter {}  root_cell_id {:x}",
-                    op_name, cell_id, counter, root_id
-                );
-
-                return Ok((Some(counter), None));
-            }
+            return Ok((Some(counter), None));
         }
 
         Ok((None, None))
@@ -751,9 +713,6 @@ impl AsyncCellsStorageAdapter {
 
         let worker = tokio::task::spawn(async move {
             let r = tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut guard = boc_db_clone.cells_counters.as_ref().map(|m| m.lock());
-                let mut cells_counters: Option<&mut CellsCounters> = guard.as_deref_mut();
-
                 let cells_cf = boc_db_clone.cell_db.cells_cf()?;
                 let counters_cf = boc_db_clone.counters_cf()?;
                 let mut visited = fnv::FnvHashMap::<UInt256, VisitedCell>::default();
@@ -781,8 +740,8 @@ impl AsyncCellsStorageAdapter {
                             cache_.remove(&i);
                         }
                     }
-                    let rh = cell.repr_hash();
-                    boc_db_clone.save_one_cell(cell, &mut visited, &rh, &mut cells_counters)?;
+                    let rh = cell.repr_hash().clone();
+                    boc_db_clone.save_one_cell(cell, &mut visited, &rh)?;
                     indexes.push(cell_index);
                 }
                 commit(&mut visited)?;
@@ -825,37 +784,17 @@ impl CellsTempStorage for AsyncCellsStorageAdapter {
             Ok(guard.val().clone())
         } else {
             let (hash, _) = self.load_hash_and_depth(index)?;
-            let cell = self.boc_db.cell_db.load_cell(&hash, false)?;
+            let cell = self.boc_db.cell_db.load_cell(&hash)?;
             self.cache.insert(index, cell.clone());
             Ok(cell)
         }
     }
 
-    fn store_simple_cell(
-        &mut self,
-        index: u32,
-        data: CellData,
-        refs: &[(UInt256, u16)],
-    ) -> Result<()> {
-        if index as usize >= self.index.len() {
-            fail!("AsyncCellsStorageAdapter::store_simple_cell index out of bounds: {}", index);
-        }
-        if data.level() != 0 {
-            fail!("AsyncCellsStorageAdapter::store_simple_cell supports only zero level cells");
-        }
-        self.index[index as usize] = (data.hash(0), data.depth(0));
-        let cell =
-            Cell::with_cell_impl(StoredCell::with_cell_data(data, refs, &self.boc_db.cell_db)?);
-        self.cache.insert(index, cell.clone());
-        self.sender.blocking_send((index, cell))?;
-        Ok(())
-    }
-
     fn store_cell(&mut self, index: u32, cell: &Cell) -> Result<()> {
         if index as usize >= self.index.len() {
-            fail!("AsyncCellsStorageAdapter::store_simple_cell index out of bounds: {}", index);
+            fail!("AsyncCellsStorageAdapter::store_cell index out of bounds: {}", index);
         }
-        self.index[index as usize] = (cell.repr_hash(), cell.repr_depth());
+        self.index[index as usize] = (cell.repr_hash().clone(), cell.repr_depth());
         self.cache.insert(index, cell.clone());
         self.sender.blocking_send((index, cell.clone()))?;
         Ok(())
@@ -865,5 +804,9 @@ impl CellsTempStorage for AsyncCellsStorageAdapter {
         self.index = vec![];
         // self.cache.clear();
         Ok(())
+    }
+
+    fn loader(&self) -> &CellLoader {
+        self.boc_db.cell_db().storing_loader()
     }
 }

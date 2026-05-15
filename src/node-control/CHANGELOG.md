@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **TONCore: process pending withdraws before each new stake** — every tick before staking, the elections runner probes the active TONCore pool's cheap `has_withdraw_requests` getter. When the queue is non-empty it sends `process_withdraw_requests` (op = 2, `limit = 100`) and skips stake submission for that tick to give the pool time to drain; the next tick re-probes and either resubmits op = 2 (if more requests arrived) or proceeds to stake. This frees up locked liquidity from nominators who already requested a withdrawal so it does not get re-staked. A new participant status `processing_withdraw_requests` surfaces this intermediate state in `/v1/elections` and `/v1/validators` snapshots. No-op for SNP nominator pools and direct staking.
+## [Unreleased]
+
+### Added
+
+- **TONCore pool deploy mode (`deploy_layout`)** — per-slot string (JSON field name unchanged). Canonical values: **`legacy`** (full pool bytecode in `StateInit.code`; same addresses as pools created with older nodectl) and **`tonscan`** (alias: `tonscan_compatible`, `tonscan-compatible` — bootstrap `StateInit.code` + `SETCODE` on first execution; explorers such as Tonscan recognise the contract). **Use `tonscan` for new pools.** Already-deployed slots must stay on the mode they were created with — address derivation differs between modes. Wired through REST (`POST /v1/pools/core`, pool slot views), JSON config, and CLI (`nodectl config pool add core --deploy-mode`, alias `--deploy-layout`). Defaults: **missing `deploy_layout` in persisted config** stays **`legacy`** so derived addresses are preserved; **`POST /v1/pools/core`** / **`nodectl config pool add core`** omitting deploy mode default to **`tonscan`**.
 
 ## [0.4.0] - 2026-04-21
 

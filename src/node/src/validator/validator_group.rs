@@ -12,9 +12,10 @@
 
 use super::{
     consensus::{
-        get_hash, BlockHash, BlockPayloadPtr, CollationParentHint, ConsensusOptions,
-        ConsensusOverlayManagerPtr, ConsensusType, PrivateKey, PublicKey, PublicKeyHash, Session,
-        SessionHolderPtr, SessionId, SessionListener, SessionListenerPtr, SessionNode,
+        get_hash, BlockHash, BlockPayloadPtr, CandidateObservedFlags, CollationParentHint,
+        ConsensusOptions, ConsensusOverlayManagerPtr, ConsensusType,
+        EnsureCandidateAvailabilityOptions, PrivateKey, PublicKey, PublicKeyHash, ResolverPurpose,
+        Session, SessionHolderPtr, SessionId, SessionListener, SessionListenerPtr, SessionNode,
         ValidatorBlockCandidate, ValidatorBlockCandidateCallback,
         ValidatorBlockCandidateDecisionCallback,
     },
@@ -27,14 +28,14 @@ use crate::{
     validator::{
         consensus_overlay::ConsensusOverlayManagerImpl,
         mutex_wrapper::MutexWrapper,
+        state_resolver_cache::{ResolverBackend, StateResolverCache},
         validator_utils::{
-            validator_query_candidate_to_validator_block_candidate, validatordescr_to_session_node,
-            ValidatorListHash,
+            prevs_to_string, validator_query_candidate_to_validator_block_candidate,
+            validatordescr_to_session_node, ValidatorListHash,
         },
     },
 };
 use std::{
-    cmp::max,
     collections::VecDeque,
     fmt::{Display, Formatter},
     sync::{
@@ -95,6 +96,18 @@ const WAIT_FOR_VALIDATION: bool = false;
 /// validator-group message loop while a collation task runs.
 const WAIT_FOR_COLLATION: bool = false;
 
+/// C++ parity: simplex candidate-native validation deadline.
+/// Matches `block-validator.cpp`: `validate_block_candidate(..., td::Timestamp::in(60.0))`.
+const SIMPLEX_VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// C++ parity: legacy (catchain) validation deadline.
+/// Matches `validator-group.cpp`: `run_validate_query(..., td::Timestamp::in(15.0))`.
+const LEGACY_VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// C++ parity: collation request deadline.
+/// Matches `validator-group.cpp` / `collation-manager.cpp`: `td::Timestamp::in(10.0)`.
+const COLLATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Determines if block candidate should be broadcast publicly via FastSync overlay.
 /// Mirrors C++ `need_send_candidate_broadcast` logic from validator-group.cpp.
 ///
@@ -121,22 +134,138 @@ fn need_send_candidate_broadcast(
 /// }
 /// ```
 fn should_reject_stale_mc_candidate(
-    last_accepted_seqno: Option<u32>,
-    candidate_parent_seqno: u32,
+    last_accepted_block_id: Option<&BlockIdExt>,
+    candidate_parent_block_id: &BlockIdExt,
 ) -> bool {
-    match last_accepted_seqno {
-        Some(accepted) => candidate_parent_seqno < accepted,
-        None => false,
-    }
+    matches!(
+        last_accepted_block_id,
+        Some(accepted_block_id) if candidate_parent_block_id < accepted_block_id
+    )
 }
 
-fn sync_last_accepted_mc_seqno_from_applied_top(
+fn should_wait_for_mc_validation_parent(
+    last_accepted_block_id: Option<&BlockIdExt>,
+    candidate_parent_block_id: &BlockIdExt,
+) -> bool {
+    matches!(
+        last_accepted_block_id,
+        Some(accepted_block_id) if accepted_block_id < candidate_parent_block_id
+    ) || last_accepted_block_id.is_none()
+}
+
+fn initial_accepted_mc_head_from_start_inputs(
+    shard: &ShardIdent,
+    prev: &[BlockIdExt],
+    min_masterchain_block_id: &BlockIdExt,
+) -> Option<BlockIdExt> {
+    if !shard.is_masterchain() {
+        return None;
+    }
+    // C++ parity intent (block-validator Start uses state->as_normal()):
+    // prefer exact session prev head when known, otherwise seed from the masterchain
+    // start context so MC parent waits do not stall at accepted_head=<none>.
+    prev.iter().max().cloned().or_else(|| Some(min_masterchain_block_id.clone()))
+}
+
+fn sync_last_accepted_mc_head_from_block(
     group_impl: &mut ValidatorGroupImpl,
-    applied_top: &BlockIdExt,
+    block_id: &BlockIdExt,
 ) {
     if group_impl.shard.is_masterchain() {
         let prev = group_impl.last_accepted_mc_seqno.unwrap_or(0);
-        group_impl.last_accepted_mc_seqno = Some(prev.max(applied_top.seq_no));
+        group_impl.last_accepted_mc_seqno = Some(prev.max(block_id.seq_no));
+        match group_impl.last_accepted_mc_block_id.as_ref() {
+            Some(current) if current >= block_id => {}
+            _ => group_impl.last_accepted_mc_block_id = Some(block_id.clone()),
+        }
+    }
+}
+
+fn sync_last_notified_mc_finalized_seqno(
+    group_impl: &mut ValidatorGroupImpl,
+    applied_top: &BlockIdExt,
+) {
+    // C++ parity (`block-accepter.cpp`): keep external MC-finalized cursor monotonic.
+    let prev = group_impl.last_notified_mc_finalized_seqno.unwrap_or(0);
+    group_impl.last_notified_mc_finalized_seqno = Some(prev.max(applied_top.seq_no));
+}
+
+fn should_suppress_stale_finalized_rebroadcast(
+    last_notified_mc_finalized_seqno: Option<u32>,
+    block_seqno: u32,
+) -> bool {
+    // C++ parity (`block-accepter.cpp`):
+    // if (last_mc_finalized_seqno_ >= 2 && block.id.seqno() < last_mc_finalized_seqno_ - 2) {
+    //   broadcast_mode = 0;
+    // }
+    matches!(
+        last_notified_mc_finalized_seqno,
+        Some(last_seqno) if last_seqno >= 2 && block_seqno < last_seqno - 2
+    )
+}
+
+async fn wait_for_mc_validation_parent(
+    mut accepted_mc_block_rx: tokio::sync::watch::Receiver<Option<BlockIdExt>>,
+    candidate_block_id: &BlockIdExt,
+    candidate_parent_block_id: &BlockIdExt,
+) -> Result<()> {
+    //TODO: LK: add max timeout for parents waiting
+    let mut logged_wait = false;
+    loop {
+        let accepted_block_id = accepted_mc_block_rx.borrow_and_update().clone();
+        if should_reject_stale_mc_candidate(accepted_block_id.as_ref(), candidate_parent_block_id) {
+            metrics::counter!("simplex_mc_fork_prevention_rejected").increment(1);
+            fail!(
+                "MC fork prevention: candidate {} builds upon {} \
+                 but we already accepted {}",
+                candidate_block_id,
+                candidate_parent_block_id,
+                accepted_block_id.as_ref().expect("stale branch must have accepted head")
+            );
+        }
+        if should_wait_for_mc_validation_parent(
+            accepted_block_id.as_ref(),
+            candidate_parent_block_id,
+        ) {
+            if !logged_wait {
+                logged_wait = true;
+                log::debug!(
+                    "MC validation wait started for candidate {} \
+                     (parent={}, accepted_head={})",
+                    candidate_block_id,
+                    candidate_parent_block_id,
+                    accepted_block_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "<none>".to_string()),
+                );
+            }
+
+            match accepted_mc_block_rx.changed().await {
+                Ok(()) => continue,
+                Err(_) => {
+                    fail!(
+                        "MC validation wait cancelled for candidate {} \
+                         while waiting for accepted parent {}",
+                        candidate_block_id,
+                        candidate_parent_block_id
+                    );
+                }
+            }
+        }
+        if logged_wait {
+            log::debug!(
+                "MC validation wait resolved for candidate {} \
+                 (parent={}, accepted_head={})",
+                candidate_block_id,
+                candidate_parent_block_id,
+                accepted_block_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<none>".to_string()),
+            );
+        }
+        return Ok(());
     }
 }
 
@@ -282,6 +411,12 @@ pub struct ValidatorGroupImpl {
     /// Highest MC block seqno accepted (committed) in this session.
     /// Used for MC fork prevention: reject candidates building on stale heads.
     last_accepted_mc_seqno: Option<u32>,
+    /// Exact MC block identity accepted (or externally notified) as the current head.
+    /// Used for C++-parity stale-branch rejection in MC validation.
+    last_accepted_mc_block_id: Option<BlockIdExt>,
+    /// Highest external MC-finalized notification seqno delivered via `notify_mc_finalized`.
+    /// Used to suppress stale finalized block rebroadcasts (`block-accepter.cpp` parity).
+    last_notified_mc_finalized_seqno: Option<u32>,
 }
 
 impl Drop for ValidatorGroupImpl {
@@ -342,11 +477,18 @@ impl ValidatorGroupImpl {
             fail!("Inactive session cannot be started! {}", self.info())
         }
 
+        let initial_accepted_mc_block_id = initial_accepted_mc_head_from_start_inputs(
+            &self.shard,
+            &prev,
+            &min_masterchain_block_id,
+        );
+
         self.prev_block_ids.update_prev(prev);
         self.min_masterchain_block_id = Some(min_masterchain_block_id.clone());
         self.min_ts = min_ts;
         if self.shard.is_masterchain() {
             self.last_accepted_mc_seqno = Some(min_masterchain_block_id.seq_no);
+            self.last_accepted_mc_block_id = initial_accepted_mc_block_id;
         }
 
         if self.session.is_none() {
@@ -357,12 +499,16 @@ impl ValidatorGroupImpl {
             self.session = Some(session);
         }
 
-        let initial_block_seqno = self.prev_block_ids.get_next_seqno().unwrap_or(1);
         if let Some(session) = &self.session {
             log::info!(target: "validator",
-                "SESSION_LIFECYCLE: session.start(seqno={}) shard={} cc_seqno={}",
-                initial_block_seqno, self.shard, self.cc_seqno);
-            session.start(initial_block_seqno);
+                "SESSION_LIFECYCLE: session.start(prevs={}, min_mc={}) shard={} cc_seqno={}",
+                self.prev_block_ids.display_prevs(),
+                min_masterchain_block_id,
+                self.shard,
+                self.cc_seqno
+            );
+            session
+                .start(self.prev_block_ids.get_prevs().to_vec(), min_masterchain_block_id.clone());
         }
 
         log::info!(target: "validator",
@@ -547,6 +693,8 @@ impl ValidatorGroupImpl {
 
             replay_finished: false,
             last_accepted_mc_seqno: None,
+            last_accepted_mc_block_id: None,
+            last_notified_mc_finalized_seqno: None,
         }
     }
 
@@ -659,6 +807,12 @@ pub struct ValidatorGroup {
     allow_unsafe_self_blocks_resync: bool,
 
     group_impl: Arc<MutexWrapper<ValidatorGroupImpl>>,
+    /// Validator-side cache/resolver for speculative shard states.
+    ///
+    /// Simplex delivers candidate observations through `SessionListener`.
+    /// We persist those observations here and resolve parent states before
+    /// falling back to `engine.wait_state()`.
+    state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     action_queue: tokio::sync::mpsc::UnboundedSender<ValidationAction>,
     callback: Arc<dyn SessionListener + Send + Sync>,
     receiver: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ValidationAction>>>>,
@@ -666,8 +820,49 @@ pub struct ValidatorGroup {
     last_validation_time: Arc<AtomicU64>,
     last_collation_time: Arc<AtomicU64>,
     is_collating: Arc<AtomicBool>,
+    accepted_mc_seqno_tx: tokio::sync::watch::Sender<Option<u32>>,
+    accepted_mc_block_tx: tokio::sync::watch::Sender<Option<BlockIdExt>>,
     /// Set by the validation queue on prolonged inactivity, cleared on any action.
     pub stalled: Arc<AtomicBool>,
+}
+
+impl ResolverBackend for ValidatorGroup {
+    fn request_candidate_availability(
+        &self,
+        block_id: BlockIdExt,
+        opts: EnsureCandidateAvailabilityOptions,
+    ) {
+        // Reverse bridge:
+        // StateResolverCache -> ValidatorGroup (ResolverBackend) -> SimplexSession.
+        // This keeps cache/resolver logic independent from simplex internals.
+        let group_impl = self.group_impl.clone();
+        let session_id = self.session_id.clone();
+        let shard = self.shard.clone();
+        tokio::spawn(async move {
+            let simplex_session = group_impl.execute_sync(|gi| gi.get_simplex_session()).await;
+            match simplex_session {
+                Some(session) => {
+                    log::info!(
+                        target: "simplex_resolver",
+                        "ResolverBackend::request_candidate_availability session_id={:x} shard={} block_id={} purpose={:?}",
+                        session_id,
+                        shard,
+                        block_id,
+                        opts.purpose,
+                    );
+                    session.ensure_candidate_available(block_id, opts);
+                }
+                None => {
+                    log::warn!(
+                        target: "simplex_resolver",
+                        "ResolverBackend::request_candidate_availability: no simplex session for shard={} block_id={}",
+                        shard,
+                        block_id,
+                    );
+                }
+            }
+        });
+    }
 }
 
 impl ValidatorGroup {
@@ -701,6 +896,8 @@ impl ValidatorGroup {
             general_session_info.shard.clone(),
         );
         let action_queue = listener.queue_sender();
+        let (accepted_mc_seqno_tx, _accepted_mc_seqno_rx) = tokio::sync::watch::channel(None);
+        let (accepted_mc_block_tx, _accepted_mc_block_rx) = tokio::sync::watch::channel(None);
 
         log::trace!(target: "validator", "Creating validator group: {}, consensus_type: {}", id, consensus_type);
         ValidatorGroup {
@@ -715,12 +912,15 @@ impl ValidatorGroup {
             engine,
             allow_unsafe_self_blocks_resync,
             group_impl: Arc::new(MutexWrapper::new(group_impl, id)),
+            state_resolver_cache: Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             action_queue,
             callback: Arc::new(listener),
             receiver: Arc::new(Mutex::new(Some(receiver))),
             last_validation_time: Arc::new(AtomicU64::new(0)),
             last_collation_time: Arc::new(AtomicU64::new(0)),
             is_collating: Arc::new(AtomicBool::new(false)),
+            accepted_mc_seqno_tx,
+            accepted_mc_block_tx,
             stalled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -786,15 +986,36 @@ impl ValidatorGroup {
         }
     }
 
+    fn publish_accepted_mc_seqno(&self, seqno: Option<u32>) {
+        if self.shard.is_masterchain() {
+            self.accepted_mc_seqno_tx.send_replace(seqno);
+        }
+    }
+
+    fn publish_accepted_mc_head(&self, block_id: Option<BlockIdExt>) {
+        if self.shard.is_masterchain() {
+            self.accepted_mc_block_tx.send_replace(block_id);
+        }
+    }
+
     pub async fn on_applied_top(&self, applied_top: BlockIdExt) {
-        self.group_impl
+        let (accepted_mc_seqno, accepted_mc_block_id) = self
+            .group_impl
             .execute_sync(|group_impl| {
-                sync_last_accepted_mc_seqno_from_applied_top(group_impl, &applied_top);
+                sync_last_notified_mc_finalized_seqno(group_impl, &applied_top);
+                // C++ parity (block-validator.cpp):
+                // BlockFinalizedInMasterchain ignores seqno 0 for accepted-head progression.
+                if !(group_impl.shard.is_masterchain() && applied_top.seq_no == 0) {
+                    sync_last_accepted_mc_head_from_block(group_impl, &applied_top);
+                }
                 if let Some(ref session) = group_impl.session {
                     session.notify_mc_finalized(applied_top);
                 }
+                (group_impl.last_accepted_mc_seqno, group_impl.last_accepted_mc_block_id.clone())
             })
             .await;
+        self.publish_accepted_mc_seqno(accepted_mc_seqno);
+        self.publish_accepted_mc_head(accepted_mc_block_id);
     }
 
     pub fn is_collating(&self) -> bool {
@@ -866,6 +1087,22 @@ impl ValidatorGroup {
                     }
                 })
                 .await;
+            self.publish_accepted_mc_seqno(
+                self.group_impl.execute_sync(|group_impl| group_impl.last_accepted_mc_seqno).await,
+            );
+            self.publish_accepted_mc_head(
+                self.group_impl
+                    .execute_sync(|group_impl| group_impl.last_accepted_mc_block_id.clone())
+                    .await,
+            );
+
+            if matches!(self.consensus_options, ConsensusOptions::Simplex(_)) {
+                // Bind cache backend only for simplex sessions.
+                // Catchain mode must not request non-finalized parents via simplex.
+                self.state_resolver_cache.lock().await.set_backend(
+                    Arc::downgrade(&self) as Weak<dyn ResolverBackend>,
+                );
+            }
         });
         Ok(())
     }
@@ -973,6 +1210,32 @@ impl ValidatorGroup {
         self.group_impl.execute_sync(|group_impl| group_impl.info()).await
     }
 
+    pub async fn on_candidate_observed(
+        &self,
+        block_id: BlockIdExt,
+        data: BlockPayloadPtr,
+        collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    ) {
+        log::info!(
+            target: "simplex_resolver",
+            "ValidatorGroup::on_candidate_observed session_id={:x} shard={} block_id={} parent_ready={} local_collated={} body_present={}",
+            self.session_id,
+            self.shard,
+            block_id,
+            flags.parent_ready,
+            flags.local_collated,
+            flags.body_present,
+        );
+
+        self.state_resolver_cache.lock().await.upsert_observed_candidate(
+            block_id,
+            data,
+            collated_data,
+            flags,
+        );
+    }
+
     pub async fn on_generate_slot(
         &self,
         source_info: validator_session::BlockSourceInfo,
@@ -1024,6 +1287,36 @@ impl ValidatorGroup {
             .await;
         let min_ts = min_ts.max(request.get_creation_time());
 
+        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
+        if is_simplex {
+            match &parent {
+                CollationParentHint::Implicit => {
+                    panic!(
+                        "ValidatorGroup::on_generate_slot: Simplex must not use implicit collation parents"
+                    );
+                }
+                CollationParentHint::Explicit(parent_block_ids) => {
+                    assert!(
+                        !parent_block_ids.is_empty() && parent_block_ids.len() <= 2,
+                        "ValidatorGroup::on_generate_slot: Simplex explicit parents must contain one or two block ids"
+                    );
+                    for parent_block_id in parent_block_ids {
+                        self.state_resolver_cache.lock().await.request_availability(
+                            parent_block_id,
+                            ResolverPurpose::SimplexCollationParent,
+                        );
+                        log::info!(
+                            target: "simplex_resolver",
+                            "ValidatorGroup::on_generate_slot session_id={:x} shard={} explicit_parent={} requested_availability=true",
+                            self.session_id,
+                            self.shard,
+                            parent_block_id,
+                        );
+                    }
+                }
+            }
+        }
+
         if !is_collator && self.is_accelerated_consensus_enabled {
             log::info!(
                 target: "validator",
@@ -1046,6 +1339,10 @@ impl ValidatorGroup {
 
         let prev_block_ids = match &parent {
             CollationParentHint::Implicit => {
+                assert!(
+                    !is_simplex,
+                    "ValidatorGroup::on_generate_slot: Simplex must not use implicit collation parents"
+                );
                 if let Some(prev_id) = pipeline_context.last_id() {
                     // Construct prev_block_ids for precollations (accelerated consensus).
                     PrevBlockHistory::with_id(prev_id.clone())
@@ -1058,68 +1355,55 @@ impl ValidatorGroup {
                     prev_block_ids
                 }
             }
-            CollationParentHint::Explicit(parent_id) => {
-                // Simplex explicit-parent collation: parent is locked by consensus layer.
-                //
-                // Invariant: explicit parent must not be "too old" vs local progress.
-                // - last_committed_seqno: from `prev_block_ids` (finalized/committed head)
-                // - last_collated_seqno: from `pipeline_context` (accelerated consensus), if any
-                //
-                // With notarized-parent collation, the parent
-                // can be *ahead* of last_committed_seqno (notarized but not yet finalized).
-                // This is expected and allowed. The guard only rejects parents that are *behind*
-                // our current collation head (going backward).
-                let last_committed_seqno =
-                    prev_block_ids.get_next_seqno().and_then(|n| n.checked_sub(1)).unwrap_or(0);
-
-                let last_collated_seqno =
-                    pipeline_context.last_id().map(|id| id.seq_no).unwrap_or(last_committed_seqno);
-
-                let min_allowed_parent_seqno = max(last_committed_seqno, last_collated_seqno);
-
-                if parent_id.shard() != &shard {
-                    log::error!(
-                        target: "validator",
-                        "ValidatorGroup::on_generate_slot: explicit parent shard mismatch \
-                        (round={}, request_id={}, expected_shard={}, parent={})",
-                        round,
-                        request_id,
-                        shard,
-                        parent_id
-                    );
+            CollationParentHint::Explicit(parent_ids) => {
+                if parent_ids.is_empty() || parent_ids.len() > 2 {
                     self.is_collating.store(false, Ordering::Release);
-                    callback(Err(error!("Explicit parent shard mismatch")));
+                    callback(Err(error!("Explicit parents must contain one or two block ids")));
                     return;
                 }
-
-                if parent_id.seq_no < min_allowed_parent_seqno {
-                    log::error!(
-                        target: "validator",
-                        "ValidatorGroup::on_generate_slot: explicit parent is too old \
-                        (round={}, request_id={}, parent_seqno={}, min_allowed_seqno={}, committed_seqno={}, collated_seqno={}, parent={})",
-                        round,
-                        request_id,
-                        parent_id.seq_no,
-                        min_allowed_parent_seqno,
-                        last_committed_seqno,
-                        last_collated_seqno,
-                        parent_id
-                    );
-                    self.is_collating.store(false, Ordering::Release);
-                    callback(Err(error!("Explicit parent is too old")));
-                    return;
-                }
-
                 log::trace!(
                     target: "validator",
-                    "ValidatorGroup::on_generate_slot: using explicit parent \
-                    (round={}, request_id={}, parent={})",
+                    "ValidatorGroup::on_generate_slot: using explicit parents \
+                    (round={}, request_id={}, parents={})",
                     round,
                     request_id,
-                    parent_id
+                    prevs_to_string(parent_ids)
                 );
 
-                PrevBlockHistory::with_id(parent_id.clone())
+                if is_simplex {
+                    PrevBlockHistory::with_prevs(&shard, parent_ids.clone())
+                } else {
+                    let last_committed_seqno =
+                        prev_block_ids.get_next_seqno().and_then(|n| n.checked_sub(1)).unwrap_or(0);
+                    let last_collated_seqno = pipeline_context
+                        .last_id()
+                        .map(|id| id.seq_no)
+                        .unwrap_or(last_committed_seqno);
+                    let min_allowed_parent_seqno =
+                        std::cmp::max(last_committed_seqno, last_collated_seqno);
+                    let explicit_parent_seqno =
+                        parent_ids.iter().map(|id| id.seq_no).max().unwrap_or(last_committed_seqno);
+
+                    if explicit_parent_seqno < min_allowed_parent_seqno {
+                        log::error!(
+                            target: "validator",
+                            "ValidatorGroup::on_generate_slot: explicit parents are too old \
+                            (round={}, request_id={}, parent_seqno={}, min_allowed_seqno={}, committed_seqno={}, collated_seqno={}, parents={})",
+                            round,
+                            request_id,
+                            explicit_parent_seqno,
+                            min_allowed_parent_seqno,
+                            last_committed_seqno,
+                            last_collated_seqno,
+                            prevs_to_string(parent_ids)
+                        );
+                        self.is_collating.store(false, Ordering::Release);
+                        callback(Err(error!("Explicit parents are too old")));
+                        return;
+                    }
+
+                    PrevBlockHistory::with_prevs(&shard, parent_ids.clone())
+                }
             }
         };
 
@@ -1142,6 +1426,7 @@ impl ValidatorGroup {
         let local_key = self.local_key.clone();
         let validator_set = self.validator_set.clone(); //TODO: optimize
         let group_impl = self.group_impl.clone();
+        let state_resolver_cache = self.state_resolver_cache.clone();
         let last_collation_time = self.last_collation_time.clone();
         let is_collating = self.is_collating.clone();
         let max_precollated_blocks = match &self.consensus_options {
@@ -1155,7 +1440,8 @@ impl ValidatorGroup {
         let request_clone = request.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
-        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
+        let collate_pipeline_context =
+            if is_simplex { PipelineContext::new() } else { pipeline_context.clone() };
 
         let collation_task = tokio::spawn(async move {
             log::info!(
@@ -1178,106 +1464,147 @@ impl ValidatorGroup {
             // SIMPLEX_ROUNDLESS: bypass collation round check for Simplex
             // When round == SIMPLEX_ROUNDLESS, skip the expected_collation_round validation
             let is_roundless = is_simplex_roundless(round);
-            let (result, result_message) = if is_roundless || round == expected_collation_round {
-                let (result, new_state_n_block, result_message) = match mm_block_id {
-                    Some(mc) => {
-                        match run_collate_query(
-                            shard.clone(),
-                            min_ts,
-                            mc.seq_no,
-                            &prev_block_ids,
-                            pipeline_context,
-                            local_key,
-                            validator_set.clone(),
-                            engine.clone(),
-                            is_simplex,
-                        )
-                        .await
-                        {
-                            Ok((candidate, new_state, new_block, block_root)) => {
-                                let now = UnixTime::now();
-                                last_collation_time.fetch_max(now, Ordering::Relaxed);
 
-                                // Send block candidate broadcast if conditions are met
-                                // Note: For SIMPLEX_ROUNDLESS, first_block_round check may not apply
-                                if need_send_candidate_broadcast(&source_info, is_masterchain) {
-                                    let validator_set_hash = ValidatorSet::calc_subset_hash_short(
-                                        validator_set.list(),
-                                        cc_seqno,
-                                    )
-                                    .unwrap_or(0);
+            // C++ parity: bounded collation deadline (10s from validator-group.cpp /
+            // collation-manager.cpp). On timeout, report failure and clear is_collating
+            // so the next request can proceed.
+            let collation_future = async {
+                if is_roundless || round == expected_collation_round {
+                    let (result, new_state_n_block, result_message) = match mm_block_id {
+                        Some(mc) => {
+                            match run_collate_query(
+                                shard.clone(),
+                                min_ts,
+                                mc.seq_no,
+                                &prev_block_ids,
+                                collate_pipeline_context,
+                                state_resolver_cache.clone(),
+                                local_key,
+                                validator_set.clone(),
+                                engine.clone(),
+                                is_simplex,
+                            )
+                            .await
+                            {
+                                Ok((candidate, new_state, new_block, block_root)) => {
+                                    let now = UnixTime::now();
+                                    last_collation_time.fetch_max(now, Ordering::Relaxed);
 
-                                    if let Err(e) = engine
-                                        .send_block_candidate_broadcast(
-                                            &candidate.id,
-                                            cc_seqno,
-                                            validator_set_hash,
-                                            &block_root,
-                                        )
-                                        .await
-                                    {
-                                        log::warn!(
-                                            target: "validator",
-                                            "({next_block_descr}): Failed to send block candidate broadcast after collation: {}",
-                                            e
-                                        );
-                                    } else {
-                                        log::debug!(
-                                            target: "validator",
-                                            "({next_block_descr}): Sent block candidate broadcast after collation"
-                                        );
+                                    if need_send_candidate_broadcast(&source_info, is_masterchain) {
+                                        let validator_set_hash =
+                                            ValidatorSet::calc_subset_hash_short(
+                                                validator_set.list(),
+                                                cc_seqno,
+                                            )
+                                            .unwrap_or(0);
+
+                                        if let Err(e) = engine
+                                            .send_block_candidate_broadcast(
+                                                &candidate.id,
+                                                cc_seqno,
+                                                validator_set_hash,
+                                                &block_root,
+                                            )
+                                            .await
+                                        {
+                                            log::warn!(
+                                                target: "validator",
+                                                "({next_block_descr}): Failed to send block candidate broadcast after collation: {}",
+                                                e
+                                            );
+                                        } else {
+                                            log::debug!(
+                                                target: "validator",
+                                                "({next_block_descr}): Sent block candidate broadcast after collation"
+                                            );
+                                        }
                                     }
+
+                                    let new_state_n_block = Some((new_state, new_block));
+
+                                    (
+                                        Ok(candidate),
+                                        new_state_n_block,
+                                        "Collation successful".to_string(),
+                                    )
                                 }
-
-                                let new_state_n_block = Some((new_state, new_block));
-
-                                (
-                                    Ok(candidate),
-                                    new_state_n_block,
-                                    "Collation successful".to_string(),
-                                )
-                            }
-                            Err(err) => {
-                                let err_msg = format!("Collation failed: `{}`", err);
-                                (Err(err), None, err_msg)
+                                Err(err) => {
+                                    let err_msg = format!("Collation failed: `{}`", err);
+                                    (Err(err), None, err_msg)
+                                }
                             }
                         }
-                    }
-                    None => (
-                        Err(error!("Min masterchain block id missing")),
-                        None,
-                        "Collation failed: Min masterchain block id missing".to_string(),
-                    ),
-                };
+                        None => (
+                            Err(error!("Min masterchain block id missing")),
+                            None,
+                            "Collation failed: Min masterchain block id missing".to_string(),
+                        ),
+                    };
 
-                if let Some((new_state, new_block)) = new_state_n_block {
-                    group_impl
-                        .execute_sync(|group_impl| {
-                            // SIMPLEX_ROUNDLESS: don't advance expected_collation_round
-                            // Simplex uses seqno-based tracking, not round-based
-                            if !is_roundless {
-                                group_impl.expected_collation_round = round + 1;
-                            }
+                    if let Some((new_state, new_block)) = new_state_n_block {
+                        group_impl
+                            .execute_sync(|group_impl| {
+                                if !is_roundless {
+                                    group_impl.expected_collation_round = round + 1;
+                                }
 
-                            if group_impl.is_pipeline_context_enabled {
-                                group_impl.pipeline_context.add(
-                                    new_state,
-                                    new_block,
-                                    max_precollated_blocks,
+                                if group_impl.is_pipeline_context_enabled {
+                                    group_impl.pipeline_context.add(
+                                        new_state.clone(),
+                                        new_block.clone(),
+                                        max_precollated_blocks,
+                                    );
+                                }
+                            })
+                            .await;
+
+                        if is_simplex {
+                            let candidate_for_cache =
+                                result.as_ref().ok().cloned().expect(
+                                    "Simplex successful collation must produce a candidate",
                                 );
-                            }
-                        })
-                        .await;
+                            let mut cache = state_resolver_cache.lock().await;
+                            cache.upsert_observed_candidate(
+                                candidate_for_cache.id.clone(),
+                                candidate_for_cache.data.clone(),
+                                candidate_for_cache.collated_data.clone(),
+                                CandidateObservedFlags {
+                                    body_present: true,
+                                    parent_ready: true,
+                                    local_collated: true,
+                                },
+                            );
+                            cache.store_validated_state(&candidate_for_cache.id, new_state);
+                        }
+                    }
+
+                    (result, result_message)
+                } else {
+                    let result_message = format!(
+                        "round {} != expected_collation_round {}. Collation sequence violation",
+                        round, expected_collation_round
+                    );
+
+                    (Err(anyhow::anyhow!(result_message.clone())), result_message)
                 }
+            };
 
-                (result, result_message)
-            } else {
-                let result_message = format!(
-                    "round {} != expected_collation_round {}. Collation sequence violation",
-                    round, expected_collation_round
-                );
-
-                (Err(anyhow::anyhow!(result_message.clone())), result_message)
+            let (result, result_message) = match tokio::time::timeout(
+                COLLATION_TIMEOUT,
+                collation_future,
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    metrics::counter!("simplex_collation_timeout").increment(1);
+                    let msg = format!("Collation timed out after {:?}", COLLATION_TIMEOUT);
+                    log::warn!(
+                        target: "validator",
+                        "({next_block_descr}): ValidatorGroup::on_generate_slot: {round_info}, {msg}"
+                    );
+                    (Err(error!("{}", msg)), msg)
+                }
             };
 
             log::info!(
@@ -1287,7 +1614,6 @@ impl ValidatorGroup {
 
             callback(result);
 
-            // Reset the collating flag
             is_collating.store(false, Ordering::Release);
         });
 
@@ -1352,34 +1678,37 @@ impl ValidatorGroup {
         let engine = self.engine.clone();
         let validator_set = self.validator_set.clone();
         let shard = self.shard().clone();
+        let state_resolver_cache = self.state_resolver_cache.clone();
         let general_session_info = self.general_session_info.clone();
         let session_id = self.session_id.clone();
         let last_validation_time = self.last_validation_time.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
         let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
-        let (
-            expected_current_round,
-            prev_block_ids,
-            pipeline_context,
-            mc_block_id_opt,
-            min_ts,
-            last_accepted_mc_seqno,
-        ) = group_impl
-            .execute_sync(|group_impl| {
-                (
-                    group_impl.expected_current_round,
-                    group_impl.prev_block_ids.clone(),
-                    group_impl.pipeline_context.clone(), //TODO: optimize
-                    group_impl.min_masterchain_block_id.clone(),
-                    group_impl.min_ts,
-                    group_impl.last_accepted_mc_seqno,
-                )
-            })
-            .await;
+        let (expected_current_round, prev_block_ids, pipeline_context, mc_block_id_opt, min_ts) =
+            group_impl
+                .execute_sync(|group_impl| {
+                    (
+                        group_impl.expected_current_round,
+                        group_impl.prev_block_ids.clone(),
+                        group_impl.pipeline_context.clone(), //TODO: optimize
+                        group_impl.min_masterchain_block_id.clone(),
+                        group_impl.min_ts,
+                    )
+                })
+                .await;
+        let accepted_mc_block_rx = self.accepted_mc_block_tx.subscribe();
 
         let validation_task = tokio::spawn(async move {
-            let validation_result = async {
+            // C++ parity: bounded validation deadline.
+            // Simplex: 60s (block-validator.cpp), legacy: 15s (validator-group.cpp).
+            let deadline = if use_candidate_native {
+                SIMPLEX_VALIDATION_TIMEOUT
+            } else {
+                LEGACY_VALIDATION_TIMEOUT
+            };
+
+            let validation_result = tokio::time::timeout(deadline, async {
                 if use_candidate_native {
                     // ---- Simplex candidate-native validation path ----
                     //
@@ -1397,33 +1726,27 @@ impl ValidatorGroup {
                         );
                     }
 
-                    // MC fork prevention (C++ block-validator.cpp, commit 9aac62b8):
-                    // Reject MC candidates whose parent is behind our last accepted MC block.
-                    if is_masterchain {
-                        let prev_ids = info.read_prev_ids()?;
-                        let candidate_parent_seqno =
-                            prev_ids.first().map(|id| id.seq_no).unwrap_or(0);
-                        if should_reject_stale_mc_candidate(
-                            last_accepted_mc_seqno,
-                            candidate_parent_seqno,
-                        ) {
-                            metrics::counter!("simplex_mc_fork_prevention_rejected").increment(1);
-                            fail!(
-                                "MC fork prevention: candidate {} builds upon seqno {} \
-                                 but we already accepted seqno {}",
-                                root_hash.to_hex_string(),
-                                candidate_parent_seqno,
-                                last_accepted_mc_seqno.unwrap_or(0)
-                            );
-                        }
-                    }
-
                     let candidate_block_id = BlockIdExt::with_params(
                         info.shard().clone(),
                         info.seq_no(),
                         root_hash.clone(),
                         get_hash(&candidate.data),
                     );
+
+                    // MC fork prevention (C++ block-validator.cpp, commit 9aac62b8):
+                    // Wait until the accepted MC head reaches the candidate parent, then
+                    // reject stale branches if we have already moved past that parent.
+                    if is_masterchain {
+                        let prev_ids = info.read_prev_ids()?;
+                        if let Some(candidate_parent_block_id) = prev_ids.first() {
+                            wait_for_mc_validation_parent(
+                                accepted_mc_block_rx.clone(),
+                                &candidate_block_id,
+                                candidate_parent_block_id,
+                            )
+                            .await?;
+                        }
+                    }
 
                     // Obsolete candidate guard (parity with legacy path)
                     let last_applied_block_opt = if general_session_info.shard.is_masterchain() {
@@ -1464,6 +1787,7 @@ impl ValidatorGroup {
                         candidate.clone(),
                         engine.clone(),
                         pipeline_context,
+                        state_resolver_cache.clone(),
                         is_simplex,
                     )
                     .await?;
@@ -1564,8 +1888,23 @@ impl ValidatorGroup {
                     )
                     .await
                 }
-            }
+            })
             .await;
+
+            // Convert timeout to a validation failure so Simplex retry machinery
+            // clears pending_approve and reschedules.
+            let validation_result: Result<SystemTime> = match validation_result {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    metrics::counter!("simplex_validation_timeout").increment(1);
+                    log::warn!(
+                        target: "validator",
+                        "({next_block_descr}): ValidatorGroup::on_candidate: {candidate_id}, \
+                         validation timed out after {deadline:?}"
+                    );
+                    Err(error!("validation timed out after {:?}", deadline))
+                }
+            };
 
             let validation_result_message = match &validation_result {
                 Ok(completion_time) => {
@@ -1747,7 +2086,7 @@ impl ValidatorGroup {
         )
         .await;
 
-        let (full_result, new_prevs) = self
+        let (full_result, new_prevs, accepted_mc_seqno, accepted_mc_block_id) = self
             .group_impl
             .execute_sync(|group_impl| {
                 let full_result = match result {
@@ -1786,13 +2125,20 @@ impl ValidatorGroup {
                 };
 
                 if full_result.is_ok() {
-                    sync_last_accepted_mc_seqno_from_applied_top(group_impl, &next_block_id);
+                    sync_last_accepted_mc_head_from_block(group_impl, &next_block_id);
                     group_impl.prev_block_ids.update_prev(vec![next_block_id]);
                 }
 
-                (full_result, group_impl.prev_block_ids.display_prevs())
+                (
+                    full_result,
+                    group_impl.prev_block_ids.display_prevs(),
+                    group_impl.last_accepted_mc_seqno,
+                    group_impl.last_accepted_mc_block_id.clone(),
+                )
             })
             .await;
+        self.publish_accepted_mc_seqno(accepted_mc_seqno);
+        self.publish_accepted_mc_head(accepted_mc_block_id);
 
         match full_result {
             Ok(()) => log::info!(
@@ -1851,16 +2197,47 @@ impl ValidatorGroup {
             return;
         }
 
+        self.state_resolver_cache.lock().await.prune_finalized(&block_id);
+
         // Important: do not block ValidationAction queue on out-of-order acceptance.
         // This path can involve downloads/apply and must run in detached task.
         let engine = self.engine.clone();
         let validator_set = self.validator_set.clone();
         let group_impl = self.group_impl.clone();
+        let accepted_mc_seqno_tx = self.accepted_mc_seqno_tx.clone();
+        let accepted_mc_block_tx = self.accepted_mc_block_tx.clone();
         let local_key = self.local_key.clone();
         let source_id = source.id().clone();
         let data_vec = data.data().to_vec();
         let data_opt = if data_vec.is_empty() { None } else { Some(data_vec) };
         let we_generated = source.id() == local_key.id();
+        let block_seqno = block_id.seq_no;
+        let (send_block_broadcast, last_notified_mc_finalized_seqno) = self
+            .group_impl
+            .execute_sync(|group_impl| {
+                let suppress = should_suppress_stale_finalized_rebroadcast(
+                    group_impl.last_notified_mc_finalized_seqno,
+                    block_seqno,
+                );
+                (we_generated && !suppress, group_impl.last_notified_mc_finalized_seqno)
+            })
+            .await;
+        if we_generated
+            && !send_block_broadcast
+            && should_suppress_stale_finalized_rebroadcast(
+                last_notified_mc_finalized_seqno,
+                block_seqno,
+            )
+        {
+            log::debug!(
+                target: "validator",
+                "ValidatorGroup::on_block_finalized: suppressed stale rebroadcast for {} \
+                 (block_seqno={}, last_notified_mc_finalized_seqno={})",
+                block_id,
+                block_seqno,
+                last_notified_mc_finalized_seqno.unwrap_or(0),
+            );
+        }
         metrics::counter!("ton_node_validator_finalized_received_total", "consensus" => "simplex")
             .increment(1);
 
@@ -1922,7 +2299,7 @@ impl ValidatorGroup {
                 validator_set,
                 signatures,
                 approve_sig_set,
-                we_generated,
+                send_block_broadcast,
                 engine,
             )
             .await;
@@ -1935,11 +2312,17 @@ impl ValidatorGroup {
                         accepted block_id={block_id} source={source_id} round={round}"
                     );
 
-                    group_impl
+                    let (accepted_mc_seqno, accepted_mc_block_id) = group_impl
                         .execute_sync(|group_impl| {
-                            sync_last_accepted_mc_seqno_from_applied_top(group_impl, &block_id);
+                            sync_last_accepted_mc_head_from_block(group_impl, &block_id);
+                            (
+                                group_impl.last_accepted_mc_seqno,
+                                group_impl.last_accepted_mc_block_id.clone(),
+                            )
                         })
                         .await;
+                    accepted_mc_seqno_tx.send_replace(accepted_mc_seqno);
+                    accepted_mc_block_tx.send_replace(accepted_mc_block_id);
                 }
                 Err(err) => {
                     log::error!(
@@ -2052,289 +2435,5 @@ impl Drop for ValidatorGroup {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ton_block::KeyId;
-
-    fn make_group_impl_for_start_tests() -> ValidatorGroupImpl {
-        ValidatorGroupImpl::new(
-            &KeyId::from_data([0u8; 32]),
-            ShardIdent::masterchain(),
-            1,
-            UInt256::default(),
-            false,
-            false,
-            ConsensusType::Catchain,
-        )
-    }
-
-    #[test]
-    fn test_mc_fork_prevention_none_allows() {
-        assert!(!should_reject_stale_mc_candidate(None, 0));
-        assert!(!should_reject_stale_mc_candidate(None, 100));
-    }
-
-    #[test]
-    fn test_mc_fork_prevention_equal_allows() {
-        assert!(!should_reject_stale_mc_candidate(Some(10), 10));
-    }
-
-    #[test]
-    fn test_mc_fork_prevention_ahead_allows() {
-        assert!(!should_reject_stale_mc_candidate(Some(10), 11));
-        assert!(!should_reject_stale_mc_candidate(Some(10), 100));
-    }
-
-    #[test]
-    fn test_mc_fork_prevention_stale_rejects() {
-        assert!(should_reject_stale_mc_candidate(Some(10), 9));
-        assert!(should_reject_stale_mc_candidate(Some(10), 0));
-        assert!(should_reject_stale_mc_candidate(Some(100), 50));
-    }
-
-    #[test]
-    fn test_sync_last_accepted_mc_seqno_from_applied_top_is_monotonic() {
-        let mut group = make_group_impl_for_start_tests();
-
-        let top10 = BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            10,
-            UInt256::from([0x11; 32]),
-            UInt256::from([0x12; 32]),
-        );
-        sync_last_accepted_mc_seqno_from_applied_top(&mut group, &top10);
-        assert_eq!(group.last_accepted_mc_seqno, Some(10));
-
-        let top7 = BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            7,
-            UInt256::from([0x21; 32]),
-            UInt256::from([0x22; 32]),
-        );
-        sync_last_accepted_mc_seqno_from_applied_top(&mut group, &top7);
-        assert_eq!(group.last_accepted_mc_seqno, Some(10));
-
-        let top11 = BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            11,
-            UInt256::from([0x31; 32]),
-            UInt256::from([0x32; 32]),
-        );
-        sync_last_accepted_mc_seqno_from_applied_top(&mut group, &top11);
-        assert_eq!(group.last_accepted_mc_seqno, Some(11));
-    }
-
-    #[test]
-    fn test_prepare_start_immediate_keeps_created_and_marks_pending() {
-        let mut group = make_group_impl_for_start_tests();
-
-        assert!(group.prepare_start());
-        assert!(group.status == ValidatorGroupStatus::Created);
-        assert!(group.start_pending);
-    }
-
-    #[test]
-    fn test_prepare_start_keeps_created_status() {
-        let mut group = make_group_impl_for_start_tests();
-
-        assert!(group.prepare_start());
-        assert!(group.status == ValidatorGroupStatus::Created);
-        assert!(group.start_pending);
-    }
-
-    #[test]
-    fn test_prepare_start_rejects_duplicate_pending_start() {
-        let mut group = make_group_impl_for_start_tests();
-
-        assert!(group.prepare_start());
-        assert!(!group.prepare_start());
-        assert!(group.status == ValidatorGroupStatus::Created);
-        assert!(group.start_pending);
-    }
-
-    #[test]
-    fn test_reset_after_start_failure_restores_retryable_state() {
-        let mut group = make_group_impl_for_start_tests();
-
-        assert!(group.prepare_start());
-        group.reset_after_start_failure();
-
-        assert!(group.status == ValidatorGroupStatus::Created);
-        assert!(!group.start_pending);
-        assert!(group.session.is_none());
-    }
-
-    // --- Status ordering / transition table tests (WS6) ---
-
-    #[test]
-    fn test_status_ordering_is_monotonic() {
-        let states = [
-            ValidatorGroupStatus::Created,
-            ValidatorGroupStatus::EngineCreated,
-            ValidatorGroupStatus::Sync,
-            ValidatorGroupStatus::Active,
-            ValidatorGroupStatus::Stopping,
-            ValidatorGroupStatus::Stopped,
-        ];
-        for i in 0..states.len() {
-            for j in i + 1..states.len() {
-                assert!(states[i] < states[j], "{} must be < {}", states[i], states[j]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_before_allows_forward_transitions() {
-        let created = ValidatorGroupStatus::Created;
-        let engine_created = ValidatorGroupStatus::EngineCreated;
-        let sync = ValidatorGroupStatus::Sync;
-        let active = ValidatorGroupStatus::Active;
-        let stopping = ValidatorGroupStatus::Stopping;
-
-        assert!(created.before(&engine_created));
-        assert!(engine_created.before(&sync));
-        assert!(sync.before(&active));
-        assert!(active.before(&stopping));
-    }
-
-    #[test]
-    fn test_before_rejects_backward_transitions() {
-        let sync = ValidatorGroupStatus::Sync;
-        let active = ValidatorGroupStatus::Active;
-        let created = ValidatorGroupStatus::Created;
-
-        assert!(!active.before(&sync));
-        assert!(!sync.before(&created));
-    }
-
-    #[test]
-    fn test_engine_created_state_between_created_and_sync() {
-        let created = ValidatorGroupStatus::Created;
-        let engine_created = ValidatorGroupStatus::EngineCreated;
-        let sync = ValidatorGroupStatus::Sync;
-
-        assert!(created < engine_created);
-        assert!(engine_created < sync);
-        assert!(created.before(&engine_created));
-        assert!(engine_created.before(&sync));
-    }
-
-    #[test]
-    fn test_prepare_start_accepts_engine_created_state() {
-        let mut group = make_group_impl_for_start_tests();
-        group.status = ValidatorGroupStatus::EngineCreated;
-
-        assert!(group.prepare_start());
-        assert!(group.status == ValidatorGroupStatus::EngineCreated);
-        assert!(group.start_pending);
-    }
-
-    #[test]
-    fn test_prepare_start_rejects_sync_and_later_states() {
-        for status in [
-            ValidatorGroupStatus::Sync,
-            ValidatorGroupStatus::Active,
-            ValidatorGroupStatus::Stopping,
-            ValidatorGroupStatus::Stopped,
-        ] {
-            let mut group = make_group_impl_for_start_tests();
-            group.status = status;
-            assert!(!group.prepare_start(), "prepare_start should reject status {}", status);
-        }
-    }
-
-    // --- Stale-future culling predicate tests (mirrors manager.cpp equal+related) ---
-
-    /// Reproduces the stale-future culling predicate from validator_manager.rs
-    /// to verify correctness in isolation with various shard topologies.
-    fn should_cull_future(
-        active_shard: &ShardIdent,
-        active_cc: u32,
-        future_shard: &ShardIdent,
-        future_cc: u32,
-    ) -> bool {
-        let shards_equal = active_shard == future_shard;
-        let shards_related = active_shard.is_ancestor_for(future_shard)
-            || future_shard.is_ancestor_for(active_shard);
-        let equal_condition = shards_equal && active_cc >= future_cc;
-        let related_condition = shards_related && active_cc > future_cc;
-        equal_condition || related_condition
-    }
-
-    #[test]
-    fn test_cull_same_shard_equal_seqno() {
-        let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
-        assert!(should_cull_future(&shard, 5, &shard, 5));
-    }
-
-    #[test]
-    fn test_cull_same_shard_higher_active_seqno() {
-        let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
-        assert!(should_cull_future(&shard, 6, &shard, 5));
-    }
-
-    #[test]
-    fn test_no_cull_same_shard_lower_active_seqno() {
-        let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
-        assert!(!should_cull_future(&shard, 4, &shard, 5));
-    }
-
-    #[test]
-    fn test_cull_ancestor_shard_higher_seqno() {
-        let parent = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
-        let child = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
-        assert!(parent.is_ancestor_for(&child));
-        assert!(should_cull_future(&parent, 6, &child, 5));
-    }
-
-    #[test]
-    fn test_cull_descendant_shard_higher_seqno() {
-        let parent = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
-        let child = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
-        assert!(should_cull_future(&child, 6, &parent, 5));
-    }
-
-    #[test]
-    fn test_no_cull_related_shard_equal_seqno() {
-        let parent = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
-        let child = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
-        // For related (non-equal) shards, the condition is strict >
-        assert!(!should_cull_future(&parent, 5, &child, 5));
-    }
-
-    #[test]
-    fn test_no_cull_unrelated_shards() {
-        let shard_a = ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap();
-        let shard_b = ShardIdent::with_tagged_prefix(0, 0xC000_0000_0000_0000).unwrap();
-        assert!(!shard_a.is_ancestor_for(&shard_b));
-        assert!(!shard_b.is_ancestor_for(&shard_a));
-        assert!(!should_cull_future(&shard_a, 100, &shard_b, 1));
-    }
-
-    #[test]
-    fn test_no_cull_different_workchain() {
-        let shard_wc0 = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
-        let shard_wc1 = ShardIdent::with_tagged_prefix(1, 0x8000_0000_0000_0000).unwrap();
-        assert!(!should_cull_future(&shard_wc0, 10, &shard_wc1, 5));
-    }
-
-    #[test]
-    fn test_metric_label_covers_all_states() {
-        let states = vec![
-            (ValidatorGroupStatus::Created, "created"),
-            (ValidatorGroupStatus::EngineCreated, "engine_created"),
-            (ValidatorGroupStatus::Sync, "sync"),
-            (ValidatorGroupStatus::Active, "active"),
-            (ValidatorGroupStatus::Stopping, "stopping"),
-            (ValidatorGroupStatus::Stopped, "stopped"),
-        ];
-        for (status, expected_label) in states {
-            assert_eq!(
-                status.metric_label(),
-                expected_label,
-                "metric_label mismatch for {}",
-                status
-            );
-        }
-    }
-}
+#[path = "tests/test_validator_group.rs"]
+mod tests;

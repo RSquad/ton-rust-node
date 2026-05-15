@@ -8,13 +8,13 @@
  */
 use crate::{
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory,
-    storage::utils,
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
+    storage::hashicorp_token_provider::{create_token_provider, AuthConfig, TokenProvider},
     types::{metadata::Metadata, secret::Secret, store_mode::StoreMode},
 };
 use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use zeroize::Zeroize;
 
 #[allow(dead_code)]
@@ -188,14 +188,41 @@ pub struct KVReadResponse<T> {
     pub data: KVDataWrapper<T>,
 }
 
+pub const DEFAULT_TRANSIT_MOUNT: &str = "transit";
+pub const DEFAULT_KV_MOUNT: &str = "secret";
+
+pub struct VaultConfig {
+    pub namespace: Option<String>,
+    pub transit_mount: String,
+    pub transit_prefix: Option<String>,
+    pub kv_mount: String,
+    pub kv_prefix: Option<String>,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            namespace: None,
+            transit_mount: DEFAULT_TRANSIT_MOUNT.to_string(),
+            transit_prefix: None,
+            kv_mount: DEFAULT_KV_MOUNT.to_string(),
+            kv_prefix: None,
+        }
+    }
+}
+
 pub struct Client {
     client: reqwest::Client,
     addr: String,
-    token: ProtectedMemory,
+    token_provider: Arc<dyn TokenProvider>,
+    transit_mount: String,
+    transit_prefix: Option<String>,
+    kv_mount: String,
+    kv_prefix: Option<String>,
 }
 
 impl Client {
-    pub fn new(addr: &str, token: ProtectedMemory) -> anyhow::Result<Self> {
+    pub fn new(addr: &str, auth: AuthConfig, config: VaultConfig) -> anyhow::Result<Self> {
         let addr = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr.to_string()
         } else {
@@ -203,36 +230,64 @@ impl Client {
         };
 
         let client = reqwest::Client::new();
+        let vault_addr = format!("{addr}/v1");
+        let token_provider = create_token_provider(auth, client.clone(), &vault_addr);
 
-        Ok(Self { client, addr: format!("{addr}/v1"), token })
+        let mut this = Self {
+            client,
+            addr: vault_addr,
+            token_provider,
+            transit_mount: config.transit_mount,
+            transit_prefix: config.transit_prefix,
+            kv_mount: config.kv_mount,
+            kv_prefix: config.kv_prefix,
+        };
+
+        if let Some(namespace) = config.namespace {
+            this = this.with_namespace(&namespace);
+        }
+
+        Ok(this)
     }
 
     pub fn with_namespace(self, namespace: &str) -> Self {
         Self { addr: format!("{}/{namespace}", self.addr), ..self }
     }
 
-    pub async fn enable_transit(&self) -> anyhow::Result<()> {
-        let payload = serde_json::json!({
-            "type": "transit"
-        });
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
 
-        let url = format!("{}/sys/mounts/transit", &self.addr);
+    pub fn transit_mount_path(&self, action: &str, rest: Option<&str>) -> String {
+        match &self.transit_prefix {
+            Some(prefix) => match rest {
+                Some(rest) => {
+                    format!("{}/{}/{}/{}.{}", self.addr, self.transit_mount, action, prefix, rest)
+                }
+                None => format!("{}/{}/{}/{}", self.addr, self.transit_mount, action, prefix),
+            },
+            None => match rest {
+                Some(rest) => {
+                    format!("{}/{}/{}/{}", self.addr, self.transit_mount, action, rest)
+                }
+                None => format!("{}/{}/{}", self.addr, self.transit_mount, action),
+            },
+        }
+    }
 
-        let response: reqwest::Response =
-            self.do_request_raw_rs(reqwest::Method::POST, &url, Some(&payload)).await?;
+    pub fn kv_data_path(&self, rest: &str) -> String {
+        match &self.kv_prefix {
+            Some(prefix) => format!("{}/{}/data/{}/{}", self.addr, self.kv_mount, prefix, rest),
+            None => format!("{}/{}/data/{}", self.addr, self.kv_mount, rest),
+        }
+    }
 
-        if response.status().is_success() {
-            Ok(())
-        } else if response.status().as_u16() == 400 {
-            let error_text = response.text().await?;
-            if !error_text.contains("path is already in use") {
-                anyhow::bail!("Failed to enable transit: {error_text}");
+    pub fn kv_meta_path(&self, rest: &str) -> String {
+        match &self.kv_prefix {
+            Some(prefix) => {
+                format!("{}/{}/metadata/{}/{}", self.addr, self.kv_mount, prefix, rest)
             }
-
-            Ok(())
-        } else {
-            let error_text = response.text().await?;
-            anyhow::bail!("Failed to enable transit: {error_text}");
+            None => format!("{}/{}/metadata/{}", self.addr, self.kv_mount, rest),
         }
     }
 
@@ -243,8 +298,7 @@ impl Client {
         exportable: bool,
     ) -> anyhow::Result<()> {
         let payload = CreateKeyRequest { key_type: key_type.to_string(), exportable };
-
-        let url = format!("{}/transit/keys/{}", &self.addr, Self::escape(secret_name));
+        let url = self.transit_mount_path("keys", Some(Self::escape(secret_name).as_str()));
         let response: reqwest::Response =
             self.do_request_raw_rs(reqwest::Method::POST, &url, Some(&payload)).await?;
 
@@ -270,16 +324,12 @@ impl Client {
         key_mode: KeyMode,
     ) -> anyhow::Result<ProtectedMemory> {
         let url = match key_mode {
-            KeyMode::Encryption => {
-                format!(
-                    "{}/transit/export/encryption-key/{}",
-                    &self.addr,
-                    Self::escape(secret_name)
-                )
-            }
-            KeyMode::Signing => {
-                format!("{}/transit/export/signing-key/{}", &self.addr, Self::escape(secret_name))
-            }
+            KeyMode::Encryption => self.transit_mount_path(
+                "export/encryption-key",
+                Some(Self::escape(secret_name).as_str()),
+            ),
+            KeyMode::Signing => self
+                .transit_mount_path("export/signing-key", Some(Self::escape(secret_name).as_str())),
         };
 
         let result: ExportKeyResponse = self
@@ -305,7 +355,7 @@ impl Client {
         })?;
 
         // TODO: make b64::decode implementation without allocation
-        let key_bytes = utils::b64::decode(key_b64)?;
+        let key_bytes = base64::decode(key_b64)?;
 
         if key_bytes.len() != 64 {
             anyhow::bail!(VaultError::invalid_private_key(format!(
@@ -314,13 +364,14 @@ impl Client {
             )));
         }
 
-        let key_pd = ProtectedMemory::from_slice(key_bytes[..32].try_into().unwrap()).await?;
+        let key_pd: ProtectedMemory =
+            ProtectedMemoryInner::from_slice(key_bytes[..32].try_into().unwrap())?.into();
 
         Ok(key_pd)
     }
 
     pub async fn get_key_info(&self, secret_name: &str) -> anyhow::Result<(KeyInfo, bool)> {
-        let url = format!("{}/transit/keys/{}", &self.addr, { Self::escape(secret_name) });
+        let url = self.transit_mount_path("keys", Some(Self::escape(secret_name).as_str()));
         let mut response: KeyInfoResponse = self
             .do_request_no_body(reqwest::Method::GET, &url)
             .await?
@@ -343,7 +394,7 @@ impl Client {
         }
 
         // Get wrapping key from Vault
-        let url = format!("{}/transit/wrapping_key", &self.addr);
+        let url = format!("{}/{}/wrapping_key", &self.addr, &self.transit_mount);
         let result: WrappingKeyResponse = self
             .do_request_no_body(reqwest::Method::GET, &url)
             .await?
@@ -355,23 +406,25 @@ impl Client {
         rand::thread_rng().fill_bytes(&mut aes_key);
 
         // Get the private key data
-        let keypair = match secret {
+        let keypair = match &secret {
             Secret::SymmetricKey { .. } | Secret::Blob { .. } => {
                 anyhow::bail!(VaultError::unsupported_algorithm(secret.metadata().algorithm));
             }
             Secret::KeyPair { keypair } => keypair,
         };
-        let private_key = keypair.private_key().await?;
-        let private_key_lock = private_key.lock().await?;
-        let private_key_data: &[u8] = &private_key_lock;
 
         // Convert raw Ed25519 seed to PKCS#8 DER format
-        let signing_key =
+        let signing_key = {
+            let private_key = keypair.private_key()?;
+            let private_key_lock = private_key.lock()?;
+            let private_key_data: &[u8] = &private_key_lock;
+
             ed25519_dalek::SigningKey::from_bytes(private_key_data.try_into().map_err(|_| {
                 VaultError::encryption_failed(
                     "Invalid Ed25519 key length, expected 32 bytes".to_string(),
                 )
-            })?);
+            })?)
+        };
 
         use ed25519_dalek::pkcs8::EncodePrivateKey;
         let pkcs8_der = signing_key.to_pkcs8_der().map_err(|e| {
@@ -413,7 +466,7 @@ impl Client {
         };
 
         let request = ImportKeyRequest {
-            ciphertext: utils::b64::encode(&combined),
+            ciphertext: base64::encode(&combined),
             key_type: "ed25519".to_string(),
             exportable: secret.metadata().extractable,
             allow_replacement: Some(allow_replacement),
@@ -428,17 +481,14 @@ impl Client {
 
         let key_exists = self.get_key_info(secret_id.as_str()).await.is_ok();
         let url = if key_exists {
-            format!(
-                "{}/transit/keys/{}/import_version",
-                &self.addr,
-                Self::escape(secret_id.as_str())
-            )
+            self.transit_mount_path("keys", Some(Self::escape(secret_id.as_str()).as_str()))
+                + "/import_version"
         } else {
-            format!("{}/transit/keys/{}/import", &self.addr, Self::escape(secret_id.as_str()))
+            self.transit_mount_path("keys", Some(Self::escape(secret_id.as_str()).as_str()))
+                + "/import"
         };
 
         let response = self.do_request_raw_rs(reqwest::Method::POST, &url, Some(&request)).await?;
-
         let status = response.status();
         let response_text = response.text().await?;
 
@@ -452,7 +502,7 @@ impl Client {
     }
 
     pub async fn sign(&self, secret_name: &str, message: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let message_b64 = utils::b64::encode(message);
+        let message_b64 = base64::encode(message);
 
         let rq = SignDataRequest {
             input: message_b64.clone(),
@@ -461,14 +511,14 @@ impl Client {
             prehashed: None,
         };
 
-        let url = format!("{}/transit/sign/{}", &self.addr, Self::escape(secret_name));
+        let url = self.transit_mount_path("sign", Some(Self::escape(secret_name).as_str()));
         let result: SignDataResponse = self
             .do_request(reqwest::Method::POST, &url, Some(&rq))
             .await?
             .ok_or_else(|| VaultError::not_found(format!("URL '{}' not found (404)", url)))?;
 
         let parts: Vec<&str> = result.data.signature.split(':').collect();
-        let signature = utils::b64::decode(
+        let signature = base64::decode(
             parts.get(2).ok_or_else(|| anyhow::anyhow!("Malformed signature format from Vault"))?,
         )?;
         Ok(signature)
@@ -480,8 +530,8 @@ impl Client {
         message: &[u8],
         signature: &[u8],
     ) -> anyhow::Result<()> {
-        let message_b64 = utils::b64::encode(message);
-        let vault_signature = format!("vault:v1:{}", utils::b64::encode(signature));
+        let message_b64 = base64::encode(message);
+        let vault_signature = format!("vault:v1:{}", base64::encode(signature));
 
         let rq = VerifySignatureRequest {
             input: message_b64.clone(),
@@ -491,7 +541,7 @@ impl Client {
             prehashed: None,
         };
 
-        let url = format!("{}/transit/verify/{}", &self.addr, Self::escape(secret_name));
+        let url = self.transit_mount_path("verify", Some(Self::escape(secret_name).as_str()));
         let result: VerifySignatureResponse = self
             .do_request(reqwest::Method::POST, &url, Some(&rq))
             .await?
@@ -505,7 +555,7 @@ impl Client {
     }
 
     pub async fn list_keys(&self) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/transit/keys", &self.addr);
+        let url = self.transit_mount_path("keys", None);
         let result: Option<ListKeysResponse> =
             self.do_request_no_body(reqwest::Method::from_bytes("LIST".as_bytes())?, &url).await?;
         Ok(result.unwrap_or_default().data.keys)
@@ -513,9 +563,8 @@ impl Client {
 
     pub async fn delete_key(&self, secret_name: &str) -> anyhow::Result<()> {
         let config_url =
-            format!("{}/transit/keys/{}/config", &self.addr, Self::escape(secret_name));
+            self.transit_mount_path("keys", Some(Self::escape(secret_name).as_str())) + "/config";
         let config_request = UpdateKeyConfigRequest { deletion_allowed: Some(true) };
-
         let config_response = self
             .do_request_raw_rs(reqwest::Method::POST, &config_url, Some(&config_request))
             .await?;
@@ -529,7 +578,7 @@ impl Client {
             anyhow::bail!("Failed to enable deletion for key '{}': {}", secret_name, error_text);
         }
 
-        let delete_url = format!("{}/transit/keys/{}", &self.addr, Self::escape(secret_name));
+        let delete_url = self.transit_mount_path("keys", Some(Self::escape(secret_name).as_str()));
         let delete_response =
             self.do_request_raw_rs::<()>(reqwest::Method::DELETE, &delete_url, None).await?;
 
@@ -551,8 +600,7 @@ impl Client {
         metadata: &Metadata,
         cas: Option<u64>,
     ) -> anyhow::Result<()> {
-        let url =
-            format!("{}/secret/data/transit-metadata/{}", &self.addr, Self::escape(secret_name));
+        let url = self.kv_data_path(&format!("transit-metadata/{}", Self::escape(secret_name)));
         let mut payload = serde_json::json!({
                 "data": metadata
         });
@@ -577,8 +625,7 @@ impl Client {
     }
 
     pub async fn get_metadata(&self, secret_name: &str) -> anyhow::Result<Option<Metadata>> {
-        let url =
-            format!("{}/secret/data/transit-metadata/{}", &self.addr, Self::escape(secret_name));
+        let url = self.kv_data_path(&format!("transit-metadata/{}", Self::escape(secret_name)));
         let response = self.do_request_raw_rs::<()>(reqwest::Method::GET, &url, None).await?;
 
         let status = response.status();
@@ -597,11 +644,7 @@ impl Client {
     }
 
     pub async fn delete_metadata(&self, secret_name: &str) -> anyhow::Result<()> {
-        let url = format!(
-            "{}/secret/metadata/transit-metadata/{}",
-            &self.addr,
-            Self::escape(secret_name)
-        );
+        let url = self.kv_meta_path(&format!("transit-metadata/{}", Self::escape(secret_name)));
 
         let response = self.do_request_raw_rs::<()>(reqwest::Method::DELETE, &url, None).await?;
 
@@ -634,7 +677,7 @@ impl Client {
             }
         }
 
-        let url = format!("{}/secret/data/blobs/{}", &self.addr, Self::escape(secret_name));
+        let url = self.kv_data_path(&format!("blobs/{}", Self::escape(secret_name)));
 
         let blob_data =
             BlobData { data: data_b64.to_string(), created_at: chrono::Utc::now().to_rfc3339() };
@@ -665,7 +708,7 @@ impl Client {
     }
 
     pub async fn read_blob(&self, secret_name: &str) -> anyhow::Result<BlobData> {
-        let url = format!("{}/secret/data/blobs/{}", &self.addr, Self::escape(secret_name));
+        let url = self.kv_data_path(&format!("blobs/{}", Self::escape(secret_name)));
 
         let response = self.do_request_raw_rs::<()>(reqwest::Method::GET, &url, None).await?;
 
@@ -685,7 +728,7 @@ impl Client {
     }
 
     pub async fn delete_blob(&self, secret_name: &str) -> anyhow::Result<()> {
-        let url = format!("{}/secret/metadata/blobs/{}", &self.addr, Self::escape(secret_name));
+        let url = self.kv_meta_path(&format!("blobs/{}", Self::escape(secret_name)));
 
         let response = self.do_request_raw_rs::<()>(reqwest::Method::DELETE, &url, None).await?;
 
@@ -701,7 +744,7 @@ impl Client {
     }
 
     pub async fn list_blobs(&self) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/secret/metadata/blobs", &self.addr);
+        let url = self.kv_meta_path("blobs");
 
         let result: Option<ListKeysResponse> =
             self.do_request_no_body(reqwest::Method::from_bytes("LIST".as_bytes())?, &url).await?;
@@ -757,21 +800,31 @@ impl Client {
     where
         Rq: serde::Serialize + ?Sized,
     {
-        let mut rq_builder = self
-            .client
-            .request(method, url)
-            .header("X-Vault-Token", self.token.lock().await?.as_ref());
+        let token = self.token_provider.token().await?;
+        self.request_with_token(&token, method, url, rq).await
+    }
+
+    async fn request_with_token<Rq>(
+        &self,
+        token: &ProtectedMemory,
+        method: reqwest::Method,
+        url: &str,
+        rq: Option<&Rq>,
+    ) -> anyhow::Result<reqwest::Response>
+    where
+        Rq: serde::Serialize + ?Sized,
+    {
+        let mut rq_builder =
+            self.client.request(method, url).header("X-Vault-Token", token.lock()?.as_ref());
 
         if let Some(rq_payload) = rq {
             rq_builder = rq_builder.json(rq_payload);
-        };
+        }
 
-        let rs = rq_builder.send().await?;
-
-        Ok(rs)
+        Ok(rq_builder.send().await?)
     }
 
-    fn escape(s: &str) -> String {
-        urlencoding::encode(s).to_string()
+    pub fn escape(s: &str) -> String {
+        s.replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
     }
 }

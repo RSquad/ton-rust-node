@@ -8,7 +8,7 @@
  */
 use crate::{
     crypto::key_material::KeyMaterial, errors::error::VaultError,
-    memory::protected_memory::ProtectedMemory, utils::hex::hex_decode,
+    memory::protected_memory::ProtectedMemoryInner, utils::hex::hex_decode,
 };
 use std::ffi::{CStr, CString};
 
@@ -17,12 +17,12 @@ pub struct MasterKey {
 }
 
 impl MasterKey {
-    pub async fn from_env(var_name: &str) -> anyhow::Result<Self> {
-        let key_material = Self::load_from_env(var_name).await?;
+    pub fn from_env(var_name: &str) -> anyhow::Result<Self> {
+        let key_material = Self::load_from_env(var_name)?;
         Ok(Self { key_material })
     }
 
-    pub async fn from_key_material(key_material: KeyMaterial) -> anyhow::Result<Self> {
+    pub fn from_key_material(key_material: KeyMaterial) -> anyhow::Result<Self> {
         Ok(Self { key_material })
     }
 
@@ -30,8 +30,8 @@ impl MasterKey {
         &self.key_material
     }
 
-    pub async fn clone(&self) -> anyhow::Result<Self> {
-        Ok(MasterKey { key_material: self.key_material.clone().await? })
+    pub fn try_clone(&self) -> anyhow::Result<Self> {
+        Ok(MasterKey { key_material: self.key_material.try_clone()? })
     }
 
     fn getenv_nocopy(name: &CStr) -> Option<&CStr> {
@@ -46,7 +46,7 @@ impl MasterKey {
         }
     }
 
-    async fn load_from_env(var_name: &str) -> anyhow::Result<KeyMaterial> {
+    fn load_from_env(var_name: &str) -> anyhow::Result<KeyMaterial> {
         let var_name_c_string = CString::new(var_name)?;
         let key_hex_ptr = match Self::getenv_nocopy(var_name_c_string.as_c_str()) {
             Some(ptr) => ptr,
@@ -67,10 +67,10 @@ impl MasterKey {
             )));
         }
 
-        let mut key = ProtectedMemory::new(key_hex.len() / 2)?;
+        let mut key = ProtectedMemoryInner::new(key_hex.len() / 2)?;
         {
-            let mut key_write_guard = key.lock_mut().await?;
-            hex_decode(key_hex, &mut key_write_guard).map_err(|e| {
+            let mut handle = key.write_handle()?;
+            hex_decode(key_hex, handle.as_mut()).map_err(|e| {
                 VaultError::master_key_unavailable(format!(
                     "Wrong ENV variable '{}' value. {}",
                     var_name, e
@@ -78,6 +78,6 @@ impl MasterKey {
             })?;
         }
 
-        KeyMaterial::new_symmetric_key(key).await
+        KeyMaterial::new_symmetric_key(key.into())
     }
 }

@@ -994,7 +994,7 @@ class Bootstrap:
     def phase4_wait_progress(self) -> None:
         self._phase(4, "Waiting for blockchain progress...")
         seq_a = None
-        for _ in range(60):
+        for _ in range(600):
             seq_a = self._seqno()
             if seq_a is not None:
                 break
@@ -1002,7 +1002,7 @@ class Bootstrap:
         if seq_a is None:
             self._fail(f"Failed to read masterchain seqno from {self.cfg.http_api_url}")
 
-        time.sleep(8)
+        time.sleep(16)
         seq_b = self._seqno()
         if seq_b is None or seq_b <= seq_a:
             self._fail(f"Masterchain seqno not growing ({seq_a} → {seq_b})")

@@ -780,7 +780,7 @@ impl LiteServerQuerySubscriber {
                     let acc = Account::construct_from_cell(usage_tree.root_cell())?;
                     let balance_root = acc
                         .balance()
-                        .map(|cc| cc.other.root().map(|c| c.repr_hash()))
+                        .map(|cc| cc.other.root().map(|c| c.repr_hash().clone()))
                         .flatten()
                         .unwrap_or_default();
                     MerkleProof::create_with_subtrees(
@@ -1011,6 +1011,11 @@ impl LiteServerQuerySubscriber {
                             break;
                         }
                     }
+                    context
+                        .engine
+                        .engine_allocated()
+                        .account_state_cache_bytes
+                        .store(lru.total_bytes, Ordering::Relaxed);
                 } else {
                     log::info!(
                         "liteserver: GetAccountState coalesced for {key} in {}ms",
@@ -1226,7 +1231,7 @@ impl LiteServerQuerySubscriber {
                 let stats_hash = custom
                     .block_create_stats
                     .as_ref()
-                    .map(|s| s.counters.root().map(|c| c.repr_hash()))
+                    .map(|s| s.counters.root().map(|c| c.repr_hash().clone()))
                     .flatten()
                     .unwrap_or_default();
                 subtrees.insert(stats_hash);
@@ -1236,7 +1241,10 @@ impl LiteServerQuerySubscriber {
 
         if (mode & CFG_VISIT_ROOT) != 0 {
             subtrees.insert(
-                cfg.root().ok_or_else(|| error!("No config root in state {id}"))?.repr_hash(),
+                cfg.root()
+                    .ok_or_else(|| error!("No config root in state {id}"))?
+                    .repr_hash()
+                    .clone(),
             );
         } else {
             param_list.sort_unstable();
@@ -1244,7 +1252,7 @@ impl LiteServerQuerySubscriber {
             for &pid in &param_list {
                 let key_bits: SliceData = pid.write_to_bitstring()?;
                 if let Some(leaf) = cfg.config_params.get(key_bits)? {
-                    subtrees.insert(leaf.cell()?.repr_hash());
+                    subtrees.insert(leaf.cell()?.repr_hash().clone());
                 }
             }
         }
@@ -1421,7 +1429,7 @@ impl LiteServerQuerySubscriber {
 
                     let envelope = enqueued_msg.read_envelope_msg()?;
                     let msg_cell = envelope.message_cell();
-                    let msg_hash = msg_cell.repr_hash();
+                    let msg_hash = msg_cell.repr_hash().clone();
 
                     // Build metadata with safe casts
                     let metadata = if let Some(meta) = envelope.metadata() {
@@ -1541,7 +1549,7 @@ impl LiteServerQuerySubscriber {
                 for hash in library_list {
                     if let Ok(Some(lib_descr)) = libs_u.get(&hash) {
                         let cell = lib_descr.lib();
-                        if cell.repr_hash() != hash {
+                        if *cell.repr_hash() != hash {
                             continue;
                         }
                         let data = if include_data { write_boc(&cell)? } else { Vec::new() };
@@ -1565,7 +1573,7 @@ impl LiteServerQuerySubscriber {
     async fn get_masterchain_info(engine: &Arc<dyn EngineOperations>) -> Result<MasterchainInfo> {
         let mc_block_id = get_last_liteserver_state_block(engine)?;
         let mc_state = engine.load_state(&mc_block_id).await?;
-        let state_root_hash = mc_state.root_cell().repr_hash();
+        let state_root_hash = mc_state.root_cell().repr_hash().clone();
 
         let zerostate_block_id = engine.zerostate_id()?.clone();
 
@@ -1584,7 +1592,7 @@ impl LiteServerQuerySubscriber {
         let mc_block_id = get_last_liteserver_state_block(engine)?;
 
         let mc_state = engine.load_state(&mc_block_id).await?;
-        let state_root_hash = mc_state.root_cell().repr_hash();
+        let state_root_hash = mc_state.root_cell().repr_hash().clone();
         let zerostate_block_id = engine.zerostate_id()?.clone();
         let init = ZeroStateIdExt {
             workchain: zerostate_block_id.shard().workchain_id(),
@@ -1860,7 +1868,7 @@ impl LiteServerQuerySubscriber {
 
         let result = BlockState {
             id: block_id,
-            root_hash: state.root_cell().repr_hash(),
+            root_hash: state.root_cell().repr_hash().clone(),
             file_hash: UInt256::calc_file_hash(&data),
             data,
         };
@@ -1919,7 +1927,7 @@ impl LiteServerQuerySubscriber {
             while let Some(slice) = acc_block.transactions().get_as_slice(&lt)? {
                 let cell = slice.reference(0)?;
                 // check hash if exist
-                if !hash.is_zero() && cell.repr_hash() != hash {
+                if !hash.is_zero() && *cell.repr_hash() != hash {
                     fail!(
                         "transaction hash mismatch: prev_trans_lt/hash invalid \
                         for wc={workchain_id}, lt={lt}"
@@ -2120,7 +2128,7 @@ impl LiteServerQuerySubscriber {
                         mode: flags,
                         account: Some(account.clone()),
                         lt: Some(*lt as i64),
-                        hash: Some(cell.repr_hash()),
+                        hash: Some(cell.repr_hash().clone()),
                         metadata: None,
                     }
                 })

@@ -1094,8 +1094,8 @@ impl ControlClient {
         assert_eq!(builder.bits_used(), 32 + 32 + 32 + 32);
         assert_eq!(builder.references_used(), 1);
 
-        let data = builder.clone().into_cell()?.repr_hash();
-        let signature = secret_key.sign(data.as_slice());
+        let cell = builder.clone().into_cell()?;
+        let signature = secret_key.sign(cell.repr_hash().as_slice());
         let mut body = BuilderData::with_bytes(&signature)?;
         body.append_builder(&builder)?;
 
@@ -1335,6 +1335,7 @@ mod test {
                     false,
                     false,
                     false,
+                    None,
                     &|| Ok(()),
                     None,
                     Arc::new(AtomicU8::new(0)),
@@ -1366,7 +1367,7 @@ mod test {
             let block_id = BlockIdExt::with_params(
                 ShardIdent::full(0),
                 0,
-                cell.repr_hash(),
+                cell.repr_hash().clone(),
                 UInt256::calc_file_hash(&bytes),
             );
             let shard_state = ShardStateStuff::deserialize_zerostate(
@@ -1385,7 +1386,7 @@ mod test {
             let block_id = BlockIdExt::with_params(
                 ShardIdent::masterchain(),
                 ss.seq_no(),
-                cell.repr_hash(),
+                cell.repr_hash().clone(),
                 UInt256::calc_file_hash(&bytes),
             );
 

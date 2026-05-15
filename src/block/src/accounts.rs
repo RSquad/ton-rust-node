@@ -176,7 +176,7 @@ impl StorageUsageCalc {
         gas_consumer: &mut impl GasConsumer,
     ) -> Result<u32> {
         if add_root
-            && (!self.hashes.insert(cell.repr_hash())
+            && (!self.hashes.insert(cell.repr_hash().clone())
                 || !self.add_checked(1, cell.bit_length() as u64))
         {
             return Ok(0);
@@ -185,7 +185,11 @@ impl StorageUsageCalc {
             return Ok(0);
         }
         let mut max_merkle_depth = 0;
-        let slice = gas_consumer.load_cell(cell.clone())?;
+        let slice = if add_root {
+            gas_consumer.load_cell(cell.clone())?
+        } else {
+            SliceData::load_cell(cell.clone())?
+        };
         for i in 0..slice.remaining_references() {
             let merkle_depth = self.append_cell(&slice.reference(i)?, true, gas_consumer)?;
             max_merkle_depth = max_merkle_depth.max(merkle_depth);
@@ -197,19 +201,26 @@ impl StorageUsageCalc {
         Ok(max_merkle_depth)
     }
 
-    pub fn append_builder(
+    /// Variant of `append_cell` where the root cell is loaded WITHOUT gas
+    /// (e.g. when the root is synthesized locally and isn't part of the
+    /// source cell tree) but still counted in the storage stat. Recursive
+    /// sub-references are loaded WITH gas through `gas_consumer`. Matches
+    /// cpp behavior for outbound message storage calculation in SENDMSG,
+    /// where envelope refs are walked with gas charging but a body cell
+    /// synthesized from inline body bits isn't separately loaded.
+    pub fn append_cell_no_root_gas(
         &mut self,
-        root: &BuilderData,
+        cell: &Cell,
         add_root: bool,
         gas_consumer: &mut impl GasConsumer,
-    ) -> Result<()> {
-        if add_root && !self.add_checked(1, root.bits_used() as u64) {
-            return Ok(());
+    ) -> Result<u32> {
+        if add_root
+            && (!self.hashes.insert(cell.repr_hash().clone())
+                || !self.add_checked(1, cell.bit_length() as u64))
+        {
+            return Ok(0);
         }
-        for cell in root.references() {
-            self.append_cell(cell, true, gas_consumer)?;
-        }
-        Ok(())
+        self.append_cell(cell, false, gas_consumer)
     }
 
     pub fn storage_used(&self) -> Result<StorageUsed> {
@@ -559,14 +570,14 @@ impl AccountStuff {
             _ => None,
         }
     }
-    fn update_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
-        self.storage_info.used = self.storage_stat.update(&self.storage)?;
+    fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+        self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
         if self.storage_info.used.cells.as_u64() >= dict_hash_min_cells as u64
             && !self.addr.is_masterchain()
         {
-            let dict_root = self.storage_stat.dict_root()?;
+            let dict_root = self.storage_stat.calc_dict()?;
             self.storage_info.storage_extra.dict_hash =
-                Some(dict_root.map_or_else(Default::default, Cell::repr_hash));
+                Some(dict_root.map_or_else(UInt256::default, |c| c.repr_hash().clone()));
             Ok(dict_root.cloned())
         } else {
             self.storage_info.storage_extra.dict_hash = None;
@@ -574,10 +585,13 @@ impl AccountStuff {
         }
     }
 
-    fn init_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    fn calc_and_check_storage_stat_dict(
+        &mut self,
+        dict_hash_min_cells: u32,
+    ) -> Result<Option<Cell>> {
         let dict_hash = self.storage_info.dict_hash().cloned();
         let used = self.storage_info.used.clone();
-        let result = self.update_storage_stat(dict_hash_min_cells)?;
+        let result = self.calc_storage_stat_dict(dict_hash_min_cells)?;
         if dict_hash.as_ref() != self.storage_info.dict_hash() {
             fail!(
                 "Storage stat dict hash mismatch, expected {:?}, got {:?}",
@@ -600,7 +614,7 @@ impl AccountStuff {
             .storage_info
             .dict_hash()
             .ok_or_else(|| error!("Cannot import storage stat dict: dict_hash is None"))?;
-        if &dict.repr_hash() != dict_hash {
+        if dict.repr_hash() != dict_hash {
             fail!(
                 "Cannot import storage stat dict: hash mismatch, expected {:x}, got {:x}",
                 dict_hash,
@@ -648,7 +662,6 @@ impl Account {
         Account { stuff: None }
     }
     const fn with_stuff(stuff: AccountStuff) -> Self {
-        debug_assert!(stuff.addr.rewrite_pfx().is_none());
         Self { stuff: Some(stuff) }
     }
 
@@ -666,7 +679,7 @@ impl Account {
             storage: AccountStorage::active(last_trans_lt, balance, state_init),
             storage_stat: AccountStorageStat::new(),
         });
-        account.update_storage_stat(dict_hash_min_cells)?;
+        account.calc_storage_stat_dict(dict_hash_min_cells)?;
         Ok(account)
     }
 
@@ -887,16 +900,19 @@ impl Account {
         self.stuff().and_then(|s| s.storage_info.dict_hash())
     }
 
-    pub fn update_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    pub fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
         match self.stuff_mut() {
-            Some(stuff) => stuff.update_storage_stat(dict_hash_min_cells),
+            Some(stuff) => stuff.calc_storage_stat_dict(dict_hash_min_cells),
             None => Ok(None),
         }
     }
 
-    pub fn init_storage_stat(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
+    pub fn calc_and_check_storage_stat_dict(
+        &mut self,
+        dict_hash_min_cells: u32,
+    ) -> Result<Option<Cell>> {
         match self.stuff_mut() {
-            Some(stuff) => stuff.init_storage_stat(dict_hash_min_cells),
+            Some(stuff) => stuff.calc_and_check_storage_stat_dict(dict_hash_min_cells),
             None => Ok(None),
         }
     }
@@ -909,8 +925,13 @@ impl Account {
         }
     }
 
-    pub fn storage_stat(&self) -> Option<&AccountStorageStat> {
-        self.stuff().map(|stuff| &stuff.storage_stat)
+    pub fn precalc_storage_stat(&mut self) -> Result<Option<&AccountStorageStat>> {
+        self.stuff_mut()
+            .map(|stuff| {
+                stuff.storage_stat.calc_stat(&stuff.storage)?;
+                Ok(&stuff.storage_stat)
+            })
+            .transpose()
     }
 
     pub fn del_storage_stat(&mut self) {
@@ -981,7 +1002,7 @@ impl Account {
 
     /// getting the hash of the root of the cell with Code of Smart Contract
     pub fn get_code_hash(&self) -> Option<UInt256> {
-        Some(self.state_init()?.code.as_ref()?.repr_hash())
+        Some(self.state_init()?.code.as_ref()?.repr_hash().clone())
     }
 
     /// getting the root of the cell with persistent Data of Smart Contract
@@ -996,7 +1017,7 @@ impl Account {
 
     /// getting hash of the root of the cell with persistent Data of Smart Contract
     pub fn get_data_hash(&self) -> Option<UInt256> {
-        Some(self.state_init()?.data.as_ref()?.repr_hash())
+        Some(self.state_init()?.data.as_ref()?.repr_hash().clone())
     }
 
     /// save persistent data of smart contract

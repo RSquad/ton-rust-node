@@ -6,64 +6,65 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::memory::protected_memory::ProtectedMemory;
+use crate::memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner};
 
-#[tokio::test]
-async fn test_new_protected_data() {
-    let data = ProtectedMemory::new(100).unwrap();
-    assert_eq!(data.len().await, 100);
-    assert!(!data.is_empty().await);
-    assert!(data.allocated().await >= 100);
+#[test]
+fn test_new_protected_data() {
+    let data: ProtectedMemory = ProtectedMemoryInner::new(100).unwrap().into();
+    assert_eq!(data.len(), 100);
+    assert!(!data.is_empty());
+    assert!(data.allocated() >= 100);
 }
 
-#[tokio::test]
-async fn test_new_zero_size_ok() {
-    let result = ProtectedMemory::new(0);
+#[test]
+fn test_new_zero_size_ok() {
+    let result = ProtectedMemoryInner::new(0);
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn test_read_guard() {
-    let data = ProtectedMemory::new(10).unwrap();
-    let guard = data.lock().await.unwrap();
+#[test]
+fn test_read_guard() {
+    let data: ProtectedMemory = ProtectedMemoryInner::new(10).unwrap().into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard.len(), 10);
     let _slice: &[u8] = &guard;
 }
 
-#[tokio::test]
-async fn test_write_guard() {
-    let mut data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_write_handle() {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
     {
-        let mut guard = data.lock_mut().await.unwrap();
-        assert_eq!(guard.len(), 10);
+        let mut handle = inner.write_handle().unwrap();
+        assert_eq!(handle.len(), 10);
 
-        guard[0] = 1;
-        guard[1] = 2;
+        handle[0] = 1;
+        handle[1] = 2;
     }
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard[0], 1);
     assert_eq!(guard[1], 2);
 }
 
-#[tokio::test]
-async fn test_extend_from_slice_within_capacity() {
-    let mut data = ProtectedMemory::new(10).unwrap();
-    let initial_capacity = data.allocated().await;
+#[test]
+fn test_extend_from_slice_within_capacity() {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
+    let initial_capacity = inner.allocated();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard[0] = 1;
-        guard[1] = 2;
+        let mut handle = inner.write_handle().unwrap();
+        handle[0] = 1;
+        handle[1] = 2;
     }
 
-    let additional = vec![3, 4, 5];
-    data.lock_mut().await.unwrap().extend_from_slice(&additional).unwrap();
+    inner.extend_from_slice(&[3, 4, 5]).unwrap();
 
-    assert_eq!(data.len().await, 13);
-    assert_eq!(data.allocated().await, initial_capacity);
+    assert_eq!(inner.len(), 13);
+    assert_eq!(inner.allocated(), initial_capacity);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard[0], 1);
     assert_eq!(guard[1], 2);
     assert_eq!(guard[10], 3);
@@ -71,159 +72,155 @@ async fn test_extend_from_slice_within_capacity() {
     assert_eq!(guard[12], 5);
 }
 
-#[tokio::test]
-async fn test_extend_from_slice_requires_reallocation() {
-    let mut data = ProtectedMemory::new(10).unwrap();
-    let initial_capacity = data.allocated().await;
+#[test]
+fn test_extend_from_slice_requires_reallocation() {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
+    let initial_capacity = inner.allocated();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard[0] = 1;
-        guard[1] = 2;
+        let mut handle = inner.write_handle().unwrap();
+        handle[0] = 1;
+        handle[1] = 2;
     }
 
     let additional = vec![42; initial_capacity];
-    data.lock_mut().await.unwrap().extend_from_slice(&additional).unwrap();
+    inner.extend_from_slice(&additional).unwrap();
 
-    assert_eq!(data.len().await, 10 + initial_capacity);
-    assert!(data.allocated().await > initial_capacity);
+    assert_eq!(inner.len(), 10 + initial_capacity);
+    assert!(inner.allocated() > initial_capacity);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard[0], 1);
     assert_eq!(guard[1], 2);
     assert_eq!(guard[10], 42);
     assert_eq!(guard[guard.len() - 1], 42);
 }
 
-#[tokio::test]
-async fn test_extend_from_slice_empty() {
-    let mut data = ProtectedMemory::new(10).unwrap();
-    let initial_len = data.len().await;
-    let initial_capacity = data.allocated().await;
+#[test]
+fn test_extend_from_slice_empty() {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
+    let initial_len = inner.len();
+    let initial_capacity = inner.allocated();
 
-    data.lock_mut().await.unwrap().extend_from_slice(&[]).unwrap();
+    inner.extend_from_slice(&[]).unwrap();
 
-    assert_eq!(data.len().await, initial_len);
-    assert_eq!(data.allocated().await, initial_capacity);
+    assert_eq!(inner.len(), initial_len);
+    assert_eq!(inner.allocated(), initial_capacity);
 }
 
-#[tokio::test]
-async fn test_extend_multiple_times() {
-    let mut data = ProtectedMemory::new(5).unwrap();
+#[test]
+fn test_extend_multiple_times() {
+    let mut inner = ProtectedMemoryInner::new(5).unwrap();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard[0] = 0;
-        guard[1] = 1;
-        guard[2] = 2;
-        guard[3] = 3;
-        guard[4] = 4;
+        let mut handle = inner.write_handle().unwrap();
+        handle[0] = 0;
+        handle[1] = 1;
+        handle[2] = 2;
+        handle[3] = 3;
+        handle[4] = 4;
 
-        guard.extend_from_slice(&[5, 6]).unwrap();
-        guard.extend_from_slice(&[7, 8]).unwrap();
-        guard.extend_from_slice(&[9, 10, 11]).unwrap();
+        handle.extend_from_slice(&[5, 6]).unwrap();
+        handle.extend_from_slice(&[7, 8]).unwrap();
+        handle.extend_from_slice(&[9, 10, 11]).unwrap();
     }
 
-    assert_eq!(data.len().await, 12);
+    assert_eq!(inner.len(), 12);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(&guard[..], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 }
 
-#[tokio::test]
-async fn test_truncate() -> anyhow::Result<()> {
-    let mut data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_truncate() -> anyhow::Result<()> {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
+        let mut handle = inner.write_handle().unwrap();
         for i in 0..10 {
-            guard[i] = i as u8;
+            handle[i] = i as u8;
         }
 
-        guard.truncate(5)?;
+        handle.truncate(5)?;
     }
 
-    assert_eq!(data.len().await, 5);
+    assert_eq!(inner.len(), 5);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard[0], 0);
     assert_eq!(guard[4], 4);
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_truncate_to_zero() -> anyhow::Result<()> {
-    let mut data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_truncate_to_zero() -> anyhow::Result<()> {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard[0] = 42;
-        guard.truncate(0)?;
+        let mut handle = inner.write_handle().unwrap();
+        handle[0] = 42;
+        handle.truncate(0)?;
     }
 
-    assert_eq!(data.len().await, 0);
-    assert!(data.is_empty().await);
+    assert_eq!(inner.len(), 0);
+    assert!(inner.is_empty());
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_truncate_larger_than_size_does_nothing() -> anyhow::Result<()> {
-    let mut data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_truncate_larger_than_size_does_nothing() -> anyhow::Result<()> {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard[0] = 42;
-        guard.truncate(20)?;
+        let mut handle = inner.write_handle().unwrap();
+        handle[0] = 42;
+        handle.truncate(20)?;
     }
 
-    assert_eq!(data.len().await, 10);
+    assert_eq!(inner.len(), 10);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard[0], 42);
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_truncate_same_size_does_nothing() -> anyhow::Result<()> {
-    let mut data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_truncate_same_size_does_nothing() -> anyhow::Result<()> {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
 
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.truncate(10)?;
-    }
+    inner.truncate(10)?;
 
-    assert_eq!(data.len().await, 10);
+    assert_eq!(inner.len(), 10);
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_extend_after_truncate() -> anyhow::Result<()> {
-    let mut data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_extend_after_truncate() -> anyhow::Result<()> {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
+        let mut handle = inner.write_handle().unwrap();
         for i in 0..10 {
-            guard[i] = i as u8;
+            handle[i] = i as u8;
         }
     }
 
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.truncate(5)?;
-    }
-    assert_eq!(data.len().await, 5);
+    inner.truncate(5)?;
+    assert_eq!(inner.len(), 5);
 
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.extend_from_slice(&[10, 11, 12]).unwrap();
-    }
-    assert_eq!(data.len().await, 8);
+    inner.extend_from_slice(&[10, 11, 12])?;
+    assert_eq!(inner.len(), 8);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard[0], 0);
     assert_eq!(guard[4], 4);
     assert_eq!(guard[5], 10);
@@ -233,113 +230,102 @@ async fn test_extend_after_truncate() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_large_allocation() {
+#[test]
+fn test_large_allocation() {
     let size = 10000;
-    let data = ProtectedMemory::new(size).unwrap();
-    assert_eq!(data.len().await, size);
-    assert!(data.allocated().await >= size);
+    let data: ProtectedMemory = ProtectedMemoryInner::new(size).unwrap().into();
+    assert_eq!(data.len(), size);
+    assert!(data.allocated() >= size);
 }
 
-#[tokio::test]
-async fn test_extend_with_large_data() {
-    let mut data = ProtectedMemory::new(100).unwrap();
+#[test]
+fn test_extend_with_large_data() {
+    let mut inner = ProtectedMemoryInner::new(100).unwrap();
     let large_data = vec![42; 10000];
 
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.extend_from_slice(&large_data).unwrap();
-    }
+    inner.extend_from_slice(&large_data).unwrap();
 
-    assert_eq!(data.len().await, 10100);
+    assert_eq!(inner.len(), 10100);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(guard[100], 42);
     assert_eq!(guard[guard.len() - 1], 42);
 }
 
-#[tokio::test]
-async fn test_sequential_operations() -> anyhow::Result<()> {
-    let mut data = ProtectedMemory::new(5).unwrap();
+#[test]
+fn test_sequential_operations() -> anyhow::Result<()> {
+    let mut inner = ProtectedMemoryInner::new(5).unwrap();
 
     {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.copy_from_slice(&[1, 2, 3, 4, 5]);
+        let mut handle = inner.write_handle()?;
+        handle.copy_from_slice(&[1, 2, 3, 4, 5]);
     }
 
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.extend_from_slice(&[6, 7, 8]).unwrap();
-    }
-    assert_eq!(data.len().await, 8);
+    inner.extend_from_slice(&[6, 7, 8])?;
+    assert_eq!(inner.len(), 8);
 
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.truncate(6)?;
-    }
-    assert_eq!(data.len().await, 6);
+    inner.truncate(6)?;
+    assert_eq!(inner.len(), 6);
 
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.extend_from_slice(&[9, 10]).unwrap();
-    }
-    assert_eq!(data.len().await, 8);
+    inner.extend_from_slice(&[9, 10])?;
+    assert_eq!(inner.len(), 8);
 
-    let guard = data.lock().await.unwrap();
+    let data: ProtectedMemory = inner.into();
+    let guard = data.lock().unwrap();
     assert_eq!(&guard[..], &[1, 2, 3, 4, 5, 6, 9, 10]);
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_protection_restored_after_read() {
-    let data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_protection_restored_after_read() {
+    let data: ProtectedMemory = ProtectedMemoryInner::new(10).unwrap().into();
 
     {
-        let _guard = data.lock().await.unwrap();
+        let _guard = data.lock().unwrap();
     }
 
-    let _guard2 = data.lock().await.unwrap();
+    let _guard2 = data.lock().unwrap();
 }
 
-#[tokio::test]
-async fn test_protection_restored_after_write() {
-    let mut data = ProtectedMemory::new(10).unwrap();
+#[test]
+fn test_protection_restored_after_write() {
+    let mut inner = ProtectedMemoryInner::new(10).unwrap();
 
     {
-        let mut _guard = data.lock_mut().await.unwrap();
+        let mut _h = inner.write_handle().unwrap();
     }
 
-    let _guard2 = data.lock_mut().await.unwrap();
+    let _h2 = inner.write_handle().unwrap();
 }
 
-#[tokio::test]
-async fn test_capacity_grows_appropriately() {
-    let mut data = ProtectedMemory::new(1).unwrap();
-    let initial_capacity = data.allocated().await;
+#[test]
+fn test_capacity_grows_appropriately() {
+    let mut inner = ProtectedMemoryInner::new(1).unwrap();
+    let initial_capacity = inner.allocated();
 
     let extension = vec![1; initial_capacity * 2];
-    {
-        let mut guard = data.lock_mut().await.unwrap();
-        guard.extend_from_slice(&extension).unwrap();
-    }
+    inner.extend_from_slice(&extension).unwrap();
 
-    assert!(data.allocated().await >= initial_capacity * 2);
-    assert_eq!(data.len().await, 1 + initial_capacity * 2);
+    assert!(inner.allocated() >= initial_capacity * 2);
+    assert_eq!(inner.len(), 1 + initial_capacity * 2);
 }
 
 #[tokio::test]
 async fn test_concurrent_access() {
     use std::sync::Arc;
 
-    let data = Arc::new(ProtectedMemory::new(64).unwrap());
+    let data: Arc<ProtectedMemory> = Arc::new(ProtectedMemoryInner::new(64).unwrap().into());
     let mut handles = vec![];
 
     for _ in 0..10 {
         let data_clone = Arc::clone(&data);
         let handle = tokio::spawn(async move {
-            let guard = data_clone.lock().await.unwrap();
-            assert_eq!(guard.len(), 64);
+            {
+                let guard = data_clone.lock().unwrap();
+                assert_eq!(guard.len(), 64);
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         });
         handles.push(handle);

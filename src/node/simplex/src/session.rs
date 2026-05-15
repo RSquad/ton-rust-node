@@ -73,6 +73,7 @@ use consensus_common::{
         add_compute_percentage_metric, add_compute_relative_metric, add_compute_result_metric,
         get_elapsed_time, MetricsDumper,
     },
+    EnsureCandidateAvailabilityOptions,
 };
 use crossbeam::channel::{bounded, Sender};
 use std::{
@@ -82,8 +83,8 @@ use std::{
     collections::BTreeMap,
     fmt, panic,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     thread,
     time::{Duration, SystemTime},
@@ -138,6 +139,18 @@ impl ReceiverListener for ReceiverListenerImpl {
     ) {
         self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
             processor.on_candidate_received(source_idx, candidate, notar_cert);
+        }));
+    }
+
+    fn on_candidate_notar_received(
+        &self,
+        source_idx: u32,
+        slot: crate::block::SlotIndex,
+        block_hash: UInt256,
+        notar_cert: Vec<u8>,
+    ) {
+        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
+            processor.on_candidate_notar_received(source_idx, slot, block_hash, notar_cert);
         }));
     }
 
@@ -360,14 +373,15 @@ pub(crate) struct SessionImpl {
     /// Indicates database should be destroyed on stop
     destroy_db_flag: Arc<AtomicBool>,
     /// Atomic flag: main_loop should begin active FSM processing.
-    /// Set by `start(seqno)`. The overlay is created at `create()` time and
+    /// Set by `start(prev_blocks, min_masterchain_block_id)`. The overlay is created at
+    /// `create()` time and
     /// warms up while main_loop polls this flag, so peers are connected
     /// before the first_block_timeout clock starts ticking.
     start_flag: Arc<AtomicBool>,
-    /// Initial block seqno, provided by `start(seqno)`.
+    /// Explicit startup payload, provided by `start(prev_blocks, min_masterchain_block_id)`.
     /// Read by main_loop after start_flag is set, before SessionDescription
-    /// creation.
-    deferred_initial_seqno: Arc<AtomicU32>,
+    /// and SessionProcessor creation.
+    deferred_start_info: Arc<Mutex<Option<(Vec<BlockIdExt>, BlockIdExt)>>>,
     /// Atomic flag to indicate main processing thread has stopped
     main_processing_thread_stopped: Arc<AtomicBool>,
     /// Atomic flag to indicate callbacks processing thread has stopped
@@ -389,13 +403,19 @@ pub(crate) struct SessionImpl {
 }
 
 impl ConsensusSession for SessionImpl {
-    fn start(&self, initial_block_seqno: u32) {
-        log::info!(
-            "SimplexSession {}: start(seqno={}) called — storing seqno and unblocking main loop",
-            self.session_id.to_hex_string(),
-            initial_block_seqno
+    fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt) {
+        assert!(
+            !prev_blocks.is_empty() && prev_blocks.len() <= 2,
+            "SimplexSession::start requires one or two previous blocks, got {}",
+            prev_blocks.len()
         );
-        self.deferred_initial_seqno.store(initial_block_seqno, Ordering::Release);
+        log::info!(
+            "SimplexSession {}: start(prevs={}, min_mc={}) called",
+            self.session_id.to_hex_string(),
+            prev_blocks.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+            min_masterchain_block_id
+        );
+        *self.deferred_start_info.lock().unwrap() = Some((prev_blocks, min_masterchain_block_id));
         self.start_flag.store(true, Ordering::Release);
     }
 
@@ -422,6 +442,23 @@ impl ConsensusSession for SessionImpl {
 }
 
 impl SimplexSession for SessionImpl {
+    fn ensure_candidate_available(
+        &self,
+        block_id: BlockIdExt,
+        opts: EnsureCandidateAvailabilityOptions,
+    ) {
+        log::debug!(
+            target: "simplex_resolver",
+            "SimplexSession::ensure_candidate_available session_id={} block_id={} purpose={:?} include_parent_chain={}",
+            self.session_id.to_hex_string(),
+            block_id,
+            opts.purpose,
+            opts.include_parent_chain,
+        );
+        self.main_task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
+            processor.ensure_candidate_available(block_id, opts);
+        }));
+    }
     fn notify_mc_finalized(&self, applied_top: BlockIdExt) {
         // Post closure to the main queue for thread-safe applied-top tracking updates
         // in SessionProcessor. This drives empty-block policy and MC validation gating.
@@ -499,7 +536,7 @@ impl SessionImpl {
         is_stopped_flag: Arc<AtomicBool>,
         destroy_db_flag: Arc<AtomicBool>,
         start_flag: Arc<AtomicBool>,
-        deferred_initial_seqno: Arc<AtomicU32>,
+        deferred_start_info: Arc<Mutex<Option<(Vec<BlockIdExt>, BlockIdExt)>>>,
         panicked_flag: Arc<AtomicBool>,
         task_queue: TaskQueuePtr,
         callbacks_task_queue: CallbackTaskQueuePtr,
@@ -604,24 +641,21 @@ impl SessionImpl {
         // are dropped to the zombie client and we can stall finalization (only 3/5 nodes
         // have the candidate).
         let health_counters = Arc::new(crate::receiver::ReceiverHealthCounters::new());
+        let receiver_settings = crate::receiver::ReceiverSettings::from_session_options(
+            &options,
+            max_candidate_size,
+            max_candidate_query_answer_size,
+        );
         let receiver = match crate::receiver::ReceiverWrapper::create(
             session_id.clone(),
             &shard,
-            max_candidate_size,
-            max_candidate_query_answer_size,
-            options.proto_version,
             &ids,
             &local_key,
             overlay_manager.clone(),
             receiver_listener,
-            options.standstill_timeout,
-            options.standstill_max_egress_bytes_per_s,
-            options.slots_per_leader_window,
-            options.max_leader_window_desync,
             panicked_flag.clone(),
-            options.use_quic,
             health_counters.clone(),
-            crate::receiver::CandidateResolveConfig::from_session_options(&options),
+            receiver_settings,
         ) {
             Ok(r) => r,
             Err(err) => {
@@ -654,17 +688,19 @@ impl SessionImpl {
         let is_fresh_start = bootstrap.is_empty();
 
         log::info!(
-            "Session {} bootstrap loaded: fresh_start={}, finalized_blocks={}, candidate_infos={}, notar_certs={}",
+            "Session {} bootstrap loaded: fresh_start={}, finalized_blocks={}, candidate_infos={}, notar_certs={}, final_certs={}, skip_certs={}",
             session_id.to_hex_string(),
             is_fresh_start,
             bootstrap.finalized_blocks.len(),
             bootstrap.candidate_infos.len(),
             bootstrap.notar_certs.len(),
+            bootstrap.final_certs.len(),
+            bootstrap.skip_certs.len(),
         );
 
         // Signal init complete before the start gate — the overlay and DB are
-        // fully ready.  The caller (create()) can return and later call
-        // start(seqno) to unblock the FSM.
+        // fully ready. The caller (create()) can return and later call
+        // start(...) to unblock the FSM.
         if !init_signaled.get() {
             if init_result_sender.send(Ok(())).is_err() {
                 log::warn!(
@@ -675,7 +711,7 @@ impl SessionImpl {
             init_signaled.set(true);
         }
 
-        // Wait for start(seqno) before creating SessionDescription.
+        // Wait for start(...) before creating SessionDescription.
         // The overlay is already registered and warming up peer connections
         // while we poll here, so by the time start() is called the overlay
         // should have established connectivity -- preventing premature
@@ -683,7 +719,7 @@ impl SessionImpl {
         // any peers are reachable.
         if !start_flag.load(Ordering::Acquire) {
             log::info!(
-                "SimplexSession {} waiting for start(seqno) signal (overlay warming up)...",
+                "SimplexSession {} waiting for start(prevs, min_mc) signal (overlay warming up)...",
                 session_id.to_hex_string()
             );
             while !start_flag.load(Ordering::Acquire) {
@@ -698,11 +734,22 @@ impl SessionImpl {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        let initial_block_seqno = deferred_initial_seqno.load(Ordering::Acquire);
+        let (session_start_prev_blocks, min_masterchain_block_id) = deferred_start_info
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("SimplexSession start flag set without explicit prev blocks");
+        let initial_block_seqno =
+            session_start_prev_blocks.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1;
         log::info!(
-            "SimplexSession {} start(seqno={}) received, creating SessionDescription",
+            "SimplexSession {} start(prevs={}, min_mc={}) received, creating SessionDescription",
             session_id.to_hex_string(),
-            initial_block_seqno
+            session_start_prev_blocks
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            min_masterchain_block_id
         );
 
         receiver.start();
@@ -730,6 +777,7 @@ impl SessionImpl {
         let description_for_recovery = description.clone();
         let mut processor = match SessionProcessor::new(
             description,
+            session_start_prev_blocks,
             listener,
             task_queue.clone(),
             callbacks_task_queue.clone(),
@@ -788,10 +836,22 @@ impl SessionImpl {
         //
         // IMPORTANT: Do not use `SystemTime::now()` here. All session timing must go
         // through `SessionDescription::get_time()` so tests can override time.
+        //
+        // First-cycle delay: push the initial metric/profiling/health-check ticks
+        // out by one full period so we never emit a t0 snapshot or fire health
+        // checks before the session has actually warmed up (peer discovery,
+        // bootstrap recovery, and active-weight convergence are still in flight).
+        // Without this delay the very first `run_health_checks()` call sees
+        // `active_weight = 0` and logs a spurious SIMPLEX_HEALTH `low_activity`
+        // anomaly that pollutes downstream monitoring dumps.
         let mut last_warn_dump_time = SystemTime::now(); // only for queue-latency warnings
-        let mut next_metrics_dump_time = processor.get_description().get_time();
-        let mut next_profiling_dump_time = next_metrics_dump_time;
-        let mut next_health_check_time = next_metrics_dump_time;
+        let session_start_time = processor.get_description().get_time();
+        let mut next_metrics_dump_time =
+            session_start_time + Duration::from_millis(SESSION_METRICS_DUMP_PERIOD_MS);
+        let mut next_profiling_dump_time =
+            session_start_time + Duration::from_millis(SESSION_PROFILING_DUMP_PERIOD_MS);
+        let mut next_health_check_time =
+            session_start_time + Duration::from_millis(SESSION_HEALTH_CHECK_PERIOD_MS);
 
         // Arm FSM skip timeouts now that overlay warmup and bootstrap
         // recovery are complete.  Matches C++ Start event timing.
@@ -847,8 +907,9 @@ impl SessionImpl {
 
                 metrics_dumper.update(processor.get_metrics_receiver());
 
+                let session_id_str = session_id.to_hex_string();
+
                 if log::log_enabled!(log::Level::Info) {
-                    let session_id_str = session_id.to_hex_string();
                     log::info!("SimplexSession {} metrics:", &session_id_str);
 
                     {
@@ -857,6 +918,24 @@ impl SessionImpl {
                             log::info!("{}{}", session_id_str, string);
                         });
                     }
+                }
+
+                // Republish the same snapshot to the global Prometheus
+                // recorder so it surfaces on the node's `/metrics` endpoint.
+                // `.speed` derivative keys are dropped on purpose; see
+                // `prometheus_publisher` module docs for label semantics.
+                {
+                    check_execution_time!(5_000);
+                    let shard_str = shard.to_string();
+                    let session_id8 = &session_id_str[..8.min(session_id_str.len())];
+                    crate::prometheus_publisher::publish_snapshot(
+                        &metrics_dumper,
+                        options.prometheus_labels,
+                        crate::prometheus_publisher::SessionIdentity {
+                            shard: &shard_str,
+                            session_id8,
+                        },
+                    );
                 }
 
                 next_metrics_dump_time = processor.get_description().get_time()
@@ -1012,6 +1091,7 @@ impl SessionImpl {
         // Result status counters (total/success/failure metrics)
         add_compute_result_metric(&mut metrics_dumper, "simplex_validates");
         add_compute_result_metric(&mut metrics_dumper, "simplex_collates");
+        add_compute_result_metric(&mut metrics_dumper, "simplex_self_collates");
         add_compute_result_metric(&mut metrics_dumper, "simplex_collates_expire");
         add_compute_result_metric(&mut metrics_dumper, "simplex_collates_precollated");
         add_compute_result_metric(&mut metrics_dumper, "simplex_commits");
@@ -1023,6 +1103,9 @@ impl SessionImpl {
         metrics_dumper.add_derivative_metric("simplex_collates.total");
         metrics_dumper.add_derivative_metric("simplex_collates.success");
         metrics_dumper.add_derivative_metric("simplex_collates.failure");
+        metrics_dumper.add_derivative_metric("simplex_self_collates.total");
+        metrics_dumper.add_derivative_metric("simplex_self_collates.success");
+        metrics_dumper.add_derivative_metric("simplex_self_collates.failure");
         metrics_dumper.add_derivative_metric("simplex_collation_starts");
         metrics_dumper.add_derivative_metric("simplex_candidate_received_broadcast");
         metrics_dumper.add_derivative_metric("simplex_candidate_received_query");
@@ -1228,7 +1311,7 @@ impl SessionImpl {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let destroy_db_flag = Arc::new(AtomicBool::new(false));
         let start_flag = Arc::new(AtomicBool::new(false));
-        let deferred_initial_seqno = Arc::new(AtomicU32::new(0));
+        let deferred_start_info = Arc::new(Mutex::new(None));
         let main_processing_thread_stopped = Arc::new(AtomicBool::new(false));
         let callbacks_processing_thread_stopped = Arc::new(AtomicBool::new(false));
         let panicked_flag = Arc::new(AtomicBool::new(false));
@@ -1250,7 +1333,7 @@ impl SessionImpl {
             stop_flag: stop_flag.clone(),
             destroy_db_flag: destroy_db_flag.clone(),
             start_flag: start_flag.clone(),
-            deferred_initial_seqno: deferred_initial_seqno.clone(),
+            deferred_start_info: deferred_start_info.clone(),
             main_processing_thread_stopped: main_processing_thread_stopped.clone(),
             callbacks_processing_thread_stopped: callbacks_processing_thread_stopped.clone(),
             panicked_flag: panicked_flag.clone(),
@@ -1294,7 +1377,7 @@ impl SessionImpl {
                         main_processing_thread_stopped,
                         destroy_db_flag,
                         start_flag,
-                        deferred_initial_seqno,
+                        deferred_start_info,
                         panicked_flag_for_main_loop,
                         main_task_queue,
                         callbacks_task_queue,

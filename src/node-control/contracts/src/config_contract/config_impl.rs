@@ -703,7 +703,7 @@ mod tests {
         let addr = config.address().await.expect("Failed to get address");
         // Config contract is at -1:5555...5555
         assert_eq!(addr.workchain_id(), -1);
-        assert_eq!(addr.address().get_bytestring(0), [0x55u8; 32]);
+        assert_eq!(addr.address().get_bytestring(0).as_slice(), &[0x55u8; 32]);
     }
 
     #[test]

@@ -14,6 +14,7 @@
 use colored::Colorize;
 use consensus_common::{
     node_test_network::NodeTestNetwork, ConsensusCommonFactory, ConsensusOverlayManagerPtr,
+    ResolverPurpose,
 };
 use lazy_static::lazy_static;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -23,7 +24,7 @@ use spin::mutex::SpinMutex;
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::{self, Cursor, LineWriter, Write},
+    io::{self, LineWriter, Write},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -52,7 +53,30 @@ lazy_static! {
     static ref SIMPLEX_TEST_MUTEX: Mutex<()> = Mutex::new(());
 }
 
+/// Upper bound for resolver-probe repair requests in integration tests.
+const RESOLVER_PROBE_MAX_REQUESTS: u32 = 256;
+
 include!("../../../common/src/info.rs");
+
+fn session_start_args(
+    shard: &ShardIdent,
+    initial_block_seqno: u32,
+) -> (Vec<BlockIdExt>, BlockIdExt) {
+    (
+        vec![BlockIdExt::with_params(
+            shard.clone(),
+            initial_block_seqno.saturating_sub(1),
+            UInt256::default(),
+            UInt256::default(),
+        )],
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+    )
+}
 
 /*
     Overlay type configuration
@@ -106,7 +130,7 @@ impl DummyCollatedData {
 
     fn from_bytes(bytes: &[u8]) -> Self {
         // Extract from BOC wrapper
-        let boc = BocReader::new().read(&mut Cursor::new(bytes)).unwrap();
+        let boc = BocReader::new().read(bytes).unwrap();
         let cell = &boc.roots[0];
         let raw = cell.data();
         bincode::deserialize(raw).unwrap()
@@ -359,6 +383,9 @@ struct SessionInstance {
     is_collator: Arc<AtomicBool>,
     collation_count: Arc<AtomicU32>,
     on_candidate_count: Arc<AtomicU32>,
+    on_candidate_observed_count: Arc<AtomicU32>,
+    parent_missing_observed_count: Arc<AtomicU32>,
+    resolver_probe_requests_count: Arc<AtomicU32>,
     on_block_finalized_count: Arc<AtomicU32>,
     config: TestConfig,
     /// Finalization latencies in milliseconds (for statistical analysis)
@@ -373,6 +400,7 @@ struct SessionInstance {
     session_errors_count: Arc<AtomicU32>,
     /// Shared finalized block roots for harness-level introspection.
     finalized_blocks: FinalizedBlocksMap,
+    simplex_session: Arc<dyn SimplexSession + Send + Sync>,
     _session: SessionPtr,
     _listener: Arc<dyn SessionListener + Send + Sync>,
 }
@@ -401,6 +429,18 @@ impl SessionInstance {
 
     fn on_candidate_count(&self) -> u32 {
         self.on_candidate_count.load(Ordering::Relaxed)
+    }
+
+    fn on_candidate_observed_count(&self) -> u32 {
+        self.on_candidate_observed_count.load(Ordering::Relaxed)
+    }
+
+    fn parent_missing_observed_count(&self) -> u32 {
+        self.parent_missing_observed_count.load(Ordering::Relaxed)
+    }
+
+    fn resolver_probe_requests_count(&self) -> u32 {
+        self.resolver_probe_requests_count.load(Ordering::Relaxed)
     }
 
     fn on_block_finalized_count(&self) -> u32 {
@@ -495,6 +535,48 @@ impl SessionListener for SessionInstance {
         callback(Ok(SystemTime::now()))
     }
 
+    fn on_candidate_observed(
+        &self,
+        block_id: BlockIdExt,
+        _data: BlockPayloadPtr,
+        _collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    ) {
+        self.on_candidate_observed_count.fetch_add(1, Ordering::Relaxed);
+        if !flags.parent_ready {
+            self.parent_missing_observed_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Runtime resolver-probe used by the ghost-parent integration test:
+        // emulate validator-side demand requests for candidate chain availability.
+        let resolver_probe_enabled = self.config.test_name == "simplex_ghost_parent_resolver_probe";
+        if !resolver_probe_enabled || self.source_index != 0 || !flags.body_present {
+            return;
+        }
+
+        let current_requests = self.resolver_probe_requests_count.load(Ordering::Relaxed);
+        if current_requests >= RESOLVER_PROBE_MAX_REQUESTS {
+            return;
+        }
+
+        self.resolver_probe_requests_count.fetch_add(1, Ordering::Relaxed);
+        self.simplex_session.ensure_candidate_available(
+            block_id.clone(),
+            EnsureCandidateAvailabilityOptions {
+                purpose: ResolverPurpose::SimplexCollationParent,
+                include_parent_chain: true,
+            },
+        );
+        log::info!(
+            target: "simplex_resolver",
+            "resolver probe request source_idx={} block_id={} parent_ready={} local_collated={}",
+            self.source_index,
+            block_id,
+            flags.parent_ready,
+            flags.local_collated
+        );
+    }
+
     fn on_generate_slot(
         &self,
         source_info: simplex::BlockSourceInfo,
@@ -540,11 +622,11 @@ impl SessionListener for SessionInstance {
 
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                // Implicit is only expected for the very first (genesis) slot
-                // when no parent block exists yet.
-                self.max_finalized_seqno.load(Ordering::SeqCst)
+                panic!("Simplex consensus test must not receive implicit parent hints")
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
+            consensus_common::CollationParentHint::Explicit(parent_ids) => {
+                parent_ids.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1
+            }
         };
 
         // Use seqno as the slot value for embedded data (since slot isn't exposed in API)
@@ -809,6 +891,19 @@ impl SessionListener for SessionInstanceListener {
         if let Some(instance) = self.instance.lock().upgrade() {
             let instance = instance.lock();
             instance.on_block_skipped(round);
+        }
+    }
+
+    fn on_candidate_observed(
+        &self,
+        block_id: BlockIdExt,
+        data: BlockPayloadPtr,
+        collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    ) {
+        if let Some(instance) = self.instance.lock().upgrade() {
+            let instance = instance.lock();
+            instance.on_candidate_observed(block_id, data, collated_data, flags);
         }
     }
 
@@ -1096,7 +1191,10 @@ where
             Arc::downgrade(&session_listener),
         )
         .unwrap();
-        session.start(initial_block_seqno);
+        let (prev_blocks, min_masterchain_block_id) =
+            session_start_args(&shard, initial_block_seqno);
+        session.start(prev_blocks, min_masterchain_block_id);
+        let simplex_session = session.clone() as Arc<dyn SimplexSession + Send + Sync>;
 
         let session_instance = Arc::new(SpinMutex::new(SessionInstance {
             public_key: nodes[i].public_key.clone(),
@@ -1104,6 +1202,9 @@ where
             collation_requested: Arc::new(AtomicBool::new(false)),
             collation_count: Arc::new(AtomicU32::new(0)),
             on_candidate_count: Arc::new(AtomicU32::new(0)),
+            on_candidate_observed_count: Arc::new(AtomicU32::new(0)),
+            parent_missing_observed_count: Arc::new(AtomicU32::new(0)),
+            resolver_probe_requests_count: Arc::new(AtomicU32::new(0)),
             on_block_finalized_count: Arc::new(AtomicU32::new(0)),
             is_collator: Arc::new(AtomicBool::new(false)),
             config: config.clone(),
@@ -1112,6 +1213,7 @@ where
             finalized_seqnos: finalized_seqnos.clone(),
             session_errors_count: Arc::new(AtomicU32::new(0)),
             finalized_blocks: finalized_blocks.clone(),
+            simplex_session,
             source_index: i as u32,
             _session: session,
             _listener: listener.clone(),
@@ -1429,7 +1531,11 @@ where
 
                         match new_session {
                             Ok(session) => {
-                                session.start(ctx.initial_block_seqno);
+                                let (prev_blocks, min_masterchain_block_id) =
+                                    session_start_args(&ctx.shard, ctx.initial_block_seqno);
+                                session.start(prev_blocks, min_masterchain_block_id);
+                                let simplex_session =
+                                    session.clone() as Arc<dyn SimplexSession + Send + Sync>;
                                 // Create a completely new SessionInstance with fresh state.
                                 // The seqno trackers are shared with the listener - they were already
                                 // updated by on_block_finalized during recovery (before this point).
@@ -1454,6 +1560,9 @@ where
                                     collation_requested: Arc::new(AtomicBool::new(false)),
                                     collation_count: Arc::new(AtomicU32::new(0)),
                                     on_candidate_count: Arc::new(AtomicU32::new(0)),
+                                    on_candidate_observed_count: Arc::new(AtomicU32::new(0)),
+                                    parent_missing_observed_count: Arc::new(AtomicU32::new(0)),
+                                    resolver_probe_requests_count: Arc::new(AtomicU32::new(0)),
                                     on_block_finalized_count: Arc::new(AtomicU32::new(
                                         recovered_commits,
                                     )),
@@ -1464,6 +1573,7 @@ where
                                     finalized_seqnos: finalized_seqnos.clone(),
                                     session_errors_count: Arc::new(AtomicU32::new(0)),
                                     finalized_blocks: finalized_blocks.clone(),
+                                    simplex_session,
                                     source_index: node_idx as u32,
                                     _session: session,
                                     _listener: new_listener.clone(),
@@ -1485,6 +1595,12 @@ where
                                     old_inst.collation_count = new_inst.collation_count.clone();
                                     old_inst.on_candidate_count =
                                         new_inst.on_candidate_count.clone();
+                                    old_inst.on_candidate_observed_count =
+                                        new_inst.on_candidate_observed_count.clone();
+                                    old_inst.parent_missing_observed_count =
+                                        new_inst.parent_missing_observed_count.clone();
+                                    old_inst.resolver_probe_requests_count =
+                                        new_inst.resolver_probe_requests_count.clone();
                                     old_inst.on_block_finalized_count =
                                         new_inst.on_block_finalized_count.clone();
                                     old_inst.is_collator = new_inst.is_collator.clone();
@@ -1498,6 +1614,7 @@ where
                                     old_inst.session_errors_count =
                                         new_inst.session_errors_count.clone();
                                     old_inst.finalized_blocks = new_inst.finalized_blocks.clone();
+                                    old_inst.simplex_session = new_inst.simplex_session.clone();
                                     old_inst._session = new_inst._session.clone();
                                     old_inst._listener = new_inst._listener.clone();
                                 }
@@ -1678,12 +1795,15 @@ where
         let inst = instance.lock();
         let is_finished = inst.is_finished();
         log::info!(
-            "Instance {}: finished={}, collation_requested={}, collation_count={}, candidate_count={}, finalized_count={}",
+            "Instance {}: finished={}, collation_requested={}, collation_count={}, candidate_count={}, observed_count={}, parent_missing={}, resolver_requests={}, finalized_count={}",
             index,
             inst.is_finished(),
             inst.collation_requested(),
             inst.collation_count(),
             inst.on_candidate_count(),
+            inst.on_candidate_observed_count(),
+            inst.parent_missing_observed_count(),
+            inst.resolver_probe_requests_count(),
             inst.on_block_finalized_count()
         );
         let finalized_count = inst.on_block_finalized_count();
@@ -1831,7 +1951,9 @@ fn test_simplex_consensus_with_failures() {
             test_name: "simplex_with_failures".to_string(),
             // This scenario includes randomized generation/rejection failures and can
             // occasionally complete just above 120s on loaded CI/containers.
-            test_timeout: Duration::from_secs(150),
+            // Candidate repair pacing (C++-aligned partial-merge / per-peer dedup) can add
+            // wall-clock; keep headroom so the harness does not flake under load.
+            test_timeout: Duration::from_secs(240),
             expect_timeout: false,
             shard: ShardIdent::masterchain(),
             mc_notification_interval: None, // Masterchain - no MC notifications
@@ -2374,6 +2496,7 @@ fn test_simplex_start_gate() {
             Arc::downgrade(&session_listener),
         )
         .expect("Failed to create session");
+        let simplex_session = session.clone() as Arc<dyn SimplexSession + Send + Sync>;
 
         let session_instance = Arc::new(SpinMutex::new(SessionInstance {
             source_index: i as u32,
@@ -2382,6 +2505,9 @@ fn test_simplex_start_gate() {
             collation_requested: Arc::new(AtomicBool::new(false)),
             collation_count: Arc::new(AtomicU32::new(0)),
             on_candidate_count: Arc::new(AtomicU32::new(0)),
+            on_candidate_observed_count: Arc::new(AtomicU32::new(0)),
+            parent_missing_observed_count: Arc::new(AtomicU32::new(0)),
+            resolver_probe_requests_count: Arc::new(AtomicU32::new(0)),
             on_block_finalized_count: finalized_counters[i].clone(),
             is_collator: Arc::new(AtomicBool::new(false)),
             config: config.clone(),
@@ -2390,6 +2516,7 @@ fn test_simplex_start_gate() {
             finalized_seqnos,
             session_errors_count: Arc::new(AtomicU32::new(0)),
             finalized_blocks: finalized_blocks.clone(),
+            simplex_session,
             _session: session.clone(),
             _listener: listener.clone(),
         }));
@@ -2437,7 +2564,9 @@ fn test_simplex_start_gate() {
         initial_block_seqno
     );
     for session in &sessions {
-        session.start(initial_block_seqno);
+        let (prev_blocks, min_masterchain_block_id) =
+            session_start_args(&shard, initial_block_seqno);
+        session.start(prev_blocks, min_masterchain_block_id);
     }
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -2591,6 +2720,71 @@ fn test_simplex_consensus_candidate_chaining_with_lossy_overlay() {
                     config.total_rounds
                 );
             }
+        },
+    );
+}
+
+/// Integration test: exercise resolver-demand requests during live consensus.
+///
+/// The harness enables lossy delivery on one node and uses
+/// `SessionListener::on_candidate_observed` to emulate validator-side resolver
+/// demand (`ensure_candidate_available(include_parent_chain=true)`).
+#[test]
+fn test_simplex_consensus_ghost_parent_resolver_probe() {
+    run_simplex_consensus_test(
+        TestConfig {
+            total_rounds: 24,
+            min_finalized_percent: 0.2,
+            node_count: 4,
+            generation_failure_probability: 0.0,
+            candidate_rejection_probability: 0.0,
+            max_collations: 2500,
+            target_rate: Duration::from_millis(300),
+            first_block_timeout: Duration::from_millis(3000),
+            test_name: "simplex_ghost_parent_resolver_probe".to_string(),
+            test_timeout: Duration::from_secs(150),
+            expect_timeout: false,
+            shard: ShardIdent::masterchain(),
+            mc_notification_interval: None,
+            overlay_type: OverlayType::InProcess,
+            net_gremlin: None,
+            restart_gremlin: None,
+            lossy_overlay: Some(consensus_common::LossyOverlayOpts {
+                lost_broadcast_probability: 0.25,
+                lost_message_probability: 0.2,
+                lost_query_probability: 0.2,
+                ..Default::default()
+            }),
+            lossy_overlay_node_indices: Some(vec![0]),
+            standstill_timeout: None,
+            slots_per_leader_window: Some(4),
+        },
+        |instances| {
+            let probe = instances[0].lock();
+            let observed = probe.on_candidate_observed_count();
+            let parent_missing = probe.parent_missing_observed_count();
+            let requests = probe.resolver_probe_requests_count();
+            let finalized = probe.on_block_finalized_count();
+            drop(probe);
+
+            log::info!(
+                "[ghost-parent-resolver-probe] node0 observed={}, parent_missing={}, requests={}, finalized={}",
+                observed,
+                parent_missing,
+                requests,
+                finalized
+            );
+
+            assert!(observed > 0, "resolver probe node should observe at least one candidate");
+            assert!(
+                requests > 0,
+                "resolver probe should issue ensure_candidate_available requests"
+            );
+            assert!(finalized > 0, "resolver probe node should finalize blocks");
+            assert!(
+                parent_missing > 0 || requests >= 10,
+                "expected unresolved-parent observations or sustained resolver probing under lossy delivery"
+            );
         },
     );
 }

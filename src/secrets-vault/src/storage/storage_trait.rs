@@ -6,13 +6,16 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::{
-    memory::protected_memory::ProtectedMemory,
-    types::{
-        metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
-        store_mode::StoreMode,
-    },
+use crate::types::{
+    metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
+    store_mode::StoreMode,
 };
+
+#[derive(PartialEq)]
+pub enum ListMode {
+    All,
+    OnlyNeeded,
+}
 
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync + downcast_rs::Downcast {
@@ -23,13 +26,9 @@ pub trait Storage: Send + Sync + downcast_rs::Downcast {
         secret_id: &SecretId,
     ) -> anyhow::Result<Secret>;
     async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()>;
-    async fn store_vec(
-        &self,
-        secrets: Vec<(ProtectedMemory, Metadata, StoreMode)>,
-    ) -> anyhow::Result<()>;
     async fn load(&self, secret_id: &SecretId) -> anyhow::Result<Secret>;
     async fn load_metadata(&self, secret_id: &SecretId) -> anyhow::Result<Option<Metadata>>;
-    async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>>;
+    async fn list_metadata(&self, mode: ListMode) -> anyhow::Result<Vec<Metadata>>;
     async fn delete(&self, secret_id: &SecretId) -> anyhow::Result<()>;
     fn format_version(&self) -> anyhow::Result<u32>;
 }

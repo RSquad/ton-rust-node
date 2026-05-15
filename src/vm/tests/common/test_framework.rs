@@ -14,9 +14,9 @@ include!("../../../common/src/log.rs");
 use std::{os::raw::c_char, sync::LazyLock};
 use ton_assembler::{compile_code, compile_code_to_builder, CompileError};
 use ton_block::{
-    BocWriter, Cell, Deserializable, Error, Exception, ExceptionCode, HashmapE, LibDescr,
-    Libraries, MerkleProof, Message, Result, Serializable, ShardAccount, ShardStateUnsplit,
-    SliceData, UInt256, UnixTime, SUPPORTED_VERSION,
+    read_single_root_boc_file, BocWriter, Cell, Deserializable, Error, Exception, ExceptionCode,
+    HashmapE, LibDescr, Libraries, MerkleProof, Message, Result, Serializable, ShardAccount,
+    ShardStateUnsplit, SliceData, SmallData, UInt256, UnixTime, SUPPORTED_VERSION,
 };
 use ton_vm::{
     error::{tvm_exception, tvm_exception_code, tvm_exception_or_custom_code},
@@ -100,7 +100,7 @@ impl TestCaseInputs {
     pub fn with_mc_state(mut self, mc_state_root: Cell) -> TestCaseInputs {
         assert!(mc_state_root.level() == 0, "state should not contain pruned cells");
         let mc_state_proof = MerkleProof {
-            hash: mc_state_root.repr_hash(),
+            hash: mc_state_root.repr_hash().clone(),
             depth: mc_state_root.repr_depth(),
             proof: mc_state_root,
         };
@@ -204,13 +204,13 @@ impl TestCaseInputs {
         self
     }
 
-    pub fn expect_bytecode(self, bytecode: Vec<u8>) -> TestCaseInputs {
+    pub fn expect_bytecode(self, bytecode: impl Into<SmallData>) -> TestCaseInputs {
         self.expect_bytecode_extended(bytecode, None)
     }
 
     pub fn expect_bytecode_extended(
         self,
-        bytecode: Vec<u8>,
+        bytecode: impl Into<SmallData>,
         message: Option<&str>,
     ) -> TestCaseInputs {
         let inputcode = SliceData::new(bytecode);
@@ -220,7 +220,7 @@ impl TestCaseInputs {
                 let mut selfcode = selfcode.clone();
                 let mut bytevec = vec![];
                 while selfcode.remaining_bits() != 0 {
-                    bytevec.append(&mut selfcode.get_bytestring(0));
+                    bytevec.extend_from_slice(&selfcode.get_bytestring(0));
                     if selfcode.remaining_references() > 0 {
                         selfcode = SliceData::load_cell(selfcode.reference(0).unwrap()).unwrap();
                     } else {
@@ -321,7 +321,7 @@ static EMPTY_LIBRARY: LazyLock<Cell> = LazyLock::new(|| {
     let mut lib = LibDescr::new(lib_cell.clone());
     lib.publishers_mut().add_key(&UInt256::ZERO).unwrap();
     let mut library = Libraries::default();
-    library.set(&lib_cell.repr_hash(), &lib).unwrap();
+    library.set(lib_cell.repr_hash(), &lib).unwrap();
     library.root().unwrap().clone()
 });
 
@@ -340,7 +340,7 @@ fn compare_with_fift(
     block_version: i32,
 ) {
     #[cfg(windows)]
-    let lib_name = "../../ton/build/crypto/Release/vm_run_shared.dll";
+    let lib_name = "../../ton/build/crypto/vm_run_shared.dll";
     #[cfg(not(windows))]
     let lib_name = "../../ton-node-cpp/build/crypto/libvm_run_shared.so";
     assert!(std::fs::exists(lib_name).unwrap());
@@ -439,6 +439,55 @@ fn compare_with_fift(
         log::info!("bytecode: {}\n", hex::encode(bytecode.data()));
         log::info!("code:\n{}\n", code);
         assert_eq!(tvm_result, fift_result, "fift check: {:?}", execution_result);
+    }
+}
+
+// this function is used to prepare data for fixing the bug with incorrect gas for short codes in C++ implementation of TVM
+pub fn prepare_gas_fix() {
+    #[cfg(windows)]
+    let lib_name = "../../ton/build/crypto/vm_run_shared.dll";
+    #[cfg(not(windows))]
+    let lib_name = "../../ton-node-cpp/build/crypto/libvm_run_shared.so";
+    assert!(std::fs::exists(lib_name).unwrap());
+    let lib = libloading::Library::new(lib_name).expect("no shared dll found");
+    let mut result = Vec::new();
+    let time = UnixTime::now() as i32;
+    let mut count = 0;
+    let log_mask = 0;
+    unsafe {
+        let run_boc: libloading::Symbol<
+            unsafe extern "C" fn(*const u8, i32, i32, i32, i32, i32) -> *mut c_char,
+        > = lib.get(b"run_vm_boc").unwrap();
+        let free_mem: libloading::Symbol<unsafe extern "C" fn(*const c_char) -> *mut c_char> =
+            lib.get(b"free_mem").unwrap();
+        for bits in 1..=23 {
+            for bytes in 0..1u32 << bits {
+                let data = bytes << (32 - bits) | (1 << (32 - bits - 1));
+                let data = data.to_be_bytes();
+                assert_eq!(data[3], 0);
+                let code_cell = SliceData::new(data.to_vec()).into_cell().unwrap();
+                let data = ton_block::write_boc(&code_cell).unwrap();
+                let size = data.len() * 8;
+                let res = run_boc(data.as_ptr(), size as i32, time, 300, 13, log_mask);
+                assert!(!res.is_null(), "Fift execution failed, check fift logs");
+                let fift_result =
+                    std::ffi::CStr::from_ptr(res).to_string_lossy().trim().to_string();
+                println!("    (0x{bytes:X}, {bits}, {fift_result}),");
+                result.push((bytes, bits, fift_result));
+                free_mem(res);
+                count += 1;
+                if count % 1_000_000 == 0 {
+                    println!("Checked {count} cases bits: {bits} bytes: {bytes}");
+                }
+            }
+        }
+    }
+    for (bytes, bits, line) in result {
+        let mut res = line.split_whitespace();
+        if res.next() == Some("0") && res.next() == Some("6") {
+            let gas = res.next().unwrap().parse::<usize>().unwrap() - 50;
+            println!("(0x{bytes:X}, {bits}, {gas}),");
+        }
     }
 }
 
@@ -914,10 +963,10 @@ pub fn test_case_with_real_data(
     account: &str,
     message: &str,
 ) -> TestCaseInputs {
-    let mc_state_proof = Cell::read_from_file(mc_state_proof);
-    let account = Cell::read_from_file(account);
+    let mc_state_proof = read_single_root_boc_file(mc_state_proof).unwrap();
+    let account = read_single_root_boc_file(account).unwrap();
     let shard_account = ShardAccount::with_account_root(account, Default::default(), 0);
-    let message = Cell::read_from_file(message);
+    let message = read_single_root_boc_file(message).unwrap();
     TestCaseInputs::with_bytecode(Cell::default())
         .with_mc_state_proof(mc_state_proof)
         .with_account(shard_account)

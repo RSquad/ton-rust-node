@@ -27,8 +27,8 @@ use ton_block::{
     address_crc, base64_decode, base64_decode_url_safe, base64_encode, error, fail,
     read_single_root_boc, ton_method_id, write_boc, Account, AccountIdPrefixFull, AccountStatus,
     Block, BlockIdExt, Cell, Coins, Deserializable, ExtBlkRef, ExternalInboundMessageHeader,
-    HashmapAugType, HashmapType, KeyExtBlkRef, Message, MsgAddressInt, Result, Serializable,
-    ShardAccount, ShardIdent, SliceData, StateInit, StorageUsageCalc, Transaction,
+    HashmapAugType, HashmapE, HashmapType, KeyExtBlkRef, LibDescr, Message, MsgAddressInt, Result,
+    Serializable, ShardAccount, ShardIdent, SliceData, StateInit, StorageUsageCalc, Transaction,
     TransactionDescr, UInt256, UnixTime, ADDR_FORMAT_BOUNCE, ADDR_FORMAT_TESTNET,
     ADDR_FORMAT_URL_SAFE,
 };
@@ -73,6 +73,7 @@ pub(crate) fn register(registry: &mut RpcRegistryBuilder) {
     // -- [ get config ] --
     registry.add_jsonrpc("getConfigParam", get_config_param, true);
     registry.add_jsonrpc("getLibraries", get_libraries, true);
+    registry.add_jsonrpc("getLibrariesExt", get_libraries_ext, true);
 
     // -- [ run method ] --
     registry.add_jsonrpc("runGetMethod", run_get_method, false);
@@ -222,7 +223,7 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
         while let Some(slice) = acc_block.transactions().get_as_slice(&lt)? {
             let tr_cell = slice.reference(0)?;
             // check hash if exist
-            if !expected_hash.is_zero() && tr_cell.repr_hash() != expected_hash {
+            if !expected_hash.is_zero() && *tr_cell.repr_hash() != expected_hash {
                 fail!("transaction hash mismatch: prev_trans_lt/hash invalid for wc={workchain_id}, lt={lt}")
             }
 
@@ -1018,8 +1019,8 @@ async fn get_block_transactions_int(
     })?;
     all_txs.sort_by(|a, b| a.1.cmp(&b.1));
     if let (Some(after_lt), Some(after_hash)) = (p.after_lt, p.after_hash.as_ref()) {
-        let after_hash = after_hash.parse()?;
-        let pos = all_txs.iter().position(|a| a.1 == after_lt && a.2.repr_hash() == after_hash);
+        let after_hash: UInt256 = after_hash.parse()?;
+        let pos = all_txs.iter().position(|a| a.1 == after_lt && *a.2.repr_hash() == after_hash);
         if let Some(pos) = pos {
             all_txs = all_txs.split_off(pos);
         }
@@ -1131,6 +1132,8 @@ async fn get_block_data(p: GetBlockParams, ctx: Ctx) -> Result<(BlockIdExt, Vec<
 async fn get_block_header(p: GetBlockParams, ctx: Ctx) -> JsonResult {
     let (block_id, data) = get_block_data(p, ctx).await?;
     let block = Block::construct_from_bytes(&data)?;
+    let extra = block.read_extra()?;
+    let created_by = extra.created_by();
     let info = block.read_info()?;
     Ok(serde_json::json!({
         "@type": "blocks.header",
@@ -1151,6 +1154,7 @@ async fn get_block_header(p: GetBlockParams, ctx: Ctx) -> JsonResult {
         "start_lt": info.start_lt().to_string(),
         "end_lt": info.end_lt().to_string(),
         "gen_utime": info.gen_utime(),
+        "created_by": base64_encode(created_by.as_slice()),
         "prev_blocks": info.read_prev_ids()?.iter().map(|id| serialize_block_id(id)).collect::<Vec<_>>(),
     }))
 }
@@ -1301,6 +1305,41 @@ async fn get_libraries(p: GetLibrariesParams, ctx: Ctx) -> JsonResult {
     }))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct GetLibrariesExtParams {
+    seqno: Option<u32>,
+}
+
+fn serialize_libraries_dict_for_emulator(libraries: &ton_block::Libraries) -> Result<String> {
+    let mut raw = HashmapE::with_bit_len(256);
+    libraries.iterate_slices_with_keys(|mut key, mut value| -> Result<bool> {
+        let hash = UInt256::construct_from(&mut key)?;
+        let descr = LibDescr::construct_from(&mut value)?;
+        raw.setref(hash.into(), descr.lib().clone())?;
+        Ok(true)
+    })?;
+
+    Ok(match HashmapType::data(&raw) {
+        Some(root) => base64_encode(write_boc(root)?),
+        None => String::new(),
+    })
+}
+
+async fn get_libraries_ext(p: GetLibrariesExtParams, ctx: Ctx) -> JsonResult {
+    let mc_block_id = get_mc_state_id(&ctx, p.seqno).await?;
+    let mc_state = ctx.engine.load_and_pin_state(&mc_block_id).await?;
+    let libraries = mc_state.state().state()?.libraries();
+    let dict_boc = serialize_libraries_dict_for_emulator(libraries)?;
+    let libraries_count = libraries.len()?;
+
+    Ok(serde_json::json!({
+        "@type": "smc.libraryResultExt",
+        "block_id": serialize_block_id(&mc_block_id),
+        "dict_boc": dict_boc,
+        "libraries_count": libraries_count,
+        "@extra": extra(0),
+    }))
+}
 #[derive(Debug, serde::Deserialize)]
 struct DetectAddressParams {
     address: String,

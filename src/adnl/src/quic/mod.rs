@@ -25,7 +25,7 @@ use std::{
     fmt::{Debug, Formatter, Write},
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Once, Weak,
     },
     time::{Duration, Instant},
@@ -64,7 +64,17 @@ enum SendError {
 struct QuicInboundKey(Arc<KeyId>, Arc<KeyId>, usize);
 
 type QuicInboundMap = lockfree::map::Map<QuicInboundKey, quinn::Connection>;
+type QuicIpConnCount = lockfree::map::Map<IpAddr, AtomicUsize>;
+type QuicDelayedAccepts = lockfree::map::Map<IpAddr, ()>;
 type QuicSendQueue = SendQueue<Vec<u8>>;
+
+/// Reason why a delayed-accept reservation was refused.
+enum DelayedAcceptRefusal {
+    /// This IP already has a delayed accept in progress.
+    IpAlreadyDelayed,
+    /// The global delayed-accept limit (MAX_DELAYED_ACCEPTS) was reached.
+    GlobalLimitReached,
+}
 
 /// Extract a `KeyId` from an Ed25519 SubjectPublicKeyInfo (SPKI) DER blob.
 /// Ed25519 SPKI = 12-byte OID header || 32-byte raw public key (total 44 bytes).
@@ -165,28 +175,6 @@ impl rustls::client::ResolvesClientCert for QuicCertResolver {
     }
 }
 
-/// Fixed single-key server cert resolver for the per-key fallback configs.
-struct QuicSingleKeyServerResolver(Arc<rustls::sign::CertifiedKey>);
-
-impl Debug for QuicSingleKeyServerResolver {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QuicSingleKeyServerResolver").finish()
-    }
-}
-
-impl rustls::server::ResolvesServerCert for QuicSingleKeyServerResolver {
-    fn resolve(
-        &self,
-        _client_hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(self.0.clone())
-    }
-
-    fn only_raw_public_keys(&self) -> bool {
-        true
-    }
-}
-
 /// Per-identity outbound state: a dedicated client config (with this identity's cert) and
 /// its outbound connection pool keyed by remote SocketAddr.
 struct LocalKeyState {
@@ -254,22 +242,15 @@ impl rustls::client::danger::ServerCertVerifier for QuicServerCertVerifier {
     }
 }
 
-/// Resolves the server's TLS credential per SNI. Returns a raw Ed25519 SPKI (RFC 7250 RPK)
-/// instead of an X.509 certificate to match the C++ ADNL/QUIC implementation.
+/// Presents the active RPK (Ed25519 SPKI, RFC 7250) to connecting peers.
+/// SNI is ignored — there is exactly one active identity per endpoint.
 struct QuicServerCertResolver {
-    keys: Arc<lockfree::map::Map<String, Arc<rustls::sign::CertifiedKey>>>,
-    /// Most recently registered identity name. Used as SNI fallback when the client
-    /// (e.g. C++ ngtcp2) doesn't send SNI, matching C++ SO_REUSEADDR behavior where
-    /// the last-bound socket receives packets.
-    last_added_name: Arc<Mutex<Option<String>>>,
+    active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
 }
 
 impl QuicServerCertResolver {
-    fn new(
-        keys: Arc<lockfree::map::Map<String, Arc<rustls::sign::CertifiedKey>>>,
-        last_added_name: Arc<Mutex<Option<String>>>,
-    ) -> Arc<Self> {
-        Arc::new(Self { keys, last_added_name })
+    fn new(active_identity: Arc<Mutex<Option<ActiveIdentity>>>) -> Arc<Self> {
+        Arc::new(Self { active_identity })
     }
 }
 
@@ -282,34 +263,12 @@ impl Debug for QuicServerCertResolver {
 impl rustls::server::ResolvesServerCert for QuicServerCertResolver {
     fn resolve(
         &self,
-        client_hello: rustls::server::ClientHello<'_>,
+        _client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let sni_desc = client_hello.server_name().unwrap_or("<none>");
-        log::trace!(target: TARGET, "QuicServerCertResolver::resolve SNI='{sni_desc}'");
-        if let Some(sni) = client_hello.server_name() {
-            if let Some(entry) = self.keys.get(sni) {
-                log::trace!(target: TARGET, "QuicServerCertResolver: exact SNI match for '{sni}'");
-                return Some(entry.val().clone());
-            }
-        }
-        let fallback_name = self.last_added_name.lock().ok().and_then(|g| g.clone());
-        let result = fallback_name
-            .as_ref()
-            .and_then(|name| self.keys.get(name).map(|e| (name.clone(), e.val().clone())))
-            .or_else(|| self.keys.iter().next().map(|e| (e.key().clone(), e.val().clone())))
-            .map(|(name, key)| {
-                log::debug!(
-                    target: TARGET,
-                    "QuicServerCertResolver: SNI '{}' not found, falling back to '{}'{}",
-                    sni_desc, name,
-                    if fallback_name.is_some() { " (last added)" } else { " (arbitrary)" }
-                );
-                key
-            });
-        if result.is_none() {
-            log::warn!(target: TARGET, "QuicServerCertResolver: NO keys registered, returning None");
-        }
-        result
+        self.active_identity
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|identity| identity.cert.clone()))
     }
 
     fn only_raw_public_keys(&self) -> bool {
@@ -414,54 +373,20 @@ fn peer_key_id_from_connection(conn: &quinn::Connection) -> Option<Arc<KeyId>> {
     key_id_from_spki(first.as_ref()).ok()
 }
 
-/// Tracks rapid reconnection attempts from a remote address.
-/// Used to detect C++ clients stuck in a connect-and-abandon loop due to
-/// key mismatch after validator key rotation.
-struct ReconnectTracker {
-    /// Number of connections that closed without opening any streams.
-    count: u32,
-    /// When the first failed attempt in this window was recorded.
-    window_start: Instant,
-}
-
-impl ReconnectTracker {
-    fn record(entry: &mut ReconnectTracker, window: Duration) {
-        let now = Instant::now();
-        if now.duration_since(entry.window_start) > window {
-            entry.count = 1;
-            entry.window_start = now;
-        } else {
-            entry.count += 1;
-        }
-    }
-
-    fn should_fallback(entry: &ReconnectTracker, window: Duration, threshold: u32) -> bool {
-        let now = Instant::now();
-        if now.duration_since(entry.window_start) > window || entry.count < threshold {
-            return false;
-        }
-        // After threshold: alternate OLD/NEW on each attempt.
-        // offset 0 → OLD, offset 1 → NEW, offset 2 → OLD, ...
-        (entry.count - threshold) % 2 == 0
-    }
-}
-
 /// Per-port endpoint state: the quinn endpoint, its accept loop handle,
 /// and the TLS cert/key maps for identities registered on this port.
+#[derive(Clone)]
+struct ActiveIdentity {
+    key_id: Arc<KeyId>,
+    cert: Arc<rustls::sign::CertifiedKey>,
+}
+
 struct EndpointState {
     endpoint: quinn::Endpoint,
-    server_cert_keys: Arc<lockfree::map::Map<String, Arc<rustls::sign::CertifiedKey>>>,
-    local_key_names: Arc<lockfree::map::Map<String, Arc<KeyId>>>,
-    /// Tracks the most recently added identity name for SNI fallback.
-    last_added_name: Arc<Mutex<Option<String>>>,
-    /// Per-key ServerConfig for fallback: when a peer keeps failing with the
-    /// default (newest) key, we cycle through older keys.
-    per_key_configs: Arc<Mutex<HashMap<String, Arc<quinn::ServerConfig>>>>,
-    /// Tracks rapid reconnection failures per remote IP (port-independent,
-    /// since QUIC clients use a new source port for each connection).
-    /// Shared with the accept loop; also stored here for potential future stats access.
-    #[allow(dead_code)]
-    reconnect_tracker: Arc<Mutex<HashMap<IpAddr, ReconnectTracker>>>,
+    /// The currently active identity for this endpoint.
+    active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
+    /// All registered keys on this endpoint (for key rotation / removal).
+    registered_keys: Arc<Mutex<HashMap<Arc<KeyId>, Arc<rustls::sign::CertifiedKey>>>>,
 }
 
 /// Command sent to the background Tokio task that manages QUIC key operations.
@@ -493,8 +418,6 @@ pub struct QuicNode {
     /// Shared subscriber list for all accept loops.
     subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
     peer_keys: lockfree::map::Map<Arc<KeyId>, SocketAddr>,
-    /// Max concurrent in-flight streams per inbound connection.
-    max_streams_per_connection: usize,
     /// Inbound connection maps, one per endpoint/accept-loop. Used by the stats dumper.
     inbound_pools: Mutex<Vec<Arc<QuicInboundMap>>>,
     /// Per-TL-tag message counters for the stats dumper.
@@ -514,26 +437,36 @@ impl QuicNode {
     const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
     /// How often the stats dumper logs connection statistics.
     const STATS_DUMP_INTERVAL: Duration = Duration::from_secs(60);
-    const DEFAULT_MAX_STREAMS_PER_CONNECTION: usize = 256;
     const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5000;
     /// Maximum number of messages buffered per outbound peer
     const SEND_QUEUE_CAPACITY: usize = 1024;
     /// Timeout for QUIC handshake when connecting to a peer.
     /// C++ ngtcp2 abandons after ~3-5s, so 5s is a reasonable upper bound.
 
-    // --- Key fallback on rapid reconnection ---
-    // When a C++ client keeps connecting and immediately disconnecting (key
-    // mismatch after validator key rotation), the server detects the pattern
-    // and presents an older key as a fallback.
-    //
-    /// Enable the key fallback mechanism. When `false`, the server always
-    /// presents the most recently registered key (last_added_name).
-    const KEY_FALLBACK_ENABLED: bool = false;
-    /// Time window for counting rapid reconnection attempts from the same IP.
-    const KEY_FALLBACK_WINDOW: Duration = Duration::from_secs(60);
-    /// Number of connection attempts within the window before triggering fallback.
-    const KEY_FALLBACK_THRESHOLD: u32 = 3;
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Experiment A (fix_quic_problem_0417.md): gate for the per-IP delayed-
+    /// accept path. When `false`, every handshake proceeds straight to
+    /// `handle_connection`, bounded only by `rate_limit()` (stateless retry +
+    /// conn_rate_limiters + global_rate_limiter) and `CONNECT_TIMEOUT`.
+    ///
+    /// Rationale: `incoming.refuse()` from the delayed-accept path triggers the
+    /// peer's ngtcp2 on_closed -> outbound_.erase(path) -> ADNL retry -> new
+    /// handshake, a self-reinforcing churn loop. The 2 s delay additionally
+    /// burns the peer's 5 s handshake budget on high-RTT/lossy paths. Set back
+    /// to `true` to re-enable the throttle.
+    const DELAYED_ACCEPT_ENABLED: bool = false;
+
+    /// Per-IP live inbound connection limit.
+    /// When an IP already has PER_IP_INBOUND_FAST_THRESHOLD inbound connections,
+    /// new incoming handshakes may enter a bounded delayed-accept path.
+    const PER_IP_INBOUND_FAST_THRESHOLD: usize = 5;
+    /// Maximum number of delayed accepts permitted globally.
+    const MAX_DELAYED_ACCEPTS: usize = 64;
+    /// How long to hold a bounded delayed accept before starting the handshake.
+    const PER_IP_INBOUND_DELAY: Duration = Duration::from_secs(2);
+
+    const ZOMBIE_STREAM_GRACE: Duration = Duration::from_secs(60);
 
     /// Backoff schedule: first 2 attempts (cycle 1) have no delay, then groups
     /// of 10 attempts (5 cycles) increase by 5s each, capped at 30s.
@@ -561,12 +494,9 @@ impl QuicNode {
     pub fn new(
         subscribers: Vec<Arc<dyn Subscriber>>,
         cancellation_token: tokio_util::sync::CancellationToken,
-        max_streams_per_connection: Option<usize>,
         runtime_handle: tokio::runtime::Handle,
         rate_limit_config: Option<QuicRateLimitConfig>,
     ) -> Arc<Self> {
-        let max_streams_per_connection =
-            max_streams_per_connection.unwrap_or(Self::DEFAULT_MAX_STREAMS_PER_CONNECTION);
         static CRYPTO_INIT: Once = Once::new();
         CRYPTO_INIT.call_once(|| {
             rustls::crypto::ring::default_provider()
@@ -580,7 +510,6 @@ impl QuicNode {
             endpoints: Mutex::new(HashMap::new()),
             subscribers: Arc::new(subscribers),
             peer_keys: lockfree::map::Map::new(),
-            max_streams_per_connection,
             inbound_pools: Mutex::new(Vec::new()),
             msg_stats: MsgStats::new(),
             key_cmd_tx,
@@ -697,6 +626,9 @@ impl QuicNode {
             quinn::IdleTimeout::try_from(Duration::from_secs(15)).expect("15s fits in IdleTimeout"),
         ));
         client_transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        // BBR instead of the default CUBIC
+        client_transport
+            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         quinn_client_config.transport_config(Arc::new(client_transport));
 
         let local_key_state = Arc::new(LocalKeyState {
@@ -714,48 +646,31 @@ impl QuicNode {
         let endpoint_state = self.get_or_create_endpoint(bind_addr)?;
 
         // Server cert: SPKI DER (RPK) — presented when accepting inbound connections.
-        let name = Self::key_id_to_server_name(key_id);
         let server_spki = rustls::pki_types::CertificateDer::from(pub_key_bytes);
         let server_signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)
             .map_err(|e| error!("Cannot create server signing key: {e}"))?;
-        add_unbound_object_to_map(&*endpoint_state.server_cert_keys, name.clone(), || {
-            Ok(Arc::new(rustls::sign::CertifiedKey::new(
-                vec![server_spki.clone()],
-                server_signing_key.clone(),
-            )))
-        })?;
+        let certified_key = Arc::new(rustls::sign::CertifiedKey::new(
+            vec![server_spki.clone()],
+            server_signing_key.clone(),
+        ));
 
-        // Register the key name → key id mapping for SNI resolution on this endpoint
-        add_unbound_object_to_map(&*endpoint_state.local_key_names, name.clone(), || {
-            Ok(key_id.clone())
-        })?;
-
-        // Build a dedicated ServerConfig for this key (used by the fallback mechanism
-        // when a peer keeps reconnecting and failing with the default/newest key).
-        if let Some(cert_entry) = endpoint_state.server_cert_keys.get(&name) {
-            match Self::build_single_key_server_config(cert_entry.val().clone()) {
-                Ok(cfg) => {
-                    if let Ok(mut configs) = endpoint_state.per_key_configs.lock() {
-                        configs.insert(name.clone(), Arc::new(cfg));
-                    }
-                }
-                Err(e) => log::warn!(
-                    target: TARGET,
-                    "Cannot build per-key ServerConfig for {key_id}: {e}"
-                ),
-            }
+        // Register in the endpoint's key store
+        if let Ok(mut keys) = endpoint_state.registered_keys.lock() {
+            keys.insert(key_id.clone(), certified_key.clone());
         }
 
         // Auto-activate the first key so the server always has an active identity
-        if let Ok(mut last) = endpoint_state.last_added_name.lock() {
-            if last.is_none() {
-                *last = Some(name);
-                log::info!(
-                    target: TARGET,
-                    "Registered and auto-activated QUIC identity {} on port {}",
-                    key_id, bind_addr.port()
-                );
-                return Ok(());
+        if let Ok(active) = endpoint_state.active_identity.lock() {
+            if active.is_none() {
+                drop(active);
+                if self.set_active_key(&endpoint_state, key_id, &certified_key) {
+                    log::info!(
+                        target: TARGET,
+                        "Registered and auto-activated QUIC identity {} on port {}",
+                        key_id, bind_addr.port()
+                    );
+                    return Ok(());
+                }
             }
         }
 
@@ -797,25 +712,45 @@ impl QuicNode {
             fail!("No QUIC endpoint on port {port} for key {key_id}");
         };
 
-        let name = Self::key_id_to_server_name(key_id);
+        // Remove from registered keys
+        if let Ok(mut keys) = endpoint_state.registered_keys.lock() {
+            keys.remove(key_id);
+        }
 
-        // Remove from server cert resolver map
-        endpoint_state.server_cert_keys.remove(&name);
-
-        // Remove from local key name → key id mapping
-        endpoint_state.local_key_names.remove(&name);
-
-        // Update last_added_name: if it was pointing to the removed key,
-        // switch to another remaining key (or None).
-        if let Ok(mut last) = endpoint_state.last_added_name.lock() {
-            if last.as_deref() == Some(&name) {
-                *last = endpoint_state.local_key_names.iter().next().map(|e| e.key().clone());
+        // If the removed key was the active one, switch to another or None.
+        // Determine the replacement under registered_keys first, then lock
+        // active_identity — this keeps the same order as add_key (registered_keys
+        // before active_identity) and avoids a potential deadlock.
+        let replacement = endpoint_state.registered_keys.lock().ok().and_then(|keys| {
+            keys.iter()
+                .next()
+                .map(|(id, cert)| ActiveIdentity { key_id: id.clone(), cert: cert.clone() })
+        });
+        if let Ok(mut active) = endpoint_state.active_identity.lock() {
+            if active.as_ref().map(|identity| identity.key_id.as_ref()) == Some(key_id.as_ref()) {
+                *active = replacement;
             }
         }
 
-        // Remove per-key ServerConfig for fallback
-        if let Ok(mut configs) = endpoint_state.per_key_configs.lock() {
-            configs.remove(&name);
+        // Close all inbound connections that were established with this key.
+        // The handle_connection tasks will detect the closure and clean up.
+        if let Ok(pools) = self.inbound_pools.lock() {
+            let mut closed = 0u32;
+            for pool in pools.iter() {
+                for entry in pool.iter() {
+                    let QuicInboundKey(ref local_id, _, _) = *entry.key();
+                    if local_id == key_id {
+                        entry.val().close(0u32.into(), b"Key removed");
+                        closed += 1;
+                    }
+                }
+            }
+            if closed > 0 {
+                log::info!(
+                    target: TARGET,
+                    "Closed {closed} inbound connection(s) bound to removed key {key_id}"
+                );
+            }
         }
 
         // Remove from local key state (outbound connections for this identity)
@@ -830,7 +765,7 @@ impl QuicNode {
         Ok(())
     }
 
-    /// Activate a previously added key as the current SNI fallback identity.
+    /// Activate a previously added key as the current identity for inbound connections.
     /// Called when the validator set containing this key becomes active.
     pub fn activate_key(&self, key_id: &Arc<KeyId>) {
         let _ = self.key_cmd_tx.send(KeyCommand::ActivateKey { key_id: key_id.clone() });
@@ -850,12 +785,31 @@ impl QuicNode {
             log::warn!(target: TARGET, "activate_key: no endpoint on port {port} for key {key_id}");
             return;
         };
-        let name = Self::key_id_to_server_name(key_id);
-        // Update last-added name for SNI fallback (C++ ngtcp2 doesn't send SNI)
-        if let Ok(mut last) = endpoint_state.last_added_name.lock() {
-            *last = Some(name);
+        let cert =
+            endpoint_state.registered_keys.lock().ok().and_then(|keys| keys.get(key_id).cloned());
+        let Some(cert) = cert else {
+            log::warn!(target: TARGET, "activate_key: no cert for key {key_id}");
+            return;
+        };
+        if self.set_active_key(endpoint_state, key_id, &cert) {
+            log::info!(target: TARGET, "Activated QUIC identity {} on port {}", key_id, port);
         }
-        log::info!(target: TARGET, "Activated QUIC identity {} on port {}", key_id, port);
+    }
+
+    fn set_active_key(
+        &self,
+        endpoint_state: &EndpointState,
+        key_id: &Arc<KeyId>,
+        cert: &Arc<rustls::sign::CertifiedKey>,
+    ) -> bool {
+        if let Ok(mut active) = endpoint_state.active_identity.lock() {
+            if active.as_ref().map(|identity| identity.key_id.as_ref()) == Some(key_id.as_ref()) {
+                return false;
+            }
+            *active = Some(ActiveIdentity { key_id: key_id.clone(), cert: cert.clone() });
+            return true;
+        }
+        false
     }
 
     pub fn add_peer_key(&self, key_id: Arc<KeyId>, addr: SocketAddr) -> Result<()> {
@@ -943,15 +897,12 @@ impl QuicNode {
             let send_queue = outbound.send_queue.clone();
             let sender_state = outbound.sender_state.clone();
             let outbound_conns = state.outbound.clone();
-            let server_name = Self::key_id_to_server_name(peers.other());
-
             spawn_cancelable(
                 self.cancellation_token.clone(),
                 Self::run_sender_task(
                     quic,
                     peers.clone(),
                     addr,
-                    server_name,
                     send_queue,
                     sender_state,
                     outbound_conns,
@@ -1029,7 +980,7 @@ impl QuicNode {
         }
     }
 
-    async fn connect(&self, peers: &AdnlPeers, addr: SocketAddr, server_name: &str) -> Result<()> {
+    async fn connect(&self, peers: &AdnlPeers, addr: SocketAddr) -> Result<()> {
         let dst = peers.other();
         let state = self.local_key_state(peers.local())?;
 
@@ -1055,8 +1006,8 @@ impl QuicNode {
                 .ok_or_else(|| error!("No QUIC endpoint for port {}", state.bound_port))?
         };
         let conn = endpoint
-            .connect_with(state.client_config.clone(), addr, server_name)
-            .map_err(|e| error!("QUIC connect to {addr} (SNI={server_name}): {e}"))?
+            .connect_with(state.client_config.clone(), addr, Self::OUTBOUND_SERVER_NAME)
+            .map_err(|e| error!("QUIC connect to {addr}: {e}"))?
             .await
             .map_err(|e| error!("QUIC handshake to {addr}: {e}"))?;
 
@@ -1115,7 +1066,6 @@ impl QuicNode {
         peers: &AdnlPeers,
     ) -> Result<QuicOutboundConnection> {
         let addr = self.addr_by_key(peers.other())?;
-        let server_name = Self::key_id_to_server_name(peers.other());
         let state = self.local_key_state(peers.local())?;
         loop {
             let conn = Self::get_or_create_outbound_connection(&state.outbound, addr)?;
@@ -1123,7 +1073,7 @@ impl QuicNode {
                 break Ok(conn);
             }
             log::info!(target: TARGET, "Try new QUIC connection to {addr} in foreground");
-            if let Err(e) = self.connect(peers, addr, &server_name).await {
+            if let Err(e) = self.connect(peers, addr).await {
                 self.transport_errors.connect_failed.fetch_add(1, Ordering::Relaxed);
                 return Err(e);
             }
@@ -1166,12 +1116,10 @@ impl QuicNode {
         }
 
         // Create per-endpoint TLS state
-        let server_cert_keys: Arc<lockfree::map::Map<String, Arc<rustls::sign::CertifiedKey>>> =
-            Arc::new(lockfree::map::Map::new());
-        let last_added_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let active_identity: Arc<Mutex<Option<ActiveIdentity>>> = Arc::new(Mutex::new(None));
+        let registered_keys = Arc::new(Mutex::new(HashMap::new()));
         let verifier = QuicClientCertVerifier::new();
-        let server_cert_resolver =
-            QuicServerCertResolver::new(server_cert_keys.clone(), last_added_name.clone());
+        let server_cert_resolver = QuicServerCertResolver::new(active_identity.clone());
         let mut tls_config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(verifier.clone())
             .with_cert_resolver(server_cert_resolver.clone());
@@ -1197,6 +1145,9 @@ impl QuicNode {
         // Keep established connections alive so the idle timeout only fires on
         // truly dead peers, not on connections that are just quiet between rounds.
         transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+        // BBR instead of the default CUBIC
+        transport_config
+            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         quinn_server_config.transport_config(Arc::new(transport_config));
 
         // Create UDP socket with SO_REUSEADDR so the port can be reused immediately
@@ -1214,6 +1165,22 @@ impl QuicNode {
             sock.set_nonblocking(true).map_err(|e| error!("Cannot set non-blocking: {e}"))?;
             UdpSocket::from(sock)
         };
+        // Probe the UDP socket's hardware/OS offload capabilities before moving
+        // it into the quinn endpoint. GSO/GRO status is useful for diagnosing
+        // throughput differences across hosts.
+        match quinn::udp::UdpSocketState::new((&udp_socket).into()) {
+            Ok(state) => log::info!(
+                target: TARGET,
+                "QUIC UDP caps on {bind_addr}: max_gso_segments={}, gro_segments={}, may_fragment={}",
+                state.max_gso_segments(),
+                state.gro_segments(),
+                state.may_fragment(),
+            ),
+            Err(e) => log::warn!(
+                target: TARGET,
+                "QUIC UDP caps probe failed on {bind_addr}: {e}"
+            ),
+        }
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
@@ -1223,10 +1190,10 @@ impl QuicNode {
         )
         .map_err(|e| error!("Cannot create QUIC endpoint on {bind_addr}: {e}"))?;
 
-        let local_key_names: Arc<lockfree::map::Map<String, Arc<KeyId>>> =
-            Arc::new(lockfree::map::Map::new());
-
         let inbound: Arc<QuicInboundMap> = Arc::new(lockfree::map::Map::new());
+        let ip_conn_count: Arc<QuicIpConnCount> = Arc::new(lockfree::map::Map::new());
+        let delayed_accepts: Arc<QuicDelayedAccepts> = Arc::new(lockfree::map::Map::new());
+        let delayed_accept_count = Arc::new(AtomicUsize::new(0));
         match self.inbound_pools.lock() {
             Ok(mut pools) => pools.push(inbound.clone()),
             Err(e) => log::warn!(
@@ -1234,9 +1201,6 @@ impl QuicNode {
                 "inbound_pools lock poisoned, inbound stats will be incomplete: {e}"
             ),
         }
-
-        let per_key_configs = Arc::new(Mutex::new(HashMap::new()));
-        let reconnect_tracker = Arc::new(Mutex::new(HashMap::new()));
 
         let rl_config = self.rate_limit_config.clone();
         let conn_rate_limiters =
@@ -1249,30 +1213,22 @@ impl QuicNode {
 
         Self::spawn_accept_loop(
             endpoint.clone(),
-            local_key_names.clone(),
-            server_cert_resolver,
+            active_identity.clone(),
             self.subscribers.clone(),
             bind_addr,
-            self.max_streams_per_connection,
             self.cancellation_token.clone(),
             inbound,
+            ip_conn_count,
+            delayed_accepts,
+            delayed_accept_count,
             self.msg_stats.clone(),
-            per_key_configs.clone(),
-            reconnect_tracker.clone(),
             rl_config,
             conn_rate_limiters,
             global_rate_limiter,
             self.transport_errors.clone(),
         );
 
-        let state = Arc::new(EndpointState {
-            endpoint,
-            server_cert_keys,
-            local_key_names,
-            last_added_name,
-            per_key_configs,
-            reconnect_tracker,
-        });
+        let state = Arc::new(EndpointState { endpoint, active_identity, registered_keys });
         endpoints.insert(port, state.clone());
 
         log::info!(target: TARGET, "Created QUIC endpoint on {bind_addr}");
@@ -1320,41 +1276,105 @@ impl QuicNode {
         }
     }
 
+    /// Returns `true` if this IP has fewer than PER_IP_INBOUND_FAST_THRESHOLD
+    /// live inbound connections and is allowed to start another handshake.
+    fn ip_allow_fast(ip_conn_count: &QuicIpConnCount, ip: IpAddr) -> bool {
+        match ip_conn_count.get(&ip) {
+            Some(entry) => {
+                entry.val().load(Ordering::Relaxed) < Self::PER_IP_INBOUND_FAST_THRESHOLD
+            }
+            None => true,
+        }
+    }
+
+    fn ip_conn_inc(ip_conn_count: &QuicIpConnCount, ip: IpAddr) {
+        if let Some(entry) = ip_conn_count.get(&ip) {
+            entry.val().fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let _ = add_unbound_object_to_map_with_update(ip_conn_count, ip, |found| match found {
+            Some(count) => {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            }
+            None => Ok(Some(AtomicUsize::new(1))),
+        });
+    }
+
+    fn ip_conn_dec(ip_conn_count: &QuicIpConnCount, ip: IpAddr) {
+        if let Some(entry) = ip_conn_count.get(&ip) {
+            let prev = entry.val().fetch_sub(1, Ordering::Relaxed);
+            if prev <= 1 {
+                // Remove the zero-valued entry so the map only holds IPs with
+                // active connections.  A narrow race exists: a concurrent
+                // ip_conn_inc for the same IP may bump the counter between
+                // fetch_sub and remove.  This is benign — ip_conn_inc's
+                // fallback recreates the entry, so at worst one connection
+                // skips the delayed-accept path.
+                ip_conn_count.remove(&ip);
+            }
+        }
+    }
+
+    /// Try to reserve a delayed-accept slot for `ip`.
+    /// Returns `Ok(())` on success, `Err(reason)` on refusal.
+    fn try_acquire_delayed_accept(
+        delayed_accepts: &QuicDelayedAccepts,
+        delayed_accept_count: &AtomicUsize,
+        ip: IpAddr,
+    ) -> std::result::Result<(), DelayedAcceptRefusal> {
+        let inserted = match add_unbound_object_to_map(delayed_accepts, ip, || Ok(())) {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                log::warn!(target: TARGET, "Cannot reserve delayed accept for {ip}: {e}");
+                return Err(DelayedAcceptRefusal::IpAlreadyDelayed);
+            }
+        };
+        if !inserted {
+            return Err(DelayedAcceptRefusal::IpAlreadyDelayed);
+        }
+
+        let reserved = delayed_accept_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < Self::MAX_DELAYED_ACCEPTS).then_some(count + 1)
+            })
+            .is_ok();
+        if !reserved {
+            delayed_accepts.remove(&ip);
+            return Err(DelayedAcceptRefusal::GlobalLimitReached);
+        }
+        Ok(())
+    }
+
+    fn release_delayed_accept(
+        delayed_accepts: &QuicDelayedAccepts,
+        delayed_accept_count: &AtomicUsize,
+        ip: IpAddr,
+    ) {
+        delayed_accepts.remove(&ip);
+        delayed_accept_count.fetch_sub(1, Ordering::AcqRel);
+    }
+
     async fn handle_connection(
         incoming: quinn::Incoming,
-        local_key_names: Arc<lockfree::map::Map<String, Arc<KeyId>>>,
-        server_cert_resolver: Arc<QuicServerCertResolver>,
+        active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
         inbound: Arc<QuicInboundMap>,
+        ip_conn_count: Arc<QuicIpConnCount>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         bind_addr: SocketAddr,
-        max_streams_per_connection: usize,
         msg_stats: Arc<MsgStats>,
-        fallback_config: Option<Arc<quinn::ServerConfig>>,
-        reconnect_tracker: Arc<Mutex<HashMap<IpAddr, ReconnectTracker>>>,
     ) {
         let addr = incoming.remote_address();
-        // Use fallback ServerConfig if provided (older key for rapid-reconnect peers).
-        let connecting = if let Some(config) = fallback_config {
-            match incoming.accept_with(config) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!(target: TARGET, "QUIC accept_with (fallback) from {addr}: {e}");
-                    return;
-                }
-            }
-        } else {
-            match incoming.accept() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!(target: TARGET, "QUIC accept from {addr}: {e}");
-                    return;
-                }
+
+        let connecting = match incoming.accept() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(target: TARGET, "QUIC accept from {addr}: {e}");
+                return;
             }
         };
         // Bound handshake time: C++ ngtcp2 clients abandon after ~3-5s and retry,
         // so a handshake still in progress after 5s is almost certainly stale.
-        // Without this, stale Connecting futures accumulate inside quinn's endpoint,
-        // slowing its internal event loop and delaying endpoint.accept() for new peers.
         let conn = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
@@ -1379,26 +1399,19 @@ impl QuicNode {
             }
         };
 
-        let local_key_id = {
-            let resolved = server_cert_resolver
-                .last_added_name
-                .lock()
-                .ok()
-                .and_then(|g| g.clone())
-                .and_then(|name| local_key_names.get(&name).map(|e| e.val().clone()));
-            match resolved {
-                Some(key_id) => key_id,
-                None => match local_key_names.iter().next() {
-                    Some(entry) => entry.val().clone(),
-                    None => {
-                        log::warn!(
-                            target: TARGET,
-                            "No local keys registered on {bind_addr}, closing {addr}"
-                        );
-                        conn.close(0u32.into(), b"No local keys");
-                        return;
-                    }
-                },
+        let local_key_id = match active_identity
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|identity| identity.key_id.clone()))
+        {
+            Some(key_id) => key_id,
+            None => {
+                log::warn!(
+                    target: TARGET,
+                    "No active key on {bind_addr}, closing {addr}"
+                );
+                conn.close(0u32.into(), b"No active key");
+                return;
             }
         };
 
@@ -1413,20 +1426,19 @@ impl QuicNode {
         let inbound_key =
             QuicInboundKey(local_key_id.clone(), peer_key_id.clone(), conn.stable_id());
         let _ = add_unbound_object_to_map(&inbound, inbound_key.clone(), || Ok(conn.clone()));
+        Self::ip_conn_inc(&ip_conn_count, addr.ip());
 
         let peers = AdnlPeers::with_keys(local_key_id, peer_key_id);
         let conn_id = conn.stable_id();
-        // Limit concurrent in-flight streams per connection to bound memory usage.
-        // When the semaphore is full, accept stalls, applying QUIC-level backpressure.
-        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(max_streams_per_connection));
 
         // Accept both bi-directional streams (queries + legacy messages) and
         // uni-directional streams (fire-and-forget messages from the new sender).
+        // Concurrency is bounded at the QUIC layer via
+        // `TransportConfig::max_concurrent_bidi_streams` — no additional
+        // user-level semaphore is needed.
         let streams_accepted = Arc::new(AtomicU64::new(0));
         let conn_bi = conn.clone();
         let conn_uni = conn.clone();
-        let sem_bi = stream_semaphore.clone();
-        let sem_uni = stream_semaphore;
         let subs_bi = subscribers.clone();
         let subs_uni = subscribers;
         let peers_bi = peers.clone();
@@ -1446,15 +1458,10 @@ impl QuicNode {
                     }
                 };
                 streams_bi.fetch_add(1, Ordering::Relaxed);
-                let permit = match sem_bi.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
                 let subscribers = subs_bi.clone();
                 let peers = peers_bi.clone();
                 let stats = stats_bi.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
                     if let Err(e) = Self::process_incoming_stream(
                         recv,
                         send,
@@ -1481,15 +1488,10 @@ impl QuicNode {
                     }
                 };
                 streams_uni.fetch_add(1, Ordering::Relaxed);
-                let permit = match sem_uni.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
                 let subscribers = subs_uni.clone();
                 let peers = peers_uni.clone();
                 let stats = stats_uni.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
                     if let Err(e) =
                         Self::process_incoming_uni_stream(recv, &subscribers, &peers, addr, &stats)
                             .await
@@ -1504,6 +1506,8 @@ impl QuicNode {
         // Also monitor conn.closed() directly — if the remote peer disconnects
         // without ever opening streams (e.g., C++ key-mismatch abandon), we detect
         // it immediately instead of waiting for the 15s idle timeout.
+        let zombie_streams = streams_accepted.clone();
+        let zombie_conn = conn.clone();
         tokio::select! {
             () = bi_loop => {}
             () = uni_loop => {}
@@ -1513,18 +1517,26 @@ impl QuicNode {
                     "QUIC connection from {addr} closed early: {reason}"
                 );
             }
+            () = async move {
+                if Self::ZOMBIE_STREAM_GRACE.is_zero() {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(Self::ZOMBIE_STREAM_GRACE).await;
+                if zombie_streams.load(Ordering::Relaxed) == 0 {
+                    log::info!(
+                        target: TARGET,
+                        "Evicting zombie QUIC inbound from {addr}: no streams after {:?}",
+                        Self::ZOMBIE_STREAM_GRACE
+                    );
+                    zombie_conn.close(0u32.into(), b"zombie - no streams");
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
         }
         let total_streams = streams_accepted.load(Ordering::Relaxed);
         inbound.remove(&inbound_key);
-
-        // If the connection was productive (streams were opened), clear the
-        // reconnect tracker for this IP. This resets the fallback state so
-        // future connections from this peer use the default (newest) key again.
-        if total_streams > 0 {
-            if let Ok(mut tracker) = reconnect_tracker.lock() {
-                tracker.remove(&addr.ip());
-            }
-        }
+        Self::ip_conn_dec(&ip_conn_count, addr.ip());
 
         log::info!(
             target: TARGET,
@@ -1533,39 +1545,9 @@ impl QuicNode {
         );
     }
 
-    fn key_id_to_server_name(key_id: &KeyId) -> String {
-        // DNS labels are limited to 63 chars; 64 hex chars → split into two 32-char labels
-        let hex = hex::encode(key_id.data());
-        log::trace!(target: TARGET, "key_id_to_server_name {} -> {}.{}", hex, &hex[..32], &hex[32..]);
-        format!("{}.{}", &hex[..32], &hex[32..])
-    }
-
-    /// Build a ServerConfig that always presents a single fixed RPK certificate.
-    /// Used by the fallback mechanism to present an older key to peers that
-    /// keep failing with the default (newest) key.
-    fn build_single_key_server_config(
-        certified_key: Arc<rustls::sign::CertifiedKey>,
-    ) -> Result<quinn::ServerConfig> {
-        let resolver = Arc::new(QuicSingleKeyServerResolver(certified_key));
-        let verifier = QuicClientCertVerifier::new();
-        let mut tls_config = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_cert_resolver(resolver);
-        tls_config.alpn_protocols = vec![b"ton".to_vec()];
-
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
-                .map_err(|e| error!("Cannot create per-key QUIC server config: {e}"))?,
-        ));
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_concurrent_bidi_streams(1_000u32.into());
-        transport_config.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(Duration::from_secs(15)).expect("15s fits in IdleTimeout"),
-        ));
-        transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
-        server_config.transport_config(Arc::new(transport_config));
-        Ok(server_config)
-    }
+    /// Dummy server name for outbound QUIC connections. Quinn/TLS requires a
+    /// server_name parameter but neither side uses SNI for identity resolution.
+    const OUTBOUND_SERVER_NAME: &'static str = "ton";
 
     fn local_key_state(&self, src: &Arc<KeyId>) -> Result<Arc<LocalKeyState>> {
         self.local_keys
@@ -1800,7 +1782,6 @@ impl QuicNode {
         quic: Arc<Self>,
         peers: AdnlPeers,
         addr: SocketAddr,
-        server_name: String,
         send_queue: Arc<QuicSendQueue>,
         sender_state: Arc<SenderState>,
         outbound: Arc<Connections<QuicOutboundConnection>>,
@@ -1822,10 +1803,7 @@ impl QuicNode {
         'outer: loop {
             // Drain the queue
             while let Some(data) = send_queue.pop() {
-                match quic
-                    .send_message(&peers, addr, &server_name, &outbound, &sender_state, &data)
-                    .await
-                {
+                match quic.send_message(&peers, addr, &outbound, &sender_state, &data).await {
                     Ok(()) => {}
                     Err(SendError::Temporary(e)) => {
                         log::warn!(target: TARGET, "QUIC sender to {addr} send error: {e}");
@@ -1837,16 +1815,7 @@ impl QuicNode {
                         }
                         // Retry once after 1s
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        match quic
-                            .send_message(
-                                &peers,
-                                addr,
-                                &server_name,
-                                &outbound,
-                                &sender_state,
-                                &data,
-                            )
-                            .await
+                        match quic.send_message(&peers, addr, &outbound, &sender_state, &data).await
                         {
                             Ok(()) => {}
                             Err(SendError::Temporary(e)) => {
@@ -1899,7 +1868,6 @@ impl QuicNode {
         &self,
         peers: &AdnlPeers,
         addr: SocketAddr,
-        server_name: &str,
         outbound: &Connections<QuicOutboundConnection>,
         sender_state: &SenderState,
         data: &[u8],
@@ -1925,12 +1893,7 @@ impl QuicNode {
                     target: TARGET,
                     "QUIC sender: connecting to {addr} (attempt {attempt})"
                 );
-                match tokio::time::timeout(
-                    Self::CONNECT_TIMEOUT,
-                    self.connect(peers, addr, server_name),
-                )
-                .await
-                {
+                match tokio::time::timeout(Self::CONNECT_TIMEOUT, self.connect(peers, addr)).await {
                     Ok(Ok(())) => {
                         sender_state.record_connect_success();
                     }
@@ -2103,16 +2066,15 @@ impl QuicNode {
     /// slow or stale handshakes don't block new ones (head-of-line blocking fix).
     fn spawn_accept_loop(
         endpoint: quinn::Endpoint,
-        local_key_names: Arc<lockfree::map::Map<String, Arc<KeyId>>>,
-        server_cert_resolver: Arc<QuicServerCertResolver>,
+        active_identity: Arc<Mutex<Option<ActiveIdentity>>>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         bind_addr: SocketAddr,
-        max_streams_per_connection: usize,
         cancellation_token: tokio_util::sync::CancellationToken,
         inbound: Arc<QuicInboundMap>,
+        ip_conn_count: Arc<QuicIpConnCount>,
+        delayed_accepts: Arc<QuicDelayedAccepts>,
+        delayed_accept_count: Arc<AtomicUsize>,
         msg_stats: Arc<MsgStats>,
-        per_key_configs: Arc<Mutex<HashMap<String, Arc<quinn::ServerConfig>>>>,
-        reconnect_tracker: Arc<Mutex<HashMap<IpAddr, ReconnectTracker>>>,
         rl_config: QuicRateLimitConfig,
         mut conn_rate_limiters: ConnectionRateLimiters,
         mut global_rate_limiter: Option<RateLimiter>,
@@ -2150,98 +2112,93 @@ impl QuicNode {
                         };
                         let addr = incoming.remote_address();
                         log::debug!(target: TARGET, "Accept in QUIC server on {bind_addr} from {addr}");
-
-                        // Check if this peer has been rapidly reconnecting BEFORE
-                        // recording this attempt, so the fallback triggers on the
-                        // connection AFTER the threshold, not the one that reaches it.
-                        let fallback_config = Self::pick_fallback_config(
-                            addr,
-                            &reconnect_tracker,
-                            &per_key_configs,
-                            &server_cert_resolver,
-                        );
-
-                        // Record this attempt AFTER the fallback check, so the
-                        // threshold triggers on the next connection, not this one.
-                        if Self::KEY_FALLBACK_ENABLED {
-                            if let Ok(mut tracker) = reconnect_tracker.lock() {
-                                let entry = tracker.entry(addr.ip()).or_insert_with(|| ReconnectTracker {
-                                    count: 0,
-                                    window_start: Instant::now(),
-                                });
-                                ReconnectTracker::record(entry, Self::KEY_FALLBACK_WINDOW);
+                        let delayed = if Self::DELAYED_ACCEPT_ENABLED
+                            && !Self::ip_allow_fast(&ip_conn_count, addr.ip())
+                        {
+                            match Self::try_acquire_delayed_accept(
+                                &delayed_accepts,
+                                &delayed_accept_count,
+                                addr.ip(),
+                            ) {
+                                Ok(()) => {
+                                    log::debug!(
+                                        target: TARGET,
+                                        "Delaying QUIC accept from {addr} for {:?} \
+                                        (live inbound >= {}, delayed global={}/{})",
+                                        Self::PER_IP_INBOUND_DELAY,
+                                        Self::PER_IP_INBOUND_FAST_THRESHOLD,
+                                        delayed_accept_count.load(Ordering::Relaxed),
+                                        Self::MAX_DELAYED_ACCEPTS,
+                                    );
+                                    transport_errors.delayed.fetch_add(1, Ordering::Relaxed);
+                                    true
+                                }
+                                Err(reason) => {
+                                    let reason_str = match reason {
+                                        DelayedAcceptRefusal::IpAlreadyDelayed =>
+                                            "IP already has a delayed accept in progress",
+                                        DelayedAcceptRefusal::GlobalLimitReached =>
+                                            "global delayed accept limit reached",
+                                    };
+                                    log::debug!(
+                                        target: TARGET,
+                                        "Refusing QUIC accept from {addr}: {reason_str}"
+                                    );
+                                    transport_errors.delayed_refused.fetch_add(1, Ordering::Relaxed);
+                                    incoming.refuse();
+                                    continue;
+                                }
                             }
-                        }
+                        } else {
+                            false
+                        };
 
+                        transport_errors.accepted.fetch_add(1, Ordering::Relaxed);
                         let token = cancellation_token.clone();
-                        let lkn = local_key_names.clone();
-                        let scr = server_cert_resolver.clone();
+                        let ai = active_identity.clone();
                         let ib = inbound.clone();
+                        let ipc = ip_conn_count.clone();
                         let subs = subscribers.clone();
                         let stats = msg_stats.clone();
-                        let tracker = reconnect_tracker.clone();
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                _ = token.cancelled() => {
-                                    log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
+                        if delayed {
+                            let da = delayed_accepts.clone();
+                            let dac = delayed_accept_count.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = token.cancelled() => {
+                                        log::debug!(target: TARGET, "QUIC delayed accept for {addr} cancelled");
+                                        Self::release_delayed_accept(&da, &dac, addr.ip());
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(Self::PER_IP_INBOUND_DELAY) => {
+                                        Self::release_delayed_accept(&da, &dac, addr.ip());
+                                    }
                                 }
-                                _ = Self::handle_connection(
-                                    incoming, lkn, scr, ib, subs, bind_addr,
-                                    max_streams_per_connection, stats,
-                                    fallback_config, tracker,
-                                ) => {}
-                            }
-                        });
+                                tokio::select! {
+                                    _ = token.cancelled() => {
+                                        log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
+                                    }
+                                    _ = Self::handle_connection(
+                                        incoming, ai, ib, ipc, subs, bind_addr, stats,
+                                    ) => {}
+                                }
+                            });
+                        } else {
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = token.cancelled() => {
+                                        log::debug!(target: TARGET, "QUIC connection handler for {addr} cancelled");
+                                    }
+                                    _ = Self::handle_connection(
+                                        incoming, ai, ib, ipc, subs, bind_addr, stats,
+                                    ) => {}
+                                }
+                            });
+                        }
                     }
                 }
             }
         });
-    }
-
-    /// Pick an alternative ServerConfig if a peer has been rapidly reconnecting.
-    /// Returns None (use default) or Some(config with an older key).
-    fn pick_fallback_config(
-        addr: SocketAddr,
-        reconnect_tracker: &Mutex<HashMap<IpAddr, ReconnectTracker>>,
-        per_key_configs: &Mutex<HashMap<String, Arc<quinn::ServerConfig>>>,
-        server_cert_resolver: &QuicServerCertResolver,
-    ) -> Option<Arc<quinn::ServerConfig>> {
-        if !Self::KEY_FALLBACK_ENABLED {
-            return None;
-        }
-
-        let should_fallback = reconnect_tracker
-            .lock()
-            .ok()
-            .and_then(|tracker| {
-                tracker.get(&addr.ip()).map(|entry| {
-                    ReconnectTracker::should_fallback(
-                        entry,
-                        Self::KEY_FALLBACK_WINDOW,
-                        Self::KEY_FALLBACK_THRESHOLD,
-                    )
-                })
-            })
-            .unwrap_or(false);
-
-        if !should_fallback {
-            return None;
-        }
-
-        // Find a key that is NOT the current default (last_added_name).
-        let last_name = server_cert_resolver.last_added_name.lock().ok().and_then(|g| g.clone());
-
-        let configs = per_key_configs.lock().ok()?;
-        for (name, config) in configs.iter() {
-            if Some(name) != last_name.as_ref() {
-                log::info!(
-                    target: TARGET,
-                    "Fallback: presenting older key to {addr} (rapid reconnection detected)"
-                );
-                return Some(config.clone());
-            }
-        }
-        None
     }
 
     /// Background task that periodically scans all outbound connection pools and
@@ -2454,20 +2411,35 @@ impl QuicNode {
                     .ok();
                 }
 
-                let (sf, qt, cf, qf, dr, rl_ip, rl_gl, retry) = transport.transport_errors.take();
+                let e = transport.transport_errors.take();
                 Write::write_fmt(
                     &mut dump,
                     format_args!(
-                        "  errors: send_failed={sf} query_timeout={qt} \
-                    connect_failed={cf} queue_full={qf} dead_conn_removed={dr}\n",
+                        "  errors: send_failed={} query_timeout={} \
+                    connect_failed={} queue_full={} dead_conn_removed={}\n",
+                        e.send_failed,
+                        e.query_timeout,
+                        e.connect_failed,
+                        e.queue_full,
+                        e.dead_conn_removed,
                     ),
                 )
                 .ok();
                 Write::write_fmt(
                     &mut dump,
                     format_args!(
-                        "  rate_limit: per_ip_rejected={rl_ip} global_rejected={rl_gl} \
-                    retry_sent={retry}\n",
+                        "  rate_limit: per_ip_rejected={} global_rejected={} \
+                    retry_sent={}\n",
+                        e.rate_limited_per_ip, e.rate_limited_global, e.retry_sent,
+                    ),
+                )
+                .ok();
+                Write::write_fmt(
+                    &mut dump,
+                    format_args!(
+                        "  accept: accepted={} delayed={} \
+                    delayed_refused={}\n",
+                        e.accepted, e.delayed, e.delayed_refused,
                     ),
                 )
                 .ok();

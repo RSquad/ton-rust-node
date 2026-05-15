@@ -368,7 +368,7 @@ async fn test_getaccount() {
     assert!(answer.shard_account_meta().is_some());
 
     let mut client = recreate_client(client, &config).await;
-    let account_id = UInt256::from(engine.account.get_id().unwrap().get_bytestring(0));
+    let account_id = UInt256::from(engine.account.get_id().unwrap().get_bytestring(0).as_slice());
     let answer: ShardAccountState = request(
         &mut client,
         GetAccountByBlock {
@@ -697,6 +697,7 @@ async fn test_stats() {
                 false,
                 false,
                 false,
+                None,
                 &|| Ok(()),
                 None,
                 Arc::new(AtomicU8::new(0)),

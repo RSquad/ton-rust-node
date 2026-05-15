@@ -118,6 +118,31 @@ fn create_test_desc_weights(
     .unwrap()
 }
 
+/// Create test SessionDescription with custom options
+fn create_test_desc_with_options(
+    count: u32,
+    slots_per_window: u32,
+    mut opts: crate::SessionOptions,
+) -> SessionDescription {
+    let nodes = create_test_validators(count);
+    let local_key = nodes[0].public_key.clone();
+    let shard = ShardIdent::masterchain();
+
+    opts.slots_per_leader_window = slots_per_window;
+
+    SessionDescription::new(
+        &opts,
+        SessionId::default(),
+        1,
+        &nodes,
+        local_key,
+        &shard,
+        SystemTime::now(),
+        None,
+    )
+    .unwrap()
+}
+
 /// Helper to create test candidate for FSM tests
 ///
 /// Creates a minimal candidate for testing. Uses stub block to avoid
@@ -424,6 +449,33 @@ fn test_misbehavior_finalize_after_skip() {
     // Finalize should be rejected
     let result = state.on_vote_test(&desc, ValidatorIndex::new(0), finalize, Vec::new());
     assert!(result.is_err(), "Finalize after skip should return error");
+}
+
+#[test]
+fn test_misbehavior_skip_after_finalize() {
+    let desc = create_test_desc(4, 1);
+    let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+
+    let hash = UInt256::from([0xCD; 32]);
+    let finalize =
+        Vote::Finalize(FinalizeVote { slot: SlotIndex::new(0), block_hash: hash.clone() });
+    let skip = Vote::Skip(SkipVote { slot: SlotIndex::new(0) });
+
+    state
+        .on_vote_test(&desc, ValidatorIndex::new(0), finalize, vec![1, 2, 3])
+        .expect("finalize should succeed");
+
+    let result = state.on_vote_test(&desc, ValidatorIndex::new(0), skip, vec![4, 5, 6]);
+    assert!(result.is_misbehavior(), "Skip after finalize should be reported as misbehavior");
+
+    match result.misbehavior_proof().expect("expected proof") {
+        MisbehaviorProof::ConflictingVoteTypes { existing_vote, new_vote, reason, .. } => {
+            assert_eq!(existing_vote, &VoteDescriptor::Finalize(hash));
+            assert_eq!(new_vote, &VoteDescriptor::Skip);
+            assert_eq!(*reason, ConflictReason::SkipAfterFinalize);
+        }
+        other => panic!("Expected ConflictingVoteTypes proof, got {:?}", other),
+    }
 }
 
 #[test]
@@ -1091,6 +1143,44 @@ fn test_armed_timeouts_enable_skip_after_expiry() {
         .filter(|event| matches!(event, SimplexEvent::BroadcastVote(Vote::Skip(_))))
         .count();
     assert!(skip_count > 0, "skip votes must fire after timeout expires");
+}
+
+#[test]
+fn test_set_timeouts_anchors_skip_slot_to_progress_cursor_cpp_parity() {
+    // C++ parity: timeout_slot_ is set from the actual progress cursor
+    // (LeaderWindowObserved start_slot), not from the window start.
+    // When the progress cursor enters a new window mid-way (e.g., after skip
+    // catch-up), timeouts must be anchored to the cursor, not slot 0.
+    let desc = create_test_desc(4, 2); // 2 slots per window
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Skip-cert slots 0 and 1 (full window 0) so progress cursor enters window 1.
+    let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(0), cert0).unwrap();
+    let cert1 = create_test_skip_cert(&desc, SlotIndex::new(1), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(1), cert1).unwrap();
+    drain_events(&mut state);
+
+    assert_eq!(
+        state.get_first_non_progressed_slot(),
+        SlotIndex::new(2),
+        "precondition: progress cursor at slot 2"
+    );
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "precondition: advanced to window 1"
+    );
+
+    // set_timeouts was called during window transition. skip_slot must be
+    // anchored to the progress cursor (slot 2), not re-calculated from
+    // a lower value.
+    assert!(
+        state.skip_slot >= SlotIndex::new(2),
+        "skip_slot must be anchored to progress cursor (slot 2), not window start, got {}",
+        state.skip_slot
+    );
 }
 
 #[test]
@@ -3578,7 +3668,7 @@ fn test_get_last_finalize_certificate_returns_highest_slot() {
 }
 
 #[test]
-fn test_set_finalize_certificate_stores_old_slot_without_tracking() {
+fn test_set_finalize_certificate_ignores_old_slot_like_cpp() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
 
@@ -3595,7 +3685,7 @@ fn test_set_finalize_certificate_stores_old_slot_without_tracking() {
 
     let hash_a = UInt256::from([0xAA; 32]);
 
-    state
+    let stored = state
         .set_finalize_certificate(
             &desc,
             slot1,
@@ -3603,12 +3693,11 @@ fn test_set_finalize_certificate_stores_old_slot_without_tracking() {
             create_test_final_cert(&desc, slot1, hash_a.clone(), &signers),
         )
         .expect("should not conflict");
+    assert!(!stored, "old-slot FinalCert must be ignored like C++ state.slot_at()");
 
-    // Old-slot FinalCert must be stored for gapless commit / restart support,
-    // but must NOT affect FSM tracking or emit events.
     assert!(
-        state.get_finalize_certificate(slot1, &hash_a).is_some(),
-        "old-slot FinalCert must be retrievable"
+        state.get_finalize_certificate(slot1, &hash_a).is_none(),
+        "old-slot FinalCert must not be stored"
     );
     assert_eq!(
         state.first_non_finalized_slot, before_nf,
@@ -3705,6 +3794,37 @@ fn test_set_skip_certificate_deduplicates_without_events() {
     assert!(
         !state.has_pending_events(),
         "duplicate skip cert must not emit relay-triggering events"
+    );
+}
+
+#[test]
+fn test_set_skip_certificate_ignores_signers_that_already_finalized() {
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    let slot = SlotIndex::new(0);
+    let finalized_hash = UInt256::from([0xD1; 32]);
+    let finalize_vote = Vote::Finalize(FinalizeVote { slot, block_hash: finalized_hash.clone() });
+    state
+        .on_vote_test(&desc, ValidatorIndex::new(0), finalize_vote, vec![9, 9, 9])
+        .expect("local finalize should succeed");
+
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+    let skip_cert = create_test_skip_cert(&desc, slot, &signers);
+    state
+        .set_skip_certificate(&desc, slot, skip_cert)
+        .expect("set_skip_certificate should succeed");
+
+    let slot_votes = state.slot_votes.get(&slot).expect("slot votes must exist");
+    assert!(
+        slot_votes.votes[0].skip.is_none(),
+        "conflicting skip signature from finalized validator must be ignored"
+    );
+    assert!(slot_votes.votes[0].finalize.is_some(), "existing finalize vote must be preserved");
+    assert_eq!(
+        state.get_skip_weight(slot),
+        2,
+        "skip weight must only include non-conflicting signatures"
     );
 }
 
@@ -3954,6 +4074,142 @@ fn test_set_finalize_certificate_advances_progress_cursor_past_pre_skipped_slots
 }
 
 #[test]
+fn test_set_finalize_certificate_cross_window_materializes_progress_slot_base() {
+    // Regression: FinalCert on the last slot of a window jumps progress cursor to the next window.
+    // The target slot may be untouched yet; C++ `slot_at(now_)` materializes it before reading base.
+    let desc = create_test_desc(4, 2); // 2 slots per window
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Precondition: next window has not been touched yet.
+    assert!(state.get_window(WindowIndex::new(1)).is_none());
+
+    // Finalize slot 1 (end of window 0), so cursor jumps to slot 2 (window 1 start).
+    let finalized_slot = SlotIndex::new(1);
+    let block_hash = UInt256::from([0xC1; 32]);
+    let final_cert = create_test_final_cert(&desc, finalized_slot, block_hash.clone(), &signers);
+    state
+        .set_finalize_certificate(&desc, finalized_slot, &block_hash, final_cert)
+        .expect("set_finalize_certificate should succeed");
+
+    assert_eq!(state.get_first_non_progressed_slot(), SlotIndex::new(2));
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "window must advance after finalization jump crosses boundary"
+    );
+
+    let expected_parent = Some(CandidateParentInfo { slot: finalized_slot, hash: block_hash });
+    assert_eq!(
+        state.get_slot_available_base(&desc, SlotIndex::new(2)),
+        Some(expected_parent),
+        "progress-cursor target slot must have available_base materialized"
+    );
+}
+
+#[test]
+fn test_is_slot_progressed_requires_notar_or_skip_markers() {
+    // C++ `advance_present()` only checks notarized/skipped slot state.
+    // A finalized frontier alone must not mark a slot as progressed.
+    let desc = create_test_desc(4, 4);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    state.first_non_finalized_slot = SlotIndex::new(5);
+
+    assert!(
+        !state.is_slot_progressed(&desc, SlotIndex::new(0)),
+        "slot without notar/skip markers must not be considered progressed"
+    );
+
+    state.get_slot_mut(&desc, SlotIndex::new(5)).expect("slot 5 exists").skipped = true;
+    assert!(
+        state.is_slot_progressed(&desc, SlotIndex::new(5)),
+        "skip marker must mark the slot as progressed"
+    );
+}
+
+#[test]
+fn test_slot_accessors_hide_finalized_slots_like_cpp() {
+    let desc = create_test_desc(4, 4);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    assert!(state.get_slot_ref(&desc, SlotIndex::new(0)).is_some());
+    assert!(state.get_slot_mut(&desc, SlotIndex::new(0)).is_some());
+
+    state.set_first_non_finalized_slot(SlotIndex::new(1));
+
+    assert!(
+        state.get_slot_ref(&desc, SlotIndex::new(0)).is_none(),
+        "finalized slots must be hidden just like C++ state.slot_at()"
+    );
+    assert!(
+        state.get_slot_mut(&desc, SlotIndex::new(0)).is_none(),
+        "finalized slots must not be mutable through parity accessors"
+    );
+}
+
+#[test]
+fn test_tracked_slots_interval_uses_highest_materialized_slot_cpp_parity() {
+    let desc = create_test_desc(4, 4);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    assert_eq!(state.get_tracked_slots_interval(), (0, 1), "genesis base materializes only slot 0");
+
+    state.get_slot_mut(&desc, SlotIndex::new(4)).expect("slot 4 exists").skipped = true;
+    assert_eq!(
+        state.get_tracked_slots_interval(),
+        (0, 5),
+        "tracked end must follow the highest materialized slot, not the full window extent"
+    );
+}
+
+#[test]
+fn test_tracked_slots_interval_excludes_slot_votes_and_candidate_ids_cpp_parity() {
+    // C++ state.h tracked_slots_interval():
+    //   begin = first_non_finalized_slot_
+    //   end = slots_.empty() ? first_non_finalized_slot_ : slots_.rbegin()->first + 1
+    //
+    // Rust previously extended `end` from slot_votes keys and candidate_ids values,
+    // making the interval wider than C++. After the parity fix, only materialized
+    // slots (those with actual SlotState) drive `end`.
+    let desc = create_test_desc(4, 4);
+    let state = SimplexState::new(&desc).expect("Failed to create state");
+
+    // Genesis materializes slot 0, so interval is [0, 1)
+    assert_eq!(
+        state.get_tracked_slots_interval(),
+        (0, 1),
+        "initial interval must be [0, 1) based on materialized genesis slot only"
+    );
+}
+
+#[test]
+fn test_set_finalize_certificate_does_not_walk_progress_when_cursor_already_ahead() {
+    // C++ FinalCert handling only runs `advance_present()` when `now_ <= finalized_slot`.
+    // If the progress cursor is already ahead, the FinalCert must not walk further.
+    let desc = create_test_desc(4, 8);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    let finalized_slot = SlotIndex::new(0);
+    let block_hash = UInt256::from([0xC2; 32]);
+    state.get_slot_mut(&desc, finalized_slot).expect("slot 0 exists").observed_notar_certificate =
+        Some(CandidateParentInfo { slot: finalized_slot, hash: block_hash.clone() });
+    state.get_slot_mut(&desc, SlotIndex::new(2)).expect("slot 2 exists").skipped = true;
+    state.first_non_progressed_slot = SlotIndex::new(2);
+
+    let final_cert = create_test_final_cert(&desc, finalized_slot, block_hash.clone(), &signers);
+    state
+        .set_finalize_certificate(&desc, finalized_slot, &block_hash, final_cert)
+        .expect("set_finalize_certificate should succeed");
+
+    assert_eq!(
+        state.get_first_non_progressed_slot(),
+        SlotIndex::new(2),
+        "late finalization must not re-run progress walk when cursor is already ahead"
+    );
+}
+
+#[test]
 fn test_set_finalize_certificate_emits_block_finalized_and_finalization_reached_for_tracked_slot() {
     // External finalize cert ingestion must emit:
     // - BlockFinalized (commit trigger), and
@@ -4152,12 +4408,16 @@ fn test_vote_bound_with_advanced_finalization() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc).expect("create");
     let expected_first_too_new = SlotIndex::new(
-        ((5000 / desc.opts().slots_per_leader_window) + desc.opts().max_leader_window_desync + 1)
-            * desc.opts().slots_per_leader_window,
+        (desc.opts().max_leader_window_desync + 1) * desc.opts().slots_per_leader_window,
     );
 
     // Advance finalization cursor
     state.set_first_non_finalized_slot(SlotIndex::new(5000));
+    assert_eq!(
+        state.get_first_non_progressed_slot(),
+        SlotIndex::new(0),
+        "finalized frontier restoration alone must not move progress cursor"
+    );
 
     let first_too_new = state.first_too_new_vote_slot();
     assert_eq!(first_too_new, expected_first_too_new);
@@ -4256,11 +4516,11 @@ fn test_standstill_slot_grid_dump_empty_state() {
 
     let grid = state.standstill_slot_grid_dump(&desc);
 
-    // With 4 validators and 2 slots per window (window 0 created), expect 2 slot lines
+    // C++ parity: startup materializes only slot 0 (genesis base), so tracked
+    // standstill range initially contains a single slot line.
     let lines: Vec<&str> = grid.lines().collect();
-    assert_eq!(lines.len(), 2, "expected 2 slot lines, got {}", lines.len());
+    assert_eq!(lines.len(), 1, "expected 1 slot line, got {}", lines.len());
     assert_eq!(lines[0], "0: ....");
-    assert_eq!(lines[1], "1: ....");
 }
 
 #[test]
@@ -4300,12 +4560,10 @@ fn test_standstill_slot_grid_dump_with_votes() {
 
     let grid = state.standstill_slot_grid_dump(&desc);
     let lines: Vec<&str> = grid.lines().collect();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 1);
 
     // Slot 0: v0=N, v1=S, v2=I (notarize+skip), v3=.
     assert_eq!(lines[0], "0: NSI.");
-    // Slot 1: no votes
-    assert_eq!(lines[1], "1: ....");
 }
 
 #[test]
@@ -4916,21 +5174,20 @@ fn test_out_of_order_skip_certs_still_propagate_base_to_pending() {
 
 /*
     ========================================================================
-    Base propagation chaining through already-skipped slots
+    Base propagation to the first non-skipped slot
 
-    When skip certs arrive out of order, `propagate_base_after_skip_cert`
-    must chain the base forward through all consecutive already-skipped
-    intermediate slots. Without this, the base jumps from the cert's slot
-    to the first non-skipped slot, leaving intermediate slots baseless
-    and pending blocks stuck forever (no backward-walk like C++ has).
+    C++ `next_nonskipped_slot_after()` jumps over skipped intervals and
+    propagates base only to the first non-skipped successor. Intermediate
+    skipped slots remain baseless.
     ========================================================================
 */
 
 #[test]
-fn test_base_chains_through_already_skipped_slots() {
+fn test_skip_base_propagation_jumps_to_first_non_skipped_slot_after_source_arrives() {
     // Scenario: skip certs for slots 1-6 arrive BEFORE slot 0's cert.
-    // When slot 0's cert is finally processed, the chaining loop must
-    // propagate the genesis base through slots 1→2→3→4→5→6→7.
+    // Before slot 0's cert there is no source base, so the skipped run remains
+    // baseless. Once slot 0's cert is processed, Rust must preserve C++ parity
+    // and jump directly to slot 7 (the first non-skipped slot).
     let desc = create_test_desc(4, 8); // 4 validators, 8 slots/window
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
 
@@ -4946,41 +5203,172 @@ fn test_base_chains_through_already_skipped_slots() {
     // Verify: slots 1-6 are skipped but have no available_base (no source yet)
     for s in 1..=6u32 {
         let base = state.get_slot_ref(&desc, SlotIndex::new(s)).unwrap().available_base.clone();
-        assert!(
-            base.is_none(),
-            "slot {} should have no base before slot 0's cert chains through",
-            s
-        );
+        assert!(base.is_none(), "slot {} should have no base before slot 0's cert propagates", s);
     }
 
-    // Now issue skip cert for slot 0 — triggers chaining through 1→2→3→4→5→6→7
+    // Now issue skip cert for slot 0 — C++ parity jumps directly to slot 7.
     let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
     state.set_skip_certificate(&desc, SlotIndex::new(0), cert0).unwrap();
     drain_events(&mut state);
 
-    // Every intermediate skipped slot must now have the genesis base
     for s in 1..=6u32 {
         let base = state.get_slot_ref(&desc, SlotIndex::new(s)).unwrap().available_base.clone();
-        assert_eq!(
-            base,
-            Some(None), // genesis
-            "slot {} must have genesis base after chaining from slot 0",
+        assert!(
+            base.is_none(),
+            "slot {} must remain baseless because base only jumps to the first non-skipped slot",
             s
         );
     }
 
-    // Slot 7 (first non-skipped after the chain) must also have the base
+    // Slot 7 (first non-skipped after the skipped run) must receive the base.
     let base7 = state.get_slot_ref(&desc, SlotIndex::new(7)).unwrap().available_base.clone();
     assert_eq!(base7, Some(None), "slot 7 (first non-skipped) must have genesis base");
 }
 
 #[test]
-fn test_base_chaining_enables_pending_block_at_intermediate_skipped_slot() {
+fn test_skip_intervals_track_first_non_skipped_boundary_cpp_parity() {
+    let desc = create_test_desc(4, 8);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    state
+        .set_skip_certificate(
+            &desc,
+            SlotIndex::new(1),
+            create_test_skip_cert(&desc, SlotIndex::new(1), &signers),
+        )
+        .expect("slot 1 skip cert should store");
+    assert_eq!(
+        state.skip_intervals.iter().copied().collect::<Vec<_>>(),
+        vec![SlotIndex::new(2)],
+        "after skipping slot 1, the next direct successor becomes the tracked boundary"
+    );
+
+    state
+        .set_skip_certificate(
+            &desc,
+            SlotIndex::new(2),
+            create_test_skip_cert(&desc, SlotIndex::new(2), &signers),
+        )
+        .expect("slot 2 skip cert should store");
+    assert_eq!(
+        state.skip_intervals.iter().copied().collect::<Vec<_>>(),
+        vec![SlotIndex::new(3)],
+        "when the skipped run extends, the boundary must move to the next non-skipped slot"
+    );
+
+    state
+        .set_skip_certificate(
+            &desc,
+            SlotIndex::new(4),
+            create_test_skip_cert(&desc, SlotIndex::new(4), &signers),
+        )
+        .expect("slot 4 skip cert should store");
+    assert_eq!(
+        state.skip_intervals.iter().copied().collect::<Vec<_>>(),
+        vec![SlotIndex::new(3), SlotIndex::new(5)],
+        "disjoint skipped runs must retain separate boundaries like C++ skip_intervals_"
+    );
+}
+
+#[test]
+fn test_finalization_prunes_skip_intervals_before_tracked_range_cpp_parity() {
+    let desc = create_test_desc(4, 8);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    state.skip_intervals.insert(SlotIndex::new(1));
+    state.skip_intervals.insert(SlotIndex::new(3));
+    state.skip_intervals.insert(SlotIndex::new(6));
+
+    state.set_first_non_finalized_slot(SlotIndex::new(3));
+
+    assert_eq!(
+        state.skip_intervals.iter().copied().collect::<Vec<_>>(),
+        vec![SlotIndex::new(3), SlotIndex::new(6)],
+        "finalization must drop skip interval boundaries that point into pruned slots"
+    );
+}
+
+#[test]
+fn test_skip_base_propagation_holds_progress_until_base_known() {
+    // Regression for releasenet invariant panics: if a skipped slot has no base
+    // yet, Rust must not advance the progress cursor into a state where
+    // advance_present()/leader-window publication would later panic.
+    let desc = create_test_desc(4, 8);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Corrupt slot 0 base to emulate the invariant break discovered in incident analysis.
+    state.get_slot_mut(&desc, SlotIndex::new(0)).expect("slot 0 exists").available_base = None;
+
+    let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
+    state
+        .set_skip_certificate(&desc, SlotIndex::new(0), cert0)
+        .expect("skip cert should be accepted");
+
+    assert_eq!(
+        state.get_first_non_progressed_slot(),
+        SlotIndex::new(0),
+        "progress cursor must stay on the skipped slot until a valid base is known"
+    );
+    assert!(
+        state.get_slot_ref(&desc, SlotIndex::new(1)).unwrap().available_base.is_none(),
+        "successor base should remain unknown until a later cert repairs the chain"
+    );
+}
+
+#[test]
+fn test_skip_base_missing_does_not_panic_on_window_boundary_crossing() {
+    // Reproduces the progress-cursor invariant failure path from releasenet:
+    // if a skipped slot has no base and the skipped run crosses a window
+    // boundary, leader-window advancement must not panic.
+    let desc = create_test_desc(4, 2); // 2 slots per window so slot 1 -> slot 2 crosses boundary
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    state.get_slot_mut(&desc, SlotIndex::new(0)).expect("slot 0 exists").available_base = None;
+
+    state
+        .set_skip_certificate(
+            &desc,
+            SlotIndex::new(0),
+            create_test_skip_cert(&desc, SlotIndex::new(0), &signers),
+        )
+        .expect("slot 0 skip cert should store");
+    state
+        .set_skip_certificate(
+            &desc,
+            SlotIndex::new(1),
+            create_test_skip_cert(&desc, SlotIndex::new(1), &signers),
+        )
+        .expect("slot 1 skip cert should store");
+
+    assert_eq!(
+        state.get_first_non_progressed_slot(),
+        SlotIndex::new(0),
+        "progress cursor must not advance across a baseless skipped run"
+    );
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(0),
+        "leader window must not advance while the progress cursor base is unknown"
+    );
+    assert!(
+        state
+            .get_slot_mut(&desc, SlotIndex::new(2))
+            .expect("slot 2 exists")
+            .available_base
+            .is_none(),
+        "the next window must remain baseless until the missing source base is repaired"
+    );
+}
+
+#[test]
+fn test_skip_base_jump_enables_pending_block_at_first_non_skipped_slot() {
     // Regression test for the real-network failure mode:
     // A pending block sits at a slot whose skip cert arrived before the base
-    // propagated. The old code would never set `available_base` on that slot
-    // because `find_next_nonskipped_slot` jumped past it. The chaining fix
-    // ensures the base reaches it.
+    // propagated. Once the source base arrives, Rust must preserve the C++ jump
+    // to the first non-skipped slot and unblock the pending candidate there.
     let desc = create_test_desc(4, 8);
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
 
@@ -5015,22 +5403,116 @@ fn test_base_chaining_enables_pending_block_at_intermediate_skipped_slot() {
         "candidate still pending — base hasn't reached slot 4 yet"
     );
 
-    // Now process slot 0's skip cert → chain: 0→1→2→3→4 (slot 4 not skipped-cert)
+    // Now process slot 0's skip cert. C++ parity jumps directly to slot 4
+    // because slots 1-3 are already skipped and slot 4 is the first non-skipped slot.
     let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
     state.set_skip_certificate(&desc, SlotIndex::new(0), cert0).unwrap();
+
+    for s in 1..=3u32 {
+        assert!(
+            state.get_slot_ref(&desc, SlotIndex::new(s)).unwrap().available_base.is_none(),
+            "intermediate skipped slot {} must remain baseless in C++ parity mode",
+            s
+        );
+    }
+    assert_eq!(
+        state.get_slot_ref(&desc, SlotIndex::new(4)).unwrap().available_base,
+        Some(None),
+        "slot 4 must receive the genesis base as the first non-skipped slot"
+    );
 
     let events: Vec<_> = from_fn(|| state.pull_event()).collect();
     assert!(
         events.iter().any(
             |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if *slot == SlotIndex::new(4))
         ),
-        "must emit NotarVote for pending slot 4 after base chains through, got: {:?}",
+        "must emit NotarVote for pending slot 4 after base jumps to it, got: {:?}",
         events
     );
 
     assert!(
         state.get_window(WindowIndex::new(0)).unwrap().slots[4].pending_block.is_none(),
         "pending_block must be cleared after notarization"
+    );
+}
+
+#[test]
+fn test_skip_base_jump_across_many_skipped_windows_enables_pending_block() {
+    // Bootstrap-style variant of the previous regression:
+    // a long skipped prefix spans multiple leader windows before the first
+    // non-skipped candidate arrives. Once the missing source base appears,
+    // Rust must still jump the base directly to the first non-skipped slot
+    // and unblock that pending candidate.
+    let desc = create_test_desc(4, 4);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    // Skip-vote the first four windows locally (slots 0..15) so slot 16 can be
+    // stored as pending without an immediate notarization.
+    for w in 0..=3u32 {
+        state.try_skip_window(WindowIndex::new(w));
+    }
+    drain_events(&mut state);
+
+    let target_slot = SlotIndex::new(16);
+    let target_hash = UInt256::from([0xE1; 32]);
+    let candidate =
+        create_test_candidate(target_slot.0, target_hash, BlockIdExt::default(), None, 0);
+    state.on_candidate(&desc, candidate).unwrap();
+    drain_events(&mut state);
+
+    let target_window = desc.get_window_idx(target_slot);
+    let target_offset = desc.get_slot_offset_in_window(target_slot) as usize;
+    assert!(
+        state.get_window(target_window).unwrap().slots[target_offset].pending_block.is_some(),
+        "precondition: candidate at slot 16 stored as pending"
+    );
+    assert!(
+        state.get_slot_ref(&desc, target_slot).unwrap().available_base.is_none(),
+        "precondition: slot 16 has no base before source repair"
+    );
+
+    // Skip certs for slots 1..15 arrive BEFORE slot 0's skip cert.
+    for s in 1..=15u32 {
+        let cert = create_test_skip_cert(&desc, SlotIndex::new(s), &signers);
+        state.set_skip_certificate(&desc, SlotIndex::new(s), cert).unwrap();
+    }
+    drain_events(&mut state);
+
+    assert!(
+        state.get_window(target_window).unwrap().slots[target_offset].pending_block.is_some(),
+        "candidate remains pending while slot 0 base source is still missing"
+    );
+
+    // Now slot 0's skip cert arrives. C++-parity jump must carry genesis base
+    // directly to slot 16 because slots 1..15 are already skipped.
+    let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(0), cert0).unwrap();
+
+    for s in 1..=15u32 {
+        assert!(
+            state.get_slot_ref(&desc, SlotIndex::new(s)).unwrap().available_base.is_none(),
+            "intermediate skipped slot {} must remain baseless in C++ parity mode",
+            s
+        );
+    }
+    assert_eq!(
+        state.get_slot_ref(&desc, target_slot).unwrap().available_base,
+        Some(None),
+        "slot 16 must receive genesis base as the first non-skipped slot after the skipped run"
+    );
+
+    let events: Vec<_> = from_fn(|| state.pull_event()).collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot, .. })) if *slot == target_slot)
+        ),
+        "must emit NotarVote for pending slot 16 after base jumps to it, got: {:?}",
+        events
+    );
+    assert!(
+        state.get_window(target_window).unwrap().slots[target_offset].pending_block.is_none(),
+        "pending slot 16 must clear after notarization"
     );
 }
 
@@ -5535,7 +6017,7 @@ fn test_new_window_rearms_timeout_base() {
     state.reset_timeouts_on_start(&desc);
 
     let target_rate = desc.opts().target_rate;
-    let backoff_factor = desc.opts().timeout_increase_factor; // 1.05 default
+    let backoff_factor = desc.opts().first_block_timeout_multiplier;
 
     // Trigger timeout to skip window 0
     desc.set_time(t0 + Duration::from_secs(10));
@@ -5555,7 +6037,7 @@ fn test_new_window_rearms_timeout_base() {
     drain_events(&mut state);
 
     // Window 0 had timeouts (had_timeouts=true), so adaptive backoff applies:
-    // first_block_timeout *= timeout_increase_factor (1.05)
+    // first_block_timeout *= first_block_timeout_multiplier (C++ noncritical params).
     let backed_off_first_block = desc.opts().first_block_timeout.mul_f64(backoff_factor);
 
     // Progress cursor should have advanced past window 0, triggering
@@ -5576,6 +6058,63 @@ fn test_new_window_rearms_timeout_base() {
         "skip_timestamp must be armed for new window (with backoff)"
     );
     assert_eq!(state.skip_slot, SlotIndex::new(4), "skip_slot must be at start of window 1");
+}
+
+#[test]
+fn test_adaptive_backoff_uses_first_block_timeout_noncritical_params() {
+    // C++ parity: adaptive backoff in consensus.cpp uses
+    // first_block_timeout_multiplier + first_block_timeout_cap.
+    let mut opts = crate::SessionOptions::default();
+    opts.first_block_timeout = Duration::from_millis(1000);
+    opts.first_block_timeout_multiplier = 2.0;
+    opts.first_block_timeout_cap = Duration::from_millis(1300);
+
+    let desc = create_test_desc_with_options(4, 4, opts);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    let target_rate = desc.opts().target_rate;
+    let expected_backoff = desc
+        .opts()
+        .first_block_timeout
+        .mul_f64(desc.opts().first_block_timeout_multiplier)
+        .min(desc.opts().first_block_timeout_cap);
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    state.reset_timeouts_on_start(&desc);
+
+    // Trigger timeout to skip window 0 (marks had_timeouts=true).
+    desc.set_time(t0 + Duration::from_secs(10));
+    state.check_all(&desc);
+    drain_events(&mut state);
+    assert!(state.timeout_base.is_none(), "base cleared after window skip");
+
+    // Feed skip certs for full window 0 so progress crosses boundary and re-arms timeout.
+    let t1 = t0 + Duration::from_secs(11);
+    desc.set_time(t1);
+    for slot_num in 0u32..4 {
+        let skip = Vote::Skip(SkipVote { slot: SlotIndex::new(slot_num) });
+        state.on_vote_test(&desc, ValidatorIndex::new(0), skip.clone(), Vec::new()).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(1), skip.clone(), Vec::new()).unwrap();
+        state.on_vote_test(&desc, ValidatorIndex::new(2), skip, Vec::new()).unwrap();
+    }
+    drain_events(&mut state);
+
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "window must advance to 1 after skip certs"
+    );
+    assert_eq!(
+        state.timeout_base,
+        Some(t1 + expected_backoff),
+        "timeout_base must use first_block_timeout_multiplier/cap"
+    );
+    assert_eq!(
+        state.skip_timestamp,
+        Some(t1 + expected_backoff + target_rate),
+        "skip_timestamp must be re-armed with noncritical backoff result"
+    );
 }
 
 /// End-to-end: first leader absent -> full first-window skip -> second leader collates & notarizes.

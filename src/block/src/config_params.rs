@@ -19,9 +19,9 @@ use crate::{
         ChildCell, Coins, ExtraCurrencyCollection, Number12, Number13, Number16, Number32, Number8,
     },
     validators::{ValidatorDescr, ValidatorSet},
-    AccountId, BlockError, BuilderData, Cell, Deserializable, HashmapE, HashmapIterator,
-    HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData, UInt256,
-    BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
+    AccountId, BlockError, BuilderData, Cell, Deserializable, EmptyValue, HashmapE,
+    HashmapIterator, HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData,
+    UInt256, BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 use num::BigInt;
 use std::collections::BTreeMap;
@@ -1102,7 +1102,7 @@ impl Serializable for ConfigParam8 {
 
 // _ mandatory_params:(Hashmap 32 True) = ConfigParam 9;
 
-define_HashmapE! {MandatoryParams, 32, ()}
+define_HashmapE! {MandatoryParams, 32, EmptyValue}
 
 ///
 /// Config Param 9 structure
@@ -1381,7 +1381,7 @@ impl StoragePrices {
         Self::default()
     }
 
-    pub fn calc_storage_fee(
+    pub fn calc_storage_fee_part(
         &self,
         cells: u64,
         bits: u64,
@@ -1390,10 +1390,8 @@ impl StoragePrices {
     ) -> BigInt {
         let bit_price = if is_masterchain { self.mc_bit_price_ps } else { self.bit_price_ps };
         let cell_price = if is_masterchain { self.mc_cell_price_ps } else { self.cell_price_ps };
-        (BigInt::from(delta)
-            * (bits as u128 * bit_price as u128 + cells as u128 * cell_price as u128)
-            + 0xffff)
-            >> 16u8
+        let total = bits as u128 * bit_price as u128 + cells as u128 * cell_price as u128;
+        BigInt::from(delta) * total
     }
 }
 
@@ -1990,7 +1988,7 @@ impl Serializable for ConsensusConfig {
 _ fundamental_smc_addr:(HashmapE 256 True) = ConfigParam 31;
 */
 
-define_HashmapE! {FundamentalSmcAddresses, 256, ()}
+define_HashmapE! {FundamentalSmcAddresses, 256, EmptyValue}
 
 impl IntoIterator for &FundamentalSmcAddresses {
     type Item = <HashmapIterator<HashmapE> as std::iter::Iterator>::Item;
@@ -2015,7 +2013,7 @@ impl ConfigParam31 {
     }
 
     pub fn add_address(&mut self, address: AccountId) {
-        self.fundamental_smc_addr.set(&address, &()).unwrap();
+        self.fundamental_smc_addr.set(&address, &EmptyValue).unwrap();
     }
 }
 
@@ -3487,7 +3485,7 @@ impl Deserializable for SuspendedAddressesKey {
     }
 }
 
-define_HashmapE! {SuspendedAddresses, 288, ()}
+define_HashmapE! {SuspendedAddresses, 288, EmptyValue}
 
 #[derive(Default, Clone, Debug, Eq, PartialEq)]
 pub struct SuspendedAddressList {
@@ -3531,7 +3529,7 @@ impl SuspendedAddressList {
     }
     pub fn add_suspended_address(&mut self, wc: i32, addr: SliceData) -> Result<()> {
         let key = SuspendedAddressesKey::new(wc, addr);
-        self.addresses.set(&key, &())
+        self.addresses.set(&key, &EmptyValue)
     }
     pub fn iterate_addresses(
         &self,

@@ -32,6 +32,26 @@ use ton_block::{
 
 include!("../../../common/src/info.rs");
 
+fn session_start_args(
+    shard: &ShardIdent,
+    initial_block_seqno: u32,
+) -> (Vec<BlockIdExt>, BlockIdExt) {
+    (
+        vec![BlockIdExt::with_params(
+            shard.clone(),
+            initial_block_seqno.saturating_sub(1),
+            UInt256::default(),
+            UInt256::default(),
+        )],
+        BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            0,
+            UInt256::default(),
+            UInt256::default(),
+        ),
+    )
+}
+
 /*
     Test constants
 */
@@ -113,9 +133,11 @@ impl SessionListener for ValidationTestListener {
 
         let seqno = match &parent {
             consensus_common::CollationParentHint::Implicit => {
-                self.max_finalized_seqno.load(Ordering::SeqCst)
+                panic!("Simplex validation test must not receive implicit parent hints")
             }
-            consensus_common::CollationParentHint::Explicit(parent_id) => parent_id.seq_no + 1,
+            consensus_common::CollationParentHint::Explicit(parent_ids) => {
+                parent_ids.iter().map(|id| id.seq_no).max().unwrap_or(0) + 1
+            }
         };
 
         // Generate dummy candidate with proper hashes
@@ -409,7 +431,9 @@ fn run_validation_test() {
         Arc::downgrade(&session_listener_0),
     )
     .expect("Failed to create session 0");
-    session_0.start(initial_block_seqno);
+    let (prev_blocks_0, min_masterchain_block_id_0) =
+        session_start_args(&shard, initial_block_seqno);
+    session_0.start(prev_blocks_0, min_masterchain_block_id_0);
 
     let session_1 = SessionFactory::create_session(
         &session_opts,
@@ -422,7 +446,9 @@ fn run_validation_test() {
         Arc::downgrade(&session_listener_1),
     )
     .expect("Failed to create session 1");
-    session_1.start(initial_block_seqno);
+    let (prev_blocks_1, min_masterchain_block_id_1) =
+        session_start_args(&shard, initial_block_seqno);
+    session_1.start(prev_blocks_1, min_masterchain_block_id_1);
 
     log::info!("Sessions created, waiting for validation callback on node 1...");
 
