@@ -56,6 +56,7 @@ impl ServiceTask for ElectionsTask {
             self.store.clone(),
             self.runtime_cfg.vault(),
             self.on_status_change.clone(),
+            self.runtime_cfg.clone(),
         )
         .await
     }

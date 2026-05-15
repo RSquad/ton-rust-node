@@ -8,11 +8,12 @@
  */
 use super::{
     providers::{DefaultElectionsProvider, ElectionsProvider},
-    runner::ElectionRunner,
+    runner::{ElectionRunner, PersistStaticAdnls},
 };
+use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{
-    app_config::{AppConfig, BindingStatus},
+    app_config::{AppConfig, BindingStatus, ElectionsConfig},
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
@@ -33,6 +34,7 @@ pub async fn run(
     store: Arc<SnapshotStore>,
     vault: Option<Arc<SecretVault>>,
     on_status_change: Option<BindingStatusCallback>,
+    runtime_cfg: Arc<dyn RuntimeConfig>,
 ) -> anyhow::Result<()> {
     let Some(config) = app_config.elections.as_ref() else {
         anyhow::bail!("elections config is empty");
@@ -77,8 +79,27 @@ pub async fn run(
 
     let elector = Arc::new(ElectorWrapperImpl::new(contract_provider!(rpc_client)));
 
-    let mut runner =
-        ElectionRunner::new(config, &app_config.bindings, elector, providers, wallets, pools);
+    let persist_static_adnls: PersistStaticAdnls = {
+        let runtime_cfg = runtime_cfg.clone();
+        Arc::new(move |generated: HashMap<String, String>| {
+            runtime_cfg.update_and_save(Box::new(move |cfg| {
+                let elections = cfg.elections.get_or_insert_with(ElectionsConfig::default);
+                for (node_id, b64) in generated {
+                    elections.static_adnls.insert(node_id, b64);
+                }
+            }))
+        })
+    };
+
+    let mut runner = ElectionRunner::new(
+        config,
+        &app_config.bindings,
+        elector,
+        providers,
+        wallets,
+        pools,
+        Some(persist_static_adnls),
+    );
     runner
         .run_loop(
             Duration::from_secs(config.tick_interval),

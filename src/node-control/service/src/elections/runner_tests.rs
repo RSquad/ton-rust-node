@@ -20,7 +20,11 @@ use contracts::{
     nominator::{NominatorRoles, PoolData, SNP_STORAGE_RESERVE, TONCORE_STORAGE_RESERVE, opcodes},
 };
 use mockall::mock;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use ton_block::{
     BuilderData, Cell, Coins, ConfigParam15, Deserializable, MsgAddressInt, Number16, SigPubKey,
     SliceData, UInt256, ValidatorDescr, ValidatorSet,
@@ -362,6 +366,9 @@ struct TestHarness {
     toncore_nominator_mocks: Option<(MockSingleNominatorWrapper, MockSingleNominatorWrapper)>,
     elections_config: ElectionsConfig,
     bindings: HashMap<String, NodeBinding>,
+    /// Captures static ADNL addresses persisted by `ensure_static_adnls`. When set,
+    /// `build()` installs a callback that writes generated entries here.
+    persisted_static_adnls: Option<Arc<std::sync::Mutex<HashMap<String, String>>>>,
 }
 
 impl TestHarness {
@@ -380,9 +387,17 @@ impl TestHarness {
                 sleep_period_pct: 0.0,
                 waiting_period_pct: 0.3,
                 static_adnls: HashMap::new(),
+                static_adnl_disabled: HashSet::new(),
             },
             bindings: HashMap::new(),
+            persisted_static_adnls: None,
         }
+    }
+
+    fn with_persist_capture(mut self) -> (Self, Arc<std::sync::Mutex<HashMap<String, String>>>) {
+        let store = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        self.persisted_static_adnls = Some(store.clone());
+        (self, store)
     }
 
     fn with_pool(mut self) -> Self {
@@ -398,6 +413,15 @@ impl TestHarness {
 
     async fn build(mut self, node_id: &str) -> ElectionRunner {
         self.bindings.entry(node_id.to_string()).or_insert_with(|| default_binding(true));
+
+        // Default to ephemeral ADNL so existing tests keep using `new_adnl_addr`. Tests that
+        // exercise the auto-generate path call `with_persist_capture` to opt back in.
+        if !self.elections_config.static_adnls.contains_key(node_id)
+            && !self.elections_config.static_adnl_disabled.contains(node_id)
+            && self.persisted_static_adnls.is_none()
+        {
+            self.elections_config.static_adnl_disabled.insert(node_id.to_string());
+        }
 
         let wallet: Arc<dyn TonWallet> = Arc::new(self.wallet_mock);
         let mut wallets: HashMap<String, Arc<dyn TonWallet>> = HashMap::new();
@@ -420,6 +444,19 @@ impl TestHarness {
 
         let elector: Arc<dyn ElectorWrapper> = Arc::new(self.elector_mock);
 
+        let persist: Option<PersistStaticAdnls> =
+            self.persisted_static_adnls.clone().map(|store| {
+                let store = store.clone();
+                let cb: PersistStaticAdnls = Arc::new(move |generated: HashMap<String, String>| {
+                    let mut g = store.lock().unwrap();
+                    for (k, v) in generated {
+                        g.insert(k, v);
+                    }
+                    Ok(())
+                });
+                cb
+            });
+
         ElectionRunner::new(
             &self.elections_config,
             &self.bindings,
@@ -427,6 +464,7 @@ impl TestHarness {
             providers,
             Arc::new(wallets),
             Arc::new(pools),
+            persist,
         )
     }
 }
@@ -1265,6 +1303,7 @@ async fn test_multiple_nodes_one_excluded() {
         sleep_period_pct: 0.0,
         waiting_period_pct: 0.3,
         static_adnls: HashMap::new(),
+        static_adnl_disabled: HashSet::from(["node-1".to_string(), "node-2".to_string()]),
     };
 
     let mut bindings = HashMap::new();
@@ -1326,6 +1365,7 @@ async fn test_multiple_nodes_one_excluded() {
         providers,
         Arc::new(wallets),
         Arc::new(pools),
+        None,
     );
 
     let result = runner.run().await;
@@ -1703,6 +1743,7 @@ async fn test_node_without_wallet_skipped() {
         sleep_period_pct: 0.0,
         waiting_period_pct: 0.3,
         static_adnls: HashMap::new(),
+        static_adnl_disabled: HashSet::new(),
     };
 
     let mut bindings = HashMap::new();
@@ -1725,6 +1766,7 @@ async fn test_node_without_wallet_skipped() {
         providers,
         Arc::new(wallets),
         Arc::new(pools),
+        None,
     );
 
     assert!(
@@ -3176,4 +3218,151 @@ async fn test_static_adnl_uses_register_instead_of_new() {
     assert!(node.participant.is_some(), "participant should be set");
     let participant = node.participant.as_ref().unwrap();
     assert_eq!(participant.adnl_addr, static_adnl.to_vec(), "ADNL must be the static one");
+}
+
+// =====================================================
+// TEST: auto-generate static ADNL when missing
+// =====================================================
+
+#[tokio::test]
+async fn test_static_adnl_auto_generated_when_missing() {
+    let node_id = "node-1";
+    let generated_adnl = [0xCC_u8; 32];
+    let generated_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &generated_adnl);
+
+    let (mut harness, persisted) = TestHarness::new().with_persist_capture();
+    // static_adnls map is empty and node is NOT in static_adnl_disabled -> auto-generate path
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+
+    // Default provider expectations, but replace new_adnl_addr with register_adnl_addr expectation
+    // since the runner should use the auto-generated static address.
+    harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    harness.provider_mock.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    harness.provider_mock.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    harness.provider_mock.expect_get_next_vset().returning(|| Ok(None));
+    harness
+        .provider_mock
+        .expect_new_validator_key()
+        .returning(|_since, _until| Ok((KEY_ID.to_vec(), PUB_KEY.to_vec())));
+    harness.provider_mock.expect_export_public_key().returning(|_key_id| Ok(PUB_KEY.to_vec()));
+    harness.provider_mock.expect_sign().returning(|_key, _data| Ok(SIGNATURE.to_vec()));
+    harness.provider_mock.expect_account().returning(move |_addr| Ok(fake_account(WALLET_BALANCE)));
+    harness.provider_mock.expect_send_boc().returning(|_boc| Ok(()));
+    harness.provider_mock.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    harness.provider_mock.expect_config_param_17().returning(|| Ok(default_cfg17()));
+    harness.provider_mock.expect_shutdown().returning(|| Ok(()));
+
+    // generate_adnl_addr: exactly 1 call across the run
+    harness
+        .provider_mock
+        .expect_generate_adnl_addr()
+        .times(1)
+        .returning(move || Ok(generated_adnl.to_vec()));
+
+    // register_adnl_addr: exactly 1 call with the generated key
+    let expected = generated_adnl.to_vec();
+    harness
+        .provider_mock
+        .expect_register_adnl_addr()
+        .withf(move |adnl_key_id, _perm_key_id, _until| adnl_key_id == expected.as_slice())
+        .times(1)
+        .returning(|_adnl, _perm, _until| Ok(()));
+
+    // new_adnl_addr must NOT be called (no expectation set).
+
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert_eq!(
+        node.static_adnl_addr.as_deref(),
+        Some(generated_adnl.as_slice()),
+        "in-memory static_adnl_addr should be populated"
+    );
+    let participant = node.participant.as_ref().expect("participant should be set");
+    assert_eq!(participant.adnl_addr, generated_adnl.to_vec());
+
+    let saved = persisted.lock().unwrap();
+    assert_eq!(saved.get(node_id), Some(&generated_b64), "address must be persisted via callback");
+}
+
+// =====================================================
+// TEST: static_adnl_disabled -> ephemeral path (new_adnl_addr) (SMA-87)
+// =====================================================
+
+#[tokio::test]
+async fn test_static_adnl_disabled_uses_ephemeral() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.static_adnl_disabled.insert(node_id.to_string());
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    // setup_default_provider already sets up new_adnl_addr returning ADNL_ADDR.
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+
+    // generate_adnl_addr must NOT be called for disabled nodes (no expectation).
+    // register_adnl_addr must NOT be called either (no expectation).
+
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.static_adnl_addr.is_none(), "disabled node must have no static_adnl_addr");
+    let participant = node.participant.as_ref().expect("participant should be set");
+    assert_eq!(participant.adnl_addr, ADNL_ADDR.to_vec(), "must use ephemeral ADNL");
+}
+
+// =====================================================
+// TEST: failed generation aborts node's tick but other nodes proceed (SMA-87)
+// =====================================================
+
+#[tokio::test]
+async fn test_static_adnl_generation_failure_aborts_node_only() {
+    // One node fails to generate static ADNL; its run should fail-soft (no participant set),
+    // and nothing should be persisted via callback.
+    let node_id = "node-1";
+    let (mut harness, persisted) = TestHarness::new().with_persist_capture();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+
+    harness.provider_mock.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    harness.provider_mock.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    harness.provider_mock.expect_get_current_vset().returning(|| Err(anyhow::anyhow!("no vset")));
+    harness.provider_mock.expect_get_next_vset().returning(|| Ok(None));
+    harness
+        .provider_mock
+        .expect_new_validator_key()
+        .returning(|_since, _until| Ok((KEY_ID.to_vec(), PUB_KEY.to_vec())));
+    harness.provider_mock.expect_export_public_key().returning(|_key_id| Ok(PUB_KEY.to_vec()));
+    harness.provider_mock.expect_account().returning(move |_addr| Ok(fake_account(WALLET_BALANCE)));
+    harness.provider_mock.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    harness.provider_mock.expect_config_param_17().returning(|| Ok(default_cfg17()));
+    harness.provider_mock.expect_shutdown().returning(|| Ok(()));
+
+    // generate_adnl_addr fails: ensure step logs and skips persistence.
+    harness
+        .provider_mock
+        .expect_generate_adnl_addr()
+        .times(1)
+        .returning(|| Err(anyhow::anyhow!("control server unreachable")));
+
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id).await;
+    let _ = runner.run().await; // node-level participation may fail; tick must not panic.
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(node.static_adnl_addr.is_none(), "no static_adnl after failed generation");
+    assert!(node.participant.is_none(), "no participant when ADNL generation failed");
+    let saved = persisted.lock().unwrap();
+    assert!(saved.is_empty(), "nothing should be persisted on failure");
 }
