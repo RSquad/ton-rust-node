@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::commands::nodectl::utils::resolve_service_url;
+use crate::commands::nodectl::utils::{build_api_client, map_send_error, resolve_service_url};
 use anyhow::Context;
 use colored::Colorize;
 use common::{app_config::StakePolicy, ton_utils::display_tons_from_str};
@@ -185,7 +185,7 @@ pub struct StakePolicyCmd {
 impl ApiCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
         let base_url = resolve_service_url(self.url.as_deref(), self.config.as_deref())?;
-        let client = reqwest::Client::new();
+        let client = build_api_client()?;
         let token = self.token.as_deref();
 
         match &self.action {
@@ -411,7 +411,7 @@ async fn send_post<T: serde::Serialize>(
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
-    let response = req.send().await?;
+    let response = req.send().await.map_err(|e| map_send_error(e, url))?;
     let status = response.status();
     let body = response.text().await?;
     ensure_success(status, &body)?;
@@ -428,7 +428,7 @@ async fn send_get_raw(
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
-    let response = req.send().await?;
+    let response = req.send().await.map_err(|e| map_send_error(e, url))?;
     let status = response.status();
     let body = response.text().await?;
     ensure_success(status, &body)?;
