@@ -103,6 +103,7 @@ impl TaskController {
         self.enable_locked()
     }
 
+    /// Caller must hold `self.lifecycle`.
     fn enable_locked(&self) -> TaskStateView {
         let mut st = self.state.lock().expect("failed to lock state");
 
@@ -144,6 +145,7 @@ impl TaskController {
         self.disable_locked().await
     }
 
+    /// Caller must hold `self.lifecycle`.
     async fn disable_locked(&self) -> TaskStateView {
         let handle_to_await = {
             let mut st = self.state.lock().expect("failed to lock state");
@@ -448,10 +450,11 @@ mod tests {
         ctrl.disable().await;
     }
 
-    /// Regression test for SMA-89: concurrent `restart()` calls must not
-    /// orphan a spawned task. Before the lifecycle lock, two interleaved
-    /// restarts could leave a task running with no handle/cancel pointing
-    /// at it; after `disable()` the live count would stay above zero.
+    /// Smoke test for concurrent `restart()` calls: stresses 8 parallel
+    /// restarts and asserts no task is orphaned (exactly one live during,
+    /// zero after `disable()`). Not deterministic — relies on the scheduler
+    /// producing a bad interleave under the old code; passes more reliably
+    /// on multi-core runners. Treat as a regression guard, not a proof.
     #[tokio::test]
     async fn concurrent_restarts_do_not_orphan_tasks() {
         struct LiveCountTask {
