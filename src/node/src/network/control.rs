@@ -270,9 +270,9 @@ impl ControlQuerySubscriber {
         Ok(match shard_account {
             Some((shard_account, _state_guard)) => {
                 let account = shard_account.read_account()?;
-                let code = account.get_code().map(|cell| cell.repr_hash());
-                let data = account.get_data().map(|cell| cell.repr_hash());
-                let libs = account.libraries().root().map(|cell| cell.repr_hash());
+                let code = account.get_code().map(|cell| cell.repr_hash().clone());
+                let data = account.get_data().map(|cell| cell.repr_hash().clone());
+                let libs = account.libraries().root().map(|cell| cell.repr_hash().clone());
 
                 let cell = shard_account.account_cell();
                 let proof = MerkleProof::create(&cell, |hash| {
@@ -674,8 +674,13 @@ impl ControlQuerySubscriber {
 
     async fn prepare_future_bundle(&self, prev_block_ids: Vec<BlockIdExt>) -> Result<Success> {
         if let DataSource::Engine(ref engine) = self.data_source {
-            let bundle =
-                CollatorTestBundle::build_for_collating_block(engine, prev_block_ids, None).await?;
+            let bundle = CollatorTestBundle::build_for_collating_block(
+                engine,
+                prev_block_ids,
+                None,
+                Vec::new(),
+            )
+            .await?;
             tokio::task::spawn_blocking(move || {
                 bundle.save("target/bundles").ok();
             });

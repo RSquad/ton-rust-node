@@ -9,10 +9,13 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
-    cell_db::CellDb, db::rocksdb::RocksDb, shardstate_db_async::CellsDbConfig, types::StoredCell,
+    cell_db::CellDb,
+    db::rocksdb::RocksDb,
+    shardstate_db_async::CellsDbConfig,
+    types::{serialize_stored_cell, STORED_CELL_MAX_RAW_LEN},
     StorageAlloc, TARGET,
 };
-use std::{ops::Deref, path::Path, sync::Arc};
+use std::{sync::Arc, time::Instant};
 use ton_block::{Cell, Result, UInt256, MAX_LEVEL};
 
 pub struct DynamicBocArchiveDb {
@@ -23,7 +26,6 @@ impl DynamicBocArchiveDb {
     pub fn with_db(
         db: Arc<RocksDb>,
         cell_db_cf: &str,
-        db_root_path: impl AsRef<Path>,
         config: &CellsDbConfig,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
@@ -31,7 +33,6 @@ impl DynamicBocArchiveDb {
         let cell_db = Arc::new(CellDb::with_db(
             db,
             cell_db_cf,
-            db_root_path,
             config,
             #[cfg(feature = "telemetry")]
             telemetry,
@@ -60,7 +61,7 @@ impl DynamicBocArchiveDb {
             return Ok(existing);
         }
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         // Traverse cell tree, collect new cells
         let mut new_cells = fnv::FnvHashMap::default();
@@ -70,7 +71,7 @@ impl DynamicBocArchiveDb {
 
         // Batch write all new cells
         let wrote_cells = new_cells.len();
-        let write_start = std::time::Instant::now();
+        let write_start = Instant::now();
         if !new_cells.is_empty() {
             let mut batch = rocksdb::WriteBatch::default();
             for (id, data) in &new_cells {
@@ -87,7 +88,7 @@ impl DynamicBocArchiveDb {
         }
         let write_time = write_start.elapsed().as_micros();
 
-        let now4 = std::time::Instant::now();
+        let now4 = Instant::now();
         self.cell_db.cleanup_storing_cells(new_cells.keys());
         let storing_cells_cleanup_time = now4.elapsed().as_micros();
 
@@ -111,13 +112,13 @@ impl DynamicBocArchiveDb {
             storing_cells_cleanup_time
         );
 
-        self.cell_db.load_cell(&root_id, true)
+        self.cell_db.load_cell(&root_id)
     }
 
     fn collect_new_cells(
         &self,
         cell: &Cell,
-        new_cells: &mut fnv::FnvHashMap<UInt256, Vec<u8>>,
+        new_cells: &mut fnv::FnvHashMap<UInt256, smallvec::SmallVec<[u8; STORED_CELL_MAX_RAW_LEN]>>,
         visited: &mut fnv::FnvHashSet<UInt256>,
         cells_cf: &impl rocksdb::AsColumnFamilyRef,
         check_stop: &(dyn Fn() -> Result<()> + Sync),
@@ -131,7 +132,7 @@ impl DynamicBocArchiveDb {
         }
 
         // Already a StoredCell (loaded from DB)
-        if cell.is::<StoredCell>() {
+        if self.cell_db.is_stored_cell(cell) {
             return Ok(());
         }
 
@@ -147,8 +148,8 @@ impl DynamicBocArchiveDb {
         }
 
         // Serialize and add to batch
-        let data = StoredCell::serialize(cell.deref())?;
-        new_cells.insert(cell_id, data);
+        let data = serialize_stored_cell(cell)?;
+        new_cells.insert(cell_id.clone(), data);
         Ok(())
     }
 
@@ -160,14 +161,14 @@ impl DynamicBocArchiveDb {
 
         log::debug!(target: TARGET, "DynamicBocArchiveDb::save_update  {:x}", root_id);
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         let mut new_cells = fnv::FnvHashMap::default();
         Self::collect_cells_from_update(&root_cell, &mut new_cells)?;
         let cells_traverse_time = start.elapsed().as_micros();
 
         let wrote_cells = new_cells.len();
-        let write_start = std::time::Instant::now();
+        let write_start = Instant::now();
         if !new_cells.is_empty() {
             let mut batch = rocksdb::WriteBatch::default();
             for (id, data) in &new_cells {
@@ -190,7 +191,7 @@ impl DynamicBocArchiveDb {
     /// are the boundary (they represent unchanged subtrees already in the DB).
     fn collect_cells_from_update(
         cell: &Cell,
-        new_cells: &mut fnv::FnvHashMap<UInt256, Vec<u8>>,
+        new_cells: &mut fnv::FnvHashMap<UInt256, smallvec::SmallVec<[u8; STORED_CELL_MAX_RAW_LEN]>>,
     ) -> Result<()> {
         let cell_id = cell.repr_hash();
 
@@ -208,12 +209,12 @@ impl DynamicBocArchiveDb {
             Self::collect_cells_from_update(&reference, new_cells)?;
         }
 
-        let data = StoredCell::serialize_virtual(cell.deref())?;
-        new_cells.insert(cell_id, data);
+        let data = serialize_stored_cell(cell)?;
+        new_cells.insert(cell_id.clone(), data);
         Ok(())
     }
 
-    pub fn load_cell(self: &Arc<Self>, cell_id: &UInt256, panic: bool) -> Result<Cell> {
-        self.cell_db.load_cell(cell_id, panic)
+    pub fn load_cell(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
+        self.cell_db.load_cell(cell_id)
     }
 }

@@ -63,6 +63,8 @@ pub struct EngineTelemetry {
     pub validator_adnl_keys: Arc<Metric>,
     pub validator_peers: Arc<Metric>,
     pub validator_sets: Arc<Metric>,
+    pub account_state_cache_mb: Arc<Metric>,
+    pub storage_dicts_cache_cells: Arc<Metric>,
 }
 
 pub struct EngineAlloc {
@@ -74,6 +76,7 @@ pub struct EngineAlloc {
     pub validator_adnl_keys: Arc<AtomicU64>,
     pub validator_peers: Arc<AtomicU64>,
     pub validator_sets: Arc<AtomicU64>,
+    pub account_state_cache_bytes: Arc<AtomicU64>,
 }
 
 /// Config-level binding of a validator key to an election.

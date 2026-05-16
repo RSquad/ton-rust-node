@@ -10,8 +10,9 @@
  */
 use super::*;
 use ton_block::{
-    base64_decode, read_single_root_boc, ton_method_id, Coins, CurrencyCollection,
-    InternalMessageHeader, Message, MsgAddressInt, ShardAccount,
+    base64_decode, read_single_root_boc, read_single_root_boc_file, ton_method_id, Coins,
+    ConfigParam18, ConfigParamEnum, CurrencyCollection, Deserializable, InternalMessageHeader,
+    Message, MsgAddressInt, ShardAccount, StoragePrices,
 };
 
 #[test]
@@ -65,9 +66,41 @@ fn test_smart_contract_info_internal_message_info_uses_fwd_fee() {
 }
 
 #[test]
+fn test_unpacked_config_tuple_uses_latest_storage_price_by_utime_since() {
+    let mut config = ConfigParams::default();
+    let mut cp18 = ConfigParam18::default();
+    cp18.insert(&StoragePrices {
+        utime_since: 100,
+        bit_price_ps: 1,
+        cell_price_ps: 2,
+        mc_bit_price_ps: 3,
+        mc_cell_price_ps: 4,
+    })
+    .unwrap();
+    cp18.insert(&StoragePrices {
+        utime_since: 200,
+        bit_price_ps: 10,
+        cell_price_ps: 20,
+        mc_bit_price_ps: 30,
+        mc_cell_price_ps: 40,
+    })
+    .unwrap();
+    config.set_config(ConfigParamEnum::ConfigParam18(cp18)).unwrap();
+
+    let sci = SmartContractInfo { unix_time: 250, config_params: config, ..Default::default() };
+    let tuple = sci.get_unpacked_config_tuple();
+    let storage_price = tuple.tuple_item_ref(0).unwrap().as_slice().unwrap();
+    let mut storage_price = storage_price.clone();
+    let actual = StoragePrices::construct_from(&mut storage_price).unwrap();
+
+    assert_eq!(actual.utime_since, 200);
+    assert_eq!(actual.bit_price_ps, 10);
+}
+
+#[test]
 fn test_run_get_method_seqno_with_config() {
     let mc_state_name = "../block/src/tests/data/free-ton-mc-state-61884";
-    let mc_state_cell = Cell::read_from_file(mc_state_name);
+    let mc_state_cell = read_single_root_boc_file(mc_state_name).unwrap();
     let method_id = ton_method_id("seqno");
     assert_eq!(method_id, 0x14C97);
 
@@ -93,7 +126,7 @@ fn test_run_get_method_seqno_with_config() {
 #[test]
 fn test_run_get_method_seqno_with_elector() {
     let mc_state_name = "../block/src/tests/data/free-ton-mc-state-61884";
-    let mc_state_cell = Cell::read_from_file(mc_state_name);
+    let mc_state_cell = read_single_root_boc_file(mc_state_name).unwrap();
     let method_id = ton_method_id("seqno");
     assert_eq!(method_id, 0x14C97);
 
@@ -216,7 +249,7 @@ fn load_elector_shard_account() -> ShardAccount {
 
 fn load_mc_state_cell() -> Cell {
     let mc_state_name = "../block/src/tests/data/free-ton-mc-state-61884";
-    Cell::read_from_file(mc_state_name)
+    read_single_root_boc_file(mc_state_name).unwrap()
 }
 
 fn run_elector_method(
@@ -483,7 +516,7 @@ fn test_convert_stack_slice_roundtrip_preserves_msg_addr_bit_len() {
 fn test_convert_stack_slice_roundtrip_preserves_slice_window() {
     let mut source = SliceData::from_raw(vec![0b1010_1100, 0b1111_0000], 16);
     source.move_by(3).unwrap();
-    let slice = source.get_slice(7).unwrap();
+    let slice = source.get_slice(0, 7).unwrap();
 
     let items = convert_stack(&[StackItem::slice(slice.clone())]).unwrap();
     let roundtrip = convert_ton_stack(&items).unwrap();

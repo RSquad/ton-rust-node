@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`DELETE /v1/elections/static-adnl/{node}`** — opt the node out of static ADNL; the runner will generate a fresh ephemeral ADNL each cycle.
 - **`--disable` flag on `nodectl config elections static-adnl`** — CLI counterpart of the DELETE endpoint.
 - **`static_adnl_disabled` field on `BindingElectionStatusDto`** — surfaced by `GET /v1/elections/settings` and the `elections show` CLI output ("disabled" marker in the Static ADNL column).
+- **TONCore pool deploy mode (`deploy_layout`)** — per-slot string (JSON field name unchanged). Canonical values: **`legacy`** (full pool bytecode in `StateInit.code`; same addresses as pools created with older nodectl) and **`tonscan`** (alias: `tonscan_compatible`, `tonscan-compatible` — bootstrap `StateInit.code` + `SETCODE` on first execution; explorers such as Tonscan recognise the contract). **Use `tonscan` for new pools.** Already-deployed slots must stay on the mode they were created with — address derivation differs between modes. Wired through REST (`POST /v1/pools/core`, pool slot views), JSON config, and CLI (`nodectl config pool add core --deploy-mode`, alias `--deploy-layout`). Defaults: **missing `deploy_layout` in persisted config** stays **`legacy`** so derived addresses are preserved; **`POST /v1/pools/core`** / **`nodectl config pool add core`** omitting deploy mode default to **`tonscan`**.
 
 ## [0.4.0] - 2026-04-21
 

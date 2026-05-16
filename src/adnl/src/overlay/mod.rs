@@ -1394,8 +1394,10 @@ impl OverlayNode {
     const MIN_BYTES_FEC_TWO_STEPS_BROADCAST: usize = 513;
     const MIN_NODES_FEC_TWO_STEPS_BROADCAST: u32 = 4;
     const PEER_BLOCK_LATENCY_SEC: u32 = 10;
-    const TIMEOUT_GC_MS: u64 = 1000; // Milliseconds
-    const TIMEOUT_PEERS_MS: u64 = 60000; // Milliseconds
+    const TIMEOUT_BROADCAST_GC_MS: u64 = 1000;
+    const TIMEOUT_NEIGHBOURS_MS: u64 = 60000;
+    const TIMEOUT_PENDING_PEERS_MS: u64 = 200;
+    const TIMEOUT_PING_MS: u64 = 1000;
 
     /// Constructor
     pub fn with_params(
@@ -1495,15 +1497,6 @@ impl OverlayNode {
             }
         }
         Ok(ret)
-    }
-
-    /// Add private peers to the overlay
-    pub fn add_private_peers_to_overlay(
-        &self,
-        overlay_id: &Arc<OverlayShortId>,
-        peers: &[Arc<KeyId>],
-    ) -> Result<usize> {
-        self.add_peers_to_overlay(overlay_id, peers, "Cannot get overlay to add peers")
     }
 
     /// Add public overlay peer
@@ -2085,37 +2078,47 @@ impl OverlayNode {
                 } else {
                     None
                 };
-                let mut timeout_peers = 0;
+                let base_tick_ms = Self::TIMEOUT_BROADCAST_GC_MS
+                    .min(Self::TIMEOUT_NEIGHBOURS_MS)
+                    .min(Self::TIMEOUT_PING_MS);
+                let mut timeout_broadcast_gc = 0;
+                let mut timeout_neighbours = 0;
+                let mut timeout_pending_peers = 0;
+                let mut timeout_ping = 0;
+                let mut has_pending = local_adnl_key.is_some();
                 let mut last_one_time_broadcast = None;
-                let mut next_ping = None;
                 #[cfg(feature = "xp25")]
                 let mut last_repeated_broadcast = None;
+                let mut next_ping = None;
                 while Arc::strong_count(&overlay) > 1 {
-                    overlay
-                        .purge_broadcasts(
-                            &mut last_one_time_broadcast,
-                            &mut receiver_one_time,
-                            #[cfg(feature = "xp25")]
-                            &mut last_repeated_broadcast,
-                            #[cfg(feature = "xp25")]
-                            &mut receiver_repeated,
-                        )
-                        .await;
-                    timeout_peers += Self::TIMEOUT_GC_MS;
-                    if timeout_peers > Self::TIMEOUT_PEERS_MS {
-                        // let result = if overlay.overlay_type.is_private() {
-                        //     overlay.update_neighbours(1)
-                        // } else {
-                        //     overlay.update_random_peers(1)
-                        // };
-                        // if let Err(e) = result {
-                        if let Err(e) = overlay.update_neighbours(1) {
-                            log::error!(target: TARGET, "Error: {}", e)
-                        }
+                    let mut tick_ms = if has_pending {
+                        base_tick_ms.min(Self::TIMEOUT_PENDING_PEERS_MS)
+                    } else {
+                        base_tick_ms
+                    };
+                    if timeout_broadcast_gc >= Self::TIMEOUT_BROADCAST_GC_MS {
+                        timeout_broadcast_gc = 0;
+                        overlay
+                            .purge_broadcasts(
+                                &mut last_one_time_broadcast,
+                                &mut receiver_one_time,
+                                #[cfg(feature = "xp25")]
+                                &mut last_repeated_broadcast,
+                                #[cfg(feature = "xp25")]
+                                &mut receiver_repeated,
+                            )
+                            .await;
+                    }
+                    let mut update_neighbours = timeout_neighbours >= Self::TIMEOUT_NEIGHBOURS_MS;
+                    if has_pending && (timeout_pending_peers >= Self::TIMEOUT_PENDING_PEERS_MS) {
+                        timeout_pending_peers = 0;
                         if let Some(key) = &local_adnl_key {
                             let mut pending = Vec::new();
                             while let Some(peer) = overlay.pending_peers.pop() {
                                 pending.push(peer);
+                            }
+                            if pending.is_empty() {
+                                has_pending = false;
                             }
                             for peer in pending {
                                 match overlay.try_add_peer(key, &peer) {
@@ -2125,6 +2128,7 @@ impl OverlayNode {
                                             "Resolved pending peer {peer} in overlay {}",
                                             overlay.overlay_id
                                         );
+                                        update_neighbours = true;
                                         continue;
                                     }
                                     Err(e) => log::warn!(
@@ -2137,46 +2141,72 @@ impl OverlayNode {
                                 overlay.pending_peers.push(peer);
                             }
                         }
-                        timeout_peers = 0;
                     }
-                    let peer = if let Some(iter) = next_ping.as_mut() {
-                        overlay.known_peers.all().next(iter)
-                    } else {
-                        let (iter, peer) = overlay.known_peers.all().first();
-                        next_ping.replace(iter);
-                        peer
-                    };
-                    let sleep_ms = if let Some(peer) = peer {
-                        let query_start = std::time::Instant::now();
-                        let ping_task = overlay.ping_peer(&default_key, &peer, Self::TIMEOUT_GC_MS);
-                        let (ping_res, peers_res) = if overlay.overlay_type.is_private() {
-                            (ping_task.await, None)
+                    if update_neighbours {
+                        timeout_neighbours = 0;
+                        // let result = if overlay.overlay_type.is_private() {
+                        //     overlay.update_neighbours(1)
+                        // } else {
+                        //     overlay.update_random_peers(1)
+                        // };
+                        // if let Err(e) = result {
+                        if let Err(e) = overlay.update_neighbours(1) {
+                            log::error!(target: TARGET, "Error: {}", e)
+                        }
+                    }
+                    let elapsed_ms = if timeout_ping >= Self::TIMEOUT_PING_MS {
+                        timeout_ping = 0;
+                        let peer = if let Some(iter) = next_ping.as_mut() {
+                            overlay.known_peers.all().next(iter)
                         } else {
-                            let v2 = overlay.overlay_type.has_certified_members();
-                            let peers_task = overlay.get_random_peers(
-                                &peer,
-                                &default_key,
-                                v2,
-                                Some(Self::TIMEOUT_GC_MS),
-                            );
-                            let (ping_res, peers_res) = tokio::join!(ping_task, peers_task);
-                            (ping_res, Some(peers_res))
+                            let (iter, peer) = overlay.known_peers.all().first();
+                            next_ping.replace(iter);
+                            peer
                         };
-                        if let Err(e) = ping_res {
-                            log::info!(target: TARGET, "Error in overlay ping {peer}: {e}");
+                        if let Some(peer) = peer {
+                            let query_start = std::time::Instant::now();
+                            let ping_task =
+                                overlay.ping_peer(&default_key, &peer, Self::TIMEOUT_PING_MS);
+                            let (ping_res, peers_res) = if overlay.overlay_type.is_private() {
+                                (ping_task.await, None)
+                            } else {
+                                let v2 = overlay.overlay_type.has_certified_members();
+                                let peers_task = overlay.get_random_peers(
+                                    &peer,
+                                    &default_key,
+                                    v2,
+                                    Some(Self::TIMEOUT_PING_MS),
+                                );
+                                let (ping_res, peers_res) = tokio::join!(ping_task, peers_task);
+                                (ping_res, Some(peers_res))
+                            };
+                            if let Err(e) = ping_res {
+                                log::info!(target: TARGET, "Error in overlay ping {peer}: {e}");
+                            }
+                            if let Some(Err(e)) = peers_res {
+                                log::info!(
+                                    target: TARGET,
+                                    "Error get random peers from {peer}: {e}"
+                                );
+                            }
+                            query_start.elapsed().as_millis() as u64
+                        } else {
+                            next_ping = None;
+                            0
                         }
-                        if let Some(Err(e)) = peers_res {
-                            log::info!(target: TARGET, "Error get random peers from {peer}: {e}");
-                        }
-                        let elapsed_ms = query_start.elapsed().as_millis() as u64;
-                        Self::TIMEOUT_GC_MS.saturating_sub(elapsed_ms)
                     } else {
-                        next_ping = None;
-                        Self::TIMEOUT_GC_MS
+                        0
                     };
+                    let sleep_ms = tick_ms.saturating_sub(elapsed_ms);
                     if sleep_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    } else {
+                        tick_ms = elapsed_ms;
                     }
+                    timeout_broadcast_gc += tick_ms;
+                    timeout_neighbours += tick_ms;
+                    timeout_pending_peers += tick_ms;
+                    timeout_ping += tick_ms;
                 }
             });
         }
@@ -2413,7 +2443,11 @@ impl Subscriber for OverlayNode {
             return Ok(true);
         }
         if let Err(e) = overlay.check_peer(peers.other(), certificate.as_ref()) {
-            log::warn!("Error checking peer {}: {e}", peers.other());
+            log::warn!(
+                target: TARGET,
+                "Error checking peer {} in overlay {overlay_id}: {e}",
+                peers.other()
+            );
             return Ok(true);
         }
 

@@ -12,7 +12,7 @@ use crate::crypto::prng::Prng;
 use std::alloc::Layout;
 use std::{
     fmt::{Debug, Formatter},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     ptr::{copy_nonoverlapping, NonNull},
 };
 use zeroize::Zeroize;
@@ -31,7 +31,8 @@ trait PlatformMemory {
         }
     }
 }
-struct ProtectedMemoryInner {
+
+pub struct ProtectedMemoryInner {
     ptr: NonNull<[u8]>,
     size_allocated: usize,
     size_used: usize,
@@ -46,7 +47,7 @@ impl PlatformMemory for ProtectedMemoryInner {
                 anyhow::bail!(std::io::Error::last_os_error())
             }
             let page_size = page_size as usize;
-            let num_pages = size.div_ceil(page_size);
+            let num_pages = size.div_ceil(page_size).max(1);
             let size_to_allocate = num_pages * page_size;
             match memsec::malloc_sized(size_to_allocate) {
                 Some(ptr) => Ok((ptr, size_to_allocate)),
@@ -100,7 +101,7 @@ impl PlatformMemory for ProtectedMemoryInner {
     fn alloc_page(size: usize) -> anyhow::Result<(NonNull<[u8]>, usize)> {
         unsafe {
             let page_size = 4096;
-            let num_pages = size.div_ceil(page_size);
+            let num_pages = size.div_ceil(page_size).max(1);
             let size_to_allocate = num_pages * page_size;
 
             let layout = Layout::from_size_align(size_to_allocate, page_size)
@@ -179,6 +180,32 @@ impl ProtectedMemoryInner {
         Ok(Self { ptr, size_allocated, size_used: size })
     }
 
+    pub fn from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        let mut inner = Self::new(0)?;
+        inner.extend_from_slice(data)?;
+        Ok(inner)
+    }
+
+    pub fn generate_random(prng: &dyn Prng, size: usize) -> anyhow::Result<Self> {
+        let mut inner = Self::new(size)?;
+        {
+            let mut handle = inner.write_handle()?;
+            prng.fill_random(handle.as_mut())?;
+        }
+        Ok(inner)
+    }
+
+    pub fn try_clone(&self) -> anyhow::Result<Self> {
+        Self::protect_page(self.ptr, false, true)?; // ReadOnly
+        let read_slice =
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const u8, self.size_used) };
+        let result = Self::from_slice(read_slice);
+        let restore = Self::protect_page(self.ptr, false, false); // NoAccess
+        let cloned = result?;
+        restore?;
+        Ok(cloned)
+    }
+
     pub fn len(&self) -> usize {
         self.size_used
     }
@@ -191,192 +218,86 @@ impl ProtectedMemoryInner {
         self.size_used == 0
     }
 
-    fn extend_from_slice(&mut self, other: &[u8]) -> anyhow::Result<()> {
-        if other.is_empty() {
-            return Ok(());
-        }
-
-        let new_size_used = self
-            .size_used
-            .checked_add(other.len())
-            .ok_or_else(|| anyhow::anyhow!("size overflow"))?;
-
-        if new_size_used <= self.size_allocated {
-            Self::protect_page(self.ptr, true, true)?; // ReadWrite
-
-            unsafe {
-                copy_nonoverlapping(
-                    other.as_ptr(),
-                    (self.ptr.as_ptr() as *mut u8).add(self.size_used),
-                    other.len(),
-                );
-            }
-
-            self.size_used = new_size_used;
-            Self::protect_page(self.ptr, false, false)?; // NoAccess
-
-            return Ok(());
-        }
-
-        let (new_ptr, new_size_allocated) = Self::alloc_page(new_size_used)?;
-
+    pub fn write_handle(&mut self) -> anyhow::Result<WriteHandle<'_>> {
         Self::protect_page(self.ptr, true, true)?; // ReadWrite
-        Self::protect_page(new_ptr, true, true)?; // ReadWrite
-
-        unsafe {
-            copy_nonoverlapping(
-                self.ptr.as_ptr() as *const u8,
-                new_ptr.as_ptr() as *mut u8,
-                self.size_used,
-            );
-
-            copy_nonoverlapping(
-                other.as_ptr(),
-                (new_ptr.as_ptr() as *mut u8).add(self.size_used),
-                other.len(),
-            );
-
-            Self::memzero(self.ptr.as_ptr() as *mut u8, self.size_allocated);
-        }
-
-        Self::lock_page(new_ptr, new_size_allocated)?;
-        Self::unlock_page(self.ptr, self.size_allocated).ok();
-        Self::free_page(self.ptr);
-
-        self.ptr = new_ptr;
-        self.size_allocated = new_size_allocated;
-        self.size_used = new_size_used;
-
-        Self::protect_page(self.ptr, false, false)?; // NoAccess
-
-        Ok(())
+        Ok(WriteHandle { inner: self })
     }
 
-    fn truncate(&mut self, len: usize) -> anyhow::Result<()> {
-        if len >= self.size_used {
-            return Ok(());
-        }
-
-        Self::protect_page(self.ptr, true, true /* ReadWrite */)?;
-        unsafe {
-            Self::memzero((self.ptr.as_ptr() as *mut u8).add(len), self.size_used - len);
-        }
-        Self::protect_page(self.ptr, false, false /* NoAccess */)?;
-
-        self.size_used = len;
-        Ok(())
+    pub fn extend_from_slice(&mut self, other: &[u8]) -> anyhow::Result<()> {
+        let mut handle = self.write_handle()?;
+        handle.extend_from_slice(other)
     }
 
-    fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const u8, self.size_used) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u8, self.size_used) }
-    }
-
-    fn restore_protection(&self) -> anyhow::Result<()> {
-        Self::protect_page(self.ptr, false, false) // NoAccess
+    pub fn truncate(&mut self, len: usize) -> anyhow::Result<()> {
+        let mut handle = self.write_handle()?;
+        handle.truncate(len)
     }
 }
 
+impl Drop for ProtectedMemoryInner {
+    fn drop(&mut self) {
+        Self::protect_page(self.ptr, true, true).ok(); // ReadWrite
+        Self::memzero(self.ptr.as_ptr() as *mut u8, self.size_allocated);
+        Self::free_page(self.ptr);
+    }
+}
+
+unsafe impl Send for ProtectedMemoryInner {}
+
 pub struct ProtectedMemory {
-    inner: tokio::sync::Mutex<ProtectedMemoryInner>,
+    inner: ProtectedMemoryInner,
+    reader_count: parking_lot::Mutex<usize>,
+}
+
+impl From<ProtectedMemoryInner> for ProtectedMemory {
+    fn from(inner: ProtectedMemoryInner) -> Self {
+        Self { inner, reader_count: parking_lot::Mutex::new(0) }
+    }
 }
 
 impl ProtectedMemory {
-    pub fn new(size: usize) -> anyhow::Result<Self> {
-        Ok(Self { inner: tokio::sync::Mutex::new(ProtectedMemoryInner::new(size)?) })
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 
-    pub async fn from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        let mut protected_data = Self::new(0)?;
+    pub fn allocated(&self) -> usize {
+        self.inner.allocated()
+    }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn lock(&self) -> anyhow::Result<ReadGuard<'_>> {
         {
-            let mut lock = protected_data.lock_mut().await?;
-            lock.extend_from_slice(data)?;
+            let mut count = self.reader_count.lock();
+            if *count == 0 {
+                ProtectedMemoryInner::protect_page(self.inner.ptr, false, true)?;
+            }
+            *count += 1;
         }
-
-        Ok(protected_data)
+        Ok(ReadGuard { pm: self })
     }
 
-    pub async fn generate_random(prng: &dyn Prng, size: usize) -> anyhow::Result<Self> {
-        let mut data = Self::new(size)?;
-
-        {
-            let mut lock = data.lock_mut().await?;
-            prng.fill_random(&mut lock).await?;
-        }
-
-        Ok(data)
+    pub fn try_clone(&self) -> anyhow::Result<Self> {
+        let read = self.lock()?;
+        Ok(ProtectedMemoryInner::from_slice(&read)?.into())
     }
 
-    pub async fn clone(&self) -> anyhow::Result<Self> {
-        let mut data = ProtectedMemory::new(0)?;
-
-        {
-            let mut data_lock = data.lock_mut().await?;
-            let this_lock = self.lock().await?;
-            data_lock.extend_from_slice(&this_lock)?;
-        }
-
-        Ok(data)
-    }
-
-    pub async fn len(&self) -> usize {
-        let guard = self.inner.lock().await;
-        guard.len()
-    }
-
-    pub async fn allocated(&self) -> usize {
-        let guard = self.inner.lock().await;
-        guard.allocated()
-    }
-
-    pub async fn is_empty(&self) -> bool {
-        let guard: tokio::sync::MutexGuard<'_, ProtectedMemoryInner> = self.inner.lock().await;
-        guard.is_empty()
-    }
-
-    pub async fn lock(&self) -> anyhow::Result<ReadGuard<'_>> {
-        let guard: tokio::sync::MutexGuard<'_, ProtectedMemoryInner> = self.inner.lock().await;
-        ProtectedMemoryInner::protect_page(guard.ptr, false, true)?; // ReadOnly
-        Ok(ReadGuard { guard })
-    }
-
-    pub async fn lock_mut(&mut self) -> anyhow::Result<WriteGuard<'_>> {
-        let guard: tokio::sync::MutexGuard<'_, ProtectedMemoryInner> = self.inner.lock().await;
-        ProtectedMemoryInner::protect_page(guard.ptr, true, true)?; // ReadWrite
-        Ok(WriteGuard { guard })
-    }
-
-    pub async fn eq_pm(&self, other: &ProtectedMemory) -> anyhow::Result<bool> {
-        if self.len().await != other.len().await {
+    pub fn eq_pm(&self, other: &ProtectedMemory) -> anyhow::Result<bool> {
+        if self.len() != other.len() {
             return Ok(false);
         }
 
-        let d1: &[u8] = &self.lock().await?;
-        let d2: &[u8] = &other.lock().await?;
+        let d1: &[u8] = &self.lock()?;
+        let d2: &[u8] = &other.lock()?;
 
         Ok(d1 == d2)
     }
 }
 
-unsafe impl Send for ProtectedMemoryInner {}
 unsafe impl Send for ProtectedMemory {}
 unsafe impl Sync for ProtectedMemory {}
-
-impl Drop for ProtectedMemory {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.inner.try_lock() {
-            ProtectedMemoryInner::protect_page(guard.ptr, true, true).ok(); // ReadWrite
-            ProtectedMemoryInner::memzero(guard.ptr.as_ptr() as *mut u8, guard.size_allocated);
-            ProtectedMemoryInner::free_page(guard.ptr);
-            guard.size_allocated = 0;
-            guard.size_used = 0;
-        }
-    }
-}
 
 impl Debug for ProtectedMemory {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -385,26 +306,35 @@ impl Debug for ProtectedMemory {
 }
 
 pub struct ReadGuard<'a> {
-    guard: tokio::sync::MutexGuard<'a, ProtectedMemoryInner>,
+    pm: &'a ProtectedMemory,
 }
 
 impl<'a> Deref for ReadGuard<'a> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.guard.as_slice()
+        unsafe {
+            std::slice::from_raw_parts(
+                self.pm.inner.ptr.as_ptr() as *const u8,
+                self.pm.inner.size_used,
+            )
+        }
     }
 }
 
 impl<'a> AsRef<[u8]> for ReadGuard<'a> {
     fn as_ref(&self) -> &[u8] {
-        self.guard.as_slice()
+        self
     }
 }
 
 impl<'a> Drop for ReadGuard<'a> {
     fn drop(&mut self) {
-        self.guard.restore_protection().ok();
+        let mut count = self.pm.reader_count.lock();
+        *count -= 1;
+        if *count == 0 {
+            ProtectedMemoryInner::protect_page(self.pm.inner.ptr, false, false).ok();
+        }
     }
 }
 
@@ -414,56 +344,139 @@ impl<'a> Debug for ReadGuard<'a> {
     }
 }
 
-pub struct WriteGuard<'a> {
-    guard: tokio::sync::MutexGuard<'a, ProtectedMemoryInner>,
+pub struct WriteHandle<'a> {
+    inner: &'a mut ProtectedMemoryInner,
 }
 
-impl<'a> WriteGuard<'a> {
+impl<'a> WriteHandle<'a> {
     pub fn extend_from_slice(&mut self, other: &[u8]) -> anyhow::Result<()> {
-        self.guard.extend_from_slice(other)?;
-        ProtectedMemoryInner::protect_page(self.guard.ptr, true, true) // ReadWrite
+        if other.is_empty() {
+            return Ok(());
+        }
+
+        let new_size_used = self
+            .inner
+            .size_used
+            .checked_add(other.len())
+            .ok_or_else(|| anyhow::anyhow!("size overflow"))?;
+
+        if new_size_used <= self.inner.size_allocated {
+            unsafe {
+                copy_nonoverlapping(
+                    other.as_ptr(),
+                    (self.inner.ptr.as_ptr() as *mut u8).add(self.inner.size_used),
+                    other.len(),
+                );
+            }
+            self.inner.size_used = new_size_used;
+            return Ok(());
+        }
+
+        let (new_ptr, new_size_allocated) = ProtectedMemoryInner::alloc_page(new_size_used)?;
+
+        let result: anyhow::Result<()> = (|| {
+            ProtectedMemoryInner::protect_page(new_ptr, true, true)?; // ReadWrite
+            ProtectedMemoryInner::lock_page(new_ptr, new_size_allocated)?;
+
+            unsafe {
+                copy_nonoverlapping(
+                    self.inner.ptr.as_ptr() as *const u8,
+                    new_ptr.as_ptr() as *mut u8,
+                    self.inner.size_used,
+                );
+
+                copy_nonoverlapping(
+                    other.as_ptr(),
+                    (new_ptr.as_ptr() as *mut u8).add(self.inner.size_used),
+                    other.len(),
+                );
+
+                ProtectedMemoryInner::memzero(
+                    self.inner.ptr.as_ptr() as *mut u8,
+                    self.inner.size_allocated,
+                );
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            ProtectedMemoryInner::free_page(new_ptr);
+            return Err(e);
+        }
+
+        ProtectedMemoryInner::unlock_page(self.inner.ptr, self.inner.size_allocated).ok();
+        ProtectedMemoryInner::free_page(self.inner.ptr);
+
+        self.inner.ptr = new_ptr;
+        self.inner.size_allocated = new_size_allocated;
+        self.inner.size_used = new_size_used;
+
+        Ok(())
     }
 
     pub fn truncate(&mut self, len: usize) -> anyhow::Result<()> {
-        self.guard.truncate(len)?;
-        ProtectedMemoryInner::protect_page(self.guard.ptr, true, true /* ReadWrite */)
+        if len >= self.inner.size_used {
+            return Ok(());
+        }
+
+        unsafe {
+            ProtectedMemoryInner::memzero(
+                (self.inner.ptr.as_ptr() as *mut u8).add(len),
+                self.inner.size_used - len,
+            );
+        }
+
+        self.inner.size_used = len;
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.size_used
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.size_used == 0
     }
 }
 
-impl<'a> Deref for WriteGuard<'a> {
+impl<'a> Deref for WriteHandle<'a> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.guard.as_slice()
+        unsafe {
+            std::slice::from_raw_parts(self.inner.ptr.as_ptr() as *const u8, self.inner.size_used)
+        }
     }
 }
 
-impl<'a> DerefMut for WriteGuard<'a> {
+impl<'a> std::ops::DerefMut for WriteHandle<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard.as_mut_slice()
+        unsafe {
+            std::slice::from_raw_parts_mut(self.inner.ptr.as_ptr() as *mut u8, self.inner.size_used)
+        }
     }
 }
 
-impl<'a> AsRef<[u8]> for WriteGuard<'a> {
+impl<'a> AsRef<[u8]> for WriteHandle<'a> {
     fn as_ref(&self) -> &[u8] {
-        self.guard.as_slice()
+        self
     }
 }
 
-impl<'a> AsMut<[u8]> for WriteGuard<'a> {
+impl<'a> AsMut<[u8]> for WriteHandle<'a> {
     fn as_mut(&mut self) -> &mut [u8] {
-        self.guard.as_mut_slice()
+        self
     }
 }
 
-impl<'a> Drop for WriteGuard<'a> {
+impl<'a> Drop for WriteHandle<'a> {
     fn drop(&mut self) {
-        self.guard.restore_protection().ok();
+        ProtectedMemoryInner::protect_page(self.inner.ptr, false, false).ok();
     }
 }
 
-impl<'a> Debug for WriteGuard<'a> {
+impl<'a> Debug for WriteHandle<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriteGuard").finish_non_exhaustive()
+        f.debug_struct("WriteHandle").finish_non_exhaustive()
     }
 }

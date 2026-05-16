@@ -8,11 +8,14 @@
  */
 use crate::{
     crypto::{
-        crypto_trait::Crypto, factory::CryptoFactory, key_material::KeyMaterial,
+        crypto_trait::Crypto,
+        factory::{CryptoFactory, DefaultCryptoFactory},
+        key_material::KeyMaterial,
         key_pair_in_memory::KeyPairInMemory,
     },
     errors::error::VaultError,
     make_secret_id,
+    memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
     storage::{file_json::FileJsonStorage, storage_trait::Storage},
     tests::fixture::*,
     types::{
@@ -20,7 +23,7 @@ use crate::{
         store_mode::StoreMode,
     },
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 struct V1Vault {
     file_path: PathBuf,
@@ -29,22 +32,26 @@ struct V1Vault {
 
 async fn add_ed25519_key_to_vault(
     secret_id: SecretId,
-    crypto: Box<dyn Crypto>,
+    crypto: Arc<dyn Crypto>,
     storage: &FileJsonStorage,
     is_corrupt: bool,
 ) -> anyhow::Result<()> {
     // Create a 64-byte "expanded" private key (simulating the old bug)
-    let mut key_material =
-        KeyMaterial::generate_new(Algorithm::Ed25519, None, crypto.as_ref()).await?;
+    let mut key_material = KeyMaterial::generate_new(Algorithm::Ed25519, None, crypto.as_ref())?;
 
     if is_corrupt {
-        key_material
-            .secret_key
-            .as_mut()
-            .ok_or_else(|| VaultError::empty_secret_key(""))?
-            .lock_mut()
-            .await?
-            .extend_from_slice(key_material.public_key.as_ref().unwrap())?;
+        // Build a new 64-byte secret_key = original 32-byte secret_key || public_key.
+        let secret_key =
+            key_material.secret_key.as_ref().ok_or_else(|| VaultError::empty_secret_key(""))?;
+        let mut new_inner = ProtectedMemoryInner::new(0)?;
+        {
+            let mut handle = new_inner.write_handle()?;
+            let read = secret_key.lock()?;
+            handle.extend_from_slice(&read)?;
+            handle.extend_from_slice(key_material.public_key.as_ref().unwrap())?;
+        }
+        let new_secret_key: ProtectedMemory = new_inner.into();
+        key_material.secret_key = Some(new_secret_key);
     }
 
     // Build a Secret::KeyPair with the 64-byte secret key
@@ -58,19 +65,16 @@ async fn add_ed25519_key_to_vault(
     Ok(())
 }
 
-async fn create_and_fill_v1_vault(
-    crypto_factory: Box<dyn CryptoFactory>,
-) -> anyhow::Result<V1Vault> {
-    let crypto1 = crypto_factory.new_crypto()?;
-    let crypto2 = crypto_factory.new_crypto()?;
+async fn create_and_fill_v1_vault() -> anyhow::Result<V1Vault> {
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
 
     let master_key = create_test_master_key().await?;
     let temp_dir = tempfile::TempDir::new()?;
     let file_path = temp_dir.path().join("vault.json");
-    let storage = FileJsonStorage::new(master_key, &file_path, crypto_factory, false).await?;
+    let storage = FileJsonStorage::new(master_key, &file_path, false, crypto.clone()).await?;
 
-    add_ed25519_key_to_vault(make_secret_id!("Secret_1"), crypto1, &storage, true).await?;
-    add_ed25519_key_to_vault(make_secret_id!("Secret_2"), crypto2, &storage, false).await?;
+    add_ed25519_key_to_vault(make_secret_id!("Secret_1"), crypto.clone(), &storage, true).await?;
+    add_ed25519_key_to_vault(make_secret_id!("Secret_2"), crypto.clone(), &storage, false).await?;
     storage.flush().await?;
 
     // Patch the on-disk file: set version to 1 to simulate old format
@@ -86,23 +90,20 @@ async fn create_and_fill_v1_vault(
 #[tokio::test]
 #[serial_test::serial]
 async fn test_migrate_from_v1() -> anyhow::Result<()> {
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
+
     for config in fixture() {
         if config.storage_type != StorageType::FileJson {
             continue;
         }
 
         let master_key = create_test_master_key().await?;
-        let vault_v1_into =
-            create_and_fill_v1_vault(create_crypto_factory(config.crypto_type).await?).await?;
+        let vault_v1_into = create_and_fill_v1_vault().await?;
 
         // Run migration
-        let storage = FileJsonStorage::new(
-            master_key,
-            &vault_v1_into.file_path,
-            create_crypto_factory(config.crypto_type).await?,
-            true,
-        )
-        .await?;
+        let storage =
+            FileJsonStorage::new(master_key, &vault_v1_into.file_path, true, crypto.clone())
+                .await?;
 
         // Decrypt the migrated secret and verify the key is now 32 bytes
         let meta_1 = storage
@@ -123,21 +124,19 @@ async fn test_migrate_from_v1() -> anyhow::Result<()> {
         let key_pair_1 = secret_1.as_keypair()?;
         let key_pair_2 = secret_2.as_keypair()?;
 
-        let pub_key_1 = key_pair_1.public_key().await?.unwrap();
-        let pub_key_2 = key_pair_2.public_key().await?.unwrap();
+        let pub_key_1 = key_pair_1.public_key().unwrap();
+        let pub_key_2 = key_pair_2.public_key().unwrap();
 
-        let pvt_key_1 = key_pair_1.private_key().await?.lock().await?.to_vec();
-        let pvt_key_2 = key_pair_2.private_key().await?.lock().await?.to_vec();
+        let pvt_key_1 = key_pair_1.private_key()?.lock()?.to_vec();
+        let pvt_key_2 = key_pair_2.private_key()?.lock()?.to_vec();
 
         assert_eq!(pub_key_1.len(), 32, "Public key should be 32 bytes after migration");
         assert_eq!(pub_key_2.len(), 32, "Public key should be 32 bytes after migration");
         assert_eq!(pvt_key_1.len(), 32, "Private key should be 32 bytes after migration");
         assert_eq!(pvt_key_2.len(), 32, "Private key should be 32 bytes after migration");
 
-        let crypto = create_crypto_factory(config.crypto_type).await?.new_crypto()?;
-
-        assert_eq!(crypto.pub_key_from_pvt(Algorithm::Ed25519, &pvt_key_1).await?, pub_key_1);
-        assert_eq!(crypto.pub_key_from_pvt(Algorithm::Ed25519, &pvt_key_2).await?, pub_key_2);
+        assert_eq!(crypto.pub_key_from_pvt(Algorithm::Ed25519, &pvt_key_1)?, pub_key_1);
+        assert_eq!(crypto.pub_key_from_pvt(Algorithm::Ed25519, &pvt_key_2)?, pub_key_2);
     }
 
     Ok(())
@@ -146,22 +145,18 @@ async fn test_migrate_from_v1() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial_test::serial]
 async fn test_auto_migrate_false_rejects_v1() -> anyhow::Result<()> {
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
+
     for config in fixture() {
         if config.storage_type != StorageType::FileJson {
             continue;
         }
 
         let master_key = create_test_master_key().await?;
-        let vault_v1 =
-            create_and_fill_v1_vault(create_crypto_factory(config.crypto_type).await?).await?;
+        let vault_v1 = create_and_fill_v1_vault().await?;
 
-        let result = FileJsonStorage::new(
-            master_key,
-            &vault_v1.file_path,
-            create_crypto_factory(config.crypto_type).await?,
-            false,
-        )
-        .await;
+        let result =
+            FileJsonStorage::new(master_key, &vault_v1.file_path, false, crypto.clone()).await;
 
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
@@ -178,24 +173,21 @@ async fn test_auto_migrate_false_rejects_v1() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial_test::serial]
 async fn test_migrate_creates_backup() -> anyhow::Result<()> {
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
+
     for config in fixture() {
         if config.storage_type != StorageType::FileJson {
             continue;
         }
 
         let master_key = create_test_master_key().await?;
-        let vault_v1 =
-            create_and_fill_v1_vault(create_crypto_factory(config.crypto_type).await?).await?;
+        let vault_v1 = create_and_fill_v1_vault().await?;
 
         let original_content = tokio::fs::read_to_string(&vault_v1.file_path).await?;
 
         // Run migration
-        FileJsonStorage::migrate(
-            &vault_v1.file_path,
-            master_key.key_material(),
-            create_crypto_factory(config.crypto_type).await?.new_crypto()?.as_ref(),
-        )
-        .await?;
+        FileJsonStorage::migrate(&vault_v1.file_path, master_key.key_material(), crypto.clone())
+            .await?;
 
         // Verify a backup file was created
         let dir = vault_v1.file_path.parent().unwrap();

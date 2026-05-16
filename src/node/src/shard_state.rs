@@ -19,8 +19,8 @@ use adnl::{
 use std::sync::atomic::Ordering;
 use std::{io::Write, sync::Arc};
 use ton_block::{
-    error, fail, read_single_root_boc, AccountId, BinTreeType, BlockIdExt, BocReader, BocWriter,
-    Cell, ConfigParams, Deserializable, HashmapAugType, InRefValue, McShardRecord, McStateExtra,
+    error, fail, read_single_root_boc, AccountId, BinTreeType, BlockIdExt, BocWriter, Cell,
+    ConfigParams, Deserializable, HashmapAugType, InRefValue, McShardRecord, McStateExtra,
     ProcessedInfo, Result, Serializable, ShardAccount, ShardDescr, ShardHashes, ShardIdent,
     ShardStateSplit, ShardStateUnsplit, SliceData, UInt256, WorkchainDescr,
 };
@@ -49,9 +49,7 @@ impl ShardStateStuff {
                 "State's shard block_id is not equal to given one".to_string()
             ))
         }
-        if shard_state.shard().shard_prefix_with_tag() != block_id.shard().shard_prefix_with_tag() {
-            fail!(NodeError::InvalidData("State's shard id is not equal to given one".to_string()))
-        } else if shard_state.seq_no() != block_id.seq_no {
+        if shard_state.seq_no() != block_id.seq_no {
             fail!(NodeError::InvalidData("State's seqno is not equal to given one".to_string()))
         }
         Self::with_params(
@@ -95,7 +93,7 @@ impl ShardStateStuff {
             fail!("Wrong zero state's {} file hash", block_id);
         }
         let root = read_single_root_boc(bytes)?;
-        if &root.repr_hash() != block_id.root_hash() {
+        if root.repr_hash() != block_id.root_hash() {
             fail!("Wrong zero state's {} root hash", block_id);
         }
         Self::from_root_cell(
@@ -107,28 +105,6 @@ impl ShardStateStuff {
         )
     }
 
-    pub fn deserialize_state_inmem(
-        block_id: BlockIdExt,
-        bytes: Arc<Vec<u8>>,
-        #[cfg(feature = "telemetry")] telemetry: &EngineTelemetry,
-        allocated: &EngineAlloc,
-        abort: &dyn Fn() -> bool,
-    ) -> Result<Arc<Self>> {
-        if block_id.seq_no() == 0 {
-            fail!("Use `deserialize_zerostate` method for zerostate");
-        }
-        let root = BocReader::new().set_abort(abort).read_inmem(bytes)?.withdraw_single_root()?;
-        Self::from_root_cell(
-            block_id,
-            root,
-            #[cfg(feature = "telemetry")]
-            telemetry,
-            allocated,
-        )
-    }
-
-    // is used in tests
-    #[cfg(test)]
     pub fn deserialize_state(
         block_id: BlockIdExt,
         bytes: &[u8],
@@ -372,13 +348,12 @@ impl ShardStateStuff {
                 telemetry,
                 allocated,
             ),
-            _ => Self::deserialize_state_inmem(
+            _ => Self::deserialize_state(
                 id,
-                Arc::new(bytes),
+                &bytes,
                 #[cfg(feature = "telemetry")]
                 telemetry,
                 allocated,
-                &|| false,
             ),
         }
     }

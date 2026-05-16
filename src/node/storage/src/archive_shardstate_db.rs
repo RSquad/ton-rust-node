@@ -16,7 +16,7 @@ use crate::{
     traits::Serializable,
     StorageAlloc, TARGET,
 };
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 use ton_block::{BlockIdExt, Cell, CellsFactory, CellsStorage, Result, UInt256, UnixTime};
 
 pub struct ArchiveShardStateDb {
@@ -30,7 +30,6 @@ impl ArchiveShardStateDb {
         db: Arc<RocksDb>,
         index_cf: &str,
         cells_cf: &str,
-        db_root_path: impl AsRef<Path>,
         config: &CellsDbConfig,
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
@@ -38,7 +37,6 @@ impl ArchiveShardStateDb {
         let boc_db = Arc::new(DynamicBocArchiveDb::with_db(
             db.clone(),
             cells_cf,
-            db_root_path.as_ref(),
             config,
             #[cfg(feature = "telemetry")]
             telemetry,
@@ -49,7 +47,7 @@ impl ArchiveShardStateDb {
     }
 
     pub fn put(&self, id: &BlockIdExt, state_root: Cell) -> Result<Cell> {
-        let cell_id = state_root.repr_hash();
+        let cell_id = state_root.repr_hash().clone();
         log::debug!(
             target: TARGET,
             "ArchiveShardStateDb::put  id {}  root_cell_id {:x}", id, cell_id
@@ -62,7 +60,7 @@ impl ArchiveShardStateDb {
             );
             let data = self.index.get(id)?;
             let db_entry = DbEntry::deserialize(&data)?;
-            return self.boc_db.cell_db().load_cell(&db_entry.cell_id, false);
+            return self.boc_db.cell_db().load_cell(&db_entry.cell_id);
         }
 
         let saved = self.boc_db.save_boc(state_root, &|| Ok(()))?;
@@ -74,7 +72,7 @@ impl ArchiveShardStateDb {
 
     pub fn put_update(&self, id: &BlockIdExt, state_root: Cell) -> Result<()> {
         let state_root = state_root.virtualize(1);
-        let cell_id = state_root.repr_hash();
+        let cell_id = state_root.repr_hash().clone();
         log::debug!(
             target: TARGET,
             "ArchiveShardStateDb::put_update  id {}  root_cell_id {:x}", id, cell_id
@@ -102,11 +100,11 @@ impl ArchiveShardStateDb {
             target: TARGET,
             "ArchiveShardStateDb::get  id {}  cell_id {:x}", id, db_entry.cell_id
         );
-        self.boc_db.cell_db().load_cell(&db_entry.cell_id, false)
+        self.boc_db.cell_db().load_cell(&db_entry.cell_id)
     }
 
     pub fn get_cell(&self, id: &UInt256) -> Result<Cell> {
-        self.boc_db.cell_db().load_cell(id, false)
+        self.boc_db.cell_db().load_cell(id)
     }
 
     pub fn contains(&self, id: &BlockIdExt) -> Result<bool> {
@@ -115,6 +113,10 @@ impl ArchiveShardStateDb {
 
     pub fn cells_factory(&self) -> Arc<dyn CellsFactory> {
         self.boc_db.cell_db().clone() as Arc<dyn CellsFactory>
+    }
+
+    pub fn rocksdb_memory_usage(&self) -> crate::RocksDbMemoryUsage {
+        self.boc_db.cell_db().db().memory_usage()
     }
 
     pub fn create_hashed_cell_storage(

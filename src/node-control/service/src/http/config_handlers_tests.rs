@@ -20,7 +20,8 @@ use crate::{
 use axum::body::Body;
 use common::{
     app_config::{
-        AppConfig, HttpConfig, PoolConfig, TonCoreInitParams, TonCorePoolConfig, VotingConfig,
+        AppConfig, HttpConfig, PoolConfig, TonCoreDeployMode, TonCoreInitParams, TonCorePoolConfig,
+        VotingConfig,
     },
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
@@ -245,6 +246,7 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed_with_config_fallback
                         min_validator_stake: 10_000_000_000_000,
                         min_nominator_stake: 10_000_000_000_000,
                     }),
+                    ..Default::default()
                 }),
                 None,
             ],
@@ -268,6 +270,7 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed_with_config_fallback
     assert_eq!(slots[0]["validator_share"], 4000);
     assert_eq!(slots[0]["max_nominators"], 40);
     assert_eq!(slots[0]["data_source"], "config");
+    assert_eq!(slots[0]["deploy_layout"], "legacy");
 }
 
 #[tokio::test]
@@ -290,6 +293,7 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
                         min_validator_stake: 10_000_000_000_000,
                         min_nominator_stake: 10_000_000_000_000,
                     }),
+                    ..Default::default()
                 }),
                 Some(TonCorePoolConfig {
                     address: Some(
@@ -297,6 +301,7 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
                             .into(),
                     ),
                     params: None,
+                    ..Default::default()
                 }),
             ],
         },
@@ -355,8 +360,38 @@ async fn pools_add_core_creates_new_pool_with_one_slot() {
         PoolConfig::TONCore { pools } => {
             assert!(pools[0].is_some(), "even slot must be present");
             assert!(pools[1].is_none(), "odd slot must remain empty");
-            let params = pools[0].as_ref().unwrap().params.as_ref().unwrap();
+            let slot = pools[0].as_ref().unwrap();
+            assert_eq!(
+                slot.deploy_mode,
+                TonCoreDeployMode::TonscanCompatible,
+                "create without deploy_layout should persist tonscan-compatible default"
+            );
+            let params = slot.params.as_ref().unwrap();
             assert_eq!(params.validator_share, 4000);
+        }
+        _ => panic!("expected TONCore pool"),
+    }
+}
+
+#[tokio::test]
+async fn pools_add_core_persists_explicit_tonscan_deploy_mode() {
+    let st = state_with_pools(HashMap::new()).await;
+    let body = serde_json::json!({
+        "name": "core_tonscan",
+        "slot": "even",
+        "validator_share": 4000u16,
+        "deploy_layout": "tonscan",
+    });
+    let resp = routes(false, st.clone()).oneshot(post_json("/v1/pools/core", &body)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let cfg = st.runtime_cfg.get();
+    match cfg.pools.get("core_tonscan").expect("pool inserted") {
+        PoolConfig::TONCore { pools } => {
+            assert_eq!(
+                pools[0].as_ref().unwrap().deploy_mode,
+                TonCoreDeployMode::TonscanCompatible
+            );
         }
         _ => panic!("expected TONCore pool"),
     }
@@ -377,6 +412,7 @@ async fn pools_add_core_adds_second_slot_to_existing_pool() {
                         min_validator_stake: 10_000_000_000_000,
                         min_nominator_stake: 10_000_000_000_000,
                     }),
+                    ..Default::default()
                 }),
                 None,
             ],
@@ -395,6 +431,11 @@ async fn pools_add_core_adds_second_slot_to_existing_pool() {
         PoolConfig::TONCore { pools } => {
             assert!(pools[0].is_some(), "even slot preserved");
             assert!(pools[1].is_some(), "odd slot added");
+            assert_eq!(pools[0].as_ref().unwrap().deploy_mode, TonCoreDeployMode::Legacy);
+            assert_eq!(
+                pools[1].as_ref().unwrap().deploy_mode,
+                TonCoreDeployMode::TonscanCompatible
+            );
         }
         _ => panic!("expected TONCore pool"),
     }
@@ -421,7 +462,10 @@ async fn pools_add_core_rejects_already_configured_slot() {
     pools.insert(
         "core1".to_string(),
         PoolConfig::TONCore {
-            pools: [Some(TonCorePoolConfig { address: None, params: None }), None],
+            pools: [
+                Some(TonCorePoolConfig { address: None, params: None, ..Default::default() }),
+                None,
+            ],
         },
     );
     let st = state_with_pools(pools).await;

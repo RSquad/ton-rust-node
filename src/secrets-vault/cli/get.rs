@@ -11,10 +11,10 @@ use crate::utils::{open_vault, print_secret, print_secret_header};
 pub async fn execute(secret_id: &str) -> anyhow::Result<()> {
     let vault = open_vault().await?;
     let secret_id = secret_id.into();
-    let secret = vault.get(&secret_id).await?;
+    let secret = vault.load(&secret_id).await?;
 
     print_secret_header();
-    print_secret(&secret).await?;
+    print_secret(&secret)?;
 
     Ok(())
 }

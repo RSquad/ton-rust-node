@@ -10,8 +10,8 @@
  */
 use super::consensus::{
     get_elapsed_time, AsyncRequestPtr, BlockHash, BlockPayloadPtr, BlockSourceInfo,
-    CollationParentHint, ConsensusReplayListener, PublicKey, PublicKeyHash, SessionId,
-    SessionListener, SessionStats, ValidatorBlockCandidateCallback,
+    CandidateObservedFlags, CollationParentHint, ConsensusReplayListener, PublicKey, PublicKeyHash,
+    SessionId, SessionListener, SessionStats, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback,
 };
 use crate::validator::validator_group::{ValidatorGroup, ValidatorGroupStatus};
@@ -59,6 +59,12 @@ pub enum ValidationAction {
         collated_data: BlockPayloadPtr,
         callback: ValidatorBlockCandidateDecisionCallback,
     },
+    OnCandidateObserved {
+        block_id: BlockIdExt,
+        data: BlockPayloadPtr,
+        collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    },
     OnBlockCommitted(OnBlockCommitted),
     OnBlockSkipped {
         round: u32,
@@ -96,6 +102,14 @@ impl fmt::Display for ValidationAction {
 
             ValidationAction::OnCandidate { ref source_info, .. } => {
                 write!(f, "OnCandidate round: {}", source_info.priority.round)
+            }
+
+            ValidationAction::OnCandidateObserved { ref block_id, ref flags, .. } => {
+                write!(
+                    f,
+                    "OnCandidateObserved block_id={} parent_ready={} local_collated={}",
+                    block_id, flags.parent_ready, flags.local_collated,
+                )
             }
 
             ValidationAction::OnBlockCommitted(ref committed) => {
@@ -167,6 +181,29 @@ impl SessionListener for ValidatorSessionListener {
         self.do_send_general(
             Some(round),
             ValidationAction::OnCandidate { source_info, root_hash, data, collated_data, callback },
+        );
+    }
+
+    fn on_candidate_observed(
+        &self,
+        block_id: BlockIdExt,
+        data: BlockPayloadPtr,
+        collated_data: BlockPayloadPtr,
+        flags: CandidateObservedFlags,
+    ) {
+        log::debug!(
+            target: "simplex_resolver",
+            "ValidatorSessionListener::on_candidate_observed session_id={:x} shard={} block_id={} parent_ready={} local_collated={} body_present={}",
+            self.session_id,
+            self.shard,
+            block_id,
+            flags.parent_ready,
+            flags.local_collated,
+            flags.body_present,
+        );
+        self.do_send_general(
+            None,
+            ValidationAction::OnCandidateObserved { block_id, data, collated_data, flags },
         );
     }
 
@@ -353,6 +390,20 @@ async fn process_validation_action(action: ValidationAction, g: Arc<ValidatorGro
             }
 
             g.on_candidate(source_info, root_hash, data, collated_data, callback).await
+        }
+
+        ValidationAction::OnCandidateObserved { block_id, data, collated_data, flags } => {
+            log::trace!(
+                target: "simplex_resolver",
+                "({}): OnCandidateObserved block_id={} parent_ready={} local_collated={} body_present={}",
+                next_block_descr,
+                block_id,
+                flags.parent_ready,
+                flags.local_collated,
+                flags.body_present,
+            );
+
+            g.on_candidate_observed(block_id, data, collated_data, flags).await
         }
 
         ValidationAction::OnBlockCommitted(OnBlockCommitted {

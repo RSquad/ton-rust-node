@@ -401,6 +401,7 @@ impl LiteServerTestEngine {
             false,
             false,
             false,
+            None,
             &|| Ok(()),
             None,
             Arc::new(AtomicU8::new(0)),
@@ -939,7 +940,7 @@ fn finalize_block_to_boc(mut id_tpl: BlockIdExt, block: &Block) -> Result<(Vec<u
     BocWriter::with_root(&root)?.write(&mut bytes)?;
     let file_hash = UInt256::calc_file_hash(&bytes);
 
-    id_tpl.root_hash = root_hash;
+    id_tpl.root_hash = root_hash.clone();
     id_tpl.file_hash = file_hash;
 
     Ok((bytes, id_tpl))
@@ -1120,11 +1121,10 @@ async fn test_get_state_returns_expected_boc_and_hashes() -> Result<()> {
 
     assert_eq!(got.id, engine.state_id);
 
-    let expected_root = engine.state.root_cell().repr_hash();
     let expected_file = engine.state.block_id().file_hash.clone();
     let expected_data = write_boc(engine.state.root_cell())?;
 
-    assert_eq!(got.root_hash, expected_root);
+    assert_eq!(got.root_hash, *engine.state.root_cell().repr_hash());
     assert_eq!(got.file_hash, expected_file);
     assert_eq!(got.data, expected_data);
 
@@ -1427,7 +1427,7 @@ impl DispatchQueueTestEngine {
 
         let cell = ss.serialize().unwrap();
         let bytes = write_boc(&cell).unwrap();
-        let root_hash = cell.repr_hash();
+        let root_hash = cell.repr_hash().clone();
         let file_hash = UInt256::calc_file_hash(&bytes);
 
         let state_id =
@@ -2020,6 +2020,7 @@ impl WaitRegistryTestEngine {
             false,
             false,
             false,
+            None,
             &|| Ok(()),
             None,
             Arc::new(AtomicU8::new(0)),

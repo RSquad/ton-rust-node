@@ -59,7 +59,7 @@ async function run() {
     });
     console.log(`Sent ${fromNano(amount)} TON to ${address}, waiting for balance update...`);
 
-    const timeout = 60_000;
+    const timeout = 300_000;
     const poll = 1_000;
     const start = Date.now();
     while (Date.now() - start < timeout) {

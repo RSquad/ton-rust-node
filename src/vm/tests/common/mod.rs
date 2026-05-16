@@ -55,7 +55,7 @@ pub static MC_STATE_ROOT: LazyLock<Cell> = LazyLock::new(|| {
 
 pub static MC_STATE_PROOF: LazyLock<Cell> = LazyLock::new(|| {
     let mc_state_proof = MerkleProof {
-        hash: MC_STATE_ROOT.repr_hash(),
+        hash: MC_STATE_ROOT.repr_hash().clone(),
         depth: MC_STATE_ROOT.repr_depth(),
         proof: MC_STATE_ROOT.clone(),
     };

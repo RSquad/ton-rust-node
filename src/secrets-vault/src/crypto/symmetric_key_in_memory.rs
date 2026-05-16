@@ -34,11 +34,15 @@ impl SymmetricKey for SymmetricKeyInMemory {
         &self.metadata
     }
 
-    async fn extractable(&self) -> anyhow::Result<bool> {
+    fn metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+
+    fn extractable(&self) -> anyhow::Result<bool> {
         Ok(self.metadata.extractable)
     }
 
-    async fn key(&self) -> anyhow::Result<ProtectedMemory> {
+    fn key(&self) -> anyhow::Result<&ProtectedMemory> {
         if !self.metadata.extractable {
             anyhow::bail!(VaultError::not_extractable(self.metadata.secret_id.as_ref()))
         }
@@ -49,7 +53,7 @@ impl SymmetricKey for SymmetricKeyInMemory {
             .as_ref()
             .ok_or_else(|| VaultError::empty_secret_key("Secret key is not set"))?;
 
-        secret_key.clone().await
+        Ok(secret_key)
     }
 
     async fn encrypt(&self, _plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -60,7 +64,7 @@ impl SymmetricKey for SymmetricKeyInMemory {
         todo!();
     }
 
-    async fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
-        self.key_material.serialize().await
+    fn serialize(&self) -> anyhow::Result<ProtectedMemory> {
+        self.key_material.serialize()
     }
 }

@@ -7,25 +7,29 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    crypto::factory::{CryptoFactory, DefaultCryptoFactory},
     storage::file_json::FileJsonStorage,
     tests::fixture::*,
-    types::{algorithm::Algorithm, metadata::Metadata, secret::Secret, store_mode::StoreMode},
+    types::{
+        algorithm::Algorithm, metadata::Metadata, secret::SecretInMemoryFactory,
+        store_mode::StoreMode,
+    },
 };
 
 #[tokio::test]
 #[serial_test::serial]
 async fn test_file_format_is_json() -> anyhow::Result<()> {
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
+
     for config in fixture() {
         if config.storage_type != StorageType::FileJson {
             continue;
         }
 
-        let crypto_factory = create_crypto_factory(config.crypto_type).await?;
         let storage = create_test_storage(&config).await.unwrap();
         let secret_id = "test/key".into();
         let metadata = Metadata::new(Some(&secret_id), Algorithm::Aes256Gcm, true);
-        let secret =
-            Secret::from_raw_data(b"test_value", metadata, crypto_factory.new_crypto()?).await?;
+        let secret = SecretInMemoryFactory::new_secret(b"test_value", metadata, crypto.clone())?;
 
         storage.store(&secret, StoreMode::NewOnly).await?;
 

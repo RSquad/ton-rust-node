@@ -22,17 +22,19 @@ use crate::{
 };
 #[cfg(feature = "telemetry")]
 use crate::{collator_test_bundle::create_engine_telemetry, engine_traits::EngineTelemetry};
+use consensus_common::{CandidateObservedFlags, ConsensusCommonFactory};
 use pretty_assertions::assert_eq;
 use std::{
     fs::{create_dir_all, remove_dir_all},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use storage::{
     block_handle_db::{BlockHandle, BlockHandleStorage},
     types::BlockMeta,
 };
 use ton_block::{
-    AccountIdPrefixFull, AccountStorageDictProof, BinTreeType, BocReader, InRefValue, MerkleProof,
+    read_boc, AccountIdPrefixFull, AccountStorageDictProof, BinTreeType, InRefValue, MerkleProof,
     Result,
 };
 
@@ -54,7 +56,10 @@ struct TestPipelineCollatorEngine {
     states: lockfree::map::Map<BlockIdExt, Arc<ShardStateStuff>>,
     blocks: lockfree::map::Map<BlockIdExt, BlockStuff>,
     last_mc_state: Mutex<BlockIdExt>,
+    shard_blocks_actual_mc_seqno: Mutex<Option<u32>>,
+    requested_shard_blocks_mc_seqnos: Mutex<Vec<u32>>,
     block_handle_storage: BlockHandleStorage,
+    wait_state_delay_ms: u64,
     collator_config: CollatorConfig,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<EngineTelemetry>,
@@ -67,12 +72,21 @@ impl TestPipelineCollatorEngine {
             states: lockfree::map::Map::new(),
             blocks: lockfree::map::Map::new(),
             last_mc_state: Mutex::new(BlockIdExt::default()),
+            shard_blocks_actual_mc_seqno: Mutex::new(None),
+            requested_shard_blocks_mc_seqnos: Mutex::new(Vec::new()),
             block_handle_storage: create_block_handle_storage(None).unwrap(),
+            wait_state_delay_ms: 0,
             collator_config: CollatorConfig::default(),
             #[cfg(feature = "telemetry")]
             telemetry: create_engine_telemetry(),
             allocated: create_engine_allocated(),
         }
+    }
+
+    pub fn with_wait_state_delay(wait_state_delay_ms: u64) -> Self {
+        let mut engine = Self::new();
+        engine.wait_state_delay_ms = wait_state_delay_ms;
+        engine
     }
 
     pub fn add_state(&self, state: Arc<ShardStateStuff>) {
@@ -85,6 +99,14 @@ impl TestPipelineCollatorEngine {
 
     pub fn set_last_mc(&self, id: BlockIdExt) {
         self.last_mc_state.lock().unwrap().clone_from(&id);
+    }
+
+    pub fn set_shard_blocks_actual_mc_seqno(&self, seqno: u32) {
+        *self.shard_blocks_actual_mc_seqno.lock().unwrap() = Some(seqno);
+    }
+
+    pub fn requested_shard_blocks_mc_seqnos(&self) -> Vec<u32> {
+        self.requested_shard_blocks_mc_seqnos.lock().unwrap().clone()
     }
 }
 
@@ -124,6 +146,9 @@ impl EngineOperations for TestPipelineCollatorEngine {
         _timeout_ms: Option<u64>,
         _allow_block_downloading: bool,
     ) -> Result<Arc<ShardStateStuff>> {
+        if self.wait_state_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.wait_state_delay_ms)).await;
+        }
         self.load_state(id).await
     }
 
@@ -137,9 +162,43 @@ impl EngineOperations for TestPipelineCollatorEngine {
 
     async fn get_shard_blocks(
         &self,
-        _: &Arc<ShardStateStuff>,
-        _: Option<&mut u32>,
+        last_mc_state: &Arc<ShardStateStuff>,
+        actual_last_mc_seqno: Option<&mut u32>,
     ) -> Result<Vec<Arc<TopBlockDescrStuff>>> {
+        let given_mc_seqno = last_mc_state.block_id().seq_no;
+        self.requested_shard_blocks_mc_seqnos.lock().unwrap().push(given_mc_seqno);
+
+        if let Some(actual_mc_seqno) = *self.shard_blocks_actual_mc_seqno.lock().unwrap() {
+            if let Some(actual_last_mc_seqno) = actual_last_mc_seqno {
+                *actual_last_mc_seqno = actual_mc_seqno;
+            }
+            // Mirror the two production behaviours behind `cfg(feature = "xp25")`:
+            //   * default build (`shard_blocks.rs`) — fail on `!=` either direction.
+            //   * xp25 build (`shard_blocks_intershard.rs`) — fail only on `<`;
+            //     the speculative-ahead case (`given_mc_seqno > actual_mc_seqno`)
+            //     returns `Ok(vec![])` with `actual_last_mc_seqno` updated, so
+            //     the collator's Ok-arm fallback can fire.
+            #[cfg(not(feature = "xp25"))]
+            {
+                if given_mc_seqno != actual_mc_seqno {
+                    fail!(
+                        "Given last_mc_seq_no {} is not actual {}",
+                        given_mc_seqno,
+                        actual_mc_seqno
+                    );
+                }
+            }
+            #[cfg(feature = "xp25")]
+            {
+                if given_mc_seqno < actual_mc_seqno {
+                    fail!(
+                        "Taken last_mc_seq_no {} is smaller than the actual {}",
+                        given_mc_seqno,
+                        actual_mc_seqno
+                    );
+                }
+            }
+        }
         Ok(vec![])
     }
 
@@ -335,6 +394,193 @@ async fn test_pipeline_collator() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_simplex_wait_prev_state_uses_resolver_cache_before_engine() {
+    async fn test() -> Result<()> {
+        let bundle = Arc::new(
+            CollatorTestBundle::build_with_zero_state(
+                "src/tests/static/zerostate.boc",
+                &["src/tests/static/basestate0.boc", "src/tests/static/basestate0.boc"],
+            )
+            .await?,
+        );
+        let prev_id = bundle.prev_blocks_ids()[0].clone();
+        let prev_state = bundle.load_state(&prev_id).await?;
+        let shard = prev_id.shard().clone();
+        let prev_blocks_history = PrevBlockHistory::with_prevs(&shard, vec![prev_id.clone()]);
+
+        let mc_state = bundle.load_last_applied_mc_state().await?;
+        let mc_state_extra = mc_state.shard_state_extra()?;
+        let mut cc_seqno_with_delta = 0;
+        let cc_seqno_from_state = if shard.is_masterchain() {
+            mc_state_extra.validator_info.catchain_seqno
+        } else {
+            mc_state_extra.shards.calc_shard_cc_seqno(&shard)?
+        };
+        let nodes = crate::validator::validator_utils::compute_validator_set_cc(
+            &mc_state,
+            &shard,
+            prev_blocks_history.get_next_seqno().unwrap_or_default(),
+            cc_seqno_from_state,
+            &mut cc_seqno_with_delta,
+        )?;
+        let validator_set = ValidatorSet::with_cc_seqno(0, 0, 0, cc_seqno_with_delta, nodes)?;
+
+        // Engine intentionally does not contain `prev_id` state. The resolver
+        // cache pre-publishes it via watch channel, so OR semantics should
+        // return from cache without waiting for engine state availability.
+        let engine = Arc::new(TestPipelineCollatorEngine::with_wait_state_delay(250))
+            as Arc<dyn EngineOperations>;
+        let state_resolver_cache = Arc::new(tokio::sync::Mutex::new(StateResolverCache::new()));
+        let _cache_rx_keepalive = {
+            let mut cache = state_resolver_cache.lock().await;
+            let rx = cache.subscribe_state(&prev_id);
+            cache.store_validated_state(&prev_id, prev_state.clone());
+            rx
+        };
+
+        let collator = Collator::new(
+            shard,
+            0,
+            &prev_blocks_history,
+            PipelineContext::new(),
+            state_resolver_cache,
+            validator_set,
+            UInt256::default(),
+            engine,
+            None,
+            CollatorSettings { is_simplex: true, ..Default::default() },
+        )?;
+
+        let resolved_state = collator.wait_prev_state_via_engine_or_cache(&prev_id).await?;
+        assert_eq!(resolved_state.block_id(), prev_state.block_id());
+        Ok(())
+    }
+
+    test_async(|| Box::pin(test()), || {}).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_simplex_wait_prev_state_materializes_state_from_cached_chain() {
+    async fn test() -> Result<()> {
+        // Build a real candidate/state pair from fixture data so Merkle update application
+        // in the resolver path is exercised with valid block/state payloads.
+        let bundle = Arc::new(
+            CollatorTestBundle::build_with_zero_state(
+                "src/tests/static/zerostate.boc",
+                &["src/tests/static/basestate0.boc", "src/tests/static/basestate0.boc"],
+            )
+            .await?,
+        );
+        let collate_result = crate::collator_test_bundle::try_collate(
+            bundle.clone() as Arc<dyn EngineOperations>,
+            bundle.block_id().shard().clone(),
+            bundle.prev_blocks_ids().clone(),
+            PipelineContext::new(),
+            None,
+            None,
+            true,
+            true,
+            true,
+        )
+        .await?;
+        let (candidate, expected_state) = match collate_result {
+            CollateResult::Ok { candidate, new_state, .. } => (
+                candidate.clone(),
+                ShardStateStuff::from_state(
+                    candidate.block_id.clone(),
+                    new_state,
+                    #[cfg(feature = "telemetry")]
+                    bundle.engine_telemetry(),
+                    bundle.engine_allocated(),
+                )?,
+            ),
+            CollateResult::Err { err, .. } => fail!("failed to build fixture candidate: {err:?}"),
+        };
+
+        let target_id = candidate.block_id.clone();
+        let parent_id = bundle.prev_blocks_ids()[0].clone();
+        let parent_state = bundle.load_state(&parent_id).await?;
+        let shard = target_id.shard().clone();
+        let prev_blocks_history = PrevBlockHistory::with_prevs(&shard, vec![target_id.clone()]);
+
+        let mc_state = bundle.load_last_applied_mc_state().await?;
+        let mc_state_extra = mc_state.shard_state_extra()?;
+        let mut cc_seqno_with_delta = 0;
+        let cc_seqno_from_state = if shard.is_masterchain() {
+            mc_state_extra.validator_info.catchain_seqno
+        } else {
+            mc_state_extra.shards.calc_shard_cc_seqno(&shard)?
+        };
+        let nodes = crate::validator::validator_utils::compute_validator_set_cc(
+            &mc_state,
+            &shard,
+            prev_blocks_history.get_next_seqno().unwrap_or_default(),
+            cc_seqno_from_state,
+            &mut cc_seqno_with_delta,
+        )?;
+        let validator_set = ValidatorSet::with_cc_seqno(0, 0, 0, cc_seqno_with_delta, nodes)?;
+
+        let state_resolver_cache = Arc::new(tokio::sync::Mutex::new(StateResolverCache::new()));
+        {
+            let mut cache = state_resolver_cache.lock().await;
+            let empty_payload = ConsensusCommonFactory::create_block_payload(Vec::new());
+            cache.upsert_observed_candidate(
+                parent_id.clone(),
+                empty_payload.clone(),
+                empty_payload,
+                CandidateObservedFlags {
+                    body_present: false,
+                    parent_ready: true,
+                    local_collated: false,
+                },
+            );
+            cache.store_validated_state(&parent_id, parent_state);
+            cache.upsert_observed_candidate(
+                target_id.clone(),
+                ConsensusCommonFactory::create_block_payload(candidate.data.clone()),
+                ConsensusCommonFactory::create_block_payload(candidate.collated_data.clone()),
+                CandidateObservedFlags {
+                    body_present: true,
+                    parent_ready: true,
+                    local_collated: false,
+                },
+            );
+        }
+
+        // Engine intentionally has no target state; resolver must materialize it from cache.
+        let engine = Arc::new(TestPipelineCollatorEngine::with_wait_state_delay(250))
+            as Arc<dyn EngineOperations>;
+        let collator = Collator::new(
+            shard,
+            0,
+            &prev_blocks_history,
+            PipelineContext::new(),
+            state_resolver_cache.clone(),
+            validator_set,
+            UInt256::default(),
+            engine,
+            None,
+            CollatorSettings { is_simplex: true, ..Default::default() },
+        )?;
+
+        let resolved_state = collator.wait_prev_state_via_engine_or_cache(&target_id).await?;
+        assert_eq!(
+            resolved_state.root_cell().repr_hash(),
+            expected_state.root_cell().repr_hash(),
+            "resolver materialization must reproduce collator-computed next state"
+        );
+        let cached = {
+            let cache = state_resolver_cache.lock().await;
+            cache.try_get_state(&target_id)
+        };
+        assert!(cached.is_some(), "materialized target state must be stored in resolver cache");
+        Ok(())
+    }
+
+    test_async(|| Box::pin(test()), || {}).await;
+}
+
 // prepare for testing purposes
 fn prepare_test_env_message(
     src_prefix: u64,
@@ -444,7 +690,7 @@ async fn try_collate_by_bundle(
         // println!("Original old state root {:#.3}", old_state);
         // println!("Original new state root {:#.3}", new_state);
         if let Err(result) =
-            compare_blocks(ethalon_block.block()?, &Block::construct_from_bytes(&candidate.data)?)
+            compare_blocks(&Block::construct_from_bytes(&candidate.data)?, ethalon_block.block()?)
         {
             panic!("Blocks are not equal: {}", result);
         }
@@ -483,6 +729,101 @@ async fn test_collate_first_block() {
         },
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_masterchain_collation_bootstrap_fallback_on_speculative_parent_mc_seqno_mismatch() {
+    async fn test() -> Result<()> {
+        let bundle = Arc::new(
+            CollatorTestBundle::build_with_zero_state(
+                "src/tests/static/zerostate.boc",
+                &["src/tests/static/basestate0.boc", "src/tests/static/basestate0.boc"],
+            )
+            .await?,
+        );
+
+        let first_result = crate::collator_test_bundle::try_collate(
+            bundle.clone() as Arc<dyn EngineOperations>,
+            bundle.block_id().shard().clone(),
+            bundle.prev_blocks_ids().clone(),
+            PipelineContext::new(),
+            None,
+            None,
+            true,
+            true,
+            true,
+        )
+        .await?;
+
+        let (speculative_parent_id, speculative_parent_state) = match first_result {
+            CollateResult::Ok { candidate, new_state, .. } => (
+                candidate.block_id.clone(),
+                ShardStateStuff::from_state(
+                    candidate.block_id,
+                    new_state,
+                    #[cfg(feature = "telemetry")]
+                    bundle.engine_telemetry(),
+                    bundle.engine_allocated(),
+                )?,
+            ),
+            CollateResult::Err { err, .. } => {
+                fail!("failed to build speculative parent for bootstrap mismatch test: {err:?}")
+            }
+        };
+        let speculative_parent_top_blocks =
+            speculative_parent_state.shard_hashes()?.top_blocks_all()?;
+
+        let applied_mc_state = bundle.load_last_applied_mc_state().await?;
+
+        let engine = Arc::new(TestPipelineCollatorEngine::new());
+        engine.add_state(speculative_parent_state);
+        engine.add_state(applied_mc_state.clone());
+        for id in bundle.prev_blocks_ids() {
+            engine.add_state(bundle.load_state(id).await?);
+        }
+        for id in speculative_parent_top_blocks {
+            if let Ok(state) = bundle.load_state(&id).await {
+                engine.add_state(state);
+            }
+        }
+        engine.set_last_mc(applied_mc_state.block_id().clone());
+        engine.set_shard_blocks_actual_mc_seqno(0);
+
+        let result = crate::collator_test_bundle::try_collate(
+            engine.clone() as Arc<dyn EngineOperations>,
+            ShardIdent::masterchain(),
+            vec![speculative_parent_id.clone()],
+            PipelineContext::new(),
+            None,
+            None,
+            true,
+            false,
+            true,
+        )
+        .await?;
+        let candidate = match result {
+            CollateResult::Ok { candidate, .. } => candidate,
+            CollateResult::Err { err, .. } => {
+                fail!("collation should succeed via bootstrap fallback, got error: {err}")
+            }
+        };
+        assert_eq!(
+            candidate.block_id.seq_no(),
+            speculative_parent_id.seq_no() + 1,
+            "collator must build on speculative parent despite shard-blocks lag"
+        );
+
+        let requested = engine.requested_shard_blocks_mc_seqnos();
+        assert_eq!(
+            requested,
+            vec![speculative_parent_id.seq_no()],
+            "collator must first try speculative seqno and avoid hard-failing on shard-blocks lag"
+        );
+
+        Ok(())
+    }
+
+    test_async(|| Box::pin(test()), || {}).await;
 }
 
 #[ignore]
@@ -565,8 +906,7 @@ async fn test_collated_data1() {
 
     let candidate = try_collate_by_bundle(Arc::new(bundle), true).await.unwrap();
 
-    let mut collated_data_roots =
-        BocReader::new().read_inmem(Arc::new(candidate.collated_data)).unwrap().roots;
+    let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
     assert_eq!(collated_data_roots.len(), 10);
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
@@ -584,7 +924,9 @@ async fn test_collated_data1() {
     account
         .read_account()
         .unwrap()
-        .init_storage_stat(config.size_limits_config().unwrap().acc_state_cells_for_storage_dict)
+        .calc_and_check_storage_stat_dict(
+            config.size_limits_config().unwrap().acc_state_cells_for_storage_dict,
+        )
         .unwrap();
 }
 
@@ -601,8 +943,7 @@ async fn check_bundle(bundle: &str, collated_roots: usize) {
 
     let candidate = try_collate_by_bundle(Arc::new(bundle), true).await.unwrap();
 
-    let mut collated_data_roots =
-        BocReader::new().read_inmem(Arc::new(candidate.collated_data)).unwrap().roots;
+    let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
     assert_eq!(collated_data_roots.len(), collated_roots);
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
@@ -632,9 +973,9 @@ async fn check_bundle(bundle: &str, collated_roots: usize) {
             if let Some(dict_hash) = account.dict_hash() {
                 // check that we either have dict proof or account state is not pruned
                 // so we are able to init dict
-                if !dict_proofs.iter().any(|p| &p.proof.hash(0) == dict_hash) {
+                if !dict_proofs.iter().any(|p| p.proof.hash(0) == dict_hash) {
                     account
-                        .init_storage_stat(
+                        .calc_and_check_storage_stat_dict(
                             config.size_limits_config().unwrap().acc_state_cells_for_storage_dict,
                         )
                         .unwrap();
