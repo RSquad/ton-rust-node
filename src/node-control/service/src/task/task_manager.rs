@@ -455,7 +455,7 @@ mod tests {
     /// zero after `disable()`). Not deterministic — relies on the scheduler
     /// producing a bad interleave under the old code; passes more reliably
     /// on multi-core runners. Treat as a regression guard, not a proof.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_restarts_do_not_orphan_tasks() {
         struct LiveCountTask {
             live: Arc<AtomicU32>,
@@ -494,7 +494,7 @@ mod tests {
             }));
         }
         for j in joins {
-            let _ = j.await;
+            j.await.expect("restart task panicked");
         }
 
         // Give the most recent restart a moment to spawn.
