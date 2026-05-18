@@ -46,7 +46,7 @@ Before starting the deployment, ensure you have:
 nodectl is distributed as a Docker image. Pull the latest version:
 
 ```bash
-docker pull ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0
+docker pull ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0
 ```
 
 To run any `nodectl` CLI command, use `docker run` with the image:
@@ -56,7 +56,7 @@ docker run --rm \
   -v "$(pwd)/nodectl-config.json":/nodectl/config.json \
   -e VAULT_URL="$VAULT_URL" \
   -e CONFIG_PATH="/nodectl/config.json" \
-  ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+  ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
   nodectl <command> [options]
 ```
 
@@ -67,7 +67,7 @@ alias nodectl='docker run --rm \
   -v "$(pwd)/nodectl-config.json":/nodectl/config.json \
   -e VAULT_URL="$VAULT_URL" \
   -e CONFIG_PATH="/nodectl/config.json" \
-  ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+  ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
   nodectl'
 ```
 
@@ -78,7 +78,7 @@ alias nodectl='docker run --rm \
 >   -v "$(pwd)/vault.json":/nodectl/vault.json \
 >   -e VAULT_URL="file:///nodectl/vault.json?master_key=$MASTER_KEY" \
 >   -e CONFIG_PATH="/nodectl/config.json" \
->   ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+>   ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
 >   nodectl'
 > ```
 
@@ -314,7 +314,7 @@ docker run -d \
   -e VAULT_URL="$VAULT_URL" \
   -e CONFIG_PATH="/nodectl/config.json" \
   -e RUST_BACKTRACE=1 \
-  ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+  ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
   nodectl service --config=/nodectl/config.json
 ```
 
@@ -328,7 +328,7 @@ docker run -d \
 >   -e VAULT_URL="file:///nodectl/vault.json?master_key=$MASTER_KEY" \
 >   -e CONFIG_PATH="/nodectl/config.json" \
 >   -e RUST_BACKTRACE=1 \
->   ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+>   ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
 >   nodectl service --config=/nodectl/config.json
 > ```
 > Without this mount, all vault keys (wallet keys, ADNL keys) will be lost on every container restart.
