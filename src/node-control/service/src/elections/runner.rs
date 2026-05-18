@@ -547,6 +547,25 @@ impl ElectionRunner {
             self.past_elections_cache_id = election_id;
         }
 
+        // Pool address is cached only on election_id transition. If the first attempt failed
+        // (e.g. get_pool_data parse error on TONCore), retry every tick until resolved.
+        for (node_id, node) in self.nodes.iter_mut() {
+            if node.pool.is_none() || node.pool_addr_cache.is_some() {
+                continue;
+            }
+            let Some(p) = &node.pool else { continue };
+            match p.address().await {
+                Ok(addr) => {
+                    tracing::info!("node [{}] pool address cached: {}", node_id, addr);
+                    node.pool_addr_cache = Some(addr);
+                }
+                Err(e) => {
+                    tracing::error!("node [{}] pool address error: {}", node_id, e);
+                    skip_tick_nodes.push(node_id.clone());
+                }
+            }
+        }
+
         // walk through the nodes and try to participate in the elections
         let mut nodes = self
             .nodes
