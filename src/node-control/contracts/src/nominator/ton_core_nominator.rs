@@ -264,9 +264,11 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
         let max_nominators_count = stack.i64(6).context("parse max_nominators_count")? as u16;
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
         let min_nominator_stake = stack.i64(8).context("parse min_nominator_stake")? as u64;
-        // Index 9 is `nominators:dict` (not currently used). Index 10 is `withdraw_requests:dict`
-        // from `pool.fc` persistent storage; `Some(_)` means at least one nominator has a
-        // pending withdraw request (see `has_withdraw_requests`).
+        // Indices 9–10: `nominators` / `withdraw_requests` dicts (empty dicts arrive as empty
+        // `tvm.list`, see `TvmStackParser::cell_opt`). Index 9 is parsed only as a layout probe:
+        // if the stack ever shifts, this errors before we silently misread index 10. `Some(_)` at
+        // 10 means there is at least one pending withdraw request.
+        let _nominators = stack.cell_opt(9).context("parse nominators")?;
         let withdraw_requests = stack.cell_opt(10).context("parse withdraw_requests")?;
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {

@@ -758,12 +758,12 @@ class Bootstrap:
             return ""
 
     def _bun_topup(self, address: str, amount: str) -> None:
-        # Keep subprocess timeout above topup.ts post-send balance poll (60s hardcoded) + margin.
-        timeout_raw = os.environ.get("BUN_TOPUP_TIMEOUT_SECONDS", "400")
+        # Keep subprocess timeout above topup.ts post-send balance poll (600s) + margin.
+        timeout_raw = os.environ.get("BUN_TOPUP_TIMEOUT_SECONDS", "720")
         try:
             timeout = int(timeout_raw)
         except ValueError:
-            timeout = 400
+            timeout = 720
         subprocess.run(["bun", "run", "topup", address, amount],
                        cwd=self.paths.load_net_dir, check=True,
                        stdin=subprocess.DEVNULL, timeout=timeout)

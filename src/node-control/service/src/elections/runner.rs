@@ -146,10 +146,28 @@ struct Node {
 }
 
 impl Node {
-    /// Get theaddress from which the stake will be sent to elector: pool or wallet.
+    /// Resolved pool target for this node.
+    /// - `Ok(None)` — direct staking (no pool configured).
+    /// - `Ok(Some(addr))` — staking via pool at `addr`.
+    /// - `Err` — pool is configured but its address is not cached yet. This is transient:
+    ///   the next tick's resolve loop will retry. Callers should propagate the error so
+    ///   the node is not silently downgraded to wallet-based staking.
+    fn pool_target(&self) -> anyhow::Result<Option<&MsgAddressInt>> {
+        match (&self.pool, &self.pool_addr_cache) {
+            (None, _) => Ok(None),
+            (Some(_), Some(addr)) => Ok(Some(addr)),
+            (Some(_), None) => {
+                Err(anyhow::anyhow!("pool address not resolved; will retry next tick"))
+            }
+        }
+    }
+
+    /// Get the address from which the stake will be sent to elector: pool or wallet.
+    /// Errors if pool is configured but its address has not been resolved yet — preventing
+    /// a misroute to wallet-based staking when the pool address cache is transiently empty.
     /// Note: only raw address bytes are returned (without workchain ID).
     async fn stake_addr(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(match &self.pool_addr_cache {
+        Ok(match self.pool_target()? {
             Some(addr) => addr.address().storage().to_vec(),
             None => self.wallet.address().await?.address().storage().to_vec(),
         })
@@ -311,6 +329,29 @@ struct StakeContext<'a> {
 }
 
 impl ElectionRunner {
+    /// Fill `node.pool_addr_cache` if the node has a pool but no cached address.
+    /// On failure the node is appended to `skip_tick_nodes` so participation is deferred
+    /// to the next tick; the next tick's resolve pass will retry.
+    async fn resolve_pool_addr(node_id: &str, node: &mut Node, skip_tick_nodes: &mut Vec<String>) {
+        let Some(pool) = &node.pool else {
+            node.pool_addr_cache = None;
+            return;
+        };
+        if node.pool_addr_cache.is_some() {
+            return;
+        }
+        match pool.address().await {
+            Ok(addr) => {
+                tracing::info!("node [{}] pool address cached: {}", node_id, addr);
+                node.pool_addr_cache = Some(addr);
+            }
+            Err(e) => {
+                tracing::error!("node [{}] pool address error: {}", node_id, e);
+                skip_tick_nodes.push(node_id.to_string());
+            }
+        }
+    }
+
     pub(crate) fn new(
         elections_config: &ElectionsConfig,
         bindings: &HashMap<String, NodeBinding>,
@@ -481,14 +522,41 @@ impl ElectionRunner {
 
         self.build_elections_snapshot(election_id, &cfg15, &elections_info, &cfg17).await;
 
+        let mut skip_tick_nodes = vec![];
+
+        // Pool address cache must be valid before any branch that uses `stake_addr`/`pool_target`
+        // (the finished branch below included). TONCore router pool address changes per election
+        // cycle (the router alternates between two pools), so invalidate the cache on election_id
+        // transition. SNP pool addresses are stable but invalidating uniformly is cheap.
+        // Also covers elections-task restart: `past_elections_cache_id` is 0 after start, so the
+        // first tick lands here and re-resolves.
+        if self.past_elections_cache_id != election_id {
+            for node in self.nodes.values_mut() {
+                if node.pool.is_some() {
+                    node.pool_addr_cache = None;
+                }
+            }
+        }
+        // Resolve pool address for any node where it isn't cached yet. On election_id transition
+        // the cache was just invalidated above; on other ticks this recovers from a transient
+        // `pool.address()` failure (e.g. a `get_pool_data` parse error on TONCore).
+        for (node_id, node) in self.nodes.iter_mut() {
+            Self::resolve_pool_addr(node_id, node, &mut skip_tick_nodes).await;
+        }
+
         if elections_info.finished {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Finished;
             tracing::warn!("elections are finished");
             // check if node stakes are accepted by the elector
-            for node in self.nodes.values_mut() {
+            for (node_id, node) in self.nodes.iter_mut() {
                 // Reset previous state; only mark as accepted if present in current participants
                 node.stake_accepted = false;
                 node.accepted_stake_amount = None;
+                // Skip nodes whose pool address didn't resolve this tick: we cannot determine
+                // the correct staking address, and the next tick will retry.
+                if skip_tick_nodes.contains(node_id) {
+                    continue;
+                }
 
                 let staking_addr = node.stake_addr().await?;
                 if let Some(p) =
@@ -511,7 +579,6 @@ impl ElectionRunner {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Postponed;
         }
 
-        let mut skip_tick_nodes = vec![];
         // Fetch past_elections only when election_id changes (cache across ticks).
         if self.past_elections_cache_id != election_id {
             self.past_elections = self.elector.past_elections().await.context("past_elections")?;
@@ -526,24 +593,6 @@ impl ElectionRunner {
                     nanotons_to_tons_f64(prev)
                 );
             }
-            // Cache pool address for each node:
-            // for TONCore pool getting address is a network RPC call,
-            //for SNP pool - its a simple getter.
-            for (node_id, node) in self.nodes.iter_mut() {
-                node.pool_addr_cache = if let Some(p) = &node.pool {
-                    match p.address().await {
-                        Ok(addr) => Some(addr),
-                        Err(e) => {
-                            tracing::error!("node [{}] pool address error: {}", node_id, e);
-                            skip_tick_nodes.push(node_id.clone());
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-            // Apply new election id only if all data was requested successfully.
             self.past_elections_cache_id = election_id;
         }
 
@@ -713,8 +762,10 @@ impl ElectionRunner {
         // Resolve target once per tick:
         // if pool address is cached use it, otherwise fallback to elector.
         let elector_addr = self.elector.address().await?;
-        // address to which the wallet will send stake request: pool or elector
-        let to_addr = node.pool_addr_cache.as_ref().cloned().unwrap_or(elector_addr);
+        // address to which the wallet will send stake request: pool or elector.
+        // `pool_target()?` errors if pool is configured but its address is not yet cached —
+        // this prevents the request from being misrouted directly to the elector.
+        let to_addr = node.pool_target()?.cloned().unwrap_or(elector_addr);
         // address from which the stake will be sent to elector: wallet or pool
         let from_addr = node.stake_addr().await?;
         // Find validator key for current elections in the validator config
@@ -1079,7 +1130,9 @@ impl ElectionRunner {
                 );
             }
             let elector_addr = self.elector.address().await?;
-            let to_addr = node.pool_addr_cache.as_ref().cloned().unwrap_or(elector_addr);
+            // pool_target() errors if pool is set but its address is not cached yet — avoids
+            // routing recover stake to the elector when the pool is actually configured.
+            let to_addr = node.pool_target()?.cloned().unwrap_or(elector_addr);
             let msg_boc = write_boc(
                 &node
                     .wallet
