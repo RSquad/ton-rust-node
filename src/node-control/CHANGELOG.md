@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Static ADNL address is now the default across elections.** Previously nodectl generated a fresh ADNL key every election cycle, which broke Rust-node fastsync for peers that still knew the validator by its previous ADNL. Now nodectl auto-generates and persists a static ADNL per node on the first election cycle and reuses it thereafter. Existing `elections.static_adnls` entries are honored unchanged. To opt out for a node and revert to per-cycle ephemeral ADNL, run `nodectl config elections static-adnl --node <name> --disable` (or `DELETE /v1/elections/static-adnl/{node}`). The opt-out is stored in the new `elections.static_adnl_disabled` set. Running the existing rotate command (`nodectl config elections static-adnl --node <name>`) re-enables the static default if it was previously disabled.
+
 ### Added
 
+- **`DELETE /v1/elections/static-adnl/{node}`** — opt the node out of static ADNL; the runner will generate a fresh ephemeral ADNL each cycle.
+- **`--disable` flag on `nodectl config elections static-adnl`** — CLI counterpart of the DELETE endpoint.
+- **`static_adnl_disabled` field on `BindingElectionStatusDto`** — surfaced by `GET /v1/elections/settings` and the `elections show` CLI output ("disabled" marker in the Static ADNL column).
 - **TONCore pool deploy mode (`deploy_layout`)** — per-slot string (JSON field name unchanged). Canonical values: **`legacy`** (full pool bytecode in `StateInit.code`; same addresses as pools created with older nodectl) and **`tonscan`** (alias: `tonscan_compatible`, `tonscan-compatible` — bootstrap `StateInit.code` + `SETCODE` on first execution; explorers such as Tonscan recognise the contract). **Use `tonscan` for new pools.** Already-deployed slots must stay on the mode they were created with — address derivation differs between modes. Wired through REST (`POST /v1/pools/core`, pool slot views), JSON config, and CLI (`nodectl config pool add core --deploy-mode`, alias `--deploy-layout`). Defaults: **missing `deploy_layout` in persisted config** stays **`legacy`** so derived addresses are preserved; **`POST /v1/pools/core`** / **`nodectl config pool add core`** omitting deploy mode default to **`tonscan`**.
 
 ## [0.4.0] - 2026-04-21

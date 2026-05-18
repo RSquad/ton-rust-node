@@ -201,6 +201,10 @@ pub(crate) fn routes(enable_swagger: bool, state: AppState) -> axum::Router {
             "/v1/elections/static-adnl",
             axum::routing::post(super::config_handlers::v1_elections_static_adnl_handler),
         )
+        .route(
+            "/v1/elections/static-adnl/{node}",
+            axum::routing::delete(super::config_handlers::v1_elections_static_adnl_disable_handler),
+        )
         .route("/v1/voting/proposals", axum::routing::post(v1_voting_proposals_add_handler))
         .route("/v1/voting/proposals/{hash}", axum::routing::delete(v1_voting_proposals_rm_handler))
         .route("/v1/task/elections", axum::routing::post(v1_task_elections_handler))
@@ -865,6 +869,7 @@ impl utoipa::Modify for BearerAuthAddon {
         super::config_handlers::v1_contracts_automation_settings_handler,
         super::config_handlers::v1_contracts_automation_settings_update_handler,
         super::config_handlers::v1_elections_static_adnl_handler,
+        super::config_handlers::v1_elections_static_adnl_disable_handler,
         // It won't compile without full names
         super::config_handlers::v1_nodes_handler,
         super::config_handlers::v1_nodes_add_handler,
