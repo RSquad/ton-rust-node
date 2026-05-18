@@ -58,8 +58,11 @@ fmt:
 	@cargo +nightly fmt $(check) --manifest-path ./tl/ton_tl_codegen/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./secrets-vault/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./vm/Cargo.toml
-	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/*.rs
-	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/build/*.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/config.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/info.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/log.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/src/test.rs
+	@rustfmt +nightly $(check) --edition 2021 --config-path ./ ./common/build/build.rs
 
 #### Tests
 

@@ -565,7 +565,8 @@ impl Engine {
                 break result;
             }
             self.cmd_code = SliceProto::from(self.cc.code());
-            if let Some((prefix, bits, gas)) = check_too_short_code(self.cc.code_mut())? {
+            if let Some((prefix, bits, gas)) = check_too_short_code(self.cc.code())? {
+                self.cc.code_mut().move_by(bits as usize)?;
                 let err = match self.try_use_gas(gas as i64) {
                     Err(err) => err,
                     Ok(_) => error!(
@@ -575,6 +576,7 @@ impl Engine {
                 };
                 self.step += 1;
                 self.raise_exception(err)?;
+                continue;
             }
             let execution_result = match HANDLERS_CP0.get_handler(self) {
                 Err(err) => {

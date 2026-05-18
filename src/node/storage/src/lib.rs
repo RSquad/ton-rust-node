@@ -28,40 +28,7 @@ pub mod types;
 
 #[cfg(feature = "telemetry")]
 use adnl::telemetry::{Metric, MetricBuilder};
-use std::{
-    sync::{atomic::AtomicU64, Arc},
-    time::{Duration, Instant},
-};
-
-pub struct TimeChecker {
-    operation: String,
-    threshold: Duration,
-    start: Instant,
-}
-
-impl TimeChecker {
-    pub fn new(operation: String, threshold_ms: u64) -> Self {
-        let start = std::time::Instant::now();
-        log::trace!("{} - started", operation);
-        Self { operation, threshold: Duration::from_millis(threshold_ms), start }
-    }
-}
-
-impl Drop for TimeChecker {
-    fn drop(&mut self) {
-        let time = self.start.elapsed();
-        if time < self.threshold {
-            log::trace!("{} - finished, TIME: {}", self.operation, time.as_millis());
-        } else {
-            log::warn!(
-                "{} - finished too slow, TIME: {}ms, expected: {}ms",
-                self.operation,
-                time.as_millis(),
-                self.threshold.as_millis()
-            );
-        }
-    }
-}
+use std::sync::{atomic::AtomicU64, Arc};
 
 #[cfg(feature = "telemetry")]
 pub struct StorageTelemetry {

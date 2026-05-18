@@ -26,10 +26,7 @@ use std::{
     fmt::{Debug, Display, Formatter},
     iter::Iterator,
     mem,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Instant,
 };
 use ton_block::{
@@ -577,7 +574,7 @@ impl OutMsgQueueInfoStuff {
         next_mc_end_lt: u64,
         next_shards: Option<&ShardHashes>,
         states_manager: &StatesManager,
-        stop_flag: &Option<&AtomicBool>,
+        stop_flag: &Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<()> {
         let workchain = self.shard().workchain_id();
         let masterchain = workchain == MASTERCHAIN_ID;
@@ -845,7 +842,7 @@ impl MsgQueueManager {
         next_state_opt: Option<&Arc<ShardStateStuff>>,
         after_merge: bool,
         after_split: bool,
-        stop_flag: Option<&AtomicBool>,
+        stop_flag: Option<&tokio_util::sync::CancellationToken>,
         usage_tree: Option<&UsageTree>,
         imported_visited: Option<&mut HashSet<UInt256>>,
         block_descr: Option<Arc<String>>,
@@ -1097,7 +1094,7 @@ impl MsgQueueManager {
         shard: &ShardIdent,
         real_out_queue_info: &OutMsgQueueInfoStuff,
         prev_states: &[Arc<ShardStateStuff>],
-        stop_flag: &Option<&AtomicBool>,
+        stop_flag: &Option<&tokio_util::sync::CancellationToken>,
         block_descr: Arc<String>,
     ) -> Result<()> {
         log::debug!("{}: in add_trivial_neighbor_after_merge()", block_descr);
@@ -1158,7 +1155,7 @@ impl MsgQueueManager {
         real_out_queue_info: &OutMsgQueueInfoStuff,
         mut sibling_out_queue_info: Option<OutMsgQueueInfoStuff>,
         prev_shard: &ShardIdent,
-        stop_flag: &Option<&AtomicBool>,
+        stop_flag: &Option<&tokio_util::sync::CancellationToken>,
         block_descr: Arc<String>,
     ) -> Result<()> {
         log::debug!("{}: in add_trivial_neighbor()", block_descr);
@@ -2091,9 +2088,9 @@ impl<T: Clone + Eq> Iterator for MsgQueueMergerIterator<T> {
     }
 }
 
-fn check_stop_flag(stop_flag: &Option<&AtomicBool>) -> Result<()> {
+fn check_stop_flag(stop_flag: &Option<&tokio_util::sync::CancellationToken>) -> Result<()> {
     if let Some(stop_flag) = stop_flag {
-        if stop_flag.load(Ordering::Relaxed) {
+        if stop_flag.is_cancelled() {
             fail!("Stop flag was set")
         }
     }

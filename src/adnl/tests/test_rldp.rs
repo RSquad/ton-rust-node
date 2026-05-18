@@ -393,6 +393,10 @@ fn test_rldp_session_with_loss(
         min_timeout_ms,
     );
     rt.block_on(async move {
+        // Extend inbound RLDP cap for test
+        ctx1.rldp.change_inbound_cap_for_peers(&[ctx2.peer.clone()], 1).unwrap();
+        ctx2.rldp.change_inbound_cap_for_peers(&[ctx1.peer.clone()], 1).unwrap();
+
         let data_send = Mockup::build_query();
         let data_recv = Mockup::build_reply();
         let max_answer_size = Some(513 * 1024);

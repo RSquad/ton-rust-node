@@ -35,8 +35,7 @@ use std::{
     time::{Duration, Instant},
 };
 use ton_api::{
-    deserialize_boxed, deserialize_boxed_bundle_with_suffix, deserialize_boxed_with_suffix,
-    serialize_boxed, serialize_boxed_append,
+    deserialize_boxed, deserialize_boxed_with_suffix, serialize_boxed, serialize_boxed_append,
     ton::{
         adnl::id::short::Short as AdnlShortId,
         catchain::{
@@ -2208,6 +2207,28 @@ impl OverlayNode {
                     timeout_pending_peers += tick_ms;
                     timeout_ping += tick_ms;
                 }
+                // Reduce inbound cap for pending peers of Private overlays additionally
+                // to known peers.
+                if !matches!(overlay.overlay_type, OverlayType::Private { .. }) {
+                    return;
+                }
+                let Some(rldp) = &overlay.rldp else {
+                    return;
+                };
+                let mut remaining: Vec<Arc<KeyId>> = Vec::new();
+                while let Some(peer) = overlay.pending_peers.pop() {
+                    remaining.push(peer);
+                }
+                if remaining.is_empty() {
+                    return;
+                }
+                if let Err(e) = rldp.change_inbound_cap_for_peers(&remaining, -1) {
+                    log::warn!(
+                        target: TARGET,
+                        "Error reducing inbound cap for pending peers in overlay {}: {e}",
+                        overlay.overlay_id
+                    );
+                }
             });
         }
         Ok(added)
@@ -2250,6 +2271,9 @@ impl OverlayNode {
         let overlay_id = params.overlay_id;
         if self.add_overlay(overlay_type, params)? {
             self.add_peers_to_overlay(overlay_id, peers, "Cannot add the private overlay")?;
+            if let Some(rldp) = self.rldp.get() {
+                rldp.change_inbound_cap_for_peers(peers, 1)?;
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -2308,6 +2332,27 @@ impl OverlayNode {
                 }
             } else if overlay.overlay_type.is_private() {
                 fail!("Try to delete private overlay {} as public", overlay_id)
+            }
+            if let Some(rldp) = self.rldp.get() {
+                let roots: Vec<Arc<KeyId>> = match &overlay.overlay_type {
+                    OverlayType::CertifiedMembers { root_adnl_ids, .. } => {
+                        root_adnl_ids.iter().cloned().collect()
+                    }
+                    OverlayType::Private { .. } => {
+                        let mut roots = Vec::new();
+                        let known = overlay.known_peers.all();
+                        let (mut iter, mut peer) = known.first();
+                        while let Some(p) = peer {
+                            roots.push(p);
+                            peer = known.next(&mut iter);
+                        }
+                        roots
+                    }
+                    OverlayType::Public => Vec::new(),
+                };
+                if !roots.is_empty() {
+                    rldp.change_inbound_cap_for_peers(&roots, -1)?;
+                }
             }
             overlay.received_peers.stop();
             overlay.received_rawbytes.stop();
@@ -2479,22 +2524,31 @@ impl Subscriber for OverlayNode {
             None
         };
 
-        let (mut bundle, postfix_offset) = deserialize_boxed_bundle_with_suffix(suffix)?;
-        if bundle.len() > 2 {
-            return Ok(false);
+        let (first, mut postfix_offset) = deserialize_boxed_with_suffix(suffix)?;
+        let mut second: Option<TLObject> = None;
+        let mut have_postfix = false;
+        if postfix_offset < suffix.len() {
+            if let Ok((s, pos2)) = deserialize_boxed_with_suffix(&suffix[postfix_offset..]) {
+                second = Some(s);
+                postfix_offset += pos2;
+            }
+            if postfix_offset < suffix.len() {
+                if postfix_offset + 1 < suffix.len() {
+                    return Ok(false);
+                }
+                have_postfix = true;
+            }
         }
-        let have_postfix = postfix_offset < suffix.len();
 
         #[cfg(feature = "telemetry")]
-        overlay.update_stats(peers.other(), bundle[0].bare_object().constructor(), false)?;
-        if bundle.len() == 2 {
+        overlay.update_stats(peers.other(), first.bare_object().constructor(), false)?;
+        if let Some(second) = second {
             // Catchain/validator session messages in private overlay
-            let catchain_update = match bundle.remove(0).downcast::<CatchainBlockUpdateBoxed>() {
+            let catchain_update = match first.downcast::<CatchainBlockUpdateBoxed>() {
                 Ok(CatchainBlockUpdateBoxed::Catchain_BlockUpdate(upd)) => upd,
                 Err(msg) => fail!("Unsupported private overlay message {:?}", msg),
             };
-            let inner_update = match bundle.remove(0).downcast::<ValidatorSessionBlockUpdateBoxed>()
-            {
+            let inner_update = match second.downcast::<ValidatorSessionBlockUpdateBoxed>() {
                 Ok(ValidatorSessionBlockUpdateBoxed::ValidatorSession_BlockUpdate(upd)) => {
                     CatchainData::ValidatorSession(upd)
                 }
@@ -2513,7 +2567,6 @@ impl Subscriber for OverlayNode {
             receiver.push((catchain_update, inner_update, peers.other().clone()));
             Ok(true)
         } else {
-            let message = bundle.remove(0);
             let (data, hops) = if have_postfix {
                 (&data[..suffix_offset + postfix_offset + 1], Some(suffix[postfix_offset]))
             } else {
@@ -2526,7 +2579,7 @@ impl Subscriber for OverlayNode {
                 overlay: &overlay,
                 peers,
             };
-            let message = match message.downcast::<Broadcast>() {
+            let message = match first.downcast::<Broadcast>() {
                 Ok(Broadcast::Overlay_BroadcastFec(bcast)) => {
                     if let Err(e) = Self::check_fec_broadcast_message(&bcast) {
                         // Ignore invalid messages as early as possible

@@ -108,6 +108,7 @@ impl Job {
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct CellsDbConfig {
+    #[serde(deserialize_with = "CellsDbConfig::deserialize_states_db_queue_len")]
     pub states_db_queue_len: u32,
     #[serde(default, skip_serializing, rename = "prefill_cells_counters")]
     _prefill_cells_counters: Option<bool>,
@@ -125,6 +126,21 @@ impl CellsDbConfig {
     }
     fn default_counters_lru_cache_capacity() -> usize {
         5_000_000
+    }
+    fn deserialize_states_db_queue_len<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<u32, D::Error> {
+        let v = <u32 as serde::Deserialize>::deserialize(d)?;
+        if v < Self::min_states_db_queue_len() {
+            return Err(serde::de::Error::custom(format!(
+                "states_db_queue_len must be >= {}, got {v}",
+                Self::min_states_db_queue_len()
+            )));
+        }
+        Ok(v)
+    }
+    fn min_states_db_queue_len() -> u32 {
+        100
     }
 }
 
@@ -157,6 +173,8 @@ impl ShardStateDb {
     const MASK_GC: u8 = 0x01;
     const MASK_WORKER: u8 = 0x02;
     pub(crate) const MASK_STOPPED: u8 = 0x80;
+    const GC_QUEUE_POLL_INTERVAL_MS: u64 = 10_000;
+    const PUT_QUEUE_POLL_INTERVAL_MS: u64 = 100;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -242,13 +260,13 @@ impl ShardStateDb {
                 loop {
                     let in_queue = in_queue.load(Ordering::Relaxed);
                     metrics::gauge!("ton_node_db_shardstate_queue_size").set(in_queue as f64);
-                    if in_queue >= max_queue_len {
+                    if in_queue >= max_queue_len / 2 {
                         log::warn!(
                             target: TARGET,
-                            "ShardStateDb GC: waiting for queue (current queue length: {})",
+                            "ShardStateDb GC: queue is half full (length: {}), waiting...",
                             in_queue
                         );
-                        if !sleep_nicely(stop, 1000).await {
+                        if !sleep_nicely(stop, ShardStateDb::GC_QUEUE_POLL_INTERVAL_MS).await {
                             return false;
                         }
                     } else {
@@ -425,15 +443,19 @@ impl ShardStateDb {
             "ShardStateDb::put  id {}  root_cell_id {:x}",
             id, root_id
         );
+        let mut attempt = 0usize;
         loop {
             let in_queue = self.in_queue.load(Ordering::Relaxed);
             if in_queue >= self.config.states_db_queue_len {
-                log::warn!(
-                    target: TARGET,
-                    "ShardStateDb::put  id {}  root_cell_id {:x}  waiting for queue (current queue length: {})",
-                    id, root_id, in_queue
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if attempt % 10 == 0 {
+                    log::warn!(
+                        target: TARGET,
+                        "ShardStateDb::put id {id}  root_cell_id {root_id:x} \
+                        waiting for queue (current queue length: {in_queue})"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(Self::PUT_QUEUE_POLL_INTERVAL_MS)).await;
+                attempt += 1;
 
                 if self.stop.load(Ordering::Relaxed) & Self::MASK_STOPPED != 0 {
                     fail!("Stopped");

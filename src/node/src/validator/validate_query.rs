@@ -54,16 +54,16 @@ use std::{
 use ton_block::{base64_encode, write_boc, UsageTree};
 use ton_block::{
     fail, read_boc, Account, AccountBlock, AccountDispatchQueue, AccountId, AccountIdPrefixFull,
-    AccountStatus, AccountStorageDictProof, AddSub, Block, BlockCreateStats, BlockError,
-    BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, Coins, ConfigParamEnum,
-    ConfigParams, ConsensusExtraData, Counters, CreatorStats, CurrencyCollection, DepthBalanceInfo,
-    Deserializable, EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities, HashmapAugType,
-    HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries, McBlockExtra,
-    McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgEnvelope,
-    MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable, ShardAccount,
-    ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent, ShardStateUnsplit,
-    SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase, Transaction,
-    TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr,
+    AccountStatus, AccountStorageDictProof, AddSub, Augmentation, Block, BlockCreateStats,
+    BlockError, BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, Coins,
+    ConfigParamEnum, ConfigParams, ConsensusExtraData, Counters, CreatorStats, CurrencyCollection,
+    DepthBalanceInfo, Deserializable, EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities,
+    HashmapAugType, HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries,
+    McBlockExtra, McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt,
+    MsgEnvelope, MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable,
+    ShardAccount, ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent,
+    ShardStateUnsplit, SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase,
+    Transaction, TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr,
     INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 #[cfg(feature = "xp25")]
@@ -2775,12 +2775,22 @@ impl ValidateQuery {
                 )
             }
         }
-        if let Some((new_state, _new_extra)) = new_val_extra {
+        if let Some((new_state, new_extra)) = new_val_extra {
             if hash_upd.new_hash != *new_state.account_cell().repr_hash() {
                 reject_query!(
                     "(HASH_UPDATE Account) from the AccountBlock of {:x} \
                     has incorrect new hash",
                     acc_id
+                )
+            }
+            // check augmentation
+            let new_account = new_state
+                .read_account()
+                .map_err(|err| error!("cannot read Account of {acc_id:x} from new state: {err}"))?;
+            let extra = new_account.aug()?;
+            if extra != new_extra {
+                reject_query!(
+                    "invalid account {acc_id:x} augmentation {new_extra:?}, recomputed {extra:?}",
                 )
             }
         }
@@ -5196,11 +5206,11 @@ impl ValidateQuery {
         is_first: bool,
         is_last: bool,
     ) -> Result<bool> {
+        let trans_hash = trans_root.repr_hash();
         log::debug!(
             target: "validate_query",
-            "({}): checking {lt} transaction {:x} of account {account_addr:x}",
+            "({}): checking {lt} transaction {trans_hash:x} of account {account_addr:x}",
             base.next_block_descr,
-            trans_root.repr_hash(),
         );
         let trans = Transaction::construct_from_cell(trans_root.clone())?;
         let account_create = account.is_none();
@@ -5743,9 +5753,9 @@ impl ValidateQuery {
                 let new_hash = account_root.repr_hash().clone();
                 if state_update.new_hash != new_hash {
                     error = Some(error!(
-                        "transaction {} of {:x} is invalid: it claims that the new \
-                        account state hash is {:x} but the re-computed value is {:x}, account: {}",
-                        lt, account_addr, state_update.new_hash, new_hash, account
+                        "{:x} transaction {} of {:x} is invalid: it claims that the new \
+                        account state hash is {:x} but the re-computed value is {:x}, account: {:?}",
+                        trans_hash, lt, account_addr, state_update.new_hash, new_hash, account
                     ));
                     // #[cfg(test)]
                     // {
@@ -5759,9 +5769,9 @@ impl ValidateQuery {
                     // }
                 } else if trans.out_msgs != trans_execute.out_msgs {
                     error = Some(error!(
-                        "transaction {} of {:x} is invalid: it has produced a set of \
+                        "{:x} transaction {} of {:x} is invalid: it has produced a set of \
                         outbound messages different from that listed in the transaction",
-                        lt, account_addr
+                        trans_hash, lt, account_addr,
                     ));
                 } else {
                     if let Some(TrComputePhase::Vm(compute_ph)) = descr.compute_phase_ref() {
@@ -5783,7 +5793,9 @@ impl ValidateQuery {
                     trans_execute.write_state_update(&state_update)?;
                     let trans_execute_root = trans_execute.serialize()?;
                     if trans_root != trans_execute_root {
-                        error = Some(error!("re created transaction {} doesn't correspond", lt));
+                        error = Some(error!(
+                            "re created {trans_hash:x} transaction {lt} doesn't correspond"
+                        ));
                     }
                 }
                 #[cfg(test)]

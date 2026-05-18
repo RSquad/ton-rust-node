@@ -11,13 +11,13 @@
 use crate::engine_traits::EngineOperations;
 use std::sync::Arc;
 use ton_block::{
-    fail, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell, EmptyValue,
-    HashUpdate, HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries, Result,
-    Serializable, ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions, UInt256,
-    UsageTree,
+    fail, time_checker, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell,
+    EmptyValue, HashUpdate, HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries,
+    Result, Serializable, ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions,
+    UInt256, UsageTree,
 };
 
-const STAT_UPDATE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
+const STAT_UPDATE_THRESHOLD: u64 = 100;
 
 pub struct ShardAccountStuff {
     account: Account,
@@ -51,22 +51,11 @@ impl ShardAccountStuff {
             if let Some(dict) = engine.get_account_storage_dict(dict_hash) {
                 Some(dict)
             } else if full_collated_data {
-                let now = std::time::Instant::now();
+                let _tc = time_checker!(
+                    || format!("account {:x} calc_and_check_storage_stat_dict", account_id),
+                    STAT_UPDATE_THRESHOLD
+                );
                 let result = account.calc_and_check_storage_stat_dict(dict_hash_min_cells)?;
-                let elapsed = now.elapsed();
-                if elapsed > STAT_UPDATE_THRESHOLD {
-                    log::warn!(
-                        "TIME account {:x} calc_and_check_storage_stat_dict {:?}",
-                        account_id,
-                        elapsed
-                    );
-                } else {
-                    log::debug!(
-                        "TIME account {:x} calc_and_check_storage_stat_dict {:?}",
-                        account_id,
-                        elapsed
-                    );
-                }
                 result
             } else {
                 None
@@ -80,8 +69,8 @@ impl ShardAccountStuff {
                 let usage_tree = UsageTree::with_params(dict.clone(), true);
                 *dict = usage_tree.root_cell();
                 storage_dict_usage = Some(usage_tree);
-                account.import_storage_stat_dict(dict.clone())?;
             }
+            account.import_storage_stat_dict(dict.clone())?;
         }
         let orig_libs = account.libraries();
         Ok(Self {
@@ -158,14 +147,12 @@ impl ShardAccountStuff {
         // log::trace!("{} {}", self.collated_block_descr, debug_transaction(transaction.clone())?);
         self.account = account;
 
-        let now = std::time::Instant::now();
+        let tc = time_checker!(
+            || format!("account {:x} calc_storage_stat_dict", self.account_id),
+            STAT_UPDATE_THRESHOLD
+        );
         self.storage_dict = self.account.calc_storage_stat_dict(self.dict_hash_min_cells)?;
-        let elapsed = now.elapsed();
-        if elapsed > STAT_UPDATE_THRESHOLD {
-            log::warn!("TIME account {:x} calc_storage_stat_dict {:?}", self.account_id, elapsed);
-        } else {
-            log::debug!("TIME account {:x} calc_storage_stat_dict {:?}", self.account_id, elapsed);
-        }
+        drop(tc);
 
         self.account_updates.extend(AccountStorageStat::get_roots(self.account.state_init()));
         self.shard_acc.write_account(&self.account)?;
