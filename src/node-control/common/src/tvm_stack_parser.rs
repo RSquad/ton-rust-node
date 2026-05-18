@@ -81,7 +81,7 @@ impl TvmStackParser {
 
     /// Optional dictionary cell from TONCore `get_pool_data` (`nominators`, `withdraw_requests`).
     ///
-    /// Rust node JSON-RPC encodes an **empty** dict as integer `0`, an empty `tvm.list`, or `null`
+    /// Rust node JSON-RPC encodes an **empty** dict as an empty `tvm.list`, or `null`
     /// (`Unsupported`). A cell (or a non-empty list wrapping a cell) means a non-empty dict on chain.
     pub fn dict_cell_opt(&self, index: usize) -> anyhow::Result<Option<Cell>> {
         let entry = self.entry(index)?;
