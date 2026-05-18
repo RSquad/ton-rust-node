@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Internal
 
 - **`elections` crate merged into `service` as a module** — code moved under `service/src/elections/`; the standalone `node-control/elections` workspace member is removed. No behavior change for operators.
-- **CI: highload wallet for TONCore nominator setup** — speeds up multi-nominator load test bootstrap; single-host scenario node count lowered from 7 to 5.
+- **CI: highload wallet for Nominator Pool setup** — speeds up multi-nominator load test bootstrap; single-host "snp-toncore" scenario node count lowered from 7 to 5 (default scenario has 6 nodes as before).
 - **REST entity CRUD tests** — automated coverage for `POST|DELETE /v1/{nodes,wallets,pools,bindings}`: happy paths, validation/conflict cases, persistence to disk, role checks (nominator → 403, operator → allowed).
 
 ## [0.4.0] - 2026-04-21
