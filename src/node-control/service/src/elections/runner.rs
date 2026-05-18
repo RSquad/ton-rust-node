@@ -530,7 +530,13 @@ impl ElectionRunner {
         // transition. SNP pool addresses are stable but invalidating uniformly is cheap.
         // Also covers elections-task restart: `past_elections_cache_id` is 0 after start, so the
         // first tick lands here and re-resolves.
-        if self.past_elections_cache_id != election_id {}
+        if self.past_elections_cache_id != election_id {
+            for node in self.nodes.values_mut() {
+                if node.pool.is_some() {
+                    node.pool_addr_cache = None;
+                }
+            }
+        }
         // Resolve pool address for any node where it isn't cached yet. On election_id transition
         // the cache was just invalidated above; on other ticks this recovers from a transient
         // `pool.address()` failure (e.g. a `get_pool_data` parse error on TONCore).
@@ -586,11 +592,6 @@ impl ElectionRunner {
                     "prev_min_eff_stake from past elections: {} TON",
                     nanotons_to_tons_f64(prev)
                 );
-            }
-            for node in self.nodes.values_mut() {
-                if node.pool.is_some() {
-                    node.pool_addr_cache = None;
-                }
             }
             self.past_elections_cache_id = election_id;
         }
