@@ -14,10 +14,10 @@ use super::{
     NominatorRoles, NominatorWrapper, PoolData, PoolKind, TONCORE_STORAGE_RESERVE,
     ton_core_nominator::TonCoreNominatorWrapper,
 };
-use crate::{ContractProvider, SmartContract};
+use crate::{ContractProvider, SmartContract, TonWallet};
 use anyhow::Context;
 use std::sync::Arc;
-use ton_block::{MsgAddressInt, StateInit};
+use ton_block::{Cell, MsgAddressInt, StateInit};
 
 /// TONCore nominator binding: two pool contracts (even/odd validation rounds).
 ///
@@ -98,5 +98,25 @@ impl NominatorWrapper for TonCoreNominatorRouter {
 
     fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
         self.pools.iter().flatten().cloned().collect()
+    }
+
+    /// Reports the active slot's queue only — `send_process_withdraw_requests` would also route
+    /// to that slot, so checking the inactive slot here would create a false positive that
+    /// the runner could not act on.
+    async fn has_withdraw_requests(&self) -> anyhow::Result<bool> {
+        self.active_pool().await?.has_withdraw_requests().await
+    }
+
+    async fn send_process_withdraw_requests(
+        &self,
+        wallet: Arc<dyn TonWallet>,
+        query_id: u64,
+        limit: u8,
+        gas_value: u64,
+    ) -> anyhow::Result<Cell> {
+        self.active_pool()
+            .await?
+            .send_process_withdraw_requests(wallet, query_id, limit, gas_value)
+            .await
     }
 }

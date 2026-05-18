@@ -212,6 +212,14 @@ mock! {
         fn inner_pools(&self) -> Vec<std::sync::Arc<dyn NominatorWrapper>>;
         fn storage_reserve(&self) -> u64;
         fn pool_kind(&self) -> PoolKind;
+        async fn has_withdraw_requests(&self) -> anyhow::Result<bool>;
+        async fn send_process_withdraw_requests(
+            &self,
+            wallet: std::sync::Arc<dyn contracts::TonWallet>,
+            query_id: u64,
+            limit: u8,
+            gas_value: u64,
+        ) -> anyhow::Result<ton_block::Cell>;
     }
 }
 
@@ -597,21 +605,44 @@ fn setup_pool(pool: &mut MockSingleNominatorWrapper) {
     pool.expect_inner_pools().returning(|| vec![]);
     pool.expect_storage_reserve().returning(|| SNP_STORAGE_RESERVE);
     pool.expect_pool_kind().returning(|| PoolKind::SNP);
+    // Mirror the `NominatorWrapper::has_withdraw_requests` trait default for SNP — mockall
+    // shadows trait defaults, so the elections runner's per-tick probe needs an explicit `Ok(false)`.
+    pool.expect_has_withdraw_requests().returning(|| Ok(false));
 }
 
 fn pool_data_with_state(state: i32) -> PoolData {
     PoolData { state, ..Default::default() }
 }
 
-fn setup_toncore_nominator_slot(
+/// Shared TONCore single-slot mock wiring for router tests.
+///
+/// When `default_has_withdraw_requests` is `Some(v)`, sets `expect_has_withdraw_requests` to return `Ok(v)`.
+/// Pass `None` if the test sets `expect_has_withdraw_requests` /
+/// `expect_send_process_withdraw_requests` itself (process-withdraws branch tests).
+fn setup_toncore_nominator_slot_with(
     pool: &mut MockSingleNominatorWrapper,
     addr: MsgAddressInt,
     state: i32,
+    default_has_withdraw_requests: Option<bool>,
 ) {
     pool.expect_address().returning(move || Ok(addr.clone()));
     pool.expect_get_pool_data().returning(move || Ok(pool_data_with_state(state)));
     pool.expect_storage_reserve().returning(|| TONCORE_STORAGE_RESERVE);
     pool.expect_pool_kind().returning(|| PoolKind::TONCore);
+    if let Some(has) = default_has_withdraw_requests {
+        pool.expect_has_withdraw_requests().returning(move || Ok(has));
+    }
+}
+
+/// [`setup_toncore_nominator_slot_with`] with `has_withdraw_requests` probe defaulting to `Ok(false)` — keeps
+/// existing TONCore tests unaffected. Use `_with(..., None)` when the test wires
+/// `expect_has_withdraw_requests` / `expect_send_process_withdraw_requests` itself.
+fn setup_toncore_nominator_slot(
+    pool: &mut MockSingleNominatorWrapper,
+    addr: MsgAddressInt,
+    state: i32,
+) {
+    setup_toncore_nominator_slot_with(pool, addr, state, Some(false));
 }
 
 // =====================================================
@@ -2941,6 +2972,143 @@ async fn test_toncore_nominator_elections_finished_checks_active_pool_only() {
     // Router now resolves a single active pool address; participant from non-active slot is not matched.
     assert!(!node.stake_accepted);
     assert_eq!(node.accepted_stake_amount, None);
+}
+
+// =====================================================
+// TONCore: process_withdraw_requests (op = 2) before stake
+// =====================================================
+
+/// Happy path: pending withdraws → opcode-2 sent, `withdraw_requests_pending` true, stake skipped this tick.
+///
+/// Verifies the core invariant from the design: `process_withdraw_requests` precedes a new
+/// stake submission, and the runner waits one tick for the pool to drain before staking.
+#[tokio::test]
+async fn test_toncore_pending_withdraws_sends_opcode_and_skips_stake_this_tick() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot_with(p0, pool_address(), 0, None);
+    p0.expect_has_withdraw_requests().returning(|| Ok(true));
+    p0.expect_send_process_withdraw_requests().returning(|_w, _q, _l, _g| Ok(dummy_cell()));
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(
+        node.withdraw_requests_pending,
+        "snapshot probe must still reflect a non-empty withdraw request queue"
+    );
+    assert!(
+        node.stake_submissions.is_empty(),
+        "stake must NOT be submitted in the same tick as opcode-2"
+    );
+    assert!(
+        node.participant.is_none(),
+        "participate() should be skipped this tick (continue after opcode-2)"
+    );
+}
+
+/// When `has_withdraw_requests` is false, the runner does not send opcode-2 and submits stake this tick.
+#[tokio::test]
+async fn test_toncore_empty_withdraw_queue_proceeds_to_stake() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot_with(p0, pool_address(), 0, None);
+    p0.expect_has_withdraw_requests().returning(|| Ok(false));
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let expected_stake = POOL_BALANCE - TONCORE_STORAGE_RESERVE - EXTRA_STORAGE_FEES;
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(!node.withdraw_requests_pending);
+    assert!(node.participant.is_some());
+    assert_eq!(
+        node.participant.as_ref().unwrap().stake,
+        expected_stake,
+        "stake should be submitted when the pool reports no pending withdraw requests"
+    );
+}
+
+/// `send_process_withdraw_requests` failure logs an error and still runs `participate`. The tick's
+/// `withdraw_requests_pending` reflects the successful probe (queue was non-empty) even if build/send failed.
+#[tokio::test]
+async fn test_toncore_pending_withdraws_send_failure_probes_pending_and_proceeds() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+    setup_toncore_nominator_slot_with(p0, pool_address(), 0, None);
+    p0.expect_has_withdraw_requests().returning(|| Ok(true));
+    p0.expect_send_process_withdraw_requests()
+        .returning(|_w, _q, _l, _g| Err(anyhow::anyhow!("simulated build failure")));
+    setup_toncore_nominator_slot(p1, pool_address_1(), 2);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() must succeed; opcode-2 errors are non-fatal");
+
+    let node = runner.nodes.get(node_id).unwrap();
+    assert!(
+        node.withdraw_requests_pending,
+        "probe reported a pending queue before opcode-2 build failed"
+    );
+    assert_eq!(
+        node.stake_submissions.len(),
+        1,
+        "stake should still be submitted: opcode-2 failure must not block participation"
+    );
+    assert!(node.last_error.is_some(), "withdraw send failure should be surfaced via last_error");
 }
 
 // =====================================================

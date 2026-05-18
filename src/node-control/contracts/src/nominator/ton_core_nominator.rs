@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    ContractProvider, SmartContract,
+    ContractProvider, SmartContract, TonWallet,
     nominator::{
         NominatorRoles, NominatorWrapper, PoolConfig, PoolData, PoolKind, TONCORE_STORAGE_RESERVE,
     },
@@ -264,6 +264,10 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
         let max_nominators_count = stack.i64(6).context("parse max_nominators_count")? as u16;
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
         let min_nominator_stake = stack.i64(8).context("parse min_nominator_stake")? as u64;
+        // Index 9 is `nominators:dict` (not currently used). Index 10 is `withdraw_requests:dict`
+        // from `pool.fc` persistent storage; `Some(_)` means at least one nominator has a
+        // pending withdraw request (see `has_withdraw_requests`).
+        let withdraw_requests = stack.cell_opt(10).context("parse withdraw_requests")?;
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {
             let bytes = stack.number_bytes(12, 32).context("parse saved_validator_set_hash")?;
@@ -294,7 +298,29 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
             validator_set_changes_count,
             validator_set_change_time,
             stake_held_for,
+            withdraw_requests,
         })
+    }
+
+    async fn has_withdraw_requests(&self) -> anyhow::Result<bool> {
+        // nominator-pool `pool.fc`: `int has_withdraw_requests() method_id` — one stack int, no full
+        // `get_pool_data` parse (cheaper for per-tick × N nodes probes in the elections runner).
+        let stack = self
+            .provider
+            .get_method(self.pool_addr.to_string(), "has_withdraw_requests", vec![])
+            .await?;
+        stack.bool(0).context("parse has_withdraw_requests")
+    }
+
+    async fn send_process_withdraw_requests(
+        &self,
+        wallet: Arc<dyn TonWallet>,
+        query_id: u64,
+        limit: u8,
+        gas_value: u64,
+    ) -> anyhow::Result<Cell> {
+        let payload = crate::nominator::ton_core_pool::process_withdraw_requests(query_id, limit)?;
+        wallet.message(self.pool_addr.clone(), gas_value, payload).await
     }
 }
 
