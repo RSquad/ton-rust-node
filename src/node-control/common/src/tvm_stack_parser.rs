@@ -66,24 +66,13 @@ impl TvmStackParser {
         Ok(cell)
     }
 
-    pub fn cell_opt(&self, index: usize) -> anyhow::Result<Option<Cell>> {
-        let entry = self.entry(index)?;
-        if let StackEntry::Tvm_StackEntryUnsupported = entry {
-            return Ok(None);
-        }
-        let boc = entry
-            .cell()
-            .ok_or_else(|| anyhow::anyhow!("stack entry is not a cell: index={}", index))?;
-        let cell = read_single_root_boc(&boc.bytes)
-            .map_err(|e| anyhow::anyhow!("invalid boc: index={}: {}", index, e))?;
-        Ok(Some(cell))
-    }
-
-    /// Optional dictionary cell from TONCore `get_pool_data` (`nominators`, `withdraw_requests`).
+    /// Optional cell entry.
     ///
-    /// Rust node JSON-RPC encodes an **empty** dict as an empty `tvm.list`, or `null`
-    /// (`Unsupported`). A cell (or a non-empty list wrapping a cell) means a non-empty dict on chain.
-    pub fn dict_cell_opt(&self, index: usize) -> anyhow::Result<Option<Cell>> {
+    /// Handles all empty-cell shapes the rust node's JSON-RPC may produce for TVM stack
+    /// entries — including TONCore `get_pool_data` dicts (`nominators`, `withdraw_requests`):
+    /// `null` (`Unsupported`) and an empty `tvm.list { elements: [] }` both decode to `None`.
+    /// A non-empty dict arrives as a cell, optionally wrapped in a single-element list.
+    pub fn cell_opt(&self, index: usize) -> anyhow::Result<Option<Cell>> {
         let entry = self.entry(index)?;
         if let StackEntry::Tvm_StackEntryUnsupported = entry {
             return Ok(None);
@@ -94,12 +83,12 @@ impl TvmStackParser {
                 return Ok(None);
             }
             return Self::new(elements.to_vec())
-                .dict_cell_opt(0)
-                .with_context(|| format!("parse dict cell inside list at index={index}"));
+                .cell_opt(0)
+                .with_context(|| format!("parse cell inside list at index={index}"));
         }
-        let boc = entry.cell().ok_or_else(|| {
-            anyhow::anyhow!("stack entry is not an optional dict cell: index={}", index)
-        })?;
+        let boc = entry
+            .cell()
+            .ok_or_else(|| anyhow::anyhow!("stack entry is not a cell: index={}", index))?;
         let cell = read_single_root_boc(&boc.bytes)
             .map_err(|e| anyhow::anyhow!("invalid boc: index={}: {}", index, e))?;
         Ok(Some(cell))
@@ -662,33 +651,51 @@ mod tests {
     }
 
     #[test]
-    fn test_dict_cell_opt_empty_as_number() {
-        let stack = vec![create_number_entry("0")];
-        let parser = TvmStackParser::new(stack);
-        assert!(parser.dict_cell_opt(0).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_dict_cell_opt_empty_as_list() {
-        let stack = vec![create_list_entry(vec![])];
-        let parser = TvmStackParser::new(stack);
-        assert!(parser.dict_cell_opt(0).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_dict_cell_opt_unsupported() {
+    fn test_cell_opt_unsupported_is_none() {
         let stack = vec![create_unsupported_entry()];
         let parser = TvmStackParser::new(stack);
-        assert!(parser.dict_cell_opt(0).unwrap().is_none());
+        assert!(parser.cell_opt(0).unwrap().is_none());
     }
 
     #[test]
-    fn test_dict_cell_opt_non_empty_cell() {
+    fn test_cell_opt_empty_list_is_none() {
+        let stack = vec![create_list_entry(vec![])];
+        let parser = TvmStackParser::new(stack);
+        assert!(parser.cell_opt(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cell_opt_cell_directly() {
         let cell = Cell::default();
         let stack = vec![create_cell_entry(&cell)];
         let parser = TvmStackParser::new(stack);
-        let parsed = parser.dict_cell_opt(0).unwrap().expect("expected cell");
+        let parsed = parser.cell_opt(0).unwrap().expect("expected cell");
         assert_eq!(parsed.repr_hash(), cell.repr_hash());
+    }
+
+    #[test]
+    fn test_cell_opt_list_wrapping_cell() {
+        let cell = Cell::default();
+        let stack = vec![create_list_entry(vec![create_cell_entry(&cell)])];
+        let parser = TvmStackParser::new(stack);
+        let parsed = parser.cell_opt(0).unwrap().expect("expected cell");
+        assert_eq!(parsed.repr_hash(), cell.repr_hash());
+    }
+
+    #[test]
+    fn test_cell_opt_rejects_number() {
+        let stack = vec![create_number_entry("0")];
+        let parser = TvmStackParser::new(stack);
+        let err = parser.cell_opt(0).unwrap_err().to_string();
+        assert!(err.contains("stack entry is not a cell"));
+    }
+
+    #[test]
+    fn test_cell_opt_rejects_tuple() {
+        let stack = vec![create_tuple_entry(vec![])];
+        let parser = TvmStackParser::new(stack);
+        let err = parser.cell_opt(0).unwrap_err().to_string();
+        assert!(err.contains("stack entry is not a cell"));
     }
 
     #[test]
