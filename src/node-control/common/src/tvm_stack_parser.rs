@@ -88,9 +88,6 @@ impl TvmStackParser {
         if let StackEntry::Tvm_StackEntryUnsupported = entry {
             return Ok(None);
         }
-        if entry.number().is_some() {
-            return Ok(None);
-        }
         if let Some(list) = entry.list() {
             let elements = list.elements();
             if elements.is_empty() {
