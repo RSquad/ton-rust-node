@@ -232,6 +232,9 @@ impl BuilderData {
                         self.references.len()
                     );
                 }
+                if self.data.len() < 33 {
+                    fail!("Merkle proof cell data too short");
+                }
                 let hash = self.references()[0].hash(0);
                 if hash.as_slice() != &self.data[1..33] {
                     fail!("Merkle proof cell reference hash does not match the hash in the data {:x} != {}",
@@ -245,6 +248,9 @@ impl BuilderData {
                         "Merkle update cell must have exactly two references, but got {}",
                         self.references.len()
                     );
+                }
+                if self.data.len() < 65 {
+                    fail!("Merkle update cell data too short");
                 }
                 let hash = self.references()[0].hash(0);
                 if hash.as_slice() != &self.data[1..33] {

@@ -253,8 +253,8 @@ struct CollatorData {
     shard_top_block_descriptors: Vec<Arc<TopBlockDescrStuff>>,
     block_create_count: HashMap<UInt256, u64>,
     new_messages: BinaryHeap<NewMessage>, // using for priority queue
-    accepted_ext_messages: Vec<(UInt256, i32)>, // message id and wokchain id
-    rejected_ext_messages: Vec<(UInt256, String)>, // message id and reject reason
+    accepted_ext_messages: Vec<UInt256>,
+    rejected_ext_messages: Vec<UInt256>,
     usage_tree: UsageTree,
     external_messages: Vec<(Arc<Message>, UInt256)>, // for bundle in case of error
     imported_visited: HashSet<UInt256>,
@@ -762,7 +762,13 @@ impl CollatorData {
     }
 
     fn reject_ext_message(&mut self, msg_id: UInt256, reason: impl ToString) {
-        self.rejected_ext_messages.push((msg_id, reason.to_string()));
+        log::trace!(
+            target: EXT_MESSAGES_TRACE_TARGET,
+            "rejecting external message {:x}: {}",
+            msg_id,
+            reason.to_string()
+        );
+        self.rejected_ext_messages.push(msg_id);
     }
 }
 
@@ -1083,7 +1089,7 @@ impl ExecutionManager {
                     "{}: account {} rejected inbound external message {:x}, by reason: {}",
                     self.collated_block_descr, address, msg_id, err
                 );
-                collator_data.rejected_ext_messages.push((msg_id.clone(), err.to_string()));
+                collator_data.rejected_ext_messages.push(msg_id.clone());
                 return Ok(());
             } else {
                 log::debug!(
@@ -1091,9 +1097,7 @@ impl ExecutionManager {
                     "{}: account {} accepted inbound external message {:x}",
                     self.collated_block_descr, address, msg_id,
                 );
-                collator_data
-                    .accepted_ext_messages
-                    .push((msg_id.clone(), msg.dst_workchain_id().unwrap_or_default()));
+                collator_data.accepted_ext_messages.push(msg_id.clone());
                 collator_data.external_messages.push((msg.clone(), msg_id.clone()));
             }
         }
@@ -3965,9 +3969,29 @@ impl Collator {
             self.check_stop_flag()?;
         }
         self.wait_transactions(exec_manager, collator_data, Some(internal_msg_count)).await?;
-        let accepted = mem::take(&mut collator_data.accepted_ext_messages);
-        let rejected = mem::take(&mut collator_data.rejected_ext_messages);
-        self.engine.complete_external_messages(rejected, accepted)?;
+        // Accepted: postpone so the next collation pass within the pipeline
+        // window skips them; the authoritative cleanup happens once the block
+        // is applied (process_applied_block). If apply never lands, postpone
+        // generations exhaust and the messages are dropped, allowing rebroadcast.
+        //
+        // Note: this diverges from the C++ collator, which leaves accepted
+        // messages fully active in the pool until apply (see C++
+        // Collator::create_block_candidate sending only delay/bad to
+        // complete_external_messages). C++ relies on the wallet seqno cache
+        // (ExtMessagePool::wallets_) to short-circuit retries of the same
+        // logical wallet message between collate and apply. We don't have that
+        // cache, so a naive C++-mirror would re-execute every accepted message
+        // in subsequent collation attempts within the pipeline window. Routing
+        // accepted via to_delay instead gives that dedup cheaply through the
+        // existing postpone/generations machinery while preserving liveness:
+        // forced erase only happens after MESSAGE_MAX_GENERATIONS cycles, by
+        // which point apply should have either landed (and cleaned up via
+        // norm-hash) or visibly failed.
+        let to_delay = mem::take(&mut collator_data.accepted_ext_messages);
+        // Rejected: erase by raw id. Norm-hash siblings are kept so sibling
+        // variants with valid signatures can still be tried.
+        let to_delete = mem::take(&mut collator_data.rejected_ext_messages);
+        self.engine.complete_external_messages(&to_delay, &to_delete)?;
         Ok(())
     }
 

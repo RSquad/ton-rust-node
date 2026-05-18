@@ -1670,8 +1670,8 @@ impl EngineOperations for CollatorTestBundle {
 
     fn complete_external_messages(
         &self,
-        _to_delay: Vec<(UInt256, String)>,
-        _to_delete: Vec<(UInt256, i32)>,
+        _to_delay: &[UInt256],
+        _to_delete: &[UInt256],
     ) -> Result<()> {
         Ok(())
     }

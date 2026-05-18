@@ -220,8 +220,8 @@ impl EngineOperations for MockEngine {
     }
     fn complete_external_messages(
         &self,
-        to_delay: Vec<(UInt256, String)>,
-        to_delete: Vec<(UInt256, i32)>,
+        to_delay: &[UInt256],
+        to_delete: &[UInt256],
     ) -> Result<()> {
         self.ext_messages.complete_messages(to_delay, to_delete, self.now())
     }
