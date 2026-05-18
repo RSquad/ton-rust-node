@@ -15,7 +15,7 @@ use crate::{
 use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
 use std::{collections::HashMap, sync::Arc};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[allow(dead_code)]
 pub enum KeyMode {
@@ -229,7 +229,7 @@ impl Client {
             format!("https://{}", addr)
         };
 
-        let client = reqwest::Client::new();
+        let client = build_http_client()?;
         let vault_addr = format!("{addr}/v1");
         let token_provider = create_token_provider(auth, client.clone(), &vault_addr);
 
@@ -827,4 +827,46 @@ impl Client {
     pub fn escape(s: &str) -> String {
         s.replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
     }
+}
+
+/// Build an HTTP client with optional mTLS support.
+/// Reads VAULT_CACERT, VAULT_CLIENT_CERT, VAULT_CLIENT_KEY from environment.
+/// If not set, returns a default client.
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().use_rustls_tls();
+
+    if let Ok(ca_path) = std::env::var("VAULT_CACERT") {
+        let ca_pem = std::fs::read(&ca_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read VAULT_CACERT ({ca_path}): {e}"))?;
+        let cert = reqwest::Certificate::from_pem(&ca_pem)?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    match (std::env::var("VAULT_CLIENT_CERT").ok(), std::env::var("VAULT_CLIENT_KEY").ok()) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(&cert_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read VAULT_CLIENT_CERT ({cert_path}): {e}")
+            })?;
+            let key_pem = Zeroizing::new(std::fs::read(&key_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read VAULT_CLIENT_KEY ({key_path}): {e}")
+            })?);
+            let mut identity_pem_buf = cert_pem;
+            if !identity_pem_buf.ends_with(b"\n") {
+                identity_pem_buf.push(b'\n');
+            }
+            identity_pem_buf.extend_from_slice(&key_pem);
+            let identity_pem = Zeroizing::new(identity_pem_buf);
+            let identity = reqwest::Identity::from_pem(&identity_pem)?;
+            builder = builder.identity(identity);
+        }
+        (None, None) => {}
+        (Some(_), None) => anyhow::bail!(
+            "VAULT_CLIENT_CERT is set but VAULT_CLIENT_KEY is not; both must be set or both unset"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "VAULT_CLIENT_KEY is set but VAULT_CLIENT_CERT is not; both must be set or both unset"
+        ),
+    }
+
+    Ok(builder.build()?)
 }
