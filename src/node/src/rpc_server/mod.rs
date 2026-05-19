@@ -19,6 +19,10 @@ mod serializers;
 mod token;
 mod wallets;
 
+/// Maximum size of an incoming JSON-RPC / REST request body, in bytes.
+/// This bounds the size of any BOC accepted via the public API.
+const MAX_BODY_SIZE: u64 = 16 << 20;
+
 pub struct RpcServer {
     shutdown: tokio::sync::oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
@@ -157,6 +161,7 @@ impl RpcRegistryBuilder {
         } else {
             warp::path(name)
                 .and(warp::post())
+                .and(warp::body::content_length_limit(MAX_BODY_SIZE))
                 .and(warp::body::json())
                 .and(warp::any().map(move || ctx.clone()))
                 .and_then(handler)
@@ -242,6 +247,11 @@ async fn handle_rejection(
         (warp::http::StatusCode::UNPROCESSABLE_ENTITY, "Invalid query string".to_string())
     } else if let Some(_) = err.find::<warp::reject::MethodNotAllowed>() {
         (warp::http::StatusCode::METHOD_NOT_ALLOWED, "HTTP method not allowed".to_string())
+    } else if let Some(_) = err.find::<warp::reject::PayloadTooLarge>() {
+        (
+            warp::http::StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Request body exceeds {MAX_BODY_SIZE}-byte limit"),
+        )
     } else if let Some(e) = err.find::<warp::filters::body::BodyDeserializeError>() {
         let message = match e.source() {
             Some(cause) => format!("Invalid JSON body: {cause}"),
@@ -273,6 +283,7 @@ fn build_routes(ctx: Ctx) -> RestFilter {
 
     let jsonrpc_route = warp::path("jsonRPC".to_string())
         .and(warp::post())
+        .and(warp::body::content_length_limit(MAX_BODY_SIZE))
         .and(warp::body::json())
         .and(warp::any().map(move || registry.clone()))
         .and_then(jsonrpc_handler)

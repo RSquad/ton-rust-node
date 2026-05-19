@@ -108,22 +108,26 @@ fn test_message_keeper() {
     assert!(mk.check_active(10000));
 
     assert!(mk.can_postpone());
+    // gen=0: postpone delays by (0+1)*5 = 5s -> reactivate_at=205
     mk.postpone(200);
-    mk.postpone(300);
-    mk.postpone(400);
+    mk.postpone(300); // no-op while inactive
+    mk.postpone(400); // no-op while inactive
 
-    assert!(mk.check_active(201));
+    assert!(!mk.check_active(204));
     assert!(mk.check_active(205));
+    assert!(mk.check_active(206));
 
     assert!(mk.can_postpone());
+    // gen=1: delay by 10s -> reactivate_at=316
     mk.postpone(306);
 
     assert!(!mk.check_active(307));
-    assert!(!mk.check_active(310));
-    assert!(mk.check_active(311));
-    assert!(mk.check_active(312));
+    assert!(!mk.check_active(315));
+    assert!(mk.check_active(316));
+    assert!(mk.check_active(317));
 
     assert!(mk.can_postpone());
+    // gen=2: delay by 15s -> reactivate_at=335
     mk.postpone(320);
     assert!(mk.check_active(335));
 
@@ -143,6 +147,7 @@ fn test_message_keeper_multithread() {
             std::thread::sleep(std::time::Duration::from_millis(200));
 
             assert!(mk.can_postpone());
+            // gen=0: reactivate at 10001+5 = 10006
             mk.postpone(10001);
             std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -150,18 +155,20 @@ fn test_message_keeper_multithread() {
             std::thread::sleep(std::time::Duration::from_millis(200));
 
             assert!(mk.can_postpone());
+            // gen=1: reactivate at 10007+10 = 10017
             mk.postpone(10007);
             assert!(!mk.check_active(10009));
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            assert!(mk.check_active(10012));
+            assert!(mk.check_active(10017));
             std::thread::sleep(std::time::Duration::from_millis(200));
 
             assert!(mk.can_postpone());
-            mk.postpone(10013);
+            // gen=2: reactivate at 10018+15 = 10033
+            mk.postpone(10018);
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            assert!(mk.check_active(10023));
+            assert!(mk.check_active(10033));
             assert!(!mk.can_postpone());
         });
         hs.push(h);
@@ -217,9 +224,8 @@ fn test_messages_pool() {
     assert_eq!(m1.len(), 1);
     assert_eq!(m1[0].0, m);
 
-    // postpone message with prefix 0x22 for first time and delete second message with prefix 0x01
-    //mp.complete_messages(vec!((id3.clone(), String::new())), vec!((id2.clone(), 0)), 1).unwrap();
-    mp.complete_messages(vec![(id3.clone(), String::new())], vec![], 1).unwrap();
+    // postpone message with prefix 0x22 for first time (gen=0 -> reactivate at 6)
+    mp.complete_messages(&[id3.clone()], &[], 1).unwrap();
 
     // get messages for shard 0x1000_0000_0000_0000 - total 2 messages with prefix 0x01
     let m1 = mp
@@ -229,39 +235,39 @@ fn test_messages_pool() {
     assert_eq!(m1[0].1, id1);
     assert_eq!(m1[1].1, id2);
 
-    // get messages for shard 0x3000_0000_0000_0000 - total 1 message with prefix 0x22
+    // at t=6 the postponed message has just reactivated (gen->1)
     let m1 = mp
-        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 4)
+        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 6)
         .unwrap();
     assert_eq!(m1.len(), 1);
     assert_eq!(m1[0].0, m);
 
-    // postpone message with prefix 0x22 for second time
-    mp.complete_messages(vec![(id3.clone(), String::new())], vec![], 5).unwrap();
+    // postpone for second time (gen=1 -> reactivate at 16)
+    mp.complete_messages(&[id3.clone()], &[], 6).unwrap();
 
-    // get messages for shard 0x3000_0000_0000_0000 - no messages
+    // at t=15 still inactive
     let m1 = mp
-        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 6)
+        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 15)
         .unwrap();
     assert_eq!(m1.len(), 0);
 
-    // get messages for shard 0x3000_0000_0000_0000 - total 1 message with prefix 0x22
+    // at t=16 reactivates (gen->2)
     let m1 = mp
-        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 11)
+        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 16)
         .unwrap();
     assert_eq!(m1.len(), 1);
 
-    // postpone message with prefix 0x22 for third time
-    mp.complete_messages(vec![(id3.clone(), String::new())], vec![], 12).unwrap();
+    // postpone for third time (gen=2 -> reactivate at 31)
+    mp.complete_messages(&[id3.clone()], &[], 16).unwrap();
 
-    // get messages for shard 0x3000_0000_0000_0000 - total 1 message with prefix 0x22
+    // at t=31 reactivates (gen->3)
     let m1 = mp
-        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 30)
+        .get_messages(&ShardIdent::with_tagged_prefix(0, 0x3000_0000_0000_0000).unwrap(), 31)
         .unwrap();
     assert_eq!(m1.len(), 1);
 
-    // try to postpone message with prefix 0x22 for fourth time - it will be deleted
-    mp.complete_messages(vec![(id3.clone(), String::new())], vec![], 42).unwrap();
+    // fourth postpone: gen==3, can_postpone returns false -> erased
+    mp.complete_messages(&[id3.clone()], &[], 32).unwrap();
 
     // get messages for shard 0x3000_0000_0000_0000 - no messages
     let m1 = mp
