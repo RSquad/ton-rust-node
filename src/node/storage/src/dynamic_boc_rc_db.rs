@@ -231,6 +231,13 @@ impl DynamicBocDb {
         }
         let tr_commit_time = now3.elapsed().as_micros();
 
+        // Counter cache is flushed only after the DB commit succeeds.
+        // Eager updates during traversal would diverge from the DB on any
+        // failure before this point and would compound across retries.
+        for (id, vc) in visited.iter() {
+            self.set_cached_counter(id, vc.parents_count());
+        }
+
         let now4 = Instant::now();
         self.cell_db.cleanup_storing_cells(visited.keys());
         let storing_cells_cleanup_time = now4.elapsed().as_micros();
@@ -268,10 +275,14 @@ impl DynamicBocDb {
     }
 
     // Is not thread-safe!
+    /// `extra_ops` is appended to the same batch and committed atomically
+    /// with BOC operations — prevents double-decrement on retry between
+    /// separate commits (e.g. BOC delete vs shardstate entry delete).
     pub fn delete_boc(
         self: &Arc<Self>,
         root_cell_id: &UInt256,
         check_stop: &(dyn Fn() -> Result<()> + Sync),
+        extra_ops: impl FnOnce(&mut rocksdb::WriteBatch) -> Result<()>,
     ) -> Result<()> {
         log::debug!(target: TARGET, "DynamicBocDb::delete_boc  {:x}", root_cell_id);
 
@@ -310,12 +321,26 @@ impl DynamicBocDb {
         #[cfg(feature = "telemetry")]
         let tr_build_time = now2.elapsed().as_micros();
 
+        // append caller-provided ops to the same batch for atomic commit
+        extra_ops(&mut transaction)?;
+
         #[cfg(feature = "telemetry")]
         let now3 = Instant::now();
         self.cell_db.db().write(transaction)?;
 
         #[cfg(feature = "telemetry")]
         let tr_commit_time = now3.elapsed().as_micros();
+
+        // Counter cache is flushed only after the DB commit succeeds.
+        // See the same comment in `save_boc`.
+        for (id, vc) in visited.iter() {
+            let counter = vc.parents_count();
+            if counter == 0 {
+                self.remove_cached_counter(id);
+            } else {
+                self.set_cached_counter(id, counter);
+            }
+        }
         #[cfg(feature = "telemetry")]
         let total_time = now.elapsed().as_micros() as u64;
 
@@ -433,7 +458,7 @@ impl DynamicBocDb {
         let cell_id = cell.repr_hash();
         let mut skip_counter_check = false;
 
-        if self.cell_db().is_stored_cell(cell) {
+        if cell.is_lazy() || self.cell_db().is_stored_cell(cell) {
             // This cell is possibly in DB, trying to load counter
             if let Some(counter) = try_load_counter(cell_id)? {
                 return Ok((false, Some(counter)));
@@ -478,10 +503,12 @@ impl DynamicBocDb {
 
                 if let Some(counter) = ref_verdicts[i].1 {
                     // If we already know counter - just update, do not query DB second time.
+                    // Counter cache is NOT updated here: it would diverge from the DB
+                    // on any failure before the WriteBatch commits. The cache is
+                    // refreshed from `visited` in `save_boc` after `db.write`.
                     match visited.entry(ref_hash.clone()) {
                         std::collections::hash_map::Entry::Occupied(mut entry) => {
                             let new_counter = entry.get_mut().inc_parents_count()?;
-                            self.set_cached_counter(&ref_hash, new_counter);
                             log::trace!(
                                 target: TARGET,
                                 "DynamicBocDb::save_cells_recursive  {:x}  update visited {}  root_cell_id {:x}",
@@ -490,7 +517,6 @@ impl DynamicBocDb {
                         }
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             entry.insert(VisitedCell::with_counter(counter + 1));
-                            self.set_cached_counter(&ref_hash, counter + 1);
                             log::trace!(
                                 target: TARGET,
                                 "DynamicBocDb::save_cells_recursive  {:x}  update counter {}  root_cell_id {:x}",
@@ -512,10 +538,10 @@ impl DynamicBocDb {
             }
         }
 
-        // Add this cell as new
+        // Add this cell as new. Counter cache is deferred to the post-commit
+        // flush in `save_boc`.
         let c = VisitedCell::with_new_cell(cell.clone());
         visited.insert(cell_id.clone(), c);
-        self.set_cached_counter(cell_id, 1);
         log::trace!(
             target: TARGET,
             "DynamicBocDb::save_cells_recursive  {:x}  new cell  root_cell_id {:x}",
@@ -544,10 +570,10 @@ impl DynamicBocDb {
             "DynamicBocDb::save_cells_recursive",
         )?;
         if counter.is_none() {
-            // New cell.
+            // New cell. Counter cache is deferred to the post-commit flush
+            // in the caller (see `AsyncCellsStorageAdapter::new` commit).
             let c = VisitedCell::with_new_cell(cell.clone());
             visited.insert(cell_id.clone(), c);
-            self.set_cached_counter(&cell_id, 1);
             log::trace!(
                 target: TARGET,
                 "DynamicBocDb::save_one_cell  {:x}  new cell  root_cell_id {:x}",
@@ -594,7 +620,8 @@ impl DynamicBocDb {
                 "DynamicBocDb::delete_cells_recursive",
             )? {
                 if counter == 0 {
-                    self.remove_cached_counter(&cell_id);
+                    // Counter cache eviction is deferred to the post-commit
+                    // flush in `delete_boc`.
 
                     let cell = if let Some(c) = cell {
                         c
@@ -632,10 +659,11 @@ impl DynamicBocDb {
         update_cell: impl Fn(&mut VisitedCell) -> Result<u32>,
         op_name: &str,
     ) -> Result<(Option<u32>, Option<Cell>)> {
+        // Counter cache mutations are deferred: callers flush from `visited`
+        // after the DB WriteBatch commits.
         if let Some(visited_cell) = visited.get_mut(cell_id) {
             // Cell was already updated while this operation, just update counter
             let new_counter = update_cell(visited_cell)?;
-            self.set_cached_counter(cell_id, new_counter);
             log::trace!(
                 target: TARGET,
                 "{}  {:x}  update visited {}  root_cell_id {:x}",
@@ -645,13 +673,9 @@ impl DynamicBocDb {
         }
 
         // Check LRU counter cache
-        if let Some(cached) = self.cell_counter_cache.get(cell_id) {
-            #[cfg(feature = "telemetry")]
-            self.cell_db.telemetry().counter_cache_hits.update(1);
-            let counter = cached.load(Ordering::Relaxed);
+        if let Some(counter) = self.get_cached_counter(cell_id) {
             let mut visited_cell = VisitedCell::with_counter(counter);
             let new_counter = update_cell(&mut visited_cell)?;
-            cached.store(new_counter, Ordering::Relaxed);
             visited.insert(cell_id.clone(), visited_cell);
             log::trace!(
                 target: TARGET,
@@ -660,8 +684,6 @@ impl DynamicBocDb {
             );
             return Ok((Some(new_counter), None));
         }
-        #[cfg(feature = "telemetry")]
-        self.cell_db.telemetry().counter_cache_misses.update(1);
 
         // Fallback to DB
         #[cfg(feature = "telemetry")]
@@ -681,7 +703,6 @@ impl DynamicBocDb {
             let mut visited_cell = VisitedCell::with_raw_counter(&counter_raw)?;
             let counter = update_cell(&mut visited_cell)?;
             visited.insert(cell_id.clone(), visited_cell);
-            self.set_cached_counter(cell_id, counter);
             log::trace!(
                 target: TARGET,
                 "{}  {:x}  load counter {}  root_cell_id {:x}",
@@ -730,6 +751,11 @@ impl AsyncCellsStorageAdapter {
                         transaction.put_cf(&counters_cf, id.as_slice(), vc.serialize_counter());
                     }
                     boc_db_clone.cell_db.db().write(transaction)?;
+                    // Counter cache is flushed only after the DB commit
+                    // succeeds. See `save_boc` for the rationale.
+                    for (id, vc) in visited.iter() {
+                        boc_db_clone.set_cached_counter(id, vc.parents_count());
+                    }
                     visited.clear();
                     Ok(())
                 };

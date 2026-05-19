@@ -175,15 +175,13 @@ impl SsCallback {
 
 #[async_trait::async_trait]
 impl storage::shardstate_db_async::Callback for SsCallback {
-    async fn invoke(&self, job: storage::shardstate_db_async::Job, ok: bool) {
-        if ok {
-            self.handle.set_state_saved();
-            if let Err(e) = self.block_handle_storage.save_handle(&self.handle, None) {
-                log::error!("SsCallback: failed to save block handle: {}", e);
-            }
+    async fn invoke(&self, job: storage::shardstate_db_async::Job) {
+        self.handle.set_state_saved();
+        if let Err(e) = self.block_handle_storage.save_handle(&self.handle, None) {
+            log::error!("SsCallback: failed to save block handle: {e}");
         }
         if let Some(inner) = &self.inner {
-            inner.invoke(job, ok).await;
+            inner.invoke(job).await;
         }
     }
 }
@@ -802,7 +800,7 @@ impl InternalDb {
                     })
                     .await??;
                     if let Some(callback) = callback_ss {
-                        callback.invoke(Job::PutState(state_root, handle.id().clone()), true).await;
+                        callback.invoke(Job::PutState(state_root, handle.id().clone())).await;
                     }
                     if handle.set_state() | handle.set_state_saved() {
                         self.store_block_handle(handle, callback_handle)?;

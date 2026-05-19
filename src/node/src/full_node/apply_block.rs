@@ -130,6 +130,15 @@ pub async fn calc_and_store_state(
         };
 
         let merkle_update = block.block()?.read_state_update()?;
+        if merkle_update.old_hash != *prev_ss_root.repr_hash() {
+            fail!(
+                "Merkle update old_hash mismatch with prev state for block {}: \
+                 update.old_hash = {:x}, prev_ss_root.repr_hash = {:x}",
+                block.id(),
+                merkle_update.old_hash,
+                prev_ss_root.repr_hash()
+            );
+        }
         let block_id = block.id().clone();
         let engine_cloned = engine.clone();
 
@@ -137,10 +146,9 @@ pub async fn calc_and_store_state(
         let ss = tokio::task::spawn_blocking(move || -> Result<Arc<ShardStateStuff>> {
             let now = std::time::Instant::now();
             let cf = engine_cloned.db_cells_factory()?;
-            let cl = engine_cloned.db_cells_loader()?;
             let mut fast_attempt = true;
             let (ss_root, _metrics) =
-                match merkle_update.apply_with_loader(&prev_ss_root, &cf, cl.deref()) {
+                match merkle_update.apply_lazy_unchecked(&cf) {
                     Err(e) => {
                         log::debug!(
                             "Failed the fast attempt of Merkle update applying for block {}: {}. Trying classic approach...",

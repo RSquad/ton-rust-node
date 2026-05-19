@@ -88,7 +88,7 @@ spin = '0.7'
 stream-cancel = '0.8'
 string-builder = '0.2'
 thiserror = '1.0'
-tokio = { features = ['rt-multi-thread'], version = '1.40' }
+tokio = { features = ['rt-multi-thread', 'signal'], version = '1.40' }
 tokio-util = '0.7'
 warp = { version = "0.4", features = ["server"] }
 adnl = { features = ['client', 'node', 'server'], path = '../adnl' }
@@ -110,7 +110,8 @@ ton_api = { path = '../tl/ton_api' }
 validator_session = { path = 'validator-session' }
 
 [target.'cfg(not(windows))'.dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true, features = ["override_allocator_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
 
 [[bench]]
 name = "liteserver_pipeline"
@@ -128,7 +129,7 @@ tokio = { features = ['macros'], version = '1.40' }
 
 [features]
 default = ['telemetry', 'ton_block/export_key', 'validator_session/export_key', 'jemalloc']
-jemalloc = ['tikv-jemallocator']
+jemalloc = ['tikv-jemallocator', 'tikv-jemalloc-ctl']
 cell_counter = ['ton_block/cell_counter']
 ci_run = []
 export_key = ['catchain/export_key', 'ton_block/export_key']

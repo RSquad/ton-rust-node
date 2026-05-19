@@ -37,6 +37,7 @@ pub struct StorageTelemetry {
     pub packages: Arc<Metric>,
 
     pub storing_cells: Arc<Metric>,
+    pub storing_cells_bytes: Arc<Metric>,
     pub shardstates_queue: Arc<Metric>,
 
     pub loaded_cells_from_db: Arc<MetricBuilder>,
@@ -81,6 +82,7 @@ impl Default for StorageTelemetry {
             handles: Metric::without_totals("", 1),
             packages: Metric::without_totals("", 1),
             storing_cells: Metric::without_totals("", 1),
+            storing_cells_bytes: Metric::without_totals("", 1),
             shardstates_queue: Metric::without_totals("", 1),
             loaded_cells_from_db: MetricBuilder::with_metric_and_period(
                 Metric::with_total_amount("", 1),

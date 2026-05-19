@@ -1938,6 +1938,242 @@ fn test_arena_concurrent_trees() {
     }
 }
 
+// LazyLoadCell tests
+
+/// Build a pruned-branch placeholder for `orig` at merkle_depth=0.
+/// Mirrors `MerkleUpdate::make_pruned_branch_cell` but uses only public APIs.
+fn make_pruned_for(orig: &Cell) -> Cell {
+    let orig_mask = orig.level_mask().mask();
+    assert!(orig_mask & 1 == 0, "test helper assumes orig has no bit-0 set");
+    let pruned_mask = orig_mask | 1;
+    let lvl = LevelMask::with_mask(pruned_mask).level() as usize;
+
+    // cell_data: [0x01][mask][hashes 32*lvl][depths BE 2*lvl]
+    let mut data = vec![0u8; 1 + 1 + (SHA256_SIZE + DEPTH_SIZE) * lvl];
+    data[0] = u8::from(CellType::PrunedBranch);
+    data[1] = pruned_mask;
+    let mut off = 2;
+    for h in orig.hashes() {
+        data[off..off + SHA256_SIZE].copy_from_slice(h.as_slice());
+        off += SHA256_SIZE;
+    }
+    for d in orig.depths() {
+        data[off..off + DEPTH_SIZE].copy_from_slice(&d.to_be_bytes());
+        off += DEPTH_SIZE;
+    }
+
+    // Build raw cell: [d1][d2][cell_data]
+    let raw = Cell::build_data(
+        &{
+            let mut d = data.clone();
+            d.push(0x80); // completion tag (data is byte-aligned, so just append 0x80? — see find_tag)
+            d
+        },
+        CellType::PrunedBranch,
+        pruned_mask,
+        0,
+        None,
+    )
+    .unwrap();
+    Cell::with_data_and_refs(&raw, false, &[], None, None).unwrap()
+}
+
+#[test]
+fn test_lazy_cell_basic_load() {
+    let orig = create_cell(&[], &[0xAB, 0x80]).unwrap();
+    let pruned = make_pruned_for(&orig);
+    let orig_clone = orig.clone();
+    let called = Arc::new(AtomicUsize::new(0));
+    let called_clone = called.clone();
+
+    let loader: CellLoader = Arc::new(move |hash: &UInt256| {
+        called_clone.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(hash, orig_clone.repr_hash());
+        Ok(orig_clone.clone())
+    });
+
+    let lazy = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap();
+    assert!(lazy.is_lazy());
+
+    // Hash-side queries do not trigger load.
+    assert_eq!(lazy.repr_hash(), orig.repr_hash());
+    assert_eq!(lazy.repr_depth(), orig.repr_depth());
+    assert_eq!(lazy.level_mask(), orig.level_mask());
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+
+    // Data triggers load.
+    assert_eq!(lazy.data(), orig.data());
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+
+    // Subsequent access does not reload.
+    assert_eq!(lazy.bit_length(), orig.bit_length());
+    assert_eq!(lazy.cell_type(), orig.cell_type());
+    assert_eq!(lazy.references_count(), orig.references_count());
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn test_lazy_cell_with_children() {
+    let child1 = create_cell(&[], &[0x01, 0x80]).unwrap();
+    let child2 = create_cell(&[], &[0x02, 0x80]).unwrap();
+    let orig = create_cell(&[child1.clone(), child2.clone()], &[0xFF, 0x80]).unwrap();
+    let pruned = make_pruned_for(&orig);
+    let orig_clone = orig.clone();
+    let called = Arc::new(AtomicUsize::new(0));
+    let called_clone = called.clone();
+
+    let loader: CellLoader = Arc::new(move |_hash: &UInt256| {
+        called_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(orig_clone.clone())
+    });
+
+    let lazy = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap();
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+
+    let ref0 = lazy.reference(0).unwrap();
+    assert_eq!(ref0.repr_hash(), child1.repr_hash());
+    let ref1 = lazy.reference(1).unwrap();
+    assert_eq!(ref1.repr_hash(), child2.repr_hash());
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn test_lazy_cell_try_load_propagates_error() {
+    let orig = create_cell(&[], &[0xAA, 0x80]).unwrap();
+    let pruned = make_pruned_for(&orig);
+
+    let loader: CellLoader = Arc::new(|_hash: &UInt256| crate::fail!("loader unavailable"));
+    let lazy = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap();
+
+    let err = lazy.reference(0).unwrap_err();
+    assert!(err.to_string().contains("loader unavailable"), "got: {}", err);
+}
+
+#[test]
+fn test_lazy_cell_rejects_non_pruned() {
+    let cell = create_cell(&[], &[0x42, 0x80]).unwrap();
+    let loader: CellLoader = Arc::new(|_h| crate::fail!("unused"));
+    let err = Cell::lazy_from_pruned(&cell, loader, 0).unwrap_err();
+    assert!(err.to_string().contains("pruned"), "got: {}", err);
+}
+
+#[test]
+fn test_lazy_cell_concurrent_load() {
+    // Many threads racing through load(): the loader runs at least once and
+    // every thread converges on the same cached cell.
+    let orig = create_cell(&[], &[0xCD, 0x80]).unwrap();
+    let pruned = make_pruned_for(&orig);
+    let orig_clone = orig.clone();
+    let called = Arc::new(AtomicUsize::new(0));
+    let called_clone = called.clone();
+
+    let loader: CellLoader = Arc::new(move |_h: &UInt256| {
+        called_clone.fetch_add(1, Ordering::SeqCst);
+        // Brief work to encourage contention.
+        std::thread::yield_now();
+        Ok(orig_clone.clone())
+    });
+    let lazy = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap();
+    let lazy = Arc::new(lazy);
+    let orig_hash = orig.repr_hash().clone();
+
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let lazy = lazy.clone();
+            let orig_hash = orig_hash.clone();
+            std::thread::spawn(move || {
+                let d = lazy.data();
+                assert_eq!(d, &[0xCD]);
+                assert_eq!(lazy.repr_hash(), &orig_hash);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    // get_or_init guarantees exactly one load via the panicking path.
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn test_lazy_cell_drop_releases_loader() {
+    // After all references to the lazy cell are dropped, the loader Arc is
+    // dropped too — verified via Weak::upgrade returning None.
+    let orig = create_cell(&[], &[0x01, 0x80]).unwrap();
+    let pruned = make_pruned_for(&orig);
+    let orig_clone = orig.clone();
+    let loader: CellLoader = Arc::new(move |_h| Ok(orig_clone.clone()));
+    let weak = Arc::downgrade(&loader);
+
+    let lazy = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap();
+    assert!(weak.upgrade().is_some());
+    drop(lazy);
+    assert!(weak.upgrade().is_none());
+}
+
+/// Build a synthetic pruned branch cell with an arbitrary combined level
+/// mask, hashes and depths. Unlike `make_pruned_for` this does not need a
+/// real origin cell, so it can exercise pruned shapes that ordinary cells
+/// cannot easily produce (e.g. masks with bits above the pruning bit).
+fn make_pruned_with_mask(combined_mask: u8, hashes: &[[u8; 32]], depths: &[u16]) -> Cell {
+    let lvl = LevelMask::with_mask(combined_mask).level() as usize;
+    assert_eq!(hashes.len(), lvl, "need {lvl} hashes for mask {combined_mask:#05b}");
+    assert_eq!(depths.len(), lvl, "need {lvl} depths for mask {combined_mask:#05b}");
+
+    let mut data = vec![0u8; 1 + 1 + (SHA256_SIZE + DEPTH_SIZE) * lvl];
+    data[0] = u8::from(CellType::PrunedBranch);
+    data[1] = combined_mask;
+    let mut off = 2;
+    for h in hashes {
+        data[off..off + SHA256_SIZE].copy_from_slice(h);
+        off += SHA256_SIZE;
+    }
+    for d in depths {
+        data[off..off + DEPTH_SIZE].copy_from_slice(&d.to_be_bytes());
+        off += DEPTH_SIZE;
+    }
+    data.push(0x80); // bit-string completion tag
+
+    let raw = Cell::build_data(&data, CellType::PrunedBranch, combined_mask, 0, None).unwrap();
+    Cell::with_data_and_refs(&raw, false, &[], None, None).unwrap()
+}
+
+#[test]
+fn test_lazy_from_pruned_strips_correct_bit_not_highest() {
+    // Combined mask 0b011 simulates an origin cell with mask 0b010 (level 2)
+    // that was pruned at merkle_depth = 0 (pruning bit = bit 0).
+    //
+    // The previous "strip highest set bit" heuristic would strip bit 1 and
+    // return orig_mask = 0b001 (wrong). The current implementation strips
+    // exactly bit `merkle_depth` and must return orig_mask = 0b010.
+    let hash_lvl1 = [0x11u8; 32];
+    let hash_lvl2 = [0x22u8; 32];
+    let pruned = make_pruned_with_mask(0b011, &[hash_lvl1, hash_lvl2], &[5, 7]);
+
+    let loader: CellLoader =
+        Arc::new(|_| crate::fail!("loader must not be called for hash-only queries"));
+
+    let lazy = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap();
+    assert_eq!(
+        lazy.level_mask().mask(),
+        0b010,
+        "orig_mask must keep the high bit (broken-heuristic answer would be 0b001)"
+    );
+}
+
+#[test]
+fn test_lazy_from_pruned_rejects_missing_pruning_bit() {
+    // Combined mask 0b010 with merkle_depth = 0: pruning bit (bit 0) is
+    // NOT present — the constructor must reject this input rather than
+    // silently produce a corrupt cell.
+    let hash_lvl1 = [0x33u8; 32];
+    let pruned = make_pruned_with_mask(0b010, &[hash_lvl1], &[3]);
+
+    let loader: CellLoader = Arc::new(|_| crate::fail!("unused"));
+    let err = Cell::lazy_from_pruned(&pruned, loader, 0).unwrap_err();
+    assert!(err.to_string().contains("pruning bit"), "expected 'pruning bit' error, got: {err}",);
+}
+
 #[test]
 fn test_arena_concurrent_contains() {
     // Allocate cells from multiple threads, then verify contains()

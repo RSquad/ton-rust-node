@@ -53,12 +53,16 @@ impl Display for MerkleUpdateApplyMetrics {
 
 pub trait CellsFactory: Send + Sync {
     fn create_cell(self: Arc<Self>, builder: BuilderData) -> Result<Cell>;
+    fn create_lazy_load_cell(self: Arc<Self>, pruned: &Cell, merkle_depth: u8) -> Result<Cell>;
 }
 
 pub struct DefaultCellsFactory;
 impl CellsFactory for DefaultCellsFactory {
     fn create_cell(self: Arc<Self>, builder: BuilderData) -> Result<Cell> {
         builder.into_cell()
+    }
+    fn create_lazy_load_cell(self: Arc<Self>, _pruned: &Cell, _merkle_depth: u8) -> Result<Cell> {
+        fail!("Lazy load cells are not supported by default factory")
     }
 }
 
@@ -365,11 +369,17 @@ impl MerkleUpdate {
                     .ok_or_else(|| error!("Can't load cell with hash {:x}", hash))
             };
             let mut new_cells = ahash::AHashMap::new();
-            let new_root =
-                self.traverse_on_apply(&self.new, &loader, &mut new_cells, 0, factory)?;
+            let new_root = self.traverse_on_apply(
+                &self.new,
+                Some(&loader),
+                &mut new_cells,
+                0,
+                factory,
+                &mut 0,
+            )?;
             metrics.created_new_cells = new_cells.len();
 
-            // constructed tree's hash have to coinside with self.new_hash
+            // constructed tree's hash have to coincide with self.new_hash
             if *new_root.repr_hash() != self.new_hash {
                 fail!(BlockError::WrongMerkleUpdate("new bag's hash mismatch".to_string()))
             }
@@ -392,10 +402,50 @@ impl MerkleUpdate {
             Ok((old_root.clone(), MerkleUpdateApplyMetrics::default()))
         } else {
             let mut new_cells = ahash::AHashMap::new();
-            let new_root = self.traverse_on_apply(&self.new, loader, &mut new_cells, 0, factory)?;
+            let new_root = self.traverse_on_apply(
+                &self.new,
+                Some(loader),
+                &mut new_cells,
+                0,
+                factory,
+                &mut 0,
+            )?;
             metrics.created_new_cells = new_cells.len();
 
-            // constructed tree's hash have to coinside with self.new_hash
+            // constructed tree's hash have to coincide with self.new_hash
+            if *new_root.repr_hash() != self.new_hash {
+                fail!(BlockError::WrongMerkleUpdate("new bag's hash mismatch".to_string()))
+            }
+
+            Ok((new_root, metrics))
+        }
+    }
+
+    pub fn apply_lazy_unchecked(
+        &self,
+        factory: &Arc<dyn CellsFactory>,
+    ) -> Result<(Cell, MerkleUpdateApplyMetrics)> {
+        let mut metrics = MerkleUpdateApplyMetrics::default();
+
+        // cells for new bag
+        if self.new_hash == self.old_hash {
+            let root = factory.clone().create_lazy_load_cell(&self.new, 0)?;
+            Ok((root, metrics))
+        } else {
+            let mut new_cells = ahash::AHashMap::new();
+            let mut pruned_cells = 0;
+            let new_root = self.traverse_on_apply(
+                &self.new,
+                None,
+                &mut new_cells,
+                0,
+                factory,
+                &mut pruned_cells,
+            )?;
+            metrics.created_new_cells = new_cells.len();
+            metrics.new_pruned = pruned_cells;
+
+            // constructed tree's hash have to coincide with self.new_hash
             if *new_root.repr_hash() != self.new_hash {
                 fail!(BlockError::WrongMerkleUpdate("new bag's hash mismatch".to_string()))
             }
@@ -456,10 +506,11 @@ impl MerkleUpdate {
     fn traverse_on_apply(
         &self,
         update_cell: &Cell,
-        loader: &dyn Fn(&UInt256) -> Result<Cell>,
+        loader: Option<&dyn Fn(&UInt256) -> Result<Cell>>,
         new_cells: &mut ahash::AHashMap<UInt256, Cell>,
         merkle_depth: u8,
         cells_factory: &Arc<dyn CellsFactory>,
+        pruned_cells: &mut usize,
     ) -> Result<Cell> {
         // We will recursively construct new skeleton for new cells
         // and connect unchanged branches to it
@@ -489,6 +540,7 @@ impl MerkleUpdate {
                             new_cells,
                             child_merkle_depth,
                             cells_factory,
+                            pruned_cells,
                         )?;
                         new_cells.insert(new_child_hash, c.clone());
                         c
@@ -497,11 +549,18 @@ impl MerkleUpdate {
                 CellType::PrunedBranch => {
                     // if this pruned branch is related to current update
                     let mask = update_child.level_mask().mask();
+                    *pruned_cells += 1;
                     if mask & (1 << child_merkle_depth) != 0 {
                         // connect branch from old bag instead pruned
                         let new_child_hash =
                             Cell::hash(update_child, update_child.level() as usize - 1);
-                        loader(new_child_hash)?
+                        if let Some(loader) = loader {
+                            loader(new_child_hash)?
+                        } else {
+                            cells_factory
+                                .clone()
+                                .create_lazy_load_cell(update_child, child_merkle_depth)?
+                        }
                     } else {
                         // else - just copy this cell (like an ordinary)
                         cells_factory.clone().create_cell(BuilderData::from_cell(update_child)?)?
