@@ -11,9 +11,14 @@
 use super::*;
 use crate::{
     define_HashmapE, generate_test_account, read_single_root_boc, write_boc, AccountTestOptions,
-    Block, BocWriter, CurrencyCollection, MerkleProof, ShardState, UsageTree,
+    Block, BocWriter, CellLoader, CurrencyCollection, MerkleProof, ShardState, UsageTree,
 };
-use std::{fs::read, path::Path, time::Instant};
+use std::{
+    fs::read,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    time::Instant,
+};
 
 #[test]
 fn test_merkle_update() {
@@ -456,4 +461,136 @@ fn test_merkle_update5() {
         let (new_proof_2, _) = update.apply_for(&old_proof).unwrap();
         assert_eq!(new_proof, new_proof_2);
     }
+}
+
+// ---------------------------------------------------------------------------
+// apply_lazy_unchecked tests
+// ---------------------------------------------------------------------------
+
+/// Test factory: stores cells indexed by repr_hash, builds lazy cells whose
+/// loader pulls from that map. Counts loader invocations so tests can assert
+/// laziness.
+struct TestLazyFactory {
+    cells_by_hash: ahash::AHashMap<UInt256, Cell>,
+    loader_calls: Arc<AtomicUsize>,
+}
+
+impl TestLazyFactory {
+    fn new(root: &Cell) -> Arc<Self> {
+        let mut cells_by_hash = ahash::AHashMap::new();
+        Self::collect(root, &mut cells_by_hash);
+        Arc::new(Self { cells_by_hash, loader_calls: Arc::new(AtomicUsize::new(0)) })
+    }
+
+    fn collect(cell: &Cell, out: &mut ahash::AHashMap<UInt256, Cell>) {
+        if out.insert(cell.repr_hash().clone(), cell.clone()).is_some() {
+            return;
+        }
+        for i in 0..cell.references_count() {
+            let r = cell.reference(i).unwrap();
+            Self::collect(&r, out);
+        }
+    }
+}
+
+impl CellsFactory for TestLazyFactory {
+    fn create_cell(self: Arc<Self>, builder: BuilderData) -> Result<Cell> {
+        builder.into_cell()
+    }
+
+    fn create_lazy_load_cell(self: Arc<Self>, pruned: &Cell, merkle_depth: u8) -> Result<Cell> {
+        let cells = self.cells_by_hash.clone();
+        let counter = Arc::clone(&self.loader_calls);
+        let loader: CellLoader = Arc::new(move |hash: &UInt256| {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            cells
+                .get(hash)
+                .cloned()
+                .ok_or_else(|| error!("Cell not found in test factory: {:x}", hash))
+        });
+        Cell::lazy_from_pruned(pruned, loader, merkle_depth)
+    }
+}
+
+/// Build a small account-based old/new pair, like the existing
+/// test_merkle_update setup but kept local.
+fn build_account_update_pair() -> (Cell, Cell) {
+    let mut acc = generate_test_account(true, AccountTestOptions::with_default_setup(true));
+    let old_cell = acc.serialize().unwrap();
+    acc.add_funds(&CurrencyCollection::with_coins(42)).unwrap();
+    let data = SliceData::new(vec![
+        0b00011111, 0b11111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111,
+        0b11110100,
+    ]);
+    acc.set_data(data.into_cell().unwrap());
+    let new_cell = acc.serialize().unwrap();
+    assert_ne!(old_cell.repr_hash(), new_cell.repr_hash());
+    (old_cell, new_cell)
+}
+
+#[test]
+fn test_apply_lazy_unchecked_matches_classic() {
+    let (old_cell, new_cell) = build_account_update_pair();
+    let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
+
+    let default_factory: Arc<dyn CellsFactory> = Arc::new(DefaultCellsFactory);
+    let (classic_root, _) = mupd.apply_with_factory(&old_cell, &default_factory).unwrap();
+
+    let lazy_factory: Arc<dyn CellsFactory> = TestLazyFactory::new(&old_cell);
+    let (lazy_root, _) = mupd.apply_lazy_unchecked(&lazy_factory).unwrap();
+
+    assert_eq!(lazy_root.repr_hash(), classic_root.repr_hash());
+    assert_eq!(lazy_root.repr_hash(), new_cell.repr_hash());
+    assert_eq!(lazy_root.repr_depth(), classic_root.repr_depth());
+    assert_eq!(lazy_root.level_mask(), classic_root.level_mask());
+}
+
+#[test]
+fn test_apply_lazy_unchecked_empty_update() {
+    // new == old → MerkleUpdate.new is a single pruned branch over `old`.
+    // apply_lazy_unchecked must hit the `self.new_hash == self.old_hash`
+    // path on line ~432 and produce a lazy cell that mirrors `old`.
+    let (old_cell, _) = build_account_update_pair();
+    let mupd = MerkleUpdate::create(&old_cell, &old_cell).unwrap();
+    assert_eq!(mupd.old_hash, mupd.new_hash);
+
+    let factory = TestLazyFactory::new(&old_cell);
+    let factory_dyn: Arc<dyn CellsFactory> = factory.clone();
+    let (lazy_root, _) = mupd.apply_lazy_unchecked(&factory_dyn).unwrap();
+
+    // Hash/depth/mask come from the pruned branch inline data — no loader
+    // calls should be needed.
+    assert_eq!(lazy_root.repr_hash(), old_cell.repr_hash());
+    assert_eq!(lazy_root.repr_depth(), old_cell.repr_depth());
+    assert_eq!(lazy_root.level_mask(), old_cell.level_mask());
+    assert_eq!(
+        factory.loader_calls.load(AtomicOrdering::SeqCst),
+        0,
+        "loader must not run while only hash/depth/mask are queried",
+    );
+
+    // Touching data triggers exactly one load.
+    let _ = lazy_root.data();
+    assert_eq!(factory.loader_calls.load(AtomicOrdering::SeqCst), 1);
+    let _ = lazy_root.data();
+    assert_eq!(factory.loader_calls.load(AtomicOrdering::SeqCst), 1, "load is memoised");
+}
+
+#[test]
+fn test_apply_lazy_unchecked_lazy_loading() {
+    // For a non-trivial update we expect hash queries on the resulting tree
+    // to be answerable without loading every pruned subtree.
+    let (old_cell, new_cell) = build_account_update_pair();
+    let mupd = MerkleUpdate::create(&old_cell, &new_cell).unwrap();
+
+    let factory = TestLazyFactory::new(&old_cell);
+    let factory_dyn: Arc<dyn CellsFactory> = factory.clone();
+    let (lazy_root, _) = mupd.apply_lazy_unchecked(&factory_dyn).unwrap();
+
+    let before = factory.loader_calls.load(AtomicOrdering::SeqCst);
+    let _ = lazy_root.repr_hash();
+    let _ = lazy_root.repr_depth();
+    let _ = lazy_root.level_mask();
+    let after = factory.loader_calls.load(AtomicOrdering::SeqCst);
+    assert_eq!(before, after, "repr_hash/repr_depth/level_mask must not trigger loader",);
 }

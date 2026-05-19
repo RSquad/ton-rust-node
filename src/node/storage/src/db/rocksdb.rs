@@ -446,6 +446,12 @@ impl<K: DbKey + Send + Sync> RocksDbTable<K> {
         self.delete_raw(key.key())
     }
 
+    /// Append a delete operation for `key` into `batch`. Caller commits.
+    pub fn add_delete_to_batch(&self, batch: &mut WriteBatch, key: &K) -> Result<()> {
+        batch.delete_cf(&self.cf()?, key.key());
+        Ok(())
+    }
+
     pub fn try_get(&self, key: &K) -> Result<Option<DbSlice<'_>>> {
         self.try_get_raw(key.key())
     }

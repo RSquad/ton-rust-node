@@ -21,9 +21,15 @@ use std::{
     ops::{BitOr, BitOrAssign},
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
-        Arc, LazyLock, Mutex, Weak,
+        Arc, LazyLock, Mutex, OnceLock, Weak,
     },
 };
+
+// Live-cell counters (count and bytes); updated in alloc_cell / Drop dealloc path.
+#[cfg(feature = "cell_counter")]
+static CELL_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "cell_counter")]
+static CELL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 mod slice;
 pub use self::slice::*;
@@ -765,8 +771,7 @@ impl Drop for BocCellDraft {
             let hash_count = hashes_count(buf);
             let refs_count = refs_count(buf);
             let size = 8 + DataCell::content_size(data_len, hash_count, refs_count);
-            let layout = Layout::from_size_align(size, 8).unwrap();
-            unsafe { std::alloc::dealloc(raw_ptr, layout) }
+            unsafe { Cell::dealloc_raw_cell(raw_ptr, size, true) };
         }
         // arena: nothing to do
     }
@@ -783,7 +788,7 @@ impl Drop for BocCellDraft {
 /// # Tagged pointer
 ///
 /// ```text
-/// bit 0      variant:  0 = DataCell,  1 = tagged (Loaded/Usage/Virtual)
+/// bit 0      variant:  0 = DataCell,  1 = tagged (Loaded/Usage/Virtual/LazyLoaded)
 /// bits 2‑1   ownership model:
 ///              01  CELL_HEAP          heap, atomic refcount
 ///              10  CELL_ARENA  arena, no ownership tracking
@@ -818,10 +823,12 @@ impl Drop for BocCellDraft {
 ///
 /// # LoadedCell (variant tag = 1)
 ///
-/// Lazy-loaded cell (e.g. from database). Stores its own hashes/depths
-/// and the repr hashes/depths of each child, but loads children on demand
-/// through a `loader` closure. The sub-buffer starting at `d1` has the
-/// same standard layout as DataCell.
+/// **Fully loaded cell with deferred child resolution.** Owns its `cell_data`,
+/// its own hashes/depths, and the repr hashes/depths of every child inline —
+/// `data()`, `raw_data()`, `bit_length()`, `cell_type()`, `references_count()`,
+/// `hash(i)`, `depth(i)` answer without I/O. Only `reference(i)` invokes the
+/// `loader` closure (with the child's repr hash) to materialise that child.
+/// The sub-buffer starting at `d1` has the same standard layout as DataCell.
 ///
 /// ```text
 /// [tag: 1] [d1: 1] [d2: 1]
@@ -851,6 +858,31 @@ impl Drop for BocCellDraft {
 /// ```text
 /// [tag: 1] [offset: 1] [pad: 6] [cell: 8]   (16 bytes total)
 /// ```
+///
+/// # LazyLoadCell (variant tag = 4, heap-only)
+///
+/// **Header-only placeholder; the entire cell is loaded on first content
+/// access.** In contrast to LoadedCell (which already holds `cell_data` and
+/// only defers children), a LazyLoadCell stores *only* the original cell's
+/// level mask, hashes, and depths — no `cell_data`, no `d1`/`d2`, no
+/// children. Constructed from a pruned branch placeholder via
+/// [`Cell::lazy_from_pruned()`].
+///
+/// Without invoking the loader: `level_mask()`, `level()`, `hashes_count()`,
+/// `hash(i)`, `depth(i)`, `hash_depth(i)`, `repr_hash()`, `repr_depth()`.
+///
+/// Triggering the loader on first call: `cell_type()`, `bit_length()`,
+/// `references_count()`, `data()`, `raw_data()`, `reference(i)`,
+/// `cell_buf()`. The loaded cell is cached inline via `OnceLock<Cell>` —
+/// subsequent accesses delegate directly to it without further I/O.
+///
+/// ```text
+/// [tag: 1] [level_mask: 1] [pad: 6]
+/// [hashes: 32*h_count] [depths: 2*h_count]
+/// [align 8] [once_lock: 16 (OnceLock<Cell>)] [loader: 16 (Arc<dyn Fn>)]
+///
+/// h_count = level + 1   (original cell's hashes array length)
+/// ```
 pub struct Cell {
     tagged_pointer: usize,
 }
@@ -876,6 +908,7 @@ const CELL_ARENA: usize = 0b100;
 const CELL_VARIANT_LOADED: u8 = 1;
 const CELL_VARIANT_USAGE: u8 = 2;
 const CELL_VARIANT_VIRTUAL: u8 = 3;
+const CELL_VARIANT_LAZY_LOAD: u8 = 4;
 
 /// Size of a single Cell tagged pointer
 const CELL_PTR_SIZE: usize = std::mem::size_of::<usize>();
@@ -899,6 +932,7 @@ struct DataCell;
 struct LoadedCell;
 struct UsageCell;
 struct VirtualCell;
+struct LazyLoadCell;
 
 impl DataCell {
     /// Standard cell buffer: [d1][d2][hashes][depths][cell_data] (d1 has store_hashes=true)
@@ -1097,6 +1131,148 @@ impl VirtualCell {
     }
 }
 
+impl LazyLoadCell {
+    // Layout from content_ptr p (heap only — variant is heap-allocated):
+    //   p+0  tag (CELL_VARIANT_LAZY_LOAD)
+    //   p+1  level_mask byte (original cell's level_mask)
+    //   p+2..p+8  padding
+    //   p+8  hashes (SHA256_SIZE * h_count)
+    //   p+8+32*h  depths (DEPTH_SIZE * h_count, BE)
+    //   [align to 8] once_lock OnceLock<Cell>
+    //   [next] loader CellLoader (Arc<dyn Fn>, fat pointer = 16 bytes)
+    //
+    // h_count = level + 1; depth and hashes are stored in the canonical
+    // significant-index order (matching DataCell layout).
+
+    const HASHES_OFFSET: usize = 8;
+
+    fn level_mask(p: *const u8) -> LevelMask {
+        unsafe { LevelMask::with_mask(*p.add(1)) }
+    }
+
+    fn hashes_count(p: *const u8) -> usize {
+        Self::level_mask(p).level() as usize + 1
+    }
+
+    fn depths_offset(h_count: usize) -> usize {
+        Self::HASHES_OFFSET + SHA256_SIZE * h_count
+    }
+
+    fn meta_size(h_count: usize) -> usize {
+        // Hashes + depths, aligned up to 8 for the OnceLock that follows.
+        let raw = Self::HASHES_OFFSET + (SHA256_SIZE + DEPTH_SIZE) * h_count;
+        (raw + 7) & !7
+    }
+
+    fn once_lock_offset(h_count: usize) -> usize {
+        Self::meta_size(h_count)
+    }
+
+    fn loader_offset(h_count: usize) -> usize {
+        Self::once_lock_offset(h_count) + std::mem::size_of::<OnceLock<Cell>>()
+    }
+
+    fn content_size(h_count: usize) -> usize {
+        Self::loader_offset(h_count) + std::mem::size_of::<CellLoader>()
+    }
+
+    fn hash<'a>(p: *const u8, index: usize) -> &'a UInt256 {
+        let array_index = Self::level_mask(p).calc_hash_index(index);
+        let off = Self::HASHES_OFFSET + SHA256_SIZE * array_index;
+        unsafe { &*(p.add(off) as *const UInt256) }
+    }
+
+    fn depth(p: *const u8, index: usize) -> u16 {
+        let array_index = Self::level_mask(p).calc_hash_index(index);
+        let h_count = Self::hashes_count(p);
+        let off = Self::depths_offset(h_count) + DEPTH_SIZE * array_index;
+        unsafe { ((*p.add(off)) as u16) << 8 | (*p.add(off + 1)) as u16 }
+    }
+
+    fn hash_depth<'a>(p: *const u8, index: usize) -> (&'a UInt256, u16) {
+        let lm = Self::level_mask(p);
+        let array_index = lm.calc_hash_index(index);
+        let h_count = lm.level() as usize + 1;
+        let h_off = Self::HASHES_OFFSET + SHA256_SIZE * array_index;
+        let d_off = Self::depths_offset(h_count) + DEPTH_SIZE * array_index;
+        let h = unsafe { &*(p.add(h_off) as *const UInt256) };
+        let d = unsafe { ((*p.add(d_off)) as u16) << 8 | (*p.add(d_off + 1)) as u16 };
+        (h, d)
+    }
+
+    fn once_lock<'a>(p: *const u8) -> &'a OnceLock<Cell> {
+        let h_count = Self::hashes_count(p);
+        unsafe { &*(p.add(Self::once_lock_offset(h_count)) as *const OnceLock<Cell>) }
+    }
+
+    fn loader<'a>(p: *const u8) -> &'a CellLoader {
+        let h_count = Self::hashes_count(p);
+        unsafe { &*(p.add(Self::loader_offset(h_count)) as *const CellLoader) }
+    }
+
+    /// Lookup key = original cell's repr hash = last entry in the hashes array.
+    fn repr_hash<'a>(p: *const u8) -> &'a UInt256 {
+        let h_count = Self::hashes_count(p);
+        let off = Self::HASHES_OFFSET + SHA256_SIZE * (h_count - 1);
+        unsafe { &*(p.add(off) as *const UInt256) }
+    }
+
+    /// Load the underlying cell on first access; subsequent calls return the
+    /// cached reference. On loader failure logs the error and panics — see
+    /// the `CellLoader` contract in the LazyLoadCell doc.
+    fn load<'a>(p: *const u8) -> &'a Cell {
+        let once = Self::once_lock(p);
+        once.get_or_init(|| {
+            let loader = Self::loader(p);
+            let hash = Self::repr_hash(p);
+            match loader(hash) {
+                Ok(cell) => {
+                    let loaded = cell.repr_hash();
+                    if loaded != hash {
+                        log::error!(
+                            "loaded cell repr_hash {loaded:x} mismatches lazy hash {hash:x}"
+                        );
+                        panic!("loaded cell repr_hash {loaded:x} mismatches lazy hash {hash:x}");
+                    }
+                    cell
+                }
+                Err(e) => {
+                    log::error!("lazy cell load failed for {hash:x}: {e}");
+                    panic!("lazy cell load failed for {hash:x}: {e}");
+                }
+            }
+        })
+    }
+
+    /// Like `load` but propagates the loader error instead of panicking. Used
+    /// by `reference(i)` and other fallible accessors. Concurrent callers may
+    /// each invoke the loader once (optimistic init via `OnceLock::set`); the
+    /// first to publish wins, the rest drop their copies.
+    fn try_load<'a>(p: *const u8) -> Result<&'a Cell> {
+        let once = Self::once_lock(p);
+        if let Some(cell) = once.get() {
+            return Ok(cell);
+        }
+        let loader = Self::loader(p);
+        let hash = Self::repr_hash(p);
+        let cell = loader(hash)?;
+        let loaded = cell.repr_hash();
+        if loaded != hash {
+            fail!("loaded cell repr_hash {loaded:x} mismatches lazy hash {hash:x}");
+        }
+        // If another thread already populated the slot, `set` returns Err with
+        // our cell which is then dropped — only one heap allocation survives.
+        let _ = once.set(cell);
+        Ok(once.get().expect("OnceLock just initialized"))
+    }
+
+    unsafe fn drop_contents(p: *mut u8) {
+        let h_count = Self::hashes_count(p);
+        std::ptr::drop_in_place(p.add(Self::once_lock_offset(h_count)) as *mut OnceLock<Cell>);
+        std::ptr::drop_in_place(p.add(Self::loader_offset(h_count)) as *mut CellLoader);
+    }
+}
+
 // Clone, Drop
 
 impl Clone for Cell {
@@ -1121,10 +1297,8 @@ impl Drop for Cell {
                 unsafe {
                     self.drop_variant_contents();
                 }
-                let layout = Layout::from_size_align(self.alloc_size(), 8).unwrap();
-                unsafe {
-                    std::alloc::dealloc(self.raw_ptr(), layout);
-                }
+                let size = self.alloc_size();
+                unsafe { Self::dealloc_raw_cell(self.raw_ptr(), size, true) };
             }
         }
         // arena: nothing to do
@@ -1305,7 +1479,8 @@ impl Cell {
     // Shared helpers
 
     /// Standard cell buffer [d1][d2][cell_data] for the underlying data cell.
-    /// Delegates through Usage/Virtual wrappers to the actual data cell.
+    /// Delegates through Usage/Virtual wrappers to the actual data cell. For
+    /// lazy cells triggers a load.
     fn cell_buf(&self) -> &[u8] {
         if self.is_data_cell() {
             DataCell::buf(self.content_ptr())
@@ -1314,6 +1489,7 @@ impl Cell {
                 CELL_VARIANT_LOADED => LoadedCell::buf(self.content_ptr()),
                 CELL_VARIANT_USAGE => UsageCell::inner(self.content_ptr()).cell_buf(),
                 CELL_VARIANT_VIRTUAL => VirtualCell::inner(self.content_ptr()).cell_buf(),
+                CELL_VARIANT_LAZY_LOAD => LazyLoadCell::load(self.content_ptr()).cell_buf(),
                 _ => unreachable!(),
             }
         }
@@ -1321,7 +1497,7 @@ impl Cell {
 
     // Allocation helpers
 
-    fn alloc_size(&self) -> usize {
+    pub fn alloc_size(&self) -> usize {
         self.ownership_prefix_size() + self.content_size()
     }
 
@@ -1337,6 +1513,9 @@ impl Cell {
                 }
                 CELL_VARIANT_USAGE => UsageCell::CONTENT_SIZE,
                 CELL_VARIANT_VIRTUAL => VirtualCell::CONTENT_SIZE,
+                CELL_VARIANT_LAZY_LOAD => {
+                    LazyLoadCell::content_size(LazyLoadCell::hashes_count(self.content_ptr()))
+                }
                 _ => unreachable!(),
             }
         }
@@ -1351,8 +1530,14 @@ impl Cell {
                     log::error!("FATAL! Cell allocation of {} bytes failed", size);
                     std::process::exit(0xFF);
                 }
+                #[cfg(feature = "cell_counter")]
+                {
+                    CELL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    CELL_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+                }
                 p
             },
+            // Arena cells share one allocation; counted via arena itself, not per cell.
             Some(arena) => arena.alloc_raw(layout),
         }
     }
@@ -1399,6 +1584,7 @@ impl Cell {
                 CELL_VARIANT_LOADED => LoadedCell::drop_contents(p),
                 CELL_VARIANT_USAGE => UsageCell::drop_contents(p),
                 CELL_VARIANT_VIRTUAL => VirtualCell::drop_contents(p),
+                CELL_VARIANT_LAZY_LOAD => LazyLoadCell::drop_contents(p),
                 _ => unreachable!(),
             }
         }
@@ -1768,7 +1954,7 @@ impl Cell {
         info: &CellRawInfo,
         refs_count: usize,
         arena: &Option<Arc<CellsArena>>,
-    ) -> (*mut u8, usize) {
+    ) -> (*mut u8, usize, usize) {
         let data_len = info.data.len();
         let level_mask = LevelMask::with_mask(info.d1 >> LEVELMASK_D1_OFFSET);
         let cell_type = if info.d1 & EXOTIC_D1_FLAG != 0 {
@@ -1785,7 +1971,8 @@ impl Cell {
 
         let prefix_size = Self::prefix_size_for(arena);
         let content_size = DataCell::content_size(data_len, hash_count, refs_count);
-        let ptr = Self::alloc_cell(prefix_size + content_size, arena);
+        let total_size = prefix_size + content_size;
+        let ptr = Self::alloc_cell(total_size, arena);
         Self::write_ownership_prefix(ptr, arena);
         let content = unsafe { ptr.add(prefix_size) };
 
@@ -1796,7 +1983,22 @@ impl Cell {
             std::ptr::copy_nonoverlapping(info.data.as_ptr(), content.add(2 + hd_size), data_len);
         }
 
-        (ptr, Self::make_tag(arena, false))
+        (ptr, Self::make_tag(arena, false), total_size)
+    }
+
+    /// Free a raw cell allocation that was never owned by a Cell. Mirrors the
+    /// counter bookkeeping in `alloc_cell`. No-op for arena allocations.
+    unsafe fn dealloc_raw_cell(ptr: *mut u8, size: usize, is_heap: bool) {
+        if !is_heap {
+            return;
+        }
+        let layout = Layout::from_size_align(size, 8).unwrap();
+        std::alloc::dealloc(ptr, layout);
+        #[cfg(feature = "cell_counter")]
+        {
+            CELL_COUNT.fetch_sub(1, Ordering::Relaxed);
+            CELL_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
+        }
     }
 
     /// Create a DataCell from raw wire data and resolved references.
@@ -1830,7 +2032,7 @@ impl Cell {
         }
 
         let has_store_hashes = store_hashes(raw);
-        let (ptr, tag) = Self::alloc_data_cell(&info, refs_count, &arena);
+        let (ptr, tag, total_size) = Self::alloc_data_cell(&info, refs_count, &arena);
         let prefix_size = Self::prefix_size_for(&arena);
         let content = unsafe { ptr.add(prefix_size) };
 
@@ -1855,17 +2057,22 @@ impl Cell {
             }
         }
 
-        unsafe {
-            // compute_hashes verifies pre-filled hashes (if store_hashes set) and
-            // sets store_hashes in d1 upon completion.
+        // compute_hashes verifies pre-filled hashes (if store_hashes set) and
+        // sets store_hashes in d1 upon completion. On error we must release
+        // the allocation since no Cell owns it yet.
+        let compute_result = unsafe {
             Self::compute_hashes(
                 content,
                 references,
                 references.len(),
                 max_depth.unwrap_or(MAX_DEPTH),
-            )?;
-            Self::write_refs(content, references);
+            )
+        };
+        if let Err(e) = compute_result {
+            unsafe { Self::dealloc_raw_cell(ptr, total_size, arena.is_none()) };
+            return Err(e);
         }
+        unsafe { Self::write_refs(content, references) };
 
         Ok(Self { tagged_pointer: ptr as usize | tag })
     }
@@ -1910,7 +2117,7 @@ impl Cell {
 
         // Validate & allocate (reuse shared helpers)
         let info = Self::check_data(&buf[..wire_len], true)?;
-        let (ptr, tag) = Self::alloc_data_cell(&info, rc, arena);
+        let (ptr, tag, _total_size) = Self::alloc_data_cell(&info, rc, arena);
         let prefix = Self::prefix_size_for(arena);
         let content = unsafe { ptr.add(prefix) };
 
@@ -2058,7 +2265,8 @@ impl Cell {
 
         let prefix_size = Self::prefix_size_for(&arena);
         let content_size = LoadedCell::content_size(data_len, hash_count, refs_count);
-        let ptr = Self::alloc_cell(prefix_size + content_size, &arena);
+        let total_size = prefix_size + content_size;
+        let ptr = Self::alloc_cell(total_size, &arena);
         Self::write_ownership_prefix(ptr, &arena);
         let content = unsafe { ptr.add(prefix_size) };
 
@@ -2092,7 +2300,13 @@ impl Cell {
                 debug_assert!(is_pruned || is_leaf || is_zero_level);
                 debug_assert_eq!(hash_count, 1);
                 let repr_refs = ReprRefs { hashes: ref_hashes, depths: ref_depths };
-                Self::compute_hashes(content.add(1), &repr_refs, refs_count, MAX_DEPTH)?;
+                // On compute_hashes error release the allocation: no Cell owns it yet.
+                if let Err(e) =
+                    Self::compute_hashes(content.add(1), &repr_refs, refs_count, MAX_DEPTH)
+                {
+                    Self::dealloc_raw_cell(ptr, total_size, arena.is_none());
+                    return Err(e);
+                }
             }
 
             let rh_dst = content.add(LoadedCell::refs_hashes_offset(data_len, hash_count));
@@ -2221,6 +2435,99 @@ impl Cell {
         Ok(Self { tagged_pointer: ptr as usize | Self::make_tag(&arena, true) })
     }
 
+    /// Create a heap-allocated lazy-load cell from a pruned branch placeholder.
+    ///
+    /// The pruned cell carries the original cell's hashes and depths in its
+    /// `cell_data` (see [`make_pruned_branch_cell`]). This constructor copies
+    /// them into a `LazyLoadCell` whose external API mimics the original cell:
+    /// `hash(i)`, `depth(i)`, `level_mask()`, and `repr_hash()` are answered
+    /// from the inline buffer without invoking the loader. Accessors that
+    /// need cell data or children (`data`, `raw_data`, `bit_length`,
+    /// `cell_type`, `references_count`, `reference(i)`, etc.) trigger the
+    /// loader on first call; the result is cached inline.
+    ///
+    /// `merkle_depth` is the merkle nesting depth at which this pruned branch
+    /// was created (same value that was passed to `make_pruned_branch_cell`).
+    /// The pruning bit sits at position `merkle_depth` in the level mask; the
+    /// original cell's level mask is recovered by clearing that exact bit.
+    /// This is necessary because the original cell may itself carry bits
+    /// higher than `merkle_depth` (e.g. nested merkle constructions inside
+    /// contract data) — a "strip the highest bit" heuristic would corrupt
+    /// `orig_mask` and produce wrong inline hashes/depths.
+    ///
+    /// On loader failure the cell logs an error and panics for the
+    /// non-fallible accessors; `reference(i)` and similar `Result`-returning
+    /// methods propagate the error instead.
+    pub fn lazy_from_pruned(pruned: &Cell, loader: CellLoader, merkle_depth: u8) -> Result<Self> {
+        let cell_type = pruned.cell_type();
+        if cell_type != CellType::PrunedBranch {
+            fail!("lazy_from_pruned expects a pruned branch, got {cell_type:?}");
+        }
+        if merkle_depth > 2 {
+            fail!("lazy_from_pruned: merkle_depth {merkle_depth} > 2");
+        }
+        let pruned_mask = pruned.level_mask().mask();
+        let pruning_bit = 1u8 << merkle_depth;
+        if pruned_mask & pruning_bit == 0 {
+            fail!(
+                "lazy_from_pruned: pruning bit (1 << {merkle_depth}) not set in mask {pruned_mask:#05b}"
+            );
+        }
+        let orig_mask = pruned_mask & !pruning_bit;
+        let orig_level_mask = LevelMask::with_mask(orig_mask);
+        let h_count = orig_level_mask.level() as usize + 1;
+
+        // Pruned data layout (see make_pruned_branch_cell): [type=0x01][mask]
+        // [hashes: 32 * (level+1)][depths: 2 * (level+1) BE]. The pruned cell's
+        // level is orig.level + 1, so it stores at least h_count hashes/depths.
+        let pruned_data = pruned.data();
+        let needed = 2 + (SHA256_SIZE + DEPTH_SIZE) * h_count;
+        if pruned_data.len() < needed {
+            fail!(
+                "pruned data too short: {} < {} (h_count {})",
+                pruned_data.len(),
+                needed,
+                h_count
+            );
+        }
+
+        let prefix_size = 8;
+        let content_size = LazyLoadCell::content_size(h_count);
+        let ptr = Self::alloc_cell(prefix_size + content_size, &None);
+        Self::write_ownership_prefix(ptr, &None);
+        let content = unsafe { ptr.add(prefix_size) };
+
+        unsafe {
+            *content = CELL_VARIANT_LAZY_LOAD;
+            *content.add(1) = orig_mask;
+
+            // Copy hashes from pruned data into our inline buffer.
+            std::ptr::copy_nonoverlapping(
+                pruned_data.as_ptr().add(2),
+                content.add(LazyLoadCell::HASHES_OFFSET),
+                SHA256_SIZE * h_count,
+            );
+            // Copy depths (BE in pruned data, BE in our storage — same encoding).
+            std::ptr::copy_nonoverlapping(
+                pruned_data.as_ptr().add(2 + SHA256_SIZE * h_count),
+                content.add(LazyLoadCell::depths_offset(h_count)),
+                DEPTH_SIZE * h_count,
+            );
+
+            // Initialise OnceLock and write loader.
+            std::ptr::write(
+                content.add(LazyLoadCell::once_lock_offset(h_count)) as *mut OnceLock<Cell>,
+                OnceLock::new(),
+            );
+            std::ptr::write(
+                content.add(LazyLoadCell::loader_offset(h_count)) as *mut CellLoader,
+                loader,
+            );
+        }
+
+        Ok(Self { tagged_pointer: ptr as usize | CELL_HEAP | CELL_TYPE_BIT })
+    }
+
     pub fn usage(
         cell: Cell,
         visit_on_load: bool,
@@ -2285,10 +2592,23 @@ impl Cell {
         0
     }
 
+    /// Heap-allocated cells only; arena cells are tracked via arena lifetime.
     pub fn cell_count() -> u64 {
         #[cfg(feature = "cell_counter")]
         {
             CELL_COUNT.load(Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "cell_counter"))]
+        {
+            0
+        }
+    }
+
+    /// Heap-allocated cells only; arena cells are tracked via arena lifetime.
+    pub fn cell_bytes() -> u64 {
+        #[cfg(feature = "cell_counter")]
+        {
+            CELL_BYTES.load(Ordering::Relaxed)
         }
         #[cfg(not(feature = "cell_counter"))]
         {
@@ -2310,6 +2630,7 @@ impl Cell {
                     UsageCell::inner(p).data()
                 }
                 CELL_VARIANT_VIRTUAL => VirtualCell::inner(self.content_ptr()).data(),
+                CELL_VARIANT_LAZY_LOAD => LazyLoadCell::load(self.content_ptr()).data(),
                 _ => unreachable!(),
             }
         }
@@ -2329,6 +2650,7 @@ impl Cell {
                     UsageCell::inner(p).raw_data()
                 }
                 CELL_VARIANT_VIRTUAL => fail!("raw_data not supported for virtual cells"),
+                CELL_VARIANT_LAZY_LOAD => LazyLoadCell::try_load(self.content_ptr())?.raw_data(),
                 _ => unreachable!(),
             }
         }
@@ -2352,6 +2674,9 @@ impl Cell {
                     let p = self.content_ptr();
                     return VirtualCell::inner(p).level_mask().virtualize(VirtualCell::offset(p));
                 }
+                CELL_VARIANT_LAZY_LOAD => {
+                    return LazyLoadCell::level_mask(self.content_ptr());
+                }
                 _ => {}
             }
         }
@@ -2373,6 +2698,7 @@ impl Cell {
                         self.level() as usize + 1
                     };
                 }
+                CELL_VARIANT_LAZY_LOAD => return LazyLoadCell::hashes_count(self.content_ptr()),
                 _ => {}
             }
         }
@@ -2398,6 +2724,7 @@ impl Cell {
                     let virt_idx = inner.level_mask().calc_virtual_hash_index(index, off);
                     return inner.hash(virt_idx);
                 }
+                CELL_VARIANT_LAZY_LOAD => return LazyLoadCell::hash(self.content_ptr(), index),
                 _ => {}
             }
         }
@@ -2415,6 +2742,7 @@ impl Cell {
                     let virt_idx = inner.level_mask().calc_virtual_hash_index(index, off);
                     return inner.depth(virt_idx);
                 }
+                CELL_VARIANT_LAZY_LOAD => return LazyLoadCell::depth(self.content_ptr(), index),
                 _ => {}
             }
         }
@@ -2434,6 +2762,9 @@ impl Cell {
                     let inner = VirtualCell::inner(p);
                     let virt_idx = inner.level_mask().calc_virtual_hash_index(index, off);
                     return inner.hash_depth(virt_idx);
+                }
+                CELL_VARIANT_LAZY_LOAD => {
+                    return LazyLoadCell::hash_depth(self.content_ptr(), index)
                 }
                 _ => {}
             }
@@ -2480,6 +2811,9 @@ impl Cell {
                     UsageCell::reference(p, index)
                 }
                 CELL_VARIANT_VIRTUAL => VirtualCell::reference(self.content_ptr(), index),
+                CELL_VARIANT_LAZY_LOAD => {
+                    LazyLoadCell::try_load(self.content_ptr())?.reference(index)
+                }
                 _ => unreachable!(),
             }
         }
@@ -2554,6 +2888,12 @@ impl Cell {
     #[allow(dead_code)]
     pub fn is_pruned(&self) -> bool {
         self.cell_type() == CellType::PrunedBranch
+    }
+
+    /// True if this is a `LazyLoadCell` — regardless of whether its inner
+    /// cell has been resolved yet. Does NOT trigger the loader.
+    pub fn is_lazy(&self) -> bool {
+        !self.is_data_cell() && self.variant_tag() == CELL_VARIANT_LAZY_LOAD
     }
 
     pub fn to_hex_string(&self, lower: bool) -> String {

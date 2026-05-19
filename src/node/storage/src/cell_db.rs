@@ -33,6 +33,8 @@ pub struct CellDb {
     storing_cells: Arc<lockfree::map::Map<UInt256, Cell>>,
     #[cfg(feature = "telemetry")]
     storing_cells_count: AtomicU64,
+    #[cfg(feature = "telemetry")]
+    storing_cells_bytes: AtomicU64,
     cell_cache: quick_cache::sync::Cache<UInt256, Cell>,
     /// Loader for cells loaded from DB (StoredCell)
     stored_loader: OnceLock<CellLoader>,
@@ -60,6 +62,8 @@ impl CellDb {
             storing_cells: Arc::new(lockfree::map::Map::new()),
             #[cfg(feature = "telemetry")]
             storing_cells_count: AtomicU64::new(0),
+            #[cfg(feature = "telemetry")]
+            storing_cells_bytes: AtomicU64::new(0),
             cell_cache: quick_cache::sync::Cache::new(config.cells_lru_cache_capacity),
             stored_loader: OnceLock::new(),
             storing_loader: OnceLock::new(),
@@ -214,8 +218,14 @@ impl CellDb {
                     );
                     #[cfg(feature = "telemetry")]
                     {
+                        let alloc_size = removed.val().alloc_size() as u64;
                         let _count = self.storing_cells_count.fetch_sub(1, Ordering::Relaxed);
+                        let _bytes =
+                            self.storing_cells_bytes.fetch_sub(alloc_size, Ordering::Relaxed);
                         self.telemetry.storing_cells.update(_count - 1);
+                        self.telemetry
+                            .storing_cells_bytes
+                            .update(_bytes.saturating_sub(alloc_size));
                     }
 
                     // Evict from cell_cache so next load gets stored_loader version
@@ -351,9 +361,13 @@ impl CellsFactory for CellDb {
                 log::trace!(target: TARGET, "CellDb::create_cell {:x} - created new", cell.repr_hash());
                 #[cfg(feature = "telemetry")]
                 {
+                    let cell_size = cell.alloc_size() as u64;
                     let storing_cells_count =
                         self.storing_cells_count.fetch_add(1, Ordering::Relaxed);
+                    let storing_cells_bytes =
+                        self.storing_cells_bytes.fetch_add(cell_size, Ordering::Relaxed);
                     self.telemetry.storing_cells.update(storing_cells_count + 1);
+                    self.telemetry.storing_cells_bytes.update(storing_cells_bytes + cell_size);
                 }
             }
             lockfree::map::Insertion::Failed(_) => {
@@ -369,6 +383,9 @@ impl CellsFactory for CellDb {
         }
 
         Ok(result_cell)
+    }
+    fn create_lazy_load_cell(self: Arc<Self>, pruned: &Cell, merkle_depth: u8) -> Result<Cell> {
+        Cell::lazy_from_pruned(pruned, self.stored_loader().clone(), merkle_depth)
     }
 }
 

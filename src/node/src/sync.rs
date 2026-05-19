@@ -113,6 +113,11 @@ pub(crate) async fn start_sync(
         let archive_context = archive_context.unwrap_or_else(|| {
             let shards_count = 1 << sync_context.engine.get_monitor_min_split();
             sync_context.downloads += shards_count + 1;
+            log::info!(
+                target: TARGET,
+                "downloads mc={mc_seq_no} update: {} => {}",
+                sync_context.downloads - shards_count - 1, sync_context.downloads,
+            );
             ArchiveContext {
                 absent_shards: HashMap::new(),
                 loaded_shards: HashMap::new(),
@@ -222,19 +227,25 @@ pub(crate) async fn start_sync(
     async fn new_downloads(
         sync_context: &mut SyncContext,
         queue: &mut Vec<(u32, ArchiveStatus)>,
-        mut sync_mc_seq_no: u32,
+        sync_mc_seq_no: u32,
     ) -> Result<()> {
         force_redownload(sync_context, queue).await?;
+        // Gap-close: nothing in queue moves us past sync_mc_seq_no.
+        if !queue.iter().any(|(s, _)| *s <= sync_mc_seq_no) {
+            queue.push((sync_mc_seq_no, ArchiveStatus::Downloading));
+            download(sync_context, sync_mc_seq_no, None);
+        }
+        // Prefetch above the max queued entry to avoid overlapping with existing.
+        let mut next =
+            queue.iter().map(|(s, _)| *s).max().unwrap_or(sync_mc_seq_no) + ARCHIVE_PACKAGE_SIZE;
         while sync_context.downloads < sync_context.concurrency {
             if queue.len() > sync_context.concurrency {
                 // Do not download too much in advance due to possible OOM
                 break;
             }
-            if !queue.iter().any(|(seq_no, _)| seq_no == &sync_mc_seq_no) {
-                queue.push((sync_mc_seq_no, ArchiveStatus::Downloading));
-                download(sync_context, sync_mc_seq_no, None);
-            }
-            sync_mc_seq_no += ARCHIVE_PACKAGE_SIZE;
+            queue.push((next, ArchiveStatus::Downloading));
+            download(sync_context, next, None);
+            next += ARCHIVE_PACKAGE_SIZE;
         }
         log::info!(
             target: TARGET,
@@ -331,7 +342,13 @@ pub(crate) async fn start_sync(
                     match apply(&mut sync_context, seq_no, &last_mc_block_id, archive_context).await
                     {
                         Ok(Some(archive_context)) => {
-                            sync_context.downloads += before - archive_context.calc_downloaded();
+                            let delta = before - archive_context.calc_downloaded();
+                            sync_context.downloads += delta;
+                            log::info!(
+                                target: TARGET,
+                                "downloads mc={seq_no} apply-queued-incomplete: {} +{delta} => {}",
+                                sync_context.downloads - delta, sync_context.downloads,
+                            );
                             queue.insert(
                                 index,
                                 (seq_no, ArchiveStatus::Incomplete(archive_context)),
@@ -376,6 +393,11 @@ pub(crate) async fn start_sync(
                         fail!("INTERNAL ERROR: sync queue broken")
                     };
                     sync_context.downloads -= update;
+                    log::info!(
+                        target: TARGET,
+                        "downloads mc={seq_no_recv} response: {} -{update} => {}",
+                        sync_context.downloads + update, sync_context.downloads,
+                    );
                     let incomplete =
                         archive_context.master.is_none() || archive_context.has_retryable_shards();
                     let archive_context = if incomplete {
@@ -391,8 +413,13 @@ pub(crate) async fn start_sync(
                         .await
                         {
                             Ok(Some(archive_context)) => {
-                                sync_context.downloads +=
-                                    before - archive_context.calc_downloaded();
+                                let delta = before - archive_context.calc_downloaded();
+                                sync_context.downloads += delta;
+                                log::info!(
+                                    target: TARGET,
+                                    "downloads mc={seq_no_recv} apply-fresh-incomplete: {} +{delta} => {}",
+                                    sync_context.downloads - delta, sync_context.downloads,
+                                );
                                 Some(archive_context)
                             }
                             Ok(None) => {
@@ -815,7 +842,13 @@ async fn import_shard_blocks(
             miss {absent_blocks} blocks among {total_blocks} total ones"
         );
     }
-    sync_context.downloads -= archive_context.shards_count - archive_context.loaded_shards.len();
+    let delta = archive_context.shards_count - archive_context.loaded_shards.len();
+    sync_context.downloads -= delta;
+    log::info!(
+        target: TARGET,
+        "downloads mc={mc_seq_no} import-done: {} -{delta} => {}",
+        sync_context.downloads + delta, sync_context.downloads,
+    );
     Ok(None)
 }
 

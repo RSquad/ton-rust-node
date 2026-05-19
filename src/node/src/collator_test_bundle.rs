@@ -198,6 +198,7 @@ pub fn create_engine_telemetry() -> Arc<EngineTelemetry> {
         awaiters: Metric::without_totals("", 1),
         catchain_clients: Metric::without_totals("", 1),
         cells: Metric::without_totals("", 1),
+        cells_mb: Metric::without_totals("", 1),
         shard_states: Metric::without_totals("", 1),
         top_blocks: Metric::without_totals("", 1),
         validator_adnl_keys: Metric::without_totals("", 1),
@@ -205,6 +206,10 @@ pub fn create_engine_telemetry() -> Arc<EngineTelemetry> {
         validator_sets: Metric::without_totals("", 1),
         account_state_cache_mb: Metric::without_totals("", 1),
         storage_dicts_cache_cells: Metric::without_totals("", 1),
+        jemalloc_allocated_mb: Metric::without_totals("", 1),
+        jemalloc_resident_mb: Metric::without_totals("", 1),
+        jemalloc_mapped_mb: Metric::without_totals("", 1),
+        jemalloc_retained_mb: Metric::without_totals("", 1),
     })
 }
 

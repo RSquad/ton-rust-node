@@ -76,14 +76,15 @@ pub enum Job {
 
 #[async_trait::async_trait]
 pub trait Callback: Sync + Send {
-    async fn invoke(&self, job: Job, ok: bool);
+    /// Invoked only on successful apply; failures are retried, stop skips it.
+    async fn invoke(&self, job: Job);
 }
 
 pub struct SsNotificationCallback(tokio::sync::Notify);
 
 #[async_trait::async_trait]
 impl Callback for SsNotificationCallback {
-    async fn invoke(&self, _job: Job, _ok: bool) {
+    async fn invoke(&self, _job: Job) {
         self.0.notify_one();
     }
 }
@@ -577,37 +578,42 @@ impl ShardStateDb {
                 self.telemetry.shardstates_queue.update(std::cmp::max(0, in_queue) as u64);
                 log::debug!("ShardStateDb worker: in_queue {}", in_queue);
 
-                let mut ok = false;
-                match &mut job {
-                    Job::PutState(cell, id) => match self.clone().put_internal(id, cell.clone()) {
-                        Err(e) => {
-                            if check_stop() {
-                                return;
+                loop {
+                    match &mut job {
+                        Job::PutState(cell, id) => {
+                            match self.clone().put_internal(id, cell.clone()) {
+                                Err(e) => {
+                                    if check_stop() {
+                                        return;
+                                    }
+                                    log::error!(
+                                        target: TARGET, "CRITICAL! ShardStateDb::put_internal  {}", e
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                                Ok(saved_root) => {
+                                    *cell = saved_root;
+                                }
                             }
-                            log::error!(
-                                target: TARGET, "CRITICAL! ShardStateDb::put_internal  {}", e
-                            );
                         }
-                        Ok(saved_root) => {
-                            *cell = saved_root;
-                            ok = true;
-                        }
-                    },
-                    Job::DeleteState(id) => {
-                        if let Err(e) = self.clone().delete_internal(id) {
-                            if check_stop() {
-                                return;
+                        Job::DeleteState(id) => {
+                            if let Err(e) = self.clone().delete_internal(id) {
+                                if check_stop() {
+                                    return;
+                                }
+                                log::error!(
+                                    target: TARGET, "CRITICAL! ShardStateDb::delete_internal  {}", e
+                                );
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
                             }
-                            log::error!(
-                                target: TARGET, "CRITICAL! ShardStateDb::delete_internal  {}", e
-                            );
-                        } else {
-                            ok = true
                         }
                     }
+                    break;
                 }
                 if let Some(callback) = callback {
-                    let _ = callback.invoke(job, ok).await;
+                    let _ = callback.invoke(job).await;
                 }
             }
         }
@@ -662,6 +668,8 @@ impl ShardStateDb {
         let db_entry = DbEntry::deserialize(&self.shardstate_db.get(id)?)?;
 
         let ss_db = self.clone();
+        let shardstate_db = self.shardstate_db.clone();
+        let id_for_batch = id.clone();
         tokio::task::block_in_place(|| {
             let check_stop = || {
                 if ss_db.stop.load(Ordering::Relaxed) & Self::MASK_STOPPED != 0 {
@@ -670,10 +678,10 @@ impl ShardStateDb {
                     Ok(())
                 }
             };
-            ss_db.dynamic_boc_db.delete_boc(&db_entry.cell_id, &check_stop)
+            ss_db.dynamic_boc_db.delete_boc(&db_entry.cell_id, &check_stop, |batch| {
+                shardstate_db.add_delete_to_batch(batch, &id_for_batch)
+            })
         })?;
-
-        self.shardstate_db.delete(id)?;
 
         log::trace!(target: TARGET, "ShardStateDb::delete_internal  DONE  id {}", id);
         Ok(())
