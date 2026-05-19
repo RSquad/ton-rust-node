@@ -306,6 +306,15 @@ impl AppError {
             body: ApiErrorBody { code: 500, message: message.into() },
         }
     }
+
+    /// `503 Service Unavailable` — for upstream dependencies that are down
+    /// (e.g. ton-http-api unreachable).
+    pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            body: ApiErrorBody { code: 503, message: message.into() },
+        }
+    }
 }
 
 impl axum::response::IntoResponse for AppError {

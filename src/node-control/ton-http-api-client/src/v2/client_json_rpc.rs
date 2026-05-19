@@ -22,6 +22,16 @@ use toncenter_rs::client::{
     ApiClientV2 as TonApiClientV2, ApiKey as TonApiKey, Network as TonNetwork,
 };
 
+/// Marker embedded in the aggregated "all endpoints failed" error. Call sites
+/// should use [`is_endpoints_unreachable`] rather than matching on it directly.
+pub const ENDPOINTS_UNREACHABLE_TAG: &str = "ton-http-api unreachable";
+
+/// `true` if `err` (or any source in its chain) is the aggregated
+/// "all endpoints failed" error from [`ClientJsonRpc::json_rpc`].
+pub fn is_endpoints_unreachable(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.to_string().contains(ENDPOINTS_UNREACHABLE_TAG))
+}
+
 struct EndpointClient {
     url: String,
     client: TonApiClientV2,
@@ -186,7 +196,7 @@ impl ClientJsonRpc {
             failures = %detail,
             "ton-http-api unreachable on all endpoints"
         );
-        anyhow::bail!("ton-http-api unreachable: tried {} endpoint(s): [{}]", total, detail)
+        anyhow::bail!("{}: tried {} endpoint(s): [{}]", ENDPOINTS_UNREACHABLE_TAG, total, detail)
     }
 
     pub async fn get_config_param(&self, param_id: u32) -> anyhow::Result<ConfigParamEnum> {
@@ -306,7 +316,7 @@ impl ClientJsonRpc {
 
 #[cfg(test)]
 mod tests {
-    use super::ClientJsonRpc;
+    use super::{ClientJsonRpc, is_endpoints_unreachable};
     use common::app_config::EndpointTimeouts;
     use std::{
         sync::{
@@ -490,6 +500,10 @@ mod tests {
         assert!(
             !err_text.contains("Request `getAddressInformation`"),
             "error should not include method wrapper text: {err_text}"
+        );
+        assert!(
+            is_endpoints_unreachable(&err),
+            "helper should recognize aggregated unreachable error: {err_text}"
         );
 
         bad_1_handle.await.expect("bad_1 server task");

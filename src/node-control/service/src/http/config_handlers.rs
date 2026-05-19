@@ -31,7 +31,10 @@ use contracts::{
 use control_client::client_adnl::ControlClientAdnl;
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::SystemTime};
 use ton_block::{MsgAddressInt, write_boc};
-use ton_http_api_client::v2::{client_json_rpc::ClientJsonRpc, data_models::AccountState};
+use ton_http_api_client::v2::{
+    client_json_rpc::{ClientJsonRpc, is_endpoints_unreachable},
+    data_models::AccountState,
+};
 
 /// `type_id` for ADNL public keys (Ed25519).
 const ADNL_PUBKEY_TYPE_ID: i32 = 1209251014;
@@ -725,6 +728,9 @@ pub async fn v1_wallets_handler(
                 Ok(info) => {
                     (Some(addr_str), Some(info.account_state.to_string()), Some(info.balance))
                 }
+                Err(e) if is_endpoints_unreachable(&e) => {
+                    return Err(AppError::service_unavailable(format!("{e:#}")));
+                }
                 Err(_) => (Some(addr_str), None, None),
             }
         } else {
@@ -786,14 +792,13 @@ pub async fn v1_pools_handler(
                 // Pool has an explicit address in config — try to fetch balance directly
                 } else if let Some(a) = address {
                     match MsgAddressInt::from_str(a) {
-                        Ok(parsed) => {
-                            let bal = rpc_client
-                                .get_address_information(&parsed)
-                                .await
-                                .ok()
-                                .map(|info| info.balance);
-                            (Some(a.clone()), bal)
-                        }
+                        Ok(parsed) => match rpc_client.get_address_information(&parsed).await {
+                            Ok(info) => (Some(a.clone()), Some(info.balance)),
+                            Err(e) if is_endpoints_unreachable(&e) => {
+                                return Err(AppError::service_unavailable(format!("{e:#}")));
+                            }
+                            Err(_) => (Some(a.clone()), None),
+                        },
                         Err(_) => (Some(a.clone()), None),
                     }
                 // Pool has neither cached instance nor address (e.g. only owner, no binding)
@@ -836,8 +841,12 @@ pub async fn v1_pools_handler(
                 }
                 let mut slots: Vec<TonCorePoolSlotDto> = Vec::new();
                 while let Some(joined) = set.join_next().await {
-                    if let Ok(slot) = joined {
-                        slots.push(slot);
+                    match joined {
+                        Ok(Ok(slot)) => slots.push(slot),
+                        Ok(Err(e)) if is_endpoints_unreachable(&e) => {
+                            return Err(AppError::service_unavailable(format!("{e:#}")));
+                        }
+                        Ok(Err(_)) | Err(_) => {}
                     }
                 }
                 slots.sort_by(|a, b| a.slot.cmp(&b.slot));
@@ -903,7 +912,7 @@ async fn fetch_toncore_slot_dto(
     slot_idx: usize,
     slot_cfg: TonCorePoolConfig,
     cached: Option<Arc<dyn NominatorWrapper>>,
-) -> TonCorePoolSlotDto {
+) -> Result<TonCorePoolSlotDto, anyhow::Error> {
     let TonCorePoolConfig { address: config_address, deploy_mode, params } = slot_cfg;
     let slot_name = if slot_idx == 0 { "even" } else { "odd" };
 
@@ -948,6 +957,7 @@ async fn fetch_toncore_slot_dto(
                         addr_for_active,
                     )
                 }
+                Err(e) if is_endpoints_unreachable(&e) => return Err(e),
                 Err(_) => (
                     TonCorePoolSlotDto {
                         slot: slot_name.to_string(),
@@ -980,6 +990,7 @@ async fn fetch_toncore_slot_dto(
                 dto.last_election_id = Some(d.stake_at);
                 deploy_params_from_chain = true;
             }
+            Err(e) if is_endpoints_unreachable(&e) => return Err(e),
             Err(e) => {
                 tracing::warn!(
                     slot = slot_name,
@@ -1001,7 +1012,7 @@ async fn fetch_toncore_slot_dto(
         None
     };
 
-    dto
+    Ok(dto)
 }
 
 #[utoipa::path(
@@ -1249,6 +1260,9 @@ pub async fn v1_master_wallet_handler(
             Ok(info) => {
                 let pk = extract_public_key(&state).await;
                 (Some(addr_str), Some(info.account_state.to_string()), Some(info.balance), pk)
+            }
+            Err(e) if is_endpoints_unreachable(&e) => {
+                return Err(AppError::service_unavailable(format!("{e:#}")));
             }
             Err(_) => (Some(addr_str), None, None, None),
         };
