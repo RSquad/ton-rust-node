@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+
 use crate::{
     crypto::{
         blob_in_memory::BlobInMemory, crypto_trait::Crypto, key_material::KeyMaterial,
@@ -70,7 +71,7 @@ pub fn decrypt(
     }
 
     let read_lock_decrypted_data = decrypted_data.lock()?;
-    let read_data = &read_lock_decrypted_data as &[u8];
+    let read_data: &[u8] = &read_lock_decrypted_data;
 
     let (data_len_bytes, rest) = read_data.split_at(size_of::<u32>());
     let (meta_len_bytes, rest) = rest.split_at(size_of::<u32>());

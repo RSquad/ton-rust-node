@@ -22,7 +22,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use ton_api::IntoBoxed;
-use ton_block::{Ed25519KeyOption, UInt256};
+use ton_block::{Ed25519KeyOption, UInt256, ZeroizingBytes};
 
 include!("../../../common/src/test.rs");
 
@@ -329,7 +329,7 @@ fn test_catchain_network_in_process_overlay() {
     // Create node descriptions with shared overlay manager and generated private keys
     let mut node_descs = Vec::new();
     for _ in 0..NODE_COUNT {
-        let private_key = Ed25519KeyOption::generate().unwrap();
+        let private_key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let adnl_id = private_key.id().clone();
         node_descs.push(NodeDesc {
             overlay_manager: overlay_manager.clone(),
@@ -368,7 +368,7 @@ fn test_catchain_network_adnl_overlay() {
     let mut node_descs = Vec::new();
     for i in 0..NODE_COUNT {
         let test_node = test_network.get_node(i);
-        let private_key = Ed25519KeyOption::generate().unwrap();
+        let private_key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let adnl_id = test_node.stack.adnl.key_by_tag(test_node.adnl_tag).unwrap().id().clone();
         node_descs.push(NodeDesc {
             overlay_manager: test_node.overlay_manager.clone(),

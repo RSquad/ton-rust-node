@@ -50,7 +50,7 @@ use ton_api::{
 };
 use ton_block::{
     base64_decode, base64_encode, error, fail, sha256_digest, Ed25519KeyOption, KeyId, KeyOption,
-    Result, UInt256, UnixTime,
+    Result, UInt256, UnixTime, ZeroizingBytes,
 };
 
 #[path = "./test_utils.rs"]
@@ -1302,7 +1302,7 @@ fn test_drop() {
 #[test]
 fn test_new_broadcast() {
     const HOPS: u8 = 5;
-    let src = Ed25519KeyOption::generate().unwrap();
+    let src = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let bcast = BroadcastOrd {
         src: (&src).try_into().unwrap(),
         certificate: OverlayCertificate::Overlay_EmptyCertificate,
@@ -1340,7 +1340,7 @@ async fn test_overlay_semiprivate() -> Result<()> {
         let pi = PeerInfo {
             id,
             ip,
-            pub_key: Ed25519KeyOption::from_public_key(
+            pub_key: Ed25519KeyOption::<ZeroizingBytes>::from_public_key(
                 cfg.key_by_tag(KEY_TAG_OVERLAY)?.pub_key()?.try_into()?,
             ),
             key: cfg.key_by_tag(KEY_TAG_OVERLAY)?.clone(),

@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+
 use crate::{
     crypto::key_material::KeyMaterial, errors::error::VaultError,
     memory::protected_memory::ProtectedMemoryInner, utils::hex::hex_decode,

@@ -12,6 +12,7 @@ use adnl::common::AdnlCryptoUtils;
 #[cfg(feature = "node")]
 use adnl::node::AddressCache;
 use rand::Rng;
+use secrets_vault::memory::protected_memory::ProtectedMemory;
 use std::convert::TryInto;
 #[cfg(feature = "node")]
 use std::sync::{Arc, Barrier};
@@ -25,7 +26,7 @@ include!("../../common/src/test.rs");
 #[test]
 fn sign_verify() {
     let data: [u8; 32] = rand::thread_rng().gen();
-    let key = Ed25519KeyOption::generate().unwrap();
+    let key = Ed25519KeyOption::<ProtectedMemory>::generate().unwrap();
     let signature = key.sign(&data).unwrap();
     assert!(key.verify(&data, &signature).is_ok())
 }
@@ -123,7 +124,9 @@ fn test_private_to_public() {
     println!("");
     for pvt in pvts.iter() {
         let pvt = hex::decode(pvt).unwrap();
-        let key = Ed25519KeyOption::from_private_key(&pvt.clone().try_into().unwrap()).unwrap();
+        let key =
+            Ed25519KeyOption::<ProtectedMemory>::from_private_key(&pvt.clone().try_into().unwrap())
+                .unwrap();
         println!(
             "Private {} -> {}, id {}",
             base64_encode(&pvt),
@@ -140,20 +143,20 @@ fn test_shared_secret() {
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
         0x7f, 0x60,
     ];
-    let key_a = Ed25519KeyOption::from_private_key(&key_a).unwrap();
+    let key_a = Ed25519KeyOption::<ProtectedMemory>::from_private_key(&key_a).unwrap();
     let key_b = [
         0xc5, 0xaa, 0x8d, 0xf4, 0x3f, 0x9f, 0x83, 0x7b, 0xed, 0xb7, 0x44, 0x2f, 0x31, 0xdc, 0xb7,
         0xb1, 0x66, 0xd3, 0x85, 0x35, 0x07, 0x6f, 0x09, 0x4b, 0x85, 0xce, 0x3a, 0x2e, 0x0b, 0x44,
         0x58, 0xf7,
     ];
-    let key_b = Ed25519KeyOption::from_private_key(&key_b).unwrap();
+    let key_b = Ed25519KeyOption::<ProtectedMemory>::from_private_key(&key_b).unwrap();
     let shared_secret_a =
         key_a.shared_secret(key_b.pub_key().unwrap().try_into().unwrap()).unwrap();
-    println!("secret(PK1, PubK2)={}", hex::encode(&shared_secret_a));
+    println!("secret(PK1, PubK2)={}", hex::encode(shared_secret_a.lock().unwrap().as_ref()));
     let shared_secret_b =
         key_b.shared_secret(key_a.pub_key().unwrap().try_into().unwrap()).unwrap();
-    println!("secret(PK2, PubK1)={}", hex::encode(&shared_secret_b));
-    assert_eq!(shared_secret_a, shared_secret_b);
+    println!("secret(PK2, PubK1)={}", hex::encode(shared_secret_b.lock().unwrap().as_ref()));
+    assert_eq!(shared_secret_a.lock().unwrap().as_ref(), shared_secret_b.lock().unwrap().as_ref());
 }
 
 #[test]

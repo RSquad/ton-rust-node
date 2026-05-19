@@ -4234,7 +4234,11 @@ impl SessionProcessorImpl {
 
         if log::log_enabled!(log::Level::Debug) {
             #[cfg(feature = "export_key")]
-            let exp_pvt_key_dump = hex::encode(local_key.export_key().unwrap());
+            let exp_pvt_key_dump = local_key
+                .exp_key()
+                .and_then(|k| k.lock())
+                .map(|g| hex::encode(g.as_ref()))
+                .unwrap_or_else(|e| format!("<error: {e}>"));
             #[cfg(not(feature = "export_key"))]
             let exp_pvt_key_dump = "<SECRET>".to_string();
 

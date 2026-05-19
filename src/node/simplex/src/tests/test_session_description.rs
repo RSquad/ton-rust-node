@@ -14,13 +14,14 @@ use crate::{
     SessionId, SessionNode, SessionOptions,
 };
 use std::time::{Duration, SystemTime};
-use ton_block::{Ed25519KeyOption, ShardIdent};
+use ton_block::{Ed25519KeyOption, ShardIdent, ZeroizingBytes};
 
 /// Create test validators with equal weights
 fn create_test_validators(count: u32) -> Vec<SessionNode> {
     (0..count)
         .map(|_| {
-            let public_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+            let public_key =
+                Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
             let adnl_id = public_key.id().clone();
             SessionNode { public_key, adnl_id, weight: 1 }
         })
@@ -32,7 +33,8 @@ fn create_test_validators_weighted(weights: &[u64]) -> Vec<SessionNode> {
     weights
         .iter()
         .map(|&weight| {
-            let public_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+            let public_key =
+                Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
             let adnl_id = public_key.id().clone();
             SessionNode { public_key, adnl_id, weight }
         })
@@ -103,7 +105,8 @@ fn test_new_with_different_local_idx() {
 #[test]
 fn test_new_fails_with_unknown_local_id() {
     let nodes = create_test_validators(4);
-    let unknown_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+    let unknown_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
     let shard = ShardIdent::masterchain();
     let opts = SessionOptions::default();
 

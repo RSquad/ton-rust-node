@@ -7,10 +7,10 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::*;
-use ton_block::Ed25519KeyOption;
+use ton_block::{Ed25519KeyOption, ZeroizingBytes};
 
 fn make_test_key() -> Arc<dyn KeyOption> {
-    Ed25519KeyOption::generate().unwrap()
+    Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()
 }
 
 fn make_validator_node(

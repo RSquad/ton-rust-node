@@ -23,7 +23,7 @@ use ton_api::{
     ton::{consensus::overlayid::OverlayId, pub_::publickey::Overlay},
     IntoBoxed,
 };
-use ton_block::{Ed25519KeyOption, KeyId, UInt256};
+use ton_block::{Ed25519KeyOption, KeyId, UInt256, ZeroizingBytes};
 
 #[test]
 fn test_candidate_resolver_cache_new() {
@@ -176,8 +176,9 @@ fn test_receiver_compute_overlay_id_matches_cpp_private_overlay() {
 
     let session_id: SessionId = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..4).map(|_| Ed25519KeyOption::generate().expect("failed to generate key")).collect();
+    let keys: Vec<_> = (0..4)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("failed to generate key"))
+        .collect();
 
     let nodes: Vec<SessionNode> = keys
         .iter()

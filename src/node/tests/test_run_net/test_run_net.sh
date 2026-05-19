@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+# This test uses Plain (inline) keys in config.json. An external vault would
+# accumulate validator keys across runs; ensure each run starts clean.
+unset VAULT_URL
+
 NODES=6
 WORKCHAINS=false
 CURRENT_BRANCH="$(git branch --show-current)"

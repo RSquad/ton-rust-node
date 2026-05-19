@@ -24,7 +24,7 @@ use ton_api::{
     serialize_boxed,
     ton::consensus::simplex::{UnsignedVote, VoteSignatureSet},
 };
-use ton_block::{Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes};
 
 /// Create test session description with given number of validators
 fn create_test_session_desc(num_validators: usize) -> (SessionDescription, Vec<PrivateKey>) {
@@ -32,7 +32,7 @@ fn create_test_session_desc(num_validators: usize) -> (SessionDescription, Vec<P
     let mut keys = Vec::with_capacity(num_validators);
 
     for _ in 0..num_validators {
-        let key = Ed25519KeyOption::generate().expect("Failed to generate key");
+        let key = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
         let adnl_id = key.id().clone();
         nodes.push(SessionNode {
             public_key: key.clone(),

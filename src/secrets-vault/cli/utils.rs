@@ -70,7 +70,7 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-pub fn print_secret_full(secret: &Secret) -> anyhow::Result<()> {
+pub fn print_secret_full(secret: &Secret, show_private: bool) -> anyhow::Result<()> {
     let metadata = secret.metadata();
     let secret_id = metadata
         .secret_id
@@ -103,6 +103,19 @@ pub fn print_secret_full(secret: &Secret) -> anyhow::Result<()> {
     if let Secret::KeyPair { keypair } = secret {
         if let Some(pub_key) = keypair.public_key() {
             println!("  {} {}", "Public Key:".cyan().bold(), base64::encode(pub_key));
+        }
+
+        if keypair.extractable() {
+            if show_private {
+                let pvt_key = keypair.private_key()?.lock()?;
+                println!("  {} {}", "Private Key:".cyan().bold(), base64::encode(pvt_key));
+            } else {
+                println!(
+                    "  {} {}",
+                    "Private Key:".cyan().bold(),
+                    "(hidden, pass --show-private to reveal)".dimmed()
+                );
+            }
         }
     }
 

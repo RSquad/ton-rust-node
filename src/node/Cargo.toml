@@ -103,7 +103,6 @@ lockfree = { path = '../lockfree' }
 secrets-vault = { path = '../secrets-vault', default-features = false, features = [
     "file-storage-json",
     "hashicorp-storage",
-    "ton-block",
 ] }
 storage = { path = 'storage' }
 ton_api = { path = '../tl/ton_api' }
@@ -119,6 +118,7 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+ctor = '0.2'
 tempfile = '3'
 difference = '2.0'
 external-ip = '6.0'

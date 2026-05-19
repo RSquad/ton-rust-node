@@ -2,6 +2,22 @@
 set -e
 source ./test_run_net.sh
 
+function dump_all_nodes_status {
+    echo "=== Per-node status at failure ==="
+    for (( N=1; N <= NODES; N++ )); do
+        local log="$TEST_ROOT/tmp/output_$N.log"
+        [ -f "$log" ] || continue
+        echo "--- node #$N ---"
+        echo "  Last Applied MC:     $(grep -E "Applied.*-1:8000000" "$log" 2>/dev/null | tail -1 | sed -E 's/.*Applied/Applied/')"
+        echo "  Last Applied shard:  $(grep -E "Applied.*\(0:" "$log" 2>/dev/null | tail -1 | sed -E 's/.*Applied/Applied/')"
+        echo "  Last collation:      $(grep "Collation successful" "$log" 2>/dev/null | tail -1)"
+        echo "  Last validator msg:  $(grep "\[validator" "$log" 2>/dev/null | tail -1)"
+        echo "  Last catchain msg:   $(grep "\[catchain" "$log" 2>/dev/null | tail -1)"
+        echo "  Recent errors:"
+        grep -E "ERROR|panic|FATAL" "$log" 2>/dev/null | tail -3 | sed 's/^/    /'
+    done
+}
+
 function find_block {
     LOOP_RES=0
     for (( N=1; N <= NODES; N++ ))
@@ -46,6 +62,7 @@ do
         date
         find_block "-1\:8000000000000000, 1"
         echo "Reached timeout limit"
+        dump_all_nodes_status
         bash "$TEST_ROOT/stop_network.sh"
         exit 1
     fi
@@ -62,6 +79,7 @@ do
         date
         find_block "-1\:8000000000000000, 50"
         echo "Reached timeout limit"
+        dump_all_nodes_status
         bash "$TEST_ROOT/stop_network.sh"
         exit 1
     fi
@@ -79,6 +97,7 @@ do
         date
         find_block "0:(.*), 50"
         echo "Reached timeout limit"
+        dump_all_nodes_status
         bash "$TEST_ROOT/stop_network.sh"
         exit 1
     fi

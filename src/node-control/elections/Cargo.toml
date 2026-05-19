@@ -22,7 +22,6 @@ contracts = { path = "../contracts" }
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
     "hashicorp-storage",
-    "ton-block",
 ] }
 
 [dev-dependencies]

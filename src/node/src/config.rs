@@ -22,6 +22,7 @@ use secrets_vault::{
     crypto::factory::CryptoFactory,
     errors::error::VaultError,
     make_secret_id,
+    memory::protected_memory::ProtectedMemory,
     storage::storage_trait::ListMode,
     types::{
         algorithm::Algorithm as SecretAlgorithm,
@@ -31,7 +32,7 @@ use secrets_vault::{
         store_mode::StoreMode as SecretStoreMode,
     },
     vault::SecretVault,
-    vault_block::BlockCryptoFactory,
+    vault_block::{get_key_option_factory, tokio_run, BlockCryptoFactory},
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -67,8 +68,8 @@ use ton_api::{
     IntoBoxed,
 };
 use ton_block::{
-    base64_decode, base64_encode, ed25519_create_private_key, error, fail, BlockIdExt,
-    Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, MsgAddressInt, Result, ShardIdent, UInt256,
+    base64_decode, base64_encode, error, fail, BlockIdExt, Ed25519KeyOption, KeyId, KeyOption,
+    KeyOptionJson, MsgAddressInt, Result, SecretBytes, ShardIdent, UInt256, ZeroizingBytes,
 };
 use ton_block_json::PathMap;
 
@@ -77,8 +78,8 @@ macro_rules! key_option_public_key {
     ($key: expr) => {
         format!(
             "{{
-               \"type_id\": 1209251014,
-               \"pub_key\": \"{}\"
+            \"type_id\": 1209251014,
+            \"pub_key\": \"{}\"
             }}",
             $key
         )
@@ -232,6 +233,8 @@ impl SecretsVaultConfig {
     const KEY_VALIDATOR_KEY_ID: &str = "validator_key_id";
     const SID_PRIVATE_KEYS: &str = "private_keys";
     const SID_VALIDATOR_KEYS: &str = "validator_keys";
+    const TYPE_ADNL_BOOTSTRAP_KEY: &str = "adnl_bootstrap_key";
+    const TYPE_ADNL_SERVER_KEY: &str = "adnl_server_key"; // Control/lite server
     const TYPE_PRIVATE_KEY: &str = "private_key";
     const TYPE_VALIDATOR_KEY: &str = "validator_key";
 
@@ -328,40 +331,99 @@ impl SecretsVaultConfig {
         Ok(())
     }
 
-    pub async fn save_private_key(key_id_b64: &str, key_json: &KeyOptionJson) -> Result<()> {
+    pub async fn save_private_key(
+        key_id_b64: &str,
+        key_config: &KeyOptionJson,
+        key: &Arc<dyn KeyOption>,
+    ) -> Result<()> {
+        if key_config.vault.is_none() {
+            return Ok(());
+        }
         let Some(vault) = Self::open_vault().await? else {
             return Ok(());
         };
-        let crypto = BlockCryptoFactory {}.new_crypto()?;
 
-        log::info!("Write key {key_id_b64} to the vault");
-        let key_pvt = key_json.get_pvt_key()?;
-        let secret_id = make_secret_id!(Self::SID_PRIVATE_KEYS, key_id_b64);
-        let metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
-            .with_tag(Self::KEY_TYPE, Self::TYPE_PRIVATE_KEY);
-        let secret = SecretInMemoryFactory::new_ed25519_pvtkey(&key_pvt, metadata, crypto)?;
+        let secret = {
+            let crypto = BlockCryptoFactory {}.new_crypto()?;
+
+            log::info!("Write key {key_id_b64} to the vault");
+            let key_pvt = ProtectedMemory::from_slice(key.pvt_key()?.lock()?.as_ref())?;
+            let secret_id = make_secret_id!(Self::SID_PRIVATE_KEYS, key_id_b64);
+            let metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
+                .with_tag(Self::KEY_TYPE, Self::TYPE_PRIVATE_KEY);
+
+            SecretInMemoryFactory::new_ed25519_pvtkey_protected(key_pvt, metadata, crypto)?
+        };
 
         vault.store(&secret, SecretStoreMode::CreateOrReplace).await
+    }
+
+    fn save_adnl_keys(
+        keys: &[Arc<dyn KeyOption>],
+        type_tag: &'static str,
+        log_label: &'static str,
+    ) -> Result<()> {
+        let mut snapshots = Vec::with_capacity(keys.len());
+        for key in keys {
+            let key_id_b64 = base64_encode(key.id().data());
+            let pvt = ProtectedMemory::from_slice(key.pvt_key()?.lock()?.as_ref())?;
+            snapshots.push((key_id_b64, pvt));
+        }
+        tokio_run(async {
+            let Some(vault) = Self::open_vault().await? else {
+                return Ok(());
+            };
+            for (key_id_b64, pvt) in snapshots {
+                log::info!("Write {log_label} {key_id_b64} to the vault");
+                let secret_id = make_secret_id!(key_id_b64);
+                let metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
+                    .with_tag(Self::KEY_TYPE, type_tag);
+                let crypto = BlockCryptoFactory {}.new_crypto()?;
+                let secret =
+                    SecretInMemoryFactory::new_ed25519_pvtkey_protected(pvt, metadata, crypto)?;
+                vault.store(&secret, SecretStoreMode::CreateOrReplace).await?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn save_adnl_bootstrap_keys(adnl: &AdnlNodeConfig, tags: &[usize]) -> Result<()> {
+        let keys: Vec<Arc<dyn KeyOption>> =
+            tags.iter().map(|&t| adnl.key_by_tag(t)).collect::<Result<_>>()?;
+        Self::save_adnl_keys(&keys, Self::TYPE_ADNL_BOOTSTRAP_KEY, "ADNL bootstrap key")
+    }
+
+    pub fn save_adnl_server_key(key: &Arc<dyn KeyOption>) -> Result<()> {
+        Self::save_adnl_keys(
+            std::slice::from_ref(key),
+            Self::TYPE_ADNL_SERVER_KEY,
+            "ADNL server key",
+        )
     }
 
     pub async fn save_validator_key(key: &ValidatorKeysJson) -> Result<()> {
         let Some(vault) = Self::open_vault().await? else {
             return Ok(());
         };
-        let crypto = BlockCryptoFactory {}.new_crypto()?;
 
-        log::info!("Write metadata for key {} to the vault", &key.validator_key_id);
-        let secret_id: SecretId = make_secret_id!(Self::SID_VALIDATOR_KEYS, &key.validator_key_id);
-        let mut metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
-            .with_tag(Self::KEY_TYPE, Self::TYPE_VALIDATOR_KEY)
-            .with_tag(Self::KEY_ELECTION_ID, key.election_id.to_string())
-            .with_tag(Self::KEY_EXPIRE_AT, key.expire_at.to_string())
-            .with_tag(Self::KEY_VALIDATOR_KEY_ID, &key.validator_key_id);
-        if let Some(adnl_key_id) = &key.validator_adnl_key_id {
-            log::info!("Write metadata for ADNL key {adnl_key_id} to the vault");
-            metadata = metadata.with_tag(Self::KEY_ADNL_KEY_ID, adnl_key_id);
-        }
-        let secret = SecretInMemoryFactory::new_raw(b"".as_slice(), metadata, crypto)?;
+        let secret = {
+            let crypto = BlockCryptoFactory {}.new_crypto()?;
+
+            log::info!("Write metadata for key {} to the vault", &key.validator_key_id);
+            let secret_id: SecretId =
+                make_secret_id!(Self::SID_VALIDATOR_KEYS, &key.validator_key_id);
+            let mut metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
+                .with_tag(Self::KEY_TYPE, Self::TYPE_VALIDATOR_KEY)
+                .with_tag(Self::KEY_ELECTION_ID, key.election_id.to_string())
+                .with_tag(Self::KEY_EXPIRE_AT, key.expire_at.to_string())
+                .with_tag(Self::KEY_VALIDATOR_KEY_ID, &key.validator_key_id);
+            if let Some(adnl_key_id) = &key.validator_adnl_key_id {
+                log::info!("Write metadata for ADNL key {adnl_key_id} to the vault");
+                metadata = metadata.with_tag(Self::KEY_ADNL_KEY_ID, adnl_key_id);
+            }
+
+            SecretInMemoryFactory::new_raw(b"".as_slice(), metadata, crypto)?
+        };
 
         vault.store(&secret, SecretStoreMode::CreateOrReplace).await
     }
@@ -556,10 +618,13 @@ impl TonNodeConfig {
                     } else {
                         fail!("IP address is not set in default config")
                     };
-                    let (adnl_config, _) = AdnlNodeConfig::with_ip_address_and_private_key_tags(
-                        ip_address,
-                        vec![NodeNetwork::TAG_DHT_KEY, NodeNetwork::TAG_OVERLAY_KEY],
-                    )?;
+                    let adnl_tags = vec![NodeNetwork::TAG_DHT_KEY, NodeNetwork::TAG_OVERLAY_KEY];
+                    let (adnl_config, adnl_node) =
+                        AdnlNodeConfig::with_ip_address_and_private_key_tags(
+                            ip_address,
+                            adnl_tags.clone(),
+                        )?;
+                    SecretsVaultConfig::save_adnl_bootstrap_keys(&adnl_node, &adnl_tags)?;
                     Some(adnl_config)
                 };
                 config.create_and_save_console_configs(configs_dir, client_console_key)?;
@@ -785,17 +850,8 @@ impl TonNodeConfig {
             .as_ref()
             .ok_or_else(|| error!("global config information not found in config.json!"))?;
         let global_config_path = self.build_config_path(name);
-        /*
-                let data = std::fs::read_to_string(global_config_path)
-                    .map_err(|err| error!("Global config file is not found! : {}", err))?;
-        */
         TonNodeGlobalConfig::from_json_file(global_config_path)
     }
-
-    // Unused
-    //    pub fn remove_all_validator_keys(&mut self) {
-    //        self.validator_keys = None;
-    //    }
 
     fn create_and_save_configs(
         &mut self,
@@ -813,7 +869,9 @@ impl TonNodeConfig {
             );
             return Ok(None);
         };
-        let (server_private_key, server_key) = Ed25519KeyOption::generate_with_json()?;
+
+        let (server_private_key, server_key) = get_key_option_factory().generate_with_json()?;
+        SecretsVaultConfig::save_adnl_server_key(&server_key)?;
 
         // generate and save client console template
         let client_config_file_path = TonNodeConfig::build_path(configs_dir, client_config_name);
@@ -1048,11 +1106,15 @@ impl TonNodeConfig {
     }
 
     fn generate_and_save_keys(&mut self, _key_type: i32) -> Result<([u8; 32], Arc<dyn KeyOption>)> {
-        let (private, public) = Ed25519KeyOption::generate_with_json()?;
+        let (mut private, public) = get_key_option_factory().generate_with_json()?;
         let key_id = public.id().data();
-        log::info!("generate_and_save_keys: generate new key (id: {})", base64_encode(key_id),);
+        let key_id_b64 = base64_encode(key_id);
+        log::info!("generate_and_save_keys: generate new key (id: {key_id_b64})");
+        if let Some(name) = &mut private.vault {
+            *name = make_secret_id!(SecretsVaultConfig::SID_PRIVATE_KEYS, &key_id_b64).to_string();
+        }
         let key_ring = self.validator_key_ring.get_or_insert_default();
-        key_ring.insert(base64_encode(key_id), private);
+        key_ring.insert(key_id_b64, private);
         Ok((*key_id, public))
     }
 
@@ -1062,16 +1124,17 @@ impl TonNodeConfig {
     ) -> Result<([u8; 32], Arc<dyn KeyOption>)> {
         match pvt_key {
             PrivateKey::Pk_Ed25519(pvt_key) => {
-                let (private, public) = Ed25519KeyOption::create_from_private_key_with_json(
-                    ed25519_create_private_key(pvt_key.key.as_array())?,
-                )?;
+                let (mut private, public) =
+                    get_key_option_factory().from_private_key_with_json(pvt_key.key.as_array())?;
                 let key_id = public.id().data();
-                log::info!(
-                    "import_private_key: import private key key (id: {})",
-                    base64_encode(key_id)
-                );
+                let key_id_b64 = base64_encode(key_id);
+                log::info!("import_private_key: import private key key (id: {key_id_b64})");
+                if let Some(name) = &mut private.vault {
+                    *name = make_secret_id!(SecretsVaultConfig::SID_PRIVATE_KEYS, &key_id_b64)
+                        .to_string();
+                }
                 let key_ring = self.validator_key_ring.get_or_insert_with(HashMap::new);
-                key_ring.insert(base64_encode(key_id), private);
+                key_ring.insert(key_id_b64, private);
                 Ok((*key_id, public))
             }
             _ => fail!("Unsupported key type"),
@@ -1494,20 +1557,20 @@ impl NodeConfigHandler {
         config_name: &str,
     ) -> Result<[u8; 32]> {
         log::info!("start generate key (type: {})", key_type);
-        let (key_id, public_key) = config.generate_and_save_keys(key_type)?;
+        let (key_id, key_opt) = config.generate_and_save_keys(key_type)?;
         config.save_to_file(config_name).await?;
 
         let id = base64_encode(key_id);
-        let key_json = config.validator_key_ring.as_ref().and_then(|r| r.get(&id)).cloned();
-        if let Some(key_json) = key_json {
+        let key_config = config.validator_key_ring.as_ref().and_then(|r| r.get(&id)).cloned();
+        if let Some(key_config) = key_config {
             try_n_times(3, Duration::from_millis(150), || {
-                SecretsVaultConfig::save_private_key(&id, &key_json)
+                SecretsVaultConfig::save_private_key(&id, &key_config, &key_opt)
             })
             .await?;
         }
 
         log::info!("finish generate key (type: {key_type}), key_id: {id}");
-        key_ring.insert(id, public_key.clone());
+        key_ring.insert(id, key_opt.clone());
         Ok(key_id)
     }
 
@@ -1522,10 +1585,10 @@ impl NodeConfigHandler {
         config.save_to_file(config_name).await?;
 
         let id = base64_encode(key_id);
-        let key_json = config.validator_key_ring.as_ref().and_then(|r| r.get(&id)).cloned();
-        if let Some(key_json) = key_json {
+        let key_config = config.validator_key_ring.as_ref().and_then(|r| r.get(&id)).cloned();
+        if let Some(key_config) = key_config {
             try_n_times(3, Duration::from_millis(150), || {
-                SecretsVaultConfig::save_private_key(&id, &key_json)
+                SecretsVaultConfig::save_private_key(&id, &key_config, &public_key)
             })
             .await?;
         }
@@ -1699,8 +1762,8 @@ impl NodeConfigHandler {
 
     fn get_key(config: &TonNodeConfig, key_id: [u8; 32]) -> Option<Arc<dyn KeyOption>> {
         if let Some(validator_key_ring) = &config.validator_key_ring {
-            if let Some(key_data) = validator_key_ring.get(&base64_encode(key_id)) {
-                match Ed25519KeyOption::from_private_key_json(key_data) {
+            if let Some(key_config) = validator_key_ring.get(&base64_encode(key_id)) {
+                match get_key_option_factory().from_private_key_json(key_config) {
                     Ok(key) => return Some(key),
                     _ => return None,
                 }
@@ -1766,12 +1829,17 @@ impl NodeConfigHandler {
         Ok(())
     }
 
-    fn add_key_to_dynamic_key_ring(&self, key_id: String, key_json: &KeyOptionJson) -> Result<()> {
-        let key = match *key_json.type_id() {
-            Ed25519KeyOption::KEY_TYPE => Ed25519KeyOption::from_private_key_json(key_json)?,
-            _ => fail!("Unknown key type (key_id: {})", key_id),
+    fn add_key_to_dynamic_key_ring(
+        &self,
+        key_id: String,
+        key_config: &KeyOptionJson,
+    ) -> Result<()> {
+        let key_option = match get_key_option_factory().from_private_key_json(key_config) {
+            Ok(k) => k,
+            Err(e) => fail!("Failed to load key (key_id: {}): {}", key_id, e),
         };
-        if let Some(key) = self.key_ring.insert(key.id().to_string(), key) {
+
+        if let Some(key) = self.key_ring.insert(key_option.id().to_string(), key_option) {
             log::warn!("Added key was already in key ring collection (id: {})", key.key());
         }
 
@@ -2065,7 +2133,7 @@ impl IdDhtNode {
         };
 
         let pub_key = key[..32].try_into()?;
-        Ok(Ed25519KeyOption::from_public_key(pub_key))
+        Ok(Ed25519KeyOption::<ZeroizingBytes>::from_public_key(pub_key))
     }
 }
 

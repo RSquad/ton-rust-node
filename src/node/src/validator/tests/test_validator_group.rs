@@ -16,7 +16,9 @@ use std::{
     sync::{atomic::AtomicBool, Mutex},
     time::Duration,
 };
-use ton_block::{signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId};
+use ton_block::{
+    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, ZeroizingBytes,
+};
 
 #[derive(Default)]
 struct DummyEngine;
@@ -89,7 +91,8 @@ fn make_group_impl_for_start_tests() -> ValidatorGroupImpl {
 }
 
 fn make_simplex_group_for_resolver_tests() -> Arc<ValidatorGroup> {
-    let local_key: PrivateKey = Ed25519KeyOption::generate().expect("key must be generated");
+    let local_key: PrivateKey =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("key must be generated");
     let validator_descr = ValidatorDescr::with_params(
         SigPubKey::from_bytes(local_key.pub_key().expect("pubkey bytes"))
             .expect("valid sig pubkey"),

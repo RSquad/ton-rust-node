@@ -55,7 +55,9 @@ use ton_api::{
     },
     IntoBoxed,
 };
-use ton_block::{error, sha256_digest, BlockIdExt, Ed25519KeyOption, Error, ShardIdent, UInt256};
+use ton_block::{
+    error, sha256_digest, BlockIdExt, Ed25519KeyOption, Error, ShardIdent, UInt256, ZeroizingBytes,
+};
 
 include!("../../../../common/src/info.rs");
 
@@ -560,7 +562,8 @@ fn run_receiver_test<F>(
     let mut private_keys = Vec::with_capacity(config.receiver_count);
 
     for _i in 0..config.receiver_count {
-        let private_key = Ed25519KeyOption::generate().expect("Failed to generate private key");
+        let private_key =
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let adnl_id = private_key.id();
 
         nodes.push(SessionNode {
@@ -748,8 +751,9 @@ fn test_receiver_candidate_resolver_forwards_candidate_before_notar() {
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -915,8 +919,9 @@ fn test_receiver_candidate_resolver() {
     let session_id = UInt256::rand();
 
     // Create 3 validators
-    let keys: Vec<_> =
-        (0..3).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..3)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -1133,8 +1138,9 @@ fn test_receiver_candidate_resolver_large_payload() {
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -1335,8 +1341,9 @@ fn test_receiver_send_certificate_and_standstill_rebroadcasts_cached_certificate
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -1446,8 +1453,9 @@ fn test_receiver_standstill_rebroadcasts_cached_local_votes() {
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -1535,8 +1543,9 @@ fn test_receiver_standstill_replay_respects_egress_budget() {
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -1627,8 +1636,9 @@ fn test_receiver_standstill_rebuilds_pending_queue_from_fresh_state() {
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -1745,8 +1755,9 @@ fn test_receiver_standstill_cache_deduplicates_equivalent_local_votes() {
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })
@@ -1836,8 +1847,9 @@ fn test_receiver_standstill_cache_does_not_overwrite_existing_certificate() {
     let overlay_manager = SessionFactory::create_in_process_overlay_manager(2);
     let session_id = UInt256::rand();
 
-    let keys: Vec<_> =
-        (0..2).map(|_| Ed25519KeyOption::generate().expect("Failed to generate key")).collect();
+    let keys: Vec<_> = (0..2)
+        .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key"))
+        .collect();
     let nodes: Vec<SessionNode> = keys
         .iter()
         .map(|k| SessionNode { public_key: k.clone(), adnl_id: k.id().clone(), weight: 1 })

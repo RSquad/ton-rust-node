@@ -39,7 +39,7 @@ use ton_api::{
 };
 use ton_block::{
     error, sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocReader, BocWriter,
-    BuilderData, Ed25519KeyOption, ShardIdent, UInt256,
+    BuilderData, Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes,
 };
 
 /*
@@ -1044,8 +1044,8 @@ where
             // Generate random nodes with in-process overlay
             let mut nodes = Vec::with_capacity(config.node_count);
             for _i in 0..config.node_count {
-                let private_key =
-                    Ed25519KeyOption::generate().expect("Failed to generate private key");
+                let private_key = Ed25519KeyOption::<ZeroizingBytes>::generate()
+                    .expect("Failed to generate private key");
                 let adnl_id = private_key.id();
                 let node =
                     SessionNode { adnl_id: adnl_id.clone(), public_key: private_key, weight: 1 };
@@ -2416,7 +2416,7 @@ fn test_simplex_start_gate() {
 
     let mut nodes = Vec::with_capacity(node_count);
     for _ in 0..node_count {
-        let key = Ed25519KeyOption::generate().unwrap();
+        let key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let adnl_id = key.id().clone();
         nodes.push(SessionNode { public_key: key, adnl_id, weight: 1 });
     }
