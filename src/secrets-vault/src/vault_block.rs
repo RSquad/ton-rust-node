@@ -39,17 +39,33 @@ use ton_block::{
 };
 use zeroize::Zeroize;
 
-pub fn tokio_run<F>(fut: F) -> F::Output
+fn tokio_run<F>(fut: F) -> F::Output
 where
     F: std::future::Future + Send,
     F::Output: Send,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => std::thread::scope(|s| {
-            s.spawn(|| handle.block_on(fut)).join().expect("tokio_run thread panicked")
-        }),
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| handle.block_on(fut))
+            } else {
+                std::thread::scope(|s| {
+                    s.spawn(|| handle.block_on(fut))
+                        .join()
+                        .expect("tokio_run worker thread panicked")
+                })
+            }
+        }
         Err(_) => {
-            tokio::runtime::Runtime::new().expect("failed to create Tokio runtime").block_on(fut)
+            use std::sync::OnceLock;
+            use tokio::runtime::Runtime;
+
+            fn shared_runtime() -> &'static Runtime {
+                static RT: OnceLock<Runtime> = OnceLock::new();
+                RT.get_or_init(|| Runtime::new().expect("failed to create Tokio runtime"))
+            }
+
+            shared_runtime().block_on(fut)
         }
     }
 }
@@ -278,22 +294,22 @@ impl VaultKeyOptionFactory {
         let Some(name) = &config.vault else {
             return Ed25519KeyOption::<ProtectedMemory>::from_private_key_json(config);
         };
-        let res: Result<(Arc<KeyId>, Secret)> = tokio_run(async {
-            if let Some(vault) = self.vault.as_deref() {
-                let loaded = vault.load(&SecretId::from(name.clone())).await?;
-                let secret = match loaded {
-                    Secret::KeyPair { .. } => loaded,
-                    Secret::Blob { blob } => {
-                        Self::secret_from_raw(&blob.data().lock()?, SecretDataType::Ed25519PvtKey)?
-                    }
-                    _ => fail!("Unsupported secret type for key '{name}': {loaded}"),
-                };
-                let id = Self::key_id_from_secret(&secret)?;
-                Ok((id, secret))
-            } else {
-                fail!("failed to load key '{name}' from Vault: Vault is not connected")
-            }
-        });
+
+        let res: Result<(Arc<KeyId>, Secret)> = if let Some(vault) = self.vault.as_deref() {
+            let loaded = tokio_run(async { vault.load(&SecretId::from(name.clone())).await })?;
+            let secret = match loaded {
+                Secret::KeyPair { .. } => loaded,
+                Secret::Blob { blob } => {
+                    Self::secret_from_raw(&blob.data().lock()?, SecretDataType::Ed25519PvtKey)?
+                }
+                _ => fail!("Unsupported secret type for key '{name}': {loaded}"),
+            };
+            let id = Self::key_id_from_secret(&secret)?;
+            Ok((id, secret))
+        } else {
+            fail!("failed to load key '{name}' from Vault: Vault is not connected")
+        };
+
         let (id, secret) = res?;
         Ok(Arc::new(VaultKeyOption::new(id, secret)?))
     }
@@ -313,15 +329,16 @@ impl VaultKeyOptionFactory {
         let Some(name) = &config.vault else {
             return Ed25519KeyOption::<ZeroizingBytes>::from_public_key_json(config);
         };
-        let res: Result<(Arc<KeyId>, Secret)> = tokio_run(async {
+        let res: Result<(Arc<KeyId>, Secret)> = {
             if let Some(vault) = self.vault.as_deref() {
-                let secret = vault.load(&SecretId::from(name.clone())).await?;
+                let secret = tokio_run(async { vault.load(&SecretId::from(name.clone())).await })?;
                 let id = Self::key_id_from_secret(&secret)?;
                 Ok((id, secret))
             } else {
                 fail!("failed to load key '{name}' from Vault: Vault is not connected")
             }
-        });
+        };
+
         let (id, secret) = res?;
         Ok(Arc::new(VaultKeyOption::new(id, secret)?))
     }

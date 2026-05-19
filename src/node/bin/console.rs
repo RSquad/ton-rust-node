@@ -1915,7 +1915,7 @@ mod test {
         fs::write(Path::new(CFG_DIR).join(&cfg_node_file), &adnl_server_config).unwrap();
         fs::write(Path::new(CFG_DIR).join(&cfg_glob_file), GLOBAL_CONFIG).unwrap();
         let node_config =
-            TonNodeConfig::from_file(CFG_DIR, &cfg_node_file, None, "", None).unwrap();
+            TonNodeConfig::from_file(CFG_DIR, &cfg_node_file, None, "", None).await.unwrap();
         let control_server_config = node_config.control_server().unwrap();
         let config = control_server_config.expect("must have control server setting");
         #[cfg(feature = "telemetry")]

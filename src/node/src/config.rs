@@ -32,7 +32,7 @@ use secrets_vault::{
         store_mode::StoreMode as SecretStoreMode,
     },
     vault::SecretVault,
-    vault_block::{get_key_option_factory, tokio_run, BlockCryptoFactory},
+    vault_block::{get_key_option_factory, BlockCryptoFactory},
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -358,7 +358,7 @@ impl SecretsVaultConfig {
         vault.store(&secret, SecretStoreMode::CreateOrReplace).await
     }
 
-    fn save_adnl_keys(
+    async fn save_adnl_keys(
         keys: &[Arc<dyn KeyOption>],
         type_tag: &'static str,
         log_label: &'static str,
@@ -369,36 +369,37 @@ impl SecretsVaultConfig {
             let pvt = ProtectedMemory::from_slice(key.pvt_key()?.lock()?.as_ref())?;
             snapshots.push((key_id_b64, pvt));
         }
-        tokio_run(async {
-            let Some(vault) = Self::open_vault().await? else {
-                return Ok(());
-            };
-            for (key_id_b64, pvt) in snapshots {
-                log::info!("Write {log_label} {key_id_b64} to the vault");
-                let secret_id = make_secret_id!(key_id_b64);
-                let metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
-                    .with_tag(Self::KEY_TYPE, type_tag);
-                let crypto = BlockCryptoFactory {}.new_crypto()?;
-                let secret =
-                    SecretInMemoryFactory::new_ed25519_pvtkey_protected(pvt, metadata, crypto)?;
-                vault.store(&secret, SecretStoreMode::CreateOrReplace).await?;
-            }
-            Ok(())
-        })
+
+        let Some(vault) = Self::open_vault().await? else {
+            return Ok(());
+        };
+
+        for (key_id_b64, pvt) in snapshots {
+            log::info!("Write {log_label} {key_id_b64} to the vault");
+            let secret_id = make_secret_id!(key_id_b64);
+            let metadata = SecretMetadata::new(Some(&secret_id), SecretAlgorithm::None, true)
+                .with_tag(Self::KEY_TYPE, type_tag);
+            let crypto = BlockCryptoFactory {}.new_crypto()?;
+            let secret =
+                SecretInMemoryFactory::new_ed25519_pvtkey_protected(pvt, metadata, crypto)?;
+            vault.store(&secret, SecretStoreMode::CreateOrReplace).await?;
+        }
+        Ok(())
     }
 
-    pub fn save_adnl_bootstrap_keys(adnl: &AdnlNodeConfig, tags: &[usize]) -> Result<()> {
+    pub async fn save_adnl_bootstrap_keys(adnl: &AdnlNodeConfig, tags: &[usize]) -> Result<()> {
         let keys: Vec<Arc<dyn KeyOption>> =
             tags.iter().map(|&t| adnl.key_by_tag(t)).collect::<Result<_>>()?;
-        Self::save_adnl_keys(&keys, Self::TYPE_ADNL_BOOTSTRAP_KEY, "ADNL bootstrap key")
+        Self::save_adnl_keys(&keys, Self::TYPE_ADNL_BOOTSTRAP_KEY, "ADNL bootstrap key").await
     }
 
-    pub fn save_adnl_server_key(key: &Arc<dyn KeyOption>) -> Result<()> {
+    pub async fn save_adnl_server_key(key: &Arc<dyn KeyOption>) -> Result<()> {
         Self::save_adnl_keys(
             std::slice::from_ref(key),
             Self::TYPE_ADNL_SERVER_KEY,
             "ADNL server key",
         )
+        .await
     }
 
     pub async fn save_validator_key(key: &ValidatorKeysJson) -> Result<()> {
@@ -582,7 +583,7 @@ impl TonNodeConfig {
         self.boot_from_zerostate.unwrap_or(false)
     }
 
-    pub fn from_file(
+    pub async fn from_file(
         configs_dir: &str,
         json_file_name: &str,
         adnl_config: Option<AdnlNodeConfigJson>,
@@ -624,11 +625,11 @@ impl TonNodeConfig {
                             ip_address,
                             adnl_tags.clone(),
                         )?;
-                    SecretsVaultConfig::save_adnl_bootstrap_keys(&adnl_node, &adnl_tags)?;
+                    SecretsVaultConfig::save_adnl_bootstrap_keys(&adnl_node, &adnl_tags).await?;
                     Some(adnl_config)
                 };
-                config.create_and_save_console_configs(configs_dir, client_console_key)?;
-                config.create_and_save_lite_configs(configs_dir)?;
+                config.create_and_save_console_configs(configs_dir, client_console_key).await?;
+                config.create_and_save_lite_configs(configs_dir).await?;
                 config.ip_address = None;
                 std::fs::write(config_file_path, serde_json::to_string_pretty(&config)?)?;
                 config
@@ -853,7 +854,7 @@ impl TonNodeConfig {
         TonNodeGlobalConfig::from_json_file(global_config_path)
     }
 
-    fn create_and_save_configs(
+    async fn create_and_save_configs(
         &mut self,
         configs_dir: &str,
         port: Option<u16>,
@@ -871,7 +872,7 @@ impl TonNodeConfig {
         };
 
         let (server_private_key, server_key) = get_key_option_factory().generate_with_json()?;
-        SecretsVaultConfig::save_adnl_server_key(&server_key)?;
+        SecretsVaultConfig::save_adnl_server_key(&server_key).await?;
 
         // generate and save client console template
         let client_config_file_path = TonNodeConfig::build_path(configs_dir, client_config_name);
@@ -904,29 +905,32 @@ impl TonNodeConfig {
         Ok(Some(server_config))
     }
 
-    fn create_and_save_console_configs(
+    async fn create_and_save_console_configs(
         &mut self,
         configs_dir: &str,
         client_pub_key: Option<String>,
     ) -> Result<()> {
-        self.control_server = self.create_and_save_configs(
-            configs_dir,
-            self.control_server_port.clone(),
-            "console_config.json",
-            Some(client_pub_key.map(|key| vec![key]).unwrap_or(vec![])),
-        )?;
+        self.control_server = self
+            .create_and_save_configs(
+                configs_dir,
+                self.control_server_port.clone(),
+                "console_config.json",
+                Some(client_pub_key.map(|key| vec![key]).unwrap_or(vec![])),
+            )
+            .await?;
         self.control_server_port = None;
         Ok(())
     }
 
-    fn create_and_save_lite_configs(&mut self, configs_dir: &str) -> Result<()> {
+    async fn create_and_save_lite_configs(&mut self, configs_dir: &str) -> Result<()> {
         self.lite_server = self
             .create_and_save_configs(
                 configs_dir,
                 self.lite_server_port.clone(),
                 "lite_client_config.json",
                 None,
-            )?
+            )
+            .await?
             .map(|adnl| LiteServerConfigJson::from_server_config(adnl));
         self.lite_server_port = None;
         Ok(())

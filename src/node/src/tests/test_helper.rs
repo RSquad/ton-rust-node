@@ -528,7 +528,7 @@ pub async fn get_config(
         vec![NodeNetwork::TAG_DHT_KEY, NodeNetwork::TAG_OVERLAY_KEY],
         Some(resolved_ip),
     )?;
-    TonNodeConfig::from_file(config_dir, config_file, Some(adnl_config), default, None)
+    TonNodeConfig::from_file(config_dir, config_file, Some(adnl_config), default, None).await
 }
 
 pub async fn test_async(test: impl Fn() -> Pinned<'static, ()>, done: impl Fn()) {
