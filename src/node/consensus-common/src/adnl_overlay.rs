@@ -1757,10 +1757,26 @@ impl ConsensusOverlay for AdnlOverlay {
                         .await
                 };
 
-                log::debug!(
-                    target: LOG_TARGET,
-                    "AdnlOverlay::send_broadcast_fec_ex ({transport}) status: {result:?}"
-                );
+                match &result {
+                    Ok(info) if info.send_to == 0 => log::warn!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                        overlay={overlay_id}: send_to=0 packets={} — \
+                        broadcast emitted to 0 neighbours (overlay known_peers empty?)",
+                        info.packets,
+                    ),
+                    Ok(info) => log::debug!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                        overlay={overlay_id} packets={} send_to={}",
+                        info.packets, info.send_to,
+                    ),
+                    Err(e) => log::warn!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                        overlay={overlay_id} FAILED: {e:?}"
+                    ),
+                }
             });
         } else {
             // TCP path: manually build BroadcastTwostepSimple and multicast

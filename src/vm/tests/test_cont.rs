@@ -2368,6 +2368,7 @@ fn test_popctrx_range() {
 
 mod runvm {
     use super::*;
+    use ton_block::BuilderData;
 
     #[test]
     fn test_runvm_error() {
@@ -2387,6 +2388,73 @@ mod runvm {
     }
 
     #[test]
+    fn test_checksignatures() {
+        let key = ton_block::Ed25519KeyOption::generate().unwrap();
+        let pub_key = BuilderData::with_raw(key.pub_key().unwrap(), 256).unwrap();
+        let pub_key = pub_key.into_cell().unwrap();
+        let data = SliceData::new(vec![0x01, 0x02, 0x03, 0x80]);
+        let signature = key.sign(&data.get_bytestring(0)).unwrap();
+        let signature = BuilderData::with_raw(signature, 512).unwrap();
+        let signature = signature.into_cell().unwrap();
+        let data = data.into_cell().unwrap();
+        let ethalon = [(3, 6013), (4, 18286), (5, 30559), (9, 79651), (10, 91924), (14, 141040)];
+        for (count, mut gas) in ethalon {
+            for flag in [0, 128] {
+                if flag == 128 {
+                    match count {
+                        3 => gas += 16000,
+                        4 => gas += 8000,
+                        _ => (),
+                    }
+                }
+                let runvm_code = compile_code_to_cell(&format!(
+                    "
+                    PUSHINT {count}
+                    PUSHCONT {{
+                        BLKPUSH 3, 2
+                        CHKSIGNS
+                        THROWIFNOT 100
+                    }}
+                    REPEAT
+                ",
+                ))
+                .unwrap();
+                let code = format!(
+                    "
+                    PUSHREFSLICE ; code
+                    PUSHREFSLICE ; data
+                    PUSHREFSLICE ; signature
+                    PUSHREFSLICE ; pub_key
+                    PLDU 256
+                    BLKPUSH 3, 2
+                    CHKSIGNS
+                    THROWIFNOT 100
+                    PUSHINT 3
+                    PUSH s4
+                    RUNVM {flag}
+                    DROP
+                    BLKPUSH 3, 2
+                    CHKSIGNS
+                    THROWIFNOT 100
+                    PUSHINT 3
+                    PUSH s4
+                    RUNVM {flag}
+                    DROP
+                    BLKSWAP 1, 3
+                    BLESS
+                    POP C0
+                "
+                );
+                test_case_with_refs(
+                    code,
+                    vec![runvm_code.clone(), data.clone(), signature.clone(), pub_key.clone()],
+                )
+                .expect_gas_used(gas);
+            }
+        }
+    }
+
+    #[test]
     fn test_runvm_success() {
         // simplest case without any additional arguments on stack
         test_case(
@@ -2398,7 +2466,7 @@ mod runvm {
         .expect_int_stack(&[3, 0])
         .expect_gas_used(142);
 
-        // pass and one argument on stack
+        // pass one argument on stack
         test_case(
             "TEN
             ONE ; pass one stack value
@@ -2406,6 +2474,16 @@ mod runvm {
             RUNVM 0",
         )
         .expect_int_stack(&[10, 3, 0])
+        .expect_gas_used(160);
+
+        // pass 0 and one argument on stack
+        test_case(
+            "TEN
+            ONE ; pass one stack value
+            PUSHSLICE x73 ; PUSHINT 3
+            RUNVM 3",
+        )
+        .expect_int_stack(&[10, 0, 3, 0])
         .expect_gas_used(160);
 
         // pass gas max one argument on stack

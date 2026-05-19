@@ -54,7 +54,9 @@ impl CellDb {
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
         if db.cf_handle(cell_db_cf).is_none() {
-            db.create_cf(cell_db_cf, &Self::build_cf_options(config.cells_cache_size_bytes))?;
+            let (options, cache) = Self::build_cf_options(config.cells_cache_size_bytes);
+            db.create_cf(cell_db_cf, &options)?;
+            db.register_cache(cache);
         }
         Ok(Self {
             db,
@@ -73,7 +75,7 @@ impl CellDb {
         })
     }
 
-    pub fn build_cf_options(cache_size: u64) -> rocksdb::Options {
+    pub fn build_cf_options(cache_size: u64) -> (rocksdb::Options, rocksdb::Cache) {
         let mut options = rocksdb::Options::default();
         let mut block_opts = rocksdb::BlockBasedOptions::default();
 
@@ -130,7 +132,7 @@ impl CellDb {
         options.set_prefix_extractor(transform);
         options.set_memtable_prefix_bloom_ratio(0.1);
 
-        options
+        (options, cache)
     }
 
     pub fn db(&self) -> &Arc<RocksDb> {

@@ -9,8 +9,6 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{fail, ExceptionCode, Result, Sha256, UInt256};
-#[cfg(feature = "cell_counter")]
-use std::sync::atomic::AtomicU64;
 use std::{
     alloc::Layout,
     cmp::{max, min},
@@ -20,7 +18,7 @@ use std::{
     io::{Read, Write},
     ops::{BitOr, BitOrAssign},
     sync::{
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, OnceLock, Weak,
     },
 };
@@ -30,6 +28,10 @@ use std::{
 static CELL_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "cell_counter")]
 static CELL_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "cell_counter")]
+static ARENA_CELL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+static ARENA_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 mod slice;
 pub use self::slice::*;
@@ -544,6 +546,10 @@ pub struct CellsArena {
     ranges_count: AtomicUsize,
     max_chunks: usize,
 
+    // Number of `alloc_raw` calls served by this arena.
+    #[cfg(feature = "cell_counter")]
+    cells_alloc: AtomicU64,
+
     // Slow path: mutex for allocating new chunks.
     // Owns chunk memory (Vec<u8>), ranges, and bumps storage.
     grow: Mutex<ArenaInner>,
@@ -619,6 +625,8 @@ impl CellsArena {
         bumps.push(ChunkBump { current: AtomicPtr::new(current), end });
         let bump_ptr = bumps.as_ptr() as *mut ChunkBump;
 
+        ARENA_BYTES_TOTAL.fetch_add(chunk_size as u64, Ordering::Relaxed);
+
         Self {
             bump: AtomicPtr::new(bump_ptr),
             chunk_size,
@@ -626,7 +634,15 @@ impl CellsArena {
             ranges_count: AtomicUsize::new(1),
             max_chunks,
             grow: Mutex::new(ArenaInner { chunks: vec![chunk], ranges, bumps }),
+            #[cfg(feature = "cell_counter")]
+            cells_alloc: AtomicU64::new(0),
         }
+    }
+
+    /// Heap memory held by chunks (chunks × chunk_size).
+    pub fn allocated_bytes(&self) -> usize {
+        let inner = self.grow.lock().unwrap();
+        inner.chunks.iter().map(|chunk| chunk.capacity()).sum()
     }
 
     /// Lock-free check whether `ptr` belongs to any chunk in this arena.
@@ -684,6 +700,7 @@ impl CellsArena {
         // Allocate new chunk
         let size = self.chunk_size.max(layout.size() + layout.align());
         let mut chunk = Vec::<u8>::with_capacity(size);
+        ARENA_BYTES_TOTAL.fetch_add(size as u64, Ordering::Relaxed);
         let chunk_ptr = chunk.as_mut_ptr();
         let chunk_end = unsafe { chunk_ptr.add(size) };
 
@@ -710,6 +727,14 @@ impl CellsArena {
 
         drop(inner);
         self.alloc_raw(layout)
+    }
+}
+
+impl Drop for CellsArena {
+    fn drop(&mut self) {
+        ARENA_BYTES_TOTAL.fetch_sub(self.allocated_bytes() as u64, Ordering::Relaxed);
+        #[cfg(feature = "cell_counter")]
+        ARENA_CELL_COUNT.fetch_sub(self.cells_alloc.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 }
 
@@ -1537,8 +1562,15 @@ impl Cell {
                 }
                 p
             },
-            // Arena cells share one allocation; counted via arena itself, not per cell.
-            Some(arena) => arena.alloc_raw(layout),
+            Some(arena) => {
+                let p = arena.alloc_raw(layout);
+                #[cfg(feature = "cell_counter")]
+                {
+                    arena.cells_alloc.fetch_add(1, Ordering::Relaxed);
+                    ARENA_CELL_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                p
+            }
         }
     }
 
@@ -2614,6 +2646,23 @@ impl Cell {
         {
             0
         }
+    }
+
+    /// Total number of cells currently held by all live `CellsArena`s.
+    pub fn arena_cell_count() -> u64 {
+        #[cfg(feature = "cell_counter")]
+        {
+            ARENA_CELL_COUNT.load(Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "cell_counter"))]
+        {
+            0
+        }
+    }
+
+    /// Heap bytes held by chunks of all live `CellsArena`s (chunks × chunk_size).
+    pub fn arena_bytes_total() -> u64 {
+        ARENA_BYTES_TOTAL.load(Ordering::Relaxed)
     }
 
     pub fn data(&self) -> &[u8] {

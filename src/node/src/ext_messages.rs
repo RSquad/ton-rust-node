@@ -638,6 +638,10 @@ impl Iterator for MessagePoolIter {
         // entries.
         loop {
             if self.finish_time_ms <= UnixTime::now_ms() {
+                log::debug!(
+                    target: EXT_MESSAGES_TRACE_TARGET,
+                    "external messages timeout has expired, finishing iteration",
+                );
                 return None;
             }
             if self.timestamp < min_timestamp {
@@ -664,6 +668,10 @@ impl Iterator for MessagePoolIter {
             {
                 while self.seqno < order.seqno.load(Ordering::Relaxed) {
                     if self.finish_time_ms <= UnixTime::now_ms() {
+                        log::debug!(
+                            target: EXT_MESSAGES_TRACE_TARGET,
+                            "external messages timeout has expired, finishing iteration",
+                        );
                         return None;
                     }
                     let result = self.find_in_map(&order.map);

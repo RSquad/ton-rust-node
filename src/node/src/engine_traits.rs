@@ -59,6 +59,8 @@ pub struct EngineTelemetry {
     pub catchain_clients: Arc<Metric>,
     pub cells: Arc<Metric>,
     pub cells_mb: Arc<Metric>,
+    pub arena_cells: Arc<Metric>,
+    pub arena_bytes_mb: Arc<Metric>,
     pub shard_states: Arc<Metric>,
     pub top_blocks: Arc<Metric>,
     pub validator_adnl_keys: Arc<Metric>,
