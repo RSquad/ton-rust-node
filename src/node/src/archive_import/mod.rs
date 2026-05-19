@@ -293,15 +293,15 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     );
 
     let cells_db_config = CellsDbConfig::default();
+    let (archive_cells_opts, archive_cells_cache) =
+        storage::cell_db::CellDb::build_cf_options(cells_db_config.cells_cache_size_bytes);
     let archive_states_db = RocksDb::new(
         &config.node_db_path,
         crate::internal_db::ARCHIVE_STATES_DB_NAME,
-        std::collections::HashMap::from([(
-            ARCHIVE_CELLS_CF_NAME.to_string(),
-            storage::cell_db::CellDb::build_cf_options(cells_db_config.cells_cache_size_bytes),
-        )]),
+        std::collections::HashMap::from([(ARCHIVE_CELLS_CF_NAME.to_string(), archive_cells_opts)]),
         AccessType::ReadWrite,
     )?;
+    archive_states_db.register_cache(archive_cells_cache);
     let archive_state_db = Arc::new(ArchiveShardStateDb::new(
         archive_states_db,
         ARCHIVE_SHARDSTATE_CF_NAME,

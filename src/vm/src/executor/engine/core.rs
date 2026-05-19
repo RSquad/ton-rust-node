@@ -78,6 +78,7 @@ pub struct RunChildVm {
     pub stack: Stack,
     pub gas_max: i64,
     pub gas_limit: i64,
+    pub push_0: bool,
     pub same_c3: bool,
     pub return_data: bool,
     pub return_actions: bool,
@@ -284,6 +285,10 @@ impl Engine {
 
     pub fn gas_remaining(&self) -> i64 {
         self.gas.get_gas_remaining()
+    }
+
+    pub fn use_free_gas(&mut self, gas: i64) {
+        self.free_gas_consumed += gas;
     }
 
     pub fn withdraw_stack(&mut self) -> Stack {
@@ -1043,14 +1048,13 @@ impl Engine {
     }
 
     pub(crate) fn run_child_vm(&mut self, params: RunChildVm) -> Status {
-        let (visited_cells, checked_signatures_count, free_gas_consumed) = if params.isolate_gas {
-            (HashSet::new(), 0, 0)
+        let visited_cells = if !params.isolate_gas {
+            std::mem::take(&mut self.visited_cells)
         } else {
-            (
-                std::mem::take(&mut self.visited_cells),
-                self.checked_signatures_count,
-                self.free_gas_consumed,
-            )
+            self.try_use_gas(self.free_gas_consumed)?;
+            self.checked_signatures_count = 0;
+            self.free_gas_consumed = 0;
+            HashSet::new()
         };
         let mut ctrls = SaveList::new();
         let cont = ContinuationType::Quit(ExceptionCode::NormalTermination as i32);
@@ -1080,12 +1084,12 @@ impl Engine {
             ctrls,
             libraries: self.libraries.clone(),
             modifiers: self.modifiers.clone(),
-            checked_signatures_count,
+            checked_signatures_count: self.checked_signatures_count,
             visited_cells,
             cstate: None,
             time: self.time,
             gas,
-            free_gas_consumed,
+            free_gas_consumed: self.free_gas_consumed,
             code_page: 0,
             debug_on: self.debug_on,
             step: 0,
@@ -1099,6 +1103,9 @@ impl Engine {
             capabilities: self.capabilities,
             block_version: self.block_version,
         };
+        if params.push_0 {
+            child.cc.stack.push_int(0);
+        }
         let mut result = match child.execute() {
             Ok(result) => result,
             Err(err) => {
@@ -1117,7 +1124,8 @@ impl Engine {
                 tvm_exception_or_custom_code(&err)
             }
         };
-        // let mut result = child.execute().unwrap_or_else(|err| tvm_exception_or_custom_code(&err));
+        self.free_gas_consumed = child.free_gas_consumed;
+        self.checked_signatures_count = child.checked_signatures_count;
         log::debug!(
             target: "tvm",
             "Child VM finished. res: {result}, steps: {}, gas: {}, stack depth: {}\n",

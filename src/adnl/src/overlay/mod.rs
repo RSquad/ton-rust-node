@@ -899,7 +899,9 @@ impl Overlay {
         let elapsed_sec = self.adnl.elapsed_sec();
         if pong.is_some() {
             self.known_peers.amnesty(peer, elapsed_sec);
-        } else {
+        } else if !self.overlay_type.is_private() {
+            // FixedMemberList C++ equivalent: don't penalize on missed pong.
+            // Consensus overlay must always target the full validator set.
             self.known_peers.penalty(peer, elapsed_sec)?;
         }
         Ok(())

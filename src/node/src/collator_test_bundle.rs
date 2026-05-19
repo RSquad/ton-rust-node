@@ -199,6 +199,8 @@ pub fn create_engine_telemetry() -> Arc<EngineTelemetry> {
         catchain_clients: Metric::without_totals("", 1),
         cells: Metric::without_totals("", 1),
         cells_mb: Metric::without_totals("", 1),
+        arena_cells: Metric::without_totals("", 1),
+        arena_bytes_mb: Metric::without_totals("", 1),
         shard_states: Metric::without_totals("", 1),
         top_blocks: Metric::without_totals("", 1),
         validator_adnl_keys: Metric::without_totals("", 1),

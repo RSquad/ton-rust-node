@@ -11,7 +11,7 @@
 use crate::{db::DbKey, error::StorageError, traits::Serializable, types::DbSlice, TARGET};
 use adnl::common::add_unbound_object_to_map;
 use rocksdb::{
-    BoundColumnFamily, DBWithThreadMode, IteratorMode, MultiThreaded, Options,
+    BoundColumnFamily, Cache, DBWithThreadMode, IteratorMode, MultiThreaded, Options,
     SnapshotWithThreadMode, WriteBatch,
 };
 use std::{
@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicI32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 use ton_block::{error, fail, BlockIdExt, Result};
@@ -43,6 +43,8 @@ pub type DbPredicateMut<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> Result<bool>;
 pub struct RocksDb {
     db: Option<DBWithThreadMode<MultiThreaded>>,
     locks: lockfree::map::Map<String, AtomicI32>,
+    // Block caches attached to this DB's column families.
+    caches: Mutex<Vec<Cache>>,
 }
 
 impl RocksDb {
@@ -103,7 +105,11 @@ impl RocksDb {
                 continue;
             }
 
-            let db = Self { db: Some(db), locks: lockfree::map::Map::new() };
+            let db = Self {
+                db: Some(db),
+                locks: lockfree::map::Map::new(),
+                caches: Mutex::new(Vec::new()),
+            };
             return Ok(Arc::new(db));
         }
     }
@@ -127,6 +133,16 @@ impl RocksDb {
         options.create_missing_column_families(true);
 
         options.set_max_total_wal_size(1024 * 1024 * 1024);
+
+        // Bound the number of open SST TableReaders. Default is -1 (unlimited),
+        // which on an archival node with tens of thousands of CFs causes
+        // table-reader memory to grow without bound (each open SST keeps its
+        // block index, bloom filter and pinned index/filter blocks in RAM —
+        // tens to hundreds of KB per file). Observed: 170k+ open .sst fds.
+        // 8192 lets RocksDB LRU-evict cold TableReaders.
+        options.set_max_open_files(8192);
+        // Shard the table cache to reduce lock contention with many CFs.
+        options.set_table_cache_num_shard_bits(6);
 
         // Let compaction and flush go through the OS page cache (the default)
         // so that newly created SST files are already warm in cache and
@@ -188,18 +204,30 @@ impl RocksDb {
         self.db.as_ref().expect("rocksdb was occasionaly destroyed")
     }
 
+    /// Registers a block cache associated with one of this DB's column families.
+    pub fn register_cache(&self, cache: Cache) {
+        self.caches.lock().expect("caches mutex poisoned").push(cache);
+    }
+
     /// Returns approximate memory usage of this RocksDB instance (in bytes).
     pub fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
         let Ok(mut builder) = rocksdb::perf::MemoryUsageBuilder::new() else {
             return Default::default();
         };
         builder.add_db(self.db());
+        // approximate_cache_total() reports only caches registered via add_cache().
+        if let Ok(caches) = self.caches.lock() {
+            for cache in caches.iter() {
+                builder.add_cache(cache);
+            }
+        }
         let Ok(mu) = builder.build() else {
             return Default::default();
         };
         crate::RocksDbMemoryUsage {
             mem_tables: mu.approximate_mem_table_total(),
             block_cache: mu.approximate_cache_total(),
+            table_readers: mu.approximate_mem_table_readers_total(),
         }
     }
 

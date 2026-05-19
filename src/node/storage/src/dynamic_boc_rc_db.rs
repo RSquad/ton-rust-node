@@ -127,7 +127,9 @@ impl DynamicBocDb {
             allocated,
         )?;
         if db.cf_handle(counters_cf_name).is_none() {
-            db.create_cf(counters_cf_name, &Self::build_counters_cf_options(config))?;
+            let (options, cache) = Self::build_counters_cf_options(config);
+            db.create_cf(counters_cf_name, &options)?;
+            db.register_cache(cache);
         }
         Ok(Self {
             cell_db: Arc::new(cell_db),
@@ -140,11 +142,11 @@ impl DynamicBocDb {
         &self.cell_db
     }
 
-    pub fn build_cells_cf_options(config: &CellsDbConfig) -> rocksdb::Options {
+    pub fn build_cells_cf_options(config: &CellsDbConfig) -> (rocksdb::Options, rocksdb::Cache) {
         CellDb::build_cf_options(config.cells_cache_size_bytes)
     }
 
-    pub fn build_counters_cf_options(config: &CellsDbConfig) -> rocksdb::Options {
+    pub fn build_counters_cf_options(config: &CellsDbConfig) -> (rocksdb::Options, rocksdb::Cache) {
         CellDb::build_cf_options(config.counters_cache_size_bytes)
     }
 

@@ -1535,6 +1535,7 @@ impl Engine {
             counter_cache_len: create_metric("NODE counter cache len"),
             rocksdb_mem_table_mb: create_metric("Alloc NODE RocksDB mem tables, MB"),
             rocksdb_block_cache_mb: create_metric("Alloc NODE RocksDB block cache, MB"),
+            rocksdb_table_readers_mb: create_metric("Alloc NODE RocksDB table readers, MB"),
         });
         let engine_telemetry = Arc::new(EngineTelemetry {
             storage: storage_telemetry,
@@ -1542,6 +1543,8 @@ impl Engine {
             catchain_clients: create_metric("Alloc NODE catchains"),
             cells: create_metric("Alloc NODE cells"),
             cells_mb: create_metric("Alloc NODE cells, MB"),
+            arena_cells: create_metric("Alloc NODE arena cells"),
+            arena_bytes_mb: create_metric("Alloc NODE arena bytes, MB"),
             jemalloc_allocated_mb: create_metric("Alloc NODE jemalloc allocated, MB"),
             jemalloc_resident_mb: create_metric("Alloc NODE jemalloc resident, MB"),
             jemalloc_mapped_mb: create_metric("Alloc NODE jemalloc mapped, MB"),
@@ -1582,6 +1585,7 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_commit_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.rocksdb_mem_table_mb.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.rocksdb_block_cache_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_table_readers_mb.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_hits.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_misses.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.cell_cache_len.clone()),
@@ -1592,6 +1596,8 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.catchain_clients.clone()),
             TelemetryItem::Metric(engine_telemetry.cells.clone()),
             TelemetryItem::Metric(engine_telemetry.cells_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.arena_cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.arena_bytes_mb.clone()),
             TelemetryItem::Metric(engine_telemetry.jemalloc_allocated_mb.clone()),
             TelemetryItem::Metric(engine_telemetry.jemalloc_resident_mb.clone()),
             TelemetryItem::Metric(engine_telemetry.jemalloc_mapped_mb.clone()),
@@ -2491,6 +2497,11 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .update(engine.engine_allocated.catchain_clients.load(Ordering::Relaxed));
             engine.engine_telemetry.cells.update(Cell::cell_count());
             engine.engine_telemetry.cells_mb.update(Cell::cell_bytes() / (1024 * 1024));
+            engine.engine_telemetry.arena_cells.update(Cell::arena_cell_count());
+            engine
+                .engine_telemetry
+                .arena_bytes_mb
+                .update(Cell::arena_bytes_total() / (1024 * 1024));
             #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
             {
                 // jemalloc stats are snapshot-based; advance epoch before reading.
@@ -2561,6 +2572,11 @@ fn telemetry_logger(engine: Arc<Engine>) {
                     .storage
                     .rocksdb_block_cache_mb
                     .update(usage.block_cache / (1024 * 1024));
+                engine
+                    .engine_telemetry
+                    .storage
+                    .rocksdb_table_readers_mb
+                    .update(usage.table_readers / (1024 * 1024));
             }
 
             let period = crate::full_node::telemetry::TPS_PERIOD_1;

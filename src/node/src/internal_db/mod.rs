@@ -247,6 +247,7 @@ impl Clone for StateDb {
 }
 
 pub struct InternalDb {
+    catchain_db: Arc<RocksDb>,
     block_handle_storage: Arc<BlockHandleStorage>,
     prev1_block_db: BlockInfoDb,
     prev2_block_db: BlockInfoDb,
@@ -335,15 +336,16 @@ impl InternalDb {
         allocated: Arc<EngineAlloc>,
     ) -> Result<Self> {
         let mut cfs_opts = HashMap::new();
+        let mut pending_caches = Vec::new();
         if config.archival_mode.is_none() {
-            cfs_opts.insert(
-                CELLS_CF_NAME.to_string(),
-                DynamicBocDb::build_cells_cf_options(&config.cells_db_config),
-            );
-            cfs_opts.insert(
-                CELLSCOUNTERS_CF_NAME.to_string(),
-                DynamicBocDb::build_counters_cf_options(&config.cells_db_config),
-            );
+            let (cells_opts, cells_cache) =
+                DynamicBocDb::build_cells_cf_options(&config.cells_db_config);
+            cfs_opts.insert(CELLS_CF_NAME.to_string(), cells_opts);
+            pending_caches.push(cells_cache);
+            let (counters_opts, counters_cache) =
+                DynamicBocDb::build_counters_cf_options(&config.cells_db_config);
+            cfs_opts.insert(CELLSCOUNTERS_CF_NAME.to_string(), counters_opts);
+            pending_caches.push(counters_cache);
         }
         let access_type = access_type.unwrap_or(AccessType::ReadWrite);
         let can_create_db = access_type == AccessType::ReadWrite;
@@ -353,6 +355,9 @@ impl InternalDb {
             cfs_opts,
             access_type.clone(),
         )?;
+        for cache in pending_caches {
+            db.register_cache(cache);
+        }
         let db_catchain = RocksDb::new(
             config.db_directory.as_str(),
             CATCHAINS_DB_NAME,
@@ -366,8 +371,11 @@ impl InternalDb {
             storage::db::rocksdb::NODE_STATE_DB_NAME,
             can_create_db,
         )?);
-        let validator_state_db =
-            Arc::new(NodeStateDb::with_db(db_catchain, VALIDATOR_STATE_DB_NAME, can_create_db)?);
+        let validator_state_db = Arc::new(NodeStateDb::with_db(
+            db_catchain.clone(),
+            VALIDATOR_STATE_DB_NAME,
+            can_create_db,
+        )?);
         let block_handle_storage = Arc::new(BlockHandleStorage::with_dbs(
             block_handle_db.clone(),
             full_node_state_db.clone(),
@@ -378,17 +386,20 @@ impl InternalDb {
         ));
 
         let state_db = if config.archival_mode.is_some() {
+            let (archive_cells_opts, archive_cells_cache) =
+                storage::cell_db::CellDb::build_cf_options(
+                    config.cells_db_config.cells_cache_size_bytes,
+                );
             let states_db = RocksDb::new(
                 &config.db_directory,
                 ARCHIVE_STATES_DB_NAME,
                 std::collections::HashMap::from([(
                     ARCHIVE_CELLS_CF_NAME.to_string(),
-                    storage::cell_db::CellDb::build_cf_options(
-                        config.cells_db_config.cells_cache_size_bytes,
-                    ),
+                    archive_cells_opts,
                 )]),
                 access_type.clone(),
             )?;
+            states_db.register_cache(archive_cells_cache);
             StateDb::Archive(Arc::new(ArchiveShardStateDb::new(
                 states_db,
                 ARCHIVE_SHARDSTATE_CF_NAME,
@@ -431,7 +442,8 @@ impl InternalDb {
             .await?,
         );
 
-        let db = Self {
+        let result = Self {
+            catchain_db: db_catchain,
             block_handle_storage,
             prev1_block_db: BlockInfoDb::with_db(db.clone(), PREV1_BLOCK_DB_NAME, can_create_db)?,
             prev2_block_db: BlockInfoDb::with_db(db.clone(), PREV2_BLOCK_DB_NAME, can_create_db)?,
@@ -443,7 +455,7 @@ impl InternalDb {
             state_db,
             archive_manager,
             shard_top_blocks_db: ShardTopBlocksDb::with_db(
-                db.clone(),
+                db,
                 SHARD_TOP_BLOCKS_DB_NAME,
                 can_create_db,
             )?,
@@ -455,7 +467,7 @@ impl InternalDb {
             allocated,
         };
 
-        Ok(db)
+        Ok(result)
     }
 
     fn resolve_db_version(&self) -> Result<u32> {
@@ -494,10 +506,11 @@ impl InternalDb {
         )
     }
 
-    /// Returns approximate RocksDB memory usage summing main DB,
-    /// archive states DB (if archival), and all epoch DBs.
+    /// Returns approximate RocksDB memory usage summing the main node DB,
+    /// catchain DB, archive states DB (if archival), and all archive/epoch DBs.
     pub fn rocksdb_memory_usage(&self) -> storage::RocksDbMemoryUsage {
-        let mut usage = self.archive_manager.rocksdb_memory_usage();
+        let mut usage = self.catchain_db.memory_usage();
+        usage += self.archive_manager.rocksdb_memory_usage();
         if let StateDb::Archive(db) = &self.state_db {
             usage += db.rocksdb_memory_usage();
         }
