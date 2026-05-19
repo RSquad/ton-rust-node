@@ -2368,7 +2368,7 @@ fn test_popctrx_range() {
 
 mod runvm {
     use super::*;
-    use ton_block::BuilderData;
+    use ton_block::{BuilderData, ZeroizingBytes};
 
     #[test]
     fn test_runvm_error() {
@@ -2389,7 +2389,7 @@ mod runvm {
 
     #[test]
     fn test_checksignatures() {
-        let key = ton_block::Ed25519KeyOption::generate().unwrap();
+        let key = ton_block::Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let pub_key = BuilderData::with_raw(key.pub_key().unwrap(), 256).unwrap();
         let pub_key = pub_key.into_cell().unwrap();
         let data = SliceData::new(vec![0x01, 0x02, 0x03, 0x80]);

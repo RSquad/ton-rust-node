@@ -6,8 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use crate::memory::protected_memory::ProtectedMemoryInner;
 #[cfg(feature = "hashicorp-storage")]
-use crate::memory::protected_memory::ProtectedMemory;
 use crate::{
     crypto::{
         crypto_trait::Crypto,
@@ -16,7 +16,6 @@ use crate::{
         master_key::MasterKey,
     },
     errors::error::VaultError,
-    memory::protected_memory::ProtectedMemoryInner,
     storage::storage_trait::{ListMode, Storage},
     types::{
         algorithm::Algorithm,
@@ -132,9 +131,12 @@ pub async fn create_storage(
         #[cfg(feature = "hashicorp-storage")]
         StorageType::HashicorpNoCache => {
             // NOTE: HashiCorp Vault must be launched in dev mode on http://127.0.0.1:8200/ (./vault server -dev -dev-root-token-id=root)
-            use crate::storage::{
-                hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
-                hashicorp_token_provider::AuthConfig,
+            use crate::{
+                memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
+                storage::{
+                    hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
+                    hashicorp_token_provider::AuthConfig,
+                },
             };
 
             let api_key_data: ProtectedMemory =
@@ -151,9 +153,12 @@ pub async fn create_storage(
         #[cfg(feature = "hashicorp-storage")]
         StorageType::HashicorpUseCache => {
             // NOTE: HashiCorp Vault must be launched in dev mode on http://127.0.0.1:8200/ (./vault server -dev -dev-root-token-id=root)
-            use crate::storage::{
-                hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
-                hashicorp_token_provider::AuthConfig,
+            use crate::{
+                memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
+                storage::{
+                    hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
+                    hashicorp_token_provider::AuthConfig,
+                },
             };
 
             let api_key_data: ProtectedMemory =

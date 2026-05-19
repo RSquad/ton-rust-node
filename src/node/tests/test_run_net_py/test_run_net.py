@@ -315,7 +315,8 @@ def prepare_default_config(
 
 
 def run_rust_node(
-    params: list[str], node_index: int, start_new_session: bool = False
+    params: list[str], node_index: int, start_new_session: bool = False,
+    with_vault: bool = True,
 ) -> subprocess.Popen:
     stdout_path = logs_path / f"stdout_{node_index}.log"
     stderr_path = logs_path / f"stderr_{node_index}.log"
@@ -327,9 +328,12 @@ def run_rust_node(
         print(f"Starting node {node_index}...")
 
     node_env = os.environ.copy()
-    per_node_url = node_env.get(f"VAULT_URL_NODE_{node_index}")
-    if per_node_url:
-        node_env["VAULT_URL"] = per_node_url
+    if with_vault:
+        per_node_url = node_env.get(f"VAULT_URL_NODE_{node_index}")
+        if per_node_url:
+            node_env["VAULT_URL"] = per_node_url
+    else:
+        node_env.pop("VAULT_URL", None)
 
     with stdout_path.open("w") as out_log, stderr_path.open("w") as err_log:
         proc = subprocess.Popen(
@@ -461,7 +465,7 @@ def prepare_node(
     console_public = {"type_id": 1209251014, "pub_key": console_key_json["pubkey"]}
     params = ["--configs", ".", "--ckey", json.dumps(console_public)]
     print(f"Starting node {node_index} to generate configs...")
-    node_proc = run_rust_node(params, node_index)
+    node_proc = run_rust_node(params, node_index, with_vault=False)
     try:
         node_work_path = build_node_work_path(node_index)
 

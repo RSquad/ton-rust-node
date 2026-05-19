@@ -24,7 +24,7 @@ use std::{
     hash::Hash,
     io::{Read, Write},
 };
-use ton_block::{base64_encode, error, fail, Ed25519KeyOption};
+use ton_block::{base64_encode, error, fail, Ed25519KeyOption, ZeroizingBytes};
 
 const MAX_DEBUG_BYTES_LEN: usize = 4;
 const MAX_TL_BYTES_LEN: usize = 16 << 20; // 16 MB
@@ -522,7 +522,11 @@ impl Display for crate::ton::PublicKey {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             crate::ton::PublicKey::Pub_Ed25519(key) => {
-                write!(f, "{}", Ed25519KeyOption::from_public_key(key.key.as_array()).id())
+                write!(
+                    f,
+                    "{}",
+                    Ed25519KeyOption::<ZeroizingBytes>::from_public_key(key.key.as_array()).id()
+                )
             }
             x => write!(f, "{:?}", x),
         }

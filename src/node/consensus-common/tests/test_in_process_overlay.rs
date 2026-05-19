@@ -24,7 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use ton_block::{KeyId, Result};
+use ton_block::{Ed25519KeyOption, KeyId, Result, ZeroizingBytes};
 
 include!("../../../common/src/test.rs");
 
@@ -190,13 +190,13 @@ fn run_overlay_test(manager: ConsensusOverlayManagerPtr) -> Result<()> {
     let mut nodes = Vec::new();
     for _ in 0..NUM_NODES {
         let private_key =
-            ton_block::Ed25519KeyOption::generate().expect("Failed to generate private key");
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let public_key_bytes = private_key
             .pub_key()
             .expect("Failed to get public key")
             .try_into()
             .expect("Invalid public key length");
-        let public_key = ton_block::Ed25519KeyOption::from_public_key(public_key_bytes);
+        let public_key = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(public_key_bytes);
         let adnl_id = public_key.id();
         node_ids.push(adnl_id.clone());
         nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });
@@ -399,13 +399,13 @@ fn run_overlay_performance_test(manager: ConsensusOverlayManagerPtr) -> Result<(
     let mut nodes = Vec::new();
     for _ in 0..NUM_NODES {
         let private_key =
-            ton_block::Ed25519KeyOption::generate().expect("Failed to generate private key");
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let public_key_bytes = private_key
             .pub_key()
             .expect("Failed to get public key")
             .try_into()
             .expect("Invalid public key length");
-        let public_key = ton_block::Ed25519KeyOption::from_public_key(public_key_bytes);
+        let public_key = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(public_key_bytes);
         let adnl_id = public_key.id();
         node_ids.push(adnl_id.clone());
         nodes.push(ConsensusNode { adnl_id: adnl_id.clone(), public_key });

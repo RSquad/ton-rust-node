@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+
 use crate::{
     memory::protected_memory::ProtectedMemory,
     types::{metadata::Metadata, secret::Blob, secret_id::SecretId},

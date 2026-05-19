@@ -483,7 +483,11 @@ impl FullNodeOverlaysRouter {
                     let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_addr.port());
                     match key.pvt_key() {
                         Ok(pvt_key) => {
-                            if let Err(e) = quic.add_key(pvt_key, cid, bind_addr) {
+                            if let Err(e) = quic.add_key(
+                                (&pvt_key.lock()? as &[u8]).try_into()?,
+                                cid,
+                                bind_addr,
+                            ) {
                                 log::warn!(
                                     "special_update_fastsync: cannot add QUIC key {cid}: {e}"
                                 );

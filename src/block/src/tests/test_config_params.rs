@@ -13,7 +13,7 @@
 use super::*;
 use crate::{
     read_single_root_boc, write_read_and_assert, Ed25519KeyOption, Serializable, ValidatorDescr,
-    VarUInteger32,
+    VarUInteger32, ZeroizingBytes,
 };
 use rand::Rng;
 
@@ -198,7 +198,7 @@ fn test_config_param_31() {
 fn get_validator_set() -> ValidatorSet {
     let mut list = vec![];
     for n in 0..2 {
-        let keypair = Ed25519KeyOption::generate().unwrap();
+        let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let key = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
         let vd = ValidatorDescr::with_params(key, n, None);
         list.push(vd);
@@ -639,14 +639,14 @@ fn test_config_params() {
 fn get_config_param_39() -> ConfigParam39 {
     let mut cp = ConfigParam39::default();
 
-    let keypair = Ed25519KeyOption::generate().unwrap();
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let spk = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
     let cs = CryptoSignature::with_r_s(&[1; 32], &[2; 32]);
     let vtk = ValidatorTempKey::with_params(UInt256::from([3; 32]), spk, 100500, 1562663724);
     let vstk = ValidatorSignedTempKey::with_key_and_signature(vtk, cs);
     cp.insert(&UInt256::from([1; 32]), &vstk).unwrap();
 
-    let keypair = Ed25519KeyOption::generate().unwrap();
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let spk = SigPubKey::from_bytes(keypair.pub_key().unwrap()).unwrap();
     let cs = CryptoSignature::with_r_s(&[6; 32], &[7; 32]);
     let vtk = ValidatorTempKey::with_params(UInt256::from([8; 32]), spk, 500100, 1562664724);

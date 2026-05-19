@@ -10,7 +10,7 @@ use crate::utils::{open_vault, print_secret, print_secret_full, print_secret_hea
 use colored::Colorize;
 use secrets_vault::{errors::error::VaultError, storage::storage_trait::ListMode};
 
-pub async fn execute(full: bool) -> anyhow::Result<()> {
+pub async fn execute(full: bool, show_private: bool) -> anyhow::Result<()> {
     let vault = open_vault().await?;
     let records = vault.list_metadata(ListMode::OnlyNeeded).await?;
 
@@ -32,7 +32,7 @@ pub async fn execute(full: bool) -> anyhow::Result<()> {
             .ok_or_else(|| VaultError::empty_secret_id("Failed to list secrets"))?;
         let secret = vault.load(secret_id).await?;
         if full {
-            print_secret_full(&secret)?;
+            print_secret_full(&secret, show_private)?;
         } else {
             print_secret(&secret)?;
         }

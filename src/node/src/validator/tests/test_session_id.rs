@@ -19,7 +19,7 @@ use std::{
 };
 use ton_block::{
     signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, FutureSplitMerge,
-    McStateExtra, ShardDescr, ShardIdent,
+    McStateExtra, ShardDescr, ShardIdent, ZeroizingBytes,
 };
 
 fn parse_shard_ident(parser: &LogParser, name: &str) -> ShardIdent {
@@ -317,7 +317,7 @@ fn test_session_id_hashes_can_differ_with_xp25() {
 // ---------------------------------------------------------------------------
 
 fn make_test_key() -> PublicKey {
-    Ed25519KeyOption::generate().unwrap()
+    Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()
 }
 
 fn make_validator_descr_from_key(key: &PublicKey) -> ValidatorDescr {

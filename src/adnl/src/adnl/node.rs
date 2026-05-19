@@ -25,6 +25,7 @@ use crate::{
     transport::{udp_sender_receiver, udp_tcp_sender_receiver, AdnlReceiver, AdnlSender},
 };
 use rand::Rng;
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{
     borrow::Cow,
     cmp::{max, min},
@@ -65,8 +66,8 @@ use ton_api::{
     IntoBoxed, TLObject,
 };
 use ton_block::{
-    base64_encode, error, fail, lz4_compress, lz4_decompress, sha256_digest, Ed25519KeyOption,
-    KeyId, KeyOption, KeyOptionJson, Lz4DecompressMode, Result, UInt256,
+    base64_encode, error, fail, lz4_compress, lz4_decompress, sha256_digest, KeyId, KeyOption,
+    KeyOptionJson, Lz4DecompressMode, Result, UInt256,
 };
 
 #[macro_export]
@@ -466,7 +467,9 @@ impl AdnlChannel {
         channel_pub_key: &[u8; 32],
         counter: Arc<AtomicU64>,
     ) -> Result<Self> {
-        let fwd_secret = channel_pvt_key.shared_secret(channel_pub_key)?;
+        let fwd_secret_pd = channel_pvt_key.shared_secret(channel_pub_key)?;
+        let fwd_secret_pd_data: &[u8] = &fwd_secret_pd.lock()?;
+        let fwd_secret: [u8; 32] = fwd_secret_pd_data.try_into()?;
         let cmp = local_key.cmp(other_key);
         let (fwd_secret, rev_secret) = if std::cmp::Ordering::Equal == cmp {
             (fwd_secret, fwd_secret)
@@ -641,7 +644,7 @@ impl AdnlNodeAddress {
         key: &Arc<dyn KeyOption>,
     ) -> Result<Self> {
         let ret = Self {
-            channel_key: Ed25519KeyOption::generate()?,
+            channel_key: get_key_option_factory().generate()?,
             ip_version_address_adnl: AtomicPair::new(
                 ip_address_adnl.version as u64,
                 ip_address_adnl.address,
@@ -728,9 +731,9 @@ impl AdnlNodeConfigJson {
         for key in self.keys.iter() {
             if key.tag == tag {
                 return if as_src {
-                    Ok(Ed25519KeyOption::from_private_key_json(&key.data)?)
+                    Ok(get_key_option_factory().from_private_key_json(&key.data)?)
                 } else {
-                    Ok(Ed25519KeyOption::from_public_key_json(&key.data)?)
+                    Ok(get_key_option_factory().from_public_key_json(&key.data)?)
                 };
             }
         }
@@ -779,7 +782,7 @@ impl AdnlNodeConfig {
     ) -> Result<(AdnlNodeConfigJson, Self)> {
         let mut keys = Vec::new();
         for (key, tag) in keytags {
-            let (json, key) = Ed25519KeyOption::from_private_key_with_json(&key)?;
+            let (json, key) = get_key_option_factory().from_private_key_with_json(&key)?;
             keys.push((json, key as Arc<dyn KeyOption>, tag))
         }
         Self::create_configs(ip_address, keys)
@@ -812,7 +815,7 @@ impl AdnlNodeConfig {
                 .unwrap_or(Self::DEFAULT_TIMEOUT_EXPIRE_QUEUED_PACKET_SEC),
         };
         for key in json_config.keys.iter() {
-            let data = Ed25519KeyOption::from_private_key_json(&key.data)?;
+            let data = get_key_option_factory().from_private_key_json(&key.data)?;
             ret.add_key(data, key.tag)?;
         }
         Ok(ret)
@@ -825,7 +828,7 @@ impl AdnlNodeConfig {
     ) -> Result<(AdnlNodeConfigJson, Self)> {
         let mut keys = Vec::new();
         for tag in tags {
-            let (json, key) = Ed25519KeyOption::generate_with_json()?;
+            let (json, key) = get_key_option_factory().generate_with_json()?;
             keys.push((json, key as Arc<dyn KeyOption>, tag))
         }
         Self::create_configs(ip_address, keys)
@@ -4588,7 +4591,7 @@ impl AdnlNode {
         if let Some(channel) = channel {
             channel.encrypt_by_method(&mut data, version, &method)?;
         } else {
-            let key = Ed25519KeyOption::generate()?;
+            let key = get_key_option_factory().generate()?;
             AdnlHandshake::build_packet(&mut data, &key, &peer.address.key, version)?;
         }
         log::trace!(

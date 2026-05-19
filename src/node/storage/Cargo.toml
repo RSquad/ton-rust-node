@@ -18,17 +18,17 @@ lru = '0.16'
 metrics = '0.24'
 parking_lot = '0.12'
 quick_cache = '0.4'
-rand = { features = [ 'small_rng' ], version = '0.8' }
+rand = { features = ['small_rng'], version = '0.8' }
 rocksdb = '0.23'
 serde = '1.0'
 serde_cbor = '0.11'
 serde_derive = '1.0'
 serde_json = '1.0'
-smallvec = { features = [ 'const_new', 'union', 'write' ], version = '1.10' }
+smallvec = { features = ['const_new', 'union', 'write'], version = '1.10' }
 strum = '0.18'
 strum_macros = '0.18'
 thiserror = '1.0'
-tokio = { features = [ 'fs', 'rt-multi-thread' ], version = '1.5' }
+tokio = { features = ['fs', 'rt-multi-thread'], version = '1.4' }
 tokio-util = '0.7'
 adnl = { path = '../../adnl' }
 ton_block = { path = '../../block' }
@@ -36,7 +36,7 @@ lockfree = { path = '../../lockfree' }
 ton_api = { path = '../../tl/ton_api' }
 
 [build-dependencies]
-cc = { features = [ 'parallel' ], version = '1.0.61' }
+cc = { features = ['parallel'], version = '1.0.61' }
 
 [dev-dependencies]
 tempfile = '3'

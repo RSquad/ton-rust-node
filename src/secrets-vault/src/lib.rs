@@ -16,10 +16,8 @@ pub mod storage;
 pub mod types;
 pub mod utils;
 pub mod vault;
-pub mod vault_builder;
-
-#[cfg(feature = "ton-block")]
 pub mod vault_block;
+pub mod vault_builder;
 
 #[cfg(test)]
 mod tests;

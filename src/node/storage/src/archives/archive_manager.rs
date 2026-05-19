@@ -355,8 +355,12 @@ impl ArchiveManager {
         fd.archive_slice().get_slice(archive_id, offset, limit).await
     }
 
+    /// Sums the main node DB (which always lives here regardless of mode)
+    /// and any extra DBs known to the provider (epoch DBs in archival mode).
     pub fn rocksdb_memory_usage(&self) -> crate::RocksDbMemoryUsage {
-        self.db_provider.memory_usage()
+        let mut usage = self.db.memory_usage();
+        usage += self.db_provider.memory_usage();
+        usage
     }
 
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) {

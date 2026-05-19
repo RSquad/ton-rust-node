@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes};
 
 /// Test helper trait to provide on_vote with default raw_vote
 trait SimplexStateTestExt {
@@ -53,7 +53,8 @@ impl SimplexStateTestExt for SimplexState {
 fn create_test_validators(count: u32) -> Vec<SessionNode> {
     (0..count)
         .map(|_i| {
-            let public_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+            let public_key =
+                Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
             let adnl_id = public_key.id().clone();
             SessionNode { public_key, adnl_id, weight: 1 }
         })
@@ -93,7 +94,8 @@ fn create_test_desc_weights(
     let nodes: Vec<SessionNode> = weights
         .into_iter()
         .map(|weight| {
-            let public_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+            let public_key =
+                Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
             let adnl_id = public_key.id().clone();
             SessionNode { public_key, adnl_id, weight }
         })
@@ -166,7 +168,7 @@ fn create_test_candidate(
         collated_file_hash: UInt256::default(),
         data: vec![],
         collated_data: vec![],
-        creator: Ed25519KeyOption::generate().unwrap(),
+        creator: Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap(),
     };
 
     Candidate::new(
@@ -185,7 +187,7 @@ fn create_stub_block(block_id: BlockIdExt) -> crate::block::BlockCandidate {
         collated_file_hash: UInt256::default(),
         data: vec![],
         collated_data: vec![],
-        creator: Ed25519KeyOption::generate().unwrap(),
+        creator: Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap(),
     }
 }
 

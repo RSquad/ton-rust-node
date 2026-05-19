@@ -20,7 +20,10 @@ use std::{
     },
     time::Duration,
 };
-use ton_block::{error, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{
+    error, BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256,
+    ZeroizingBytes,
+};
 use validator_session::*;
 
 include!("../../../common/src/info.rs");
@@ -612,7 +615,8 @@ where
     nodes.reserve(config.node_count);
 
     for _i in 0..config.node_count {
-        let private_key = Ed25519KeyOption::generate().expect("Failed to generate private key");
+        let private_key =
+            Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
         let adnl_id = private_key.id();
 
         let catchain_node =

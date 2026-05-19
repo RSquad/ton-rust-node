@@ -29,7 +29,8 @@ use ton_api::{
     IntoBoxed, TLObject,
 };
 use ton_block::{
-    ed25519_encode_private_key_to_pkcs8, ed25519_generate_private_key, Ed25519KeyOption, KeyId,
+    ed25519_encode_private_key_to_pkcs8, ed25519_generate_private_key, sha256_digest_slices, KeyId,
+    ED25519_KEY_TYPE, ED25519_SECRET_KEY_LENGTH,
 };
 
 include!("../../common/src/config.rs");
@@ -459,16 +460,14 @@ fn test_quic_reconnect_after_server_restart() {
 // ---------------------------------------------------------------------------
 fn make_endpoint(
     adnl_port: u16,
-) -> (Arc<QuicNode>, [u8; Ed25519KeyOption::PVT_KEY_SIZE], Arc<KeyId>, SocketAddr, CancellationToken)
-{
+) -> (Arc<QuicNode>, [u8; ED25519_SECRET_KEY_LENGTH], Arc<KeyId>, SocketAddr, CancellationToken) {
     make_endpoint_with_config(adnl_port, QuicRateLimitConfig::disabled())
 }
 
 fn make_endpoint_with_config(
     adnl_port: u16,
     rl_config: QuicRateLimitConfig,
-) -> (Arc<QuicNode>, [u8; Ed25519KeyOption::PVT_KEY_SIZE], Arc<KeyId>, SocketAddr, CancellationToken)
-{
+) -> (Arc<QuicNode>, [u8; ED25519_SECRET_KEY_LENGTH], Arc<KeyId>, SocketAddr, CancellationToken) {
     let key = ed25519_generate_private_key().unwrap().to_bytes();
     let (_, cfg) = AdnlNodeConfig::from_ip_address_and_private_keys(
         &format!("127.0.0.1:{adnl_port}"),
@@ -491,7 +490,7 @@ fn make_endpoint_with_config(
 /// Build a raw quinn client config using an Ed25519 RPK cert from the given key.
 /// This produces a client that speaks the same TLS-RPK protocol as QuicNode
 /// but is fully independent — useful for injecting rogue connections.
-fn build_raw_quinn_client(key_bytes: &[u8; Ed25519KeyOption::PVT_KEY_SIZE]) -> quinn::ClientConfig {
+fn build_raw_quinn_client(key_bytes: &[u8; ED25519_SECRET_KEY_LENGTH]) -> quinn::ClientConfig {
     let key_der_vec = ed25519_encode_private_key_to_pkcs8(key_bytes).unwrap();
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_der_vec).unwrap();
     let key_pair = rcgen::KeyPair::from_der_and_sign_algo(&key_der, &rcgen::PKCS_ED25519).unwrap();
@@ -853,10 +852,7 @@ fn test_quic_key_rotation() {
             let spki = certs.first().expect("no server cert");
             assert_eq!(spki.as_ref().len(), 44, "unexpected SPKI length");
             let pub_key: &[u8; 32] = spki.as_ref()[12..].try_into().unwrap();
-            let data = ton_block::sha256_digest_slices(&[
-                &Ed25519KeyOption::KEY_TYPE.to_le_bytes(),
-                pub_key,
-            ]);
+            let data = sha256_digest_slices(&[&ED25519_KEY_TYPE.to_le_bytes(), pub_key]);
             KeyId::from_data(data)
         }
 
