@@ -31,9 +31,9 @@ pub const SEND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs
 pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
 /// Default timeout for establishing a TCP connection to the nodectl service.
-pub(crate) const API_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+pub(crate) const API_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 /// Default overall request timeout for nodectl service REST calls.
-pub(crate) const API_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+pub(crate) const API_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
 const API_CONNECT_TIMEOUT_ENV: &str = "NODECTL_API_CONNECT_TIMEOUT_SECS";
 const API_REQUEST_TIMEOUT_ENV: &str = "NODECTL_API_REQUEST_TIMEOUT_SECS";
