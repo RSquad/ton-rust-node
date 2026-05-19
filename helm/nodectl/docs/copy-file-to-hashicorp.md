@@ -171,7 +171,7 @@ Flags:
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--on-conflict <fail\|skip\|overwrite>` | `fail` | What to do when the destination already has the same secret id |
-| `--list-mode <only-needed\|all>` | `only-needed` | Source listing scope |
+| `--list-mode <only-needed\|all>` | `all` | Source listing scope (`only-needed` skips transit-stored Ed25519 keys on HashiCorp) |
 | `--dry-run` | off | Print the plan without writing |
 | `--continue-on-error` | off | Keep going on per-secret errors instead of aborting |
 

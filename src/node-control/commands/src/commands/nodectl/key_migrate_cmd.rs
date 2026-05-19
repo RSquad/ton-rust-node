@@ -50,7 +50,7 @@ pub struct KeyMigrateCmd {
     on_conflict: OnConflict,
 
     /// Source list mode
-    #[arg(long = "list-mode", value_enum, default_value = "only-needed")]
+    #[arg(long = "list-mode", value_enum, default_value = "all")]
     list_mode: ListModeArg,
 
     /// Print plan without writing to destination
@@ -307,7 +307,7 @@ mod tests {
     fn migrate_cli_uses_safe_defaults() {
         let cli = TestCli::try_parse_from(["nodectl"]).expect("parse defaults");
         assert!(matches!(cli.cmd.on_conflict, OnConflict::Fail));
-        assert!(matches!(cli.cmd.list_mode, ListModeArg::OnlyNeeded));
+        assert!(matches!(cli.cmd.list_mode, ListModeArg::All));
         assert!(!cli.cmd.dry_run);
         assert!(!cli.cmd.continue_on_error);
     }
