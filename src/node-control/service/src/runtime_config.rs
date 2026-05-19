@@ -242,6 +242,7 @@ impl RuntimeConfigStore {
             ClientJsonRpc::connect_many(
                 app_config.ton_http_api.resolved_endpoints(),
                 app_config.ton_http_api.api_key.clone(),
+                app_config.ton_http_api.resolved_timeouts(),
             )
             .unwrap(),
         );
@@ -457,8 +458,12 @@ impl RuntimeConfigStore {
     async fn load_rpc_client(app_cfg: &AppConfig) -> anyhow::Result<Arc<ClientJsonRpc>> {
         let resolved = app_cfg.ton_http_api.resolved_endpoints();
         let rpc_client = Arc::new(
-            ClientJsonRpc::connect_many(resolved.clone(), app_cfg.ton_http_api.api_key.clone())
-                .context("ton api connection error")?,
+            ClientJsonRpc::connect_many(
+                resolved.clone(),
+                app_cfg.ton_http_api.api_key.clone(),
+                app_cfg.ton_http_api.resolved_timeouts(),
+            )
+            .context("ton api connection error")?,
         );
         let urls: Vec<&str> = resolved.iter().map(|(u, _)| u.as_str()).collect();
         tracing::info!("connected to ton api endpoints: {}", urls.join(", "));

@@ -12,6 +12,7 @@ use crate::v2::data_models::{
 };
 use anyhow::Context;
 use base64::Engine;
+use common::app_config::EndpointTimeouts;
 use std::{
     collections::HashSet,
     sync::atomic::{AtomicUsize, Ordering},
@@ -29,18 +30,23 @@ struct EndpointClient {
 pub struct ClientJsonRpc {
     api_key: Option<String>,
     endpoints: Vec<EndpointClient>,
+    timeouts: EndpointTimeouts,
     rr_cursor: AtomicUsize,
 }
 
 impl ClientJsonRpc {
     pub fn connect(url: String, api_key: Option<String>) -> anyhow::Result<Self> {
-        Self::connect_many(vec![(url, None)], api_key)
+        Self::connect_many(vec![(url, None)], api_key, EndpointTimeouts::default())
     }
 
     /// Builds a failover client from one or more endpoint entries.
     ///
     /// Each entry is a `(url, per_endpoint_api_key)` pair. When the
     /// per-endpoint key is `None`, the `default_api_key` is used instead.
+    ///
+    /// `timeouts` bounds the wait on every individual endpoint so that an
+    /// unreachable ton-http-api cannot stall the daemon: each call is
+    /// wrapped in [`tokio::time::timeout`] with budget [`EndpointTimeouts::total`].
     ///
     /// This constructor is defensive: it trims inputs, drops empty values and
     /// deduplicates URLs while preserving order. Callers should normally pass
@@ -49,6 +55,7 @@ impl ClientJsonRpc {
     pub fn connect_many(
         entries: Vec<(String, Option<String>)>,
         default_api_key: Option<String>,
+        timeouts: EndpointTimeouts,
     ) -> anyhow::Result<Self> {
         let mut seen = HashSet::with_capacity(entries.len());
         let mut unique: Vec<(String, Option<String>)> = Vec::with_capacity(entries.len());
@@ -81,7 +88,12 @@ impl ClientJsonRpc {
             })
             .collect::<Vec<_>>();
 
-        Ok(ClientJsonRpc { api_key: default_api_key, endpoints, rr_cursor: AtomicUsize::new(0) })
+        Ok(ClientJsonRpc {
+            api_key: default_api_key,
+            endpoints,
+            timeouts,
+            rr_cursor: AtomicUsize::new(0),
+        })
     }
 
     pub fn api_key(&self) -> Option<String> {
@@ -103,8 +115,12 @@ impl ClientJsonRpc {
     ///    successive calls are spread across endpoints in round-robin order.
     /// 2. Starting from that endpoint, each endpoint is tried once in
     ///    cyclic order until one succeeds or all have been exhausted.
+    ///    Each per-endpoint attempt is bounded by [`EndpointTimeouts::total`]
+    ///    so an unreachable upstream cannot stall the failover loop.
     /// 3. On success the response is returned immediately; on total failure
-    ///    the last error is propagated.
+    ///    an aggregated error is returned listing every attempted endpoint
+    ///    with its failure reason so the operator can identify ton-http-api
+    ///    as the source.
     async fn json_rpc(
         &self,
         method: &'static str,
@@ -113,13 +129,15 @@ impl ClientJsonRpc {
         let total = self.endpoints.len();
         let start = self.rr_cursor.fetch_add(1, Ordering::Relaxed) % total;
         let request_id = serde_json::json!(uuid::Uuid::new_v4().to_string());
-        let mut last_error: Option<anyhow::Error> = None;
+        let per_endpoint_budget = self.timeouts.total();
+        let mut failures: Vec<(String, String)> = Vec::with_capacity(total);
 
         for attempt in 0..total {
             let idx = (start + attempt) % total;
             let endpoint = &self.endpoints[idx];
-            match endpoint.client.json_rpc(method, params.clone(), request_id.clone()).await {
-                Ok(response) => {
+            let call = endpoint.client.json_rpc(method, params.clone(), request_id.clone());
+            match tokio::time::timeout(per_endpoint_budget, call).await {
+                Ok(Ok(response)) => {
                     if attempt > 0 {
                         tracing::debug!(
                             method,
@@ -130,25 +148,45 @@ impl ClientJsonRpc {
                     }
                     return Ok(response);
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
+                    let reason = err.to_string();
                     tracing::debug!(
                         method,
                         endpoint = %endpoint.url,
                         attempt = attempt + 1,
                         total_attempts = total,
-                        error = %err,
+                        error = %reason,
                         "ton-http-api request failed"
                     );
-                    last_error = Some(anyhow::Error::from(err));
+                    failures.push((endpoint.url.clone(), reason));
+                }
+                Err(_elapsed) => {
+                    let reason = format!("timed out after {}s", per_endpoint_budget.as_secs());
+                    tracing::debug!(
+                        method,
+                        endpoint = %endpoint.url,
+                        attempt = attempt + 1,
+                        total_attempts = total,
+                        timeout_secs = per_endpoint_budget.as_secs(),
+                        "ton-http-api request timed out"
+                    );
+                    failures.push((endpoint.url.clone(), reason));
                 }
             }
         }
 
-        if let Some(err) = last_error {
-            Err(err.context(format!("all endpoints ({}) failed", total)))
-        } else {
-            anyhow::bail!("request failed")
-        }
+        let detail = failures
+            .iter()
+            .map(|(url, reason)| format!("{}: {}", url, reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::warn!(
+            method,
+            total_attempts = total,
+            failures = %detail,
+            "ton-http-api unreachable on all endpoints"
+        );
+        anyhow::bail!("ton-http-api unreachable: tried {} endpoint(s): [{}]", total, detail)
     }
 
     pub async fn get_config_param(&self, param_id: u32) -> anyhow::Result<ConfigParamEnum> {
@@ -269,9 +307,13 @@ impl ClientJsonRpc {
 #[cfg(test)]
 mod tests {
     use super::ClientJsonRpc;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use common::app_config::EndpointTimeouts;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -362,8 +404,12 @@ mod tests {
             spawn_jsonrpc_ok_server(serde_json::json!({"from":"fallback"}), request_count.clone())
                 .await;
 
-        let client = ClientJsonRpc::connect_many(vec![(bad_url, None), (good_url, None)], None)
-            .expect("client");
+        let client = ClientJsonRpc::connect_many(
+            vec![(bad_url, None), (good_url, None)],
+            None,
+            EndpointTimeouts::default(),
+        )
+        .expect("client");
 
         let response = client
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
@@ -390,8 +436,12 @@ mod tests {
             spawn_jsonrpc_ok_server(serde_json::json!({"from":"second"}), second_count.clone())
                 .await;
 
-        let client = ClientJsonRpc::connect_many(vec![(first_url, None), (second_url, None)], None)
-            .expect("client");
+        let client = ClientJsonRpc::connect_many(
+            vec![(first_url, None), (second_url, None)],
+            None,
+            EndpointTimeouts::default(),
+        )
+        .expect("client");
 
         let first_response = client
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
@@ -412,12 +462,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_rpc_all_endpoints_failed_returns_last_error_only() {
+    async fn json_rpc_all_endpoints_failed_returns_aggregated_error() {
         let (bad_1, bad_1_handle) = spawn_http_500_server().await;
         let (bad_2, bad_2_handle) = spawn_http_500_server().await;
 
-        let client =
-            ClientJsonRpc::connect_many(vec![(bad_1, None), (bad_2, None)], None).expect("client");
+        let client = ClientJsonRpc::connect_many(
+            vec![(bad_1.clone(), None), (bad_2.clone(), None)],
+            None,
+            EndpointTimeouts::default(),
+        )
+        .expect("client");
 
         let err = client
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
@@ -426,15 +480,112 @@ mod tests {
         let err_text = err.to_string();
 
         assert!(
-            !err_text.contains("failed on all ton-http-api endpoints"),
-            "error should not contain aggregated wrapper message"
+            err_text.contains("ton-http-api unreachable"),
+            "error should identify ton-http-api as the source: {err_text}"
+        );
+        assert!(
+            err_text.contains(&bad_1) && err_text.contains(&bad_2),
+            "error should list every attempted endpoint: {err_text}"
         );
         assert!(
             !err_text.contains("Request `getAddressInformation`"),
-            "error should not include method wrapper text"
+            "error should not include method wrapper text: {err_text}"
         );
 
         bad_1_handle.await.expect("bad_1 server task");
         bad_2_handle.await.expect("bad_2 server task");
+    }
+
+    /// Spawns a TCP listener that accepts connections but never replies.
+    /// Used to simulate an unreachable / blackholed ton-http-api endpoint.
+    async fn spawn_blackhole_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+        let addr = listener.local_addr().expect("listener local addr");
+        let handle = tokio::spawn(async move {
+            // Accept and hold connections open without responding.
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    // Park the socket so the request never completes; drop on task abort.
+                    tokio::spawn(async move {
+                        let _socket = socket;
+                        std::future::pending::<()>().await;
+                    });
+                } else {
+                    break;
+                }
+            }
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn json_rpc_times_out_unreachable_endpoint() {
+        let (dead_url, dead_handle) = spawn_blackhole_server().await;
+        let timeouts = EndpointTimeouts {
+            connect: Duration::from_millis(100),
+            request: Duration::from_millis(200),
+        };
+
+        let client = ClientJsonRpc::connect_many(vec![(dead_url.clone(), None)], None, timeouts)
+            .expect("client");
+
+        let start = std::time::Instant::now();
+        let err = client
+            .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
+            .await
+            .expect_err("json_rpc should fail when endpoint never replies");
+        let elapsed = start.elapsed();
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains(&dead_url) && err_text.contains("timed out"),
+            "error should report timeout for dead endpoint: {err_text}"
+        );
+        // Per-endpoint budget is 300ms; allow generous slack for slow CI.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "single dead endpoint must not stall: elapsed={elapsed:?}"
+        );
+
+        dead_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn json_rpc_total_time_bounded_with_n_dead_endpoints() {
+        let (a_url, a_handle) = spawn_blackhole_server().await;
+        let (b_url, b_handle) = spawn_blackhole_server().await;
+        let (c_url, c_handle) = spawn_blackhole_server().await;
+        let timeouts = EndpointTimeouts {
+            connect: Duration::from_millis(50),
+            request: Duration::from_millis(150),
+        };
+
+        let client = ClientJsonRpc::connect_many(
+            vec![(a_url.clone(), None), (b_url.clone(), None), (c_url.clone(), None)],
+            None,
+            timeouts,
+        )
+        .expect("client");
+
+        let start = std::time::Instant::now();
+        let err = client
+            .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
+            .await
+            .expect_err("all endpoints dead should produce aggregated error");
+        let elapsed = start.elapsed();
+
+        let err_text = err.to_string();
+        assert!(err_text.contains(&a_url), "expected error to list endpoint A: {err_text}");
+        assert!(err_text.contains(&b_url), "expected error to list endpoint B: {err_text}");
+        assert!(err_text.contains(&c_url), "expected error to list endpoint C: {err_text}");
+        // Budget is 3 × 200ms = 600ms; allow generous slack for CI.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "total wait must stay bounded across N dead endpoints: elapsed={elapsed:?}"
+        );
+
+        a_handle.abort();
+        b_handle.abort();
+        c_handle.abort();
     }
 }

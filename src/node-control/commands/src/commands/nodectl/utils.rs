@@ -216,6 +216,7 @@ pub async fn load_config_vault_rpc_client(
         ClientJsonRpc::connect_many(
             config.ton_http_api.resolved_endpoints(),
             config.ton_http_api.api_key.clone(),
+            config.ton_http_api.resolved_timeouts(),
         )
         .context("ClientJsonRpc")?,
     );
