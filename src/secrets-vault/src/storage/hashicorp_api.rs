@@ -10,7 +10,7 @@ use crate::{
     errors::error::VaultError,
     memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
     storage::hashicorp_token_provider::{create_token_provider, AuthConfig, TokenProvider},
-    types::{metadata::Metadata, secret::Secret, store_mode::StoreMode},
+    types::{metadata::Metadata, secret::Secret, secret_id::SecretId, store_mode::StoreMode},
 };
 use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
@@ -393,6 +393,46 @@ impl Client {
             anyhow::bail!(VaultError::not_extractable(secret.metadata().secret_id.as_ref()));
         }
 
+        let keypair = match &secret {
+            Secret::SymmetricKey { .. } | Secret::Blob { .. } => {
+                anyhow::bail!(VaultError::unsupported_algorithm(secret.metadata().algorithm));
+            }
+            Secret::KeyPair { keypair } => keypair,
+        };
+
+        let secret_id = secret
+            .metadata()
+            .secret_id
+            .as_ref()
+            .ok_or_else(|| VaultError::empty_secret_id("Failed to import"))?;
+
+        let pvt_key = keypair.private_key()?;
+        self.import_ed25519_wrapped(secret_id, pvt_key, secret.metadata().extractable, mode).await
+    }
+
+    /// Import an Ed25519 private key into Vault Transit from raw bytes, with
+    /// the destination's `exportable` flag controlled independently of where
+    /// the bytes came from. Intended for vault-to-vault migration of
+    /// non-extractable secrets out of a backend that holds the bits at rest
+    /// (e.g. file storage). The destination key's exportability is set to
+    /// `dest_exportable`; pass `false` to preserve a non-extractable policy.
+    pub async fn import_ed25519_raw(
+        &self,
+        secret_id: &SecretId,
+        pvt_key: &ProtectedMemory,
+        dest_exportable: bool,
+        mode: StoreMode,
+    ) -> anyhow::Result<()> {
+        self.import_ed25519_wrapped(secret_id, pvt_key, dest_exportable, mode).await
+    }
+
+    async fn import_ed25519_wrapped(
+        &self,
+        secret_id: &SecretId,
+        pvt_key: &ProtectedMemory,
+        dest_exportable: bool,
+        mode: StoreMode,
+    ) -> anyhow::Result<()> {
         // Get wrapping key from Vault
         let url = format!("{}/{}/wrapping_key", &self.addr, &self.transit_mount);
         let result: WrappingKeyResponse = self
@@ -405,18 +445,9 @@ impl Client {
         let mut aes_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut aes_key);
 
-        // Get the private key data
-        let keypair = match &secret {
-            Secret::SymmetricKey { .. } | Secret::Blob { .. } => {
-                anyhow::bail!(VaultError::unsupported_algorithm(secret.metadata().algorithm));
-            }
-            Secret::KeyPair { keypair } => keypair,
-        };
-
         // Convert raw Ed25519 seed to PKCS#8 DER format
         let signing_key = {
-            let private_key = keypair.private_key()?;
-            let private_key_lock = private_key.lock()?;
+            let private_key_lock = pvt_key.lock()?;
             let private_key_data: &[u8] = &private_key_lock;
 
             ed25519_dalek::SigningKey::from_bytes(private_key_data.try_into().map_err(|_| {
@@ -468,15 +499,8 @@ impl Client {
         let request = ImportKeyRequest {
             ciphertext: base64::encode(&combined),
             key_type: "ed25519".to_string(),
-            exportable: secret.metadata().extractable,
+            exportable: dest_exportable,
             allow_replacement: Some(allow_replacement),
-        };
-
-        let secret_id = match &secret.metadata().secret_id {
-            Some(secret_id) => secret_id,
-            None => {
-                anyhow::bail!(VaultError::empty_secret_id("Failed to import"));
-            }
         };
 
         let key_exists = self.get_key_info(secret_id.as_str()).await.is_ok();

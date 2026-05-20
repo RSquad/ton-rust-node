@@ -9,6 +9,7 @@
 use crate::{
     crypto::{crypto_trait::Crypto, key_material::KeyMaterial, master_key::MasterKey},
     errors::error::VaultError,
+    memory::protected_memory::ProtectedMemory,
     storage::{
         file_json_migrator::migrate_tree_node_v1_to_v2,
         storage_trait::{ListMode, Storage},
@@ -176,6 +177,25 @@ impl FileJsonStorage {
 
     pub fn file_path(&self) -> &Path {
         &self.file_path
+    }
+
+    /// Returns raw decrypted private bytes and metadata, bypassing the
+    /// in-memory `KeyPair` accessor's `extractable` check. Intended only for
+    /// vault-to-vault migration of non-extractable secrets out of file storage,
+    /// where the bits are physically present at rest regardless of the policy
+    /// flag.
+    pub async fn export_for_migration(
+        &self,
+        secret_id: &SecretId,
+    ) -> anyhow::Result<(Metadata, ProtectedMemory)> {
+        let path_parts = Self::parse_path(secret_id);
+        let tree = self.tree.read().await;
+        let stored = tree
+            .get(&path_parts)
+            .ok_or_else(|| VaultError::not_found(format!("Secret '{}' not found", secret_id)))?;
+        let (data, metadata) =
+            decrypt(self.master_key.key_material(), &stored.encrypted_data, self.crypto.as_ref())?;
+        Ok((metadata, data))
     }
 
     /// Migrate a secret ID from the legacy `/`-separated format (pre-v0.2.0)

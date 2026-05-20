@@ -30,6 +30,10 @@ impl SecretVault {
         SecretVault { storage, event_handler }
     }
 
+    pub fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
+    }
+
     pub async fn flush(&self) -> anyhow::Result<()> {
         self.storage.flush().await
     }

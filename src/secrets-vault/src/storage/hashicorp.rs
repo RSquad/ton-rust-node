@@ -207,6 +207,10 @@ impl HashicorpStorage {
         Ok(Self { client: Arc::new(client), crypto, prefer_local_crypto })
     }
 
+    pub fn client(&self) -> &Arc<Client> {
+        &self.client
+    }
+
     fn algorithm_to_key_type(algorithm: Algorithm) -> anyhow::Result<String> {
         match algorithm {
             Algorithm::None | Algorithm::Aes256Gcm => {

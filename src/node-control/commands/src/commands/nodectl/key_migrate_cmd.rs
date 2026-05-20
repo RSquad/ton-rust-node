@@ -9,8 +9,12 @@
 use anyhow::Context;
 use colored::Colorize;
 use secrets_vault::{
-    crypto::factory::CryptoFactory, errors::error::VaultError, storage::storage_trait::ListMode,
-    types::store_mode::StoreMode, vault::SecretVault, vault_block::BlockCryptoFactory,
+    crypto::factory::CryptoFactory,
+    errors::error::VaultError,
+    storage::{file_json::FileJsonStorage, hashicorp::HashicorpStorage, storage_trait::ListMode},
+    types::{algorithm::Algorithm, metadata::Metadata, secret_id::SecretId, store_mode::StoreMode},
+    vault::SecretVault,
+    vault_block::BlockCryptoFactory,
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -60,6 +64,13 @@ pub struct KeyMigrateCmd {
     /// Continue on per-secret errors instead of aborting
     #[arg(long = "continue-on-error")]
     continue_on_error: bool,
+
+    /// Allow exporting private bytes of non-extractable Ed25519 keys from a
+    /// file-storage source into HashiCorp Vault. The imported key remains
+    /// non-extractable at the destination. Has no effect for any other
+    /// source/destination combination.
+    #[arg(long = "allow-nonexportable")]
+    allow_nonexportable: bool,
 }
 
 impl KeyMigrateCmd {
@@ -90,6 +101,13 @@ impl KeyMigrateCmd {
         let dst: Arc<SecretVault> = SecretVaultBuilder::from_url(&to_url, crypto)
             .await
             .context("open destination vault")?;
+
+        // Typed downcasts for the file→hashicorp raw migration path used for
+        // non-extractable Ed25519 secrets (gated by --allow-nonexportable).
+        let src_file: Option<&FileJsonStorage> =
+            src.storage().as_ref().downcast_ref::<FileJsonStorage>();
+        let dst_hc: Option<&HashicorpStorage> =
+            dst.storage().as_ref().downcast_ref::<HashicorpStorage>();
 
         let records =
             src.list_metadata(self.list_mode.into()).await.context("list source vault records")?;
@@ -148,15 +166,29 @@ impl KeyMigrateCmd {
                 println!("         tags: {}", preview.dimmed());
             }
 
-            let secret = match src.load(secret_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    println!("         {} cannot read from source: {}", "SKIP".yellow().bold(), e);
-                    skipped += 1;
-                    if !self.continue_on_error && !is_skippable_load_error(&e) {
-                        return Err(e);
+            let use_raw_path = self.allow_nonexportable
+                && !meta.extractable
+                && meta.algorithm == Algorithm::Ed25519
+                && src_file.is_some()
+                && dst_hc.is_some();
+
+            let secret = if use_raw_path {
+                None
+            } else {
+                match src.load(secret_id).await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        println!(
+                            "         {} cannot read from source: {}",
+                            "SKIP".yellow().bold(),
+                            e
+                        );
+                        skipped += 1;
+                        if !self.continue_on_error && !is_skippable_load_error(&e) {
+                            return Err(e);
+                        }
+                        continue;
                     }
-                    continue;
                 }
             };
 
@@ -186,12 +218,21 @@ impl KeyMigrateCmd {
                 }
             };
 
-            println!(
-                "         {} {}  mode={}",
-                "WRITE".green(),
-                secret_id.as_str(),
-                mode_label(mode)
-            );
+            if use_raw_path {
+                println!(
+                    "         {} {}  mode={}  (non-extractable, file→hashicorp)",
+                    "WRITE-RAW".magenta().bold(),
+                    secret_id.as_str(),
+                    mode_label(mode)
+                );
+            } else {
+                println!(
+                    "         {} {}  mode={}",
+                    "WRITE".green(),
+                    secret_id.as_str(),
+                    mode_label(mode)
+                );
+            }
 
             if self.dry_run {
                 println!("         {} (dry-run, no write performed)", "DRY".yellow().bold());
@@ -200,7 +241,17 @@ impl KeyMigrateCmd {
             }
 
             let write_started = Instant::now();
-            match dst.store(&secret, mode).await {
+            let write_result = match (use_raw_path, src_file, dst_hc, secret.as_ref()) {
+                (true, Some(sf), Some(dh), _) => {
+                    raw_migrate_ed25519(sf, dh, secret_id, meta, mode).await
+                }
+                (false, _, _, Some(s)) => dst.store(s, mode).await,
+                _ => Err(anyhow::anyhow!(
+                    "internal: use_raw_path/storage downcasts/loaded secret out of sync"
+                )),
+            };
+
+            match write_result {
                 Ok(()) => {
                     println!(
                         "         {} {} {}",
@@ -244,6 +295,33 @@ impl KeyMigrateCmd {
         println!("{} {}\n", "✓".green().bold(), "Migration completed".green());
         Ok(())
     }
+}
+
+/// Migrate one Ed25519 secret from file-storage to HashiCorp Vault via the raw
+/// bytes path. The destination key is created non-extractable; the original
+/// `extractable=false` policy is preserved in the recorded metadata.
+async fn raw_migrate_ed25519(
+    src_file: &FileJsonStorage,
+    dst_hc: &HashicorpStorage,
+    secret_id: &SecretId,
+    meta: &Metadata,
+    mode: StoreMode,
+) -> anyhow::Result<()> {
+    let (_, pvt_key) = src_file
+        .export_for_migration(secret_id)
+        .await
+        .context("export secret bytes from file storage")?;
+    dst_hc
+        .client()
+        .import_ed25519_raw(secret_id, &pvt_key, false, mode)
+        .await
+        .context("import wrapped key into hashicorp")?;
+    dst_hc
+        .client()
+        .set_metadata(secret_id.as_str(), meta, None)
+        .await
+        .context("write metadata into hashicorp")?;
+    Ok(())
 }
 
 fn is_skippable_load_error(e: &anyhow::Error) -> bool {
@@ -310,6 +388,7 @@ mod tests {
         assert!(matches!(cli.cmd.list_mode, ListModeArg::All));
         assert!(!cli.cmd.dry_run);
         assert!(!cli.cmd.continue_on_error);
+        assert!(!cli.cmd.allow_nonexportable);
     }
 
     #[test]
@@ -322,12 +401,14 @@ mod tests {
             "all",
             "--dry-run",
             "--continue-on-error",
+            "--allow-nonexportable",
         ])
         .expect("parse full set");
         assert!(matches!(cli.cmd.on_conflict, OnConflict::Overwrite));
         assert!(matches!(cli.cmd.list_mode, ListModeArg::All));
         assert!(cli.cmd.dry_run);
         assert!(cli.cmd.continue_on_error);
+        assert!(cli.cmd.allow_nonexportable);
     }
 
     #[test]
