@@ -174,9 +174,49 @@ Flags:
 | `--list-mode <only-needed\|all>` | `all` | Source listing scope (`only-needed` skips transit-stored Ed25519 keys on HashiCorp) |
 | `--dry-run` | off | Print the plan without writing |
 | `--continue-on-error` | off | Keep going on per-secret errors instead of aborting |
+| `--allow-nonexportable` | off | For file → HashiCorp Ed25519 secrets where the source has `extractable=false`: export the bytes from file storage anyway and import them into Vault as **non-exportable**. Has no effect for any other source/destination combination. |
 
 The source vault is read-only — if migration fails partway, `vault.json` on
 the PVC is untouched and the service keeps working with the old `VAULT_URL`.
+
+#### Non-extractable Ed25519 keys
+
+When nodectl generates an Ed25519 key with `extractable=false` (this is the
+default for the auto-generated `master-wallet-secret`, and is also used by
+keys created via `nodectl key add` without the `--extractable` flag), the
+private bytes are still present at rest in `vault.json` — the file vault
+encrypts the whole record under `master_key` and the `extractable` flag is an
+application-level policy. Migrating such keys into HashiCorp Vault is
+therefore physically possible but is gated behind `--allow-nonexportable` so
+the policy override is explicit.
+
+Without the flag, a non-extractable Ed25519 secret will fail to migrate with
+`[E104: Not extractable] Secret with id '…' is not extractable`. With the
+flag, the migration reads the raw bytes from file storage, wraps them with
+the Vault transit wrapping key, and imports the result with
+`exportable=false` in Vault — i.e. the destination key remains
+non-extractable. The recorded metadata still has `extractable=false`.
+
+For a typical nodectl deployment the relevant secret is
+`master-wallet-secret`, so the migration command in §5 becomes:
+
+```bash
+nodectl key migrate --allow-nonexportable
+```
+
+Non-extractable secrets show a `WRITE-RAW` line instead of `WRITE` in the
+per-record log, so it is obvious which records took the raw-bytes path:
+
+```text
+[1/N] READ  master-wallet-secret
+         algo=Ed25519  payload=KeyPair  extractable=no  expires=never  tags=0
+         WRITE-RAW master-wallet-secret  mode=NewOnly  (non-extractable, file→hashicorp)
+         OK master-wallet-secret (4ms)
+```
+
+The flag is a no-op for keys that already have `extractable=true`, for blob
+secrets (password hashes, JWT signing key), and for any source that is not
+`file://`.
 
 ### 6. Verify the destination
 
