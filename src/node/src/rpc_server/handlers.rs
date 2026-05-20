@@ -208,7 +208,7 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
         };
         // sanity: the block must cover our address
         if !block_id.shard().contains_full_prefix(&prefix) {
-            fail!("fetch a block {block_id} without specified account {account_id:x}")
+            fail!("fetched a block {block_id} of shard other than specified account {account_id:x}")
         }
 
         // deserialize strictly with the correct id - otherwise there will be a `wrong root hash`
