@@ -83,7 +83,7 @@ async fn test_from_url_valid_file_scheme() -> anyhow::Result<()> {
         let (url, _tmp) = create_url(config.storage_type, None::<fn(String) -> String>)?;
         let vault =
             SecretVaultBuilder::from_url(&url, DefaultCryptoFactory {}.new_crypto()?).await?;
-        clear_vault(vault.as_ref()).await?;
+        vault.clear().await?;
         let ed_id = "test_secret_ed25519".into();
         let ed_spec = SecretSpec::new(Algorithm::Ed25519);
         let ed1 = vault.generate_secret(&ed_spec, &ed_id).await?;
@@ -107,7 +107,7 @@ async fn test_from_url_with_whitespace() -> anyhow::Result<()> {
         let (url, _tmp) = create_url(config.storage_type, Some(|e| format!("   {}   ", e)))?;
         let vault =
             SecretVaultBuilder::from_url(&url, DefaultCryptoFactory {}.new_crypto()?).await?;
-        clear_vault(vault.as_ref()).await?;
+        vault.clear().await?;
         let secret_id = "whitespace_test".into();
         let spec = SecretSpec::new(Algorithm::Ed25519);
         vault.generate_secret(&spec, &secret_id).await?;
@@ -128,7 +128,7 @@ async fn test_from_url_case_insensitive_scheme() -> anyhow::Result<()> {
         )?;
         let vault =
             SecretVaultBuilder::from_url(&url, DefaultCryptoFactory {}.new_crypto()?).await?;
-        clear_vault(vault.as_ref()).await?;
+        vault.clear().await?;
         let secret_id = "case_test".into();
         let spec = SecretSpec::new(Algorithm::Ed25519);
         vault.generate_secret(&spec, &secret_id).await?;
@@ -149,7 +149,7 @@ async fn test_from_url_case_insensitive_master_key_param() -> anyhow::Result<()>
         )?;
         let vault =
             SecretVaultBuilder::from_url(&url, DefaultCryptoFactory {}.new_crypto()?).await?;
-        clear_vault(vault.as_ref()).await?;
+        vault.clear().await?;
         let secret_id = "param_case_test".into();
         let spec = SecretSpec::new(Algorithm::Ed25519);
         vault.generate_secret(&spec, &secret_id).await?;
@@ -182,7 +182,7 @@ async fn test_from_url_empty_query_segments() -> anyhow::Result<()> {
             create_url(config.storage_type, Some::<fn(String) -> String>(|e| format!("{}&&", e)))?;
         let vault =
             SecretVaultBuilder::from_url(&url, DefaultCryptoFactory {}.new_crypto()?).await?;
-        clear_vault(vault.as_ref()).await?;
+        vault.clear().await?;
         let secret_id = "empty_segments_test".into();
         let spec = SecretSpec::new(Algorithm::Ed25519);
         vault.generate_secret(&spec, &secret_id).await?;
@@ -314,7 +314,7 @@ async fn test_from_url_env_variable_full_url() -> anyhow::Result<()> {
                 let vault =
                     SecretVaultBuilder::from_url(&url, DefaultCryptoFactory {}.new_crypto()?)
                         .await?;
-                clear_vault(vault.as_ref()).await?;
+                vault.clear().await?;
                 Ok(vault)
             }
             .await

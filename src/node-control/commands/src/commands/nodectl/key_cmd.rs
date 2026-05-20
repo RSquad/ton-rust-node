@@ -10,7 +10,6 @@ use anyhow::Context;
 use colored::Colorize;
 use secrets_vault::{
     crypto::factory::CryptoFactory,
-    storage::storage_trait::ListMode,
     types::{
         algorithm::Algorithm,
         metadata::Metadata,
@@ -185,7 +184,7 @@ impl KeyImportCmd {
 
 impl KeyLsCmd {
     pub async fn run(&self, vault: &SecretVault) -> anyhow::Result<()> {
-        let records = vault.list_metadata(ListMode::OnlyNeeded).await?;
+        let records = vault.list_metadata().await?;
 
         if records.is_empty() {
             println!("\n{}\n", "No keys found".yellow());

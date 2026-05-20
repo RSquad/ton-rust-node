@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 
-mod copy;
+mod copy_file_to_hashicorp;
 mod delete;
 mod generate;
 mod get;
@@ -97,14 +97,10 @@ enum Commands {
         signature: HexBytes,
     },
     Migrate {},
-    Copy {
+    CopyFileToHashicorp {
         /// Conflict policy when destination already has a secret with the same id
         #[arg(long, default_value = "fail")]
         on_conflict: String,
-
-        /// Source list mode: only-needed (default) or all
-        #[arg(long, default_value = "only-needed")]
-        list_mode: String,
 
         /// Print plan without writing to destination
         #[arg(long)]
@@ -152,22 +148,15 @@ async fn main() {
             verify::execute(&secret_id, data.0.as_slice(), signature.0.as_slice()).await
         }
         Commands::Migrate {} => migrate::execute().await,
-        Commands::Copy { on_conflict, list_mode, dry_run, continue_on_error } => {
-            let on_conflict: copy::OnConflict = match on_conflict.parse() {
+        Commands::CopyFileToHashicorp { on_conflict, dry_run, continue_on_error } => {
+            let on_conflict: copy_file_to_hashicorp::OnConflict = match on_conflict.parse() {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{} {}", "Error:".red().bold(), e);
                     std::process::exit(1);
                 }
             };
-            let list_mode: copy::ListModeArg = match list_mode.parse() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("{} {}", "Error:".red().bold(), e);
-                    std::process::exit(1);
-                }
-            };
-            copy::execute(on_conflict, list_mode, dry_run, continue_on_error).await
+            copy_file_to_hashicorp::execute(on_conflict, dry_run, continue_on_error).await
         }
     };
 

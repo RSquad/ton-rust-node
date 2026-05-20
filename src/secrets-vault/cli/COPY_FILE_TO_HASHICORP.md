@@ -127,7 +127,7 @@ export VAULT_URL='hashicorp://http://node-vault.node-vault:8200?auth=k8s&auth_mo
 ### 8. Run the copy
 
 ```bash
-secrets-vault-cli copy
+secrets-vault-cli copy-file-to-hashicorp
 ```
 
 Example output (truncated):

@@ -676,6 +676,7 @@ async fn import_mc_blocks(
         if let Some(handle) = sync_context.engine.load_block_handle(last_mc_block_id)? {
             if handle.is_applied() {
                 log::debug!(target: TARGET, "Skipped already applied MC block {last_mc_block_id}");
+                sync_context.engine.save_last_applied_mc_block_id(last_mc_block_id)?;
                 continue;
             }
         }

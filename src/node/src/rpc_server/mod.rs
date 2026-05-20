@@ -192,9 +192,14 @@ impl RpcRegistry {
     }
 }
 
-// Convert handler result to REST JSON body: {"ok":true|false, ...}
+// Convert handler result to REST JSON body: {"ok":true, "result":..., "@extra":...}
 fn rest_ok(result: serde_json::Value) -> warp::reply::Response {
-    warp::reply::json(&serde_json::json!({ "ok": true, "result": result })).into_response()
+    warp::reply::json(&serde_json::json!({
+        "ok": true,
+        "result": result,
+        "@extra": handlers::extra(0),
+    }))
+    .into_response()
 }
 
 fn rest_err(err: ton_block::Error) -> warp::reply::Response {
@@ -202,7 +207,8 @@ fn rest_err(err: ton_block::Error) -> warp::reply::Response {
     let body = serde_json::json!({
         "ok": false,
         "error": err.to_string(),
-        "code": err.http_status().as_u16()
+        "code": err.http_status().as_u16(),
+        "@extra": handlers::extra(0),
     });
     let mut resp = warp::reply::json(&body).into_response();
     *resp.status_mut() = err.http_status();
@@ -302,40 +308,40 @@ fn build_routes(ctx: Ctx) -> RestFilter {
 }
 
 fn rpc_error(
-    id: serde_json::Value,
+    _id: serde_json::Value,
     code: i64,
     message: &str,
     jsonrpc_http_status: warp::http::StatusCode,
 ) -> warp::reply::Response {
     #[derive(serde::Serialize)]
     struct JsonRpcErrorResp {
-        jsonrpc: &'static str,
-        error: String,
-        id: serde_json::Value,
         ok: serde_json::Value,
+        error: String,
         code: i64,
+        #[serde(rename = "@extra")]
+        extra: String,
     }
     let body = JsonRpcErrorResp {
-        jsonrpc: "2.0",
-        error: message.to_string(),
         ok: serde_json::Value::Bool(false),
+        error: message.to_string(),
         code,
-        id,
+        extra: handlers::extra(0),
     };
     let mut resp = warp::reply::json(&body).into_response();
     *resp.status_mut() = jsonrpc_http_status;
     resp
 }
 
-fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> warp::reply::Response {
+fn rpc_ok(_id: serde_json::Value, result: serde_json::Value) -> warp::reply::Response {
     #[derive(serde::Serialize)]
     struct JsonRpcSuccessResp {
-        jsonrpc: &'static str,
-        result: serde_json::Value,
-        id: serde_json::Value,
         ok: serde_json::Value,
+        result: serde_json::Value,
+        #[serde(rename = "@extra")]
+        extra: String,
     }
-    let body = JsonRpcSuccessResp { jsonrpc: "2.0", result, id, ok: serde_json::Value::Bool(true) };
+    let body =
+        JsonRpcSuccessResp { ok: serde_json::Value::Bool(true), result, extra: handlers::extra(0) };
     warp::reply::json(&body).into_response()
 }
 

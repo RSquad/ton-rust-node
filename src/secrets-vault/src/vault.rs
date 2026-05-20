@@ -12,7 +12,7 @@ use crate::{
         event_types::{Event, EventType},
         handler::EventHandler,
     },
-    storage::storage_trait::{ListMode, Storage},
+    storage::storage_trait::Storage,
     types::{
         metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
         store_mode::StoreMode,
@@ -28,6 +28,10 @@ pub struct SecretVault {
 impl SecretVault {
     pub fn new(storage: Arc<dyn Storage>, event_handler: Arc<dyn EventHandler>) -> Self {
         SecretVault { storage, event_handler }
+    }
+
+    pub fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
     }
 
     pub async fn flush(&self) -> anyhow::Result<()> {
@@ -71,7 +75,7 @@ impl SecretVault {
     }
 
     pub async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
-        self.storage.store(secret, mode).await
+        self.storage.store(secret, mode, None).await
     }
 
     pub async fn delete(&self, secret_id: &SecretId) -> anyhow::Result<()> {
@@ -86,8 +90,13 @@ impl SecretVault {
         Ok(meta)
     }
 
-    pub async fn list_metadata(&self, mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
-        self.storage.list_metadata(mode).await
+    pub async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
+        self.storage.list_metadata().await
+    }
+
+    #[cfg(test)]
+    pub async fn clear(&self) -> anyhow::Result<()> {
+        self.storage.clear().await
     }
 }
 

@@ -8,11 +8,11 @@
  */
 use crate::utils::{open_vault, print_secret, print_secret_full, print_secret_header};
 use colored::Colorize;
-use secrets_vault::{errors::error::VaultError, storage::storage_trait::ListMode};
+use secrets_vault::errors::error::VaultError;
 
 pub async fn execute(full: bool, show_private: bool) -> anyhow::Result<()> {
     let vault = open_vault().await?;
-    let records = vault.list_metadata(ListMode::OnlyNeeded).await?;
+    let records = vault.list_metadata().await?;
 
     if records.is_empty() {
         println!("\n{} {}\n", "⚠".yellow().bold(), "No records found".yellow());

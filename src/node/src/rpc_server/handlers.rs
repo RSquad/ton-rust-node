@@ -165,6 +165,10 @@ impl AccountContext {
     fn last_transaction(&self) -> (u64, UInt256) {
         (self.shard_account.last_trans_lt(), self.shard_account.last_trans_hash().clone())
     }
+
+    fn is_testnet(&self) -> Result<bool> {
+        Ok(self.mc_state.state().state()?.global_id() < 0)
+    }
 }
 
 const MAX_TRANSACTION_COUNT: u32 = 16;
@@ -187,6 +191,7 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
         }
     };
     let acc_ctx = AccountContext::with_address(&ctx, &p.address, None).await?;
+    let is_testnet = acc_ctx.is_testnet()?;
     let workchain_id = acc_ctx.address.workchain_id();
     let account_id = acc_ctx.address.address();
     let mut remaining = p.limit.unwrap_or(10).min(MAX_TRANSACTION_COUNT);
@@ -196,6 +201,13 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
     };
 
     let mut export = Vec::new();
+    let addr_mode = if is_testnet {
+        ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE | ADDR_FORMAT_TESTNET
+    } else {
+        ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE
+    };
+    let account_address = acc_ctx.address.to_string_custom(addr_mode)?;
+    let raw_account = acc_ctx.address.to_string().to_uppercase();
 
     // prefix for index by lt
     let prefix = AccountIdPrefixFull::prefix(&acc_ctx.address)?;
@@ -255,6 +267,15 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
                 fail!("previous transaction time is not less than the current one")
             }
             found_any_in_this_block = true;
+            export.push(serialize_transaction(
+                &tr,
+                tr_cell,
+                &account_address,
+                "ext.transaction",
+                Some(&raw_account),
+                is_testnet,
+            )?);
+            remaining -= 1;
             if remaining == 0 {
                 break 'main;
             }
@@ -265,9 +286,6 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
                 break 'main;
             }
             expected_hash = tr.prev_trans_hash().clone();
-            // saving the found transaction
-            export.push(serialize_transaction(&tr, tr_cell, &p.address)?);
-            remaining -= 1;
         }
         // exact-behaivor: block by lt, by tx not
         if !found_any_in_this_block {
@@ -299,12 +317,17 @@ async fn get_masterchain_info(_: NoParams, ctx: Ctx) -> JsonResult {
     let mc_state = ctx.engine.load_state(&mc_block_id).await?;
     let state_root_hash = mc_state.root_cell().repr_hash();
     let zerostate_block: BlockIdExt = ctx.engine.zerostate_id()?.clone();
+    // toncenter renders the zerostate's shard as the literal "0" rather than the
+    // shard-prefix-with-tag form. Match that for parity.
+    let mut init = serialize_block_id(&zerostate_block);
+    if let Some(obj) = init.as_object_mut() {
+        obj.insert("shard".to_string(), serde_json::Value::String("0".to_string()));
+    }
     Ok(serde_json::json!({
         "@type": "blocks.masterchainInfo",
         "last": serialize_block_id(&mc_block_id),
         "state_root_hash": serialize_uint256(&state_root_hash),
-        "init": serialize_block_id(&zerostate_block),
-        "@extra": extra(0),
+        "init": init,
     }))
 }
 
@@ -356,7 +379,6 @@ async fn get_extended_address_information(p: GetAddressInformationParams, ctx: C
             "frozen_hash": frozen_hash,
           },
           "revision": 0,
-          "@extra": extra(0),
     });
 
     Ok(result)
@@ -443,7 +465,6 @@ async fn get_address_information(p: GetAddressInformationParams, ctx: Ctx) -> Js
         "block_id": serialize_block_id(&acc_ctx.mc_block_id),
         "frozen_hash": frozen_hash,
         "sync_utime": account.last_paid(),
-        "@extra": extra(0),
         "state": state,
     });
     Ok(result)
@@ -491,7 +512,6 @@ async fn run_get_method(p: RunGetMethodParams, ctx: Ctx) -> JsonResult {
         "gas_used":  result.gas_used,
         "stack": stack,
         "exit_code": result.exit_code,
-        "@extra": extra(0),
         "block_id": serialize_block_id(&acc_ctx.mc_block_id),
         "last_transaction_id": serialize_shard_account(&acc_ctx.shard_account),
     }))
@@ -560,7 +580,6 @@ async fn lookup_block(p: LookupBlockParams, ctx: Ctx) -> JsonResult {
     let Some((block_id, _data)) = result else { fail!("no block found with specified parameters") };
     Ok(serde_json::json!({
         "block_id": serialize_block_id(&block_id),
-        "@extra": extra(0),
     }))
 }
 
@@ -690,7 +709,6 @@ async fn get_shard_proof(p: GetShardBlockProofParams, ctx: Ctx) -> JsonResult {
         "mc_id": serialize_block_id(&mc_id),
         "links": links_json,
         "mc_proof": mc_proof_json, // getBlockProof(from -> mc_id)
-        "@extra": extra(0),
     }))
 }
 
@@ -705,7 +723,6 @@ async fn send_boc(p: SendBocParams, ctx: Ctx) -> JsonResult {
     ctx.engine.redirect_external_message(&body).await?;
     Ok(serde_json::json!({
         "@type": "ok",
-        "@extra": extra(0),
     }))
 }
 
@@ -731,7 +748,6 @@ async fn send_boc_return_hash(p: SendBocParams, ctx: Ctx) -> JsonResult {
         "@type": "raw.extMessageInfo",
         "hash": raw_b64,
         "hash_norm": hash_norm,
-        "@extra": extra(0),
     }))
 }
 
@@ -812,7 +828,6 @@ async fn estimate_fee(p: EstimateFeeParams, ctx: Ctx) -> JsonResult {
                 "fwd_fee": 0
             },
             "destination_fees": [],
-            "@extra": extra(0),
         }));
     };
 
@@ -841,7 +856,6 @@ async fn estimate_fee(p: EstimateFeeParams, ctx: Ctx) -> JsonResult {
             "fwd_fee": fwd_fee.as_u128()
         },
         "destination_fees": [],
-        "@extra": extra(0),
     }))
 }
 
@@ -883,7 +897,6 @@ async fn send_query(p: SendQueryParams, ctx: Ctx) -> JsonResult {
 
     Ok(serde_json::json!({
         "@type": "ok",
-        "@extra": extra(0),
     }))
 }
 
@@ -929,7 +942,8 @@ async fn try_locate_result_tx(p: TryLocateResultTxParams, ctx: Ctx) -> JsonResul
             p.destination
         )
     };
-    serialize_transaction(&tr, tr_cell, &p.destination)
+    let is_testnet = ctx.is_testnet().await;
+    serialize_transaction(&tr, tr_cell, &p.destination, "raw.transaction", None, is_testnet)
 }
 
 // lookup for block by source account and created_lt first
@@ -966,7 +980,8 @@ async fn try_locate_source_tx(p: TryLocateResultTxParams, ctx: Ctx) -> JsonResul
             p.source
         )
     };
-    serialize_transaction(&tr, tr_cell, &p.destination)
+    let is_testnet = ctx.is_testnet().await;
+    serialize_transaction(&tr, tr_cell, &p.destination, "raw.transaction", None, is_testnet)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1051,19 +1066,14 @@ async fn get_block_transactions_int(
 }
 
 async fn get_block_transactions(p: GetBlockTransactionsParams, ctx: Ctx) -> JsonResult {
-    let addr_mode = if ctx.is_testnet().await {
-        ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE | ADDR_FORMAT_TESTNET
-    } else {
-        ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE
-    };
     let result = get_block_transactions_int(&p, &ctx).await?;
     let incomplete = result.all_txs.len() > p.count;
     let mut transactions = Vec::new();
     for (address, lt, tr_cell) in result.all_txs.into_iter().take(p.count) {
         transactions.push(serde_json::json!({
             "@type": "blocks.shortTxId",
-            "mode": 7,
-            "account": address.to_string_custom(addr_mode)?,
+            "mode": 135,
+            "account": address.to_string(),
             "lt": lt.to_string(),
             "hash": serialize_uint256(&tr_cell.repr_hash())
         }));
@@ -1078,22 +1088,29 @@ async fn get_block_transactions(p: GetBlockTransactionsParams, ctx: Ctx) -> Json
 }
 
 async fn get_block_transactions_ext(p: GetBlockTransactionsParams, ctx: Ctx) -> JsonResult {
-    let addr_mode = if ctx.is_testnet().await {
-        ADDR_FORMAT_URL_SAFE | ADDR_FORMAT_TESTNET
-    } else {
-        ADDR_FORMAT_URL_SAFE
-    };
+    let is_testnet = ctx.is_testnet().await;
+    let addr_mode =
+        if is_testnet { ADDR_FORMAT_URL_SAFE | ADDR_FORMAT_TESTNET } else { ADDR_FORMAT_URL_SAFE };
     let result = get_block_transactions_int(&p, &ctx).await?;
     let incomplete = result.all_txs.len() > p.count;
     let mut transactions = Vec::new();
     for (address, _, tr_cell) in result.all_txs.into_iter().take(p.count) {
         let tr = Transaction::construct_from_cell(tr_cell.clone())?;
+        // raw "wc:hex" form for raw.transactionExt.account (toncenter uses uppercase hex)
+        let account = address.to_string().to_uppercase();
         let address = if tr.read_in_msg()?.map_or(true, |msg| msg.is_bouncable()) {
             address.to_string_custom(addr_mode | ADDR_FORMAT_BOUNCE)
         } else {
             address.to_string_custom(addr_mode)
         }?;
-        transactions.push(serialize_transaction(&tr, tr_cell, &address)?);
+        transactions.push(serialize_transaction(
+            &tr,
+            tr_cell,
+            &address,
+            "raw.transactionExt",
+            Some(&account),
+            is_testnet,
+        )?);
     }
     Ok(serde_json::json!({
         "@type": "blocks.transactionsExt",
@@ -1323,7 +1340,6 @@ async fn get_libraries(p: GetLibrariesParams, ctx: Ctx) -> JsonResult {
     Ok(serde_json::json!({
         "@type": "smc.libraryResult",
         "result": result,
-        "@extra": extra(0),
     }))
 }
 
@@ -1359,7 +1375,6 @@ async fn get_libraries_ext(p: GetLibrariesExtParams, ctx: Ctx) -> JsonResult {
         "block_id": serialize_block_id(&mc_block_id),
         "dict_boc": dict_boc,
         "libraries_count": libraries_count,
-        "@extra": extra(0),
     }))
 }
 #[derive(Debug, serde::Deserialize)]
@@ -1566,11 +1581,13 @@ async fn run_stack_test(p: RunStackParams, _ctx: Ctx) -> JsonResult {
     }))
 }
 
-fn extra(ls_index: u64) -> String {
-    let now_secs = UnixTime::now_f64();
+pub(crate) fn extra(ls_index: u64) -> String {
+    let now_secs = UnixTime::now_f64() as u64;
     let rand_val: f64 = rand::random();
-    // "%s:%s:%s" % (ts, ls_index, rand_val)
-    format!("{}:{}:{}", now_secs, ls_index, rand_val)
+    // toncenter v2 uses "_" when no specific lite-server is bound to the response.
+    let ls = if ls_index == 0 { "_".to_string() } else { ls_index.to_string() };
+    // toncenter v2 format: "<int_secs>:<ls_index|_>:<short_float>:c"
+    format!("{}:{}:{:.3}:c", now_secs, ls, rand_val)
 }
 
 #[cfg(test)]
