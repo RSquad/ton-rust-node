@@ -229,10 +229,10 @@ pub fn fixture() -> Vec<TestConfig> {
         TestConfig { storage_type: StorageType::FileJson },
         // Hashicorp Vault
         // TODO: setup vault in CI/CD test
-        #[cfg(all(feature = "crypto-default", feature = "hashicorp-storage"))]
-        TestConfig { storage_type: StorageType::HashicorpNoCache },
-        #[cfg(all(feature = "crypto-default", feature = "hashicorp-storage"))]
-        TestConfig { storage_type: StorageType::HashicorpUseCache },
+        //#[cfg(all(feature = "crypto-default", feature = "hashicorp-storage"))]
+        //TestConfig { storage_type: StorageType::HashicorpNoCache },
+        //#[cfg(all(feature = "crypto-default", feature = "hashicorp-storage"))]
+        //TestConfig { storage_type: StorageType::HashicorpUseCache },
     ];
 
     configs
