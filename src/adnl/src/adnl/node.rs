@@ -66,8 +66,8 @@ use ton_api::{
     IntoBoxed, TLObject,
 };
 use ton_block::{
-    base64_encode, error, fail, lz4_compress, lz4_decompress, sha256_digest, KeyId, KeyOption,
-    KeyOptionJson, Lz4DecompressMode, Result, UInt256,
+    base64_encode, error, fail, lz4_compress, lz4_decompress, sha256_digest, Ed25519KeyOption,
+    KeyId, KeyOption, KeyOptionJson, Lz4DecompressMode, Result, UInt256, ZeroizingBytes,
 };
 
 #[macro_export]
@@ -4591,7 +4591,7 @@ impl AdnlNode {
         if let Some(channel) = channel {
             channel.encrypt_by_method(&mut data, version, &method)?;
         } else {
-            let key = get_key_option_factory().generate()?;
+            let key = Ed25519KeyOption::<ZeroizingBytes>::generate()?;
             AdnlHandshake::build_packet(&mut data, &key, &peer.address.key, version)?;
         }
         log::trace!(

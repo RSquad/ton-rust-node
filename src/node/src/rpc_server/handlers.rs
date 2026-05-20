@@ -201,22 +201,41 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
     let prefix = AccountIdPrefixFull::prefix(&acc_ctx.address)?;
 
     'main: while remaining != 0 && lt != 0 {
-        // abort_getTransactions: if you haven't found anything yet, it's an error; otherwise, we finish with a partial result
+        // abort_getTransactions: if you haven't found anything yet, it's an error;
+        // otherwise, we finish with a partial result
         let Some((block_id, data)) = ctx.engine.lookup_block_by_lt(&prefix, lt).await? else {
             break;
         };
         // sanity: the block must cover our address
         if !block_id.shard().contains_full_prefix(&prefix) {
-            fail!(
-                "obtained a block {block_id} that cannot contain specified account {account_id:x}"
-            )
+            fail!("fetch a block {block_id} without specified account {account_id:x}")
         }
 
-        // deserialize strictly with the correct id — otherwise there will be a `wrong root hash`
+        // deserialize strictly with the correct id - otherwise there will be a `wrong root hash`
         let block_stuff = BlockStuff::deserialize_block(block_id.clone(), Arc::new(data))?;
+        let block_info = block_stuff.block()?.read_info()?;
+        if lt < block_info.start_lt() {
+            break;
+        }
+
+        if lt > block_info.end_lt() {
+            log::warn!(
+                "getTransactions: lookup_block_by_lt returned block outside LT range: \
+                address={}, target_lt={lt}, block={block_id}, block_start_lt={}, block_end_lt={}",
+                p.address,
+                block_info.start_lt(),
+                block_info.end_lt(),
+            );
+            break;
+        }
 
         let Some(acc_block) = block_stuff.get_account(account_id)? else {
-            fail!("block with id: {block_id} does not contain account: {account_id:x}")
+            log::warn!(
+                "getTransactions: lookup_block_by_lt returned block without account: \
+                address={}, account_id={account_id:x}, target_lt={lt}, block={block_id}",
+                p.address,
+            );
+            break;
         };
         let mut found_any_in_this_block = false;
         // search for a transaction with exactly the right lt
@@ -224,7 +243,10 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
             let tr_cell = slice.reference(0)?;
             // check hash if exist
             if !expected_hash.is_zero() && *tr_cell.repr_hash() != expected_hash {
-                fail!("transaction hash mismatch: prev_trans_lt/hash invalid for wc={workchain_id}, lt={lt}")
+                fail!(
+                    "transaction hash mismatch: \
+                    prev_trans_lt/hash invalid for wc={workchain_id}, lt={lt}"
+                )
             }
 
             // unpacking and monotony prev_trans_lt
@@ -254,7 +276,7 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
         // continue cycle: new lt already set prev_trans_lt
     }
     if export.is_empty() {
-        fail!("cannot compute block with specified transaction: no block by lt={lt}")
+        fail!(ApiError::NotFound(format!("cannot locate transaction for account {account_id:x}")));
     }
     Ok(serde_json::json!(export))
 }
