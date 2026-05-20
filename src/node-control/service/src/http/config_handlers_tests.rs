@@ -20,8 +20,8 @@ use crate::{
 use axum::body::Body;
 use common::{
     app_config::{
-        AppConfig, HttpConfig, PoolConfig, TonCoreDeployMode, TonCoreInitParams, TonCorePoolConfig,
-        VotingConfig,
+        AppConfig, EndpointEntry, HttpConfig, PoolConfig, TonCoreDeployMode, TonCoreInitParams,
+        TonCorePoolConfig, TonHttpApiConfig, VotingConfig,
     },
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
@@ -79,6 +79,29 @@ async fn state_from_cfg(cfg: AppConfig) -> AppState {
 async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
     let mut cfg = (*empty_app_cfg()).clone();
     cfg.pools = pools;
+    state_from_cfg(cfg).await
+}
+
+/// Binds a TCP listener and drops it so the bound port is guaranteed-dead:
+/// further connect attempts get ECONNREFUSED instantly. Used to deterministically
+/// exercise the "ton-http-api unreachable" path on machines where something
+/// might happen to be listening on the default port (e.g. a local sandbox).
+async fn dead_ton_http_api_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+async fn state_with_pools_unreachable_rpc(pools: HashMap<String, PoolConfig>) -> AppState {
+    let mut cfg = (*empty_app_cfg()).clone();
+    cfg.pools = pools;
+    let mut http_api = TonHttpApiConfig::default();
+    http_api.urls = vec![EndpointEntry::Url(dead_ton_http_api_url().await)];
+    // Sub-second timeouts so the test fails fast.
+    http_api.connect_timeout_secs = Some(1);
+    http_api.request_timeout_secs = Some(1);
+    cfg.ton_http_api = http_api;
     state_from_cfg(cfg).await
 }
 
@@ -199,13 +222,13 @@ async fn voting_proposal_rm_removes_tracked_hash() {
 
 #[tokio::test]
 async fn pools_snp_shape_preserved() {
+    // Use owner-only (no `address`) so the handler does not hit the RPC at all
+    // — keeps the test focused on DTO shape, independent of ton-http-api state.
     let mut pools = HashMap::new();
     pools.insert(
         "snp1".to_string(),
         PoolConfig::SNP {
-            address: Some(
-                "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea".into(),
-            ),
+            address: None,
             owner: Some(
                 "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
             ),
@@ -275,8 +298,12 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed_with_config_fallback
 
 #[tokio::test]
 async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
-    // Both slots have addresses but no live RPC — handler must gracefully
-    // produce two slot entries with state="error" instead of returning 500.
+    // Both slots have addresses but no live RPC. With the SMA-95 fix, the handler
+    // must surface this as 503 Service Unavailable carrying the upstream error,
+    // rather than silently returning slot rows with state="error".
+    // Use addresses that parse on every platform (MsgAddressInt::from_str
+    // rejects some short/zero forms) so the handler actually reaches the RPC
+    // call and the unreachable-upstream branch is exercised.
     let mut pools = HashMap::new();
     pools.insert(
         "core2".to_string(),
@@ -284,7 +311,7 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
             pools: [
                 Some(TonCorePoolConfig {
                     address: Some(
-                        "-1:0000000000000000000000000000000000000000000000000000000000000001"
+                        "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea"
                             .into(),
                     ),
                     params: Some(TonCoreInitParams {
@@ -297,8 +324,7 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
                 }),
                 Some(TonCorePoolConfig {
                     address: Some(
-                        "-1:0000000000000000000000000000000000000000000000000000000000000002"
-                            .into(),
+                        "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
                     ),
                     params: None,
                     ..Default::default()
@@ -307,26 +333,16 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
         },
     );
 
-    let st = state_with_pools(pools).await;
+    let st = state_with_pools_unreachable_rpc(pools).await;
     let resp = routes(false, st).oneshot(get("/v1/pools")).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 503);
     let v = json(resp).await;
-    let result = &v["result"][0];
-    let slots = result["slots"].as_array().unwrap();
-    assert_eq!(slots.len(), 2);
-    assert_eq!(slots[0]["slot"], "even");
-    assert_eq!(slots[1]["slot"], "odd");
-    for slot in slots {
-        // RPC may fail entirely (`error`) or return success with an uninitialized account
-        // (`not deployed`) depending on local ton-http-api — both mean no live pool view.
-        let st = slot["state"].as_str().unwrap();
-        assert!(matches!(st, "error" | "not deployed"), "unexpected state {st:?}");
-        assert!(slot["address"].is_string());
-    }
-    // Even slot had deploy params in config — still exposed when RPC is down.
-    assert_eq!(slots[0]["validator_share"], 4000);
-    assert_eq!(slots[0]["data_source"], "config");
-    assert!(slots[1].get("data_source").is_none());
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], 503);
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("ton-http-api unreachable"),
+        "error body should identify upstream: {v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
