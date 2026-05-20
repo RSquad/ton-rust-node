@@ -43,7 +43,7 @@ hashicorp://<vault_address>?api_key=<token>&namespace=<namespace>
 | `delete`   | Delete one or more secrets               |
 | `sign`     | Sign data using a stored key             |
 | `verify`   | Verify a signature against stored key    |
-| `copy`     | Copy all secrets from one vault to another (see [COPY_FILE_TO_HASHICORP.md](./COPY_FILE_TO_HASHICORP.md) for the file->HashiCorp runbook) |
+| `copy-file-to-hashicorp` | Copy all secrets from a file vault to a HashiCorp Vault (see [COPY_FILE_TO_HASHICORP.md](./COPY_FILE_TO_HASHICORP.md) for the runbook) |
 
 ## Examples
 
@@ -117,30 +117,31 @@ secrets-vault-cli --url='file://vault.json?master_key=<KEY_HEX>' verify \
 secrets-vault-cli --url='file://vault.json?master_key=<KEY_HEX>' delete secret_01
 ```
 
-### Copy Secrets Between Vaults
+### Copy Secrets From a File Vault to HashiCorp Vault
 
-Copies every secret from a source vault to a destination vault. Source URL is
-read from `FROM_VAULT_URL`, destination from `VAULT_URL`. Each secret is loaded
-from the source, its metadata is logged, and it is written to the destination.
+Copies every secret from a file-backed source vault to a HashiCorp Vault
+destination. Source URL is read from `FROM_VAULT_URL`, destination from
+`VAULT_URL`. Each secret is loaded from the source, its metadata is logged, and
+it is written to the destination.
 
 ```bash
 export FROM_VAULT_URL='file:///etc/ton/vault.json?master_key=<KEY_HEX>'
 export VAULT_URL='hashicorp://https://vault.example.com:8200?api_key=<API_KEY>&kv_mount=ton&kv_prefix=mainnet&transit_mount=ton-transit'
 
-secrets-vault-cli copy
+secrets-vault-cli copy-file-to-hashicorp
 ```
 
 Inspect the plan first without writing:
 
 ```bash
-secrets-vault-cli copy --dry-run
+secrets-vault-cli copy-file-to-hashicorp --dry-run
 ```
 
 Overwrite existing entries on the destination and keep going on per-secret
 errors:
 
 ```bash
-secrets-vault-cli copy --on-conflict overwrite --continue-on-error
+secrets-vault-cli copy-file-to-hashicorp --on-conflict overwrite --continue-on-error
 ```
 
 Notes:
@@ -214,15 +215,15 @@ Delete one or more secrets.
 secrets-vault-cli --url='<url>' delete <secret_id> [<secret_id>...]
 ```
 
-### `copy`
+### `copy-file-to-hashicorp`
 
-Copy all secrets from `FROM_VAULT_URL` to `VAULT_URL`. Both must be set in the
-environment; passing the same URL for both is rejected.
+Copy all secrets from a file vault at `FROM_VAULT_URL` to a HashiCorp Vault at
+`VAULT_URL`. Both must be set in the environment; passing the same URL for both
+is rejected.
 
 | Option                  | Required | Description                                                                 |
 |-------------------------|----------|-----------------------------------------------------------------------------|
 | `--on-conflict <MODE>`  | No       | When destination already has the same id: `fail` (default), `skip`, `overwrite` |
-| `--list-mode <MODE>`    | No       | Source listing scope: `only-needed` (default) or `all`                      |
 | `--dry-run`             | No       | Print the plan without writing to destination                               |
 | `--continue-on-error`   | No       | Keep going on per-secret errors instead of aborting                         |
 

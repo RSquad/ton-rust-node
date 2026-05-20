@@ -30,6 +30,10 @@ impl SecretVault {
         SecretVault { storage, event_handler }
     }
 
+    pub fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
+    }
+
     pub async fn flush(&self) -> anyhow::Result<()> {
         self.storage.flush().await
     }
@@ -71,7 +75,7 @@ impl SecretVault {
     }
 
     pub async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
-        self.storage.store(secret, mode).await
+        self.storage.store(secret, mode, None).await
     }
 
     pub async fn delete(&self, secret_id: &SecretId) -> anyhow::Result<()> {

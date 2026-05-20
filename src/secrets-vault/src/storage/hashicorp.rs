@@ -265,8 +265,17 @@ impl Storage for HashicorpStorage {
         }
     }
 
-    async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
-        let metadata = secret.metadata().clone();
+    async fn store(
+        &self,
+        secret: &Secret,
+        mode: StoreMode,
+        override_extractable: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let mut metadata = secret.metadata().clone();
+        if let Some(override_extractable) = override_extractable {
+            metadata.extractable = override_extractable;
+        }
+
         let secret_id = metadata
             .secret_id
             .as_ref()

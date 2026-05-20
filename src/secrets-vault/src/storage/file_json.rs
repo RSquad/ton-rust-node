@@ -312,6 +312,23 @@ impl FileJsonStorage {
         Ok(())
     }
 
+    pub async fn load_for_migrate(&self, secret_id: &SecretId) -> anyhow::Result<(Secret, bool)> {
+        let path_parts = Self::parse_path(secret_id);
+        let tree = self.tree.read().await;
+        let stored = tree
+            .get(&path_parts)
+            .ok_or_else(|| VaultError::not_found(format!("Secret '{}' not found", secret_id)))?;
+        let (data, mut metadata) =
+            decrypt(self.master_key.key_material(), &stored.encrypted_data, self.crypto.as_ref())?;
+
+        let is_extractable = metadata.extractable;
+        metadata.extractable = true;
+
+        let secret = SecretInMemoryFactory::deserialize(data, metadata, self.crypto.clone())?;
+
+        Ok((secret, is_extractable))
+    }
+
     async fn migrate_to(
         from_version: u32,
         to_version: u32,
@@ -415,11 +432,16 @@ impl Storage for FileJsonStorage {
         secret_id: &SecretId,
     ) -> anyhow::Result<Secret> {
         let secret = generate_secret_in_memory(spec, secret_id, self.crypto.clone())?;
-        self.store(&secret, StoreMode::NewOnly).await?;
+        self.store(&secret, StoreMode::NewOnly, None).await?;
         self.load(secret_id).await
     }
 
-    async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
+    async fn store(
+        &self,
+        secret: &Secret,
+        mode: StoreMode,
+        override_extractable: Option<bool>,
+    ) -> anyhow::Result<()> {
         let secret_id = match &secret.metadata().secret_id {
             Some(secret_id) => secret_id,
             None => {
@@ -431,9 +453,15 @@ impl Storage for FileJsonStorage {
         let mut tree = self.tree.write().await;
         let path_parts = Self::parse_path(secret_id);
         let exists = tree.exists(&path_parts);
+
+        let mut metadata = secret.metadata().clone();
+        if let Some(override_extractable) = override_extractable {
+            metadata.extractable = override_extractable;
+        }
+
         let encrypted_data = prepare_to_store(
             &data,
-            secret.metadata(),
+            &metadata,
             mode,
             exists,
             self.master_key.key_material(),

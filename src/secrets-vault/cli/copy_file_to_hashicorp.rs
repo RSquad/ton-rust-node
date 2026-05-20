@@ -6,10 +6,15 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+
+#![cfg(feature = "file-storage-json")]
+#![cfg(feature = "hashicorp-storage")]
+
 use colored::Colorize;
 use secrets_vault::{
     crypto::factory::{CryptoFactory, DefaultCryptoFactory},
     errors::error::VaultError,
+    storage::{file_json::FileJsonStorage, hashicorp::HashicorpStorage, storage_trait::Storage},
     types::store_mode::StoreMode,
     vault::SecretVault,
     vault_builder::SecretVaultBuilder,
@@ -64,10 +69,23 @@ pub async fn execute(
     }
     println!();
 
-    let src: Arc<SecretVault> = SecretVaultBuilder::from_url(&from_url, crypto.clone()).await?;
-    let dst: Arc<SecretVault> = SecretVaultBuilder::from_url(&to_url, crypto).await?;
+    let dst: Arc<SecretVault> = SecretVaultBuilder::from_url(&to_url, crypto.clone()).await?;
+    let dst_storage = {
+        dst.storage()
+            .as_ref()
+            .downcast_ref::<HashicorpStorage>()
+            .ok_or_else(|| anyhow::anyhow!("VAULT_URL must refer to a Hashicorp vault"))?
+    };
 
-    let records = src.list_metadata().await?;
+    let src: Arc<SecretVault> = SecretVaultBuilder::from_url(&from_url, crypto).await?;
+    let src_storage = {
+        src.storage()
+            .as_ref()
+            .downcast_ref::<FileJsonStorage>()
+            .ok_or_else(|| anyhow::anyhow!("FROM_VAULT_URL must refer to a file vault"))?
+    };
+
+    let records = src_storage.list_metadata().await?;
     let total = records.len();
 
     if total == 0 {
@@ -123,18 +141,7 @@ pub async fn execute(
             println!("         tags: {}", preview.dimmed());
         }
 
-        let secret = match src.load(&secret_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                println!("         {} cannot read from source: {}", "SKIP".yellow().bold(), e);
-                skipped += 1;
-                if !continue_on_error && !is_skippable_load_error(&e) {
-                    return Err(e);
-                }
-                continue;
-            }
-        };
-
+        let (secret, is_extractable) = src_storage.load_for_migrate(&secret_id).await?;
         let exists = dst.exists(&secret_id).await.unwrap_or(false);
         let mode = match (exists, on_conflict) {
             (false, _) => StoreMode::NewOnly,
@@ -170,7 +177,7 @@ pub async fn execute(
         }
 
         let write_started = Instant::now();
-        match dst.store(&secret, mode).await {
+        match dst_storage.store(&secret, mode, Some(is_extractable)).await {
             Ok(()) => {
                 println!(
                     "         {} {} {}",
@@ -213,13 +220,6 @@ pub async fn execute(
 
     println!("{} {}\n", "✓".green().bold(), "Copy completed".green());
     Ok(())
-}
-
-fn is_skippable_load_error(e: &anyhow::Error) -> bool {
-    if let Some(ve) = e.downcast_ref::<VaultError>() {
-        return ve.code() == VaultError::NOT_EXTRACTABLE;
-    }
-    false
 }
 
 fn mode_label(mode: &StoreMode) -> &'static str {

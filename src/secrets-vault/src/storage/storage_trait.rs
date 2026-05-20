@@ -19,7 +19,12 @@ pub trait Storage: Send + Sync + downcast_rs::Downcast {
         spec: &SecretSpec,
         secret_id: &SecretId,
     ) -> anyhow::Result<Secret>;
-    async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()>;
+    async fn store(
+        &self,
+        secret: &Secret,
+        mode: StoreMode,
+        override_extractable: Option<bool>,
+    ) -> anyhow::Result<()>;
     async fn load(&self, secret_id: &SecretId) -> anyhow::Result<Secret>;
     async fn load_metadata(&self, secret_id: &SecretId) -> anyhow::Result<Option<Metadata>>;
     async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>>;
