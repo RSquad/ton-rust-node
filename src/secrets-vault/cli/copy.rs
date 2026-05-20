@@ -10,7 +10,6 @@ use colored::Colorize;
 use secrets_vault::{
     crypto::factory::{CryptoFactory, DefaultCryptoFactory},
     errors::error::VaultError,
-    storage::storage_trait::ListMode,
     types::store_mode::StoreMode,
     vault::SecretVault,
     vault_builder::SecretVaultBuilder,
@@ -40,35 +39,8 @@ impl FromStr for OnConflict {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum ListModeArg {
-    OnlyNeeded,
-    All,
-}
-
-impl FromStr for ListModeArg {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "only-needed" | "onlyneeded" | "needed" => Ok(Self::OnlyNeeded),
-            "all" => Ok(Self::All),
-            other => Err(format!("invalid list-mode '{other}' (expected: only-needed|all)")),
-        }
-    }
-}
-
-impl From<ListModeArg> for ListMode {
-    fn from(v: ListModeArg) -> Self {
-        match v {
-            ListModeArg::OnlyNeeded => ListMode::OnlyNeeded,
-            ListModeArg::All => ListMode::All,
-        }
-    }
-}
-
 pub async fn execute(
     on_conflict: OnConflict,
-    list_mode: ListModeArg,
     dry_run: bool,
     continue_on_error: bool,
 ) -> anyhow::Result<()> {
@@ -95,7 +67,7 @@ pub async fn execute(
     let src: Arc<SecretVault> = SecretVaultBuilder::from_url(&from_url, crypto.clone()).await?;
     let dst: Arc<SecretVault> = SecretVaultBuilder::from_url(&to_url, crypto).await?;
 
-    let records = src.list_metadata(list_mode.into()).await?;
+    let records = src.list_metadata().await?;
     let total = records.len();
 
     if total == 0 {

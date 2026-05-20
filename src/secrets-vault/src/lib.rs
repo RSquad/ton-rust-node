@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+
 // SecretsVault - Cryptographic Key/Secrets Management Library
 
 pub mod crypto;

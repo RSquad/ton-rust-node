@@ -10,7 +10,6 @@ use crate::{
     crypto::factory::{CryptoFactory, DefaultCryptoFactory},
     errors::error::VaultError,
     make_secret_id,
-    storage::storage_trait::ListMode,
     tests::fixture::*,
     types::{
         algorithm::Algorithm,
@@ -26,7 +25,7 @@ use rand::RngCore;
 async fn test_new_storage() -> anyhow::Result<()> {
     for config in fixture() {
         let storage = create_test_storage(&config).await?;
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert!(metadata_list.is_empty());
     }
 
@@ -216,7 +215,7 @@ async fn test_load_metadata_nonexistent() -> anyhow::Result<()> {
 async fn test_list_metadata_empty() -> anyhow::Result<()> {
     for config in fixture() {
         let storage = create_test_storage(&config).await?;
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert!(metadata_list.is_empty());
     }
 
@@ -242,7 +241,7 @@ async fn test_list_metadata_multiple_entries() -> anyhow::Result<()> {
             storage.store(&secret, StoreMode::NewOnly).await?;
         }
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 5);
     }
 
@@ -402,7 +401,7 @@ async fn test_multiple_operations_sequence() -> anyhow::Result<()> {
         let secret2_loaded = storage.load(secret2_id).await?;
         assert!(secret2_loaded.eq_secret(&secret2_updated)?);
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 2);
     }
 
@@ -442,7 +441,7 @@ async fn test_concurrent_stores() -> anyhow::Result<()> {
             println!("Secret id: {}", secret_id.as_ref().unwrap());
         }
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
 
         for m in &metadata_list {
             println!("Secret id: {}", m.secret_id.as_ref().unwrap());
@@ -541,7 +540,7 @@ async fn test_delete_cleans_empty_nodes() -> anyhow::Result<()> {
         storage.store(&secret, StoreMode::NewOnly).await?;
         storage.delete(secret_id).await?;
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 0);
     }
 
@@ -724,7 +723,7 @@ async fn test_compare_signature(extractable: bool) -> anyhow::Result<()> {
 async fn test_empty_storage() -> anyhow::Result<()> {
     for config in fixture() {
         let storage = create_test_storage(&config).await?;
-        storage.list_metadata(ListMode::OnlyNeeded).await?;
+        storage.list_metadata().await?;
     }
 
     Ok(())
@@ -937,7 +936,7 @@ async fn test_blob_multiple_operations_sequence() -> anyhow::Result<()> {
         let lock = blob2_loaded_data.lock()?;
         assert_eq!(lock.as_ref(), blob2_updated_data.as_slice());
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 2);
     }
 
@@ -1062,7 +1061,7 @@ async fn test_mixed_blob_and_keypair_storage() -> anyhow::Result<()> {
         .await?;
         storage.store(&keypair, StoreMode::NewOnly).await?;
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 2);
 
         let blob_loaded = storage.load(blob.id().unwrap()).await?;
@@ -1117,7 +1116,7 @@ async fn test_blob_concurrent_stores() -> anyhow::Result<()> {
             assert!(secret_id.is_some());
         }
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 10);
 
         for m in &metadata_list {
@@ -1206,7 +1205,7 @@ async fn test_blob_hierarchical_paths() -> anyhow::Result<()> {
             assert_eq!(loaded.metadata().secret_id.as_ref().unwrap().as_str(), *path);
         }
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 4);
     }
 
@@ -1434,6 +1433,104 @@ async fn test_base64_special_symbol() -> anyhow::Result<()> {
 
         let secret_loaded = storage.load(secret.id().unwrap()).await?;
         assert!(secret.eq_secret(&secret_loaded)?);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_keypair_and_blob_lifecycle() -> anyhow::Result<()> {
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
+
+    for config in fixture() {
+        println!("Storage type: {}", config.storage_type);
+
+        let storage = create_test_storage(&config).await?;
+
+        // 1. Vault is empty
+        let metas = storage.list_metadata().await?;
+        assert!(metas.is_empty(), "expected empty vault, got {} entries", metas.len());
+
+        // 2. Add one transit key (Ed25519)
+        let key_id = make_secret_id!("lifecycle_keypair");
+        let key_spec = SecretSpec::new(Algorithm::Ed25519).extractable(true);
+        storage.generate_secret(&key_spec, &key_id).await?;
+
+        // 3. Vault contains one secret
+        let metas = storage.list_metadata().await?;
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].secret_id.as_ref().unwrap(), &key_id);
+        assert!(!metas[0].is_blob());
+        assert_eq!(metas[0].algorithm, Algorithm::Ed25519);
+
+        let key_meta = storage.load_metadata(&key_id).await?;
+        assert!(key_meta.is_some());
+        assert!(!key_meta.unwrap().is_blob());
+
+        let key_loaded = storage.load(&key_id).await?;
+        assert_eq!(key_loaded.metadata().algorithm, Algorithm::Ed25519);
+        assert!(!key_loaded.metadata().is_blob());
+
+        // 4. Add a blob secret
+        let blob_id = make_secret_id!("lifecycle_blob");
+        let blob = create_secret(
+            &make_blob_test_data(32),
+            SecretDataType::Raw,
+            blob_id.as_str(),
+            Algorithm::None,
+            crypto.clone(),
+        )
+        .await?;
+        storage.store(&blob, StoreMode::NewOnly).await?;
+
+        // 5. Vault contains two secrets
+        let metas = storage.list_metadata().await?;
+        assert_eq!(metas.len(), 2);
+
+        let key_meta = storage.load_metadata(&key_id).await?;
+        assert!(key_meta.is_some());
+        let blob_meta = storage.load_metadata(&blob_id).await?;
+        assert!(blob_meta.is_some());
+        assert!(blob_meta.as_ref().unwrap().is_blob());
+
+        let key_loaded = storage.load(&key_id).await?;
+        assert_eq!(key_loaded.metadata().algorithm, Algorithm::Ed25519);
+        let blob_loaded = storage.load(&blob_id).await?;
+        assert!(blob_loaded.metadata().is_blob());
+
+        // 6. Delete the transit key
+        storage.delete(&key_id).await?;
+
+        // 7. Both the KV metadata and the transit key are gone
+        assert!(storage.load_metadata(&key_id).await?.is_none());
+        assert!(storage.load(&key_id).await.is_err());
+
+        // 8. Blob is unchanged
+        let blob_meta = storage.load_metadata(&blob_id).await?;
+        assert!(blob_meta.is_some());
+        assert!(blob_meta.as_ref().unwrap().is_blob());
+        let blob_loaded = storage.load(&blob_id).await?;
+        assert!(blob_loaded.metadata().is_blob());
+        assert!(blob.eq_secret(&blob_loaded)?);
+
+        let metas = storage.list_metadata().await?;
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].secret_id.as_ref().unwrap(), &blob_id);
+
+        // 9. Delete the blob
+        storage.delete(&blob_id).await?;
+
+        // 10. Vault is empty
+        let metas = storage.list_metadata().await?;
+        assert!(
+            metas.is_empty(),
+            "expected empty vault after deletes, got {} entries",
+            metas.len()
+        );
+        assert!(storage.load_metadata(&blob_id).await?.is_none());
+        assert!(storage.load(&blob_id).await.is_err());
+        assert!(storage.is_empty().await?);
     }
 
     Ok(())

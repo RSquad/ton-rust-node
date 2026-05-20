@@ -11,7 +11,7 @@ use crate::{
     errors::error::VaultError,
     storage::{
         file_json_migrator::migrate_tree_node_v1_to_v2,
-        storage_trait::{ListMode, Storage},
+        storage_trait::Storage,
         utils::{decrypt, generate_secret_in_memory, hex_string, prepare_to_store},
     },
     types::{
@@ -473,7 +473,7 @@ impl Storage for FileJsonStorage {
         }
     }
 
-    async fn list_metadata(&self, _mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
+    async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
         let tree = self.tree.read().await;
         let mut all_secrets = Vec::new();
         tree.collect_all(Vec::new(), &mut all_secrets);
@@ -512,5 +512,24 @@ impl Storage for FileJsonStorage {
 
     fn format_version(&self) -> anyhow::Result<u32> {
         Ok(Self::FORMAT_VERSION)
+    }
+
+    #[cfg(test)]
+    async fn clear(&self) -> anyhow::Result<()> {
+        let metas = self.list_metadata().await?;
+
+        for meta in &metas {
+            let secret_id =
+                meta.secret_id.as_ref().ok_or_else(|| VaultError::empty_secret_id(""))?;
+            self.delete(secret_id).await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn is_empty(&self) -> anyhow::Result<bool> {
+        let tree = self.tree.read().await;
+        Ok(tree.secret.is_none() && tree.children.is_empty())
     }
 }
