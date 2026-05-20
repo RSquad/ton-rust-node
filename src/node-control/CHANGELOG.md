@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`static_adnl_disabled` shown in elections settings** — `GET /v1/elections/settings` and `nodectl config elections ls` now indicate which nodes are opted out of static ADNL (a "disabled" marker appears in the Static ADNL column).
 - **`nodectl config elections wait`** — new subcommand (alias `wait-pct`) to set the AdaptiveSplit50 staking window: `--min` sets `sleep_period_pct` (earliest stake submission, as fraction of election duration; default 0.2), `--max` sets `waiting_period_pct` (latest peer-wait deadline; default 0.4, must be ≥ `--min`). Both values are now also shown in `nodectl config elections ls`. Only applied under the `adaptive_split50` stake policy.
 - **Contracts automation: auto-deploy and auto-topup** — new `automation` config section to enable automatic wallet/pool deploy and balance top-up, with separate toggles for SNP vs Nominator Pool deploy, configurable amounts (in TON) and tick interval. Manage live via `GET|POST /v1/automation/settings` or `nodectl config automation ls|set` (no service restart). See `docs/automation.md`.
-- **`NODECTL_API_CONNECT_TIMEOUT_SECS` / `NODECTL_API_REQUEST_TIMEOUT_SECS`** — env overrides for the nodectl CLI's REST connect timeout (default 5 s) and overall request timeout (default 10 s). Timeout and connect failures now produce an actionable error message that includes the URL that was attempted.
+- **`NODECTL_API_CONNECT_TIMEOUT_SECS` / `NODECTL_API_REQUEST_TIMEOUT_SECS`** — env overrides for the nodectl CLI's REST connect timeout (default 10 s) and overall request timeout (default 60 s). Timeout and connect failures now produce an actionable error message that includes the URL that was attempted.
 
 ### Changed
 

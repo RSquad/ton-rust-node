@@ -34,6 +34,39 @@ fn default_ton_http_api_url() -> String {
     "http://127.0.0.1:3301/".to_owned()
 }
 
+/// Default per-endpoint connect timeout for ton-http-api calls (seconds).
+pub const DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS: u64 = 3;
+/// Default per-endpoint request timeout for ton-http-api calls (seconds).
+pub const DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// Resolved per-endpoint timeouts for the ton-http-api JSON-RPC client.
+///
+/// `connect` bounds the initial TCP/TLS handshake, `request` bounds the
+/// overall per-endpoint wall-clock budget. Their sum caps the time spent
+/// on any single endpoint before failing over.
+#[derive(Copy, Clone, Debug)]
+pub struct EndpointTimeouts {
+    pub connect: Duration,
+    pub request: Duration,
+}
+
+impl EndpointTimeouts {
+    /// Sum of `connect` and `request`; per-endpoint wall-clock cap.
+    #[must_use]
+    pub fn total(self) -> Duration {
+        self.connect + self.request
+    }
+}
+
+impl Default for EndpointTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS),
+            request: Duration::from_secs(DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS),
+        }
+    }
+}
+
 /// A single ton-http-api endpoint entry.
 ///
 /// Plain strings use the global `api_key`; objects can override it per-endpoint.
@@ -77,6 +110,18 @@ pub struct TonHttpApiConfig {
     url: Option<String>,
     /// Global API key used for endpoints that don't specify their own.
     pub api_key: Option<String>,
+    /// Per-endpoint connect timeout (seconds).
+    ///
+    /// Bounds the wait on TCP/TLS handshake before failing over.
+    /// Defaults to [`DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Per-endpoint request timeout (seconds).
+    ///
+    /// Bounds the overall wait after a connection has been established.
+    /// Defaults to [`DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
 }
 
 impl Default for TonHttpApiConfig {
@@ -85,6 +130,8 @@ impl Default for TonHttpApiConfig {
             urls: vec![EndpointEntry::Url(default_ton_http_api_url())],
             url: None,
             api_key: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
         }
     }
 }
@@ -134,6 +181,20 @@ impl TonHttpApiConfig {
             result.push((default_ton_http_api_url(), None));
         }
         result
+    }
+
+    /// Returns the resolved per-endpoint timeouts, filling in defaults
+    /// for any field left unset in the config.
+    #[must_use]
+    pub fn resolved_timeouts(&self) -> EndpointTimeouts {
+        EndpointTimeouts {
+            connect: Duration::from_secs(
+                self.connect_timeout_secs.unwrap_or(DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS),
+            ),
+            request: Duration::from_secs(
+                self.request_timeout_secs.unwrap_or(DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS),
+            ),
+        }
     }
 }
 
@@ -1506,6 +1567,51 @@ mod tests {
         let parsed: TonHttpApiConfig = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.endpoints(), vec!["http://a/", "http://b/"]);
         assert_eq!(parsed.resolved_endpoints()[1].1, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn test_ton_http_api_default_timeouts() {
+        let cfg = TonHttpApiConfig::default();
+        let t = cfg.resolved_timeouts();
+        assert_eq!(t.connect, Duration::from_secs(3));
+        assert_eq!(t.request, Duration::from_secs(5));
+        assert_eq!(t.total(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn test_ton_http_api_explicit_timeouts() {
+        let cfg = TonHttpApiConfig {
+            connect_timeout_secs: Some(7),
+            request_timeout_secs: Some(11),
+            ..Default::default()
+        };
+        let t = cfg.resolved_timeouts();
+        assert_eq!(t.connect, Duration::from_secs(7));
+        assert_eq!(t.request, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn test_ton_http_api_timeouts_skipped_when_unset() {
+        let cfg = TonHttpApiConfig::default();
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("connect_timeout_secs").is_none());
+        assert!(json.get("request_timeout_secs").is_none());
+    }
+
+    #[test]
+    fn test_ton_http_api_timeouts_serde_roundtrip() {
+        let json = r#"{
+            "urls": ["http://a/"],
+            "api_key": null,
+            "connect_timeout_secs": 2,
+            "request_timeout_secs": 4
+        }"#;
+        let cfg: TonHttpApiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.connect_timeout_secs, Some(2));
+        assert_eq!(cfg.request_timeout_secs, Some(4));
+        let t = cfg.resolved_timeouts();
+        assert_eq!(t.connect, Duration::from_secs(2));
+        assert_eq!(t.request, Duration::from_secs(4));
     }
 
     #[test]

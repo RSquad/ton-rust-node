@@ -31,9 +31,9 @@ pub const SEND_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs
 pub const DEPLOY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
 /// Default timeout for establishing a TCP connection to the nodectl service.
-pub(crate) const API_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+pub(crate) const API_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 /// Default overall request timeout for nodectl service REST calls.
-pub(crate) const API_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+pub(crate) const API_REQUEST_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
 const API_CONNECT_TIMEOUT_ENV: &str = "NODECTL_API_CONNECT_TIMEOUT_SECS";
 const API_REQUEST_TIMEOUT_ENV: &str = "NODECTL_API_REQUEST_TIMEOUT_SECS";
@@ -216,6 +216,7 @@ pub async fn load_config_vault_rpc_client(
         ClientJsonRpc::connect_many(
             config.ton_http_api.resolved_endpoints(),
             config.ton_http_api.api_key.clone(),
+            config.ton_http_api.resolved_timeouts(),
         )
         .context("ClientJsonRpc")?,
     );

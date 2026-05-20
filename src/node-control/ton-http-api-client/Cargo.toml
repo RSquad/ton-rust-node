@@ -15,6 +15,7 @@ ton_block = { path = "../../block" }
 ton_api = { path = "../../tl/ton_api" }
 common = { path = "../common" }
 toncenter-rs = { git = "https://github.com/RSquad/toncenter-rs.git", branch = "main" }
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = [

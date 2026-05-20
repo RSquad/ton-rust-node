@@ -6,7 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use clap::{Args, command};
+use clap::Args;
 use common::app_config::AppConfig;
 use std::{path::Path, sync::Arc};
 use ton_block::BuilderData;
@@ -40,6 +40,7 @@ impl GetConfigParamCmd {
         let rpc_client = ClientJsonRpc::connect_many(
             app_cfg.ton_http_api.resolved_endpoints(),
             app_cfg.ton_http_api.api_key.clone(),
+            app_cfg.ton_http_api.resolved_timeouts(),
         )?;
 
         let config = rpc_client
