@@ -65,14 +65,13 @@ const WALLET_STORAGE_RESERVE: u64 = 1_000_000_000;
 /// ```
 /// where `my_balance` is already decreased by storage fees which we want to cover.
 const EXTRA_STORAGE_FEES: u64 = 5_000_000;
-/// Gas attached to `process_withdraw_requests` (TONCore op = 2). Mirrors the masterchain pool-op
-/// budget used by `update_validator_set` (see `contracts_task::POOL_OP_GAS`); 0.1 TON is not
-/// enough for the pool's `load_data` + dict iteration + payouts + `save_data` cycle.
-const WITHDRAW_PROCESS_GAS: u64 = 500_000_000; // 0.5 TON
-/// Maximum number of withdraw requests processed per `process_withdraw_requests` call.
-/// `pool.fc` already caps work by the pool's `max_nominators` (≤40); 100 is a safety ceiling
-/// that fits in a single transaction without ever throttling normal operation.
-const WITHDRAW_PROCESS_LIMIT: u8 = 100;
+/// Gas attached to `process_withdraw_requests` (TONCore op = 2). Must cover compute for
+/// `load_data` + dict iteration + payouts + `save_data`; 0.5 TON was too low (exit -14 on
+/// masterchain). Empirically ~0.9 TON gasFees for limit=10 on singlehost; 1 TON leaves margin.
+const WITHDRAW_PROCESS_GAS: u64 = 1_000_000_000; // 1 TON
+/// Withdraw requests processed per `process_withdraw_requests` call. Batched to stay within
+/// the gas credit from [`WITHDRAW_PROCESS_GAS`] (limit=100 with 0.5 TON consistently OOG).
+const WITHDRAW_PROCESS_LIMIT: u8 = 10;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
 
