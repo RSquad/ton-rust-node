@@ -98,10 +98,6 @@ enum Commands {
         #[arg(long, default_value = "fail")]
         on_conflict: String,
 
-        /// Source list mode: only-needed (default) or all
-        #[arg(long, default_value = "only-needed")]
-        list_mode: String,
-
         /// Print plan without writing to destination
         #[arg(long)]
         dry_run: bool,
@@ -148,7 +144,7 @@ async fn main() {
             verify::execute(&secret_id, data.0.as_slice(), signature.0.as_slice()).await
         }
         Commands::Migrate {} => migrate::execute().await,
-        Commands::Copy { on_conflict, list_mode, dry_run, continue_on_error } => {
+        Commands::Copy { on_conflict, dry_run, continue_on_error } => {
             let on_conflict: copy::OnConflict = match on_conflict.parse() {
                 Ok(v) => v,
                 Err(e) => {
@@ -156,14 +152,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let list_mode: copy::ListModeArg = match list_mode.parse() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("{} {}", "Error:".red().bold(), e);
-                    std::process::exit(1);
-                }
-            };
-            copy::execute(on_conflict, list_mode, dry_run, continue_on_error).await
+            copy::execute(on_conflict, dry_run, continue_on_error).await
         }
     };
 

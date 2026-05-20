@@ -12,7 +12,7 @@ use crate::{
         event_types::{Event, EventType},
         handler::EventHandler,
     },
-    storage::storage_trait::{ListMode, Storage},
+    storage::storage_trait::Storage,
     types::{
         metadata::Metadata, secret::Secret, secret_id::SecretId, secret_spec::SecretSpec,
         store_mode::StoreMode,
@@ -86,8 +86,13 @@ impl SecretVault {
         Ok(meta)
     }
 
-    pub async fn list_metadata(&self, mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
-        self.storage.list_metadata(mode).await
+    pub async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
+        self.storage.list_metadata().await
+    }
+
+    #[cfg(test)]
+    pub async fn clear(&self) -> anyhow::Result<()> {
+        self.storage.clear().await
     }
 }
 

@@ -277,17 +277,39 @@ impl Client {
 
     pub fn kv_data_path(&self, rest: &str) -> String {
         match &self.kv_prefix {
-            Some(prefix) => format!("{}/{}/data/{}/{}", self.addr, self.kv_mount, prefix, rest),
-            None => format!("{}/{}/data/{}", self.addr, self.kv_mount, rest),
+            Some(prefix) => {
+                format!("{}/{}/data/blobs/{}/{}", self.addr, self.kv_mount, prefix, rest)
+            }
+            None => format!("{}/{}/data/blobs/{}", self.addr, self.kv_mount, rest),
         }
     }
 
-    pub fn kv_meta_path(&self, rest: &str) -> String {
+    pub fn kv_user_meta_path(&self, rest: &str) -> String {
         match &self.kv_prefix {
             Some(prefix) => {
-                format!("{}/{}/metadata/{}/{}", self.addr, self.kv_mount, prefix, rest)
+                format!("{}/{}/data/meta/{}/{}", self.addr, self.kv_mount, prefix, rest)
             }
-            None => format!("{}/{}/metadata/{}", self.addr, self.kv_mount, rest),
+            None => format!("{}/{}/data/meta/{}", self.addr, self.kv_mount, rest),
+        }
+    }
+
+    pub fn kv_meta_path(&self, store: &str, rest: Option<&str>) -> String {
+        match &self.kv_prefix {
+            Some(prefix) => match rest {
+                Some(rest) => {
+                    format!(
+                        "{}/{}/metadata/{}/{}/{}",
+                        self.addr, self.kv_mount, store, prefix, rest
+                    )
+                }
+                None => format!("{}/{}/metadata/{}/{}", self.addr, self.kv_mount, store, prefix),
+            },
+            None => match rest {
+                Some(rest) => {
+                    format!("{}/{}/metadata/{}/{}", self.addr, self.kv_mount, store, rest)
+                }
+                None => format!("{}/{}/metadata/{}", self.addr, self.kv_mount, store),
+            },
         }
     }
 
@@ -554,13 +576,6 @@ impl Client {
         Ok(())
     }
 
-    pub async fn list_keys(&self) -> anyhow::Result<Vec<String>> {
-        let url = self.transit_mount_path("keys", None);
-        let result: Option<ListKeysResponse> =
-            self.do_request_no_body(reqwest::Method::from_bytes("LIST".as_bytes())?, &url).await?;
-        Ok(result.unwrap_or_default().data.keys)
-    }
-
     pub async fn delete_key(&self, secret_name: &str) -> anyhow::Result<()> {
         let config_url =
             self.transit_mount_path("keys", Some(Self::escape(secret_name).as_str())) + "/config";
@@ -600,7 +615,7 @@ impl Client {
         metadata: &Metadata,
         cas: Option<u64>,
     ) -> anyhow::Result<()> {
-        let url = self.kv_data_path(&format!("transit-metadata/{}", Self::escape(secret_name)));
+        let url = self.kv_user_meta_path(&Self::escape(secret_name));
         let mut payload = serde_json::json!({
                 "data": metadata
         });
@@ -625,7 +640,7 @@ impl Client {
     }
 
     pub async fn get_metadata(&self, secret_name: &str) -> anyhow::Result<Option<Metadata>> {
-        let url = self.kv_data_path(&format!("transit-metadata/{}", Self::escape(secret_name)));
+        let url = self.kv_user_meta_path(&Self::escape(secret_name));
         let response = self.do_request_raw_rs::<()>(reqwest::Method::GET, &url, None).await?;
 
         let status = response.status();
@@ -641,22 +656,6 @@ impl Client {
         let response_text = response.text().await?;
         let result: KVReadResponse<Metadata> = serde_json::from_str(&response_text)?;
         Ok(Some(result.data.data))
-    }
-
-    pub async fn delete_metadata(&self, secret_name: &str) -> anyhow::Result<()> {
-        let url = self.kv_meta_path(&format!("transit-metadata/{}", Self::escape(secret_name)));
-
-        let response = self.do_request_raw_rs::<()>(reqwest::Method::DELETE, &url, None).await?;
-
-        let status = response.status();
-        if status.is_success() {
-            Ok(())
-        } else if status.as_u16() == 404 {
-            anyhow::bail!(VaultError::not_found(format!("Metadata '{}' not found", secret_name)));
-        } else {
-            let error_text = response.text().await?;
-            anyhow::bail!("Failed to delete metadata: {}", error_text)
-        }
     }
 
     pub async fn write_blob(
@@ -677,7 +676,7 @@ impl Client {
             }
         }
 
-        let url = self.kv_data_path(&format!("blobs/{}", Self::escape(secret_name)));
+        let url = self.kv_data_path(&Self::escape(secret_name));
 
         let blob_data =
             BlobData { data: data_b64.to_string(), created_at: chrono::Utc::now().to_rfc3339() };
@@ -708,7 +707,7 @@ impl Client {
     }
 
     pub async fn read_blob(&self, secret_name: &str) -> anyhow::Result<BlobData> {
-        let url = self.kv_data_path(&format!("blobs/{}", Self::escape(secret_name)));
+        let url = self.kv_data_path(&Self::escape(secret_name));
 
         let response = self.do_request_raw_rs::<()>(reqwest::Method::GET, &url, None).await?;
 
@@ -728,8 +727,7 @@ impl Client {
     }
 
     pub async fn delete_blob(&self, secret_name: &str) -> anyhow::Result<()> {
-        let url = self.kv_meta_path(&format!("blobs/{}", Self::escape(secret_name)));
-
+        let url = self.kv_meta_path(&"blobs", Some(&Self::escape(secret_name)));
         let response = self.do_request_raw_rs::<()>(reqwest::Method::DELETE, &url, None).await?;
 
         let status = response.status();
@@ -743,13 +741,62 @@ impl Client {
         }
     }
 
-    pub async fn list_blobs(&self) -> anyhow::Result<Vec<String>> {
-        let url = self.kv_meta_path("blobs");
+    pub async fn delete_metadata(&self, secret_name: &str) -> anyhow::Result<()> {
+        let url = self.kv_meta_path(&"meta", Some(&Self::escape(secret_name)));
+        let response = self.do_request_raw_rs::<()>(reqwest::Method::DELETE, &url, None).await?;
 
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else if status.as_u16() == 404 {
+            anyhow::bail!(VaultError::not_found(format!("Metadata '{}' not found", secret_name)));
+        } else {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to delete metadata: {}", error_text)
+        }
+    }
+
+    pub async fn list_meta(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.kv_meta_path(&"meta", None);
         let result: Option<ListKeysResponse> =
             self.do_request_no_body(reqwest::Method::from_bytes("LIST".as_bytes())?, &url).await?;
 
         Ok(result.unwrap_or_default().data.keys)
+    }
+
+    #[cfg(test)]
+    pub async fn list_all_mount_transit_keys(&self) -> anyhow::Result<Vec<String>> {
+        let url = format!("{}/{}/{}", self.addr, self.transit_mount, "keys");
+        let result: Option<ListKeysResponse> =
+            self.do_request_no_body(reqwest::Method::from_bytes("LIST".as_bytes())?, &url).await?;
+        Ok(result.unwrap_or_default().data.keys)
+    }
+
+    #[cfg(test)]
+    pub async fn list_kv_subdir(&self, subdir: &str) -> anyhow::Result<Vec<String>> {
+        let url = match &self.kv_prefix {
+            Some(p) => format!("{}/{}/metadata/{}/{}", self.addr, self.kv_mount, p, subdir),
+            None => format!("{}/{}/metadata/{}", self.addr, self.kv_mount, subdir),
+        };
+        let result: Option<ListKeysResponse> =
+            self.do_request_no_body(reqwest::Method::from_bytes("LIST".as_bytes())?, &url).await?;
+        Ok(result.unwrap_or_default().data.keys)
+    }
+
+    #[cfg(test)]
+    pub async fn kv_hard_delete(&self, rest: &str) -> anyhow::Result<()> {
+        let url = match &self.kv_prefix {
+            Some(p) => format!("{}/{}/metadata/{}/{}", self.addr, self.kv_mount, p, rest),
+            None => format!("{}/{}/metadata/{}", self.addr, self.kv_mount, rest),
+        };
+        let response = self.do_request_raw_rs::<()>(reqwest::Method::DELETE, &url, None).await?;
+        let status = response.status();
+        if status.is_success() || status.as_u16() == 404 {
+            Ok(())
+        } else {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to hard-delete kv '{}': {}", rest, error_text)
+        }
     }
 
     async fn do_request_no_body<Rs>(

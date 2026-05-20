@@ -13,7 +13,6 @@ use crate::{
     },
     errors::error::VaultError,
     make_secret_id,
-    storage::storage_trait::ListMode,
     tests::fixture::*,
     types::{
         algorithm::Algorithm,
@@ -253,7 +252,7 @@ async fn test_load_metadata() -> anyhow::Result<()> {
 async fn test_list_metadata_empty() -> anyhow::Result<()> {
     for config in fixture() {
         let vault = create_test_vault(&config).await?;
-        let metadata_list = vault.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = vault.list_metadata().await?;
         assert!(metadata_list.is_empty());
     }
 
@@ -272,7 +271,7 @@ async fn test_list_metadata_multiple_keys() -> anyhow::Result<()> {
             vault.generate_secret(&spec, &secret_id).await?;
         }
 
-        let metadata_list = vault.list_metadata(ListMode::All).await?;
+        let metadata_list = vault.list_metadata().await?;
         assert_eq!(metadata_list.len(), 5);
     }
 
@@ -328,7 +327,7 @@ async fn test_concurrent_key_generation() -> anyhow::Result<()> {
             handle.await??;
         }
 
-        let metadata_list = vault.list_metadata(ListMode::All).await?;
+        let metadata_list = vault.list_metadata().await?;
         assert_eq!(metadata_list.len(), 10);
     }
 
@@ -372,7 +371,7 @@ where
     for config in fixture() {
         let vault = create_test_vault(&config).await?;
 
-        let metadata = vault.list_metadata(ListMode::All).await?;
+        let metadata = vault.list_metadata().await?;
         assert_eq!(metadata.len(), 0);
 
         for id in 0..10 {
@@ -382,7 +381,7 @@ where
             let secret = gen_secret(secret_id.to_string(), crypto.clone()).await?;
             vault.store(&secret, StoreMode::NewOnly).await?;
 
-            let metadata = vault.list_metadata(ListMode::All).await?;
+            let metadata = vault.list_metadata().await?;
             assert_eq!(metadata.len(), id + 1);
 
             // Get
@@ -399,7 +398,7 @@ where
             assert_eq!(metadata.len(), id + 1);
         }
 
-        let metadata = vault.list_metadata(ListMode::All).await?;
+        let metadata = vault.list_metadata().await?;
         assert_eq!(metadata.len(), 10);
 
         for id in 0..10 {
@@ -410,11 +409,11 @@ where
             let res = vault.load(&secret_id).await;
             assert!(res.is_err());
 
-            let metadata = vault.list_metadata(ListMode::All).await?;
+            let metadata = vault.list_metadata().await?;
             assert_eq!(metadata.len(), 9 - id);
         }
 
-        let metadata = vault.list_metadata(ListMode::All).await?;
+        let metadata = vault.list_metadata().await?;
         assert_eq!(metadata.len(), 0);
     }
 
@@ -680,7 +679,7 @@ async fn test_blob_mixed_with_keypairs_in_vault() -> anyhow::Result<()> {
         let key_spec = SecretSpec::new(Algorithm::Ed25519).extractable(true);
         vault.generate_secret(&key_spec, &key_id).await?;
 
-        let metadata_list = vault.list_metadata(ListMode::All).await?;
+        let metadata_list = vault.list_metadata().await?;
         assert_eq!(metadata_list.len(), 2);
 
         let blob_loaded = vault.load(&blob_id).await?;
