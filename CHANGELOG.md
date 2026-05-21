@@ -6,6 +6,26 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.7.0] - 2026-05-21
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.7.0`
+
+### Added
+
+- Do not expose node keys in config, use secrets vault
+
+### Changed
+
+- External messages processing optimization
+- Memory optimization for archival node
+- Performance and memory optimizations for CellDb
+- Stability improvements for compressed BOCs and external messages
+- TVM stability updates
+
+### Fixed
+
+- Fixes for protocol vulnerabilities
+
 ## [v0.6.1] - 2026-05-06
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.6.1`
