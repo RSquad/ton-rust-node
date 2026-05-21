@@ -43,10 +43,12 @@ pub struct RunGetMethodRes {
     pub block_id: Option<BlockIdExt>,
 }
 
-#[derive(Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountState {
     Active,
+    /// TON HTTP APIs typically return `"uninit"`; some stacks use `"uninitialized"`.
+    #[serde(rename = "uninit", alias = "uninitialized")]
     #[default]
     Uninitialized,
     Frozen,
@@ -208,4 +210,27 @@ pub struct GetWalletInformationRes {
     pub wallet_type: Option<WalletType>,
     pub seqno: Option<u32>,
     pub wallet_id: Option<u64>,
+}
+
+#[cfg(test)]
+mod account_state_tests {
+    use super::AccountState;
+
+    #[test]
+    fn deserializes_uninit_from_ton_http_api() {
+        let v: AccountState = serde_json::from_value(serde_json::json!("uninit")).unwrap();
+        assert_eq!(v, AccountState::Uninitialized);
+    }
+
+    #[test]
+    fn deserializes_uninitialized_alias() {
+        let v: AccountState = serde_json::from_value(serde_json::json!("uninitialized")).unwrap();
+        assert_eq!(v, AccountState::Uninitialized);
+    }
+
+    #[test]
+    fn serializes_uninitialized_as_uninit() {
+        let s = serde_json::to_string(&AccountState::Uninitialized).unwrap();
+        assert_eq!(s, "\"uninit\"");
+    }
 }

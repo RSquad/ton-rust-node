@@ -33,6 +33,39 @@ fn default_ton_http_api_url() -> String {
     "http://127.0.0.1:3301/".to_owned()
 }
 
+/// Default per-endpoint connect timeout for ton-http-api calls (seconds).
+pub const DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS: u64 = 3;
+/// Default per-endpoint request timeout for ton-http-api calls (seconds).
+pub const DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// Resolved per-endpoint timeouts for the ton-http-api JSON-RPC client.
+///
+/// `connect` bounds the initial TCP/TLS handshake, `request` bounds the
+/// overall per-endpoint wall-clock budget. Their sum caps the time spent
+/// on any single endpoint before failing over.
+#[derive(Copy, Clone, Debug)]
+pub struct EndpointTimeouts {
+    pub connect: Duration,
+    pub request: Duration,
+}
+
+impl EndpointTimeouts {
+    /// Sum of `connect` and `request`; per-endpoint wall-clock cap.
+    #[must_use]
+    pub fn total(self) -> Duration {
+        self.connect + self.request
+    }
+}
+
+impl Default for EndpointTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS),
+            request: Duration::from_secs(DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS),
+        }
+    }
+}
+
 /// A single ton-http-api endpoint entry.
 ///
 /// Plain strings use the global `api_key`; objects can override it per-endpoint.
@@ -76,6 +109,18 @@ pub struct TonHttpApiConfig {
     url: Option<String>,
     /// Global API key used for endpoints that don't specify their own.
     pub api_key: Option<String>,
+    /// Per-endpoint connect timeout (seconds).
+    ///
+    /// Bounds the wait on TCP/TLS handshake before failing over.
+    /// Defaults to [`DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Per-endpoint request timeout (seconds).
+    ///
+    /// Bounds the overall wait after a connection has been established.
+    /// Defaults to [`DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
 }
 
 impl Default for TonHttpApiConfig {
@@ -84,6 +129,8 @@ impl Default for TonHttpApiConfig {
             urls: vec![EndpointEntry::Url(default_ton_http_api_url())],
             url: None,
             api_key: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
         }
     }
 }
@@ -133,6 +180,20 @@ impl TonHttpApiConfig {
             result.push((default_ton_http_api_url(), None));
         }
         result
+    }
+
+    /// Returns the resolved per-endpoint timeouts, filling in defaults
+    /// for any field left unset in the config.
+    #[must_use]
+    pub fn resolved_timeouts(&self) -> EndpointTimeouts {
+        EndpointTimeouts {
+            connect: Duration::from_secs(
+                self.connect_timeout_secs.unwrap_or(DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS),
+            ),
+            request: Duration::from_secs(
+                self.request_timeout_secs.unwrap_or(DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS),
+            ),
+        }
     }
 }
 
@@ -347,19 +408,77 @@ fn default_toncore_min_nominator_stake() -> u64 {
     DEFAULT_TONCORE_MIN_NOMINATOR_STAKE
 }
 
+fn skip_serializing_toncore_deploy_mode(mode: &TonCoreDeployMode) -> bool {
+    mode.is_legacy()
+}
+
+/// How a TON Core nominator pool slot is deployed — **operator-facing** choice (JSON key remains `deploy_layout`).
+///
+/// - [`TonCoreDeployMode::Legacy`] — full pool bytecode in `StateInit.code` (same addresses as pools created
+///   by older nodectl).
+/// - [`TonCoreDeployMode::TonscanCompatible`] — bootstrap `code` + `SETCODE` on first run; Tonscan recognises
+///   the contract.
+///
+/// **Defaults:** persisted config without the field stays [`Legacy`] so derived addresses stay stable. New pools
+/// from REST / CLI omitting the knob use [`default_new_pool_deploy_mode`] ([`TonscanCompatible`]).
+///
+/// **Wire strings** — canonical short forms `legacy` / `tonscan`; long alias `tonscan_compatible` (and kebab
+/// `tonscan-compatible`) is accepted for readers copying from the Rust variant name.
+///
+/// **Forwarding compatibility:** [`non_exhaustive`](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[non_exhaustive]
+pub enum TonCoreDeployMode {
+    #[default]
+    #[serde(rename = "legacy")]
+    Legacy,
+    #[serde(rename = "tonscan", alias = "tonscan_compatible", alias = "tonscan-compatible")]
+    TonscanCompatible,
+}
+
+/// Default [`TonCoreDeployMode`] when **creating** a pool slot (`POST /v1/pools/core`, `nodectl config pool add core`)
+/// without specifying deploy mode — tonscan-friendly.
+pub fn default_new_pool_deploy_mode() -> TonCoreDeployMode {
+    TonCoreDeployMode::TonscanCompatible
+}
+
+impl TonCoreDeployMode {
+    #[inline]
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
+/// CLI / `str::parse`: same accepted strings as JSON serde for [`TonCoreDeployMode`].
+impl std::str::FromStr for TonCoreDeployMode {
+    type Err = serde_json::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_owned()))
+    }
+}
+
 /// Single TONCore pool slot config (address + optional deploy params).
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct TonCorePoolConfig {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<TonCoreInitParams>,
+    /// Deploy mode for this slot; JSON field name **`deploy_layout`** (historical).
+    ///
+    /// Omitted → [`TonCoreDeployMode::Legacy`] (stable addresses vs older configs).
+    #[serde(
+        rename = "deploy_layout",
+        default,
+        skip_serializing_if = "skip_serializing_toncore_deploy_mode"
+    )]
+    pub deploy_mode: TonCoreDeployMode,
 }
 
 /// Deploy-time parameters for a TONCore nominator pool contract.
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TonCoreInitParams {
     pub validator_share: u16,
     #[serde(default = "default_toncore_max_nominators")]
@@ -452,7 +571,7 @@ impl AdnlConfig {
 
         Ok(AdnlClientConfig::new(
             Some(client_key_opt),
-            resolve_ip(&self.server_address)?,
+            resolve_ip(&self.server_address).await?,
             server_key,
             timeouts,
         ))
@@ -523,10 +642,12 @@ fn default_tick_interval() -> u64 {
     40
 }
 
+/// Default `waiting_period_pct` when the field is omitted from serialized [`ElectionsConfig`].
 fn default_waiting_pct() -> f64 {
     0.4
 }
 
+/// Default `sleep_period_pct` when the field is omitted from serialized [`ElectionsConfig`].
 fn default_sleep_pct() -> f64 {
     0.2
 }
@@ -556,8 +677,13 @@ pub struct ElectionsConfig {
     /// Pre-generated ADNL addresses, keyed by node name (base64-encoded).
     /// When a node has an entry here, the runner attaches this existing ADNL address
     /// to the validator key each election instead of generating a fresh one.
+    /// Auto-populated on first election for nodes not in `static_adnl_disabled`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub static_adnls: HashMap<String, String>,
+    /// Nodes that opt out of the static ADNL default: the runner generates a fresh
+    /// ephemeral ADNL address every cycle for them (pre-v0.5 behavior).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub static_adnl_disabled: HashSet<String>,
 }
 
 impl ElectionsConfig {
@@ -584,7 +710,7 @@ impl ElectionsConfig {
         Ok(())
     }
 
-    fn validate_timing_fields(&self) -> anyhow::Result<()> {
+    pub fn validate_timing_fields(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.sleep_period_pct) {
             anyhow::bail!("sleep_period_pct must be in range [0.0..1.0]");
         }
@@ -608,6 +734,7 @@ impl Default for ElectionsConfig {
             sleep_period_pct: default_sleep_pct(),
             waiting_period_pct: default_waiting_pct(),
             static_adnls: HashMap::new(),
+            static_adnl_disabled: HashSet::new(),
         }
     }
 }
@@ -618,6 +745,12 @@ pub struct VotingConfig {
     pub proposals: Vec<String>,
     #[serde(default = "default_tick_interval")]
     pub tick_interval: u64,
+}
+
+impl Default for VotingConfig {
+    fn default() -> Self {
+        Self { proposals: Vec::new(), tick_interval: default_tick_interval() }
+    }
 }
 
 /// Lifecycle status of a node binding.
@@ -730,6 +863,158 @@ impl Default for LogConfig {
     }
 }
 
+// Defaults aligned with `service/src/contracts/contracts_task.rs` (contracts task).
+
+fn default_contracts_wallet_deploy() -> u64 {
+    1_100_000_000
+}
+
+fn default_contracts_wallet_topup() -> u64 {
+    10_000_000_000
+}
+
+fn default_contracts_wallet_balance_threshold() -> u64 {
+    5_000_000_000
+}
+
+fn default_contracts_automation_tick_interval_sec() -> u64 {
+    default_tick_interval()
+}
+
+fn default_contracts_automation_enabled() -> bool {
+    true
+}
+
+/// Wallet-related automation amounts (nanotons): deploy send value, top-up batch, balance threshold.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WalletAmounts {
+    #[serde(default = "default_contracts_wallet_deploy")]
+    pub deploy: u64,
+    #[serde(default = "default_contracts_wallet_topup")]
+    pub topup: u64,
+    #[serde(default = "default_contracts_wallet_balance_threshold")]
+    pub threshold: u64,
+}
+
+impl Default for WalletAmounts {
+    fn default() -> Self {
+        Self {
+            deploy: default_contracts_wallet_deploy(),
+            topup: default_contracts_wallet_topup(),
+            threshold: default_contracts_wallet_balance_threshold(),
+        }
+    }
+}
+
+/// Per–pool-kind deploy send values from the master wallet when deploying a pool (nanotons).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PoolAmounts {
+    #[serde(default = "default_contracts_wallet_deploy")]
+    pub snp: u64,
+    #[serde(default = "default_contracts_wallet_deploy")]
+    pub ton_core: u64,
+}
+
+impl Default for PoolAmounts {
+    fn default() -> Self {
+        Self { snp: default_contracts_wallet_deploy(), ton_core: default_contracts_wallet_deploy() }
+    }
+}
+
+/// Parameters for the contracts task (auto-deploy wallets/pools, auto-topup validator wallets).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ContractsAutomationConfig {
+    /// Poll interval for the contracts task loop in seconds.
+    #[serde(default = "default_contracts_automation_tick_interval_sec")]
+    pub tick_interval_sec: u64,
+    #[serde(default = "default_contracts_automation_enabled")]
+    pub auto_deploy: bool,
+    #[serde(default = "default_contracts_automation_enabled")]
+    pub auto_topup: bool,
+    #[serde(default)]
+    pub wallet: WalletAmounts,
+    #[serde(default)]
+    pub pool: PoolAmounts,
+}
+
+impl Default for ContractsAutomationConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval_sec: default_contracts_automation_tick_interval_sec(),
+            auto_deploy: default_contracts_automation_enabled(),
+            auto_topup: default_contracts_automation_enabled(),
+            wallet: WalletAmounts::default(),
+            pool: PoolAmounts::default(),
+        }
+    }
+}
+
+/// Maximum automation amount field (nanotons): sanity bound against typo-scale errors (~18e9 TON fits in u64).
+const AUTOMATION_MAX_AMOUNT_NANOTONS: u64 = 100_000 * 1_000_000_000;
+
+/// Minimum `wallet.deploy`: aligned with `WALLET_GAS` in `contracts_task` (0.1 TON).
+const AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS: u64 = 100_000_000;
+
+fn automation_check_bounded_positive_amount(field: &'static str, value: u64) -> anyhow::Result<()> {
+    if value == 0 {
+        anyhow::bail!("automation.{} must be > 0", field);
+    }
+    if value > AUTOMATION_MAX_AMOUNT_NANOTONS {
+        anyhow::bail!(
+            "automation.{} must be <= {} nanotons ({} TON), got {}",
+            field,
+            AUTOMATION_MAX_AMOUNT_NANOTONS,
+            AUTOMATION_MAX_AMOUNT_NANOTONS / 1_000_000_000,
+            value
+        );
+    }
+    Ok(())
+}
+
+fn automation_check_wallet_deploy(value: u64) -> anyhow::Result<()> {
+    if value < AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS {
+        anyhow::bail!(
+            "automation.wallet.deploy must be >= {} nanotons (0.1 TON), got {}",
+            AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS,
+            value
+        );
+    }
+    if value > AUTOMATION_MAX_AMOUNT_NANOTONS {
+        anyhow::bail!(
+            "automation.wallet.deploy must be <= {} nanotons ({} TON), got {}",
+            AUTOMATION_MAX_AMOUNT_NANOTONS,
+            AUTOMATION_MAX_AMOUNT_NANOTONS / 1_000_000_000,
+            value
+        );
+    }
+    Ok(())
+}
+
+impl ContractsAutomationConfig {
+    /// Validates automation settings: tick interval; monetary fields positive and at most 100_000 TON each;
+    /// `wallet.deploy` at least 0.1 TON (aligned with deploy gas checks in the contracts task).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MIN_TICK_SEC: u64 = 1;
+        const MAX_TICK_SEC: u64 = 24 * 60 * 60;
+
+        if !(MIN_TICK_SEC..=MAX_TICK_SEC).contains(&self.tick_interval_sec) {
+            anyhow::bail!(
+                "automation.tick_interval_sec must be in range [{MIN_TICK_SEC}, {MAX_TICK_SEC}], got {}",
+                self.tick_interval_sec
+            );
+        }
+        automation_check_wallet_deploy(self.wallet.deploy)?;
+        automation_check_bounded_positive_amount("pool.snp", self.pool.snp)?;
+        automation_check_bounded_positive_amount("pool.ton_core", self.pool.ton_core)?;
+        automation_check_bounded_positive_amount("wallet.topup", self.wallet.topup)?;
+        automation_check_bounded_positive_amount("wallet.threshold", self.wallet.threshold)?;
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct AppConfig {
     pub nodes: HashMap<String, AdnlConfig>,
@@ -749,6 +1034,8 @@ pub struct AppConfig {
     /// Default interval for all tasks in seconds
     #[serde(default = "default_tick_interval")]
     pub tick_interval: u64,
+    #[serde(default)]
+    pub automation: ContractsAutomationConfig,
     pub log: Option<LogConfig>,
 }
 
@@ -793,6 +1080,7 @@ impl AppConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.elections.as_ref().map(|e| e.validate(None)).transpose()?;
+        self.automation.validate()?;
         Ok(())
     }
 }
@@ -963,6 +1251,7 @@ mod tests {
                             min_validator_stake: DEFAULT_TONCORE_MIN_VALIDATOR_STAKE,
                             min_nominator_stake: DEFAULT_TONCORE_MIN_NOMINATOR_STAKE,
                         }),
+                        ..Default::default()
                     }),
                     None,
                 ],
@@ -1018,6 +1307,7 @@ mod tests {
                             min_validator_stake: 5_000_000_000_000,
                             min_nominator_stake: 1_000_000_000_000,
                         }),
+                        ..Default::default()
                     }),
                     None,
                 ],
@@ -1045,6 +1335,71 @@ mod tests {
         assert_eq!(json["kind"], "core");
         assert_eq!(json["pools"][0]["address"], addr0);
         assert_eq!(json["pools"][1]["address"], addr1);
+    }
+
+    #[test]
+    fn test_pool_config_toncore_deploy_mode_roundtrip() {
+        let value = serde_json::json!({
+            "kind": "core",
+            "pools": [
+                {
+                    "params": { "validator_share": 50 },
+                    "deploy_layout": "tonscan",
+                },
+                null,
+            ],
+        });
+        let cfg: PoolConfig = serde_json::from_value(value.clone()).unwrap();
+        match &cfg {
+            PoolConfig::TONCore { pools } => {
+                assert_eq!(
+                    pools[0].as_ref().unwrap().deploy_mode,
+                    TonCoreDeployMode::TonscanCompatible
+                );
+            }
+            _ => panic!("expected TONCore"),
+        }
+
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["pools"][0]["deploy_layout"], "tonscan");
+
+        let legacy_default_only = serde_json::json!({
+            "kind": "core",
+            "pools": [{ "params": { "validator_share": 50 } }, null],
+        });
+        let cfg2: PoolConfig = serde_json::from_value(legacy_default_only).unwrap();
+        match &cfg2 {
+            PoolConfig::TONCore { pools } => {
+                assert!(pools[0].as_ref().unwrap().deploy_mode.is_legacy());
+            }
+            _ => panic!("expected TONCore"),
+        }
+    }
+
+    #[test]
+    fn toncore_deploy_mode_from_str_matches_serde_string_scalar() {
+        use std::str::FromStr;
+
+        let tonscan_aliases = ["tonscan", "tonscan_compatible", "tonscan-compatible"];
+        for wire in tonscan_aliases {
+            let a = TonCoreDeployMode::from_str(wire).expect("from_str");
+            let b: TonCoreDeployMode =
+                serde_json::from_value(serde_json::Value::String(wire.to_string())).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(a, TonCoreDeployMode::TonscanCompatible);
+        }
+        let a = TonCoreDeployMode::from_str("legacy").expect("from_str");
+        let b: TonCoreDeployMode =
+            serde_json::from_value(serde_json::Value::String("legacy".to_string())).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, TonCoreDeployMode::Legacy);
+
+        for dropped in ["embedded_code", "activate_upgrade", "bogus"] {
+            assert!(
+                TonCoreDeployMode::from_str(dropped).is_err(),
+                "wire form {dropped:?} must not be accepted",
+            );
+        }
     }
 
     #[test]
@@ -1212,5 +1567,129 @@ mod tests {
         let parsed: TonHttpApiConfig = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.endpoints(), vec!["http://a/", "http://b/"]);
         assert_eq!(parsed.resolved_endpoints()[1].1, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn test_ton_http_api_default_timeouts() {
+        let cfg = TonHttpApiConfig::default();
+        let t = cfg.resolved_timeouts();
+        assert_eq!(t.connect, Duration::from_secs(3));
+        assert_eq!(t.request, Duration::from_secs(5));
+        assert_eq!(t.total(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn test_ton_http_api_explicit_timeouts() {
+        let cfg = TonHttpApiConfig {
+            connect_timeout_secs: Some(7),
+            request_timeout_secs: Some(11),
+            ..Default::default()
+        };
+        let t = cfg.resolved_timeouts();
+        assert_eq!(t.connect, Duration::from_secs(7));
+        assert_eq!(t.request, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn test_ton_http_api_timeouts_skipped_when_unset() {
+        let cfg = TonHttpApiConfig::default();
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("connect_timeout_secs").is_none());
+        assert!(json.get("request_timeout_secs").is_none());
+    }
+
+    #[test]
+    fn test_ton_http_api_timeouts_serde_roundtrip() {
+        let json = r#"{
+            "urls": ["http://a/"],
+            "api_key": null,
+            "connect_timeout_secs": 2,
+            "request_timeout_secs": 4
+        }"#;
+        let cfg: TonHttpApiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.connect_timeout_secs, Some(2));
+        assert_eq!(cfg.request_timeout_secs, Some(4));
+        let t = cfg.resolved_timeouts();
+        assert_eq!(t.connect, Duration::from_secs(2));
+        assert_eq!(t.request, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn contracts_automation_default_validate_ok() {
+        let c = ContractsAutomationConfig::default();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.tick_interval_sec, default_tick_interval());
+        assert!(c.auto_deploy && c.auto_topup);
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_zero_wallet_deploy() {
+        let mut c = ContractsAutomationConfig::default();
+        c.wallet.deploy = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_wallet_deploy_below_gas() {
+        let mut c = ContractsAutomationConfig::default();
+        c.wallet.deploy = super::AUTOMATION_MIN_WALLET_DEPLOY_NANOTONS - 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_amount_above_cap() {
+        let mut c = ContractsAutomationConfig::default();
+        c.wallet.topup = super::AUTOMATION_MAX_AMOUNT_NANOTONS + 1;
+        assert!(c.validate().is_err());
+
+        let mut c = ContractsAutomationConfig::default();
+        c.pool.snp = super::AUTOMATION_MAX_AMOUNT_NANOTONS + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_validate_accepts_amount_at_cap() {
+        let mut c = ContractsAutomationConfig::default();
+        let cap = super::AUTOMATION_MAX_AMOUNT_NANOTONS;
+        c.wallet.deploy = cap;
+        c.pool.snp = cap;
+        c.pool.ton_core = cap;
+        c.wallet.topup = cap;
+        c.wallet.threshold = cap;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn contracts_automation_validate_rejects_tick_out_of_range() {
+        let mut c = ContractsAutomationConfig::default();
+        c.tick_interval_sec = 0;
+        assert!(c.validate().is_err());
+        c.tick_interval_sec = 24 * 60 * 60 + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn contracts_automation_deserializes_json_amount_fields() {
+        let json = r#"{
+            "tick_interval_sec": 40,
+            "auto_deploy": true,
+            "auto_topup": true,
+            "wallet": {
+                "deploy": 2200000000,
+                "topup": 10000000000,
+                "threshold": 5000000000
+            },
+            "pool": {
+                "snp": 1100000000,
+                "ton_core": 3300000000
+            }
+        }"#;
+        let c: ContractsAutomationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.wallet.deploy, 2_200_000_000);
+        assert_eq!(c.pool.snp, 1_100_000_000);
+        assert_eq!(c.pool.ton_core, 3_300_000_000);
+        assert_eq!(c.wallet.topup, 10_000_000_000);
+        assert_eq!(c.wallet.threshold, 5_000_000_000);
+        assert!(c.validate().is_ok());
     }
 }

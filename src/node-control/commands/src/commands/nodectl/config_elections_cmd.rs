@@ -8,7 +8,7 @@
  */
 use crate::commands::nodectl::{
     output_format::OutputFormat,
-    utils::{api_get, api_post, resolve_service_url},
+    utils::{api_delete, api_get, api_post, resolve_service_url},
 };
 use colored::Colorize;
 use common::{
@@ -34,6 +34,12 @@ pub enum ElectionsAction {
     TickInterval(TickIntervalCmd),
     /// Set the max-factor
     MaxFactor(MaxFactorCmd),
+    /// Set the AdaptiveSplit50 staking window — when to start staking and how long to wait for peers.
+    ///
+    /// Only used when the stake policy is `adaptive_split50`; ignored for `minimum`, `split50`,
+    /// and `fixed`.
+    #[command(alias = "wait-pct")]
+    Wait(WaitCmd),
     /// Enable elections for binding(s)
     Enable(EnableCmd),
     /// Disable elections for binding(s)
@@ -83,6 +89,29 @@ pub struct MaxFactorCmd {
 }
 
 #[derive(clap::Args, Clone)]
+pub struct WaitCmd {
+    /// Earliest stake submission, as fraction of election duration
+    #[arg(
+        long,
+        help = "Earliest stake submission, as fraction of election duration",
+        long_help = "Defer staking until this fraction of the election window has elapsed, \
+                     even when there are already enough peers. Range [0.0, 1.0]; default 0.2. \
+                     Only applied under the adaptive_split50 stake policy."
+    )]
+    min: Option<f64>,
+    /// Latest peer-wait deadline, as fraction of election duration
+    #[arg(
+        long,
+        help = "Latest peer-wait deadline, as fraction of election duration",
+        long_help = "Keep waiting for enough peers until this fraction of the election window. \
+                     After this point, stake regardless of peer count. Range [0.0, 1.0]; \
+                     must be \u{2265} --min; default 0.4. Only applied under the adaptive_split50 \
+                     stake policy."
+    )]
+    max: Option<f64>,
+}
+
+#[derive(clap::Args, Clone)]
 pub struct EnableCmd {
     #[arg(required = true, help = "Binding name(s) to enable for elections")]
     nodes: Vec<String>,
@@ -98,6 +127,11 @@ pub struct DisableCmd {
 pub struct StaticAdnlCmd {
     #[arg(short = 'n', long = "node", required = true, help = "Node name")]
     node: String,
+    /// Opt out of the static ADNL default for this node: the runner will generate a fresh
+    /// ephemeral ADNL address every cycle (pre-v0.5 behavior). Run without this flag again
+    /// to rotate and re-enable the static address.
+    #[arg(long = "disable", default_value_t = false)]
+    disable: bool,
 }
 
 impl ElectionsCfgCmd {
@@ -112,6 +146,7 @@ impl ElectionsCfgCmd {
             ElectionsAction::StakePolicy(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::TickInterval(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::MaxFactor(cmd) => cmd.run(url, token, config_path).await,
+            ElectionsAction::Wait(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Enable(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::Disable(cmd) => cmd.run(url, token, config_path).await,
             ElectionsAction::StaticAdnl(cmd) => cmd.run(url, token, config_path).await,
@@ -152,6 +187,9 @@ struct ElectionsSettingsView {
     policy_overrides: HashMap<String, StakePolicy>,
     max_factor: f32,
     tick_interval: u64,
+    sleep_period_pct: f64,
+    waiting_period_pct: f64,
+    #[serde(default)]
     bindings: Vec<BindingElectionView>,
 }
 
@@ -163,13 +201,17 @@ struct BindingElectionView {
     stake_policy: StakePolicy,
     #[serde(default)]
     static_adnl: Option<String>,
+    #[serde(default)]
+    static_adnl_disabled: bool,
 }
 
 fn print_elections_settings_table(view: &ElectionsSettingsView) {
     println!("\n{} {}\n", "OK".green().bold(), "Elections Configuration".green());
-    println!("  {:<20} {}", "Stake Policy:".cyan().bold(), view.stake_policy);
-    println!("  {:<20} {}", "Max Factor:".cyan().bold(), view.max_factor);
-    println!("  {:<20} {}s", "Tick Interval:".cyan().bold(), view.tick_interval);
+    println!("  {:<28} {}", "Stake Policy:".cyan().bold(), view.stake_policy);
+    println!("  {:<28} {}", "Max Factor:".cyan().bold(), view.max_factor);
+    println!("  {:<28} {}s", "Tick Interval:".cyan().bold(), view.tick_interval);
+    println!("  {:<28} {}", "Adaptive sleep fraction:".cyan().bold(), view.sleep_period_pct);
+    println!("  {:<28} {}", "Adaptive wait fraction:".cyan().bold(), view.waiting_period_pct);
 
     if !view.policy_overrides.is_empty() {
         println!("\n  {}", "Policy Overrides:".cyan().bold());
@@ -179,40 +221,71 @@ fn print_elections_settings_table(view: &ElectionsSettingsView) {
     }
 
     if !view.bindings.is_empty() {
-        let has_static_adnl = view.bindings.iter().any(|b| b.static_adnl.is_some());
+        let has_static_adnl =
+            view.bindings.iter().any(|b| b.static_adnl.is_some() || b.static_adnl_disabled);
+        // Column widths: stake policy strings can be long (e.g. adaptive_split50 (50% or 100%)).
+        // Headers/data must pad plain text before coloring — ANSI must not count toward {:<N}.
+        const W_NODE: usize = 20;
+        const W_ENABLE: usize = 12;
+        const W_STATUS: usize = 18;
+        const W_STAKE: usize = 38;
+        const W_ADNL: usize = 24;
+
         println!("\n  {}", "Bindings:".cyan().bold());
+        let rule_len =
+            W_NODE + W_ENABLE + W_STATUS + W_STAKE + if has_static_adnl { W_ADNL } else { 0 };
         if has_static_adnl {
             println!(
-                "    {:<20} {:<12} {:<16} {:<20} {}",
-                "Node".cyan(),
-                "Enable".cyan(),
-                "Status".cyan(),
-                "Stake Policy".cyan(),
-                "Static ADNL".cyan(),
+                "    {}{}{}{}{}",
+                format!("{:<w$}", "Node", w = W_NODE).cyan(),
+                format!("{:<w$}", "Enable", w = W_ENABLE).cyan(),
+                format!("{:<w$}", "Status", w = W_STATUS).cyan(),
+                format!("{:<w$}", "Stake Policy", w = W_STAKE).cyan(),
+                format!("{:<w$}", "Static ADNL", w = W_ADNL).cyan(),
             );
         } else {
             println!(
-                "    {:<20} {:<12} {:<16} {}",
-                "Node".cyan(),
-                "Enable".cyan(),
-                "Status".cyan(),
-                "Stake Policy".cyan(),
+                "    {}{}{}{}",
+                format!("{:<w$}", "Node", w = W_NODE).cyan(),
+                format!("{:<w$}", "Enable", w = W_ENABLE).cyan(),
+                format!("{:<w$}", "Status", w = W_STATUS).cyan(),
+                format!("{:<w$}", "Stake Policy", w = W_STAKE).cyan(),
             );
         }
-        println!("    {}", "─".repeat(if has_static_adnl { 100 } else { 70 }).dimmed());
+        println!("    {}", "─".repeat(rule_len).dimmed());
         for b in &view.bindings {
-            let enable_str =
-                if b.enable { "yes".green().to_string() } else { "no".red().to_string() };
+            let enable_cell = if b.enable {
+                format!("{:<w$}", "yes", w = W_ENABLE).green()
+            } else {
+                format!("{:<w$}", "no", w = W_ENABLE).red()
+            };
+
+            let status_cell = format!("{:<w_st$}", b.status.to_string(), w_st = W_STATUS);
+            let stake_cell = format!("{:<w_sk$}", b.stake_policy.to_string(), w_sk = W_STAKE);
             if has_static_adnl {
-                let adnl = b.static_adnl.as_deref().unwrap_or("—");
+                let adnl = if b.static_adnl_disabled {
+                    "disabled"
+                } else {
+                    b.static_adnl.as_deref().unwrap_or("—")
+                };
+                let adnl_cell = format!("{:<w_ad$}", adnl, w_ad = W_ADNL);
                 println!(
-                    "    {:<20} {:<21} {:<16} {:<20} {}",
-                    b.name, enable_str, b.status, b.stake_policy, adnl,
+                    "    {:<w$}{}{}{}{}",
+                    b.name,
+                    enable_cell,
+                    status_cell,
+                    stake_cell,
+                    adnl_cell,
+                    w = W_NODE,
                 );
             } else {
                 println!(
-                    "    {:<20} {:<21} {:<16} {}",
-                    b.name, enable_str, b.status, b.stake_policy,
+                    "    {:<w$}{}{}{}",
+                    b.name,
+                    enable_cell,
+                    status_cell,
+                    stake_cell,
+                    w = W_NODE,
                 );
             }
         }
@@ -233,6 +306,10 @@ struct ElectionsSettingsBody {
     tick_interval: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_factor: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sleep_period_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting_period_pct: Option<f64>,
 }
 
 const ELECTIONS_SETTINGS_PATH: &str = "/v1/elections/settings";
@@ -336,6 +413,47 @@ impl MaxFactorCmd {
     }
 }
 
+impl WaitCmd {
+    pub async fn run(
+        &self,
+        url: Option<&str>,
+        token: Option<&str>,
+        config_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if self.min.is_none() && self.max.is_none() {
+            anyhow::bail!("specify at least one of --min or --max");
+        }
+        let base_url = resolve_service_url(url, config_path)?;
+        api_post(
+            &base_url,
+            ELECTIONS_SETTINGS_PATH,
+            token,
+            &ElectionsSettingsBody {
+                sleep_period_pct: self.min,
+                waiting_period_pct: self.max,
+                ..Default::default()
+            },
+        )
+        .await?;
+        match (self.min, self.max) {
+            (Some(mn), Some(mx)) => println!(
+                "{} sleep_period_pct (--min)={}, waiting_period_pct (--max)={}",
+                "OK".green().bold(),
+                mn,
+                mx
+            ),
+            (Some(mn), None) => {
+                println!("{} sleep_period_pct (--min) set to {}", "OK".green().bold(), mn)
+            }
+            (None, Some(mx)) => {
+                println!("{} waiting_period_pct (--max) set to {}", "OK".green().bold(), mx)
+            }
+            (None, None) => unreachable!("validated above"),
+        }
+        Ok(())
+    }
+}
+
 #[derive(serde::Serialize)]
 struct NodeListBody<'a> {
     nodes: &'a [String],
@@ -384,6 +502,16 @@ impl StaticAdnlCmd {
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
         let base_url = resolve_service_url(url, config_path)?;
+        if self.disable {
+            let path = format!("/v1/elections/static-adnl/{}", self.node);
+            api_delete(&base_url, &path, token).await?;
+            println!(
+                "{} Static ADNL disabled for '{}' (fresh ADNL each cycle)",
+                "OK".green().bold(),
+                self.node
+            );
+            return Ok(());
+        }
         let resp = api_post(
             &base_url,
             "/v1/elections/static-adnl",

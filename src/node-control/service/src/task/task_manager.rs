@@ -63,6 +63,12 @@ pub struct TaskController {
     name: &'static str,
     task: Arc<dyn ServiceTask>,
     state: Mutex<State>,
+    /// Serializes the full enable/disable/restart flow so concurrent callers
+    /// cannot interleave (which would orphan tasks).
+    /// Why: `disable()` releases `state` across its `handle.await`; without
+    /// this outer lock, a second caller can race in, spawn a task, and have
+    /// its bookkeeping overwritten by the first caller resuming.
+    lifecycle: tokio::sync::Mutex<()>,
     runtime_cfg: Arc<dyn RuntimeConfig>,
 }
 
@@ -82,6 +88,7 @@ impl TaskController {
                 cancel: None,
                 handle: None,
             }),
+            lifecycle: tokio::sync::Mutex::new(()),
             runtime_cfg,
         }
     }
@@ -92,6 +99,12 @@ impl TaskController {
     }
 
     pub async fn enable(&self) -> TaskStateView {
+        let _guard = self.lifecycle.lock().await;
+        self.enable_locked()
+    }
+
+    /// Caller must hold `self.lifecycle`.
+    fn enable_locked(&self) -> TaskStateView {
         let mut st = self.state.lock().expect("failed to lock state");
 
         st.enabled = true;
@@ -128,6 +141,12 @@ impl TaskController {
     }
 
     pub async fn disable(&self) -> TaskStateView {
+        let _guard = self.lifecycle.lock().await;
+        self.disable_locked().await
+    }
+
+    /// Caller must hold `self.lifecycle`.
+    async fn disable_locked(&self) -> TaskStateView {
         let handle_to_await = {
             let mut st = self.state.lock().expect("failed to lock state");
             st.enabled = false;
@@ -166,8 +185,9 @@ impl TaskController {
     }
 
     pub async fn restart(&self) -> TaskStateView {
-        let _ = self.disable().await;
-        self.enable().await
+        let _guard = self.lifecycle.lock().await;
+        let _ = self.disable_locked().await;
+        self.enable_locked()
     }
 }
 
@@ -227,6 +247,7 @@ mod tests {
                 http: HttpConfig::default(),
                 master_wallet: None,
                 tick_interval: 30,
+                automation: Default::default(),
                 log: None,
             }),
         })
@@ -427,6 +448,72 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2, "task should have been started twice");
 
         ctrl.disable().await;
+    }
+
+    /// Smoke test for concurrent `restart()` calls: stresses 8 parallel
+    /// restarts and asserts no task is orphaned (exactly one live during,
+    /// zero after `disable()`). Not deterministic — relies on the scheduler
+    /// producing a bad interleave under the old code; passes more reliably
+    /// on multi-core runners. Treat as a regression guard, not a proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_restarts_do_not_orphan_tasks() {
+        struct LiveCountTask {
+            live: Arc<AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl ServiceTask for LiveCountTask {
+            async fn run(
+                &self,
+                ctx: CancellationCtx,
+                _app_config: Arc<AppConfig>,
+            ) -> anyhow::Result<()> {
+                self.live.fetch_add(1, Ordering::SeqCst);
+                let mut rx = ctx.subscribe();
+                let _ = rx.changed().await;
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let live = Arc::new(AtomicU32::new(0));
+        let ctrl = Arc::new(TaskController::new(
+            "test",
+            LiveCountTask { live: live.clone() },
+            runtime_config(),
+        ));
+
+        ctrl.enable().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let c = ctrl.clone();
+            joins.push(tokio::spawn(async move {
+                c.restart().await;
+            }));
+        }
+        for j in joins {
+            j.await.expect("restart task panicked");
+        }
+
+        // Give the most recent restart a moment to spawn.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            1,
+            "exactly one task instance should be live after concurrent restarts"
+        );
+
+        ctrl.disable().await;
+        // After disable, the single live task must observe cancellation and exit.
+        // If any restart had orphaned a task, its live counter would remain > 0.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "no orphaned tasks should remain alive after disable"
+        );
     }
 
     #[tokio::test]

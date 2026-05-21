@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-18
+
+### Added
+
+- **Nominator Pool deploy mode** — new per-slot setting that controls how a Nominator Pool is deployed on first run. Two values: **`legacy`** (the way older nodectl versions deployed; addresses match existing pools) and **`tonscan`** (recognised by Tonscan and other explorers — recommended for all new pools). Already-deployed pools must stay on the mode they were created with — switching changes the derived address. Available in the JSON config, REST (`POST /v1/pools/core`), and CLI (`nodectl config pool add core --deploy-mode legacy|tonscan`). Defaults: existing pools in saved config without the field stay on `legacy`; new pools created via REST or CLI default to `tonscan`.
+- **`DELETE /v1/elections/static-adnl/{node}`** — opt a node out of the new static-ADNL default; the runner will generate a fresh ephemeral ADNL each cycle (pre-v0.5 behavior).
+- **`--disable` flag on `nodectl config elections static-adnl`** — CLI equivalent of the DELETE endpoint. Running the existing rotate command again re-enables the static default.
+- **`static_adnl_disabled` shown in elections settings** — `GET /v1/elections/settings` and `nodectl config elections ls` now indicate which nodes are opted out of static ADNL (a "disabled" marker appears in the Static ADNL column).
+- **`nodectl config elections wait`** — new subcommand (alias `wait-pct`) to set the AdaptiveSplit50 staking window: `--min` sets `sleep_period_pct` (earliest stake submission, as fraction of election duration; default 0.2), `--max` sets `waiting_period_pct` (latest peer-wait deadline; default 0.4, must be ≥ `--min`). Both values are now also shown in `nodectl config elections ls`. Only applied under the `adaptive_split50` stake policy.
+- **Contracts automation: auto-deploy and auto-topup** — new `automation` config section to enable automatic wallet/pool deploy and balance top-up, with separate toggles for SNP vs Nominator Pool deploy, configurable amounts (in TON) and tick interval. Manage live via `GET|POST /v1/automation/settings` or `nodectl config automation ls|set` (no service restart). See `docs/automation.md`.
+- **`NODECTL_API_CONNECT_TIMEOUT_SECS` / `NODECTL_API_REQUEST_TIMEOUT_SECS`** — env overrides for the nodectl CLI's REST connect timeout (default 10 s) and overall request timeout (default 60 s). Timeout and connect failures now produce an actionable error message that includes the URL that was attempted.
+- **In-pod vault migration via `nodectl key migrate`** — new CLI command that copies all secrets from a file vault (`FROM_VAULT_URL=file://...`) to a HashiCorp vault (`VAULT_URL=hashicorp://...`) without leaving the Pod and without any extra binary. Supports `--dry-run`, `--on-conflict <fail|skip|overwrite>`, and `--continue-on-error`. Non-extractable secrets are migrated too — the original `extractable` flag is preserved on the destination, so a wallet key that was non-extractable in the source vault remains non-extractable in HashiCorp. Source must be `file://` and destination must be `hashicorp://`; any other combination is rejected up front. See `helm/nodectl/docs/copy-file-to-hashicorp.md`.
+
+### Changed
+
+- **Static ADNL is now the default across elections** — previously nodectl generated a fresh ADNL address every election cycle. The new default aligns nodectl with the behavior of mytonctrl-managed C++ nodes, which reuse the same ADNL across all validation rounds; a single persistent ADNL address also enables fastsync for the Rust node. nodectl now generates and persists a static ADNL per node on the first election cycle and reuses it thereafter. Existing `elections.static_adnls` entries are honored unchanged. If a node's control server is briefly unreachable during generation, the rest of the nodes proceed normally and the failing one retries next tick. Use the new `--disable` flag (or `DELETE /v1/elections/static-adnl/{node}`) to opt a node back into pre-v0.5 per-cycle behavior.
+- **Nominator Pool: process pending withdraws before each new stake** — before submitting a new stake, the elections runner now checks the active TONCore pool for pending nominator withdraw requests. If any are queued, it triggers the pool to process them and skips staking for that tick so the pool can drain; the next tick re-checks and either continues draining or proceeds to stake. This frees up locked liquidity from nominators who already requested a withdrawal so it does not get re-staked. A new participant status `processing_withdraw_requests` is surfaced in `/v1/elections` and `/v1/validators` snapshots. No-op for SNP nominator pools and direct staking.
+- **Nominator Pool validator deposit fee is now added automatically** — `config pool deposit-validator` sends `stake + 1 TON processing fee` so the requested stake amount actually arrives at the pool. Previously operators had to account for the 1 TON fee themselves.
+- **`config pool ls` shows TONCore pools as `not deployed` instead of an RPC error** (SMA-55, #128) — when a TONCore pool contract is uninitialized or not yet on-chain, the row now reads `not deployed` and the configured pool parameters from local config are still shown so you can see the planned layout before deploy.
+- **Voting moved to the REST API** (SMA-85, #132) — config-proposal voting is now served by `GET /v1/voting/config`, `GET /v1/voting/proposals`, `GET /v1/voting/proposals/{hash}`, `POST /v1/voting/proposals`, `DELETE /v1/voting/proposals/{hash}` (reads available to nominators and operators; mutations operator-only). `nodectl vote ls|inspect|add|rm` is now a thin REST client and uses the same `--url` / token / config resolution as other REST commands — the service must be running, same as other `config` mutations since v0.4.0.
+- **`config wallet ls` always shows bounceable URL-safe base64 addresses** (SMA-84, #116) — table and JSON output stay consistent regardless of how the service serializes addresses internally.
+- **`--validator-share-percent` on `nodectl config pool add core`** — accept the Nominator Pool validator share as a human percent (e.g. `40`) instead of basis points.
+
+### Fixed
+
+- **Concurrent `config elections enable/include/exclude` no longer spawns duplicate election tasks** — previously, two concurrent HTTP-triggered restarts of an election task could race such that one task was orphaned and kept running until the process restarted. Restarts now queue and execute one at a time.
+- **nodectl service no longer becomes unresponsive when a node's control-server is unreachable** — a firewalled or black-holed control port used to block tokio worker threads on connect, which could cause `/health`, `/v1/nodes`, and other REST endpoints to stop responding. Connects are now non-blocking and time out cleanly without stalling the rest of the service.
+
+### Internal
+
+- **`elections` crate merged into `service` as a module** — code moved under `service/src/elections/`; the standalone `node-control/elections` workspace member is removed. No behavior change for operators.
+- **CI: highload wallet for Nominator Pool setup** — speeds up multi-nominator load test bootstrap; single-host "snp-toncore" scenario node count lowered from 7 to 5 (default scenario has 6 nodes as before).
+- **REST entity CRUD tests** — automated coverage for `POST|DELETE /v1/{nodes,wallets,pools,bindings}`: happy paths, validation/conflict cases, persistence to disk, role checks (nominator → 403, operator → allowed).
+
 ## [0.4.0] - 2026-04-21
 
 ### Added

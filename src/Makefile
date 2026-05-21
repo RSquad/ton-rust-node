@@ -50,7 +50,6 @@ fmt:
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/common/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/contracts/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/control-client/Cargo.toml
-	@cargo +nightly fmt $(check) --manifest-path ./node-control/elections/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/nodectl/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/service/Cargo.toml
 	@cargo +nightly fmt $(check) --manifest-path ./node-control/ton-http-api-client/Cargo.toml

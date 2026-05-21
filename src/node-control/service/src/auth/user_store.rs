@@ -388,6 +388,7 @@ mod tests {
                 ClientJsonRpc::connect_many(
                     vec![("http://127.0.0.1:3301/".to_owned(), None)],
                     None,
+                    common::app_config::EndpointTimeouts::default(),
                 )
                 .unwrap(),
             )
@@ -435,6 +436,7 @@ mod tests {
             voting: None,
             master_wallet: None,
             tick_interval: 30,
+            automation: Default::default(),
             log: Some(Default::default()),
         }
     }

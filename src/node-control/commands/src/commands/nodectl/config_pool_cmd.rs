@@ -17,7 +17,7 @@ use crate::commands::nodectl::{
 };
 use colored::{ColoredString, Colorize};
 use common::{
-    app_config::PoolConfig,
+    app_config::{PoolConfig, TonCoreDeployMode, default_new_pool_deploy_mode},
     task_cancellation::CancellationCtx,
     ton_utils::{display_tons, nanotons_to_tons_f64, tons_f64_to_nanotons},
 };
@@ -91,9 +91,17 @@ pub struct PoolAddCoreCmd {
 
     #[arg(
         long = "validator-share",
-        help = "Validator reward share in basis points (e.g. 1000 = 10%)"
+        conflicts_with = "validator_share_percent",
+        help = "Validator reward share in basis points (100 bp = 1%; must be < 10000 so nominators receive pool rewards, e.g. 5000 = 50%)"
     )]
     validator_share: Option<u16>,
+
+    #[arg(
+        long = "validator-share-percent",
+        conflicts_with = "validator_share",
+        help = "Validator reward share as percent of pool rewards [0.0, 100.0), below 100% so nominators earn rewards (e.g. 50.4 → 5040 bp). Mutually exclusive with --validator-share"
+    )]
+    validator_share_percent: Option<f64>,
 
     #[arg(long = "max-nominators", help = "Max nominators (default: 40)")]
     max_nominators: Option<u16>,
@@ -122,6 +130,19 @@ pub struct PoolAddCoreCmd {
         help = "Configure/deploy TONCore slot 1 (odd rounds)"
     )]
     odd: bool,
+    /// Deploy mode for new TONCore pool slots.
+    ///
+    /// `tonscan` — deploy via stub + SETCODE; required for Tonscan to recognise the pool
+    /// (recommended for new deployments; default when omitted).
+    ///
+    /// `legacy`  — full pool code embedded directly in StateInit (kept for compatibility
+    /// with pools already deployed by older nodectl).
+    #[arg(
+        long = "deploy-mode",
+        visible_alias = "deploy-layout",
+        value_parser = clap::value_parser!(TonCoreDeployMode),
+    )]
+    deploy_mode: Option<TonCoreDeployMode>,
 }
 
 #[derive(clap::Args, Clone)]
@@ -143,7 +164,11 @@ pub struct PoolRmCmd {
 pub struct PoolDepositValidatorCmd {
     #[arg(short = 'b', long = "binding", help = "Binding name (resolves wallet and pool)")]
     binding: String,
-    #[arg(short = 'a', long = "amount", help = "Amount in TON to deposit")]
+    #[arg(
+        short = 'a',
+        long = "amount",
+        help = "Validator stake to credit (TON); message adds 1 TON pool processing fee on-chain"
+    )]
     amount: f64,
     #[arg(
         long = "pool-even",
@@ -271,6 +296,43 @@ struct PoolAddCoreBody<'a> {
     min_validator_stake: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_nominator_stake: Option<u64>,
+    #[serde(rename = "deploy_layout")]
+    deploy_mode: TonCoreDeployMode,
+}
+
+fn share_pct_to_bp(pct: f64) -> anyhow::Result<u16> {
+    anyhow::ensure!(
+        pct.is_finite() && (0.0..100.0).contains(&pct),
+        "validator-share-percent must be finite in [0.0, 100.0): 100% would leave no pool rewards for nominators (got {pct})"
+    );
+    let bp = (pct * 100.0).round() as u16;
+    anyhow::ensure!(
+        bp < 10_000,
+        "validator-share-percent rounds to {bp} basis points (100% validator share); nominators would receive no rewards — use a lower percent"
+    );
+    Ok(bp)
+}
+
+/// Validate `--validator-share` raw basis-point input.
+///
+/// Mirrors the server-side check (`0..=10_000`) but tightens the upper bound
+/// to **`< 10_000`**: a 100 % validator share would leave nominators with no
+/// pool rewards, which is almost always operator error rather than intent.
+fn validate_validator_share_bp(bp: u16) -> anyhow::Result<u16> {
+    match bp {
+        10_000 => anyhow::bail!(
+            "--validator-share 10000 bp is 100%: nominators would receive no pool rewards — use a value below 10000 bp"
+        ),
+        bp if bp > 10_000 => {
+            anyhow::bail!("validator_share must be in 0..10000 basis points (<100%; got {bp})")
+        }
+        bp => Ok(bp),
+    }
+}
+
+/// Basis points → percentage for display (100 bp = 1%; inverse of [`share_pct_to_bp`]).
+fn bp_to_pct(bp: u16) -> f64 {
+    bp as f64 / 100.0
 }
 
 impl PoolAddCoreCmd {
@@ -280,14 +342,33 @@ impl PoolAddCoreCmd {
         token: Option<&str>,
         config_path: Option<&str>,
     ) -> anyhow::Result<()> {
-        if self.address.is_none() && self.validator_share.is_none() {
-            anyhow::bail!("At least one of --address or --validator-share must be specified");
+        if self.address.is_none()
+            && self.validator_share.is_none()
+            && self.validator_share_percent.is_none()
+        {
+            anyhow::bail!(
+                "At least one of --address, --validator-share, or --validator-share-percent must be specified"
+            );
         }
 
-        if let Some(vs) = self.validator_share {
-            if !(0..=10_000).contains(&vs) {
-                anyhow::bail!("validator_share must be in 0..=10000 basis points (got {vs})");
-            }
+        let resolved_validator_share: Option<u16> =
+            match (self.validator_share, self.validator_share_percent) {
+                (Some(bp), None) => Some(validate_validator_share_bp(bp)?),
+                (None, Some(pct)) => Some(share_pct_to_bp(pct)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => {
+                    unreachable!("clap conflicts validator_share with validator_share_percent")
+                }
+            };
+
+        if resolved_validator_share.is_none()
+            && (self.max_nominators.is_some()
+                || self.min_validator_stake.is_some()
+                || self.min_nominator_stake.is_some())
+        {
+            anyhow::bail!(
+                "max_nominators / min_validator_stake / min_nominator_stake require a validator share (--validator-share or --validator-share-percent)"
+            );
         }
 
         let slot_name = if self.odd { "odd" } else { "even" };
@@ -298,24 +379,30 @@ impl PoolAddCoreCmd {
             self.address.as_deref().map(|a| normalize_ton_address(a, "address")).transpose()?;
 
         let base_url = resolve_service_url(url, config_path)?;
+        let deploy_mode = self.deploy_mode.unwrap_or_else(|| default_new_pool_deploy_mode());
         let body = PoolAddCoreBody {
             name: &self.name,
             slot: slot_name,
             address: address.as_deref(),
-            validator_share: self.validator_share,
+            validator_share: resolved_validator_share,
             max_nominators: self.max_nominators,
             // CLI flags accept TON (f64) — convert to nanotons for the API.
             min_validator_stake: self.min_validator_stake.map(tons_f64_to_nanotons),
             min_nominator_stake: self.min_nominator_stake.map(tons_f64_to_nanotons),
+            deploy_mode,
         };
         api_post(&base_url, "/v1/pools/core", token, &body).await?;
 
         let mut info_parts = Vec::new();
-        if let Some(vs) = self.validator_share {
-            info_parts.push(format!("validator_share={vs} bp"));
+        if let Some(vs) = resolved_validator_share {
+            let pct = bp_to_pct(vs);
+            info_parts.push(format!("validator_share={vs} bp (~{pct:.2}%)"));
         }
         if let Some(a) = &address {
             info_parts.push(format!("address='{a}'"));
+        }
+        if deploy_mode.is_legacy() {
+            info_parts.push("deploy_layout=legacy".to_string());
         }
 
         println!(
@@ -327,6 +414,34 @@ impl PoolAddCoreCmd {
         );
         Ok(())
     }
+}
+
+/// Account / deployment state for a TONCore pool slot in [`GET /v1/pools`].
+///
+/// Wire strings match `TonCorePoolSlotDto.state` in `config_handlers` (RPC
+/// [`ton_http_api_client::v2::data_models::AccountState`] as lowercase, plus
+/// synthetic `"not deployed"` and `"error"`).
+///
+/// Serde shape is `rename_all = "lowercase"` with [`Self::NotDeployed`] mapped
+/// to `"not deployed"` (single multi-word token on the wire).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TonCorePoolSlotWireState {
+    #[serde(rename = "not deployed", alias = "")]
+    #[default]
+    NotDeployed,
+    Active,
+    Frozen,
+    Error,
+}
+
+/// Source of deploy-style pool parameters (`validator_share`, stake thresholds) in
+/// [`GET /v1/pools`] JSON — matches `TonCorePoolSlotDto::data_source` on the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TonCorePoolSlotDataSource {
+    Chain,
+    Config,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -347,8 +462,11 @@ struct TonCorePoolSlotView {
     slot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     address: Option<String>,
-    /// Account state: "active", "uninit", "frozen", "not deployed", or "error".
-    state: String,
+    #[serde(default)]
+    state: TonCorePoolSlotWireState,
+    /// Whether deploy-style fields came from chain (`get_pool_data`) or config fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data_source: Option<TonCorePoolSlotDataSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     balance: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,6 +487,8 @@ struct TonCorePoolSlotView {
     pool_state: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_election_id: Option<u32>,
+    #[serde(rename = "deploy_layout", default)]
+    deploy_mode: TonCoreDeployMode,
 }
 
 impl PoolLsCmd {
@@ -457,10 +577,11 @@ fn print_toncore_table(views: &[&PoolView]) {
         total_slots,
     );
     println!(
-        "  {:<15} {:<5} {:<10} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+        "  {:<15} {:<5} {:<13} {:<7} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
         "Name".cyan().bold(),
         "Slot".cyan().bold(),
         "State".cyan().bold(),
+        "Src".cyan().bold(),
         "Balance".cyan().bold(),
         "Noms".cyan().bold(),
         "Share".cyan().bold(),
@@ -468,7 +589,7 @@ fn print_toncore_table(views: &[&PoolView]) {
         "Min nom.stake".cyan().bold(),
         "Address".cyan().bold(),
     );
-    println!("  {}", "─".repeat(160).dimmed());
+    println!("  {}", "─".repeat(170).dimmed());
 
     for v in views {
         let Some(slots) = v.slots.as_ref() else { continue };
@@ -479,7 +600,8 @@ fn print_toncore_table(views: &[&PoolView]) {
         }
         for s in slots {
             let display_addr = display_ton_address(s.address.as_deref());
-            let display_state = display_state(&s.pool_state.unwrap_or(-1));
+            let display_state = display_toncore_slot_row(s);
+            let display_src = display_toncore_data_source(s.data_source);
             let display_balance =
                 s.balance.map(|b| display_tons(b).white()).unwrap_or_else(|| "-".red());
             let noms = match (s.nominators_count, s.max_nominators) {
@@ -487,11 +609,10 @@ fn print_toncore_table(views: &[&PoolView]) {
                 (Some(n), None) => format!("{n}"),
                 _ => "-".to_string(),
             };
-            // `validator_share` is stored on-chain in basis points (1 bp = 0.01%);
-            // convert to a percentage for display (e.g. 4000 bp → "40.00%").
+            // `validator_share` is on-chain in basis points; use bp_to_pct for display.
             let share = s
                 .validator_share
-                .map(|sh| format!("{:.2}%", sh as f64 / 100.0))
+                .map(|sh| format!("{:.2}%", bp_to_pct(sh)))
                 .unwrap_or_else(|| "-".to_string());
             let validator_amount = s
                 .validator_amount
@@ -502,10 +623,11 @@ fn print_toncore_table(views: &[&PoolView]) {
                 .map(|b| display_tons(b).to_string())
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {:<15} {:<5} {:<10} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
+                "  {:<15} {:<5} {:<13} {:<7} {:<14} {:<10} {:<8} {:<14} {:<14} {}",
                 v.name,
                 s.slot,
                 display_state,
+                display_src,
                 display_balance,
                 noms,
                 share,
@@ -518,13 +640,41 @@ fn print_toncore_table(views: &[&PoolView]) {
     println!();
 }
 
-fn display_state(state: &i32) -> ColoredString {
+/// How deploy-style TONCore slot fields were resolved (chain vs config.toml merge).
+fn display_toncore_data_source(src: Option<TonCorePoolSlotDataSource>) -> ColoredString {
+    match src {
+        Some(TonCorePoolSlotDataSource::Chain) => "chain".green(),
+        Some(TonCorePoolSlotDataSource::Config) => "config".yellow(),
+        None => "-".normal(),
+    }
+}
+
+/// Contract-internal pool state from `get_pool_data` (idle / staking / …).
+fn display_toncore_contract_state(state: i32) -> ColoredString {
     match state {
         -1 => "error".red(),
         0 => "idle".cyan(),
         1 => "staking".green(),
         2 => "staking".green(),
         _ => "unknown".red(),
+    }
+}
+
+/// Row "State" for TONCore table: account / deployment state wins for undeployed accounts; then
+/// on-chain pool lifecycle from `pool_state` when present.
+fn display_toncore_slot_row(s: &TonCorePoolSlotView) -> ColoredString {
+    use TonCorePoolSlotWireState::*;
+    if matches!(s.state, NotDeployed) {
+        return "not deployed".yellow();
+    }
+    if let Some(ps) = s.pool_state {
+        return display_toncore_contract_state(ps);
+    }
+    match s.state {
+        Error => "error".red(),
+        Active => "active".green(),
+        Frozen => "frozen".yellow(),
+        NotDeployed => "not deployed".yellow(),
     }
 }
 
@@ -605,23 +755,32 @@ impl PoolDepositValidatorCmd {
             anyhow::bail!("Amount must be greater than 0");
         }
 
+        // Pool contract keeps DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS (1 TON) from the message value;
+        // send stake + fee so the credited validator_amount matches `--amount`.
+        let msg_value_nanotons =
+            deposit_nanotons.saturating_add(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS);
+
         let gas_reserve: u64 = 2_000_000_000;
-        if wallet_info_data.balance < deposit_nanotons.saturating_add(gas_reserve) {
+        if wallet_info_data.balance < msg_value_nanotons.saturating_add(gas_reserve) {
             anyhow::bail!(
-                "Insufficient wallet balance: {} TON (need {} TON + gas)",
+                "Insufficient wallet balance: {} TON (need {:.9} TON on-chain: {:.9} stake + {:.9} pool fee + {:.9} TON gas reserve)",
                 nanotons_to_tons_f64(wallet_info_data.balance),
+                nanotons_to_tons_f64(msg_value_nanotons.saturating_add(gas_reserve)),
                 self.amount,
+                nanotons_to_tons_f64(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS),
+                nanotons_to_tons_f64(gas_reserve),
             );
         }
 
+        println!("\n{}", "Deposit validator summary:".cyan().bold());
+        println!("  Binding: {}", self.binding);
+        println!("  Wallet:  {} ({})", binding.wallet, wallet_address);
+        println!("  Pool:    {}", pool_address);
+        println!("  Credited to validator stake: {:.9} TON", self.amount);
         println!(
-            "\n{}\n  Binding: {}\n  Wallet:  {} ({})\n  Pool:    {}\n  Amount:  {:.9} TON\n",
-            "Deposit validator summary:".cyan().bold(),
-            self.binding,
-            binding.wallet,
-            wallet_address,
-            pool_address,
-            self.amount,
+            "  Message value (stake + {:.9} TON pool fee): {:.9} TON\n",
+            nanotons_to_tons_f64(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS),
+            nanotons_to_tons_f64(msg_value_nanotons),
         );
 
         if !self.yes && !confirm("Confirm deposit?")? {
@@ -635,7 +794,7 @@ impl PoolDepositValidatorCmd {
         let pool_addr_display = pool_address.to_string();
         let body = pool_messages::deposit_validator(0)?;
         let msg = wallet
-            .build_message(pool_address, deposit_nanotons, body, true, None, None, None)
+            .build_message(pool_address, msg_value_nanotons, body, true, None, None, None)
             .await?;
 
         let msg_boc = write_boc(&msg)?;
@@ -651,10 +810,12 @@ impl PoolDepositValidatorCmd {
         .await?;
 
         println!(
-            "{} Deposited {:.9} TON to pool {}",
+            "{} Credited {:.9} TON validator stake to pool {} (sent {:.9} TON including {:.9} TON pool fee)",
             "OK".green().bold(),
             self.amount,
-            pool_addr_display
+            pool_addr_display,
+            nanotons_to_tons_f64(msg_value_nanotons),
+            nanotons_to_tons_f64(pool_messages::DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS),
         );
         Ok(())
     }
@@ -828,6 +989,70 @@ mod tests {
         );
     }
 
+    // ---- validator share validation ----
+
+    #[test]
+    fn share_pct_to_bp_accepts_valid_values() {
+        assert_eq!(share_pct_to_bp(0.0).unwrap(), 0);
+        assert_eq!(share_pct_to_bp(50.0).unwrap(), 5000);
+        assert_eq!(share_pct_to_bp(50.4).unwrap(), 5040);
+        assert_eq!(share_pct_to_bp(99.99).unwrap(), 9999);
+    }
+
+    #[test]
+    fn share_pct_to_bp_rejects_exact_100() {
+        let err = share_pct_to_bp(100.0).unwrap_err().to_string();
+        assert!(err.contains("[0.0, 100.0)"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn share_pct_to_bp_rejects_above_100() {
+        let err = share_pct_to_bp(150.0).unwrap_err().to_string();
+        assert!(err.contains("[0.0, 100.0)"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn share_pct_to_bp_rejects_negative() {
+        let err = share_pct_to_bp(-0.5).unwrap_err().to_string();
+        assert!(err.contains("[0.0, 100.0)"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn share_pct_to_bp_rejects_non_finite() {
+        assert!(share_pct_to_bp(f64::NAN).is_err());
+        assert!(share_pct_to_bp(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn share_pct_to_bp_rejects_rounding_to_10000() {
+        // 99.995 rounds up to 10000 bp — must be rejected so nominators always
+        // keep at least 1 bp of pool rewards.
+        let err = share_pct_to_bp(99.995).unwrap_err().to_string();
+        assert!(err.contains("rounds to 10000 basis points"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_validator_share_bp_accepts_valid_values() {
+        assert_eq!(validate_validator_share_bp(0).unwrap(), 0);
+        assert_eq!(validate_validator_share_bp(5000).unwrap(), 5000);
+        assert_eq!(validate_validator_share_bp(9999).unwrap(), 9999);
+    }
+
+    #[test]
+    fn validate_validator_share_bp_rejects_exact_10000_with_nominator_hint() {
+        let err = validate_validator_share_bp(10_000).unwrap_err().to_string();
+        assert!(
+            err.contains("nominators would receive no pool rewards"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_validator_share_bp_rejects_above_10000() {
+        let err = validate_validator_share_bp(15_000).unwrap_err().to_string();
+        assert!(err.contains("0..10000 basis points"), "unexpected error: {err}");
+    }
+
     // ---- PoolView serde / table rendering ----
 
     fn snp_view() -> PoolView {
@@ -859,7 +1084,8 @@ mod tests {
                         "-1:0000000000000000000000000000000000000000000000000000000000000001"
                             .into(),
                     ),
-                    state: "active".into(),
+                    state: TonCorePoolSlotWireState::Active,
+                    data_source: Some(TonCorePoolSlotDataSource::Chain),
                     balance: Some(50_000_000_000),
                     validator_share: Some(4000),
                     max_nominators: Some(40),
@@ -870,11 +1096,12 @@ mod tests {
                     validator_amount: Some(0),
                     pool_state: Some(0),
                     last_election_id: Some(1_700_000_000),
+                    ..Default::default()
                 },
                 TonCorePoolSlotView {
                     slot: "odd".into(),
                     address: None,
-                    state: "not deployed".into(),
+                    state: TonCorePoolSlotWireState::NotDeployed,
                     ..Default::default()
                 },
             ]),
@@ -901,9 +1128,11 @@ mod tests {
         let slots = json["slots"].as_array().expect("slots present");
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0]["slot"], "even");
+        assert_eq!(slots[0]["data_source"], "chain");
         assert_eq!(slots[0]["validator_share"], 4000);
         assert_eq!(slots[1]["slot"], "odd");
         assert_eq!(slots[1]["state"], "not deployed");
+        assert!(slots[1].get("data_source").is_none());
         // Optional fields on the not-deployed slot must be omitted, not null.
         assert!(slots[1].get("balance").is_none());
         assert!(slots[1].get("validator_share").is_none());
@@ -911,7 +1140,9 @@ mod tests {
         let back: PoolView = serde_json::from_value(json).unwrap();
         let back_slots = back.slots.as_ref().unwrap();
         assert_eq!(back_slots[0].nominators_count, Some(3));
-        assert_eq!(back_slots[1].state, "not deployed");
+        assert_eq!(back_slots[0].data_source, Some(TonCorePoolSlotDataSource::Chain));
+        assert_eq!(back_slots[1].state, TonCorePoolSlotWireState::NotDeployed);
+        assert!(back_slots[1].data_source.is_none());
     }
 
     #[test]

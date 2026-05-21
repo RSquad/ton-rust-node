@@ -480,3 +480,69 @@ impl Shutdown for ControlClientAdnl {
         ControlClientAdnl::shutdown(self).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adnl::common::Timeouts;
+    use std::time::{Duration, Instant};
+    use ton_block::Ed25519KeyOption;
+
+    /// Verifies that connecting to an unreachable peer does not park the
+    /// tokio worker thread, by running another async task concurrently on a
+    /// single-worker runtime and asserting that the other task makes progress
+    /// before the ADNL connect timeout elapses.
+    ///
+    /// With the legacy synchronous `AdnlClient::connect` this test would fail:
+    /// the worker would be parked inside `socket2::Socket::connect_timeout`
+    /// for the entire timeout window, the timer would not fire, and the probe
+    /// would finish only after the connect attempt returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn connect_to_unreachable_peer_does_not_starve_runtime() {
+        // RFC 5737 TEST-NET-1: guaranteed unreachable.
+        let blackhole = "192.0.2.1:12345".parse().unwrap();
+        let timeouts = Timeouts::with_duration(Duration::from_millis(800));
+        let server_key = Ed25519KeyOption::generate().unwrap();
+        let config = AdnlClientConfig::new(None, blackhole, server_key, timeouts);
+        let mut client = ControlClientAdnl::new(config, 1);
+
+        let start = Instant::now();
+
+        let probe = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Instant::now()
+        };
+        let try_connect = async {
+            let res = client.connect().await;
+            assert!(res.is_err(), "connect to blackhole must fail");
+            Instant::now()
+        };
+
+        let (probe_done, connect_done) = tokio::join!(probe, try_connect);
+
+        let probe_elapsed = probe_done.duration_since(start);
+        let connect_elapsed = connect_done.duration_since(start);
+
+        // If the environment returns a near-instant connect error (e.g. a CI
+        // sandbox without a default route, giving EHOSTUNREACH), the slow
+        // path is not exercised and the starvation check is meaningless.
+        // Skip rather than fail in that case.
+        if connect_elapsed < Duration::from_millis(100) {
+            eprintln!(
+                "skipping starvation check: connect to {} returned in {:?} \
+                 (environment does not block the route)",
+                blackhole, connect_elapsed,
+            );
+            return;
+        }
+
+        assert!(
+            probe_elapsed < Duration::from_millis(500),
+            "probe took {probe_elapsed:?}; runtime appears starved by ADNL connect"
+        );
+        assert!(
+            connect_elapsed >= Duration::from_millis(700),
+            "connect returned in {connect_elapsed:?}, expected ~800ms timeout"
+        );
+    }
+}
