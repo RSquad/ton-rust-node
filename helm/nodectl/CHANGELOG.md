@@ -5,6 +5,19 @@ All notable changes to the nodectl Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/nodectl/v0.1.0`).
 
+## [0.3.0] - 2026-05-19
+
+appVersion: `v0.5.0`
+
+### Added
+
+- Attach an existing `ServiceAccount` to the Pod by setting `serviceAccount.name` while keeping `serviceAccount.enabled=false`. Useful when the SA is managed outside the Helm release (e.g. bound to a HashiCorp Vault role).
+- Documentation: HashiCorp Vault backend in `docs/setup.md` and the file → HashiCorp migration runbook in `docs/copy-file-to-hashicorp.md`.
+
+### Changed
+
+- Default image updated to nodectl `v0.5.0`
+
 ## [0.2.1] - 2026-04-21
 
 appVersion: `v0.4.0`

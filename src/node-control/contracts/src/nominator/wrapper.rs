@@ -6,9 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::SmartContract;
+use crate::{SmartContract, TonWallet};
 use std::sync::Arc;
-use ton_block::{MsgAddressInt, StateInit};
+use ton_block::{Cell, MsgAddressInt, StateInit};
 
 /// Minimum TON to keep in an SNP pool (or validator wallet for direct staking) for storage.
 /// Matches the `MIN_TONS_FOR_STORAGE` constant in the single-nominator contract (~1 TON).
@@ -54,6 +54,41 @@ pub trait NominatorWrapper: SmartContract + Send + Sync {
     fn storage_reserve(&self) -> u64;
     /// Pool type for routing/optimization decisions.
     fn pool_kind(&self) -> PoolKind;
+    /// Whether the pool's `withdraw_requests` dictionary is non-empty (at least one queued
+    /// nominator withdraw request). Matches on-chain naming in `pool.fc` (`has_withdraw_requests`,
+    /// `get_pool_data`).
+    ///
+    /// TONCore implementations should call the contract's cheap `has_withdraw_requests` getter (one
+    /// int on the stack), not full [`get_pool_data`](Self::get_pool_data). Pools without a withdraw
+    /// queue (SNP, etc.) keep the default and return `Ok(false)` without RPC.
+    ///
+    /// # Errors
+    ///
+    /// TONCore returns an error when the getter fails (RPC unreachable, contract execution error, or
+    /// response parsing failure). The trait's default implementation always succeeds with `Ok(false)`.
+    async fn has_withdraw_requests(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Build an external message that carries `process_withdraw_requests` (TONCore op = 2)
+    /// to this pool. Caller is responsible for ensuring it is meaningful (e.g. checked
+    /// [`has_withdraw_requests`](Self::has_withdraw_requests) and is in the window between
+    /// stake recovery and the next stake submission). Default impl errors out for pool
+    /// kinds that do not support a withdraw queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pool kind does not support this operation (default implementation),
+    /// if building the internal message body fails, or if sending the message through the wallet
+    /// fails. Router-style implementations may also fail when no suitable inner pool is available.
+    async fn send_process_withdraw_requests(
+        &self,
+        _wallet: Arc<dyn TonWallet>,
+        _query_id: u64,
+        _limit: u8,
+        _gas_value: u64,
+    ) -> anyhow::Result<Cell> {
+        anyhow::bail!("send_process_withdraw_requests is supported only by TONCore nominator pools")
+    }
 }
 
 /// Roles stored in the single nominator contract
@@ -97,4 +132,8 @@ pub struct PoolData {
     pub validator_set_change_time: u64,
     /// Stake held for duration
     pub stake_held_for: u64,
+    /// TONCore-only: `withdraw_requests:dict` cell from persistent storage. `Some(_)` indicates
+    /// the dict is non-empty (≥1 nominator has a pending withdraw request); `None` means the
+    /// queue is empty or unsupported by the pool kind.
+    pub withdraw_requests: Option<Cell>,
 }

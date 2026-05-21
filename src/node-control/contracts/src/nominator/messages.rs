@@ -340,6 +340,11 @@ pub mod ton_core_pool {
         pub const CLEANUP_VOTINGS: u32 = 7;
     }
 
+    /// Fixed fee (nanotons) the TON Core pool contract keeps from each `deposit_validator` inbound
+    /// message. The pool credits `message_value - DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS` to
+    /// validator stake — send **desired stake + this constant** as the message value.
+    pub const DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS: u64 = 1_000_000_000;
+
     /// Build "accept coins" message body for **TON Core pool** (op = 1).
     ///
     /// Credits the attached message value to the pool balance. The contract only checks
@@ -398,7 +403,8 @@ pub mod ton_core_pool {
     /// Build "deposit validator" body for **TON Core pool**.
     ///
     /// Validator sends coins to increase their own stake in the pool.
-    /// Attach the desired amount of TON to the message; 1 TON is deducted as a processing fee.
+    /// Set the message **value** to **desired credited stake + [`DEPOSIT_VALIDATOR_POOL_FEE_NANOTONS`]**
+    /// (1 TON); the pool credits `value - fee` to `validator_amount`.
     pub fn deposit_validator(query_id: u64) -> anyhow::Result<Cell> {
         let mut builder = BuilderData::new();
         builder.append_u32(opcodes::DEPOSIT_VALIDATOR)?.append_u64(query_id)?;

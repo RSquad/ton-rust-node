@@ -7,16 +7,17 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    ContractProvider, SmartContract,
+    ContractProvider, SmartContract, TonWallet,
     nominator::{
         NominatorRoles, NominatorWrapper, PoolConfig, PoolData, PoolKind, TONCORE_STORAGE_RESERVE,
     },
 };
 use anyhow::Context;
-use common::app_config::TonCoreInitParams;
+use common::app_config::{TonCoreDeployMode, TonCoreInitParams};
 use std::sync::Arc;
 use ton_block::{
-    BuilderData, Coins, IBitstring, MsgAddressInt, Serializable, StateInit, read_single_root_boc,
+    BuilderData, Cell, Coins, IBitstring, MsgAddressInt, Serializable, StateInit,
+    read_single_root_boc,
 };
 
 /// Compiled code of the nominator-pool contract.
@@ -34,19 +35,32 @@ fn toncore_pool_address_from_state_init(state_init: &StateInit) -> anyhow::Resul
     Ok(addr)
 }
 
-/// Build the `StateInit` for deploying a new TONCore nominator pool.
-///
-/// Data layout follows `save_data` / `load_data` in pool.fc:
-/// ```text
-/// state:8 nominators_count:16 stake_amount_sent:coins validator_amount:coins
-/// config:^Cell nominators:dict withdraw_requests:dict
-/// stake_at:32 saved_validator_set_hash:256 validator_set_changes_count:8
-/// validator_set_change_time:32 stake_held_for:32 config_proposal_votings:dict
-/// ```
-fn build_toncore_pool_state_init(
+fn toncore_pool_full_code_cell() -> anyhow::Result<Cell> {
+    Ok(read_single_root_boc(hex::decode(CODE).expect("nominator pool code hex is invalid"))?)
+}
+
+/// TVM opcodes used by the deploy bootstrap stub ([`TonCoreDeployMode::TonscanCompatible`]).
+/// See <https://docs.ton.org/v3/documentation/tvm/instructions>.
+const OP_SETCP0: [u8; 2] = [0xFF, 0x00];
+const OP_ACCEPT: [u8; 2] = [0xF8, 0x00];
+const OP_PUSHREF: u8 = 0x88;
+const OP_SETCODE: [u8; 2] = [0xFB, 0x04];
+
+/// Small bootstrap code cell (`SETCP0` · `ACCEPT` · `PUSHREF` pool bytecode · `SETCODE`).
+fn build_toncore_pool_stub_code(full_pool_code: &Cell) -> anyhow::Result<Cell> {
+    let mut b = BuilderData::new();
+    b.append_raw(&OP_SETCP0, 16)?;
+    b.append_raw(&OP_ACCEPT, 16)?;
+    b.append_raw(&[OP_PUSHREF], 8)?;
+    b.checked_append_reference(full_pool_code.clone())?;
+    b.append_raw(&OP_SETCODE, 16)?;
+    Ok(b.into_cell()?)
+}
+
+fn build_toncore_pool_initial_data(
     validator_address: &MsgAddressInt,
     params: &TonCoreInitParams,
-) -> anyhow::Result<StateInit> {
+) -> anyhow::Result<Cell> {
     let mut config = BuilderData::new();
     let validator_hash = validator_address.address().get_bytestring(0);
     anyhow::ensure!(validator_hash.len() == 32, "validator address must be 256 bits");
@@ -72,17 +86,55 @@ fn build_toncore_pool_state_init(
     data.append_u32(0)?;
     data.append_bit_zero()?;
 
-    let code =
-        read_single_root_boc(hex::decode(CODE).expect("nominator pool code hex is invalid"))?;
-    Ok(StateInit::with_code_and_data(code, data.into_cell()?))
+    Ok(data.into_cell()?)
+}
+
+fn build_toncore_pool_state_init_embedded_code(
+    validator_address: &MsgAddressInt,
+    params: &TonCoreInitParams,
+) -> anyhow::Result<StateInit> {
+    let data = build_toncore_pool_initial_data(validator_address, params)?;
+    let code = toncore_pool_full_code_cell()?;
+    Ok(StateInit::with_code_and_data(code, data))
+}
+
+fn build_toncore_pool_state_init_activate_upgrade(
+    validator_address: &MsgAddressInt,
+    params: &TonCoreInitParams,
+) -> anyhow::Result<StateInit> {
+    let data = build_toncore_pool_initial_data(validator_address, params)?;
+    let pool_code = toncore_pool_full_code_cell()?;
+    let stub = build_toncore_pool_stub_code(&pool_code)?;
+    Ok(StateInit::with_code_and_data(stub, data))
+}
+
+fn build_toncore_pool_state_init_for_deploy_mode(
+    validator_address: &MsgAddressInt,
+    params: &TonCoreInitParams,
+    deploy_mode: TonCoreDeployMode,
+) -> anyhow::Result<StateInit> {
+    match deploy_mode {
+        TonCoreDeployMode::Legacy => {
+            build_toncore_pool_state_init_embedded_code(validator_address, params)
+        }
+        TonCoreDeployMode::TonscanCompatible => {
+            build_toncore_pool_state_init_activate_upgrade(validator_address, params)
+        }
+        _ => anyhow::bail!("unsupported TonCore deploy_mode {deploy_mode:?}"),
+    }
 }
 
 /// Derive masterchain pool address and `StateInit` from deployment parameters.
 pub(crate) fn toncore_pool_address_and_state(
     ton_core_init_params: &TonCoreInitParams,
     validator_address: &MsgAddressInt,
+    deploy_mode: TonCoreDeployMode,
 ) -> anyhow::Result<(MsgAddressInt, StateInit)> {
-    let state_init = build_toncore_pool_state_init(validator_address, ton_core_init_params)?;
+    let state_init = build_toncore_pool_state_init_for_deploy_mode(
+        validator_address,
+        ton_core_init_params,
+        deploy_mode,
+    )?;
     let addr = toncore_pool_address_from_state_init(&state_init)?;
     Ok((addr, state_init))
 }
@@ -99,8 +151,10 @@ pub fn resolve_toncore_pool(
     validator_addr: &MsgAddressInt,
     pool_address: Option<&str>,
     params: TonCoreInitParams,
+    deploy_mode: TonCoreDeployMode,
 ) -> anyhow::Result<ResolvedTonCorePool> {
-    let (address, state_init) = toncore_pool_address_and_state(&params, validator_addr)?;
+    let (address, state_init) =
+        toncore_pool_address_and_state(&params, validator_addr, deploy_mode)?;
     if let Some(addr) = pool_address {
         let explicit = addr
             .parse::<MsgAddressInt>()
@@ -137,17 +191,19 @@ impl TonCoreNominatorWrapper {
         provider: Arc<dyn ContractProvider>,
         validator_address: &MsgAddressInt,
         init_params: &TonCoreInitParams,
+        deploy_mode: TonCoreDeployMode,
     ) -> anyhow::Result<Self> {
         let (pool_addr, state_init) =
-            toncore_pool_address_and_state(&init_params, validator_address)?;
+            toncore_pool_address_and_state(init_params, validator_address, deploy_mode)?;
         Ok(Self { provider, pool_addr, state_init: Some(state_init) })
     }
 
     pub fn calculate_address(
         validator_address: &MsgAddressInt,
         params: &TonCoreInitParams,
+        deploy_mode: TonCoreDeployMode,
     ) -> anyhow::Result<MsgAddressInt> {
-        toncore_pool_address_and_state(&params, validator_address).map(|(addr, _)| addr)
+        toncore_pool_address_and_state(params, validator_address, deploy_mode).map(|(addr, _)| addr)
     }
 }
 
@@ -208,6 +264,12 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
         let max_nominators_count = stack.i64(6).context("parse max_nominators_count")? as u16;
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
         let min_nominator_stake = stack.i64(8).context("parse min_nominator_stake")? as u64;
+        // Indices 9–10: `nominators` / `withdraw_requests` dicts (empty dicts arrive as empty
+        // `tvm.list`, see `TvmStackParser::cell_opt`). Index 9 is parsed only as a layout probe:
+        // if the stack ever shifts, this errors before we silently misread index 10. `Some(_)` at
+        // 10 means there is at least one pending withdraw request.
+        let _nominators = stack.cell_opt(9).context("parse nominators")?;
+        let withdraw_requests = stack.cell_opt(10).context("parse withdraw_requests")?;
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {
             let bytes = stack.number_bytes(12, 32).context("parse saved_validator_set_hash")?;
@@ -238,7 +300,29 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
             validator_set_changes_count,
             validator_set_change_time,
             stake_held_for,
+            withdraw_requests,
         })
+    }
+
+    async fn has_withdraw_requests(&self) -> anyhow::Result<bool> {
+        // nominator-pool `pool.fc`: `int has_withdraw_requests() method_id` — one stack int, no full
+        // `get_pool_data` parse (cheaper for per-tick × N nodes probes in the elections runner).
+        let stack = self
+            .provider
+            .get_method(self.pool_addr.to_string(), "has_withdraw_requests", vec![])
+            .await?;
+        stack.bool(0).context("parse has_withdraw_requests")
+    }
+
+    async fn send_process_withdraw_requests(
+        &self,
+        wallet: Arc<dyn TonWallet>,
+        query_id: u64,
+        limit: u8,
+        gas_value: u64,
+    ) -> anyhow::Result<Cell> {
+        let payload = crate::nominator::ton_core_pool::process_withdraw_requests(query_id, limit)?;
+        wallet.message(self.pool_addr.clone(), gas_value, payload).await
     }
 }
 
@@ -246,9 +330,45 @@ impl NominatorWrapper for TonCoreNominatorWrapper {
 mod tests {
     use super::*;
     use crate::contract_provider;
+    use common::app_config::{TonCoreDeployMode, TonCoreInitParams};
     use std::str::FromStr;
     use ton_block::MsgAddressInt;
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
+
+    #[test]
+    fn stub_cell_refs_full_pool_code() {
+        let pool = toncore_pool_full_code_cell().expect("pool code");
+        let stub = build_toncore_pool_stub_code(&pool).expect("stub");
+        assert_eq!(stub.references_count(), 1);
+        assert_eq!(stub.reference(0).expect("ref").repr_hash(), pool.repr_hash());
+    }
+
+    #[test]
+    fn legacy_and_tonscan_compatible_addresses_differ() {
+        let validator = MsgAddressInt::from_str(
+            "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea",
+        )
+        .expect("validator");
+        let params = TonCoreInitParams {
+            validator_share: 4000,
+            max_nominators: 40,
+            min_validator_stake: 100_000_000_000_000,
+            min_nominator_stake: 10_000_000_000_000,
+        };
+        let a = TonCoreNominatorWrapper::calculate_address(
+            &validator,
+            &params,
+            TonCoreDeployMode::Legacy,
+        )
+        .expect("legacy addr");
+        let b = TonCoreNominatorWrapper::calculate_address(
+            &validator,
+            &params,
+            TonCoreDeployMode::TonscanCompatible,
+        )
+        .expect("tonscan_compatible addr");
+        assert_ne!(a, b);
+    }
 
     fn open_pool() -> Option<TonCoreNominatorWrapper> {
         let pool_addr = MsgAddressInt::from_str("kf-d42Dwn_dzfdwlV_aEeX7WWnJ-bBU_eZp6CfKoMb4vQ3t0")

@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 
-use crate::election_emulator::{self, ElectionContext, ParticipantStake};
+use super::election_emulator::{self, ElectionContext, ParticipantStake};
 use common::ton_utils::nanotons_to_tons_f64;
 use contracts::ElectionsInfo;
 use ton_block::config_params::{ConfigParam16, ConfigParam17};

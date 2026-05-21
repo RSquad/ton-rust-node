@@ -9,9 +9,8 @@
 pub mod task_macro;
 pub mod task_manager;
 
-use crate::{runtime_config::RuntimeConfig, task, task::task_manager::ServiceTask};
-use common::{app_config::AppConfig, snapshot::SnapshotStore, task_cancellation::CancellationCtx};
-use elections::election_task::BindingStatusCallback;
+use crate::{elections::election_task::BindingStatusCallback, runtime_config::RuntimeConfig, task};
+use common::snapshot::SnapshotStore;
 use std::sync::Arc;
 
 task!(VotingTask, crate::voting::voting_task::run {
@@ -20,47 +19,10 @@ task!(VotingTask, crate::voting::voting_task::run {
 
 task!(ContractsTask, crate::contracts::contracts_task::run {
     runtime_cfg: Arc<dyn RuntimeConfig>,
-    store: Arc<SnapshotStore>
 });
 
-// Since the elections task is placed in a separate crate, we cannot pass
-// RuntimeConfigStore directly to it. This is because RuntimeConfigStore is
-// defined in the service crate. Instead, we pass the required dependencies to
-// the task as arguments. When the elections task is moved to this crate, we can
-// pass the RuntimeConfigStore directly.
-pub struct ElectionsTask {
+task!(ElectionsTask, crate::elections::election_task::run {
     runtime_cfg: Arc<dyn RuntimeConfig>,
     store: Arc<SnapshotStore>,
     on_status_change: Option<BindingStatusCallback>,
-}
-
-impl ElectionsTask {
-    pub fn new(
-        runtime_cfg: Arc<dyn RuntimeConfig>,
-        store: Arc<SnapshotStore>,
-        on_status_change: Option<BindingStatusCallback>,
-    ) -> Self {
-        Self { runtime_cfg, store, on_status_change }
-    }
-}
-
-#[async_trait::async_trait]
-impl ServiceTask for ElectionsTask {
-    async fn run(
-        &self,
-        cancellation_ctx: CancellationCtx,
-        _app_config: Arc<AppConfig>,
-    ) -> anyhow::Result<()> {
-        elections::election_task::run(
-            cancellation_ctx,
-            self.runtime_cfg.get(),
-            self.runtime_cfg.rpc_client(),
-            self.runtime_cfg.wallets(),
-            self.runtime_cfg.pools(),
-            self.store.clone(),
-            self.runtime_cfg.vault(),
-            self.on_status_change.clone(),
-        )
-        .await
-    }
-}
+});

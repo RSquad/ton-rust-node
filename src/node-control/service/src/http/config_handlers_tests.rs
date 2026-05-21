@@ -19,7 +19,10 @@ use crate::{
 };
 use axum::body::Body;
 use common::{
-    app_config::{AppConfig, HttpConfig, PoolConfig, TonCoreInitParams, TonCorePoolConfig},
+    app_config::{
+        AppConfig, EndpointEntry, HttpConfig, PoolConfig, TonCoreDeployMode, TonCoreInitParams,
+        TonCorePoolConfig, TonHttpApiConfig, VotingConfig,
+    },
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
@@ -54,13 +57,12 @@ fn empty_app_cfg() -> Arc<AppConfig> {
         voting: None,
         master_wallet: None,
         tick_interval: 30,
+        automation: Default::default(),
         log: Some(Default::default()),
     })
 }
 
-async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
-    let mut cfg = (*empty_app_cfg()).clone();
-    cfg.pools = pools;
+async fn state_from_cfg(cfg: AppConfig) -> AppState {
     let rt = Arc::new(RuntimeConfigStore::from_app_config(Arc::new(cfg)));
     let jwt_auth = Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap());
     AppState {
@@ -74,6 +76,35 @@ async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
     }
 }
 
+async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
+    let mut cfg = (*empty_app_cfg()).clone();
+    cfg.pools = pools;
+    state_from_cfg(cfg).await
+}
+
+/// Binds a TCP listener and drops it so the bound port is guaranteed-dead:
+/// further connect attempts get ECONNREFUSED instantly. Used to deterministically
+/// exercise the "ton-http-api unreachable" path on machines where something
+/// might happen to be listening on the default port (e.g. a local sandbox).
+async fn dead_ton_http_api_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+async fn state_with_pools_unreachable_rpc(pools: HashMap<String, PoolConfig>) -> AppState {
+    let mut cfg = (*empty_app_cfg()).clone();
+    cfg.pools = pools;
+    let mut http_api = TonHttpApiConfig::default();
+    http_api.urls = vec![EndpointEntry::Url(dead_ton_http_api_url().await)];
+    // Sub-second timeouts so the test fails fast.
+    http_api.connect_timeout_secs = Some(1);
+    http_api.request_timeout_secs = Some(1);
+    cfg.ton_http_api = http_api;
+    state_from_cfg(cfg).await
+}
+
 async fn json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -81,6 +112,10 @@ async fn json(resp: axum::response::Response) -> serde_json::Value {
 
 fn get(uri: &str) -> axum::http::Request<Body> {
     axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn delete(uri: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder().method("DELETE").uri(uri).body(Body::empty()).unwrap()
 }
 
 fn post_json(uri: &str, body: &impl serde::Serialize) -> axum::http::Request<Body> {
@@ -103,14 +138,97 @@ async fn pools_empty() {
 }
 
 #[tokio::test]
+async fn voting_config_empty_when_voting_section_absent() {
+    let st = state_with_pools(HashMap::new()).await;
+    let resp = routes(false, st).oneshot(get("/v1/voting/config")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let v = json(resp).await;
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["proposals"], serde_json::json!([]));
+    assert_eq!(v["result"]["tick_interval"], 40);
+}
+
+#[tokio::test]
+async fn voting_config_reflects_runtime_section() {
+    let mut cfg = (*empty_app_cfg()).clone();
+    let hash_hex = "aa".repeat(32);
+    cfg.voting = Some(VotingConfig { proposals: vec![hash_hex.clone()], tick_interval: 77 });
+    let st = state_from_cfg(cfg).await;
+    let resp = routes(false, st).oneshot(get("/v1/voting/config")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let v = json(resp).await;
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["result"]["proposals"], serde_json::json!([hash_hex]));
+    assert_eq!(v["result"]["tick_interval"], 77);
+}
+
+#[tokio::test]
+async fn voting_proposal_add_already_tracked_returns_200_without_chain() {
+    let mut cfg = (*empty_app_cfg()).clone();
+    let h = "bb".repeat(32);
+    cfg.voting = Some(VotingConfig { proposals: vec![h.clone()], tick_interval: 40 });
+    let st = state_from_cfg(cfg).await;
+    let body = serde_json::json!({ "hash": h });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/voting/proposals")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = routes(false, st).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn voting_proposal_add_invalid_hash_returns_400() {
+    let st = state_with_pools(HashMap::new()).await;
+    let body = serde_json::json!({ "hash": "not_hex" });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/voting/proposals")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = routes(false, st).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn voting_proposal_rm_unknown_returns_404() {
+    let st = state_with_pools(HashMap::new()).await;
+    let h = "cc".repeat(32);
+    let resp =
+        routes(false, st).oneshot(delete(&format!("/v1/voting/proposals/{h}"))).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn voting_proposal_rm_removes_tracked_hash() {
+    let mut cfg = (*empty_app_cfg()).clone();
+    let h1 = "dd".repeat(32);
+    let h2 = "ee".repeat(32);
+    cfg.voting = Some(VotingConfig { proposals: vec![h1.clone(), h2.clone()], tick_interval: 40 });
+    let st = state_from_cfg(cfg).await;
+    let app = routes(false, st.clone());
+    let resp = app.oneshot(delete(&format!("/v1/voting/proposals/{h1}"))).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp2 = routes(false, st).oneshot(get("/v1/voting/config")).await.unwrap();
+    let v = json(resp2).await;
+    let proposals = v["result"]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0], h2);
+}
+
+#[tokio::test]
 async fn pools_snp_shape_preserved() {
+    // Use owner-only (no `address`) so the handler does not hit the RPC at all
+    // — keeps the test focused on DTO shape, independent of ton-http-api state.
     let mut pools = HashMap::new();
     pools.insert(
         "snp1".to_string(),
         PoolConfig::SNP {
-            address: Some(
-                "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea".into(),
-            ),
+            address: None,
             owner: Some(
                 "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
             ),
@@ -133,10 +251,11 @@ async fn pools_snp_shape_preserved() {
 }
 
 #[tokio::test]
-async fn pools_toncore_slot_with_no_address_is_not_deployed() {
+async fn pools_toncore_slot_with_no_address_is_not_deployed_with_config_fallback() {
     // Slot configured with params but no address and no binding → pool isn't
     // on-chain yet. Handler should emit a "not deployed" slot entry rather
-    // than failing or guessing an address.
+    // than failing or guessing an address, and merge deploy params from config
+    // (validator_share, max_nominators, etc.) into the response.
     let mut pools = HashMap::new();
     pools.insert(
         "core1".to_string(),
@@ -150,6 +269,7 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed() {
                         min_validator_stake: 10_000_000_000_000,
                         min_nominator_stake: 10_000_000_000_000,
                     }),
+                    ..Default::default()
                 }),
                 None,
             ],
@@ -170,13 +290,20 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed() {
     assert_eq!(slots[0]["state"], "not deployed");
     assert!(slots[0].get("address").is_none());
     assert!(slots[0].get("balance").is_none());
-    assert!(slots[0].get("validator_share").is_none());
+    assert_eq!(slots[0]["validator_share"], 4000);
+    assert_eq!(slots[0]["max_nominators"], 40);
+    assert_eq!(slots[0]["data_source"], "config");
+    assert_eq!(slots[0]["deploy_layout"], "legacy");
 }
 
 #[tokio::test]
 async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
-    // Both slots have addresses but no live RPC — handler must gracefully
-    // produce two slot entries with state="error" instead of returning 500.
+    // Both slots have addresses but no live RPC. With the SMA-95 fix, the handler
+    // must surface this as 503 Service Unavailable carrying the upstream error,
+    // rather than silently returning slot rows with state="error".
+    // Use addresses that parse on every platform (MsgAddressInt::from_str
+    // rejects some short/zero forms) so the handler actually reaches the RPC
+    // call and the unreachable-upstream branch is exercised.
     let mut pools = HashMap::new();
     pools.insert(
         "core2".to_string(),
@@ -184,37 +311,38 @@ async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
             pools: [
                 Some(TonCorePoolConfig {
                     address: Some(
-                        "-1:0000000000000000000000000000000000000000000000000000000000000001"
+                        "-1:bd313e9e1114bbbe7af6f28ef59be0ff3f02ac795423f10397a70dc16396c4ea"
                             .into(),
                     ),
-                    params: None,
+                    params: Some(TonCoreInitParams {
+                        validator_share: 4000,
+                        max_nominators: 40,
+                        min_validator_stake: 10_000_000_000_000,
+                        min_nominator_stake: 10_000_000_000_000,
+                    }),
+                    ..Default::default()
                 }),
                 Some(TonCorePoolConfig {
                     address: Some(
-                        "-1:0000000000000000000000000000000000000000000000000000000000000002"
-                            .into(),
+                        "0:c5770dc489bef32419959c174b787ab95ff9109e0e43239c18059509819697fb".into(),
                     ),
                     params: None,
+                    ..Default::default()
                 }),
             ],
         },
     );
 
-    let st = state_with_pools(pools).await;
+    let st = state_with_pools_unreachable_rpc(pools).await;
     let resp = routes(false, st).oneshot(get("/v1/pools")).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 503);
     let v = json(resp).await;
-    let result = &v["result"][0];
-    let slots = result["slots"].as_array().unwrap();
-    assert_eq!(slots.len(), 2);
-    assert_eq!(slots[0]["slot"], "even");
-    assert_eq!(slots[1]["slot"], "odd");
-    for slot in slots {
-        // RPC failed → state encoded into DTO, not bubbled up.
-        assert_eq!(slot["state"], "error");
-        assert!(slot.get("balance").is_none());
-        assert!(slot["address"].is_string());
-    }
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], 503);
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("ton-http-api unreachable"),
+        "error body should identify upstream: {v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +376,38 @@ async fn pools_add_core_creates_new_pool_with_one_slot() {
         PoolConfig::TONCore { pools } => {
             assert!(pools[0].is_some(), "even slot must be present");
             assert!(pools[1].is_none(), "odd slot must remain empty");
-            let params = pools[0].as_ref().unwrap().params.as_ref().unwrap();
+            let slot = pools[0].as_ref().unwrap();
+            assert_eq!(
+                slot.deploy_mode,
+                TonCoreDeployMode::TonscanCompatible,
+                "create without deploy_layout should persist tonscan-compatible default"
+            );
+            let params = slot.params.as_ref().unwrap();
             assert_eq!(params.validator_share, 4000);
+        }
+        _ => panic!("expected TONCore pool"),
+    }
+}
+
+#[tokio::test]
+async fn pools_add_core_persists_explicit_tonscan_deploy_mode() {
+    let st = state_with_pools(HashMap::new()).await;
+    let body = serde_json::json!({
+        "name": "core_tonscan",
+        "slot": "even",
+        "validator_share": 4000u16,
+        "deploy_layout": "tonscan",
+    });
+    let resp = routes(false, st.clone()).oneshot(post_json("/v1/pools/core", &body)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let cfg = st.runtime_cfg.get();
+    match cfg.pools.get("core_tonscan").expect("pool inserted") {
+        PoolConfig::TONCore { pools } => {
+            assert_eq!(
+                pools[0].as_ref().unwrap().deploy_mode,
+                TonCoreDeployMode::TonscanCompatible
+            );
         }
         _ => panic!("expected TONCore pool"),
     }
@@ -270,6 +428,7 @@ async fn pools_add_core_adds_second_slot_to_existing_pool() {
                         min_validator_stake: 10_000_000_000_000,
                         min_nominator_stake: 10_000_000_000_000,
                     }),
+                    ..Default::default()
                 }),
                 None,
             ],
@@ -288,6 +447,11 @@ async fn pools_add_core_adds_second_slot_to_existing_pool() {
         PoolConfig::TONCore { pools } => {
             assert!(pools[0].is_some(), "even slot preserved");
             assert!(pools[1].is_some(), "odd slot added");
+            assert_eq!(pools[0].as_ref().unwrap().deploy_mode, TonCoreDeployMode::Legacy);
+            assert_eq!(
+                pools[1].as_ref().unwrap().deploy_mode,
+                TonCoreDeployMode::TonscanCompatible
+            );
         }
         _ => panic!("expected TONCore pool"),
     }
@@ -314,7 +478,10 @@ async fn pools_add_core_rejects_already_configured_slot() {
     pools.insert(
         "core1".to_string(),
         PoolConfig::TONCore {
-            pools: [Some(TonCorePoolConfig { address: None, params: None }), None],
+            pools: [
+                Some(TonCorePoolConfig { address: None, params: None, ..Default::default() }),
+                None,
+            ],
         },
     );
     let st = state_with_pools(pools).await;

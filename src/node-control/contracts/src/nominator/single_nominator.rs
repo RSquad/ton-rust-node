@@ -148,7 +148,7 @@ impl NominatorWrapper for SingleNominatorWrapper {
         let min_validator_stake = stack.i64(7).context("parse min_validator_stake")? as u64;
         let nominator_stake_threshold =
             stack.i64(8).context("parse nominator_stake_threshold")? as u64;
-        // skip indices 9-10 (nominators, withdraw_requests)
+        // Skip indices 9-10 (nominators, withdraw_requests). SNP has no withdraw queue.
         let stake_at = stack.i64(11).context("parse stake_at")? as u32;
         let saved_validator_set_hash = {
             let bytes = stack.number_bytes(12, 32).context("parse saved_validator_set_hash")?;
@@ -179,6 +179,7 @@ impl NominatorWrapper for SingleNominatorWrapper {
             validator_set_changes_count,
             validator_set_change_time,
             stake_held_for,
+            withdraw_requests: None,
         })
     }
 }

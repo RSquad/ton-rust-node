@@ -12,7 +12,7 @@ replicas: 1
 ##
 image:
   repository: ghcr.io/rsquad/ton-rust-node/nodectl
-  tag: "v0.4.0"
+  tag: "v0.5.0"
   pullPolicy: IfNotPresent
 
 ## @param imagePullSecrets [array] Registry pull secrets for private container images
@@ -206,9 +206,9 @@ affinity: {}
 
 ## @section ServiceAccount parameters
 
-## @param serviceAccount.enabled Create a ServiceAccount for the pods
-## @param serviceAccount.name [nullable] ServiceAccount name. Defaults to the release fullname if not set.
-## @param serviceAccount.annotations [object] Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding)
+## @param serviceAccount.enabled Create a ServiceAccount for the pods. If false but `name` is set, the existing ServiceAccount is attached to the Pod without being created (useful when an external SA is already bound to a Vault role).
+## @param serviceAccount.name [nullable] ServiceAccount name. When `enabled=true`, defaults to the release fullname if empty; when `enabled=false`, set this to attach an existing ServiceAccount to the Pod.
+## @param serviceAccount.annotations [object] Annotations for the ServiceAccount (e.g. for Vault or cloud IAM role binding). Only applied when `enabled=true`.
 ##
 serviceAccount:
   enabled: false

@@ -152,7 +152,11 @@ pub struct StakeSubmission {
 }
 
 /// Participation status enum for election flow.
-/// Flow: Idle → Participating → Submitted → Accepted → Elected → Validating
+/// Flow: Idle → Participating → Submitted → Accepted → Elected → Validating.
+/// `ProcessingWithdrawRequests` is a TONCore-only intermediate state set whenever the runner's
+/// last on-chain probe reports a non-empty `withdraw_requests` queue and stake has not yet been
+/// submitted — the runner sends `process_withdraw_requests` (op = 2) on each such tick and waits
+/// one tick for the pool to drain before submitting a new stake.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -170,6 +174,11 @@ pub enum ParticipationStatus {
     Elected,
     /// Node is actively validating (in current validator set p34).
     Validating,
+    /// TONCore: the pool's `withdraw_requests` queue is still non-empty per the latest on-chain
+    /// probe and stake has not been submitted yet; the runner sends `process_withdraw_requests`
+    /// (op = 2) and re-probes each tick until the queue drains.
+    #[serde(rename = "processing_withdraw_requests", alias = "processing_withdraws")]
+    ProcessingWithdrawRequests,
 }
 
 impl std::fmt::Display for ParticipationStatus {
@@ -181,6 +190,9 @@ impl std::fmt::Display for ParticipationStatus {
             ParticipationStatus::Accepted => write!(f, "accepted"),
             ParticipationStatus::Elected => write!(f, "elected"),
             ParticipationStatus::Validating => write!(f, "validating"),
+            ParticipationStatus::ProcessingWithdrawRequests => {
+                write!(f, "processing_withdraw_requests")
+            }
         }
     }
 }

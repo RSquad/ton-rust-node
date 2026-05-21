@@ -41,8 +41,9 @@ pub struct RuntimeConfigStore {
     state: RwLock<Arc<RuntimeState>>,
     /// Unix timestamp of the last config mutation (seconds).
     updated_at: AtomicU64,
-    /// Path to the config file on disk, used for save/reload.
-    config_path: String,
+    /// Path to the config file on disk, used for save/reload. `None` in tests
+    /// that construct an in-memory store via [`Self::from_app_config`].
+    config_path: Option<String>,
     /// Hash of the last config file content we loaded, to detect external changes.
     last_file_hash: Mutex<Option<u64>>,
 }
@@ -74,6 +75,33 @@ impl std::fmt::Display for RuntimeConfigError {
 }
 
 impl std::error::Error for RuntimeConfigError {}
+
+/// Error from [`RuntimeConfigStore::try_update_and_save`]: validation rejected the mutation (HTTP 400)
+/// or persistence / lock failure (HTTP 500).
+#[derive(Debug)]
+pub enum TryUpdateSaveError {
+    /// Closure rejected the update (e.g. merged config failed validation).
+    Rejected(String),
+    Persist(anyhow::Error),
+}
+
+impl std::fmt::Display for TryUpdateSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryUpdateSaveError::Rejected(s) => f.write_str(s),
+            TryUpdateSaveError::Persist(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for TryUpdateSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TryUpdateSaveError::Persist(e) => Some(e.as_ref()),
+            TryUpdateSaveError::Rejected(_) => None,
+        }
+    }
+}
 
 // Public API for the runtime config
 pub trait RuntimeConfig: Send + Sync {
@@ -117,7 +145,7 @@ impl RuntimeConfigStore {
                 master_wallet,
             })),
             updated_at: AtomicU64::new(time_format::now()),
-            config_path,
+            config_path: Some(config_path),
             last_file_hash: Mutex::new(hash),
         })
     }
@@ -214,6 +242,7 @@ impl RuntimeConfigStore {
             ClientJsonRpc::connect_many(
                 app_config.ton_http_api.resolved_endpoints(),
                 app_config.ton_http_api.api_key.clone(),
+                app_config.ton_http_api.resolved_timeouts(),
             )
             .unwrap(),
         );
@@ -227,9 +256,17 @@ impl RuntimeConfigStore {
                 rpc_client,
             })),
             updated_at: AtomicU64::new(time_format::now()),
-            config_path: "noop".to_string(),
+            config_path: None,
             last_file_hash: Mutex::new(None),
         }
+    }
+
+    /// Test-only: enable on-disk persistence for an in-memory store. Use when a test
+    /// needs to assert the saved JSON after `update_and_save`.
+    #[cfg(test)]
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.config_path = Some(path.into());
+        self
     }
 
     pub fn updated_at(&self) -> u64 {
@@ -291,7 +328,10 @@ impl RuntimeConfigStore {
     /// differs from the last write. Called from `update_and_save` so
     /// the disk write happens before the in-memory swap.
     fn save_to_file(&self, cfg: &AppConfig) -> anyhow::Result<()> {
-        let path = Path::new(&self.config_path);
+        let Some(path) = self.config_path.as_deref() else {
+            return Ok(());
+        };
+        let path = Path::new(path);
         let json = serde_json::to_string_pretty(cfg)
             .map_err(|e| anyhow::anyhow!("serialize config error: {e}"))?;
         let current_hash = Self::hash_bytes(json.as_bytes());
@@ -308,21 +348,21 @@ impl RuntimeConfigStore {
         Ok(())
     }
 
-    /// Atomically applies the mutation and persists the resulting config.
-    /// Disk write happens before the in-memory swap, so if persistence fails
-    /// the live runtime state is left unchanged (and the error is returned).
-    pub fn update_and_save<F>(&self, f: F) -> anyhow::Result<()>
+    /// Like [`Self::update_and_save`], but the mutation can abort without persisting or swapping
+    /// state. Use this when merging partial REST patches so concurrent readers see a consistent
+    /// baseline under the config lock (avoids lost-update races).
+    pub fn try_update_and_save<F>(&self, f: F) -> Result<(), TryUpdateSaveError>
     where
-        F: FnOnce(&mut AppConfig),
+        F: FnOnce(&mut AppConfig) -> Result<(), String> + Send,
     {
-        let mut guard =
-            self.state.write().map_err(|e| anyhow::anyhow!("state lock poisoned: {e}"))?;
+        let mut guard = self.state.write().map_err(|e| {
+            TryUpdateSaveError::Persist(anyhow::anyhow!("state lock poisoned: {e}"))
+        })?;
         let old = Arc::clone(&guard);
         let mut cfg = (*old.config).clone();
-        f(&mut cfg);
+        f(&mut cfg).map_err(TryUpdateSaveError::Rejected)?;
 
-        // Persist first — if this fails, the in-memory state is not touched.
-        self.save_to_file(&cfg)?;
+        self.save_to_file(&cfg).map_err(TryUpdateSaveError::Persist)?;
 
         *guard = Arc::new(RuntimeState {
             config: Arc::new(cfg),
@@ -334,6 +374,25 @@ impl RuntimeConfigStore {
         });
         self.updated_at.store(time_format::now(), Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Atomically applies the mutation and persists the resulting config.
+    /// Disk write happens before the in-memory swap, so if persistence fails
+    /// the live runtime state is left unchanged (and the error is returned).
+    pub fn update_and_save<F>(&self, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut AppConfig) + Send,
+    {
+        match self.try_update_and_save(move |cfg| {
+            f(cfg);
+            Ok(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(TryUpdateSaveError::Rejected(msg)) => Err(anyhow::anyhow!(
+                "unexpected rejection from infallible update_and_save closure: {msg}"
+            )),
+            Err(TryUpdateSaveError::Persist(e)) => Err(e),
+        }
     }
 
     /// Rebuild all cached runtime objects (vault, RPC client, wallets, pools)
@@ -357,14 +416,17 @@ impl RuntimeConfigStore {
 
     /// Reload config from the file if it has changed externally.
     pub async fn reload_from_file(&self) -> bool {
-        let current_hash = Self::hash_file(&Path::new(&self.config_path));
+        let Some(path) = self.config_path.as_deref() else {
+            return false;
+        };
+        let current_hash = Self::hash_file(Path::new(path));
         let last_hash = *self.last_file_hash.lock().expect("last_file_hash lock");
         if current_hash == last_hash {
             return false;
         }
 
-        tracing::info!("config changed, reloading from '{}'", self.config_path);
-        match AppConfig::load(Path::new(&self.config_path)) {
+        tracing::info!("config changed, reloading from '{}'", path);
+        match AppConfig::load(Path::new(path)) {
             Ok(file_cfg) => match self.reload(file_cfg).await {
                 Ok(()) => {
                     *self.last_file_hash.lock().expect("last_file_hash lock") = current_hash;
@@ -376,7 +438,7 @@ impl RuntimeConfigStore {
                 }
             },
             Err(e) => {
-                tracing::error!("reload config error: path='{}' error={:#}", self.config_path, e);
+                tracing::error!("reload config error: path='{}' error={:#}", path, e);
                 false
             }
         }
@@ -396,8 +458,12 @@ impl RuntimeConfigStore {
     async fn load_rpc_client(app_cfg: &AppConfig) -> anyhow::Result<Arc<ClientJsonRpc>> {
         let resolved = app_cfg.ton_http_api.resolved_endpoints();
         let rpc_client = Arc::new(
-            ClientJsonRpc::connect_many(resolved.clone(), app_cfg.ton_http_api.api_key.clone())
-                .context("ton api connection error")?,
+            ClientJsonRpc::connect_many(
+                resolved.clone(),
+                app_cfg.ton_http_api.api_key.clone(),
+                app_cfg.ton_http_api.resolved_timeouts(),
+            )
+            .context("ton api connection error")?,
         );
         let urls: Vec<&str> = resolved.iter().map(|(u, _)| u.as_str()).collect();
         tracing::info!("connected to ton api endpoints: {}", urls.join(", "));
@@ -633,8 +699,11 @@ fn open_nominator_pool(
                         if let Some(addr_str) = &cfg.address {
                             let explicit = MsgAddressInt::from_str(addr_str)
                                 .context(format!("invalid TONCore pool address: {addr_str}"))?;
-                            let derived =
-                                TonCoreNominatorWrapper::calculate_address(validator_addr, params)?;
+                            let derived = TonCoreNominatorWrapper::calculate_address(
+                                validator_addr,
+                                params,
+                                cfg.deploy_mode,
+                            )?;
                             anyhow::ensure!(
                                 explicit == derived,
                                 "TONCore pool address ({}) does not match derived address ({})",
@@ -646,6 +715,7 @@ fn open_nominator_pool(
                             provider.clone(),
                             validator_addr,
                             params,
+                            cfg.deploy_mode,
                         )?) as Arc<dyn NominatorWrapper>))
                     }
                     (None, None) => {
