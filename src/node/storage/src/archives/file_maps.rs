@@ -34,7 +34,7 @@ use std::{
         Arc,
     },
 };
-use ton_block::{error, fail, BlockIdExt, Result, ShardIdent, LT_ALIGN};
+use ton_block::{error, BlockIdExt, Result, ShardIdent, LT_ALIGN};
 
 pub const FILES_DB_NAME: &str = "files";
 pub const KEY_FILES_DB_NAME: &str = "key_files";
@@ -78,7 +78,7 @@ impl BlockRanges {
     pub fn compare_seqno(&self, seqno: &u32) -> std::cmp::Ordering {
         let min_sn = self.min_seqno.load(Ordering::Relaxed);
         let max_sn = self.max_seqno.load(Ordering::Relaxed);
-        log::trace!(target: TARGET, "Comparing seqno {} with range {} - {}", seqno, min_sn, max_sn);
+        log::trace!(target: TARGET, "Comparing seqno {seqno} with range {min_sn} - {max_sn}");
         if seqno < &min_sn {
             std::cmp::Ordering::Greater
         } else if seqno > &max_sn {
@@ -294,14 +294,17 @@ impl FileMap {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    log::warn!(target: TARGET, "Can't read archive slice {}: {}", key, e);
+                    log::warn!(target: TARGET, "Can't read archive slice {key}: {e}");
                     if unneeded {
                         match storage.delete(&key.into()) {
                             Ok(_) => {
-                                log::info!(target: TARGET, "Deleted archive slice from index {}", key)
+                                log::info!(target: TARGET, "Deleted archive slice from index {key}")
                             }
                             Err(e) => {
-                                log::info!(target: TARGET, "Can't delete archive slice from index {}: {}", key, e)
+                                log::info!(
+                                    target: TARGET,
+                                    "Can't delete archive slice from index {key}: {e}"
+                                )
                             }
                         }
                     }
@@ -382,47 +385,50 @@ impl FileMap {
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) -> Result<()> {
         log::info!(
             target: TARGET,
-            "Archives GC started, last_unneeded_key_block: {}",
-            last_unneeded_key_block
+            "Archives GC started, last_unneeded_key_block: {last_unneeded_key_block}"
         );
-        let mut slices = self.get_unneeded_entries(last_unneeded_key_block).await;
-        log::info!(
-            target: TARGET,
-            "Archives GC: found {} unneeded slices",
-            slices.len()
-        );
+        let slices = self.get_unneeded_entries(last_unneeded_key_block).await;
+        log::info!(target: TARGET, "Archives GC: found {} unneeded slices", slices.len());
 
-        'a: while let Some(key) = slices.pop() {
-            let mut guard = self.elements.write().await;
-            let mut position = None;
-            for (p, entry) in guard.iter_mut().enumerate() {
-                if entry.key == key {
-                    position = Some(p);
-                    match Arc::get_mut(&mut entry.value) {
-                        Some(file_description) => {
-                            if let Err(e) = file_description.destroy().await {
-                                log::error!(target: TARGET, "Archives GC: can't destroy archive slice {}: {:?}", key, e);
-                                continue 'a;
-                            } else {
-                                if let Err(e) = self.storage.delete(&key.into()) {
-                                    log::error!(target: TARGET, "Archives GC: can't delete {} from index: {:?}", key, e);
-                                    continue 'a;
-                                }
-                                log::info!(target: TARGET, "Archives GC: collected {}.", key);
-                            }
-                        }
-                        None => {
-                            log::error!(target: TARGET, "Archives GC: unable to get mutable reference to file_description");
-                            continue 'a;
-                        }
-                    }
+        // Roll back a partial gc step on failure.
+        async fn reinsert(elements: &tokio::sync::RwLock<Vec<FileMapEntry>>, entry: FileMapEntry) {
+            let mut guard = elements.write().await;
+            let pos = guard.iter().position(|e| e.key > entry.key).unwrap_or(guard.len());
+            guard.insert(pos, entry);
+        }
+
+        for key in slices {
+            // Skip and retry next cycle on outstanding refs.
+            let mut entry = {
+                let mut guard = self.elements.write().await;
+                let Some(pos) = guard.iter().position(|e| e.key == key) else {
+                    log::error!(target: TARGET, "Archives GC: slice {key} not found");
+                    continue;
+                };
+                if Arc::strong_count(&guard[pos].value) > 1 {
+                    log::warn!(target: TARGET, "Archives GC: outstanding refs on {key}, skip");
+                    continue;
                 }
+                guard.remove(pos)
+            };
+
+            // Sequence: get_mut (cheap check) - storage.delete (commit point) - destroy (heavy I/O).
+            let Some(fd) = Arc::get_mut(&mut entry.value) else {
+                log::error!(target: TARGET, "Archives GC: cannot get mut ref on {key}");
+                reinsert(&self.elements, entry).await;
+                continue;
+            };
+            if let Err(e) = self.storage.delete(&key.into()) {
+                log::error!(target: TARGET, "Archives GC: can't delete {key} from index: {e}");
+                reinsert(&self.elements, entry).await;
+                continue;
             }
-            if let Some(p) = position {
-                guard.remove(p);
-            } else {
-                fail!("Slice {} not found", key)
+            if let Err(e) = fd.destroy().await {
+                // Index entry already removed; orphan files until restart sweep.
+                log::error!(target: TARGET, "Archives GC: can't destroy archive slice {key}: {e}");
+                continue;
             }
+            log::info!(target: TARGET, "Archives GC: collected {key}.");
         }
         log::info!(target: TARGET, "Archives GC finished.");
         Ok(())
@@ -430,7 +436,11 @@ impl FileMap {
 
     pub async fn get(&self, mc_seq_no: u32) -> Option<Arc<FileDescription>> {
         let guard = self.elements.read().await;
-        log::trace!(target: TARGET, "Searching for file description (elements count = {})", guard.len());
+        log::trace!(
+            target: TARGET,
+            "Searching for file description (elements count = {})",
+            guard.len()
+        );
         match guard.binary_search_by(|entry| entry.key.cmp(&mc_seq_no)) {
             Ok(index) => Some(Arc::clone(&guard[index].value)),
             Err(_) => None,
@@ -442,7 +452,11 @@ impl FileMap {
         f: impl FnMut(&FileMapEntry) -> std::cmp::Ordering,
     ) -> Option<Arc<FileDescription>> {
         let guard = self.elements.read().await;
-        log::trace!(target: TARGET, "Searching for file description (elements count = {})", guard.len());
+        log::trace!(
+            target: TARGET,
+            "Searching for file description (elements count = {})",
+            guard.len()
+        );
         let index = match guard.binary_search_by(f) {
             Ok(index) => index,
             Err(index) => (guard.len() - 1).min(index),
@@ -452,7 +466,11 @@ impl FileMap {
 
     pub async fn get_closest(&self, mc_seq_no: u32) -> Option<Arc<FileDescription>> {
         let guard = self.elements.read().await;
-        log::trace!(target: TARGET, "Searching for file description (elements count = {})", guard.len());
+        log::trace!(
+            target: TARGET,
+            "Searching for file description (elements count = {})",
+            guard.len()
+        );
         let index = match guard.binary_search_by(|entry| entry.key.cmp(&mc_seq_no)) {
             Ok(index) => index,
             Err(0) => return None,
@@ -564,7 +582,8 @@ impl FileMaps {
     pub fn get(&self, package_type: PackageType) -> &FileMap {
         match package_type {
             PackageType::Blocks => &self.files,
-            PackageType::KeyBlocks => &self.key_files, //PackageType::Temp => &self.temp_files,
+            PackageType::KeyBlocks => &self.key_files,
+            //PackageType::Temp => &self.temp_files,
         }
     }
 

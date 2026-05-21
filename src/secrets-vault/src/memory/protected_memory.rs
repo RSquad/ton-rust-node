@@ -15,6 +15,7 @@ use std::{
     ops::Deref,
     ptr::{copy_nonoverlapping, NonNull},
 };
+use ton_block::{Result, SecretBytes, SecretBytesReadGuard};
 use zeroize::Zeroize;
 
 trait PlatformMemory {
@@ -293,6 +294,18 @@ impl ProtectedMemory {
         let d2: &[u8] = &other.lock()?;
 
         Ok(d1 == d2)
+    }
+}
+
+impl SecretBytes for ProtectedMemory {
+    fn lock(&self) -> Result<SecretBytesReadGuard<'_>> {
+        Ok(SecretBytesReadGuard::Owned(Box::new(ProtectedMemory::lock(self)?)))
+    }
+    fn from_slice(data: &[u8]) -> Result<Self> {
+        Ok(ProtectedMemoryInner::from_slice(data)?.into())
+    }
+    fn len(&self) -> usize {
+        ProtectedMemory::len(self)
     }
 }
 

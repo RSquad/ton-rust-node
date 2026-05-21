@@ -11,10 +11,11 @@ ahash = "0.8.11"
 anyhow = '1.0'
 base64 = '0.13'
 bitflags = '2.6'
+bitstream-io = "4.9.0"
 blake2b_simd = '1.0'
 blst = { features = [ 'portable' ], version = '0.3.5' }
-crc32c = '0.6'
 crc16 = '0.4'
+crc32c = '0.6'
 ctr = '0.9'
 curve25519-dalek = '4.0'
 ed25519 = '2.2'
@@ -22,22 +23,22 @@ ed25519-dalek = { features = [ 'hazmat', 'pkcs8', 'rand_core' ], version = '2.0'
 getrandom = { features = [ 'js' ], version = '0.2' }
 hex = '0.4'
 keccak-hash = '0.11'
+lockfree = { path = '../lockfree' }
 log = '0.4'
 lz4 = '1.28'
 num = '0.4'
 num-derive = '0.4'
 num-traits = '0.2'
+openssl = "0.10"
 p256 = "0.13.2"
 rand = '0.8'
 secp256k1 = { version = '0.30', features = [ 'recovery', 'global-context' ] }
 serde = { features = [ 'derive', 'rc' ], version = '1.0.105' }
-openssl = "0.10"
 sha2 = '0.10'
 smallvec = { features = [ 'const_new', 'union', 'write' ], version = '1.10' }
 thiserror = '1.0'
 x25519-dalek = '2.0'
-lockfree = { path = '../lockfree' }
-bitstream-io = "4.9.0"
+zeroize = "1.8"
 
 [dev-dependencies]
 criterion = '0.5'

@@ -22,7 +22,7 @@ use crate::{
     },
 };
 use ton_api::ton::consensus::CandidateId;
-use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes};
 
 /*
     ============================================================================
@@ -64,7 +64,8 @@ fn test_threshold_calculations() {
 /// - Wrong data causes verification failure
 #[test]
 fn test_session_signature_roundtrip() {
-    let private_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+    let private_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
     let session_id = UInt256::from([1u8; 32]);
     let data = b"test data to sign";
 
@@ -96,7 +97,8 @@ fn test_session_signature_roundtrip() {
 /// - Wrong hash causes verification failure
 #[test]
 fn test_candidate_signature_roundtrip() {
-    let private_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+    let private_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
     let session_id = UInt256::from([1u8; 32]);
     let slot = SlotIndex::new(42);
     let candidate_hash = UInt256::from([3u8; 32]);
@@ -313,7 +315,7 @@ fn test_skip_vote_roundtrip() {
 #[test]
 fn test_vote_sign_and_verify() {
     // Generate key pair (Ed25519KeyOption contains both private and public key)
-    let key = Ed25519KeyOption::generate().unwrap();
+    let key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
 
     // Create session ID (not used for votes, kept for API consistency)
     let session_id = UInt256::from([0xABu8; 32]);
@@ -334,7 +336,7 @@ fn test_vote_sign_and_verify() {
     assert!(!verify_vote_signature(&signed_vote, &other_session_id, &key));
 
     // Verify with different key fails
-    let other_key = Ed25519KeyOption::generate().unwrap();
+    let other_key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     assert!(!verify_vote_signature(&signed_vote, &session_id, &other_key));
 
     // Extract vote and verify contents

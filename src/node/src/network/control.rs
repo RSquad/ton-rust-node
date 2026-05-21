@@ -63,8 +63,8 @@ use ton_api::{
     IntoBoxed, TLObject,
 };
 use ton_block::{
-    error, fail, AccountId, BlockIdExt, Ed25519KeyOption, KeyId, MerkleProof, MsgAddressInt,
-    Result, Serializable, ShardAccount, ShardIdent, UInt256, UnixTime,
+    error, fail, AccountId, BlockIdExt, KeyId, MerkleProof, MsgAddressInt, Result, Serializable,
+    ShardAccount, ShardIdent, UInt256, UnixTime, ED25519_KEY_TYPE,
 };
 use ton_block_json::serialize_config_param;
 
@@ -766,7 +766,7 @@ impl ControlQuerySubscriber {
         let query = match query.downcast::<GenerateKeyPair>() {
             Ok(_params) => {
                 return QueryResult::consume(
-                    self.process_generate_keypair(Ed25519KeyOption::KEY_TYPE).await?,
+                    self.process_generate_keypair(ED25519_KEY_TYPE).await?,
                     #[cfg(feature = "telemetry")]
                     None,
                 )

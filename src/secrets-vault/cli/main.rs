@@ -40,6 +40,10 @@ enum Commands {
     List {
         #[arg(long, short)]
         full: bool,
+
+        /// Reveal private key material in --full output. WARNING: writes raw key bytes to stdout.
+        #[arg(long)]
+        show_private: bool,
     },
     Delete {
         #[arg(required = true)]
@@ -114,7 +118,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init {} => init::execute().await,
-        Commands::List { full } => list::execute(full).await,
+        Commands::List { full, show_private } => list::execute(full, show_private).await,
         Commands::Delete { secret_ids } => delete::execute(&secret_ids).await,
         Commands::Import { secret_id, algorithm, extractable, overwrite, data } => {
             let algo: Algorithm = match algorithm.parse() {

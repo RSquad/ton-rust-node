@@ -19,6 +19,7 @@ use crate::{
 };
 use futures::prelude::*;
 use rand::RngCore;
+use secrets_vault::vault_block::get_key_option_factory;
 #[cfg(feature = "telemetry")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
@@ -39,9 +40,7 @@ use ton_api::{
     },
     AnyBoxedSerialize, IntoBoxed, TLObject,
 };
-use ton_block::{
-    base64_encode, error, fail, Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, Result,
-};
+use ton_block::{base64_encode, error, fail, KeyId, KeyOption, KeyOptionJson, Result};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,7 +107,7 @@ impl AdnlServerConfig {
 
     /// Construct from JSON config structure
     pub fn from_json_config(json_config: &AdnlServerConfigJson) -> Result<Self> {
-        let key = Ed25519KeyOption::from_private_key_json(&json_config.server_key)?;
+        let key = get_key_option_factory().from_private_key_json(&json_config.server_key)?;
         let server_key = lockfree::map::Map::new();
         let server_id = key.id().clone();
         server_key.insert(key.id().clone(), key);
@@ -117,7 +116,7 @@ impl AdnlServerConfig {
             AdnlServerClients::List(list) => {
                 let clients = lockfree::map::Map::new();
                 for key in list {
-                    let key = Ed25519KeyOption::from_public_key_json(key)?;
+                    let key = get_key_option_factory().from_public_key_json(key)?;
                     let key = key.pub_key()?;
                     if clients.insert(key.try_into()?, 0).is_some() {
                         fail!("Duplicated client key {} in server config", base64_encode(key))
@@ -198,7 +197,7 @@ impl AdnlServerThread {
         if let Some(version) = version {
             fail!("Unsupported ADNL version {version} in TCP connection")
         }
-        let other_key = Ed25519KeyOption::from_public_key(&other_key).id().clone();
+        let other_key = get_key_option_factory().from_public_key(&other_key).id().clone();
         dump!(trace, TARGET, "Nonce", &buf[..160]);
         let nonce: &mut [u8; 160] = buf.as_mut_slice().try_into()?;
         let ret = AdnlStreamCrypto::with_nonce_as_server(nonce);
@@ -472,7 +471,7 @@ impl AdnlServerThread {
                         PublicKey::Pub_Ed25519(key) => key.key.inner(),
                         x => fail!("Unsupported PublicKey {x:?} in TCP auth"),
                     };
-                    let pub_key = Ed25519KeyOption::from_public_key(&pub_key);
+                    let pub_key = get_key_option_factory().from_public_key(&pub_key);
                     pub_key.verify(nonce, complete.signature.as_slice())?;
                     thread.auth.remote_id = Some(pub_key.id().data().clone());
                     thread.auth.nonce = None;

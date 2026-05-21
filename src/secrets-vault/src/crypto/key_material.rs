@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+
 use crate::{
     crypto::crypto_trait::Crypto,
     errors::error::VaultError,

@@ -20,7 +20,7 @@ use std::{
 };
 use ton_block::{
     fail, BlockIdExt, CryptoSignature, CryptoSignaturePair, Ed25519KeyOption, Error, KeyOption,
-    Result, ShardIdent, UInt256,
+    Result, ShardIdent, UInt256, ZeroizingBytes,
 };
 
 macro_rules! _invalid_id {
@@ -617,7 +617,7 @@ impl TryFrom<&ton::PublicKey> for Arc<dyn KeyOption> {
     fn try_from(value: &ton::PublicKey) -> Result<Self> {
         match value {
             ton::PublicKey::Pub_Ed25519(key) => {
-                Ok(Ed25519KeyOption::from_public_key(key.key.as_slice()))
+                Ok(Ed25519KeyOption::<ZeroizingBytes>::from_public_key(key.key.as_slice()))
             }
             value => fail!("Unsupported public key type {:?}", value),
         }

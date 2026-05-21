@@ -829,7 +829,7 @@ impl EngineOperations for Engine {
 
     fn process_block_broadcast(self: Arc<Self>, broadcast: BlockBroadcast, src: Arc<KeyId>) {
         // because of ALL blocks-broadcasts received in one task - spawn for each block
-        log::trace!("Processing block broadcast {}", broadcast.id);
+        log::debug!("Processing block broadcast {} from {}", broadcast.id, src);
         let engine = self.clone() as Arc<dyn EngineOperations>;
         tokio::spawn(async move {
             let id = broadcast.id.clone();
@@ -855,7 +855,7 @@ impl EngineOperations for Engine {
         src: Arc<KeyId>,
     ) {
         // V2 broadcast processing - spawn for async processing
-        log::trace!("Processing block broadcast V2 {}", broadcast.id);
+        log::debug!("Processing block broadcast V2 {} from {}", broadcast.id, src);
         let engine = self.clone() as Arc<dyn EngineOperations>;
         tokio::spawn(async move {
             let id = broadcast.id.clone();
@@ -1108,8 +1108,8 @@ impl EngineOperations for Engine {
 
     fn complete_external_messages(
         &self,
-        to_delay: Vec<(UInt256, String)>,
-        to_delete: Vec<(UInt256, i32)>,
+        to_delay: &[UInt256],
+        to_delete: &[UInt256],
     ) -> Result<()> {
         self.external_messages().complete_messages(to_delay, to_delete, self.now())
     }

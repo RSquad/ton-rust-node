@@ -277,7 +277,7 @@ impl FullNodeOverlayClient {
                 Some(&self.active_peers),
             )
             .await?;
-        log::trace!("USE PEER {}, PREPARE {} FINISHED", peer, id);
+        log::debug!("download_block_full: USE PEER {}, PREPARE {} FINISHED", peer, id);
         // Download
         match prepare {
             Prepared::TonNode_NotFound => {
@@ -306,54 +306,61 @@ impl FullNodeOverlayClient {
                     id
                 );
                 let data_full: DataFull = result?;
-                let (block_data, proof_data, is_link) = match data_full {
-                    DataFull::TonNode_DataFull(data_full) => {
-                        if id != &data_full.id {
-                            self.active_peers.remove(peer.id());
-                            fail!("Block with another id was received");
+                let peer_copy = peer.clone();
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let (block_data, proof_data, is_link) = match data_full {
+                        DataFull::TonNode_DataFull(data_full) => {
+                            if id != data_full.id {
+                                fail!("Block with another id was received");
+                            }
+                            (data_full.block, data_full.proof, data_full.is_link.into())
                         }
-                        (data_full.block, data_full.proof, data_full.is_link.into())
-                    }
-                    DataFull::TonNode_DataFullCompressed(data_full) => {
-                        if id != &data_full.id {
-                            self.active_peers.remove(peer.id());
-                            fail!("Block with another id was received");
+                        DataFull::TonNode_DataFullCompressed(data_full) => {
+                            if id != data_full.id {
+                                fail!("Block with another id was received");
+                            }
+                            let decompressed = lz4_decompress(
+                                &data_full.compressed,
+                                Lz4DecompressMode::WithMaxSize(MAX_COMPRESSED_SIZE as i32),
+                            )?;
+                            let mut roots = read_boc(&decompressed)?.roots;
+                            if roots.len() != 2 {
+                                fail!(
+                                    "DataFullCompressed contains {} roots instead of 2",
+                                    roots.len()
+                                );
+                            }
+                            let proof_data = write_boc(&roots.remove(0))?;
+                            // Block's boc here must be serialized absolutely
+                            // the same way as in collator, because of file hash concept.
+                            let mut block_data = Vec::new();
+                            BocWriter::with_flags(roots, BocFlags::all())?
+                                .write(&mut block_data)?;
+                            (block_data, proof_data, data_full.is_link.into())
                         }
-                        let decompressed = lz4_decompress(
-                            &data_full.compressed,
-                            Lz4DecompressMode::WithMaxSize(MAX_COMPRESSED_SIZE as i32),
-                        )?;
-                        let mut roots = read_boc(&decompressed)?.roots;
-                        if roots.len() != 2 {
-                            self.active_peers.remove(peer.id());
-                            fail!("DataFullCompressed contains {} roots instead of 2", roots.len());
+                        DataFull::TonNode_DataFullEmpty => {
+                            fail!(
+                                "PrepareBlock returned Prepared, but DownloadBlockFull \
+                                    returned DataFullEmpty from {}",
+                                peer.id()
+                            )
                         }
-                        let proof_data = write_boc(&roots.remove(0))?;
-                        // Block's boc here must be serialized absolutely
-                        // the same way as in collator, because of file hash concept.
-                        let mut block_data = Vec::new();
-                        BocWriter::with_flags(roots, BocFlags::all())?.write(&mut block_data)?;
-                        (block_data, proof_data, data_full.is_link.into())
-                    }
-                    DataFull::TonNode_DataFullEmpty => {
-                        self.active_peers.remove(peer.id());
-                        fail!(
-                            "PrepareBlock returned Prepared, but DownloadBlockFull \
-                             returned DataFullEmpty from {}",
-                            peer.id()
-                        )
-                    }
-                };
-                let proof = BlockProofStuff::deserialize(id, proof_data, is_link).map_err(|e| {
-                    self.active_peers.remove(peer.id());
-                    error!("Error deserializing block proof from {}: {}", peer.id(), e)
-                })?;
-                let block = BlockStuff::deserialize_block_checked(id.clone(), Arc::new(block_data))
-                    .map_err(|e| {
-                        self.active_peers.remove(peer.id());
-                        error!("Error deserializing block from {}: {}", peer.id(), e)
-                    })?;
-                Ok((block, proof))
+                    };
+                    let proof =
+                        BlockProofStuff::deserialize(&id, proof_data, is_link).map_err(|e| {
+                            error!("Error deserializing block proof from {}: {}", peer.id(), e)
+                        })?;
+                    let block = BlockStuff::deserialize_block_checked(id, Arc::new(block_data))
+                        .map_err(|e| {
+                            error!("Error deserializing block from {}: {}", peer.id(), e)
+                        })?;
+                    Ok((block, proof))
+                })
+                .await?
+                .inspect_err(|_| {
+                    self.active_peers.remove(peer_copy.id());
+                })
             }
         }
     }

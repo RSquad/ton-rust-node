@@ -45,7 +45,8 @@ use ton_api::{
     IntoBoxed, TLObject,
 };
 use ton_block::{
-    base64_decode, base64_encode, sha256_digest, Ed25519KeyOption, KeyId, Result, UInt256,
+    base64_decode, base64_encode, sha256_digest, Ed25519KeyOption, KeyId, KeyOption, Result,
+    UInt256, ZeroizingBytes,
 };
 
 const KEY_TAG_OVERLAY: usize = 2;
@@ -210,7 +211,7 @@ impl RustTestNode {
     /// Add the C++ node as an ADNL peer (but not to any overlay)
     pub fn add_cpp_peer(&self, cpp: &CppTestNode) {
         let raw_key = Self::parse_cpp_pubkey(cpp.pubkey());
-        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+        let pubkey = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&raw_key);
         let ip = IpAddress::from_versioned_string(&format!("127.0.0.1:{}", cpp.udp_port()), None)
             .expect("parse IP");
 
@@ -221,7 +222,7 @@ impl RustTestNode {
     /// Add the C++ node as an ADNL peer AND to a specific public overlay via signed node.
     pub fn add_cpp_peer_to_overlay(&self, cpp: &mut CppTestNode, overlay_id: &Arc<OverlayShortId>) {
         let raw_key = Self::parse_cpp_pubkey(cpp.pubkey());
-        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+        let pubkey = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&raw_key);
         let ip = IpAddress::from_versioned_string(&format!("127.0.0.1:{}", cpp.udp_port()), None)
             .expect("parse IP");
 
@@ -236,7 +237,7 @@ impl RustTestNode {
     pub fn add_rust_peer_to_overlay(&self, other: &RustTestNode, overlay_id: &Arc<OverlayShortId>) {
         let other_key = other.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key on other node");
         let other_pubkey_data = other_key.pub_key().expect("No pub key on other node");
-        let other_pubkey = Ed25519KeyOption::from_public_key(
+        let other_pubkey = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(
             other_pubkey_data.try_into().expect("Wrong key size"),
         );
         let other_ip = IpAddress::from_versioned_string(&other.addr, None).expect("parse other IP");
@@ -252,7 +253,7 @@ impl RustTestNode {
     /// Get the KeyId for the C++ node (based on its public key)
     pub fn cpp_key_id(cpp: &CppTestNode) -> Arc<KeyId> {
         let raw_key = Self::parse_cpp_pubkey(cpp.pubkey());
-        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+        let pubkey = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&raw_key);
         pubkey.id().clone()
     }
 
@@ -585,7 +586,7 @@ impl RustQuicTestNode {
     /// Add the C++ node as an ADNL peer (UDP)
     pub fn add_cpp_peer(&self, cpp: &CppTestNode) {
         let raw_key = RustTestNode::parse_cpp_pubkey(cpp.pubkey());
-        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+        let pubkey = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&raw_key);
         let ip = IpAddress::from_versioned_string(&format!("127.0.0.1:{}", cpp.udp_port()), None)
             .expect("parse IP");
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");
@@ -595,7 +596,8 @@ impl RustQuicTestNode {
     /// Add the C++ node as a QUIC peer (registers its QUIC address = udp_port + 1000)
     pub fn add_cpp_quic_peer(&self, cpp: &CppTestNode) {
         let raw_key = RustTestNode::parse_cpp_pubkey(cpp.pubkey());
-        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+        let pubkey: Arc<dyn KeyOption> =
+            Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&raw_key);
         let quic_addr: SocketAddr =
             format!("127.0.0.1:{}", cpp.udp_port() + 1000).parse().expect("parse QUIC addr");
         self.quic.add_peer_key(pubkey.id().clone(), quic_addr).expect("add_quic_peer");
@@ -606,7 +608,7 @@ impl RustQuicTestNode {
     /// The QUIC address is discovered via `parse_quic_address` — no hardcoded offset.
     pub fn add_cpp_peer_via_address_list(&self, cpp: &CppTestNode, quic_port: u16) {
         let raw_key = RustTestNode::parse_cpp_pubkey(cpp.pubkey());
-        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+        let pubkey = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&raw_key);
 
         // Build an AddressList as a C++ node with PR #2184 would advertise:
         // both adnl.address.udp and adnl.address.quic
@@ -647,7 +649,7 @@ impl RustQuicTestNode {
     /// Add C++ node as both ADNL peer (UDP) and QUIC peer, and to overlay
     pub fn add_cpp_peer_full(&self, cpp: &mut CppTestNode, overlay_id: &Arc<OverlayShortId>) {
         let raw_key = RustTestNode::parse_cpp_pubkey(cpp.pubkey());
-        let pubkey = Ed25519KeyOption::from_public_key(&raw_key);
+        let pubkey = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&raw_key);
         let ip = IpAddress::from_versioned_string(&format!("127.0.0.1:{}", cpp.udp_port()), None)
             .expect("parse IP");
         let local_key = self.adnl.key_by_tag(KEY_TAG_OVERLAY).expect("No key");

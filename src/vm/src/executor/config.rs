@@ -52,10 +52,10 @@ pub(super) fn execute_extra_balance(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("GETEXTRABALANCE"))?;
     fetch_stack(engine, 1)?;
     let index = engine.cmd.var(0).as_integer_value(0..=u32::MAX)?;
-    let extra = engine.smci_param(7)?.tuple_item_ref(7)?.as_dict()?;
+    let extra = engine.smci_param(7)?.tuple_item_ref(1)?.as_dict()?;
     let dict = HashmapE::with_hashmap(32, extra.cloned());
     let key = index.write_to_bitstring()?;
-    let value = if let Some(mut slice) = dict.get(key)? {
+    let value = if let Some(mut slice) = dict.get_with_gas(key, engine)? {
         StackItem::int(VarUInteger32::construct_from(&mut slice)?.inner())
     } else {
         StackItem::int(0)

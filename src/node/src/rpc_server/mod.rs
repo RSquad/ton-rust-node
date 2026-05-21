@@ -19,6 +19,10 @@ mod serializers;
 mod token;
 mod wallets;
 
+/// Maximum size of an incoming JSON-RPC / REST request body, in bytes.
+/// This bounds the size of any BOC accepted via the public API.
+const MAX_BODY_SIZE: u64 = 16 << 20;
+
 pub struct RpcServer {
     shutdown: tokio::sync::oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
@@ -157,6 +161,7 @@ impl RpcRegistryBuilder {
         } else {
             warp::path(name)
                 .and(warp::post())
+                .and(warp::body::content_length_limit(MAX_BODY_SIZE))
                 .and(warp::body::json())
                 .and(warp::any().map(move || ctx.clone()))
                 .and_then(handler)
@@ -187,9 +192,14 @@ impl RpcRegistry {
     }
 }
 
-// Convert handler result to REST JSON body: {"ok":true|false, ...}
+// Convert handler result to REST JSON body: {"ok":true, "result":..., "@extra":...}
 fn rest_ok(result: serde_json::Value) -> warp::reply::Response {
-    warp::reply::json(&serde_json::json!({ "ok": true, "result": result })).into_response()
+    warp::reply::json(&serde_json::json!({
+        "ok": true,
+        "result": result,
+        "@extra": handlers::extra(0),
+    }))
+    .into_response()
 }
 
 fn rest_err(err: ton_block::Error) -> warp::reply::Response {
@@ -197,7 +207,8 @@ fn rest_err(err: ton_block::Error) -> warp::reply::Response {
     let body = serde_json::json!({
         "ok": false,
         "error": err.to_string(),
-        "code": err.http_status().as_u16()
+        "code": err.http_status().as_u16(),
+        "@extra": handlers::extra(0),
     });
     let mut resp = warp::reply::json(&body).into_response();
     *resp.status_mut() = err.http_status();
@@ -242,6 +253,11 @@ async fn handle_rejection(
         (warp::http::StatusCode::UNPROCESSABLE_ENTITY, "Invalid query string".to_string())
     } else if let Some(_) = err.find::<warp::reject::MethodNotAllowed>() {
         (warp::http::StatusCode::METHOD_NOT_ALLOWED, "HTTP method not allowed".to_string())
+    } else if let Some(_) = err.find::<warp::reject::PayloadTooLarge>() {
+        (
+            warp::http::StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Request body exceeds {MAX_BODY_SIZE}-byte limit"),
+        )
     } else if let Some(e) = err.find::<warp::filters::body::BodyDeserializeError>() {
         let message = match e.source() {
             Some(cause) => format!("Invalid JSON body: {cause}"),
@@ -273,6 +289,7 @@ fn build_routes(ctx: Ctx) -> RestFilter {
 
     let jsonrpc_route = warp::path("jsonRPC".to_string())
         .and(warp::post())
+        .and(warp::body::content_length_limit(MAX_BODY_SIZE))
         .and(warp::body::json())
         .and(warp::any().map(move || registry.clone()))
         .and_then(jsonrpc_handler)
@@ -291,40 +308,40 @@ fn build_routes(ctx: Ctx) -> RestFilter {
 }
 
 fn rpc_error(
-    id: serde_json::Value,
+    _id: serde_json::Value,
     code: i64,
     message: &str,
     jsonrpc_http_status: warp::http::StatusCode,
 ) -> warp::reply::Response {
     #[derive(serde::Serialize)]
     struct JsonRpcErrorResp {
-        jsonrpc: &'static str,
-        error: String,
-        id: serde_json::Value,
         ok: serde_json::Value,
+        error: String,
         code: i64,
+        #[serde(rename = "@extra")]
+        extra: String,
     }
     let body = JsonRpcErrorResp {
-        jsonrpc: "2.0",
-        error: message.to_string(),
         ok: serde_json::Value::Bool(false),
+        error: message.to_string(),
         code,
-        id,
+        extra: handlers::extra(0),
     };
     let mut resp = warp::reply::json(&body).into_response();
     *resp.status_mut() = jsonrpc_http_status;
     resp
 }
 
-fn rpc_ok(id: serde_json::Value, result: serde_json::Value) -> warp::reply::Response {
+fn rpc_ok(_id: serde_json::Value, result: serde_json::Value) -> warp::reply::Response {
     #[derive(serde::Serialize)]
     struct JsonRpcSuccessResp {
-        jsonrpc: &'static str,
-        result: serde_json::Value,
-        id: serde_json::Value,
         ok: serde_json::Value,
+        result: serde_json::Value,
+        #[serde(rename = "@extra")]
+        extra: String,
     }
-    let body = JsonRpcSuccessResp { jsonrpc: "2.0", result, id, ok: serde_json::Value::Bool(true) };
+    let body =
+        JsonRpcSuccessResp { ok: serde_json::Value::Bool(true), result, extra: handlers::extra(0) };
     warp::reply::json(&body).into_response()
 }
 

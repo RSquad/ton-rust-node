@@ -43,11 +43,11 @@ async fn main() -> Result<()> {
         let mut cfs_opts = HashMap::new();
         cfs_opts.insert(
             "cells".to_string(),
-            DynamicBocDb::build_cells_cf_options(&CellsDbConfig::default()),
+            DynamicBocDb::build_cells_cf_options(&CellsDbConfig::default()).0,
         );
         cfs_opts.insert(
             "counters".to_string(),
-            DynamicBocDb::build_counters_cf_options(&CellsDbConfig::default()),
+            DynamicBocDb::build_counters_cf_options(&CellsDbConfig::default()).0,
         );
         let db = RocksDb::new(DB_PATH, DB_NAME, cfs_opts, AccessType::ReadOnly)?;
         let ss_db = ShardStateDb::new(
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         block_id = BlockIdExt {
             shard_id: ShardIdent::masterchain(),
             seq_no: 0,
-            root_hash: cell.repr_hash(),
+            root_hash: cell.repr_hash().clone(),
             file_hash: Default::default(),
         };
 
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
         block_id = BlockIdExt {
             shard_id: ShardIdent::masterchain(),
             seq_no: block_id.seq_no + 1,
-            root_hash: cell.repr_hash(),
+            root_hash: cell.repr_hash().clone(),
             file_hash: Default::default(),
         };
 

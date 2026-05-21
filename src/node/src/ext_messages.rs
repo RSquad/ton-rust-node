@@ -10,7 +10,7 @@
  */
 use crate::block::BlockStuff;
 use adnl::common::add_unbound_object_to_map_with_update;
-use lockfree::map::Map;
+use lockfree::map::{Insertion, Map, Preview};
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
     Arc,
@@ -92,7 +92,10 @@ impl MessageKeeper {
         if active {
             let generation = Self::fetch_generation(atomic_storage);
             Self::set_active(&mut atomic_storage, false);
-            Self::set_reactivate_at(&mut atomic_storage, now + generation as u32 * 5);
+            // (generation + 1) * 5 so the first postpone (generation == 0) gives
+            // a non-zero grace window; otherwise reactivate_at == now and the
+            // very next iteration would immediately re-activate the message.
+            Self::set_reactivate_at(&mut atomic_storage, now + (generation as u32 + 1) * 5);
             self.atomic_storage.store(atomic_storage, Ordering::Relaxed);
         }
     }
@@ -306,36 +309,63 @@ impl MessagesPool {
             self.clear_expired_messages(timestamp, u64::MAX);
             self.increment_min_timestamp(timestamp);
         }
-        if let Some(maximum_queue_length) = self.maximum_queue_length {
-            if self.total_messages.load(Ordering::Relaxed) >= maximum_queue_length {
+
+        // Use extract_dst_std_address so AddrVar destinations (>= 64 dst bits,
+        // no anycast - anycast is rejected by create_ext_message) are routed and
+        // rate-limited by their real workchain/address rather than collapsing to
+        // (wc, 0) like int_dst_account_id() would.
+        let (workchain_id, account_slice) = message.extract_dst_std_address(true)?;
+        let addr_key = (workchain_id, UInt256::from_slice(&account_slice.get_bytestring(0)));
+        let prefix = account_slice.get_int(64)?;
+
+        // Build the keeper before reserving any admission slot so a failure here
+        // (e.g. normalized_hash) can't leak a reserved counter.
+        let keeper = MessageKeeper::new(message, addr_key.clone())?;
+        let hash_norm = keeper.hash_norm.clone();
+
+        // Reserve a global slot atomically. fetch_update guarantees we never go
+        // above the configured cap regardless of admission concurrency.
+        if let Some(cap) = self.maximum_queue_length {
+            if self
+                .total_messages
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    if v >= cap {
+                        None
+                    } else {
+                        Some(v + 1)
+                    }
+                })
+                .is_err()
+            {
                 fail!("maximum number of messages in pool is reached")
             }
+        } else {
+            self.total_messages.fetch_add(1, Ordering::Relaxed);
         }
 
-        let workchain_id = message.dst_workchain_id().unwrap_or_default();
-        let account_id = message
-            .int_dst_account_id()
-            .map_or(UInt256::default(), |s| UInt256::from_slice(&s.get_bytestring(0)));
-        let addr_key = (workchain_id, account_id);
-
-        // Per-address rate limiting
-        if let Some(guard) = self.per_address.get(&addr_key) {
-            if guard.val().load(Ordering::Relaxed) >= LIMIT_MEMPOOL_PER_ADDRESS {
-                fail!(
-                    "per-address limit ({}) reached for {}:{}",
-                    LIMIT_MEMPOOL_PER_ADDRESS,
-                    workchain_id,
-                    addr_key.1.to_hex_string()
-                )
-            }
+        // Reserve a per-address slot atomically. On failure, roll back the
+        // global slot we just took.
+        if let Err(e) = self.try_admit_per_address(&addr_key) {
+            self.total_messages.fetch_sub(1, Ordering::Relaxed);
+            return Err(e);
         }
 
         log::debug!(target: EXT_MESSAGES_TRACE_TARGET, "adding external message {:x}", id);
-        let prefix =
-            message.int_dst_account_id().map_or(0, |slice| slice.get_int(64).unwrap_or_default());
-        let keeper = MessageKeeper::new(message, addr_key.clone())?;
-        let hash_norm = keeper.hash_norm.clone();
-        self.messages.insert(id.clone(), keeper);
+
+        // Atomically install the keeper. On a concurrent duplicate the second
+        // admitter must back out reservations instead of double-counting.
+        let inserted = self.messages.insert_with(id.clone(), |_, _, found| {
+            if found.is_some() {
+                Preview::Discard
+            } else {
+                Preview::New(keeper.clone())
+            }
+        });
+        if !matches!(inserted, Insertion::Created) {
+            self.total_messages.fetch_sub(1, Ordering::Relaxed);
+            self.decrement_per_address(&addr_key);
+            return Ok(());
+        }
 
         // Index by normalized hash for variant-aware cleanup
         add_unbound_object_to_map_with_update(&self.norm_messages, hash_norm, |bucket| {
@@ -349,13 +379,6 @@ impl MessagesPool {
             }
         })?;
 
-        // Increment per-address counter
-        if let Some(guard) = self.per_address.get(&addr_key) {
-            guard.val().fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.per_address.insert(addr_key, AtomicU32::new(1));
-        }
-        self.total_messages.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         self.total_in_order.fetch_add(1, Ordering::Relaxed);
         metrics::gauge!("ton_node_ext_messages_queue_size").increment(1f64);
@@ -372,6 +395,38 @@ impl MessagesPool {
         Ok(())
     }
 
+    fn try_admit_per_address(&self, addr_key: &(i32, UInt256)) -> Result<()> {
+        let mut limit_reached = false;
+        add_unbound_object_to_map_with_update(&self.per_address, addr_key.clone(), |existing| {
+            if let Some(counter) = existing {
+                if counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        if v >= LIMIT_MEMPOOL_PER_ADDRESS {
+                            None
+                        } else {
+                            Some(v + 1)
+                        }
+                    })
+                    .is_err()
+                {
+                    limit_reached = true;
+                }
+                Ok(None)
+            } else {
+                Ok(Some(AtomicU32::new(1)))
+            }
+        })?;
+        if limit_reached {
+            fail!(
+                "per-address limit ({}) reached for {}:{}",
+                LIMIT_MEMPOOL_PER_ADDRESS,
+                addr_key.0,
+                addr_key.1.to_hex_string()
+            )
+        }
+        Ok(())
+    }
+
     pub fn iter(
         self: Arc<MessagesPool>,
         shard: ShardIdent,   // shard is used to filter messages
@@ -383,17 +438,16 @@ impl MessagesPool {
 
     pub fn complete_messages(
         &self,
-        to_delay: Vec<(UInt256, String)>,
-        to_delete: Vec<(UInt256, i32)>,
+        to_delay: &[UInt256],
+        to_delete: &[UInt256],
         now: u32,
     ) -> Result<()> {
-        for (id, reason) in &to_delay {
+        for id in to_delay {
             let result = self.messages.remove_with(id, |(_, keeper)| {
                 if keeper.can_postpone() {
                     log::debug!(
                         target: EXT_MESSAGES_TRACE_TARGET,
-                        "complete_messages: postponed external message {:x} with reason {} while enumerating to_delay list",
-                        id, reason
+                        "complete_messages: postponed external message {:x}", id
                     );
                     keeper.postpone(now);
                     false
@@ -404,19 +458,27 @@ impl MessagesPool {
             if let Some(guard) = result {
                 log::debug!(
                     target: EXT_MESSAGES_TRACE_TARGET,
-                    "complete_messages: removing external message {:x} with reason {} because can't postpone",
-                    id, reason,
+                    "complete_messages: removing external message {:x} because can't postpone",
+                    id,
                 );
                 self.finalize_removal(id, guard.val());
             }
         }
 
-        // Remove accepted messages and all their normalized-hash variants from the pool
-        let hash_norms: Vec<UInt256> = to_delete
-            .iter()
-            .filter_map(|(id, _wc)| self.messages.get(id).map(|g| g.val().hash_norm.clone()))
-            .collect();
-        self.erase_by_hash_norm(&hash_norms);
+        // Erase rejected messages by raw id only. Normalized-hash siblings are
+        // intentionally kept: a rejected variant (e.g. bad signature on a wallet
+        // message) does not invalidate sibling variants that may still succeed.
+        // Norm-hash-wide cleanup only happens on actual block apply, in
+        // process_applied_block.
+        for id in to_delete {
+            if let Some(guard) = self.messages.remove(id) {
+                log::debug!(
+                    target: EXT_MESSAGES_TRACE_TARGET,
+                    "complete_messages: removing rejected external message {:x}", id
+                );
+                self.finalize_removal(id, guard.val());
+            }
+        }
 
         Ok(())
     }
@@ -435,8 +497,17 @@ impl MessagesPool {
     }
 
     fn remove_from_norm_index(&self, id: &UInt256, hash_norm: &UInt256) {
-        if let Some(bucket) = self.norm_messages.get(hash_norm) {
+        let became_empty = if let Some(bucket) = self.norm_messages.get(hash_norm) {
             bucket.val().remove(id);
+            bucket.val().iter().next().is_none()
+        } else {
+            false
+        };
+        // Drop the empty bucket.
+        // remove_with re-checks emptiness atomically with the CAS, so we won't
+        // delete a bucket that a concurrent insertion has just populated.
+        if became_empty {
+            self.norm_messages.remove_with(hash_norm, |(_, bucket)| bucket.iter().next().is_none());
         }
     }
 
@@ -450,11 +521,16 @@ impl MessagesPool {
     }
 
     fn decrement_per_address(&self, addr_key: &(i32, UInt256)) {
-        if let Some(guard) = self.per_address.get(addr_key) {
-            let prev = guard.val().fetch_sub(1, Ordering::Relaxed);
-            if prev <= 1 {
-                self.per_address.remove(addr_key);
-            }
+        let prev = match self.per_address.get(addr_key) {
+            Some(guard) => guard.val().fetch_sub(1, Ordering::Relaxed),
+            None => return,
+        };
+        if prev == 1 {
+            // Drop the entry only if it is still at zero. A concurrent admission
+            // may have just incremented the same counter through the existing
+            // Arc; in that case we must keep the entry to avoid losing the count.
+            self.per_address
+                .remove_with(addr_key, |(_, counter)| counter.load(Ordering::Relaxed) == 0);
         }
     }
 
@@ -529,20 +605,25 @@ impl MessagePoolIter {
         &mut self,
         map: &Map<u32, MessageDescription>,
     ) -> Option<(Arc<Message>, UInt256)> {
-        // if link is valid we check if message is for desired shard and is active
         let descr = map.get(&self.seqno)?;
-        let keeper = self.pool.messages.get(&descr.val().id)?;
-        if self.shard.contains_prefix(descr.val().workchain_id, descr.val().prefix)
-            && keeper.val().check_active(self.now)
-        {
-            return Some((keeper.val().message().clone(), descr.val().id.clone()));
+        let id = descr.val().id.clone();
+        let workchain_id = descr.val().workchain_id;
+        let prefix = descr.val().prefix;
+        if let Some(keeper) = self.pool.messages.get(&id) {
+            if self.shard.contains_prefix(workchain_id, prefix)
+                && keeper.val().check_active(self.now)
+            {
+                return Some((keeper.val().message().clone(), id));
+            }
+            None
+        } else {
+            // Tombstone: the message was removed from the live map but its
+            // OrderMap slot was left behind. Drop it so subsequent scans do
+            // not re-pay the missed live lookup for the same seqno.
+            drop(descr);
+            map.remove(&self.seqno);
+            None
         }
-        // let descr = map.get(&self.seqno)?.1.clone();
-        // let keeper = self.pool.messages.get(&descr.id)?.1.clone();
-        // if self.shard.contains_prefix(descr.workchain_id, descr.prefix) && keeper.check_active(self.now) {
-        //     return Some((keeper.message().clone(), descr.id));
-        // }
-        None
     }
 }
 
@@ -550,11 +631,17 @@ impl Iterator for MessagePoolIter {
     type Item = (Arc<Message>, UInt256);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let now = UnixTime::now_ms();
         let min_timestamp = self.pool.min_timestamp.load(Ordering::Relaxed);
-        // Iterate from newest to oldest (reverse chronological order)
+        // Iterate from newest to oldest (reverse chronological order).
+        // Deadline is re-read on every check so a single next() call cannot
+        // overrun finish_time_ms while sweeping past tombstones or non-shard
+        // entries.
         loop {
-            if self.finish_time_ms < now {
+            if self.finish_time_ms <= UnixTime::now_ms() {
+                log::debug!(
+                    target: EXT_MESSAGES_TRACE_TARGET,
+                    "external messages timeout has expired, finishing iteration",
+                );
                 return None;
             }
             if self.timestamp < min_timestamp {
@@ -580,7 +667,11 @@ impl Iterator for MessagePoolIter {
                 self.pool.order.get(&self.timestamp).map(|guard| guard.val().clone())
             {
                 while self.seqno < order.seqno.load(Ordering::Relaxed) {
-                    if self.finish_time_ms < now {
+                    if self.finish_time_ms <= UnixTime::now_ms() {
+                        log::debug!(
+                            target: EXT_MESSAGES_TRACE_TARGET,
+                            "external messages timeout has expired, finishing iteration",
+                        );
                         return None;
                     }
                     let result = self.find_in_map(&order.map);

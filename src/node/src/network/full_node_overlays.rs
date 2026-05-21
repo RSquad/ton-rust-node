@@ -483,7 +483,11 @@ impl FullNodeOverlaysRouter {
                     let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_addr.port());
                     match key.pvt_key() {
                         Ok(pvt_key) => {
-                            if let Err(e) = quic.add_key(pvt_key, cid, bind_addr) {
+                            if let Err(e) = quic.add_key(
+                                (&pvt_key.lock()? as &[u8]).try_into()?,
+                                cid,
+                                bind_addr,
+                            ) {
                                 log::warn!(
                                     "special_update_fastsync: cannot add QUIC key {cid}: {e}"
                                 );
@@ -782,14 +786,17 @@ impl FullNodeOverlaysRouter {
         self: &Arc<Self>,
         validators: &ValidatorSet,
     ) -> Result<Option<Arc<dyn KeyOption>>> {
-        let val_list_id = compute_validator_list_id(validators.list(), None)?
-            .ok_or_else(|| error!("Cant compute validator list id"))?;
+        if validators.list().is_empty() {
+            return Ok(None);
+        }
 
+        let val_list_id = compute_validator_list_id(validators.list(), None)?
+            .ok_or_else(|| error!("Can't compute validator list id"))?;
         match self.network.try_get_validator_adnl_key(&val_list_id) {
             None => {
                 log::info!(
                     "No local validator ADNL key for list {:x} (node is either not a validator \
-                     for this list yet, or validator network context is still not ready)",
+                    for this list yet, or validator network context is still not ready)",
                     val_list_id
                 );
                 return Ok(None);

@@ -47,7 +47,7 @@ use ton_api::{
 };
 use ton_block::{
     error, sha256_digest, signature::BlockSignaturesVariant, BlockIdExt, BocFlags, BocWriter,
-    BuilderData, Ed25519KeyOption, ShardIdent, UInt256,
+    BuilderData, Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes,
 };
 
 // ============================================================================
@@ -71,7 +71,8 @@ fn make_test_boc(data: &[u8], flags: BocFlags) -> Vec<u8> {
 fn create_test_validators(count: u32) -> Vec<SessionNode> {
     (0..count)
         .map(|_| {
-            let public_key = Ed25519KeyOption::generate().expect("Failed to generate key");
+            let public_key =
+                Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key");
             let adnl_id = public_key.id().clone();
             SessionNode { public_key, adnl_id, weight: 1 }
         })

@@ -528,7 +528,7 @@ pub async fn get_config(
         vec![NodeNetwork::TAG_DHT_KEY, NodeNetwork::TAG_OVERLAY_KEY],
         Some(resolved_ip),
     )?;
-    TonNodeConfig::from_file(config_dir, config_file, Some(adnl_config), default, None)
+    TonNodeConfig::from_file(config_dir, config_file, Some(adnl_config), default, None).await
 }
 
 pub async fn test_async(test: impl Fn() -> Pinned<'static, ()>, done: impl Fn()) {
@@ -1261,8 +1261,8 @@ impl EngineOperations for TestEngine {
     }
     fn complete_external_messages(
         &self,
-        to_delay: Vec<(UInt256, String)>,
-        to_delete: Vec<(UInt256, i32)>,
+        to_delay: &[UInt256],
+        to_delete: &[UInt256],
     ) -> Result<()> {
         self.ext_messages.complete_messages(to_delay, to_delete, self.now())
     }

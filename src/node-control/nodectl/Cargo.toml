@@ -16,5 +16,4 @@ commands = { path = "../commands" }
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
     "hashicorp-storage",
-    "ton-block",
 ] }

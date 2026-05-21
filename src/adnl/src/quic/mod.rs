@@ -40,7 +40,8 @@ use ton_api::{
     IntoBoxed,
 };
 use ton_block::{
-    ed25519_encode_private_key_to_pkcs8, error, fail, Ed25519KeyOption, KeyId, Result,
+    ed25519_encode_private_key_to_pkcs8, error, fail, sha256_digest_slices, KeyId, Result,
+    ED25519_KEY_TYPE, ED25519_SECRET_KEY_LENGTH,
 };
 
 const TARGET: &str = "quic";
@@ -87,8 +88,7 @@ fn key_id_from_spki(spki: &[u8]) -> Result<Arc<KeyId>> {
     let pub_key: &[u8; 32] = spki[ED25519_KEY_OFFSET..]
         .try_into()
         .map_err(|_| error!("Cannot slice Ed25519 public key from SPKI"))?;
-    let data =
-        ton_block::sha256_digest_slices(&[&Ed25519KeyOption::KEY_TYPE.to_le_bytes(), pub_key]);
+    let data = sha256_digest_slices(&[&ED25519_KEY_TYPE.to_le_bytes(), pub_key]);
     Ok(KeyId::from_data(data))
 }
 
@@ -394,7 +394,7 @@ struct EndpointState {
 /// on bare OS threads (e.g. Simplex SXMAIN). The channel decouples the two.
 enum KeyCommand {
     AddKey {
-        key: [u8; Ed25519KeyOption::PVT_KEY_SIZE],
+        key: [u8; ED25519_SECRET_KEY_LENGTH],
         key_id: Arc<KeyId>,
         bind_addr: SocketAddr,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
@@ -564,7 +564,7 @@ impl QuicNode {
     /// Tokio-hosted background task via an internal channel.
     pub fn add_key(
         &self,
-        key: &[u8; Ed25519KeyOption::PVT_KEY_SIZE],
+        key: &[u8; ED25519_SECRET_KEY_LENGTH],
         key_id: &Arc<KeyId>,
         bind_addr: SocketAddr,
     ) -> Result<()> {
@@ -594,7 +594,7 @@ impl QuicNode {
     /// (called by the background key-command task).
     fn add_key_inner(
         &self,
-        key: &[u8; Ed25519KeyOption::PVT_KEY_SIZE],
+        key: &[u8; ED25519_SECRET_KEY_LENGTH],
         key_id: &Arc<KeyId>,
         bind_addr: SocketAddr,
     ) -> Result<()> {

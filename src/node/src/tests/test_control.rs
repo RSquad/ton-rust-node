@@ -577,6 +577,7 @@ async fn test_control_send_message() {
         DEFAULT_CONFIG,
         None,
     )
+    .await
     .unwrap();
 
     let (control, mut client, _, _) = start_control_with_config(

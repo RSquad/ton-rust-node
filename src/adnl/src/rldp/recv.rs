@@ -217,6 +217,7 @@ pub(crate) struct RecvTransfer {
     buf: Vec<u8>,
     complete: Complete,
     confirm: Confirm,
+    expected_total_size: Option<usize>,
     parts: RecvParts,
     start: Instant,
     state: Arc<RecvTransferState>,
@@ -227,6 +228,7 @@ impl RecvTransfer {
         transfer_id: TransferId,
         counter: Arc<AtomicU64>,
         v2: bool,
+        expected_total_size: Option<usize>,
         #[cfg(feature = "debug")] timestamp: Arc<AtomicPtr<Instant>>,
     ) -> Self {
         let (complete, confirm, parts) = if v2 {
@@ -251,6 +253,7 @@ impl RecvTransfer {
             complete,
             confirm,
             data: Vec::new(),
+            expected_total_size,
             parts,
             start: Instant::now(),
             state: Arc::new(RecvTransferState {
@@ -297,15 +300,26 @@ impl RecvTransfer {
         };
         let total_size = if let Some(total_size) = self.total_size {
             if total_size != chunk.total_size as usize {
-                fail!("Incorrect total size in RLDP packet")
+                log::warn!(
+                    "Incorrect total size {} in RLDP chunk - expected {total_size}, skipping",
+                    chunk.total_size
+                );
+                return Ok(None);
             }
             total_size
         } else {
             let total_size = chunk.total_size as usize;
+            let cap = self
+                .expected_total_size
+                .map(|s| s.min(Constraints::MAX_TOTAL_TRANSFER_SIZE))
+                .unwrap_or(Constraints::MAX_TOTAL_TRANSFER_SIZE);
+            if total_size > cap {
+                fail!("RLDP total size {total_size} exceeds cap {cap}");
+            }
             self.total_size = Some(total_size);
             self.data
                 .try_reserve_exact(total_size)
-                .map_err(|e| error!("RLDP total size {} is too big: {}", total_size, e))?;
+                .map_err(|e| error!("RLDP total size {total_size} is too big: {e}"))?;
             total_size
         };
         let chunk_part_usize = chunk.part as usize;
@@ -334,11 +348,12 @@ impl RecvTransfer {
                             in_transit -= 1
                         }
                         if in_transit > Constraints::MAX_PARTS_IN_TRANSIT {
-                            fail!(
-                                "Too big RLDP part number {}, we did not finish previous {} yet",
-                                chunk.part,
-                                in_transit
-                            )
+                            log::warn!(
+                                "Too big RLDP part number {} in chunk, \
+                                we did not finish previous {in_transit} yet, skipping",
+                                chunk.part
+                            );
+                            return Ok(None);
                         }
                     }
                     while parts.len() <= chunk_part_usize {
@@ -382,9 +397,8 @@ impl RecvTransfer {
                 RecvParts::V1(part) => {
                     if data.len() + self.data.len() > total_size {
                         fail!(
-                            "Too big size for RLDP transfer {}, expected {}",
-                            data.len() + self.data.len(),
-                            total_size
+                            "Too big size for RLDP transfer {}, expected {total_size}",
+                            data.len() + self.data.len()
                         )
                     } else {
                         self.data.append(&mut data)
@@ -404,14 +418,11 @@ impl RecvTransfer {
                         len += data.len()
                     }
                     if len > total_size {
-                        fail!("Too big size for RLDP transfer {}, expected {}", len, total_size)
+                        fail!("Too big size for RLDP transfer {len}, expected {total_size}")
                     } else if len == total_size {
                         for part in parts {
                             let Some(data) = &mut part.data else {
-                                fail!(
-                                    "RLDP transfer is completed by size ({}), but not finished",
-                                    len
-                                )
+                                fail!("RLDP transfer is completed by size {len}, but not finished")
                             };
                             self.data.append(data)
                         }

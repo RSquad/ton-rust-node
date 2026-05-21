@@ -20,7 +20,7 @@ use ton_api::{
     },
     BoxedSerialize, IntoBoxed, Signing,
 };
-use ton_block::{base64_decode, base64_encode, Ed25519KeyOption, UInt256};
+use ton_block::{base64_decode, base64_encode, Ed25519KeyOption, UInt256, ZeroizingBytes};
 
 // TODO: will be refactored in ton_api
 #[macro_export]
@@ -71,7 +71,8 @@ fn get_node() -> DhtNode {
 #[test]
 fn test_real_dht_node_data() {
     let mut node = get_node().only();
-    let public = Ed25519KeyOption::from_public_key(node.id.key().unwrap().as_slice());
+    let public =
+        Ed25519KeyOption::<ZeroizingBytes>::from_public_key(node.id.key().unwrap().as_slice());
     node.verify(&public).expect("signature must be verified ok");
 }
 
@@ -80,7 +81,8 @@ fn test_real_dht_store_data() {
     let data = hex::decode(STORE_PACKET).unwrap();
     let object = deserialize_boxed(data).unwrap();
     let mut value = object.downcast::<Store>().expect("It should be Store").value;
-    let public = Ed25519KeyOption::from_public_key(value.key.id.key().unwrap().as_slice());
+    let public =
+        Ed25519KeyOption::<ZeroizingBytes>::from_public_key(value.key.id.key().unwrap().as_slice());
     value.verify(&public).expect("signature must be verified ok");
     value.key.verify(&public).expect("signature must be verified ok");
     println!("DHT {:?}", value);
@@ -97,7 +99,7 @@ fn test_check_signature() {
     // use public key from deserialized node struct to check signature
     let mut pub_key = [0; 32];
     pub_key.copy_from_slice(node.id.key().unwrap().as_slice());
-    let keypair = Ed25519KeyOption::from_public_key(&pub_key);
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&pub_key);
     let signature = mem::take(&mut node.signature);
     let bytes = node.into_boxed().boxed_serialized_bytes().unwrap();
     assert!(keypair.verify(&bytes, &signature).is_ok());
@@ -106,7 +108,7 @@ fn test_check_signature() {
 #[test]
 fn test_sign_and_check_signature() {
     let mut node = get_node().only();
-    let keypair = Ed25519KeyOption::generate().unwrap();
+    let keypair = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let key = UInt256::with_array(keypair.pub_key().unwrap().try_into().unwrap());
     node.id = Ed25519 { key }.into_boxed();
     node.signature = Default::default();
@@ -118,7 +120,7 @@ fn test_sign_and_check_signature() {
 fn calc_key_id(key: &str) {
     println!("\nKey {}", key);
     let key = base64_decode(key).unwrap();
-    let key = Ed25519KeyOption::from_public_key(&key.try_into().unwrap());
+    let key = Ed25519KeyOption::<ZeroizingBytes>::from_public_key(&key.try_into().unwrap());
     println!("KeyId {} {:x?}", key.id(), key.id());
 }
 
@@ -126,7 +128,9 @@ fn calc_key_id_from_private(key: &str) {
     println!("\nKey {}", key);
     let key = base64_decode(key).unwrap();
     //let key = ed25519_dalek::SecretKey::from_bytes(&key).unwrap();
-    let key = Ed25519KeyOption::from_private_key(key.as_slice().try_into().unwrap()).unwrap();
+    let key =
+        Ed25519KeyOption::<ZeroizingBytes>::from_private_key(key.as_slice().try_into().unwrap())
+            .unwrap();
     println!("KeyId {} key {}", key.id(), base64_encode(key.pub_key().unwrap()));
 }
 

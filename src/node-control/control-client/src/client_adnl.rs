@@ -486,7 +486,7 @@ mod tests {
     use super::*;
     use adnl::common::Timeouts;
     use std::time::{Duration, Instant};
-    use ton_block::Ed25519KeyOption;
+    use ton_block::{Ed25519KeyOption, ZeroizingBytes};
 
     /// Verifies that connecting to an unreachable peer does not park the
     /// tokio worker thread, by running another async task concurrently on a
@@ -502,7 +502,7 @@ mod tests {
         // RFC 5737 TEST-NET-1: guaranteed unreachable.
         let blackhole = "192.0.2.1:12345".parse().unwrap();
         let timeouts = Timeouts::with_duration(Duration::from_millis(800));
-        let server_key = Ed25519KeyOption::generate().unwrap();
+        let server_key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
         let config = AdnlClientConfig::new(None, blackhole, server_key, timeouts);
         let mut client = ControlClientAdnl::new(config, 1);
 

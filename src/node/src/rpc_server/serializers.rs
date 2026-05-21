@@ -90,48 +90,93 @@ pub(crate) fn serialize_uint256(id: &UInt256) -> serde_json::Value {
     serde_json::json!(base64_encode(id.as_slice()))
 }
 
-pub(crate) fn serialize_transaction(tr: &Transaction, tr_cell: Cell, address: &str) -> JsonResult {
-    let testnet = address.starts_with('k') || address.starts_with('0');
-    let fee = tr.total_fees().coins.as_u128();
-    let storage_fee = match tr.read_description()? {
+pub(crate) fn serialize_transaction(
+    tr: &Transaction,
+    tr_cell: Cell,
+    address: &str,
+    type_name: &str,
+    account: Option<&str>,
+    testnet: bool,
+) -> JsonResult {
+    let message_format = match type_name {
+        "ext.transaction" => MessageFormat::Ext,
+        _ => MessageFormat::Raw,
+    };
+    let descr = tr.read_description()?;
+    let action_phase_fees = match &descr {
         TransactionDescr::Ordinary(descr) => {
-            descr.storage_ph.map_or(0, |ph| ph.storage_fees_collected.as_u128())
+            descr.action.as_ref().map_or(0, action_phase_external_fees)
+        }
+        TransactionDescr::TickTock(descr) => {
+            descr.action.as_ref().map_or(0, action_phase_external_fees)
+        }
+        TransactionDescr::SplitPrepare(descr) => {
+            descr.action.as_ref().map_or(0, action_phase_external_fees)
+        }
+        TransactionDescr::MergeInstall(descr) => {
+            descr.action.as_ref().map_or(0, action_phase_external_fees)
+        }
+        _ => 0,
+    };
+    let fee = tr.total_fees().coins.as_u128() + action_phase_fees;
+    let storage_fee = match &descr {
+        TransactionDescr::Ordinary(descr) => {
+            descr.storage_ph.as_ref().map_or(0, |ph| ph.storage_fees_collected.as_u128())
         }
         TransactionDescr::TickTock(descr) => descr.storage.storage_fees_collected.as_u128(),
         _ => 0, // wrong tr type
     };
     let in_msg = if let Some(msg_cell) = tr.in_msg_cell() {
-        serialize_message(msg_cell, None, Some(address), testnet)?
+        Some(serialize_message(msg_cell, None, Some(address), testnet, message_format)?)
     } else {
-        Default::default()
+        None
     };
     let mut out_msgs = Vec::new();
     tr.out_msgs.iterate_slices(|slice| {
-        out_msgs.push(serialize_message(slice.reference(0)?, Some(address), None, testnet)?);
+        out_msgs.push(serialize_message(
+            slice.reference(0)?,
+            Some(address),
+            None,
+            testnet,
+            message_format,
+        )?);
         Ok(true)
     })?;
 
-    Ok(serde_json::json!({
-        "TransactionId": {
-            "@type": "raw.transaction",
-            "address": {
-                "@type": "accountAddress",
-                "account_address": address,
-            },
-            "utime": tr.now(),
-            "data": serialize_cell_opt(Some(&tr_cell)),
-            "transaction_id": {
-                "@type": "internal.transactionId",
-                "lt": tr.logical_time().to_string(),
-                "hash": serialize_uint256(&tr_cell.repr_hash()),
-            },
-            "fee": fee.to_string(),
-            "storage_fee": storage_fee.to_string(),
-            "other_fee": (fee - storage_fee).to_string(),
-            "in_msg": in_msg,
-            "out_msgs": out_msgs
-        }
-    }))
+    let mut obj = serde_json::Map::new();
+    obj.insert("@type".into(), serde_json::Value::String(type_name.into()));
+    obj.insert(
+        "address".into(),
+        serde_json::json!({
+            "@type": "accountAddress",
+            "account_address": address,
+        }),
+    );
+    if let Some(acc) = account {
+        obj.insert("account".into(), serde_json::Value::String(acc.to_string()));
+    }
+    obj.insert("utime".into(), serde_json::json!(tr.now()));
+    obj.insert("data".into(), serde_json::json!(serialize_cell_opt(Some(&tr_cell))));
+    obj.insert(
+        "transaction_id".into(),
+        serde_json::json!({
+            "@type": "internal.transactionId",
+            "lt": tr.logical_time().to_string(),
+            "hash": serialize_uint256(&tr_cell.repr_hash()),
+        }),
+    );
+    obj.insert("fee".into(), serde_json::json!(fee.to_string()));
+    obj.insert("storage_fee".into(), serde_json::json!(storage_fee.to_string()));
+    obj.insert("other_fee".into(), serde_json::json!((fee - storage_fee).to_string()));
+    if let Some(in_msg) = in_msg {
+        obj.insert("in_msg".into(), in_msg);
+    }
+    obj.insert("out_msgs".into(), serde_json::json!(out_msgs));
+    Ok(serde_json::Value::Object(obj))
+}
+
+fn action_phase_external_fees(action: &ton_block::TrActionPhase) -> u128 {
+    action.total_fwd_fees().as_u128().saturating_sub(action.total_action_fees().as_u128())
 }
 
 fn serialize_message(
@@ -139,6 +184,7 @@ fn serialize_message(
     src: Option<&str>,
     dst: Option<&str>,
     testnet: bool,
+    format: MessageFormat,
 ) -> JsonResult {
     let hash = msg_cell.repr_hash().clone();
     let msg = Message::construct_from_cell(msg_cell).unwrap_or_default();
@@ -148,11 +194,13 @@ fn serialize_message(
         let bh = body_cell.repr_hash().clone();
         (serialize_cell_opt(Some(&body_cell)), bh, Some(body))
     } else {
-        (String::new(), Cell::default().repr_hash().clone(), None)
+        // toncenter v2: empty body is serialized as BoC of an empty cell, not as ""
+        let empty = Cell::default();
+        let bh = empty.repr_hash().clone();
+        (serialize_cell_opt(Some(&empty)), bh, None)
     };
     let init_state =
         serialize_cell_opt(msg.state_init().and_then(|init| init.serialize().ok()).as_ref());
-    // let bounce = int_header.bounce;
     let addr_mode = if testnet {
         ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE | ADDR_FORMAT_TESTNET
     } else {
@@ -166,54 +214,57 @@ fn serialize_message(
         "init_state": &init_state,
     });
 
-    let mut message_str = String::new();
-    if let Some(body) = body_opt {
+    if let Some(body) = &body_opt {
         if let Some(text) = decode_comment_from_body(body) {
             let text_b64 = base64_encode(text.as_bytes());
             msg_data_json = serde_json::json!({
                 "@type": "msg.dataText",
                 "text": text_b64,
             });
-            message_str = text;
-        } else {
-            let mut slice = body.clone();
-            let bits = slice.remaining_bits();
-            let mut out = Vec::with_capacity((bits + 7) / 8);
-
-            while slice.remaining_bits() > 0 {
-                let mut b: u8 = 0;
-                let mut taken = 0;
-
-                while taken < 8 && slice.remaining_bits() > 0 {
-                    let bit = slice.get_next_bit()? as u8;
-                    b = (b << 1) | bit;
-                    taken += 1;
-                }
-                if taken < 8 {
-                    b <<= 8 - taken;
-                }
-                out.push(b);
-            }
-
-            let mut msg_b64 = base64_encode(&out);
-            msg_b64.push('\n'); // like ton center
-            message_str = msg_b64;
         }
     }
-    Ok(serde_json::json!({"TransactionId": {
-        "@type": "raw.message",
+    let message = body_opt
+        .as_ref()
+        .map(|body| format!("{}\n", base64_encode(body.get_bytestring(0).as_slice())))
+        .unwrap_or_default();
+
+    let (msg_type, source, destination) = match format {
+        MessageFormat::Raw => (
+            "raw.message",
+            serde_json::json!({
+                "@type": "accountAddress",
+                "account_address": source,
+            }),
+            serde_json::json!({
+                "@type": "accountAddress",
+                "account_address": destination,
+            }),
+        ),
+        MessageFormat::Ext => {
+            ("ext.message", serde_json::json!(source), serde_json::json!(destination))
+        }
+    };
+
+    Ok(serde_json::json!({
+        "@type": msg_type,
         "hash": serialize_uint256(&hash),
         "source": source,
         "destination": destination,
         "value": int_header.value.coins.to_string(),
         "extra_currencies": Vec::<String>::new(), // TODO: fill extra currencies,
         "fwd_fee": int_header.fwd_fee.to_string(),
-        "extra_flags": int_header.extra_flags.to_string(),
+        "ihr_fee": int_header.extra_flags.to_string(),
         "created_lt": int_header.created_lt.to_string(),
         "body_hash": serialize_uint256(&body_hash),
         "msg_data": msg_data_json,
-        "message": message_str,
-    }}))
+        "message": message,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageFormat {
+    Raw,
+    Ext,
 }
 
 type ConversionError = TonError;

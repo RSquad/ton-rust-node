@@ -25,6 +25,7 @@ use crate::{
     transport::{udp_sender_receiver, udp_tcp_sender_receiver, AdnlReceiver, AdnlSender},
 };
 use rand::Rng;
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{
     borrow::Cow,
     cmp::{max, min},
@@ -66,7 +67,7 @@ use ton_api::{
 };
 use ton_block::{
     base64_encode, error, fail, lz4_compress, lz4_decompress, sha256_digest, Ed25519KeyOption,
-    KeyId, KeyOption, KeyOptionJson, Lz4DecompressMode, Result, UInt256,
+    KeyId, KeyOption, KeyOptionJson, Lz4DecompressMode, Result, UInt256, ZeroizingBytes,
 };
 
 #[macro_export]
@@ -466,7 +467,9 @@ impl AdnlChannel {
         channel_pub_key: &[u8; 32],
         counter: Arc<AtomicU64>,
     ) -> Result<Self> {
-        let fwd_secret = channel_pvt_key.shared_secret(channel_pub_key)?;
+        let fwd_secret_pd = channel_pvt_key.shared_secret(channel_pub_key)?;
+        let fwd_secret_pd_data: &[u8] = &fwd_secret_pd.lock()?;
+        let fwd_secret: [u8; 32] = fwd_secret_pd_data.try_into()?;
         let cmp = local_key.cmp(other_key);
         let (fwd_secret, rev_secret) = if std::cmp::Ordering::Equal == cmp {
             (fwd_secret, fwd_secret)
@@ -641,7 +644,7 @@ impl AdnlNodeAddress {
         key: &Arc<dyn KeyOption>,
     ) -> Result<Self> {
         let ret = Self {
-            channel_key: Ed25519KeyOption::generate()?,
+            channel_key: get_key_option_factory().generate()?,
             ip_version_address_adnl: AtomicPair::new(
                 ip_address_adnl.version as u64,
                 ip_address_adnl.address,
@@ -728,9 +731,9 @@ impl AdnlNodeConfigJson {
         for key in self.keys.iter() {
             if key.tag == tag {
                 return if as_src {
-                    Ok(Ed25519KeyOption::from_private_key_json(&key.data)?)
+                    Ok(get_key_option_factory().from_private_key_json(&key.data)?)
                 } else {
-                    Ok(Ed25519KeyOption::from_public_key_json(&key.data)?)
+                    Ok(get_key_option_factory().from_public_key_json(&key.data)?)
                 };
             }
         }
@@ -779,7 +782,7 @@ impl AdnlNodeConfig {
     ) -> Result<(AdnlNodeConfigJson, Self)> {
         let mut keys = Vec::new();
         for (key, tag) in keytags {
-            let (json, key) = Ed25519KeyOption::from_private_key_with_json(&key)?;
+            let (json, key) = get_key_option_factory().from_private_key_with_json(&key)?;
             keys.push((json, key as Arc<dyn KeyOption>, tag))
         }
         Self::create_configs(ip_address, keys)
@@ -812,7 +815,7 @@ impl AdnlNodeConfig {
                 .unwrap_or(Self::DEFAULT_TIMEOUT_EXPIRE_QUEUED_PACKET_SEC),
         };
         for key in json_config.keys.iter() {
-            let data = Ed25519KeyOption::from_private_key_json(&key.data)?;
+            let data = get_key_option_factory().from_private_key_json(&key.data)?;
             ret.add_key(data, key.tag)?;
         }
         Ok(ret)
@@ -825,7 +828,7 @@ impl AdnlNodeConfig {
     ) -> Result<(AdnlNodeConfigJson, Self)> {
         let mut keys = Vec::new();
         for tag in tags {
-            let (json, key) = Ed25519KeyOption::generate_with_json()?;
+            let (json, key) = get_key_option_factory().generate_with_json()?;
             keys.push((json, key as Arc<dyn KeyOption>, tag))
         }
         Self::create_configs(ip_address, keys)
@@ -959,6 +962,7 @@ impl AdnlNodeConfig {
 pub struct DataCompression;
 
 impl DataCompression {
+    const MAX_DECOMPRESSED_SIZE: usize = 16 << 20; // 16 MB
     const SIZE_COMPRESSION_THRESHOLD: usize = 256;
     const TAG_COMPRESSED: u8 = 0x80;
 
@@ -981,27 +985,35 @@ impl DataCompression {
 
     pub fn decompress_raw(data: &[u8]) -> Option<Vec<u8>> {
         let len = data.len();
-        if len <= 1 {
-            None
-        } else if data[len - 1] != Self::TAG_COMPRESSED {
-            None
-        } else {
-            match lz4_decompress(&data[..len - 1], Lz4DecompressMode::WithPrependedSize) {
-                Err(e) => {
-                    log::trace!(target: TARGET, "Decompress error: {}", e);
+        if len <= 5 {
+            return None;
+        }
+        if data[len - 1] != Self::TAG_COMPRESSED {
+            return None;
+        }
+        let src_len = ((data[3] as usize) << 24)
+            | ((data[2] as usize) << 16)
+            | ((data[1] as usize) << 8)
+            | (data[0] as usize);
+        let max = Self::MAX_DECOMPRESSED_SIZE;
+        if src_len > max {
+            log::trace!(
+                target: TARGET,
+                "Decompress rejected: prepended size {src_len} exceeds cap {max}"
+            );
+            return None;
+        }
+        match lz4_decompress(&data[4..len - 1], Lz4DecompressMode::WithMaxSize(src_len as i32)) {
+            Err(e) => {
+                log::trace!(target: TARGET, "Decompress error: {e}");
+                None
+            }
+            Ok(ret) => {
+                if src_len != ret.len() {
                     None
-                }
-                Ok(ret) => {
-                    let src_len = ((data[3] as usize) << 24)
-                        | ((data[2] as usize) << 16)
-                        | ((data[1] as usize) << 8)
-                        | (data[0] as usize);
-                    if src_len != ret.len() {
-                        None
-                    } else {
-                        log::trace!(target: TARGET, "Decompress: {} -> {}", data.len(), src_len);
-                        Some(ret)
-                    }
+                } else {
+                    log::trace!(target: TARGET, "Decompress: {len} -> {src_len}");
+                    Some(ret)
                 }
             }
         }
@@ -1709,6 +1721,9 @@ impl RecvPipeline {
     }
 
     fn put(self: &Arc<Self>, data: Vec<u8>) {
+        if self.adnl.stop.is_stopped() {
+            return;
+        }
         #[cfg(feature = "telemetry")]
         self.adnl.telemetry.recv_bytes.update(data.len() as u64);
         #[cfg(feature = "telemetry")]
@@ -1743,16 +1758,33 @@ impl RecvPipeline {
     }
 
     async fn shutdown(&self) {
+        log::warn!(target: TARGET, "Stopping recv pipeline...");
+        let start = Instant::now();
+        let mut next_log = Duration::from_millis(AdnlNode::TIMEOUT_STOPPING_LOG_MS);
         loop {
             #[cfg(feature = "static_workers")]
             while let Some(sender) = self.sync.pop() {
                 sender.send(false).ok();
             }
-            if self.workers.load(Ordering::Relaxed) == 0 {
+            let workers = self.workers.load(Ordering::Relaxed);
+            if workers == 0 {
                 break;
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= next_log {
+                let urgent_in_proc = self.proc_urgent_packets.load(Ordering::Relaxed);
+                let normal_in_proc = self.proc_normal_packets.load(Ordering::Relaxed);
+                log::warn!(
+                    target: TARGET,
+                    "Still stopping recv pipeline, waited {}ms: \
+                    workers={workers}, processing urgent={urgent_in_proc} normal={normal_in_proc}",
+                    elapsed.as_millis()
+                );
+                next_log = elapsed + Duration::from_millis(AdnlNode::TIMEOUT_STOPPING_LOG_MS);
             }
             tokio::task::yield_now().await
         }
+        log::warn!(target: TARGET, "Recv pipeline stopped after {}ms", start.elapsed().as_millis());
     }
 
     fn spawn(self: &Arc<Self>) {
@@ -2260,7 +2292,7 @@ impl AdnlNode {
     pub(crate) const MASK_TRANSPORT: u32 = 0x00000010;
     const MASK_WATCHDOG: u32 = 0x00000020;
     #[cfg(feature = "dump")]
-    const MASK_DUMP: u32 = 0x00000020;
+    const MASK_DUMP: u32 = 0x00000040;
 
     const CLOCK_TOLERANCE_SEC: i32 = 60;
     const DEFAULT_TIMEOUT_CHANNEL_RESET_SEC: u64 = 30;
@@ -2273,6 +2305,7 @@ impl AdnlNode {
     const TIMEOUT_QUERY_MAX_MS: u64 = 5000;
     const TIMEOUT_QUERY_STOP_MS: u64 = 1;
     const TIMEOUT_SHUTDOWN_MS: u64 = 50;
+    const TIMEOUT_STOPPING_LOG_MS: u64 = 500;
     const TIMEOUT_TRANSFER_SEC: u64 = 5;
 
     /// Constructor
@@ -2592,7 +2625,7 @@ impl AdnlNode {
                 status.store(ts | 5, Ordering::Relaxed);
             }
             node.stop.release(Self::MASK_WATCHDOG);
-            log::info!(target: TARGET, "Node stopping watchdog stopped");
+            log::warn!(target: TARGET, "Node stopping watchdog stopped");
         });
         // Remote connections
         let node = self.clone();
@@ -2810,13 +2843,20 @@ impl AdnlNode {
     pub async fn stop(&self) {
         log::warn!(target: TARGET, "Stopping ADNL node...");
         self.stop.stop();
+        let mut elapsed_ms: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
+            elapsed_ms += Self::TIMEOUT_QUERY_STOP_MS;
             let running = self.stop.still_running();
             if running == 0 {
                 break;
             }
-            log::warn!(target: TARGET, "Still stopping ADNL node ({:x})...", running);
+            if elapsed_ms % Self::TIMEOUT_STOPPING_LOG_MS == 0 {
+                log::warn!(
+                    target: TARGET,
+                    "Still stopping ADNL node ({running:x}), waited {elapsed_ms}ms..."
+                );
+            }
         }
         tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_SHUTDOWN_MS)).await;
         log::warn!(target: TARGET, "ADNL node stopped");
@@ -4551,7 +4591,7 @@ impl AdnlNode {
         if let Some(channel) = channel {
             channel.encrypt_by_method(&mut data, version, &method)?;
         } else {
-            let key = Ed25519KeyOption::generate()?;
+            let key = Ed25519KeyOption::<ZeroizingBytes>::generate()?;
             AdnlHandshake::build_packet(&mut data, &key, &peer.address.key, version)?;
         }
         log::trace!(

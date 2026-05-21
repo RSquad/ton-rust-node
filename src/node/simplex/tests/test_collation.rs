@@ -27,7 +27,7 @@ use std::{
 };
 use ton_block::{
     sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
-    Ed25519KeyOption, ShardIdent, UInt256,
+    Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes,
 };
 
 include!("../../../common/src/info.rs");
@@ -323,7 +323,8 @@ fn run_collation_test() {
     log::info!("=== STARTING COLLATION TEST ===");
 
     // Create single node
-    let private_key = Ed25519KeyOption::generate().expect("Failed to generate private key");
+    let private_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
     let adnl_id = private_key.id();
     let public_key = private_key.clone();
 

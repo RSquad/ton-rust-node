@@ -1270,10 +1270,9 @@ impl Augmentation<DepthBalanceInfo> for Account {
         if let Some(balance) = self.balance() {
             info.set_balance(balance.clone());
         }
-        if let Some(state_init) = self.state_init() {
-            if let Some(fixed_prefix_length) = state_init.fixed_prefix_length {
-                info.set_split_depth(fixed_prefix_length);
-            }
+        // split_depth from anycast
+        if let Some(anycast) = self.get_addr().and_then(|a| a.rewrite_pfx()) {
+            info.set_split_depth(anycast.depth.as_u32())?;
         }
         Ok(info)
     }

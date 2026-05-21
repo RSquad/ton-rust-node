@@ -282,6 +282,67 @@ fn test_boc_decompress_zero_max_size() {
 }
 
 // ============================================
+// MAX_IMPROVED_NODE_COUNT regression tests
+// ============================================
+
+/// Builds `n` distinct leaf cells so the compressor's DAG contains exactly
+/// `n` nodes.
+fn build_n_distinct_leaves(n: usize) -> Vec<Cell> {
+    (0..n)
+        .map(|i| {
+            let mut b = BuilderData::new();
+            b.append_u64(i as u64).unwrap();
+            b.into_cell().unwrap()
+        })
+        .collect()
+}
+
+/// Crafts a minimal ImprovedStructureLZ4 payload whose header advertises the
+/// given `node_count`. The rest of the payload is intentionally truncated:
+/// the tests below only assert behavior of the node-count cap check, which
+/// fires (or does not fire) before any further parsing.
+fn craft_improved_lz4_with_node_count(node_count: u32) -> Vec<u8> {
+    let mut inner: Vec<u8> = Vec::new();
+    inner.extend_from_slice(&1u32.to_be_bytes()); // root_count = 1
+    inner.extend_from_slice(&0u32.to_be_bytes()); // root_indexes[0] = 0
+    inner.extend_from_slice(&node_count.to_be_bytes());
+    let mut compressed = lz4::block::compress(&inner, None, true).unwrap();
+    compressed[0..4].copy_from_slice(&(inner.len() as u32).to_be_bytes());
+    compressed
+}
+
+#[test]
+fn test_decompress_node_count_just_over_limit_fails() {
+    let payload = craft_improved_lz4_with_node_count((MAX_IMPROVED_NODE_COUNT + 1) as u32);
+    let err = boc_decompress_improved_structure_lz4(payload, 16 << 20).unwrap_err().to_string();
+    assert!(err.contains("exceeds limit"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_decompress_node_count_at_limit_does_not_trigger_cap_check() {
+    // node_count exactly at the limit must NOT trigger the cap check. The
+    // crafted payload is truncated, so decompression still fails — but for
+    // unrelated reasons. The assertion only forbids the cap-check error.
+    let payload = craft_improved_lz4_with_node_count(MAX_IMPROVED_NODE_COUNT as u32);
+    let err = boc_decompress_improved_structure_lz4(payload, 16 << 20).unwrap_err().to_string();
+    assert!(!err.contains("exceeds limit"), "must not fail on node count cap: {err}");
+}
+
+#[test]
+fn test_compress_node_count_just_over_limit_fails() {
+    let roots = build_n_distinct_leaves(MAX_IMPROVED_NODE_COUNT + 1);
+    let err = boc_compress_improved_structure_lz4(roots).unwrap_err().to_string();
+    assert!(err.contains("exceeds limit"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_compress_node_count_at_limit_passes() {
+    let roots = build_n_distinct_leaves(MAX_IMPROVED_NODE_COUNT);
+    let result = boc_compress_improved_structure_lz4(roots);
+    assert!(result.is_ok(), "expected success at the limit, got: {:?}", result.err());
+}
+
+// ============================================
 // Test vectors from RFC documentation
 // ============================================
 

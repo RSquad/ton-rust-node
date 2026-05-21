@@ -1850,7 +1850,7 @@ Configuration is specified in JSON format.
   "nodes": {
     "<node_name>": {
       "server_address": "<IP/DOMAIN NAME>:<PORT>",
-      "server_key": { "type_id": 1209251014, "pub_key": "<BASE64>" },
+      "server_key": { "type_id": 1209251014, "pub_key": "<BASE64>" } | { "name": "<VAULT_SECRET_NAME>" },
       "client_key": { "type_id": 1209251014, "pvt_key": "<BASE64>" } | { "name": "<VAULT_SECRET_NAME>" },
       "timeouts": 5
     }

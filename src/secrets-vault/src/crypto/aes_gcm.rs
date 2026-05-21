@@ -82,7 +82,7 @@ pub fn decrypt(key_material: &KeyMaterial, ciphertext: &[u8]) -> anyhow::Result<
     {
         let mut handle = decrypted.write_handle()?;
         handle.extend_from_slice(encrypted_data)?;
-        cipher.decrypt_in_place(nonce, b"", &mut handle).map_err(|e| {
+        cipher.decrypt_in_place(nonce, b"", &mut AeadWriteHandle(handle)).map_err(|e| {
             VaultError::decryption_failed(format!("AES-GCM decryption failed: {}", e))
         })?
     }
@@ -90,13 +90,24 @@ pub fn decrypt(key_material: &KeyMaterial, ciphertext: &[u8]) -> anyhow::Result<
     Ok(decrypted.into())
 }
 
-impl<'a> aes_gcm::aead::Buffer for WriteHandle<'a> {
-    fn extend_from_slice(&mut self, other: &[u8]) -> aes_gcm::aead::Result<()> {
-        WriteHandle::extend_from_slice(self, other).map_err(|_| aes_gcm::aead::Error)
-    }
+pub struct AeadWriteHandle<'a>(pub WriteHandle<'a>);
 
+impl<'a> AsRef<[u8]> for AeadWriteHandle<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+impl<'a> AsMut<[u8]> for AeadWriteHandle<'a> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.0.as_mut()
+    }
+}
+impl<'a> aes_gcm::aead::Buffer for AeadWriteHandle<'a> {
+    fn extend_from_slice(&mut self, other: &[u8]) -> aes_gcm::aead::Result<()> {
+        self.0.extend_from_slice(other).map_err(|_| aes_gcm::aead::Error)
+    }
     fn truncate(&mut self, len: usize) {
-        if let Err(e) = WriteHandle::truncate(self, len) {
+        if let Err(e) = self.0.truncate(len) {
             eprintln!("Error when truncating AES GCM buffer: {e}. Exiting...");
             interrupt();
         }

@@ -76,8 +76,8 @@ use storage::StorageTelemetry;
 use storage::{block_handle_db::BlockHandle, StorageAlloc};
 use ton_api::ton::ton_node::broadcast::NewShardBlockBroadcast;
 use ton_block::{
-    error, fail, BlockIdExt, Cell, ConfigParams, OutMsgQueue, Result, ShardIdent, UInt256,
-    UnixTime, SHARD_FULL,
+    error, fail, time_checker, BlockIdExt, Cell, ConfigParams, OutMsgQueue, Result, ShardIdent,
+    UInt256, UnixTime, SHARD_FULL,
 };
 
 #[cfg(test)]
@@ -1159,7 +1159,7 @@ impl Engine {
                 let handle = handle.to_non_created().ok_or_else(|| {
                     error!("INTERNAL ERROR: bad result for store block {} proof", id)
                 })?;
-                log::trace!(
+                log::debug!(
                     "Downloaded block for {}apply {} TIME download: {}ms, check & save: {}",
                     if pre_apply { "pre-" } else { "" },
                     block.id(),
@@ -1475,6 +1475,7 @@ impl Engine {
             handles: create_metric("Alloc NODE block handles"),
             packages: create_metric("Alloc NODE packages"),
             storing_cells: create_metric("Alloc NODE storing cells"),
+            storing_cells_bytes: create_metric("Alloc NODE storing cells, bytes"),
             shardstates_queue: create_metric("Alloc NODE shardstates queue"),
 
             loaded_cells_from_db: create_metric_per_sec("NODE loaded from db cells/sec"),
@@ -1534,12 +1535,20 @@ impl Engine {
             counter_cache_len: create_metric("NODE counter cache len"),
             rocksdb_mem_table_mb: create_metric("Alloc NODE RocksDB mem tables, MB"),
             rocksdb_block_cache_mb: create_metric("Alloc NODE RocksDB block cache, MB"),
+            rocksdb_table_readers_mb: create_metric("Alloc NODE RocksDB table readers, MB"),
         });
         let engine_telemetry = Arc::new(EngineTelemetry {
             storage: storage_telemetry,
             awaiters: create_metric("Alloc NODE awaiters"),
             catchain_clients: create_metric("Alloc NODE catchains"),
             cells: create_metric("Alloc NODE cells"),
+            cells_mb: create_metric("Alloc NODE cells, MB"),
+            arena_cells: create_metric("Alloc NODE arena cells"),
+            arena_bytes_mb: create_metric("Alloc NODE arena bytes, MB"),
+            jemalloc_allocated_mb: create_metric("Alloc NODE jemalloc allocated, MB"),
+            jemalloc_resident_mb: create_metric("Alloc NODE jemalloc resident, MB"),
+            jemalloc_mapped_mb: create_metric("Alloc NODE jemalloc mapped, MB"),
+            jemalloc_retained_mb: create_metric("Alloc NODE jemalloc retained, MB"),
             shard_states: create_metric("Alloc NODE shard states"),
             top_blocks: create_metric("Alloc NODE top blocks"),
             validator_adnl_keys: create_metric("Alloc NODE validator ADNL keys"),
@@ -1553,6 +1562,7 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.handles.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.packages.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.storing_cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.storing_cells_bytes.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells_from_db.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_db_time_nanos.clone()),
@@ -1575,6 +1585,7 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.delete_boc_commit_micros.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.rocksdb_mem_table_mb.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.rocksdb_block_cache_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.storage.rocksdb_table_readers_mb.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_hits.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.cell_cache_misses.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.cell_cache_len.clone()),
@@ -1584,6 +1595,13 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.awaiters.clone()),
             TelemetryItem::Metric(engine_telemetry.catchain_clients.clone()),
             TelemetryItem::Metric(engine_telemetry.cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.cells_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.arena_cells.clone()),
+            TelemetryItem::Metric(engine_telemetry.arena_bytes_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_allocated_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_resident_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_mapped_mb.clone()),
+            TelemetryItem::Metric(engine_telemetry.jemalloc_retained_mb.clone()),
             TelemetryItem::Metric(engine_telemetry.shard_states.clone()),
             TelemetryItem::Metric(engine_telemetry.top_blocks.clone()),
             TelemetryItem::Metric(engine_telemetry.validator_adnl_keys.clone()),
@@ -1699,7 +1717,7 @@ impl Engine {
             limit,
             30,
             "download_next_block_worker",
-            Some((50, 11, 1000)),
+            Some((25, 11, 500)),
         )
         .await?
         .download()
@@ -1905,6 +1923,7 @@ impl Engine {
         last_keyblock: &Arc<BlockHandle>,
         mc_state: &ShardStateStuff,
     ) -> Result<()> {
+        let _tc = time_checker!(|| format!("check_gc_for_archives {}", last_keyblock.id()), 100);
         let mut gc_max_date = UnixTime::now();
         match &engine.archives_life_time_hours {
             None => return Ok(()),
@@ -1925,11 +1944,17 @@ impl Engine {
         let mut visited_pss_blocks = 0;
         let mut keyblock = last_keyblock.clone();
         let prev_blocks = &mc_state.shard_state_extra()?.prev_blocks;
+        let _walk_tc =
+            time_checker!(|| format!("check_gc_for_archives walk {}", last_keyblock.id()), 50);
         loop {
             match prev_blocks.get_prev_key_block(keyblock.id().seq_no() - 1)? {
                 None => return Ok(()),
                 Some(prev_keyblock) => {
                     let prev_keyblock = BlockIdExt::from_ext_blk(prev_keyblock);
+                    let _lh_tc = time_checker!(
+                        || format!("check_gc_for_archives load_handle {prev_keyblock}"),
+                        30
+                    );
                     let prev_keyblock =
                         engine.load_block_handle(&prev_keyblock)?.ok_or_else(|| {
                             error!(
@@ -1937,6 +1962,7 @@ impl Engine {
                                 prev_keyblock
                             )
                         })?;
+                    drop(_lh_tc);
                     if engine.is_persistent_state(
                         keyblock.gen_utime(),
                         prev_keyblock.gen_utime(),
@@ -2253,6 +2279,8 @@ pub async fn run(
     let result = async move {
         #[cfg(feature = "telemetry")]
         telemetry_logger(engine.clone());
+        #[cfg(all(target_os = "linux", feature = "telemetry"))]
+        proc_status_logger();
 
         // control server
         if let Some(config) = control_server_config {
@@ -2387,9 +2415,56 @@ pub async fn run(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn proc_status_logger() {
+    tokio::spawn(async move {
+        let parse_kb = |line: &str| -> u64 {
+            line.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0)
+        };
+        loop {
+            tokio::time::sleep(Duration::from_secs(Engine::TIMEOUT_TELEMETRY_SEC)).await;
+            let Ok(content) = std::fs::read_to_string("/proc/self/status") else { continue };
+            let mut vm_rss = 0u64;
+            let mut anon = 0u64;
+            let mut file = 0u64;
+            let mut vm_size = 0u64;
+            for line in content.lines() {
+                if line.starts_with("VmRSS:") {
+                    vm_rss = parse_kb(line);
+                } else if line.starts_with("RssAnon:") {
+                    anon = parse_kb(line);
+                } else if line.starts_with("RssFile:") {
+                    file = parse_kb(line);
+                } else if line.starts_with("VmSize:") {
+                    vm_size = parse_kb(line);
+                }
+            }
+            log::info!(
+                "proc: VmRSS={} MB RssAnon={} MB RssFile={} MB VmSize={} MB",
+                vm_rss / 1024,
+                anon / 1024,
+                file / 1024,
+                vm_size / 1024,
+            );
+        }
+    });
+}
+
 #[cfg(feature = "telemetry")]
 fn telemetry_logger(engine: Arc<Engine>) {
     tokio::spawn(async move {
+        #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+        {
+            let dirty: isize =
+                unsafe { tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0") }.unwrap_or(-1);
+            let muzzy: isize =
+                unsafe { tikv_jemalloc_ctl::raw::read(b"opt.muzzy_decay_ms\0") }.unwrap_or(-1);
+            let bg: bool = unsafe { tikv_jemalloc_ctl::raw::read(b"opt.background_thread\0") }
+                .unwrap_or(false);
+            log::info!(
+                "jemalloc opts: dirty_decay_ms={dirty} muzzy_decay_ms={muzzy} background_thread={bg}"
+            );
+        }
         let mut elapsed = 0;
         let millis = 500;
         loop {
@@ -2421,6 +2496,30 @@ fn telemetry_logger(engine: Arc<Engine>) {
                 .catchain_clients
                 .update(engine.engine_allocated.catchain_clients.load(Ordering::Relaxed));
             engine.engine_telemetry.cells.update(Cell::cell_count());
+            engine.engine_telemetry.cells_mb.update(Cell::cell_bytes() / (1024 * 1024));
+            engine.engine_telemetry.arena_cells.update(Cell::arena_cell_count());
+            engine
+                .engine_telemetry
+                .arena_bytes_mb
+                .update(Cell::arena_bytes_total() / (1024 * 1024));
+            #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+            {
+                // jemalloc stats are snapshot-based; advance epoch before reading.
+                let _ = tikv_jemalloc_ctl::epoch::advance();
+                let mb = |b: usize| (b / (1024 * 1024)) as u64;
+                if let Ok(v) = tikv_jemalloc_ctl::stats::allocated::read() {
+                    engine.engine_telemetry.jemalloc_allocated_mb.update(mb(v));
+                }
+                if let Ok(v) = tikv_jemalloc_ctl::stats::resident::read() {
+                    engine.engine_telemetry.jemalloc_resident_mb.update(mb(v));
+                }
+                if let Ok(v) = tikv_jemalloc_ctl::stats::mapped::read() {
+                    engine.engine_telemetry.jemalloc_mapped_mb.update(mb(v));
+                }
+                if let Ok(v) = tikv_jemalloc_ctl::stats::retained::read() {
+                    engine.engine_telemetry.jemalloc_retained_mb.update(mb(v));
+                }
+            }
             engine
                 .engine_telemetry
                 .shard_states
@@ -2473,6 +2572,11 @@ fn telemetry_logger(engine: Arc<Engine>) {
                     .storage
                     .rocksdb_block_cache_mb
                     .update(usage.block_cache / (1024 * 1024));
+                engine
+                    .engine_telemetry
+                    .storage
+                    .rocksdb_table_readers_mb
+                    .update(usage.table_readers / (1024 * 1024));
             }
 
             let period = crate::full_node::telemetry::TPS_PERIOD_1;

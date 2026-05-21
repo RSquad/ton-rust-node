@@ -36,7 +36,7 @@ use std::{
 };
 use ton_block::{
     sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
-    Ed25519KeyOption, ShardIdent, UInt256,
+    Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes,
 };
 
 include!("../../../common/src/info.rs");
@@ -420,7 +420,8 @@ fn run_single_node_restart_test(test_name: &str) {
     let _error_count = init_test_logger(test_name);
 
     // Create single node
-    let private_key = Ed25519KeyOption::generate().expect("Failed to generate private key");
+    let private_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key");
     let adnl_id = private_key.id().clone();
     let public_key = private_key.clone();
 

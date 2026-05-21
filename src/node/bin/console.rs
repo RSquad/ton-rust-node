@@ -8,6 +8,7 @@
  */
 use adnl::client::{AdnlClient, AdnlClientConfig, AdnlClientConfigJson};
 use node::config::TonNodeConfig;
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{
     convert::TryInto, env, fs::File, io::BufReader, net::SocketAddr, str::FromStr, time::Duration,
 };
@@ -26,7 +27,7 @@ use ton_api::{
 };
 use ton_block::{
     base64_decode, base64_encode, ed25519_create_private_key, error, fail, read_single_root_boc,
-    write_boc, AccountStatus, BlockIdExt, BuilderData, Deserializable, Ed25519KeyOption,
+    write_boc, AccountStatus, BlockIdExt, BuilderData, Deserializable,
     ExternalInboundMessageHeader, IBitstring, Message, MsgAddressInt, Result, Serializable,
     ShardAccount, ShardIdent, SliceData, UInt256, UnixTime,
 };
@@ -871,7 +872,9 @@ impl ControlClient {
         let (s, signature) =
             self.process_command("sign", &mut [&perm_str, &data_str].iter()).await?;
         log::trace!("{}", s);
-        Ed25519KeyOption::from_public_key(&pub_key[..].try_into()?).verify(&data, &signature)?;
+        get_key_option_factory()
+            .from_public_key(&pub_key[..].try_into()?)
+            .verify(&data, &signature)?;
 
         let query_id = UnixTime::now() as u64;
         // validator-elect-signed.fif
@@ -1912,7 +1915,7 @@ mod test {
         fs::write(Path::new(CFG_DIR).join(&cfg_node_file), &adnl_server_config).unwrap();
         fs::write(Path::new(CFG_DIR).join(&cfg_glob_file), GLOBAL_CONFIG).unwrap();
         let node_config =
-            TonNodeConfig::from_file(CFG_DIR, &cfg_node_file, None, "", None).unwrap();
+            TonNodeConfig::from_file(CFG_DIR, &cfg_node_file, None, "", None).await.unwrap();
         let control_server_config = node_config.control_server().unwrap();
         let config = control_server_config.expect("must have control server setting");
         #[cfg(feature = "telemetry")]
@@ -2215,7 +2218,9 @@ mod test {
         const OUT_FILE: &str = "../target/test_set_config_param.boc";
         const KEY_FILE: &str = "../target/test_set_config_param.key";
         // read from last block (19) (masterchain)
-        let cmd = format!("getaccountstate -1:5555555555555555555555555555555555555555555555555555555555555555 {OUT_FILE}");
+        let cmd = format!(
+            "getaccountstate -1:5555555555555555555555555555555555555555555555555555555555555555 {OUT_FILE}"
+        );
         test_one_cmd(&cmd, |result| {
             assert_eq!(result.len(), 1031);
             let account = Account::construct_from_bytes(&result).unwrap();

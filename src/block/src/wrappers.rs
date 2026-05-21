@@ -19,6 +19,8 @@ pub use ed25519_dalek::{
     SIGNATURE_LENGTH as ED25519_SIGNATURE_LENGTH,
 };
 use std::sync::LazyLock;
+
+pub const ED25519_EXPANDED_KEY_LENGTH: usize = 64;
 pub const P256_PUBLIC_KEY_LENGTH: usize = 33;
 pub const P256_SIGNATURE_LENGTH: usize = 64;
 

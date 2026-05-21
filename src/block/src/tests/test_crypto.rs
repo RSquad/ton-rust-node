@@ -7,10 +7,11 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::*;
+use crate::{Ed25519KeyOption, ZeroizingBytes};
 
 #[test]
 fn test_ed25519_signature() {
-    let key = crate::Ed25519KeyOption::generate().unwrap();
+    let key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let data = [1, 2, 3, 4, 5];
     let s = key.sign(&data).unwrap();
     println!(
