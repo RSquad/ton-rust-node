@@ -124,30 +124,8 @@ pub struct AdnlClient {
 }
 
 impl AdnlClient {
-    /// Connect to server
+    /// Connect to server.
     pub async fn connect(config: &AdnlClientConfig) -> Result<Self> {
-        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
-        socket.set_reuse_address(true)?;
-        socket.set_linger(Some(Duration::from_secs(0)))?;
-        //socket.bind(&"0.0.0.0:0".parse::<SocketAddr>()?.into())?;
-        socket.connect_timeout(&config.server_address.into(), config.timeouts.write())?;
-        socket.set_nonblocking(true)?;
-
-        let mut stream = AdnlStream::from_stream_with_timeouts(
-            tokio::net::TcpStream::from_std(socket.into())?,
-            config.timeouts(),
-        );
-
-        let mut crypto = Self::send_init_packet(&mut stream, config).await?;
-        if let Some(client_key) = &config.client_key {
-            Self::tcp_auth_handshake(&mut crypto, &mut stream, client_key).await?;
-        }
-        Ok(Self { crypto, stream })
-    }
-
-    /// Like [`Self::connect`], but uses `tokio::net::TcpStream::connect` so the
-    /// runtime worker is not parked while the kernel waits on an unresponsive peer.
-    pub async fn timeout_connect(config: &AdnlClientConfig) -> Result<Self> {
         let connect_timeout = config.timeouts.write();
         let tcp = tokio::time::timeout(
             connect_timeout,
@@ -156,11 +134,11 @@ impl AdnlClient {
         .await
         .map_err(|_| {
             error!(
-                "ADNL TCP connect to {} timed out after {:?}",
+                "ADNL connect to {} timed out after {:?}",
                 config.server_address, connect_timeout,
             )
         })?
-        .map_err(|e| error!("ADNL TCP connect to {} failed: {}", config.server_address, e))?;
+        .map_err(|e| error!("ADNL connect to {} failed: {}", config.server_address, e))?;
 
         socket2::SockRef::from(&tcp).set_linger(Some(Duration::from_secs(0)))?;
 

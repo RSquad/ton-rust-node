@@ -339,7 +339,7 @@ impl ControlClientAdnl {
     pub async fn connect(&mut self) -> anyhow::Result<()> {
         if self.adnl.is_none() {
             self.adnl = Some(
-                AdnlClient::timeout_connect(&self.config)
+                AdnlClient::connect(&self.config)
                     .await
                     .context("failed to connect to Control Server")?,
             );
@@ -370,7 +370,7 @@ impl ControlClientAdnl {
             }
         }
 
-        self.adnl = Some(AdnlClient::timeout_connect(&self.config).await?);
+        self.adnl = Some(AdnlClient::connect(&self.config).await?);
         Ok(())
     }
 
