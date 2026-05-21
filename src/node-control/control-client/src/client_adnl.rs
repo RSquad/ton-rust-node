@@ -463,7 +463,6 @@ impl ClientAPI for ControlClientAdnl {
 
     async fn add_adnl_address(&mut self, rq: &AddAdnlAddressRq) -> anyhow::Result<()> {
         self.do_rq::<AddAdnlAddressRqRs>(rq).await
-
     }
 
     async fn add_validator_adnl_addr(&mut self, rq: &AddValidatorAdnlAddrRq) -> anyhow::Result<()> {
