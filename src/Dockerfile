@@ -14,12 +14,14 @@ WORKDIR /node
 ARG GIT_BRANCH
 ARG GIT_COMMIT
 ARG GIT_COMMIT_DATE
+ARG RUSTFLAGS=""
 
 ENV GIT_BRANCH=${GIT_BRANCH}
 ENV GIT_COMMIT=${GIT_COMMIT}
 ENV GIT_COMMIT_DATE=${GIT_COMMIT_DATE}
+ENV RUSTFLAGS=${RUSTFLAGS}
 
-RUN cargo build --release --bin node --bin console
+RUN cargo build --release --bin node --bin console --bin secrets-vault-cli
 
 FROM ubuntu:24.04
 
@@ -32,5 +34,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /node/target/release/node /usr/local/bin/
 COPY --from=builder /node/target/release/console /usr/local/bin/
+COPY --from=builder /node/target/release/secrets-vault-cli /usr/local/bin/
 
 WORKDIR /node
