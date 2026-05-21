@@ -60,7 +60,7 @@ async fn add_ed25519_key_to_vault(
     let secret = Secret::KeyPair { keypair: Box::new(keypair) };
 
     // Store the secret via real FileJsonStorage
-    storage.store(&secret, StoreMode::NewOnly).await?;
+    storage.store(&secret, StoreMode::NewOnly, None).await?;
 
     Ok(())
 }

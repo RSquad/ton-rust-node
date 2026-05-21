@@ -550,7 +550,15 @@ impl ArchiveSlice {
         let offset_key = entry_id.into();
         let offset = match self.offsets_db.try_get_value(&offset_key)? {
             Some(offset) => offset,
-            None => return Ok(None),
+            None => {
+                log::warn!(
+                    target: TARGET,
+                    "Inconsistent archive: offsets_db missing entry {entry_id} \
+                     (slice archive_id={}, shard={shard}, mc_seq_no={mc_seq_no})",
+                    self.archive_id,
+                );
+                return Ok(None);
+            }
         };
         let package_info = match self.choose_package(mc_seq_no, shard).await? {
             ChosenPackage::Info(info) => info,

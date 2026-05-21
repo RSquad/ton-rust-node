@@ -201,7 +201,13 @@ async fn get_masterchain_info_returns_state_metadata() {
 
     pretty_assertions::assert_eq!(response["@type"], "blocks.masterchainInfo");
     pretty_assertions::assert_eq!(response["last"], serialize_block_id(master_state.block_id()));
-    pretty_assertions::assert_eq!(response["init"], serialize_block_id(master_state.block_id()));
+    // init mirrors zerostate id but with shard rendered as the literal "0" (toncenter parity)
+    let mut expected_init = serialize_block_id(master_state.block_id());
+    expected_init
+        .as_object_mut()
+        .unwrap()
+        .insert("shard".to_string(), serde_json::Value::String("0".to_string()));
+    pretty_assertions::assert_eq!(response["init"], expected_init);
     pretty_assertions::assert_eq!(
         response["state_root_hash"],
         serialize_uint256(&master_state.root_cell().repr_hash())
@@ -254,7 +260,7 @@ async fn rest_get_address_information() {
     pretty_assertions::assert_eq!(result["state"], serde_json::json!("active"));
     pretty_assertions::assert_eq!(result["block_id"], serialize_block_id(&master_state.block_id()));
     assert!(result["balance"].as_str().is_some());
-    assert!(result["@extra"].as_str().is_some());
+    assert!(body["@extra"].as_str().is_some());
     assert!(result["last_transaction_id"].is_object());
 }
 
@@ -270,14 +276,12 @@ async fn jsonrpc_get_address_information() {
     )
     .await;
 
-    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
     pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    assert!(response["@extra"].as_str().is_some());
     let result = &response["result"];
     pretty_assertions::assert_eq!(result["@type"], serde_json::json!("raw.fullAccountState"));
     pretty_assertions::assert_eq!(result["block_id"], serialize_block_id(master_state.block_id()));
     assert!(result["balance"].as_str().is_some());
-    assert!(result["@extra"].as_str().is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -289,8 +293,6 @@ async fn jsonrpc_get_account_returns_boc() {
     let response =
         call_jsonrpc(&registry, "getAccount", serde_json::json!({ "address": address })).await;
 
-    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
     pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
     let expected = get_account(
         GetAddressInformationParams { address: account_address(&account), seqno: None },
@@ -372,12 +374,10 @@ async fn jsonrpc_send_boc() {
     let response =
         call_jsonrpc(&registry, "sendBoc", serde_json::json!({ "boc": "aGVsbG8=" })).await;
 
-    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
     pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    assert!(response["@extra"].as_str().is_some());
     let result = &response["result"];
     pretty_assertions::assert_eq!(result["@type"], serde_json::json!("ok"));
-    assert!(result["@extra"].as_str().is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -526,11 +526,7 @@ async fn http_server_test_client_jsonrpc(address: std::net::SocketAddr, _account
         .await
         .unwrap();
     let response: serde_json::Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
-    pretty_assertions::assert_eq!(
-        response["jsonrpc"],
-        serde_json::Value::String("2.0".to_string())
-    );
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
     let response = &response["result"];
     pretty_assertions::assert_eq!(response["@type"], serde_json::json!("blocks.masterchainInfo"));
     println!("JSONRPC response {:?}", response);
@@ -661,9 +657,8 @@ async fn test_get_libraries_ext() {
     let (registry, master_state) = build_registry(&account);
 
     let response = call_jsonrpc(&registry, "getLibrariesExt", serde_json::json!({})).await;
-    pretty_assertions::assert_eq!(response["jsonrpc"], serde_json::json!("2.0"));
-    pretty_assertions::assert_eq!(response["id"], serde_json::json!(1));
     pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    assert!(response["@extra"].as_str().is_some());
 
     let result = response["result"].clone();
     pretty_assertions::assert_eq!(result["@type"], serde_json::json!("smc.libraryResultExt"));

@@ -6,8 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::memory::protected_memory::ProtectedMemoryInner;
 #[cfg(feature = "hashicorp-storage")]
+use crate::memory::protected_memory::ProtectedMemory;
 use crate::{
     crypto::{
         crypto_trait::Crypto,
@@ -15,8 +15,8 @@ use crate::{
         key_material::KeyMaterial,
         master_key::MasterKey,
     },
-    errors::error::VaultError,
-    storage::storage_trait::{ListMode, Storage},
+    memory::protected_memory::ProtectedMemoryInner,
+    storage::storage_trait::Storage,
     types::{
         algorithm::Algorithm,
         metadata::Metadata,
@@ -131,12 +131,9 @@ pub async fn create_storage(
         #[cfg(feature = "hashicorp-storage")]
         StorageType::HashicorpNoCache => {
             // NOTE: HashiCorp Vault must be launched in dev mode on http://127.0.0.1:8200/ (./vault server -dev -dev-root-token-id=root)
-            use crate::{
-                memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
-                storage::{
-                    hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
-                    hashicorp_token_provider::AuthConfig,
-                },
+            use crate::storage::{
+                hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
+                hashicorp_token_provider::AuthConfig,
             };
 
             let api_key_data: ProtectedMemory =
@@ -153,12 +150,9 @@ pub async fn create_storage(
         #[cfg(feature = "hashicorp-storage")]
         StorageType::HashicorpUseCache => {
             // NOTE: HashiCorp Vault must be launched in dev mode on http://127.0.0.1:8200/ (./vault server -dev -dev-root-token-id=root)
-            use crate::{
-                memory::protected_memory::{ProtectedMemory, ProtectedMemoryInner},
-                storage::{
-                    hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
-                    hashicorp_token_provider::AuthConfig,
-                },
+            use crate::storage::{
+                hashicorp::HashicorpStorage, hashicorp_api::VaultConfig,
+                hashicorp_token_provider::AuthConfig,
             };
 
             let api_key_data: ProtectedMemory =
@@ -210,7 +204,8 @@ pub fn create_url(
 
 pub async fn create_test_storage(config: &TestConfig) -> anyhow::Result<Arc<dyn Storage>> {
     let storage = create_storage(config.storage_type, None).await?;
-    clear_storage(storage.as_ref()).await?;
+    storage.clear().await?;
+
     Ok(storage)
 }
 
@@ -225,28 +220,6 @@ pub fn make_ed25519_test_key_32() -> [u8; 32] {
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
     key
-}
-
-pub async fn clear_storage(storage: &dyn Storage) -> anyhow::Result<()> {
-    let metas = storage.list_metadata(ListMode::All).await?;
-
-    for meta in &metas {
-        let secret_id = meta.secret_id.as_ref().ok_or_else(|| VaultError::empty_secret_id(""))?;
-        storage.delete(secret_id).await?;
-    }
-
-    Ok(())
-}
-
-pub async fn clear_vault(vault: &SecretVault) -> anyhow::Result<()> {
-    let metas = vault.list_metadata(ListMode::All).await?;
-
-    for meta in &metas {
-        let secret_id = meta.secret_id.as_ref().ok_or_else(|| VaultError::empty_secret_id(""))?;
-        vault.delete(secret_id).await?;
-    }
-
-    Ok(())
 }
 
 pub fn fixture() -> Vec<TestConfig> {

@@ -1919,8 +1919,28 @@ impl LiteServerQuerySubscriber {
             })
             .await??;
 
+            let block_info = block_stuff.block()?.read_info()?;
+            if lt < block_info.start_lt() {
+                break;
+            }
+
+            if lt > block_info.end_lt() {
+                log::warn!(
+                    "liteServer.getTransactions: lookup_block_by_lt returned block outside LT range: \
+                    account_id={account_id:x}, target_lt={lt}, block={block_id}, \
+                    block_start_lt={}, block_end_lt={}",
+                    block_info.start_lt(),
+                    block_info.end_lt(),
+                );
+                break;
+            }
+
             let Some(acc_block) = block_stuff.get_account(&account_id)? else {
-                fail!("block with id: {block_id} does not contain account: {account_id:x}")
+                log::warn!(
+                    "liteServer.getTransactions: lookup_block_by_lt returned block without account: \
+                    account_id={account_id:x}, target_lt={lt}, block={block_id}"
+                );
+                break;
             };
             let mut found_any_in_this_block = false;
             // search for a transaction with exactly the right lt
@@ -1964,7 +1984,7 @@ impl LiteServerQuerySubscriber {
         }
 
         if roots.is_empty() {
-            fail!("cannot compute block with specified transaction: no block by lt={lt}");
+            fail!("cannot locate transaction for account {account_id:x}");
         }
         let transactions =
             tokio::task::spawn_blocking(move || BocWriter::with_roots(roots)?.write_to_vec())

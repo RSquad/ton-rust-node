@@ -23,7 +23,6 @@ use secrets_vault::{
     errors::error::VaultError,
     make_secret_id,
     memory::protected_memory::ProtectedMemory,
-    storage::storage_trait::ListMode,
     types::{
         algorithm::Algorithm as SecretAlgorithm,
         metadata::Metadata as SecretMetadata,
@@ -276,7 +275,7 @@ impl SecretsVaultConfig {
 
         // Create/Load secrets vault
         log::info!("Load keys from the vault");
-        let metadata_list = vault.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = vault.list_metadata().await?;
 
         // Read private keys
         for metadata in &metadata_list {

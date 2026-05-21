@@ -31,7 +31,7 @@ async fn test_file_format_is_json() -> anyhow::Result<()> {
         let metadata = Metadata::new(Some(&secret_id), Algorithm::Aes256Gcm, true);
         let secret = SecretInMemoryFactory::new_secret(b"test_value", metadata, crypto.clone())?;
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let file_storage = storage.as_ref().downcast_ref::<FileJsonStorage>().unwrap();
         let file_content = tokio::fs::read_to_string(file_storage.file_path()).await?;

@@ -188,7 +188,6 @@ pub(crate) fn create_token_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::protected_memory::ProtectedMemoryInner;
 
     #[tokio::test]
     async fn static_provider_returns_token() {

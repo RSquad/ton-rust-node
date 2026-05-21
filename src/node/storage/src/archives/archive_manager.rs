@@ -380,11 +380,18 @@ impl ArchiveManager {
             .get_file_desc(&package_id, false)
             .await?
             .ok_or_else(|| error!("file descriptor was not found for {:?}", package_id))?;
-        let pi = fd
-            .archive_slice()
-            .get_file(handle, entry_id)
-            .await?
-            .ok_or_else(|| error!("file was not read for {:?}", fd.id()))?;
+        let pi = fd.archive_slice().get_file(handle, entry_id).await?.ok_or_else(|| {
+            error!(
+                "file was not read for {:?}, entry {entry_id}, handle {} \
+                     (is_archived={}, has_data={}, has_proof={}, has_proof_link={})",
+                fd.id(),
+                handle.id(),
+                handle.is_archived(),
+                handle.has_data(),
+                handle.has_proof(),
+                handle.has_proof_link(),
+            )
+        })?;
         Ok(Some(pi))
     }
 

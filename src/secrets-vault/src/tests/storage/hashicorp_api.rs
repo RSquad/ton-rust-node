@@ -24,19 +24,19 @@ fn test_client(transit_mount: &str, kv_mount: &str, kv_prefix: Option<&str>) -> 
 #[test]
 fn kv_data_path_defaults() {
     let c = test_client("transit", "secret", None);
-    assert_eq!(c.kv_data_path("blobs/mykey"), "http://vault:8200/v1/secret/data/blobs/mykey");
+    assert_eq!(c.kv_data_path("mykey"), "http://vault:8200/v1/secret/data/blobs/mykey");
 }
 
 #[test]
 fn kv_data_path_custom_mount() {
     let c = test_client("transit", "ton", None);
-    assert_eq!(c.kv_data_path("blobs/mykey"), "http://vault:8200/v1/ton/data/blobs/mykey");
+    assert_eq!(c.kv_data_path("mykey"), "http://vault:8200/v1/ton/data/blobs/mykey");
 }
 
 #[test]
 fn kv_data_path_with_prefix() {
     let c = test_client("transit", "ton", Some("mainnet"));
-    assert_eq!(c.kv_data_path("blobs/mykey"), "http://vault:8200/v1/ton/data/mainnet/blobs/mykey");
+    assert_eq!(c.kv_data_path("mykey"), "http://vault:8200/v1/ton/data/blobs/mainnet/mykey");
 }
 
 #[test]
@@ -44,20 +44,23 @@ fn kv_data_path_nested_prefix() {
     let c = test_client("transit", "ton", Some("mainnet/validator-0"));
     assert_eq!(
         c.kv_data_path("blobs/k"),
-        "http://vault:8200/v1/ton/data/mainnet/validator-0/blobs/k"
+        "http://vault:8200/v1/ton/data/blobs/mainnet/validator-0/blobs/k"
     );
 }
 
 #[test]
 fn kv_meta_path_defaults() {
     let c = test_client("transit", "secret", None);
-    assert_eq!(c.kv_meta_path("blobs"), "http://vault:8200/v1/secret/metadata/blobs");
+    assert_eq!(c.kv_user_meta_path("blobs"), "http://vault:8200/v1/secret/data/meta/blobs");
 }
 
 #[test]
 fn kv_meta_path_with_prefix() {
     let c = test_client("transit", "ton", Some("mainnet"));
-    assert_eq!(c.kv_meta_path("blobs/k"), "http://vault:8200/v1/ton/metadata/mainnet/blobs/k");
+    assert_eq!(
+        c.kv_user_meta_path("blobs/k"),
+        "http://vault:8200/v1/ton/data/meta/mainnet/blobs/k"
+    );
 }
 
 #[test]
