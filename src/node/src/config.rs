@@ -14,7 +14,7 @@ use crate::network::{
 };
 use adnl::{
     client::AdnlClientConfigJson,
-    common::{Wait, add_unbound_object_to_map_with_update},
+    common::{add_unbound_object_to_map_with_update, Wait},
     node::{AdnlNodeConfig, AdnlNodeConfigJson},
     server::{AdnlServerConfig, AdnlServerConfigJson},
 };
@@ -31,7 +31,7 @@ use secrets_vault::{
         store_mode::StoreMode as SecretStoreMode,
     },
     vault::SecretVault,
-    vault_block::{BlockCryptoFactory, get_key_option_factory},
+    vault_block::{get_key_option_factory, BlockCryptoFactory},
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -44,29 +44,31 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        Arc,
         atomic::{self, AtomicI32},
+        Arc,
     },
     time::Duration,
 };
 use storage::{archives::epoch::ArchivalModeConfig, shardstate_db_async::CellsDbConfig};
 use ton_api::{
-    IntoBoxed,
     ton::{
-        self, PrivateKey,
+        self,
         adnl::{address::address::Udp, addresslist::AddressList as AdnlAddressList},
         dht::node::Node as DhtNodeConfig,
         engine::validator::{
-            CustomOverlaysConfig as CustomOverlaysConfigBoxed, customoverlay::CustomOverlay,
-            customoverlaynode::CustomOverlayNode, customoverlaysconfig::CustomOverlaysConfig,
+            customoverlay::CustomOverlay, customoverlaynode::CustomOverlayNode,
+            customoverlaysconfig::CustomOverlaysConfig,
+            CustomOverlaysConfig as CustomOverlaysConfigBoxed,
         },
         pk::privatekey::Ed25519 as Ed25519Private,
         pub_::publickey::Ed25519,
+        PrivateKey,
     },
+    IntoBoxed,
 };
 use ton_block::{
-    BlockIdExt, Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, MsgAddressInt, Result,
-    SecretBytes, ShardIdent, UInt256, ZeroizingBytes, base64_decode, base64_encode, error, fail,
+    base64_decode, base64_encode, error, fail, BlockIdExt, Ed25519KeyOption, KeyId, KeyOption,
+    KeyOptionJson, MsgAddressInt, Result, SecretBytes, ShardIdent, UInt256, ZeroizingBytes,
 };
 use ton_block_json::PathMap;
 
@@ -2452,7 +2454,11 @@ impl ValidatorKeys {
                         atomic::Ordering::Relaxed,
                         atomic::Ordering::Relaxed,
                         |x| {
-                            if x > key.election_id { Some(key.election_id) } else { None }
+                            if x > key.election_id {
+                                Some(key.election_id)
+                            } else {
+                                None
+                            }
                         },
                     ) {
                         let old = self
