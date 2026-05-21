@@ -145,19 +145,8 @@ impl AdnlClient {
         Ok(Self { crypto, stream })
     }
 
-    /// Connect to server using async-native TCP connect with a timeout.
-    ///
-    /// Unlike [`Self::connect`], which performs a synchronous `connect(2)` via
-    /// `socket2::Socket::connect_timeout` and parks the tokio worker thread
-    /// until the kernel returns (up to the configured write timeout), this
-    /// variant uses `tokio::net::TcpStream::connect` wrapped in
-    /// `tokio::time::timeout`. The runtime worker stays free to drive other
-    /// futures while the kernel is performing the TCP handshake or waiting on
-    /// an unresponsive peer.
-    ///
-    /// The address family of the resulting socket is selected from
-    /// `config.server_address` (IPv4 or IPv6). The original `SO_LINGER 0`
-    /// option is preserved.
+    /// Like [`Self::connect`], but uses `tokio::net::TcpStream::connect` so the
+    /// runtime worker is not parked while the kernel waits on an unresponsive peer.
     pub async fn timeout_connect(config: &AdnlClientConfig) -> Result<Self> {
         let connect_timeout = config.timeouts.write();
         let tcp = tokio::time::timeout(
