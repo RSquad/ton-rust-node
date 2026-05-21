@@ -1659,7 +1659,7 @@ impl ElectionRunner {
             let staking_addrs: Vec<String> = match node.stake_addr().await {
                 Ok(addr) => vec![format!("-1:{}", hex::encode(addr))],
                 Err(e) => {
-                    tracing::error!("stake addr error: {:#}", e);
+                    tracing::debug!("stake addr error: {:#}", e);
                     vec![]
                 }
             };

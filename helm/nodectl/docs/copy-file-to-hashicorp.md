@@ -5,6 +5,13 @@ from the file-based vault on the PVC to a HashiCorp Vault backend, using the
 built-in `nodectl key migrate` command. The source `vault.json` never leaves
 the Pod, and no extra binary is required.
 
+> **Supported direction:** `nodectl key migrate` only migrates from a **file
+> vault** (`file://`) to a **HashiCorp vault** (`hashicorp://`). Any other
+> combination of source/destination is rejected up front. Non-extractable
+> secrets are migrated alongside extractable ones — the original `extractable`
+> flag is preserved on the destination, so wallet keys that were created
+> non-extractable on the file vault remain non-extractable in HashiCorp.
+
 ## What is stored in the vault
 
 nodectl keeps the following secret types behind `VAULT_URL`:
@@ -171,9 +178,8 @@ Flags:
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--on-conflict <fail\|skip\|overwrite>` | `fail` | What to do when the destination already has the same secret id |
-| `--list-mode <only-needed\|all>` | `all` | Source listing scope (`only-needed` skips transit-stored Ed25519 keys on HashiCorp) |
 | `--dry-run` | off | Print the plan without writing |
-| `--continue-on-error` | off | Keep going on per-secret errors instead of aborting |
+| `--continue-on-error` | off | Keep going on per-secret write/conflict errors instead of aborting (read errors still abort) |
 
 The source vault is read-only — if migration fails partway, `vault.json` on
 the PVC is untouched and the service keeps working with the old `VAULT_URL`.

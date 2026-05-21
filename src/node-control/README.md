@@ -803,6 +803,30 @@ nodectl key rm --name "old-key"
 
 ---
 
+#### `key migrate`
+
+Copy every secret from a **file vault** to a **HashiCorp vault**. Reads the source URL from `FROM_VAULT_URL` and the destination URL from `VAULT_URL`. Any other source/destination combination is rejected.
+
+Non-extractable secrets are migrated alongside extractable ones; the original `extractable` flag is preserved on the destination, so wallet keys that were created non-extractable on the file vault remain non-extractable in HashiCorp.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--on-conflict <fail\|skip\|overwrite>` | `fail` | What to do when the destination already has the same secret id |
+| `--dry-run` | off | Print the plan without writing |
+| `--continue-on-error` | off | Keep going on per-secret write/conflict errors instead of aborting (read errors still abort) |
+
+```bash
+export FROM_VAULT_URL='file:///nodectl/data/vault.json?master_key=...'
+export VAULT_URL='hashicorp://http://node-vault.node-vault:8200?auth=k8s&role=nodectl-app&transit_mount=ton-transit&transit_prefix=nodectl&kv_mount=ton&kv_prefix=nodectl'
+
+nodectl key migrate --dry-run   # preview
+nodectl key migrate             # run
+```
+
+The source vault is read-only; `vault.json` is never modified. See the [in-pod migration runbook](../../helm/nodectl/docs/copy-file-to-hashicorp.md) for the end-to-end procedure inside a Kubernetes Pod.
+
+---
+
 ### Authentication Commands
 
 Commands for managing REST API users and tokens. User credentials are stored in the vault. For a detailed description of roles, token lifecycle, revocation, rate limiting, and monitoring, see the **[Security Guide](./docs/nodectl-security.md)**.
