@@ -6,20 +6,19 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::{
+use super::{
     providers::{DefaultElectionsProvider, ElectionsProvider},
-    runner::ElectionRunner,
+    runner::{ElectionRunner, PersistStaticAdnls},
 };
+use crate::runtime_config::RuntimeConfig;
 use anyhow::Context;
 use common::{
-    app_config::{AppConfig, BindingStatus},
+    app_config::{AppConfig, BindingStatus, ElectionsConfig},
     snapshot::SnapshotStore,
     task_cancellation::CancellationCtx,
 };
-use contracts::{ElectorWrapperImpl, NominatorWrapper, TonWallet, contract_provider};
-use secrets_vault::vault::SecretVault;
+use contracts::{ElectorWrapperImpl, contract_provider};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
 /// Callback invoked after each tick with updated binding statuses.
 pub type BindingStatusCallback = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
@@ -27,30 +26,23 @@ pub type BindingStatusCallback = Arc<dyn Fn(HashMap<String, BindingStatus>) + Se
 pub async fn run(
     cancellation_ctx: CancellationCtx,
     app_config: Arc<AppConfig>,
-    rpc_client: Arc<ClientJsonRpc>,
-    wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
-    pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
+    runtime_cfg: Arc<dyn RuntimeConfig>,
     store: Arc<SnapshotStore>,
-    vault: Option<Arc<SecretVault>>,
     on_status_change: Option<BindingStatusCallback>,
 ) -> anyhow::Result<()> {
     let Some(config) = app_config.elections.as_ref() else {
         anyhow::bail!("elections config is empty");
     };
 
-    let adnl_configs = app_config
-        .nodes
-        .iter()
-        .map(|(node_name, cfg)| (node_name.clone(), cfg.clone()))
-        .collect::<HashMap<_, _>>();
-
+    let vault = runtime_cfg.vault();
     let mut set = tokio::task::JoinSet::new();
-    let mut sorted_nodes: Vec<_> = adnl_configs.into_iter().collect();
+    let mut sorted_nodes: Vec<_> =
+        app_config.nodes.iter().map(|(node_name, cfg)| (node_name.clone(), cfg.clone())).collect();
     sorted_nodes.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-    for (node_id, config) in sorted_nodes.into_iter() {
+    for (node_id, node_cfg) in sorted_nodes.into_iter() {
         let vault = vault.clone();
-        set.spawn(async move { (node_id, config.to_node_adnl_config(vault).await) });
+        set.spawn(async move { (node_id, node_cfg.to_node_adnl_config(vault).await) });
     }
 
     let providers: HashMap<String, Box<dyn ElectionsProvider>> = set
@@ -75,10 +67,29 @@ pub async fn run(
         anyhow::bail!("cannot proceed: some nodes have invalid configs");
     }
 
-    let elector = Arc::new(ElectorWrapperImpl::new(contract_provider!(rpc_client)));
+    let elector = Arc::new(ElectorWrapperImpl::new(contract_provider!(runtime_cfg.rpc_client())));
 
-    let mut runner =
-        ElectionRunner::new(config, &app_config.bindings, elector, providers, wallets, pools);
+    let persist_static_adnls: PersistStaticAdnls = {
+        let runtime_cfg = runtime_cfg.clone();
+        Arc::new(move |generated: HashMap<String, String>| {
+            runtime_cfg.update_and_save(Box::new(move |cfg| {
+                let elections = cfg.elections.get_or_insert_with(ElectionsConfig::default);
+                for (node_id, b64) in generated {
+                    elections.static_adnls.insert(node_id, b64);
+                }
+            }))
+        })
+    };
+
+    let mut runner = ElectionRunner::new(
+        config,
+        &app_config.bindings,
+        elector,
+        providers,
+        runtime_cfg.wallets(),
+        runtime_cfg.pools(),
+        Some(persist_static_adnls),
+    );
     runner
         .run_loop(
             Duration::from_secs(config.tick_interval),

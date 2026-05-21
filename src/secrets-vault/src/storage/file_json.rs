@@ -11,7 +11,7 @@ use crate::{
     errors::error::VaultError,
     storage::{
         file_json_migrator::migrate_tree_node_v1_to_v2,
-        storage_trait::{ListMode, Storage},
+        storage_trait::Storage,
         utils::{decrypt, generate_secret_in_memory, hex_string, prepare_to_store},
     },
     types::{
@@ -312,6 +312,23 @@ impl FileJsonStorage {
         Ok(())
     }
 
+    pub async fn load_for_migrate(&self, secret_id: &SecretId) -> anyhow::Result<(Secret, bool)> {
+        let path_parts = Self::parse_path(secret_id);
+        let tree = self.tree.read().await;
+        let stored = tree
+            .get(&path_parts)
+            .ok_or_else(|| VaultError::not_found(format!("Secret '{}' not found", secret_id)))?;
+        let (data, mut metadata) =
+            decrypt(self.master_key.key_material(), &stored.encrypted_data, self.crypto.as_ref())?;
+
+        let is_extractable = metadata.extractable;
+        metadata.extractable = true;
+
+        let secret = SecretInMemoryFactory::deserialize(data, metadata, self.crypto.clone())?;
+
+        Ok((secret, is_extractable))
+    }
+
     async fn migrate_to(
         from_version: u32,
         to_version: u32,
@@ -415,11 +432,16 @@ impl Storage for FileJsonStorage {
         secret_id: &SecretId,
     ) -> anyhow::Result<Secret> {
         let secret = generate_secret_in_memory(spec, secret_id, self.crypto.clone())?;
-        self.store(&secret, StoreMode::NewOnly).await?;
+        self.store(&secret, StoreMode::NewOnly, None).await?;
         self.load(secret_id).await
     }
 
-    async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
+    async fn store(
+        &self,
+        secret: &Secret,
+        mode: StoreMode,
+        override_extractable: Option<bool>,
+    ) -> anyhow::Result<()> {
         let secret_id = match &secret.metadata().secret_id {
             Some(secret_id) => secret_id,
             None => {
@@ -431,9 +453,15 @@ impl Storage for FileJsonStorage {
         let mut tree = self.tree.write().await;
         let path_parts = Self::parse_path(secret_id);
         let exists = tree.exists(&path_parts);
+
+        let mut metadata = secret.metadata().clone();
+        if let Some(override_extractable) = override_extractable {
+            metadata.extractable = override_extractable;
+        }
+
         let encrypted_data = prepare_to_store(
             &data,
-            secret.metadata(),
+            &metadata,
             mode,
             exists,
             self.master_key.key_material(),
@@ -473,7 +501,7 @@ impl Storage for FileJsonStorage {
         }
     }
 
-    async fn list_metadata(&self, _mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
+    async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
         let tree = self.tree.read().await;
         let mut all_secrets = Vec::new();
         tree.collect_all(Vec::new(), &mut all_secrets);
@@ -512,5 +540,24 @@ impl Storage for FileJsonStorage {
 
     fn format_version(&self) -> anyhow::Result<u32> {
         Ok(Self::FORMAT_VERSION)
+    }
+
+    #[cfg(test)]
+    async fn clear(&self) -> anyhow::Result<()> {
+        let metas = self.list_metadata().await?;
+
+        for meta in &metas {
+            let secret_id =
+                meta.secret_id.as_ref().ok_or_else(|| VaultError::empty_secret_id(""))?;
+            self.delete(secret_id).await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn is_empty(&self) -> anyhow::Result<bool> {
+        let tree = self.tree.read().await;
+        Ok(tree.secret.is_none() && tree.children.is_empty())
     }
 }

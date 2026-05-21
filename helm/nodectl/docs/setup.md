@@ -44,12 +44,79 @@ If nodectl runs in a different cluster than the validators, the Control Server p
 
 ### Create a vault secret
 
-See [Secrets Vault](../../ton-rust-node/docs/vault.md) for vault setup, URL formats, and security details.
+nodectl supports two vault backends. Pick one based on where you want the
+secrets to live.
+
+| Backend | URL scheme | Where secrets live | Typical use |
+|---------|------------|--------------------|-------------|
+| **File** | `file://` | Encrypted JSON file on the nodectl PVC, AES-256-GCM under a master key | Single-cluster deployments, simplest setup |
+| **HashiCorp Vault** | `hashicorp://` | Remote Vault — Ed25519 keys in Transit engine, blobs in KV v2 | Multi-tenant infra, shared key management, centralised audit |
+
+#### File backend
 
 ```bash
 kubectl create secret generic nodectl-vault \
   --from-literal=VAULT_URL="file:///nodectl/data/vault.json?master_key=$(openssl rand -hex 32)"
 ```
+
+The master key is a 32-byte AES-256 encryption key (64 hex characters). Store
+it securely — anyone with the key can decrypt the vault file.
+
+#### HashiCorp Vault backend
+
+Prepare the Vault server (enable the Transit and KV v2 engines, create the policy and — for Kubernetes auth — the role) per [vault.md → HashiCorp Vault backend](../../ton-rust-node/docs/vault.md#hashicorp-vault-backend). The procedure is identical for nodectl and the node chart; only the placeholders differ.
+
+Use these values when applying the policy and role templates:
+
+| Placeholder        | nodectl value     |
+|--------------------|-------------------|
+| `<TRANSIT_MOUNT>`  | `ton-transit`     |
+| `<TRANSIT_PREFIX>` | `nodectl`         |
+| `<KV_MOUNT>`       | `ton`             |
+| `<KV_PREFIX>`      | `nodectl`         |
+| `<AUTH_MOUNT>`     | `kubernetes`      |
+| `<ROLE>`           | `nodectl`         |
+| `<SA>`             | `nodectl-sa`      |
+
+For the full `VAULT_URL` grammar (every accepted query parameter, defaults) see [secrets-vault README](../../../src/secrets-vault/README.md#vault-url-schemes).
+
+##### Create the K8s Secret
+
+Pick one of the two URLs and put it into a `Secret` referenced by `vault.secretName`.
+
+**Static token** — for development or out-of-cluster Vault:
+
+```bash
+kubectl create secret generic nodectl-vault \
+  --from-literal=VAULT_URL='hashicorp://https://vault.example.com:8200?api_key=hvs.xxx&transit_mount=ton-transit&transit_prefix=nodectl&kv_mount=ton&kv_prefix=nodectl'
+```
+
+**Kubernetes auth** — recommended for in-cluster Vault:
+
+```bash
+kubectl create secret generic nodectl-vault \
+  --from-literal=VAULT_URL='hashicorp://http://vault.vault.svc:8200?auth=k8s&auth_mount=kubernetes&role=nodectl&transit_mount=ton-transit&transit_prefix=nodectl&kv_mount=ton&kv_prefix=nodectl'
+```
+
+##### Helm values
+
+For Kubernetes auth, the chart must attach the SA bound to the Vault role:
+
+```yaml
+vault:
+  secretName: nodectl-vault
+
+serviceAccount:
+  enabled: true        # chart creates the SA
+  name: nodectl-sa     # must match bound_service_account_names in the Vault role
+  # OR, to attach an existing SA you manage yourself:
+  # enabled: false
+  # name: my-existing-sa
+```
+
+##### Migrating from the file backend
+
+If you already run nodectl on the file backend and want to move secrets into HashiCorp Vault without re-generating keys, use the dedicated migration command — see [copy-file-to-hashicorp.md](copy-file-to-hashicorp.md). The target Vault must already be prepared per the steps above.
 
 ### Install the chart
 

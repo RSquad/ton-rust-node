@@ -70,13 +70,16 @@ Total master wallet funding needed: `N * 1 TON` (wallets) + `N * 1 TON` (pools) 
 
 ### Vault
 
-Vault stores private keys (wallet keys, control client keys). Currently only the file-based backend is documented:
+Vault stores all nodectl secrets — wallet keys, the master wallet key,
+control client keys, REST API user password hashes, and the JWT signing key.
+Two backends are supported:
 
 | Backend | URL format | Use case |
 |---------|-----------|----------|
-| File-based | `file:///nodectl/data/vault.json?master_key=<hex>` | All setups |
+| File-based | `file:///nodectl/data/vault.json?master_key=<hex>` | Single-cluster deployments, simplest setup |
+| HashiCorp Vault | `hashicorp://<addr>?auth=k8s&role=<role>&...` or `?api_key=<token>&...` | Multi-tenant infra, shared key management, centralised audit |
 
-Vault is configured via the **`VAULT_URL` environment variable**, not in `config.json`. The Helm chart passes this from a K8s Secret or plain value.
+Vault is configured via the **`VAULT_URL` environment variable**, not in `config.json`. The Helm chart passes this from a K8s Secret or plain value. See [docs/setup.md — Create a vault secret](docs/setup.md#create-a-vault-secret) for both backends and [docs/copy-file-to-hashicorp.md](docs/copy-file-to-hashicorp.md) for migrating an existing deployment from file to HashiCorp.
 
 > **Tip:** Add `IPC_LOCK` capability to the container security context if you want file-based vault to use `mlock()` for memory protection. Not required — the service works without it.
 
@@ -304,6 +307,7 @@ On first deploy, the init container prepares the PVC:
 | Elections and stake policies | [docs/elections.md](docs/elections.md) |
 | Chart maintainer guide | [docs/maintaining.md](docs/maintaining.md) |
 | First elections with Rust node | [docs/first-elections.md](docs/first-elections.md) |
+| Migrate vault: file → HashiCorp | [docs/copy-file-to-hashicorp.md](docs/copy-file-to-hashicorp.md) |
 
 ## Useful commands
 

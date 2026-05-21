@@ -1,0 +1,8 @@
+{
+    "p15": {
+        "validators_elected_for": 600,
+        "elections_start_before": 421,
+        "elections_end_before": 120,
+        "stake_held_for": 180
+    }
+}

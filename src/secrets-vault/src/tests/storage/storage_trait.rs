@@ -10,7 +10,6 @@ use crate::{
     crypto::factory::{CryptoFactory, DefaultCryptoFactory},
     errors::error::VaultError,
     make_secret_id,
-    storage::storage_trait::ListMode,
     tests::fixture::*,
     types::{
         algorithm::Algorithm,
@@ -26,7 +25,7 @@ use rand::RngCore;
 async fn test_new_storage() -> anyhow::Result<()> {
     for config in fixture() {
         let storage = create_test_storage(&config).await?;
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert!(metadata_list.is_empty());
     }
 
@@ -48,7 +47,7 @@ async fn test_store_and_load_new_only() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        let result = storage.store(&secret, StoreMode::NewOnly).await;
+        let result = storage.store(&secret, StoreMode::NewOnly, None).await;
         assert!(result.is_ok());
 
         let secret_loaded = storage.load(secret.id().unwrap()).await?;
@@ -73,7 +72,7 @@ async fn test_store_replace_if_exists() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&secret1, StoreMode::CreateOrReplace).await?;
+        storage.store(&secret1, StoreMode::CreateOrReplace, None).await?;
 
         let secret2 = create_secret(
             make_ed25519_test_key_32().as_ref(),
@@ -83,7 +82,7 @@ async fn test_store_replace_if_exists() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        let result = storage.store(&secret2, StoreMode::ReplaceExists).await;
+        let result = storage.store(&secret2, StoreMode::ReplaceExists, None).await;
         assert!(result.is_ok());
 
         let secret2_id = secret2.metadata().secret_id.as_ref().unwrap();
@@ -111,7 +110,7 @@ async fn test_store_create_or_replace_new_key() -> anyhow::Result<()> {
         )
         .await?;
 
-        let result = storage.store(&secret1, StoreMode::CreateOrReplace).await;
+        let result = storage.store(&secret1, StoreMode::CreateOrReplace, None).await;
         let secret1_id = secret1.metadata().secret_id.as_ref().unwrap();
         assert!(result.is_ok());
         assert!(storage.load(secret1_id).await.is_ok());
@@ -135,7 +134,7 @@ async fn test_store_create_or_replace_existing_key() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&secret1, StoreMode::CreateOrReplace).await?;
+        storage.store(&secret1, StoreMode::CreateOrReplace, None).await?;
 
         let secret2 = create_secret(
             make_ed25519_test_key_32().as_ref(),
@@ -145,7 +144,7 @@ async fn test_store_create_or_replace_existing_key() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        let result = storage.store(&secret2, StoreMode::CreateOrReplace).await;
+        let result = storage.store(&secret2, StoreMode::CreateOrReplace, None).await;
         assert!(result.is_ok());
 
         let secret_id = secret2.metadata().secret_id.as_ref().unwrap();
@@ -185,7 +184,7 @@ async fn test_load_metadata() -> anyhow::Result<()> {
         )
         .await?;
 
-        storage.store(&secret1, StoreMode::NewOnly).await?;
+        storage.store(&secret1, StoreMode::NewOnly, None).await?;
         let secret_id = secret1.metadata().secret_id.as_ref().unwrap();
 
         let loaded_metadata = storage
@@ -216,7 +215,7 @@ async fn test_load_metadata_nonexistent() -> anyhow::Result<()> {
 async fn test_list_metadata_empty() -> anyhow::Result<()> {
     for config in fixture() {
         let storage = create_test_storage(&config).await?;
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert!(metadata_list.is_empty());
     }
 
@@ -239,10 +238,10 @@ async fn test_list_metadata_multiple_entries() -> anyhow::Result<()> {
                 crypto.clone(),
             )
             .await?;
-            storage.store(&secret, StoreMode::NewOnly).await?;
+            storage.store(&secret, StoreMode::NewOnly, None).await?;
         }
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 5);
     }
 
@@ -265,7 +264,7 @@ async fn test_delete_existing_key() -> anyhow::Result<()> {
         )
         .await?;
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let secret_id = secret.metadata().secret_id.as_ref().unwrap();
         let result = storage.delete(secret_id).await;
@@ -305,7 +304,7 @@ async fn test_exists_true() -> anyhow::Result<()> {
         )
         .await?;
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let secret_id = secret.metadata().secret_id.as_ref().unwrap();
         assert!(storage.load(secret_id).await.is_ok());
@@ -355,7 +354,7 @@ async fn test_multiple_operations_sequence() -> anyhow::Result<()> {
         )
         .await?;
         let secret1_id = secret1.metadata().secret_id.as_ref().unwrap();
-        storage.store(&secret1, StoreMode::NewOnly).await?;
+        storage.store(&secret1, StoreMode::NewOnly, None).await?;
 
         let secret2 = create_secret(
             make_ed25519_test_key_32().as_ref(),
@@ -366,7 +365,7 @@ async fn test_multiple_operations_sequence() -> anyhow::Result<()> {
         )
         .await?;
         let secret2_id = secret2.metadata().secret_id.as_ref().unwrap();
-        storage.store(&secret2, StoreMode::NewOnly).await?;
+        storage.store(&secret2, StoreMode::NewOnly, None).await?;
 
         let secret3 = create_secret(
             make_ed25519_test_key_32().as_ref(),
@@ -377,7 +376,7 @@ async fn test_multiple_operations_sequence() -> anyhow::Result<()> {
         )
         .await?;
         let secret3_id = secret3.metadata().secret_id.as_ref().unwrap();
-        storage.store(&secret3, StoreMode::NewOnly).await?;
+        storage.store(&secret3, StoreMode::NewOnly, None).await?;
 
         assert!(storage.load(secret1_id).await.is_ok());
         assert!(storage.load(secret2_id).await.is_ok());
@@ -391,7 +390,7 @@ async fn test_multiple_operations_sequence() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&secret2_updated, StoreMode::ReplaceExists).await?;
+        storage.store(&secret2_updated, StoreMode::ReplaceExists, None).await?;
 
         storage.delete(secret3_id).await?;
 
@@ -402,7 +401,7 @@ async fn test_multiple_operations_sequence() -> anyhow::Result<()> {
         let secret2_loaded = storage.load(secret2_id).await?;
         assert!(secret2_loaded.eq_secret(&secret2_updated)?);
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 2);
     }
 
@@ -431,7 +430,7 @@ async fn test_concurrent_stores() -> anyhow::Result<()> {
                 )
                 .await
                 .unwrap();
-                storage.store(&secret, StoreMode::CreateOrReplace).await.unwrap();
+                storage.store(&secret, StoreMode::CreateOrReplace, None).await.unwrap();
 
                 secret.metadata().secret_id.clone()
             });
@@ -442,7 +441,7 @@ async fn test_concurrent_stores() -> anyhow::Result<()> {
             println!("Secret id: {}", secret_id.as_ref().unwrap());
         }
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
 
         for m in &metadata_list {
             println!("Secret id: {}", m.secret_id.as_ref().unwrap());
@@ -471,7 +470,7 @@ async fn test_data_integrity_after_encryption() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.metadata().secret_id.as_ref().unwrap();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let secret_loaded = storage.load(secret_id).await?;
         assert!(secret_loaded.eq_secret(&secret)?);
@@ -505,7 +504,7 @@ async fn test_hierarchical_paths() -> anyhow::Result<()> {
             )
             .await?;
 
-            storage.store(&secret, StoreMode::NewOnly).await?;
+            storage.store(&secret, StoreMode::NewOnly, None).await?;
         }
 
         for path in &paths {
@@ -538,10 +537,10 @@ async fn test_delete_cleans_empty_nodes() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.metadata().secret_id.as_ref().unwrap();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
         storage.delete(secret_id).await?;
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 0);
     }
 
@@ -565,7 +564,7 @@ async fn test_empty_path_segments() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.metadata().secret_id.as_ref().unwrap();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let secret_loaded = storage.load(secret_id).await?;
         assert!(secret_loaded.eq_secret(&secret)?);
@@ -591,7 +590,7 @@ async fn test_deep_nested_paths() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.metadata().secret_id.as_ref().unwrap();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let secret_loaded = storage.load(secret_id).await?;
         assert!(secret_loaded.eq_secret(&secret)?);
@@ -617,7 +616,7 @@ async fn test_update_existing_secret() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.metadata().secret_id.as_ref().unwrap();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let secret2 = create_secret(
             make_ed25519_test_key_32().as_ref(),
@@ -628,7 +627,7 @@ async fn test_update_existing_secret() -> anyhow::Result<()> {
         )
         .await?;
 
-        storage.store(&secret2, StoreMode::ReplaceExists).await?;
+        storage.store(&secret2, StoreMode::ReplaceExists, None).await?;
 
         let secret2_loaded = storage.load(secret_id).await?;
         assert!(secret2_loaded.eq_secret(&secret2)?);
@@ -647,7 +646,7 @@ async fn test_compare_key_size() -> anyhow::Result<()> {
         let storage = create_test_storage(&config).await?;
 
         let secret = if let Some(base_secret) = &base_secret {
-            storage.store(base_secret, StoreMode::CreateOrReplace).await?;
+            storage.store(base_secret, StoreMode::CreateOrReplace, None).await?;
             storage.load(&secret_id).await?
         } else {
             let spec = SecretSpec::new(Algorithm::Ed25519).extractable(true);
@@ -691,7 +690,7 @@ async fn test_compare_signature(extractable: bool) -> anyhow::Result<()> {
         let storage = create_test_storage(&config).await?;
 
         let secret = if let Some(base_secret) = &base_secret {
-            storage.store(base_secret, StoreMode::CreateOrReplace).await?;
+            storage.store(base_secret, StoreMode::CreateOrReplace, None).await?;
             storage.load(&secret_id).await?
         } else {
             let spec = SecretSpec::new(Algorithm::Ed25519).extractable(extractable);
@@ -724,7 +723,7 @@ async fn test_compare_signature(extractable: bool) -> anyhow::Result<()> {
 async fn test_empty_storage() -> anyhow::Result<()> {
     for config in fixture() {
         let storage = create_test_storage(&config).await?;
-        storage.list_metadata(ListMode::OnlyNeeded).await?;
+        storage.list_metadata().await?;
     }
 
     Ok(())
@@ -753,7 +752,7 @@ async fn test_blob_store_and_load_new_only() -> anyhow::Result<()> {
         )
         .await?;
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let loaded = storage.load(secret.id().unwrap()).await?;
         assert!(secret.eq_secret(&loaded)?);
@@ -785,7 +784,7 @@ async fn test_blob_store_replace_if_exists() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&blob1, StoreMode::CreateOrReplace).await?;
+        storage.store(&blob1, StoreMode::CreateOrReplace, None).await?;
 
         let blob2_data = make_blob_test_data(32);
         let blob2 = create_secret(
@@ -796,7 +795,7 @@ async fn test_blob_store_replace_if_exists() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&blob2, StoreMode::ReplaceExists).await?;
+        storage.store(&blob2, StoreMode::ReplaceExists, None).await?;
 
         let loaded = storage.load(blob2.id().unwrap()).await?;
         assert!(loaded.eq_secret(&blob2)?);
@@ -827,7 +826,7 @@ async fn test_blob_delete() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.id().unwrap().clone();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
         assert!(storage.load(&secret_id).await.is_ok());
 
         storage.delete(&secret_id).await?;
@@ -855,7 +854,7 @@ async fn test_blob_data_integrity_after_encryption() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.id().unwrap();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let loaded = storage.load(secret_id).await?;
         assert!(loaded.eq_secret(&secret)?);
@@ -886,7 +885,7 @@ async fn test_blob_multiple_operations_sequence() -> anyhow::Result<()> {
         )
         .await?;
         let blob1_id = blob1.id().unwrap().clone();
-        storage.store(&blob1, StoreMode::NewOnly).await?;
+        storage.store(&blob1, StoreMode::NewOnly, None).await?;
 
         let blob2 = create_secret(
             &make_blob_test_data(64),
@@ -897,7 +896,7 @@ async fn test_blob_multiple_operations_sequence() -> anyhow::Result<()> {
         )
         .await?;
         let blob2_id = blob2.id().unwrap().clone();
-        storage.store(&blob2, StoreMode::NewOnly).await?;
+        storage.store(&blob2, StoreMode::NewOnly, None).await?;
 
         let blob3 = create_secret(
             &make_blob_test_data(48),
@@ -908,7 +907,7 @@ async fn test_blob_multiple_operations_sequence() -> anyhow::Result<()> {
         )
         .await?;
         let blob3_id = blob3.id().unwrap().clone();
-        storage.store(&blob3, StoreMode::NewOnly).await?;
+        storage.store(&blob3, StoreMode::NewOnly, None).await?;
 
         assert!(storage.load(&blob1_id).await.is_ok());
         assert!(storage.load(&blob2_id).await.is_ok());
@@ -923,7 +922,7 @@ async fn test_blob_multiple_operations_sequence() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&blob2_updated, StoreMode::ReplaceExists).await?;
+        storage.store(&blob2_updated, StoreMode::ReplaceExists, None).await?;
 
         storage.delete(&blob3_id).await?;
 
@@ -937,7 +936,7 @@ async fn test_blob_multiple_operations_sequence() -> anyhow::Result<()> {
         let lock = blob2_loaded_data.lock()?;
         assert_eq!(lock.as_ref(), blob2_updated_data.as_slice());
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 2);
     }
 
@@ -964,7 +963,7 @@ async fn test_blob_different_sizes() -> anyhow::Result<()> {
             .await?;
             let secret_id = secret.id().unwrap().clone();
 
-            storage.store(&secret, StoreMode::NewOnly).await?;
+            storage.store(&secret, StoreMode::NewOnly, None).await?;
 
             let loaded = storage.load(&secret_id).await?;
             let loaded_blob = loaded.as_blob()?;
@@ -1019,7 +1018,7 @@ async fn test_blob_load_metadata() -> anyhow::Result<()> {
         .await?;
         let secret_id = secret.id().unwrap();
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let loaded_metadata = storage
             .load_metadata(secret_id)
@@ -1050,7 +1049,7 @@ async fn test_mixed_blob_and_keypair_storage() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&blob, StoreMode::NewOnly).await?;
+        storage.store(&blob, StoreMode::NewOnly, None).await?;
 
         let keypair = create_secret(
             make_ed25519_test_key_32().as_ref(),
@@ -1060,9 +1059,9 @@ async fn test_mixed_blob_and_keypair_storage() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&keypair, StoreMode::NewOnly).await?;
+        storage.store(&keypair, StoreMode::NewOnly, None).await?;
 
-        let metadata_list = storage.list_metadata(ListMode::All).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 2);
 
         let blob_loaded = storage.load(blob.id().unwrap()).await?;
@@ -1106,7 +1105,7 @@ async fn test_blob_concurrent_stores() -> anyhow::Result<()> {
                 )
                 .await
                 .unwrap();
-                storage.store(&secret, StoreMode::CreateOrReplace).await.unwrap();
+                storage.store(&secret, StoreMode::CreateOrReplace, None).await.unwrap();
 
                 secret.metadata().secret_id.clone()
             });
@@ -1117,7 +1116,7 @@ async fn test_blob_concurrent_stores() -> anyhow::Result<()> {
             assert!(secret_id.is_some());
         }
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 10);
 
         for m in &metadata_list {
@@ -1140,7 +1139,7 @@ async fn test_blob_compare_data_across_storages() -> anyhow::Result<()> {
         let storage = create_test_storage(&config).await?;
 
         let secret = if let Some(base_secret) = &base_secret {
-            storage.store(base_secret, StoreMode::CreateOrReplace).await?;
+            storage.store(base_secret, StoreMode::CreateOrReplace, None).await?;
             storage.load(&secret_id).await?
         } else {
             let spec = SecretSpec::new(Algorithm::None).extractable(true).size(64);
@@ -1196,7 +1195,7 @@ async fn test_blob_hierarchical_paths() -> anyhow::Result<()> {
                 crypto.clone(),
             )
             .await?;
-            storage.store(&secret, StoreMode::NewOnly).await?;
+            storage.store(&secret, StoreMode::NewOnly, None).await?;
         }
 
         for path in &paths {
@@ -1206,7 +1205,7 @@ async fn test_blob_hierarchical_paths() -> anyhow::Result<()> {
             assert_eq!(loaded.metadata().secret_id.as_ref().unwrap().as_str(), *path);
         }
 
-        let metadata_list = storage.list_metadata(ListMode::OnlyNeeded).await?;
+        let metadata_list = storage.list_metadata().await?;
         assert_eq!(metadata_list.len(), 4);
     }
 
@@ -1394,7 +1393,7 @@ async fn test_sign_from_raw_key_data() -> anyhow::Result<()> {
         )
         .await?;
 
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let loaded = storage.load(secret.id().unwrap()).await?;
         let keypair = loaded.as_keypair()?;
@@ -1430,10 +1429,108 @@ async fn test_base64_special_symbol() -> anyhow::Result<()> {
             crypto.clone(),
         )
         .await?;
-        storage.store(&secret, StoreMode::NewOnly).await?;
+        storage.store(&secret, StoreMode::NewOnly, None).await?;
 
         let secret_loaded = storage.load(secret.id().unwrap()).await?;
         assert!(secret.eq_secret(&secret_loaded)?);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_keypair_and_blob_lifecycle() -> anyhow::Result<()> {
+    let crypto = DefaultCryptoFactory {}.new_crypto()?;
+
+    for config in fixture() {
+        println!("Storage type: {}", config.storage_type);
+
+        let storage = create_test_storage(&config).await?;
+
+        // 1. Vault is empty
+        let metas = storage.list_metadata().await?;
+        assert!(metas.is_empty(), "expected empty vault, got {} entries", metas.len());
+
+        // 2. Add one transit key (Ed25519)
+        let key_id = make_secret_id!("lifecycle_keypair");
+        let key_spec = SecretSpec::new(Algorithm::Ed25519).extractable(true);
+        storage.generate_secret(&key_spec, &key_id).await?;
+
+        // 3. Vault contains one secret
+        let metas = storage.list_metadata().await?;
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].secret_id.as_ref().unwrap(), &key_id);
+        assert!(!metas[0].is_blob());
+        assert_eq!(metas[0].algorithm, Algorithm::Ed25519);
+
+        let key_meta = storage.load_metadata(&key_id).await?;
+        assert!(key_meta.is_some());
+        assert!(!key_meta.unwrap().is_blob());
+
+        let key_loaded = storage.load(&key_id).await?;
+        assert_eq!(key_loaded.metadata().algorithm, Algorithm::Ed25519);
+        assert!(!key_loaded.metadata().is_blob());
+
+        // 4. Add a blob secret
+        let blob_id = make_secret_id!("lifecycle_blob");
+        let blob = create_secret(
+            &make_blob_test_data(32),
+            SecretDataType::Raw,
+            blob_id.as_str(),
+            Algorithm::None,
+            crypto.clone(),
+        )
+        .await?;
+        storage.store(&blob, StoreMode::NewOnly, None).await?;
+
+        // 5. Vault contains two secrets
+        let metas = storage.list_metadata().await?;
+        assert_eq!(metas.len(), 2);
+
+        let key_meta = storage.load_metadata(&key_id).await?;
+        assert!(key_meta.is_some());
+        let blob_meta = storage.load_metadata(&blob_id).await?;
+        assert!(blob_meta.is_some());
+        assert!(blob_meta.as_ref().unwrap().is_blob());
+
+        let key_loaded = storage.load(&key_id).await?;
+        assert_eq!(key_loaded.metadata().algorithm, Algorithm::Ed25519);
+        let blob_loaded = storage.load(&blob_id).await?;
+        assert!(blob_loaded.metadata().is_blob());
+
+        // 6. Delete the transit key
+        storage.delete(&key_id).await?;
+
+        // 7. Both the KV metadata and the transit key are gone
+        assert!(storage.load_metadata(&key_id).await?.is_none());
+        assert!(storage.load(&key_id).await.is_err());
+
+        // 8. Blob is unchanged
+        let blob_meta = storage.load_metadata(&blob_id).await?;
+        assert!(blob_meta.is_some());
+        assert!(blob_meta.as_ref().unwrap().is_blob());
+        let blob_loaded = storage.load(&blob_id).await?;
+        assert!(blob_loaded.metadata().is_blob());
+        assert!(blob.eq_secret(&blob_loaded)?);
+
+        let metas = storage.list_metadata().await?;
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].secret_id.as_ref().unwrap(), &blob_id);
+
+        // 9. Delete the blob
+        storage.delete(&blob_id).await?;
+
+        // 10. Vault is empty
+        let metas = storage.list_metadata().await?;
+        assert!(
+            metas.is_empty(),
+            "expected empty vault after deletes, got {} entries",
+            metas.len()
+        );
+        assert!(storage.load_metadata(&blob_id).await?.is_none());
+        assert!(storage.load(&blob_id).await.is_err());
+        assert!(storage.is_empty().await?);
     }
 
     Ok(())

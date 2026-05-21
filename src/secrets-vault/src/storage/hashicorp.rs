@@ -13,7 +13,7 @@ use crate::{
     storage::{
         hashicorp_api::{Client, KeyMode, VaultConfig},
         hashicorp_token_provider::AuthConfig,
-        storage_trait::{ListMode, Storage},
+        storage_trait::Storage,
     },
     types::{
         algorithm::Algorithm,
@@ -265,8 +265,17 @@ impl Storage for HashicorpStorage {
         }
     }
 
-    async fn store(&self, secret: &Secret, mode: StoreMode) -> anyhow::Result<()> {
-        let metadata = secret.metadata().clone();
+    async fn store(
+        &self,
+        secret: &Secret,
+        mode: StoreMode,
+        override_extractable: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let mut metadata = secret.metadata().clone();
+        if let Some(override_extractable) = override_extractable {
+            metadata.extractable = override_extractable;
+        }
+
         let secret_id = metadata
             .secret_id
             .as_ref()
@@ -345,24 +354,11 @@ impl Storage for HashicorpStorage {
         Ok(())
     }
 
-    async fn list_metadata(&self, mode: ListMode) -> anyhow::Result<Vec<Metadata>> {
+    async fn list_metadata(&self) -> anyhow::Result<Vec<Metadata>> {
         let mut metas = Vec::new();
 
-        // Transit keys
-        if mode == ListMode::All {
-            let transit_keys = self.client.list_keys().await?;
-            for secret_id in transit_keys {
-                let meta = self.load_metadata(&secret_id.as_str().into()).await?;
-
-                if let Some(m) = meta {
-                    metas.push(m);
-                }
-            }
-        }
-
-        // KV blobs
-        let blob_names = self.client.list_blobs().await?;
-        for secret_id in blob_names {
+        let names = self.client.list_meta().await?;
+        for secret_id in names {
             let meta = self.load_metadata(&secret_id.as_str().into()).await?;
             if let Some(m) = meta {
                 metas.push(m);
@@ -379,5 +375,37 @@ impl Storage for HashicorpStorage {
 
     fn format_version(&self) -> anyhow::Result<u32> {
         Ok(1)
+    }
+
+    #[cfg(test)]
+    async fn clear(&self) -> anyhow::Result<()> {
+        // KV: hard-delete every leaf under blobs/ and meta/.
+        for subdir in ["blobs", "meta"] {
+            let names = self.client.list_kv_subdir(subdir).await?;
+            for name in names {
+                if name.ends_with('/') {
+                    continue;
+                }
+                self.client.kv_hard_delete(&format!("{subdir}/{name}")).await?;
+            }
+        }
+
+        // Transit: hard-delete every key in the mount.
+        let keys = self.client.list_all_mount_transit_keys().await?;
+        for key in keys {
+            self.client.delete_key(&key).await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn is_empty(&self) -> anyhow::Result<bool> {
+        for subdir in ["blobs", "meta"] {
+            if !self.client.list_kv_subdir(subdir).await?.is_empty() {
+                return Ok(false);
+            }
+        }
+        Ok(self.client.list_all_mount_transit_keys().await?.is_empty())
     }
 }

@@ -46,7 +46,7 @@ Before starting the deployment, ensure you have:
 nodectl is distributed as a Docker image. Pull the latest version:
 
 ```bash
-docker pull ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0
+docker pull ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0
 ```
 
 To run any `nodectl` CLI command, use `docker run` with the image:
@@ -56,7 +56,7 @@ docker run --rm \
   -v "$(pwd)/nodectl-config.json":/nodectl/config.json \
   -e VAULT_URL="$VAULT_URL" \
   -e CONFIG_PATH="/nodectl/config.json" \
-  ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+  ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
   nodectl <command> [options]
 ```
 
@@ -67,7 +67,7 @@ alias nodectl='docker run --rm \
   -v "$(pwd)/nodectl-config.json":/nodectl/config.json \
   -e VAULT_URL="$VAULT_URL" \
   -e CONFIG_PATH="/nodectl/config.json" \
-  ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+  ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
   nodectl'
 ```
 
@@ -78,7 +78,7 @@ alias nodectl='docker run --rm \
 >   -v "$(pwd)/vault.json":/nodectl/vault.json \
 >   -e VAULT_URL="file:///nodectl/vault.json?master_key=$MASTER_KEY" \
 >   -e CONFIG_PATH="/nodectl/config.json" \
->   ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+>   ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
 >   nodectl'
 > ```
 
@@ -314,7 +314,7 @@ docker run -d \
   -e VAULT_URL="$VAULT_URL" \
   -e CONFIG_PATH="/nodectl/config.json" \
   -e RUST_BACKTRACE=1 \
-  ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+  ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
   nodectl service --config=/nodectl/config.json
 ```
 
@@ -328,7 +328,7 @@ docker run -d \
 >   -e VAULT_URL="file:///nodectl/vault.json?master_key=$MASTER_KEY" \
 >   -e CONFIG_PATH="/nodectl/config.json" \
 >   -e RUST_BACKTRACE=1 \
->   ghcr.io/rsquad/ton-rust-node/nodectl:v0.4.0 \
+>   ghcr.io/rsquad/ton-rust-node/nodectl:v0.5.0 \
 >   nodectl service --config=/nodectl/config.json
 > ```
 > Without this mount, all vault keys (wallet keys, ADNL keys) will be lost on every container restart.
@@ -337,11 +337,11 @@ docker run -d \
 
 Once started, the service:
 
-1. **Serves the REST API** on `http.bind` (default `0.0.0.0:8080`). All subsequent configuration commands (nodes, wallets, pools, bindings, elections settings, logging, TON HTTP API) flow through this API. Protected endpoints require a JWT token — see [Step 8](#step-8-configure-rest-api-authentication).
+1. **Serves the REST API** on `http.bind` (default `0.0.0.0:8080`). All subsequent configuration commands (nodes, wallets, pools, bindings, elections settings, **contracts automation**, logging, TON HTTP API) flow through this API. Protected endpoints require a JWT token — see [Step 8](#step-8-configure-rest-api-authentication).
 
-2. **Auto-deploys contracts** — automatically deploys validator wallets and nominator pools that are configured but not yet deployed on-chain. Deployment is funded from the master wallet.
+2. **Auto-deploys contracts** — automatically deploys validator wallets and nominator pools that are configured but not yet deployed on-chain. Deployment is funded from the master wallet. **Amounts, separate SNP/TONCore pool values, the contracts task tick interval, and on/off toggles** are configured under `automation` in the service config, or at runtime with `GET`/`POST /v1/automation/settings` and **`nodectl automation`** — see **[Contracts automation](./contracts-automation.md)**.
 
-3. **Auto-funds wallets** — periodically checks validator wallet balances and sends **10 TON** from the master wallet when a wallet balance drops below **5 TON**.
+3. **Auto-funds wallets** — periodically checks validator wallet balances and tops them up from the master when the balance is below a configurable **threshold** (default **5 TON**; top-up amount default **10 TON**), unless **auto-topup** is turned off. Same link as above for changing defaults.
 
 4. **Runs the elections task** — participates in validator elections according to the configured stake policy for every enabled binding (see [Step 16](#step-16-enable-elections)).
 

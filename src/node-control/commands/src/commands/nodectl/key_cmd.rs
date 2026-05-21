@@ -6,11 +6,11 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use super::key_migrate_cmd::KeyMigrateCmd;
 use anyhow::Context;
 use colored::Colorize;
 use secrets_vault::{
     crypto::factory::CryptoFactory,
-    storage::storage_trait::ListMode,
     types::{
         algorithm::Algorithm,
         metadata::Metadata,
@@ -50,6 +50,8 @@ pub enum KeyAction {
     Ls(KeyLsCmd),
     /// Remove a key from the vault
     Rm(KeyRmCmd),
+    /// Copy all secrets from FROM_VAULT_URL to VAULT_URL
+    Migrate(KeyMigrateCmd),
 }
 
 #[derive(clap::Args, Clone)]
@@ -128,12 +130,19 @@ async fn print_secret(secret: &Secret) -> anyhow::Result<()> {
 
 impl KeyCmd {
     pub async fn run(&self) -> anyhow::Result<()> {
+        // `migrate` opens both source and destination vaults itself from
+        // FROM_VAULT_URL and VAULT_URL, so skip the shared single-vault open.
+        if let KeyAction::Migrate(cmd) = &self.action {
+            return cmd.run().await;
+        }
+
         let vault = SecretVaultBuilder::from_env(BlockCryptoFactory {}.new_crypto()?).await?;
         match &self.action {
             KeyAction::Add(cmd) => cmd.run(&vault).await,
             KeyAction::Import(cmd) => cmd.run(&vault).await,
             KeyAction::Ls(cmd) => cmd.run(&vault).await,
             KeyAction::Rm(cmd) => cmd.run(&vault).await,
+            KeyAction::Migrate(_) => unreachable!("handled above"),
         }
     }
 }
@@ -185,7 +194,7 @@ impl KeyImportCmd {
 
 impl KeyLsCmd {
     pub async fn run(&self, vault: &SecretVault) -> anyhow::Result<()> {
-        let records = vault.list_metadata(ListMode::OnlyNeeded).await?;
+        let records = vault.list_metadata().await?;
 
         if records.is_empty() {
             println!("\n{}\n", "No keys found".yellow());

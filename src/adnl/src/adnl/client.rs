@@ -124,19 +124,25 @@ pub struct AdnlClient {
 }
 
 impl AdnlClient {
-    /// Connect to server
+    /// Connect to server.
     pub async fn connect(config: &AdnlClientConfig) -> Result<Self> {
-        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
-        socket.set_reuse_address(true)?;
-        socket.set_linger(Some(Duration::from_secs(0)))?;
-        //socket.bind(&"0.0.0.0:0".parse::<SocketAddr>()?.into())?;
-        socket.connect_timeout(&config.server_address.into(), config.timeouts.write())?;
-        socket.set_nonblocking(true)?;
+        let connect_timeout = config.timeouts.write();
+        let tcp = tokio::time::timeout(
+            connect_timeout,
+            tokio::net::TcpStream::connect(config.server_address),
+        )
+        .await
+        .map_err(|_| {
+            error!(
+                "ADNL connect to {} timed out after {:?}",
+                config.server_address, connect_timeout,
+            )
+        })?
+        .map_err(|e| error!("ADNL connect to {} failed: {}", config.server_address, e))?;
 
-        let mut stream = AdnlStream::from_stream_with_timeouts(
-            tokio::net::TcpStream::from_std(socket.into())?,
-            config.timeouts(),
-        );
+        socket2::SockRef::from(&tcp).set_linger(Some(Duration::from_secs(0)))?;
+
+        let mut stream = AdnlStream::from_stream_with_timeouts(tcp, config.timeouts());
 
         let mut crypto = Self::send_init_packet(&mut stream, config).await?;
         if let Some(client_key) = &config.client_key {
