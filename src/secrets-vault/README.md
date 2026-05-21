@@ -67,19 +67,26 @@ Secrets are encrypted with AES-256-GCM under the master key and stored in a hier
 
 ### HashiCorp Vault Backend (`hashicorp://`)
 
+Ed25519 keys are managed via Vault's **Transit** engine. Blobs and per-secret
+metadata are stored in a **KV v2** engine.
+
 ```
-hashicorp://<vault_address>?api_key=<token>[&namespace=<ns>][&prefer_local_crypto=false]
+hashicorp://<vault_address>?<auth>&<vault_config>
 ```
+
+`<vault_address>` is `host[:port]`, optionally prefixed with `http://` or
+`https://`. If the scheme is omitted, `https://` is assumed. Examples:
+`vault:8200`, `http://vault:8200`, `https://vault.example.com:8200`.
 
 **Authentication** — choose one method:
 
-| Parameter   | Required | Description                                          |
-|-------------|----------|------------------------------------------------------|
-| `api_key`   | Yes*     | Static Vault token (`auth=token` or omit `auth`)     |
-| `auth`      | No       | Auth method: `token` (default) or `k8s`              |
-| `role`      | Yes**    | Vault role name (required when `auth=k8s`)           |
-| `auth_mount`| No       | Kubernetes auth mount path (default: `kubernetes`)   |
-| `jwt_path`  | No       | Path to service account JWT (default: `/var/run/secrets/kubernetes.io/serviceaccount/token`) |
+| Parameter    | Required | Description                                          |
+|--------------|----------|------------------------------------------------------|
+| `auth`       | No       | Auth method: `token` (default) or `k8s`              |
+| `api_key`    | Yes*     | Static Vault token                                   |
+| `role`       | Yes**    | Vault role name (required when `auth=k8s`)           |
+| `auth_mount` | No       | Kubernetes auth mount path (default: `kubernetes`)   |
+| `jwt_path`   | No       | Path to ServiceAccount JWT (default: `/var/run/secrets/kubernetes.io/serviceaccount/token`) |
 
 \* Required when `auth=token` or `auth` is omitted. \*\* Required when `auth=k8s`.
 
@@ -87,27 +94,40 @@ hashicorp://<vault_address>?api_key=<token>[&namespace=<ns>][&prefer_local_crypt
 
 | Parameter             | Default    | Description                                          |
 |-----------------------|------------|------------------------------------------------------|
-| `namespace`           | —          | Vault namespace                                      |
-| `prefer_local_crypto` | `false`    | Cache extractable private keys locally               |
-| `transit_mount`       | `transit`  | Mount path for Transit secret engine                 |
-| `transit_prefix`      | —          | Path prefix within the transit mount (e.g. `mainnet` or `mainnet.validator-0`). No `/` or other URL-specific characters allowed. |
-| `kv_mount`            | `secret`   | Mount path for KV v2 secret engine                   |
-| `kv_prefix`           | —          | Path prefix within KV mount (e.g. `mainnet` or `mainnet/validator-0`) |
+| `namespace`           | —          | Vault namespace (Vault Enterprise)                   |
+| `prefer_local_crypto` | `false`    | Cache extractable private keys locally to sign without round-tripping to Transit |
+| `transit_mount`       | `transit`  | Mount path of the Transit secret engine              |
+| `transit_prefix`      | —          | Path prefix within the Transit mount (e.g. `mainnet` or `mainnet.validator-0`). Becomes part of the Transit key name. **No `/` or URL-reserved characters allowed.** |
+| `kv_mount`            | `secret`   | Mount path of the KV v2 secret engine                |
+| `kv_prefix`           | —          | Path prefix within the KV mount (e.g. `mainnet` or `mainnet/validator-0`). Slashes are allowed. |
 
-Ed25519 keys are managed via Transit engine. Blobs are stored in KV v2 engine.
+**KV v2 path layout.** The backend stores two kinds of data side-by-side
+under `kv_prefix`:
+
+| Logical store | KV path (read/write)                          | Metadata path                                  |
+|---------------|-----------------------------------------------|------------------------------------------------|
+| Blobs         | `<kv_mount>/data/blobs/<kv_prefix>/<id>`       | `<kv_mount>/metadata/blobs/<kv_prefix>/<id>`   |
+| Per-secret meta | `<kv_mount>/data/meta/<kv_prefix>/<id>`      | `<kv_mount>/metadata/meta/<kv_prefix>/<id>`    |
+
+A Vault policy must cover **both** subtrees — see the policy example below.
 
 **Examples:**
 
 ```bash
-# Static token (default mounts)
+# Static token, default mounts (`transit`, `secret`) — HTTPS implicit
 hashicorp://vault:8200?api_key=hvs.xxx
 
-# Kubernetes auth
-hashicorp://vault:8200?auth=k8s&role=validator-0
+# Static token + custom mounts + prefix (explicit HTTPS)
+hashicorp://https://vault.example.com:8200?api_key=hvs.xxx&transit_mount=ton-transit&transit_prefix=nodectl&kv_mount=ton&kv_prefix=nodectl
 
-# Custom mount paths + environment prefix
-hashicorp://vault:8200?api_key=hvs.xxx&transit_mount=ton-transit&transit_prefix=mainnet.validator_0&kv_mount=ton&kv_prefix=mainnet.validator_0
+# Kubernetes auth (in-cluster Pod, plain HTTP)
+hashicorp://http://vault.vault.svc:8200?auth=k8s&role=nodectl&transit_mount=ton-transit&transit_prefix=nodectl&kv_mount=ton&kv_prefix=nodectl
+
+# Kubernetes auth on a custom mount path
+hashicorp://http://vault.vault.svc:8200?auth=k8s&auth_mount=k8s-dev&role=validator-0&transit_mount=ton-transit&transit_prefix=validator-0&kv_mount=ton&kv_prefix=dev/validator-0
 ```
+
+For deployment-side setup (enabling the engines, the Vault policy template, and Kubernetes auth) see [helm/ton-rust-node/docs/vault.md — HashiCorp Vault backend](../../helm/ton-rust-node/docs/vault.md#hashicorp-vault-backend).
 
 ## Core API
 
