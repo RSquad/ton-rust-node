@@ -1080,6 +1080,7 @@ class Bootstrap:
         # Patch global tick_interval — no CLI command exists for this field
         cfg_json = json.loads(self.paths.nodectl_config.read_text())
         cfg_json["tick_interval"] = 20
+        cfg_json["automation"]["tick_interval_sec"] = 20
         self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
         self.log.info("  global tick_interval → 20")
 
@@ -1263,6 +1264,7 @@ class Bootstrap:
             self.log.info(f"  Top up pool {addr} ({self.cfg.pool_topup} TON)")
             self._bun_topup(addr, self.cfg.pool_topup)
             time.sleep(5)
+        self.log.info("  Listing pools...")
         self._nctl("config", "pool", "ls")
 
         return wallet_addrs, pool_addrs
@@ -1612,7 +1614,7 @@ def main() -> None:
         sys.exit(1)
 
     os.environ["API_ENDPOINTS"] = cfg.http_api_url.rstrip("/") + "/"
-    vault_url = f"file://vault.json?master_key={secrets.token_hex(32)}"
+    vault_url = os.environ.get("VAULT_URL") or f"file://vault.json?master_key={secrets.token_hex(32)}"
     os.environ["VAULT_URL"] = vault_url
     if cfg.print_sensitive:
         log.info(f"VAULT_URL={vault_url}")

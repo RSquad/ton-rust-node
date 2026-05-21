@@ -52,6 +52,12 @@ test-e2e: $(SINGLEHOST_DIR)/.venv/pyvenv.cfg
 	cd $(SINGLEHOST_DIR) && \
 	  NOBUILD=$(NOBUILD) \
 	  SCENARIO=$(SCENARIO) \
+	  VAULT_URL_NODE_1="hashicorp://http://127.0.0.1:8200?api_key=root&kv_prefix=testnet/validator-1" \
+	  VAULT_URL_NODE_2="hashicorp://http://127.0.0.1:8200?api_key=root&kv_prefix=testnet/validator-2" \
+	  VAULT_URL_NODE_3="hashicorp://http://127.0.0.1:8200?api_key=root&kv_prefix=testnet/validator-3" \
+	  VAULT_URL_NODE_4="hashicorp://http://127.0.0.1:8200?api_key=root&kv_prefix=testnet/validator-4" \
+	  VAULT_URL_NODE_5="hashicorp://http://127.0.0.1:8200?api_key=root&kv_prefix=testnet/validator-5" \
+	  VAULT_URL_NODE_6="hashicorp://http://127.0.0.1:8200?api_key=root&kv_prefix=testnet/validator-6" \
 	  .venv/bin/python3 run_singlehost_nodectl.py
 
 stop-e2e:
