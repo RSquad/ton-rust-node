@@ -22,7 +22,6 @@ use secrets_vault::{
     crypto::factory::CryptoFactory,
     errors::error::VaultError,
     make_secret_id,
-    memory::protected_memory::ProtectedMemory,
     types::{
         algorithm::Algorithm as SecretAlgorithm,
         metadata::Metadata as SecretMetadata,
