@@ -27,7 +27,7 @@ use std::{
 };
 use ton_block::{
     sha256_digest, BlockIdExt, BlockSignaturesVariant, BocFlags, BocWriter, BuilderData,
-    Ed25519KeyOption, ShardIdent, UInt256,
+    Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes,
 };
 
 include!("../../../common/src/info.rs");
@@ -337,8 +337,10 @@ fn run_validation_test() {
     log::info!("=== STARTING VALIDATION TEST ===");
 
     // Create two nodes
-    let private_key_0 = Ed25519KeyOption::generate().expect("Failed to generate private key 0");
-    let private_key_1 = Ed25519KeyOption::generate().expect("Failed to generate private key 1");
+    let private_key_0 =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key 0");
+    let private_key_1 =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate private key 1");
 
     let node_0 = SessionNode {
         adnl_id: private_key_0.id().clone(),

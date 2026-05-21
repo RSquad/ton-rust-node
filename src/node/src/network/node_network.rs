@@ -632,7 +632,8 @@ impl NodeNetwork {
             }
             match adnl_key.pvt_key() {
                 Ok(pvt_key) => {
-                    if let Err(e) = quic.add_key(pvt_key, &key_id, bind_addr) {
+                    let pvt_key_data: &[u8] = &pvt_key.lock()?;
+                    if let Err(e) = quic.add_key(pvt_key_data.try_into()?, &key_id, bind_addr) {
                         log::warn!("Cannot add validator ADNL key {key_id} to QUIC: {e}");
                     }
                 }

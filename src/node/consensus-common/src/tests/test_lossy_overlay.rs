@@ -11,7 +11,7 @@
 use super::*;
 use crate::ConsensusCommonFactory;
 use std::sync::atomic::{AtomicU32, Ordering};
-use ton_block::Ed25519KeyOption;
+use ton_block::{Ed25519KeyOption, ZeroizingBytes};
 
 /// Simple test listener that counts received packets.
 struct CountingListener {
@@ -51,7 +51,7 @@ impl ConsensusOverlayListener for CountingListener {
 }
 
 fn create_test_key() -> PrivateKey {
-    Ed25519KeyOption::generate().expect("Failed to generate key")
+    Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key")
 }
 
 fn create_test_data() -> BlockPayloadPtr {

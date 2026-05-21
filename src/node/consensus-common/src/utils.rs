@@ -11,6 +11,7 @@
 //! This module contains utilities that don't depend on catchain-specific types.
 
 use crate::PublicKeyHash;
+use secrets_vault::vault_block::get_key_option_factory;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ton_block::{KeyId, UInt256};
 
@@ -180,21 +181,19 @@ pub(crate) fn parse_hex_as_session_id(hex_asm: &str) -> crate::SessionId {
 }
 
 pub(crate) fn parse_hex_as_private_key(hex_asm: &str) -> crate::PrivateKey {
-    use ton_block::Ed25519KeyOption;
     assert!(hex_asm.len() % 2 == 0);
     let mut key_slice = vec![0; hex_asm.len() / 2];
     parse_hex_to_array(hex_asm, &mut key_slice[..]);
     assert!(key_slice.len() == 32);
-    Ed25519KeyOption::from_private_key(key_slice.as_slice().try_into().unwrap()).unwrap()
+    get_key_option_factory().from_private_key(key_slice.as_slice().try_into().unwrap()).unwrap()
 }
 
 pub(crate) fn parse_hex_as_expanded_private_key(hex_asm: &str) -> crate::PrivateKey {
-    use ton_block::Ed25519KeyOption;
     assert!(hex_asm.len() % 2 == 0);
     let mut key_slice = vec![0; hex_asm.len() / 2];
     parse_hex_to_array(hex_asm, &mut key_slice[..]);
     assert!(key_slice.len() == 64);
-    Ed25519KeyOption::from_expanded_key(key_slice.as_slice().try_into().unwrap()).unwrap()
+    get_key_option_factory().from_expanded_key(key_slice.as_slice().try_into().unwrap()).unwrap()
 }
 
 /*

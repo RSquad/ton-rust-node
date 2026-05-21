@@ -27,7 +27,6 @@ chrono = "0.4"
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
     "hashicorp-storage",
-    "ton-block",
 ] }
 argon2 = "0.5.3"
 

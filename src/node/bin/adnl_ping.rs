@@ -11,9 +11,10 @@ use adnl::{
     OverlayNode, OverlayParams,
 };
 use node::config::TonNodeGlobalConfigJson;
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{convert::TryInto, env, fs::File, io::BufReader, sync::Arc};
 use ton_api::{ton::rpc::ton_node::GetCapabilities, AnyBoxedSerialize};
-use ton_block::{base64_decode, error, fail, Ed25519KeyOption, Result};
+use ton_block::{base64_decode, error, fail, Result};
 
 include!("../../common/src/log.rs");
 
@@ -56,8 +57,9 @@ fn ping(
         fail!("Cannot add overlay {}", overlay_id)
     }
     let local_key = adnl.key_by_tag(KEY_TAG)?;
-    let other_key =
-        Arc::new(Ed25519KeyOption::from_public_key((&base64_decode(pub_key)?[..]).try_into()?));
+    let other_key = Arc::new(
+        get_key_option_factory().from_public_key((&base64_decode(pub_key)?[..]).try_into()?),
+    );
     let other_id = adnl.add_peer(local_key.id(), &ip, None, &other_key)?;
     let other_id =
         if let Some(other_id) = other_id { other_id } else { fail!("Cannot add peer to ADNL") };

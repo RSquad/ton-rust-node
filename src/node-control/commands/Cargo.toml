@@ -27,7 +27,6 @@ service = { path = "../service" }
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
     "hashicorp-storage",
-    "ton-block",
 ] }
 scopeguard = "1"
 rpassword = "7"

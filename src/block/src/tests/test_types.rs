@@ -13,7 +13,7 @@ use crate::{
     base64_decode, base64_encode,
     cell::{Cell, CellType},
     ed25519_generate_private_key, ed25519_sign_with_secret, write_read_and_assert,
-    Ed25519KeyOption,
+    Ed25519KeyOption, ZeroizingBytes,
 };
 use num::{CheckedAdd, CheckedSub};
 
@@ -157,10 +157,11 @@ fn test_parse_int256() {
 
 #[test]
 fn test_shared_secret() {
-    let alice = Ed25519KeyOption::generate().unwrap();
-    let bob = Ed25519KeyOption::generate().unwrap();
+    let alice = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+    let bob = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let shared_secret = alice.shared_secret(bob.pub_key().unwrap()).unwrap();
-    assert_eq!(shared_secret, bob.shared_secret(alice.pub_key().unwrap()).unwrap());
+    let other = bob.shared_secret(alice.pub_key().unwrap()).unwrap();
+    assert_eq!(shared_secret.lock().unwrap().as_ref(), other.lock().unwrap().as_ref());
 }
 
 #[rustfmt::skip]
@@ -239,7 +240,7 @@ fn test_ed25519_signing() {
     let data = [1, 2, 3];
     let secret_key = ed25519_generate_private_key().unwrap();
     let signature1 = secret_key.sign(&data);
-    let key = Ed25519KeyOption::from_private_key(secret_key.as_bytes()).unwrap();
+    let key = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(secret_key.as_bytes()).unwrap();
     let signature2 = key.sign(&data).unwrap();
     assert_eq!(&signature1, signature2.as_slice());
     let signature3 = ed25519_sign_with_secret(secret_key.as_bytes(), &data).unwrap();

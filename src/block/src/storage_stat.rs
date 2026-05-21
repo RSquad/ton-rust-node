@@ -107,7 +107,6 @@ impl AccountStorageStat {
                 (hash, data): (&'a UInt256, &mut StorageStatCellInfo),
             ) -> (FixedBitsKey<'a>, Option<SliceData>) {
                 data.ref_count_diff = 0;
-                // Safe to unwrap: UInt256 always contains 32 bytes = 256 bits.
                 let key = FixedBitsKey::new(hash.as_slice());
                 if data.ref_count == 0 {
                     (key, None)

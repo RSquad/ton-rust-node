@@ -58,6 +58,9 @@ pub struct EngineTelemetry {
     pub awaiters: Arc<Metric>,
     pub catchain_clients: Arc<Metric>,
     pub cells: Arc<Metric>,
+    pub cells_mb: Arc<Metric>,
+    pub arena_cells: Arc<Metric>,
+    pub arena_bytes_mb: Arc<Metric>,
     pub shard_states: Arc<Metric>,
     pub top_blocks: Arc<Metric>,
     pub validator_adnl_keys: Arc<Metric>,
@@ -65,6 +68,10 @@ pub struct EngineTelemetry {
     pub validator_sets: Arc<Metric>,
     pub account_state_cache_mb: Arc<Metric>,
     pub storage_dicts_cache_cells: Arc<Metric>,
+    pub jemalloc_allocated_mb: Arc<Metric>,
+    pub jemalloc_resident_mb: Arc<Metric>,
+    pub jemalloc_mapped_mb: Arc<Metric>,
+    pub jemalloc_retained_mb: Arc<Metric>,
 }
 
 pub struct EngineAlloc {
@@ -722,8 +729,8 @@ pub trait EngineOperations: Sync + Send {
     }
     fn complete_external_messages(
         &self,
-        to_delay: Vec<(UInt256, String)>,
-        to_delete: Vec<(UInt256, i32)>,
+        to_delay: &[UInt256],
+        to_delete: &[UInt256],
     ) -> Result<()> {
         unimplemented!()
     }

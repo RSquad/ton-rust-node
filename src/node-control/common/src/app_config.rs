@@ -17,7 +17,7 @@ use secrets_vault::{
         secret::{Secret, SecretInMemoryFactory},
     },
     vault::SecretVault,
-    vault_block::BlockCryptoFactory,
+    vault_block::{BlockCryptoFactory, get_key_option_factory},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -28,7 +28,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use ton_block::Ed25519KeyOption;
 
 fn default_ton_http_api_url() -> String {
     "http://127.0.0.1:3301/".to_owned()
@@ -559,9 +558,10 @@ impl AdnlConfig {
         if pvt_key.len() < 32 {
             anyhow::bail!("invalid client private key length");
         }
-        let client_key_opt = Ed25519KeyOption::from_private_key(&pvt_key[..32].try_into()?)?;
+        let client_key_opt =
+            get_key_option_factory().from_private_key(&pvt_key[..32].try_into()?)?;
         let server_pub_key = blob.data();
-        let server_key = Ed25519KeyOption::from_public_key(
+        let server_key = get_key_option_factory().from_public_key(
             server_pub_key
                 .lock()?
                 .deref()

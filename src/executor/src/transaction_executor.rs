@@ -17,8 +17,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use ton_block::{
-    error, fail, unpack_out_action_slices, AccStatusChange, Account, AccountId, AccountStatus,
-    AddSub, BlockError, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
+    error, fail, time_checker, unpack_out_action_slices, AccStatusChange, Account, AccountId,
+    AccountStatus, AddSub, BlockError, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
     CurrencyCollection, Deserializable, ExceptionCode, GasLimitsPrices, GetRepresentationHash,
     GlobalCapabilities, HashmapE, HashmapFilterResult, IBitstring, Mask, Message, MsgAddressInt,
     NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, OutAction, Result,
@@ -434,6 +434,7 @@ pub trait TransactionExecutor {
 
         let result = vm.execute();
         log::trace!(target: "executor", "execute result: {:?}", result);
+        vm_phase.success = vm.is_committed_state();
         let mut raw_exit_arg = None;
         match result {
             Ok(exit_code) => vm_phase.exit_code = exit_code,
@@ -449,14 +450,15 @@ pub trait TransactionExecutor {
                         None => ExceptionCode::UnknownError as i32,
                     }
                 };
-                vm_phase.exit_arg = match value.as_integer_value(i32::MIN..=i32::MAX) {
-                    Err(_) | Ok(0) => None,
-                    Ok(exit_arg) => Some(exit_arg),
-                };
+                // set exit_arg only if phase is !success
+                if let Ok(v) = value.as_integer_value(i32::MIN..=i32::MAX) {
+                    if v != 0 && !vm_phase.success {
+                        vm_phase.exit_arg = Some(v);
+                    }
+                }
                 raw_exit_arg = Some(value);
             }
         };
-        vm_phase.success = vm.is_committed_state();
         log::debug!(target: "executor", "VM terminated with exit code {}", vm_phase.exit_code);
 
         // calc gas fees
@@ -1281,6 +1283,21 @@ fn outmsg_action_handler(
             int_header.ihr_disabled = true;
         }
         int_header.bounced = false;
+
+        let max_extras = config.size_limits_config().max_msg_extra_currencies as usize;
+        let extras_count = int_header.value.other.count(max_extras + 1).map_err(|err| {
+            log::warn!(target: "executor", "cannot count extra currencies: {err}");
+            RESULT_CODE_TOO_MANY_EXTRA // replicate CPP behavior
+        })?;
+        if extras_count > max_extras {
+            log::debug!(target: "executor",
+                "too many extra currencies in outbound message");
+            return check_skip_invalid(RESULT_CODE_TOO_MANY_EXTRA);
+        }
+        int_header.value.remove_zero_currencies().map_err(|err| {
+            log::warn!(target: "executor", "cannot remove zero extra currencies: {err}");
+            RESULT_CODE_TOO_MANY_EXTRA // replicate CPP behavior
+        })?;
     }
 
     let fwd_prices = config.get_fwd_prices(msg.is_masterchain());
@@ -1567,7 +1584,7 @@ fn outmsg_action_handler(
         phase.tot_msg_size.add_bits_and_cells(sstat.bits() + add_bits, sstat.cells() + 1);
 
         if mode.any(SENDMSG_ALL_BALANCE | SENDMSG_REMAINING_MSG_BALANCE) {
-            *msg_balance = CurrencyCollection::default();
+            msg_balance.coins.clear();
         }
 
         log::debug!(
@@ -1919,6 +1936,8 @@ pub(super) fn check_account_size_limits(cfg: &SizeLimitsConfig, acc: &mut Accoun
     } else {
         cfg.max_acc_state_cells as u64
     };
+    let acc_id = acc.get_id().cloned().unwrap_or_default();
+    let _tc = time_checker!(|| format!("account {:x} precalc_storage_stat", acc_id), 100);
     let Some(stat) = acc.precalc_storage_stat()? else {
         return Ok(true);
     };

@@ -28,6 +28,10 @@ consensus-common = { path = '../consensus-common' }
 ton_block = { path = '../../block' }
 storage = { path = '../storage' }
 ton_api = { path = '../../tl/ton_api' }
+secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
+    "file-storage-json",
+    "hashicorp-storage",
+] }
 
 [dev-dependencies]
 log4rs = { features = [ 'rolling_file_appender' ], version = '1.3' }

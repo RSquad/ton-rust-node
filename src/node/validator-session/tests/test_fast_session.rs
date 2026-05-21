@@ -21,7 +21,9 @@ use std::{
     },
     time::Duration,
 };
-use ton_block::{BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{
+    BlockIdExt, BlockSignaturesVariant, Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes,
+};
 use validator_session::*;
 
 include!("../../../common/src/info.rs");
@@ -258,7 +260,8 @@ fn log_fast_session() {
 
     //initialize Validator Session
 
-    let local_key = Ed25519KeyOption::generate().expect("private key has not been generated");
+    let local_key =
+        Ed25519KeyOption::<ZeroizingBytes>::generate().expect("private key has not been generated");
 
     let rand_name: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)

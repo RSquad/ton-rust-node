@@ -22,7 +22,7 @@ use crate::{
     PublicKey,
 };
 use std::collections::HashMap;
-use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256};
+use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256, ZeroizingBytes};
 
 /*
     ============================================================================
@@ -31,7 +31,7 @@ use ton_block::{BlockIdExt, Ed25519KeyOption, ShardIdent, UInt256};
 */
 
 fn create_test_public_key() -> PublicKey {
-    Ed25519KeyOption::generate().expect("Failed to generate key")
+    Ed25519KeyOption::<ZeroizingBytes>::generate().expect("Failed to generate key")
 }
 
 /*

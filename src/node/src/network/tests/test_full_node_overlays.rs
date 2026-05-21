@@ -25,6 +25,7 @@ use ton_api::{
 use ton_block::{
     BlockSignatures, BlockSignaturesPure, BlockSignaturesSimplex, BlockSignaturesVariant,
     CryptoSignature, CryptoSignaturePair, Ed25519KeyOption, UInt256, ValidatorBaseInfo,
+    ZeroizingBytes,
 };
 
 #[test]
@@ -224,7 +225,7 @@ async fn test_overlay_client() {
     )
     .await
     .unwrap();
-    let peer_key = Ed25519KeyOption::generate().unwrap();
+    let peer_key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
     let this_key = context.stack.adnl.key_by_tag(KEY_TAG).unwrap();
     let peer = context
         .stack

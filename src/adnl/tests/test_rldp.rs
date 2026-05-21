@@ -304,14 +304,14 @@ fn rldp_compatibility() {
             let ours = adnl.key_by_tag(KEY_TAG).unwrap().id().clone();
             let key = base64_decode("WtYCFK04u/rfV8KEnMgRPUzQNVnOoV+7SFTByrhIFwM=").unwrap();
             let key: [u8; 32] = key[..32].try_into().unwrap();
-            let peer_key: Arc<dyn KeyOption> = ton_block::Ed25519KeyOption::from_public_key(&key);
+            let peer_key: Arc<dyn KeyOption> = secrets_vault::vault_block::get_key_option_factory().from_public_key(&key);
             let ip = IpAddress::from_versioned_string("91.134.31.11:30000", None).unwrap();
             let peer = adnl.add_peer(&ours, &ip, &peer_key).unwrap().unwrap();
         */
         /*
             let key = hex::decode("9668c407a317ae95d07c76506c7d576bbcfed539d69d0d3f0b7da140c2d29925").unwrap();
             let key: [u8; 32] = key[..32].try_into().unwrap();
-            let peer_key: Arc<dyn KeyOption> = ton_block::Ed25519KeyOption::from_private_key(&key).unwrap();
+            let peer_key: Arc<dyn KeyOption> = secrets_vault::vault_block::get_key_option_factory().from_private_key(&key).unwrap();
             let ip = IpAddress::from_versioned_string("31.222.227.12:4091", None).unwrap();
             let peer = adnl.add_peer(&ours, &ip, &peer_key).unwrap().unwrap();
         */
@@ -393,6 +393,10 @@ fn test_rldp_session_with_loss(
         min_timeout_ms,
     );
     rt.block_on(async move {
+        // Extend inbound RLDP cap for test
+        ctx1.rldp.change_inbound_cap_for_peers(&[ctx2.peer.clone()], 1).unwrap();
+        ctx2.rldp.change_inbound_cap_for_peers(&[ctx1.peer.clone()], 1).unwrap();
+
         let data_send = Mockup::build_query();
         let data_recv = Mockup::build_reply();
         let max_answer_size = Some(513 * 1024);

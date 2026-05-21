@@ -111,7 +111,7 @@ impl Package {
 
     pub async fn truncate(&self, size: u64) -> Result<()> {
         let new_size = PKG_HEADER_SIZE as u64 + size;
-        let Some(file) = &*self.write_mutex.lock().await else {
+        let Some(file) = &mut *self.write_mutex.lock().await else {
             fail!(
                 "Cannot truncate package file {}, because it was not opened",
                 self.path().display()
@@ -127,6 +127,8 @@ impl Package {
         );
         self.size.store(new_size, Ordering::SeqCst);
         file.set_len(new_size).await?;
+        // ftruncate doesn't move the write cursor; reset to EOF to avoid sparse-gap writes.
+        file.seek(SeekFrom::Start(new_size)).await?;
         Ok(())
     }
 
@@ -155,8 +157,16 @@ impl Package {
         }
         file.seek(SeekFrom::Start(PKG_HEADER_SIZE as u64 + offset)).await?;
         PackageEntry::read_from(&mut file)
-            .await?
-            .ok_or_else(|| error!("Package::read_entry: Unexpected end of file"))
+            .await
+            .map_err(|e| {
+                error!("Package::read_entry {} at offset {offset}: {e}", self.path.display())
+            })?
+            .ok_or_else(|| {
+                error!(
+                    "Package::read_entry {} at offset {offset}: Unexpected end of file",
+                    self.path.display()
+                )
+            })
     }
 
     pub async fn append_entry(

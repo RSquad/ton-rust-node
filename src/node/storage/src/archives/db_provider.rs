@@ -18,7 +18,7 @@ pub trait ArchiveDbProvider: Send + Sync {
     /// Get the root path and RocksDb instance for the archive slice
     async fn db_for_archive(&self, archive_id: u32) -> Result<(Arc<RocksDb>, Arc<PathBuf>)>;
 
-    /// Summed approximate RocksDB memory usage across all managed instances.
+    /// Summed approximate RocksDB memory usage across all managed instances except the main node DB.
     fn memory_usage(&self) -> crate::RocksDbMemoryUsage;
 }
 
@@ -41,8 +41,9 @@ impl ArchiveDbProvider for SingleDbProvider {
         Ok((self.db.clone(), self.db_root_path.clone()))
     }
 
+    // The main node DB is the same instance accounted by the caller
     fn memory_usage(&self) -> crate::RocksDbMemoryUsage {
-        self.db.memory_usage()
+        Default::default()
     }
 }
 

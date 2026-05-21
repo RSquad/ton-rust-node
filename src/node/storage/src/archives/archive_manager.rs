@@ -38,7 +38,9 @@ use std::{
     time::Instant,
 };
 use tokio::io::AsyncWriteExt;
-use ton_block::{error, fail, AccountIdPrefixFull, BlockIdExt, Result, ShardIdent, MASTERCHAIN_ID};
+use ton_block::{
+    error, fail, time_checker, AccountIdPrefixFull, BlockIdExt, Result, ShardIdent, MASTERCHAIN_ID,
+};
 
 /// Metadata about a block being imported into the archive.
 pub struct ImportBlockMeta {
@@ -353,8 +355,12 @@ impl ArchiveManager {
         fd.archive_slice().get_slice(archive_id, offset, limit).await
     }
 
+    /// Sums the main node DB (which always lives here regardless of mode)
+    /// and any extra DBs known to the provider (epoch DBs in archival mode).
     pub fn rocksdb_memory_usage(&self) -> crate::RocksDbMemoryUsage {
-        self.db_provider.memory_usage()
+        let mut usage = self.db.memory_usage();
+        usage += self.db_provider.memory_usage();
+        usage
     }
 
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) {
@@ -374,11 +380,18 @@ impl ArchiveManager {
             .get_file_desc(&package_id, false)
             .await?
             .ok_or_else(|| error!("file descriptor was not found for {:?}", package_id))?;
-        let pi = fd
-            .archive_slice()
-            .get_file(handle, entry_id)
-            .await?
-            .ok_or_else(|| error!("file was not read for {:?}", fd.id()))?;
+        let pi = fd.archive_slice().get_file(handle, entry_id).await?.ok_or_else(|| {
+            error!(
+                "file was not read for {:?}, entry {entry_id}, handle {} \
+                     (is_archived={}, has_data={}, has_proof={}, has_proof_link={})",
+                fd.id(),
+                handle.id(),
+                handle.is_archived(),
+                handle.has_data(),
+                handle.has_proof(),
+                handle.has_proof_link(),
+            )
+        })?;
         Ok(Some(pi))
     }
 
@@ -387,7 +400,13 @@ impl ArchiveManager {
         handle: &BlockHandle,
         entry_id: &PackageEntryId<B>,
     ) -> Result<Option<PathBuf>> {
+        let _tc =
+            time_checker!(|| format!("move_file_to_archives {}", entry_id.filename_short()), 100);
         log::debug!(target: TARGET, "Moving entry to archive: {}", entry_id.filename_short());
+        let _rt_tc = time_checker!(
+            || format!("move_file_to_archives read_temp {}", entry_id.filename_short()),
+            50
+        );
         let (filename, data) = match self.read_temp_file(entry_id).await {
             Err(e) => {
                 // this case if file is already moved
@@ -403,8 +422,19 @@ impl ArchiveManager {
             }
             Ok(read) => read,
         };
-        let data = self.add_block_data_to_package(data, handle, entry_id, false).await?;
+        drop(_rt_tc);
+        let data = {
+            let _t = time_checker!(
+                || format!("add_block_data_to_package(false) {}", entry_id.filename_short()),
+                50
+            );
+            self.add_block_data_to_package(data, handle, entry_id, false).await?
+        };
         if handle.is_key_block()? {
+            let _t = time_checker!(
+                || format!("add_block_data_to_package(true) {}", entry_id.filename_short()),
+                50
+            );
             self.add_block_data_to_package(data, handle, entry_id, true).await?;
         }
         Ok(Some(filename))
@@ -419,7 +449,13 @@ impl ArchiveManager {
     ) -> Result<Vec<u8>> {
         let mc_seq_no = get_mc_seq_no(handle);
         let is_key = handle.is_key_block()?;
-        let package_id = self.get_package_id_force(mc_seq_no, key_archive, is_key).await;
+        let package_id = {
+            let _t = time_checker!(
+                || format!("get_package_id_force mc={mc_seq_no} key_arch={key_archive}"),
+                30
+            );
+            self.get_package_id_force(mc_seq_no, key_archive, is_key).await
+        };
         log::debug!(
             target: TARGET,
             "PackageId for ({},{},{}) (mc_seq_no = {}, key block = {:?}) is {:?}",
@@ -430,15 +466,22 @@ impl ArchiveManager {
             is_key,
             package_id
         );
-        let fd = self
-            .get_file_desc(&package_id, true)
-            .await?
-            .ok_or_else(|| error!("Expected some value for {package_id:?}"))?;
+        let fd = {
+            let _t = time_checker!(|| format!("get_file_desc {package_id:?}"), 30);
+            self.get_file_desc(&package_id, true)
+                .await?
+                .ok_or_else(|| error!("Expected some value for {package_id:?}"))?
+        };
         if fd.update_block_ranges(handle) {
+            let _t = time_checker!(|| format!("file_map.update {package_id:?}"), 30);
             let file_map =
                 if key_archive { self.file_maps.key_files() } else { self.file_maps.files() };
             file_map.update(fd.id().id(), &fd).await?;
         }
+        let _t = time_checker!(
+            || format!("archive_slice.add_file {} {}", package_id.id(), entry_id.filename_short()),
+            30
+        );
         fd.archive_slice().add_file(handle, entry_id, data).await
     }
 

@@ -34,11 +34,11 @@ async fn main() -> Result<()> {
         let mut cfs_opts = HashMap::new();
         cfs_opts.insert(
             "cells".to_string(),
-            DynamicBocDb::build_cells_cf_options(&CellsDbConfig::default()),
+            DynamicBocDb::build_cells_cf_options(&CellsDbConfig::default()).0,
         );
         cfs_opts.insert(
             "counters".to_string(),
-            DynamicBocDb::build_counters_cf_options(&CellsDbConfig::default()),
+            DynamicBocDb::build_counters_cf_options(&CellsDbConfig::default()).0,
         );
         let db = RocksDb::new(DB_PATH, DB_NAME, cfs_opts, AccessType::ReadOnly)?;
         let ss_db = ShardStateDb::new(

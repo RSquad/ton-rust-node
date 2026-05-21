@@ -1339,8 +1339,8 @@ fn run_vm(engine: &mut Engine, mode: isize) -> Status {
         if mode.bit(256) { engine.cc.stack.pop()?.as_integer_value(0..=1i32 << 30)? } else { -1 };
     let code = engine.cc.stack.pop()?.as_slice()?.clone();
     let stack_size = engine.cc.stack.pop()?.as_integer_value(0..=engine.cc.stack.depth())?;
-    fetch_stack(engine, stack_size)?;
     engine.try_use_gas(Gas::stack_price(stack_size))?;
+    fetch_stack(engine, stack_size)?;
 
     let mut stack = engine.cmd.withdraw_vars();
     stack.reverse();
@@ -1353,6 +1353,7 @@ fn run_vm(engine: &mut Engine, mode: isize) -> Status {
         stack,
         gas_max,
         gas_limit,
+        push_0: mode.mask(3) == 3,
         same_c3: mode.bit(1),
         return_data: mode.bit(4),
         return_actions: mode.bit(32),

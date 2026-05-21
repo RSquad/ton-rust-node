@@ -78,7 +78,7 @@ use crate::{
     error, fail, BocFlags, BocReader, BocWriter, BuilderData, Cell, CellType, Coins,
     CurrencyCollection, Deserializable, IBitstring, Result, Serializable, SliceData, UInt256,
 };
-use std::{collections::HashMap, io::Cursor, vec::Vec};
+use std::{collections::HashMap, vec::Vec};
 
 // ============================================================================
 // Public API
@@ -100,6 +100,13 @@ pub enum CompressionAlgorithm {
 /// Size of the decompressed length header in bytes (4 bytes, big-endian).
 const K_DECOMPRESSED_SIZE: usize = 4;
 
+/// Maximum number of nodes (tvm cells) accepted by the ImprovedStructureLZ4 (de)compressor.
+/// The format is dense (down to ~1 byte per node), so a 16 MiB decompressed
+/// payload could otherwise encode up to ~16M nodes and trigger multi-GB
+/// pre-allocations on the receiver. Real TON blocks fit comfortably below this
+/// limit even at maximum cell density.
+const MAX_IMPROVED_NODE_COUNT: usize = 500_000;
+
 /// Decompresses BOC data using the algorithm specified in the first byte.
 ///
 /// # Arguments
@@ -120,11 +127,15 @@ pub fn boc_decompress(compressed: impl AsRef<[u8]>, max_size: usize) -> Result<V
     if max_size == 0 {
         fail!("Can't decompress empty data");
     }
-    let compressed_data = compressed.as_ref()[1..].to_vec();
-    match compressed.as_ref()[0] {
+    let compressed = compressed.as_ref();
+    if compressed.is_empty() {
+        fail!("BOC decompression failed: empty input");
+    }
+    let compressed_data = compressed[1..].to_vec();
+    match compressed[0] {
         0 => {
             let decompressed = boc_decompress_baseline_lz4(compressed_data, max_size)?;
-            Ok(BocReader::new().stream_read(&mut Cursor::new(&decompressed))?.roots)
+            Ok(BocReader::new().read(&decompressed)?.roots)
         }
         1 => boc_decompress_improved_structure_lz4(compressed_data, max_size),
         any => Err(anyhow::format_err!("Invalid compression algorithm {}", any)),
@@ -794,7 +805,17 @@ pub fn boc_decompress_improved_structure_lz4(
     //   TRY_RESULT(node_count, read_uint(bit_reader, 32));
     // ========================================================================
     let root_count = reader.read_uint(32)? as usize;
-    if root_count < 1 || root_count > decompressed_size {
+    if root_count < 1 {
+        fail!("BOC decompression failed: invalid root count");
+    }
+    if root_count > MAX_IMPROVED_NODE_COUNT {
+        fail!(
+            "BOC decompression failed: root count {} exceeds limit {}",
+            root_count,
+            MAX_IMPROVED_NODE_COUNT
+        );
+    }
+    if root_count > decompressed_size {
         fail!("BOC decompression failed: invalid root count");
     }
     let mut root_indexes = Vec::with_capacity(root_count);
@@ -804,6 +825,13 @@ pub fn boc_decompress_improved_structure_lz4(
     let node_count = reader.read_uint(32)? as usize;
     if node_count < 1 {
         fail!("BOC decompression failed: invalid node count");
+    }
+    if node_count > MAX_IMPROVED_NODE_COUNT {
+        fail!(
+            "BOC decompression failed: node count {} exceeds limit {}",
+            node_count,
+            MAX_IMPROVED_NODE_COUNT
+        );
     }
     if node_count > decompressed_size {
         fail!("BOC decompression failed: incorrect node count provided");
@@ -1708,6 +1736,13 @@ pub fn boc_compress_improved_structure_lz4(boc_roots: Vec<Cell>) -> Result<Vec<u
     }
 
     let node_count = boc_graph.len();
+    if node_count > MAX_IMPROVED_NODE_COUNT {
+        fail!(
+            "BOC compression failed: node count {} exceeds limit {}",
+            node_count,
+            MAX_IMPROVED_NODE_COUNT
+        );
+    }
 
     // ========================================================================
     // PHASE 2: Build Reverse Graph and Compute Metadata

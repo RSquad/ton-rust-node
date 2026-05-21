@@ -1,5 +1,7 @@
 use super::*;
-use ton_block::{BlockSignatures, BlockSignaturesVariant, Ed25519KeyOption, UInt256};
+use ton_block::{
+    BlockSignatures, BlockSignaturesVariant, Ed25519KeyOption, UInt256, ZeroizingBytes,
+};
 
 #[test]
 fn test_on_applied_top_action_preserves_queue_order() {
@@ -37,7 +39,7 @@ fn test_on_block_finalized_enqueues_explicit_block_identity() {
 
     let block_id =
         BlockIdExt::with_params(ShardIdent::masterchain(), 42, UInt256::rand(), UInt256::rand());
-    let source = Ed25519KeyOption::generate().expect("generate key");
+    let source = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("generate key");
     let source_info = BlockSourceInfo {
         source,
         priority: consensus_common::BlockCandidatePriority {

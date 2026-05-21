@@ -62,10 +62,10 @@ async fn test_dynamic_boc_rc_db() -> Result<()> {
     let root_cell_2 = get_another_test_tree_of_cells();
     boc_db.save_boc(root_cell_2.clone(), &|| Ok(()))?;
 
-    boc_db.delete_boc(&root_cell.repr_hash(), &|| Ok(()))?;
+    boc_db.delete_boc(&root_cell.repr_hash(), &|| Ok(()), |_| Ok(()))?;
     assert!(boc_db.count() > 0);
 
-    boc_db.delete_boc(&root_cell_2.repr_hash(), &|| Ok(()))?;
+    boc_db.delete_boc(&root_cell_2.repr_hash(), &|| Ok(()), |_| Ok(()))?;
     assert_eq!(boc_db.count(), 0);
 
     drop(boc_db);
@@ -120,14 +120,14 @@ async fn test_dynamic_boc_rc_db_2() -> Result<()> {
     let r2_id = r2.repr_hash().clone();
     boc_db.save_boc(r2, &check_stop).unwrap();
 
-    boc_db.delete_boc(&r1_id, &check_stop).unwrap();
-    boc_db.delete_boc(&r2_id, &check_stop).unwrap();
+    boc_db.delete_boc(&r1_id, &check_stop, |_| Ok(())).unwrap();
+    boc_db.delete_boc(&r2_id, &check_stop, |_| Ok(())).unwrap();
 
     let r3 = create_ss(vec!["r3", "c3", "B"]);
     let r3_id = r3.repr_hash().clone();
     boc_db.save_boc(r3, &check_stop).unwrap();
 
-    boc_db.delete_boc(&r3_id, &check_stop).unwrap();
+    boc_db.delete_boc(&r3_id, &check_stop, |_| Ok(())).unwrap();
 
     let r4 = create_ss(vec!["r4", "c4", "A", "B"]);
     boc_db.save_boc(r4, &check_stop).unwrap();

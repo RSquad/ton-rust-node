@@ -960,7 +960,6 @@ impl AdnlOverlay {
         let quic_enabled = if use_quic {
             if let Some(quic) = &stack.quic {
                 // Register local validator's ADNL key as a TLS identity on a per-port endpoint
-                let key_bytes: [u8; 32] = *local_adnl_key.pvt_key()?;
                 let ip_addr = stack.adnl.ip_address_adnl();
                 let quic_port =
                     ip_addr.port().checked_add(adnl::QuicNode::OFFSET_PORT).ok_or_else(|| {
@@ -971,7 +970,11 @@ impl AdnlOverlay {
                         )
                     })?;
                 let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), quic_port);
-                quic.add_key(&key_bytes, local_adnl_key.id(), bind_addr)?;
+                quic.add_key(
+                    (&local_adnl_key.pvt_key()?.lock()? as &[u8]).try_into()?,
+                    local_adnl_key.id(),
+                    bind_addr,
+                )?;
                 log::info!(
                     target: LOG_TARGET,
                     "Registered QUIC key for local ADNL id={}",
@@ -1757,10 +1760,26 @@ impl ConsensusOverlay for AdnlOverlay {
                         .await
                 };
 
-                log::debug!(
-                    target: LOG_TARGET,
-                    "AdnlOverlay::send_broadcast_fec_ex ({transport}) status: {result:?}"
-                );
+                match &result {
+                    Ok(info) if info.send_to == 0 => log::warn!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                        overlay={overlay_id}: send_to=0 packets={} — \
+                        broadcast emitted to 0 neighbours (overlay known_peers empty?)",
+                        info.packets,
+                    ),
+                    Ok(info) => log::debug!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                        overlay={overlay_id} packets={} send_to={}",
+                        info.packets, info.send_to,
+                    ),
+                    Err(e) => log::warn!(
+                        target: LOG_TARGET,
+                        "AdnlOverlay::send_broadcast_fec_ex ({transport}) \
+                        overlay={overlay_id} FAILED: {e:?}"
+                    ),
+                }
             });
         } else {
             // TCP path: manually build BroadcastTwostepSimple and multicast

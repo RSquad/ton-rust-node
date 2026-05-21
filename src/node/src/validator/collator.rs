@@ -44,7 +44,7 @@ use std::{
     mem,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -253,8 +253,8 @@ struct CollatorData {
     shard_top_block_descriptors: Vec<Arc<TopBlockDescrStuff>>,
     block_create_count: HashMap<UInt256, u64>,
     new_messages: BinaryHeap<NewMessage>, // using for priority queue
-    accepted_ext_messages: Vec<(UInt256, i32)>, // message id and wokchain id
-    rejected_ext_messages: Vec<(UInt256, String)>, // message id and reject reason
+    accepted_ext_messages: Vec<UInt256>,
+    rejected_ext_messages: Vec<UInt256>,
     usage_tree: UsageTree,
     external_messages: Vec<(Arc<Message>, UInt256)>, // for bundle in case of error
     imported_visited: HashSet<UInt256>,
@@ -762,7 +762,13 @@ impl CollatorData {
     }
 
     fn reject_ext_message(&mut self, msg_id: UInt256, reason: impl ToString) {
-        self.rejected_ext_messages.push((msg_id, reason.to_string()));
+        log::trace!(
+            target: EXT_MESSAGES_TRACE_TARGET,
+            "rejecting external message {:x}: {}",
+            msg_id,
+            reason.to_string()
+        );
+        self.rejected_ext_messages.push(msg_id);
     }
 }
 
@@ -795,7 +801,8 @@ struct ExecutionManager {
     config: BlockchainConfig,
     prev_blocks_info: PrevBlocksInfo,
     engine: Arc<dyn EngineOperations>,
-    cancel_ext: Arc<AtomicBool>,
+    cancel_ext: tokio_util::sync::CancellationToken,
+    stop_flag: tokio_util::sync::CancellationToken,
 }
 
 impl ExecutionManager {
@@ -808,6 +815,8 @@ impl ExecutionManager {
         config: BlockchainConfig,
         max_collate_threads: usize,
         collated_block_descr: Arc<String>,
+        stop_flag: tokio_util::sync::CancellationToken,
+        cancel_ext: tokio_util::sync::CancellationToken,
         debug: bool,
         lt_compatible: bool,
     ) -> Result<Self> {
@@ -834,7 +843,8 @@ impl ExecutionManager {
                 mc_data.state.shard_state_extra()?.prev_blocks.clone(),
             ),
             engine,
-            cancel_ext: Arc::new(AtomicBool::new(false)),
+            cancel_ext,
+            stop_flag,
         })
     }
 
@@ -857,7 +867,7 @@ impl ExecutionManager {
         msg_metadata: Option<MsgMetadata>,
         prev_data: &PrevData,
         collator_data: &mut CollatorData,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         log::trace!("{}: execute (adding into queue): {:x}", self.collated_block_descr, account_id);
         if let Some((sender, _handle)) = self.changed_accounts.get(&account_id) {
             self.wait_tr.request();
@@ -874,7 +884,7 @@ impl ExecutionManager {
                 );
                 collator_data
                     .reject_ext_message(msg_id, format!("account {:x} not found", account_id));
-                return Ok(true); // skip external messages for unexisting accounts
+                return Ok(()); // skip external messages for unexisting accounts
             } else {
                 ShardAccount::default()
             };
@@ -887,7 +897,19 @@ impl ExecutionManager {
 
         self.check_parallel_transactions(collator_data).await?;
 
-        Ok(true)
+        Ok(())
+    }
+
+    // waits and finalizes all parallel tasks
+    async fn wait_transactions(&mut self, collator_data: &mut CollatorData) -> Result<()> {
+        log::trace!("{}: wait_transactions", self.collated_block_descr);
+
+        while self.wait_tr.count() != 0 {
+            self.wait_transaction(collator_data).await?;
+        }
+
+        self.min_lt.fetch_max(self.max_lt.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(())
     }
 
     fn spawn_account_job(
@@ -938,15 +960,16 @@ impl ExecutionManager {
                     collated_block_descr,
                     shard_acc.account_id()
                 );
-                if cancel_ext.load(Ordering::Relaxed) {
-                    log::debug!(
-                        "{}: account {:x} ext message cancelled by cutoff timeout",
-                        collated_block_descr,
-                        shard_acc.account_id()
-                    );
-                    let transaction_res = Err(error!("cancelled by cutoff timeout"));
-                    wait_tr.respond(Some((new_msg, msg_metadata, transaction_res)));
-                    continue;
+                if cancel_ext.is_cancelled() {
+                    if let AsyncMessage::Ext(_, _, msg_id) = &*new_msg {
+                        log::debug!(
+                            target: EXT_MESSAGES_TRACE_TARGET,
+                            "{}: account {:x} ext message {:x} cancelled by cutoff timeout before exec",
+                            collated_block_descr, shard_acc.account_id(), msg_id,
+                        );
+                        wait_tr.respond(None);
+                        continue;
+                    }
                 }
 
                 let config = config.clone(); // TODO: use Arc
@@ -969,28 +992,34 @@ impl ExecutionManager {
                     ..ExecuteParams::default()
                 };
                 let new_msg1 = new_msg.clone();
-                let (mut transaction_res, account, duration) =
-                    tokio::task::spawn_blocking(move || {
-                        let now = Instant::now();
-                        (
-                            Self::execute_new_message(&new_msg1, &mut account, config, params),
-                            account,
-                            now.elapsed().as_micros() as u64,
-                        )
-                    })
-                    .await?;
+                let task = tokio::task::spawn_blocking(move || {
+                    let now = Instant::now();
+                    (
+                        Self::execute_new_message(&new_msg1, &mut account, config, params),
+                        account,
+                        now.elapsed().as_micros() as u64,
+                    )
+                });
 
-                if cancel_ext.load(Ordering::Relaxed) {
-                    log::debug!(
-                        "{}: account {:x} ext message cancelled by cutoff timeout",
-                        collated_block_descr,
-                        shard_acc.account_id()
-                    );
-                    let transaction_res =
-                        Err(error!("cancelled by cutoff timeout after execution"));
-                    wait_tr.respond(Some((new_msg, msg_metadata, transaction_res)));
-                    continue;
-                }
+                let ext_msg_id =
+                    if let AsyncMessage::Ext(_, _, id) = &*new_msg { Some(id) } else { None };
+
+                let (mut transaction_res, account, duration) = if let Some(msg_id) = ext_msg_id {
+                    tokio::select! {
+                        res = task => res?,
+                        _ = cancel_ext.cancelled() => {
+                            log::debug!(
+                                target: EXT_MESSAGES_TRACE_TARGET,
+                                "{}: account {:x} ext message {:x} cancelled by cutoff timeout in-flight",
+                                collated_block_descr, shard_acc.account_id(), msg_id,
+                            );
+                            wait_tr.respond(None);
+                            continue;
+                        }
+                    }
+                } else {
+                    task.await?
+                };
 
                 if let Ok(transaction) = transaction_res.as_mut() {
                     let res = shard_acc.add_transaction(transaction, account);
@@ -1039,13 +1068,27 @@ impl ExecutionManager {
         executor.execute_with_params(msg_opt, account, params)
     }
 
-    async fn wait_transaction(&mut self, collator_data: &mut CollatorData) -> Result<()> {
+    async fn wait_transaction(
+        &mut self,
+        collator_data: &mut CollatorData,
+    ) -> Result<Option<Arc<AsyncMessage>>> {
         log::trace!("{}: wait_transaction", self.collated_block_descr);
-        let wait_op = self.wait_tr.wait(&mut self.receive_tr, false).await;
+        let wait_op = tokio::select! {
+            biased;
+            _ = self.stop_flag.cancelled() => fail!("Stop flag was set"),
+            res = self.wait_tr.wait(&mut self.receive_tr, false) => res,
+        };
         if let Some(Some((new_msg, msg_metadata, transaction_res))) = wait_op {
-            self.finalize_transaction(new_msg, msg_metadata, transaction_res, collator_data)?;
+            self.finalize_transaction(
+                new_msg.clone(),
+                msg_metadata,
+                transaction_res,
+                collator_data,
+            )?;
+            Ok(Some(new_msg))
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
     fn finalize_transaction(
@@ -1065,7 +1108,7 @@ impl ExecutionManager {
                     "{}: account {} rejected inbound external message {:x}, by reason: {}",
                     self.collated_block_descr, address, msg_id, err
                 );
-                collator_data.rejected_ext_messages.push((msg_id.clone(), err.to_string()));
+                collator_data.rejected_ext_messages.push(msg_id.clone());
                 return Ok(());
             } else {
                 log::debug!(
@@ -1073,9 +1116,7 @@ impl ExecutionManager {
                     "{}: account {} accepted inbound external message {:x}",
                     self.collated_block_descr, address, msg_id,
                 );
-                collator_data
-                    .accepted_ext_messages
-                    .push((msg_id.clone(), msg.dst_workchain_id().unwrap_or_default()));
+                collator_data.accepted_ext_messages.push(msg_id.clone());
                 collator_data.external_messages.push((msg.clone(), msg_id.clone()));
             }
         }
@@ -1288,7 +1329,8 @@ pub struct Collator {
     rand_seed: UInt256,
 
     started: Instant,
-    stop_flag: Arc<AtomicBool>,
+    stop_flag: tokio_util::sync::CancellationToken,
+    cancel_ext: tokio_util::sync::CancellationToken,
 }
 
 impl Collator {
@@ -1400,7 +1442,8 @@ impl Collator {
             debug: true,
             rand_seed,
             started: Instant::now(),
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: tokio_util::sync::CancellationToken::new(),
+            cancel_ext: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -1851,11 +1894,21 @@ impl Collator {
             collator_data.config.clone(),
             max_collate_threads,
             self.collated_block_descr.clone(),
+            self.stop_flag.clone(),
+            self.cancel_ext.clone(),
             self.debug,
             self.collator_settings.lt_compatible,
         )?;
 
         self.process_dispatch_queue(collator_data).await?;
+
+        // update min_lt to keep proper message ordering
+        let max_emitted_lt = collator_data.last_dispatch_queue_emitted_lt.values().max();
+        if let Some(max_emitted_lt) = max_emitted_lt {
+            let target = max_emitted_lt + 1;
+            exec_manager.max_lt.fetch_max(target, Ordering::Relaxed);
+            exec_manager.min_lt.fetch_max(target, Ordering::Relaxed);
+        }
 
         // tick & special transactions
         if self.shard.is_masterchain() {
@@ -3604,7 +3657,7 @@ impl Collator {
         let account_id = collator_data.config.raw_config().config_addr.clone();
         self.create_ticktock_transaction(account_id, tock, prev_data, collator_data, exec_manager)
             .await?;
-        self.wait_transactions(exec_manager, collator_data, false).await?;
+        exec_manager.wait_transactions(collator_data).await?;
         Ok(())
     }
 
@@ -3682,7 +3735,7 @@ impl Collator {
         )
         .await?;
 
-        self.wait_transactions(exec_manager, collator_data, false).await?;
+        exec_manager.wait_transactions(collator_data).await?;
 
         Ok(())
     }
@@ -3800,12 +3853,9 @@ impl Collator {
                     );
                     let msg_metadata = enq.msg_metadata_add_depth();
                     let msg = AsyncMessage::Int(enq, our);
-                    if !exec_manager
+                    exec_manager
                         .execute(account_id, msg, msg_metadata, prev_data, collator_data)
-                        .await?
-                    {
-                        break;
-                    }
+                        .await?;
                 } else {
                     // println!("{:x} {:#}", key, enq);
                     // println!("cur: {}, dst: {}", enq.cur_prefix(), enq.dst_prefix());
@@ -3928,12 +3978,9 @@ impl Collator {
                 let initiator_addr =
                     MsgAddressInt::with_params(self.shard.workchain_id(), account_id.clone())?;
                 let msg_metadata = Some(MsgMetadata::new(initiator_addr, 0));
-                if !exec_manager
+                exec_manager
                     .execute(account_id, msg, msg_metadata, prev_data, collator_data)
-                    .await?
-                {
-                    break;
-                }
+                    .await?;
             } else {
                 // usually node collates more than one shard, the message can belong another one,
                 // so we can't postpone it
@@ -3942,10 +3989,30 @@ impl Collator {
             }
             self.check_stop_flag()?;
         }
-        self.wait_transactions(exec_manager, collator_data, true).await?;
-        let accepted = mem::take(&mut collator_data.accepted_ext_messages);
-        let rejected = mem::take(&mut collator_data.rejected_ext_messages);
-        self.engine.complete_external_messages(rejected, accepted)?;
+        exec_manager.wait_transactions(collator_data).await?;
+        // Accepted: postpone so the next collation pass within the pipeline
+        // window skips them; the authoritative cleanup happens once the block
+        // is applied (process_applied_block). If apply never lands, postpone
+        // generations exhaust and the messages are dropped, allowing rebroadcast.
+        //
+        // Note: this diverges from the C++ collator, which leaves accepted
+        // messages fully active in the pool until apply (see C++
+        // Collator::create_block_candidate sending only delay/bad to
+        // complete_external_messages). C++ relies on the wallet seqno cache
+        // (ExtMessagePool::wallets_) to short-circuit retries of the same
+        // logical wallet message between collate and apply. We don't have that
+        // cache, so a naive C++-mirror would re-execute every accepted message
+        // in subsequent collation attempts within the pipeline window. Routing
+        // accepted via to_delay instead gives that dedup cheaply through the
+        // existing postpone/generations machinery while preserving liveness:
+        // forced erase only happens after MESSAGE_MAX_GENERATIONS cycles, by
+        // which point apply should have either landed (and cleaned up via
+        // norm-hash) or visibly failed.
+        let to_delay = mem::take(&mut collator_data.accepted_ext_messages);
+        // Rejected: erase by raw id. Norm-hash siblings are kept so sibling
+        // variants with valid signatures can still be tried.
+        let to_delete = mem::take(&mut collator_data.rejected_ext_messages);
+        self.engine.complete_external_messages(&to_delay, &to_delete)?;
         Ok(())
     }
 
@@ -4019,8 +4086,9 @@ impl Collator {
             Ok(None)
         } else {
             log::debug!(
-                "{}: new message {msg_hash:x} sent to execution to account {account_id:x}",
+                "{}: new message {msg_hash:x} sent to execution to account {:x}",
                 self.collated_block_descr,
+                msg.enq.dst_account_id(),
             );
             collator_data.update_last_proc_int_msg((msg.enq.lt(), msg_hash.clone()))?;
             let msg = if from_dispatch_queue {
@@ -4055,47 +4123,19 @@ impl Collator {
                 let msg_metadata = msg.enq.msg_metadata_add_depth();
                 let account_id = msg.enq.dst_account_id().clone();
                 if let Some(msg) = self.process_new_message(msg, collator_data)? {
-                    if !exec_manager
+                    exec_manager
                         .execute(account_id, msg, msg_metadata, prev_data, collator_data)
-                        .await?
-                    {
-                        collator_data.enqueue_only = true;
-                    }
+                        .await?;
                     if self.collator_settings.lt_compatible {
                         new_messages.append(&mut collator_data.new_messages);
                     }
                 }
                 self.check_stop_flag()?;
             }
-            self.wait_transactions(exec_manager, collator_data, false).await?;
+            exec_manager.wait_transactions(collator_data).await?;
             self.check_stop_flag()?;
         }
 
-        Ok(())
-    }
-
-    // waits and finalizes all parallel tasks
-    async fn wait_transactions(
-        &self,
-        exec_manager: &mut ExecutionManager,
-        collator_data: &mut CollatorData,
-        allow_cancel: bool,
-    ) -> Result<()> {
-        log::trace!("{}: wait_transactions", self.collated_block_descr);
-        while exec_manager.wait_tr.count() != 0 {
-            if allow_cancel && self.check_cutoff_timeout() {
-                log::warn!(
-                    "{}: TIMEOUT is elapsed, cancelling remaining external messages",
-                    self.collated_block_descr
-                );
-                exec_manager.cancel_ext.store(true, Ordering::Relaxed);
-                break;
-            }
-            exec_manager.wait_transaction(collator_data).await?;
-        }
-        exec_manager
-            .min_lt
-            .fetch_max(exec_manager.max_lt.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(())
     }
 
@@ -4232,9 +4272,13 @@ impl Collator {
         let mut new_config_opt = None;
         for (account_id, (sender, handle)) in mem::take(&mut exec_manager.changed_accounts) {
             mem::drop(sender);
-            let mut shard_acc = handle.await.map_err(|err| {
-                error!("account {:x} thread didn't finish: {}", account_id, err)
-            })??;
+            let mut shard_acc = tokio::select! {
+                biased;
+                _ = self.stop_flag.cancelled() => fail!("Stop flag was set on account {account_id:x}"),
+                res = handle => res.map_err(|err| {
+                    error!("account {:x} thread didn't finish: {}", account_id, err)
+                })??,
+            };
             if let Some(addr) = &config_addr {
                 if addr == &account_id {
                     new_config_opt = Some(Self::extract_new_config(shard_acc.account(), addr)?);
@@ -5145,17 +5189,25 @@ impl Collator {
     fn init_timeout(&mut self) {
         self.started = Instant::now();
 
-        let stop_timeout = self.engine.collator_config().stop_timeout_ms;
+        let stop_deadline = Instant::now()
+            + Duration::from_millis(self.engine.collator_config().stop_timeout_ms as u64);
         let stop_flag = self.stop_flag.clone();
         tokio::spawn(async move {
-            futures_timer::Delay::new(Duration::from_millis(stop_timeout as u64)).await;
-            stop_flag.store(true, Ordering::Relaxed);
+            tokio::time::sleep_until(stop_deadline.into()).await;
+            stop_flag.cancel();
+        });
+
+        let cutoff_deadline = Instant::now()
+            + Duration::from_millis(self.engine.collator_config().cutoff_timeout_ms as u64);
+        let cancel_ext = self.cancel_ext.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(cutoff_deadline.into()).await;
+            cancel_ext.cancel();
         });
     }
 
     fn check_cutoff_timeout(&self) -> bool {
-        let cutoff_timeout = self.engine.collator_config().cutoff_timeout_ms;
-        self.started.elapsed().as_millis() as u32 > cutoff_timeout
+        self.cancel_ext.is_cancelled()
     }
 
     fn get_remaining_cutoff_time_limit_nanos(&self) -> i128 {
@@ -5182,7 +5234,7 @@ impl Collator {
     }
 
     fn check_stop_flag(&self) -> Result<()> {
-        if self.stop_flag.load(Ordering::Relaxed) {
+        if self.stop_flag.is_cancelled() {
             fail!("Stop flag was set")
         }
         Ok(())

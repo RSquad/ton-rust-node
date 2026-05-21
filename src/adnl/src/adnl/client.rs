@@ -10,6 +10,7 @@
  */
 use crate::common::{AdnlHandshake, AdnlStream, AdnlStreamCrypto, Query, TaggedTlObject, Timeouts};
 use rand::{Rng, RngCore};
+use secrets_vault::vault_block::get_key_option_factory;
 use std::{
     convert::TryInto,
     net::SocketAddr,
@@ -29,7 +30,7 @@ use ton_api::{
     },
     AnyBoxedSerialize, IntoBoxed, TLObject,
 };
-use ton_block::{error, fail, Ed25519KeyOption, KeyOption, KeyOptionJson, Result};
+use ton_block::{error, fail, KeyOption, KeyOptionJson, Result};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlClientConfigJson {
@@ -84,12 +85,12 @@ impl AdnlClientConfig {
     pub fn from_json_config(
         json_config: &AdnlClientConfigJson,
     ) -> Result<(Option<AdnlClientConfigJson>, Self)> {
-        let server_key = Ed25519KeyOption::from_public_key_json(&json_config.server_key)?;
+        let server_key = get_key_option_factory().from_public_key_json(&json_config.server_key)?;
         let mut result_config = None;
         let client_key = if let Some(key) = &json_config.client_key {
-            Some(Ed25519KeyOption::from_private_key_json(key)?)
+            Some(get_key_option_factory().from_private_key_json(key)?)
         } else {
-            let (json, key) = Ed25519KeyOption::generate_with_json()?;
+            let (json, key) = get_key_option_factory().generate_with_json()?;
             result_config = Some(AdnlClientConfigJson {
                 client_key: Some(json),
                 server_address: json_config.server_address.clone(),
@@ -205,7 +206,7 @@ impl AdnlClient {
         } else {
             AdnlHandshake::build_packet(
                 &mut buf,
-                &Ed25519KeyOption::generate()?,
+                &get_key_option_factory().generate()?,
                 &config.server_key,
                 None,
             )?

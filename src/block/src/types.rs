@@ -18,13 +18,15 @@ use num::{bigint::Sign, BigInt, One, Zero};
 #[cfg(feature = "mirrornet")]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::{
+    any::type_name,
     cmp,
-    convert::TryInto,
-    fmt::{self, LowerHex, UpperHex},
+    convert::{TryFrom, TryInto},
+    fmt::{self, Display, LowerHex, UpperHex},
+    io::Read,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     str::{self, FromStr},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Default, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -270,7 +272,7 @@ pub trait ByteOrderRead {
     fn read_u256(&mut self) -> std::io::Result<[u8; 32]>;
 }
 
-impl<T: std::io::Read> ByteOrderRead for T {
+impl<T: Read> ByteOrderRead for T {
     fn read_be_uint(&mut self, bytes: usize) -> std::io::Result<u64> {
         read_uint(self, bytes, false)
     }
@@ -320,7 +322,7 @@ impl<T: std::io::Read> ByteOrderRead for T {
     }
 }
 
-fn read_uint<T: std::io::Read>(src: &mut T, bytes: usize, le: bool) -> std::io::Result<u64> {
+fn read_uint<T: Read>(src: &mut T, bytes: usize, le: bool) -> std::io::Result<u64> {
     match bytes {
         1 => {
             let mut buf = [0];
@@ -1116,42 +1118,42 @@ impl From<u32> for Number32 {
     }
 }
 
-impl std::convert::TryFrom<u32> for Number5 {
+impl TryFrom<u32> for Number5 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number8 {
+impl TryFrom<u32> for Number8 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number9 {
+impl TryFrom<u32> for Number9 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number12 {
+impl TryFrom<u32> for Number12 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number13 {
+impl TryFrom<u32> for Number13 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
     }
 }
 
-impl std::convert::TryFrom<u32> for Number16 {
+impl TryFrom<u32> for Number16 {
     type Error = Error;
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
@@ -1550,6 +1552,62 @@ impl UnixTime {
     }
 }
 
+pub struct TimeChecker<F, D>
+where
+    F: Fn() -> D,
+    D: Display,
+{
+    operation: F,
+    target: &'static str,
+    threshold: Duration,
+    start: Instant,
+}
+
+impl<F, D> TimeChecker<F, D>
+where
+    F: Fn() -> D,
+    D: Display,
+{
+    pub fn new(target: &'static str, operation: F, threshold_ms: u64) -> Self {
+        let start = Instant::now();
+        log::trace!(target: target, "{} - started", operation());
+        Self { operation, target, threshold: Duration::from_millis(threshold_ms), start }
+    }
+}
+
+impl<F, D> Drop for TimeChecker<F, D>
+where
+    F: Fn() -> D,
+    D: Display,
+{
+    fn drop(&mut self) {
+        let time = self.start.elapsed();
+        if time < self.threshold {
+            log::trace!(
+                target: self.target,
+                "{} - finished, TIME: {}",
+                (self.operation)(),
+                time.as_millis()
+            );
+        } else {
+            log::warn!(
+                target: self.target,
+                "{} - finished too slow, TIME: {}ms, expected: {}ms",
+                (self.operation)(),
+                time.as_millis(),
+                self.threshold.as_millis()
+            );
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! time_checker {
+    ($op:expr, $threshold:expr) => {
+        $crate::TimeChecker::new(module_path!(), $op, $threshold)
+    };
+}
+
 #[derive(Debug, Default, Clone, Eq)]
 pub struct ChildCell<T: Serializable + Deserializable> {
     cell: Option<Cell>,
@@ -1573,7 +1631,7 @@ impl<T: Serializable + Deserializable> ChildCell<T> {
         match self.cell.clone() {
             Some(cell) => {
                 if cell.cell_type() == CellType::PrunedBranch {
-                    fail!(BlockError::PrunedCellAccess(std::any::type_name::<T>().into()))
+                    fail!(BlockError::PrunedCellAccess(type_name::<T>().into()))
                 }
                 T::construct_from_cell(cell)
             }

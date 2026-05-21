@@ -20,7 +20,6 @@ ton-http-api-client = { path = "../ton-http-api-client" }
 secrets-vault = { path = '../../secrets-vault', default-features = false, features = [
     "file-storage-json",
     "hashicorp-storage",
-    "ton-block",
 ] }
 tracing = "0.1"
 utoipa = "4"

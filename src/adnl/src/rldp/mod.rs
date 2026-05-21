@@ -29,8 +29,9 @@ use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 use std::{
     cmp::min,
+    collections::HashSet,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -94,7 +95,10 @@ pub struct Constraints {
 }
 
 impl Constraints {
+    const DEFAULT_INBOUND_TRANSFER_SIZE: usize = 2 << 10; // 2 KB
     const MAX_PARTS_IN_TRANSIT: usize = 20;
+    const MAX_TOTAL_TRANSFER_SIZE: usize = 16 << 20; // 16 MB
+    const RLDP_ANSWER_TL_OVERHEAD: usize = 64; // RldpAnswer { query_id, data } serialize overhead
     const SLICE: usize = 2000000;
     const SYMBOL: usize = 768;
 
@@ -167,6 +171,7 @@ impl RldpStats {
 
 declare_counted!(
     struct RldpPeer {
+        extended_inbound_cap_count: AtomicI32,
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
         stats: StatsV2,
     }
@@ -260,6 +265,22 @@ impl RldpNode {
             loss_fn,
         };
         Ok(Arc::new(ret))
+    }
+
+    /// +1/-1 the extended-inbound-cap counter for all given peers
+    /// Duplicates and local ADNL keys are filtered out.
+    pub fn change_inbound_cap_for_peers(&self, peers: &[Arc<KeyId>], delta: i32) -> Result<()> {
+        let resolved: Vec<Arc<RldpPeer>> = peers
+            .iter()
+            .filter(|p| self.adnl.key_by_id(p).is_err())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|p| self.get_peer(p))
+            .collect::<Result<Vec<_>>>()?;
+        for p in &resolved {
+            p.extended_inbound_cap_count.fetch_add(delta, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Send message
@@ -557,6 +578,7 @@ impl RldpNode {
             add_counted_object_to_map(&self.peers, id.clone(), || {
                 let permits = Self::MAX_OUTBOUNDS_PER_PEER as usize;
                 let ret = RldpPeer {
+                    extended_inbound_cap_count: AtomicI32::new(0),
                     outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
                     stats: StatsV2::new(StatsConfigV2::default(), self.min_timeout_ms)?,
                     counter: self.allocated.peers.clone().into(),
@@ -638,6 +660,7 @@ impl RldpNode {
                 *transfer_id,
                 self.allocated.recv_transfers.clone(),
                 v2,
+                Some(self.peer_inbound_cap(peers.other())),
                 #[cfg(feature = "debug")]
                 self.timestamp.clone(),
             ),
@@ -916,10 +939,13 @@ impl RldpNode {
                 *x ^= 0xFF
             }
             let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
+            let expected_total_size = max_answer_size
+                .map(|s| (s as usize).saturating_add(Constraints::RLDP_ANSWER_TL_OVERHEAD));
             let recv_transfer = RecvTransfer::new(
                 recv_transfer_id,
                 self.allocated.recv_transfers.clone(),
                 v2,
+                expected_total_size,
                 #[cfg(feature = "debug")]
                 self.timestamp.clone(),
             );
@@ -1165,6 +1191,15 @@ impl RldpNode {
         Ok(None)
     }
 
+    fn peer_inbound_cap(&self, peer: &Arc<KeyId>) -> usize {
+        if let Some(p) = self.peers.get(peer) {
+            if p.val().extended_inbound_cap_count.load(Ordering::Relaxed) > 0 {
+                return Constraints::MAX_TOTAL_TRANSFER_SIZE;
+            }
+        }
+        Constraints::DEFAULT_INBOUND_TRANSFER_SIZE
+    }
+
     #[cfg(feature = "telemetry")]
     fn print_stats(&self) {}
 
@@ -1204,7 +1239,13 @@ impl RldpNode {
                 continue;
             }
             match context.recv_transfer.process_chunk(job) {
-                Err(e) => log::warn!(target: TARGET, "{rldp} error: {e}"),
+                Err(e) => {
+                    log::warn!(
+                        target: TARGET,
+                        "{rldp} error in {transfer_str}: {e}, dropping transfer"
+                    );
+                    break;
+                }
                 Ok(reply) => {
                     if let Some(reply) = reply {
                         if let Err(e) = context.adnl.send_custom(&reply, &context.peers).await {

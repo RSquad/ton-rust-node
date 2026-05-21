@@ -18,7 +18,7 @@ use crate::{
         StackItem,
     },
 };
-use ton_block::{sha512_digest, Sha256, Status};
+use ton_block::{fail, sha512_digest, ExceptionCode, Sha256, Status};
 
 // (x - )
 pub(crate) fn execute_addrand(engine: &mut Engine) -> Status {
@@ -58,6 +58,9 @@ pub(crate) fn execute_setrand(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("SETRAND"))?;
     fetch_stack(engine, 1)?;
     let rand = engine.cmd.var(0).as_integer()?.clone();
+    if !rand.ufits_in(256)? {
+        fail!(ExceptionCode::RangeCheckError, "RAND value is out of range");
+    }
     engine.set_rand(rand)?;
     Ok(())
 }

@@ -47,7 +47,7 @@ use ton_api::{
 };
 use ton_block::{
     sha256_digest, BlockIdExt, BocFlags, BocWriter, BuilderData, Ed25519KeyOption, ShardIdent,
-    UInt256,
+    UInt256, ZeroizingBytes,
 };
 
 #[test]
@@ -72,7 +72,7 @@ fn create_test_desc_with_validators(count: usize, local_idx: usize) -> Arc<Sessi
     let mut local_key: Option<crate::PublicKey> = None;
 
     for i in 0..count {
-        let key = Ed25519KeyOption::generate().expect("key gen");
+        let key = Ed25519KeyOption::<ZeroizingBytes>::generate().expect("key gen");
         let public_key: crate::PublicKey = key.clone().into();
         if i == local_idx {
             local_key = Some(public_key.clone());
@@ -360,8 +360,8 @@ fn test_apply_bootstrap_calls_expected_listener_methods_first_commit_strategy() 
     let self_idx = ValidatorIndex::new(1);
     let desc = create_test_desc_with_validators(2, 1);
 
-    let key0: crate::PrivateKey = Ed25519KeyOption::generate().unwrap();
-    let key1: crate::PrivateKey = Ed25519KeyOption::generate().unwrap();
+    let key0: crate::PrivateKey = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+    let key1: crate::PrivateKey = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
 
     let vote0 = Vote::Notarize(NotarizeVote {
         slot: SlotIndex::new(10),

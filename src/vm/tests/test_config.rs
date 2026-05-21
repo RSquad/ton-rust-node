@@ -23,9 +23,24 @@ fn test_case_with_c7(code: &str) -> TestCaseInputs {
         PUSHINT 4
         PUSHINT 5
         PUSHINT 6
-        ; balance 1000 coins and no others
+        ; balance 1000 coins
         PUSHINT 1000
-        NULL
+        ; others 123 -> 1234567
+        NEWC
+        PUSHINT 1234567
+        STVARUINT32
+        PUSHINT 123
+        NEWDICT
+        PUSHINT 32
+        DICTUSETB
+        ; others 456 -> 89
+        NEWC
+        PUSHINT 89
+        STVARUINT32
+        PUSHINT 456
+        ROT
+        PUSHINT 32
+        DICTUSETB
         PAIR
         ; prepare my address addr_var $11_0_000001000_0:32_0101_0101 => $1100_0000_1000_0:32_0101_0101
         PUSHSLICE xC080000000055
@@ -100,8 +115,7 @@ mod getparam {
         test_case_with_c7("GETPARAM 1").expect_item(StackItem::int(1));
         test_case_with_c7("GETPARAM 2").expect_item(StackItem::int(2));
         test_case_with_c7("GETPARAM 6").expect_item(StackItem::int(6));
-        test_case_with_c7("GETPARAM 7")
-            .expect_item(create::tuple(&[StackItem::int(1000), StackItem::None]));
+        test_case_with_c7("GETPARAM 7 UNTUPLE 2 DROP").expect_item(StackItem::int(1000));
         test_case_with_c7("INCOMINGVALUE UNTUPLE 2 DROP").expect_int_stack(&[1856]);
         test_case_with_c7("DUEPAYMENT").expect_int_stack(&[777]);
         test_case_with_c7("PREVBLOCKSINFOTUPLE UNTUPLE 3").expect_int_stack(&[1, 2, 3]);
@@ -170,12 +184,14 @@ mod getparam {
             );
             expect_exception(&code, ExceptionCode::RangeCheckError);
         }
-        let configs: [(&str, &[i32]); 13] = [
+        let configs: [(&str, &[i32]); 15] = [
             ("NOW", &[3]),
             ("BLOCKLT", &[4]),
             ("LTIME", &[5]),
             ("RANDSEED", &[6]),
             ("BALANCE UNTUPLE 2 DROP", &[1000]),
+            ("PUSHINT 123 GETEXTRABALANCE", &[1234567]),
+            ("PUSHINT 456 GETEXTRABALANCE", &[89]),
             ("MYADDR", &[]),
             ("CONFIGROOT", &[]),
             ("MYCODE", &[]),
@@ -189,7 +205,6 @@ mod getparam {
             if !expected.is_empty() {
                 test_case_with_c7(code).expect_int_stack(expected);
             }
-            // test_case_with_c7().expect_int_stack(expected);
             let code = format!(
                 "
                 NIL
@@ -477,8 +492,12 @@ mod balance {
 
     #[test]
     fn normal_flow() {
-        test_case_with_c7("BALANCE UNPAIR")
-            .expect_stack(Stack::new().push(StackItem::int(1000)).push(StackItem::None));
+        test_case_with_c7("BALANCE UNPAIR DROP")
+            .expect_stack(Stack::new().push(StackItem::int(1000)));
+        test_case_with_c7("PUSHINT 123 GETEXTRABALANCE")
+            .expect_stack(Stack::new().push(StackItem::int(1234567)));
+        test_case_with_c7("PUSHINT 456 GETEXTRABALANCE")
+            .expect_stack(Stack::new().push(StackItem::int(89)));
     }
 
     #[test]
