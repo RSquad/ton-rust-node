@@ -9,8 +9,12 @@
 use anyhow::Context;
 use colored::Colorize;
 use secrets_vault::{
-    crypto::factory::CryptoFactory, errors::error::VaultError, storage::storage_trait::ListMode,
-    types::store_mode::StoreMode, vault::SecretVault, vault_block::BlockCryptoFactory,
+    crypto::factory::CryptoFactory,
+    errors::error::VaultError,
+    storage::{file_json::FileJsonStorage, hashicorp::HashicorpStorage, storage_trait::Storage},
+    types::store_mode::StoreMode,
+    vault::SecretVault,
+    vault_block::BlockCryptoFactory,
     vault_builder::SecretVaultBuilder,
 };
 use std::{
@@ -26,32 +30,14 @@ enum OnConflict {
     Overwrite,
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-#[value(rename_all = "kebab-case")]
-enum ListModeArg {
-    OnlyNeeded,
-    All,
-}
-
-impl From<ListModeArg> for ListMode {
-    fn from(v: ListModeArg) -> Self {
-        match v {
-            ListModeArg::OnlyNeeded => ListMode::OnlyNeeded,
-            ListModeArg::All => ListMode::All,
-        }
-    }
-}
-
 #[derive(clap::Args, Clone, Debug)]
-#[command(about = "Copy all secrets from FROM_VAULT_URL to VAULT_URL")]
+#[command(
+    about = "Copy all secrets from a file vault (FROM_VAULT_URL) to a HashiCorp vault (VAULT_URL)"
+)]
 pub struct KeyMigrateCmd {
     /// Conflict policy when destination already has a secret with the same id
     #[arg(long = "on-conflict", value_enum, default_value = "fail")]
     on_conflict: OnConflict,
-
-    /// Source list mode
-    #[arg(long = "list-mode", value_enum, default_value = "all")]
-    list_mode: ListModeArg,
 
     /// Print plan without writing to destination
     #[arg(long = "dry-run")]
@@ -84,15 +70,24 @@ impl KeyMigrateCmd {
         }
         println!();
 
-        let src: Arc<SecretVault> = SecretVaultBuilder::from_url(&from_url, crypto.clone())
-            .await
-            .context("open source vault")?;
-        let dst: Arc<SecretVault> = SecretVaultBuilder::from_url(&to_url, crypto)
+        let dst: Arc<SecretVault> = SecretVaultBuilder::from_url(&to_url, crypto.clone())
             .await
             .context("open destination vault")?;
+        let dst_storage = dst
+            .storage()
+            .as_ref()
+            .downcast_ref::<HashicorpStorage>()
+            .ok_or_else(|| anyhow::anyhow!("VAULT_URL must refer to a HashiCorp vault"))?;
 
-        let records =
-            src.list_metadata(self.list_mode.into()).await.context("list source vault records")?;
+        let src: Arc<SecretVault> =
+            SecretVaultBuilder::from_url(&from_url, crypto).await.context("open source vault")?;
+        let src_storage = src
+            .storage()
+            .as_ref()
+            .downcast_ref::<FileJsonStorage>()
+            .ok_or_else(|| anyhow::anyhow!("FROM_VAULT_URL must refer to a file vault"))?;
+
+        let records = src_storage.list_metadata().await.context("list source vault records")?;
         let total = records.len();
 
         if total == 0 {
@@ -148,17 +143,10 @@ impl KeyMigrateCmd {
                 println!("         tags: {}", preview.dimmed());
             }
 
-            let secret = match src.load(secret_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    println!("         {} cannot read from source: {}", "SKIP".yellow().bold(), e);
-                    skipped += 1;
-                    if !self.continue_on_error && !is_skippable_load_error(&e) {
-                        return Err(e);
-                    }
-                    continue;
-                }
-            };
+            let (secret, is_extractable) = src_storage
+                .load_for_migrate(secret_id)
+                .await
+                .with_context(|| format!("read secret '{secret_id}' from source vault"))?;
 
             let exists = dst.exists(secret_id).await.unwrap_or(false);
             let mode = match (exists, self.on_conflict) {
@@ -200,7 +188,7 @@ impl KeyMigrateCmd {
             }
 
             let write_started = Instant::now();
-            match dst.store(&secret, mode).await {
+            match dst_storage.store(&secret, mode, Some(is_extractable)).await {
                 Ok(()) => {
                     println!(
                         "         {} {} {}",
@@ -244,10 +232,6 @@ impl KeyMigrateCmd {
         println!("{} {}\n", "✓".green().bold(), "Migration completed".green());
         Ok(())
     }
-}
-
-fn is_skippable_load_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<VaultError>().is_some_and(|ve| ve.code() == VaultError::NOT_EXTRACTABLE)
 }
 
 fn mode_label(mode: StoreMode) -> &'static str {
@@ -307,7 +291,6 @@ mod tests {
     fn migrate_cli_uses_safe_defaults() {
         let cli = TestCli::try_parse_from(["nodectl"]).expect("parse defaults");
         assert!(matches!(cli.cmd.on_conflict, OnConflict::Fail));
-        assert!(matches!(cli.cmd.list_mode, ListModeArg::All));
         assert!(!cli.cmd.dry_run);
         assert!(!cli.cmd.continue_on_error);
     }
@@ -318,14 +301,11 @@ mod tests {
             "nodectl",
             "--on-conflict",
             "overwrite",
-            "--list-mode",
-            "all",
             "--dry-run",
             "--continue-on-error",
         ])
         .expect("parse full set");
         assert!(matches!(cli.cmd.on_conflict, OnConflict::Overwrite));
-        assert!(matches!(cli.cmd.list_mode, ListModeArg::All));
         assert!(cli.cmd.dry_run);
         assert!(cli.cmd.continue_on_error);
     }
@@ -335,13 +315,6 @@ mod tests {
         let err = TestCli::try_parse_from(["nodectl", "--on-conflict", "bogus"]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("bogus"), "error should mention bad value: {msg}");
-    }
-
-    #[test]
-    fn migrate_cli_rejects_unknown_list_mode() {
-        let err = TestCli::try_parse_from(["nodectl", "--list-mode", "partial"]).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("partial"), "error should mention bad value: {msg}");
     }
 
     #[test]
