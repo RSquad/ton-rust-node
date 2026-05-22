@@ -652,6 +652,10 @@ fn default_sleep_pct() -> f64 {
     0.2
 }
 
+fn default_cache_refresh_secs() -> u64 {
+    300
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct ElectionsConfig {
     #[serde(default)]
@@ -684,6 +688,11 @@ pub struct ElectionsConfig {
     /// ephemeral ADNL address every cycle for them (pre-v0.5 behavior).
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub static_adnl_disabled: HashSet<String>,
+    /// TTL (seconds) for `past_elections` and pool-address caches. `0` disables the
+    /// time-based refresh (only election_id changes invalidate). Defends against
+    /// stale snapshots cached for the whole round after a bad initial fetch.
+    #[serde(default = "default_cache_refresh_secs")]
+    pub cache_refresh_secs: u64,
 }
 
 impl ElectionsConfig {
@@ -735,6 +744,7 @@ impl Default for ElectionsConfig {
             waiting_period_pct: default_waiting_pct(),
             static_adnls: HashMap::new(),
             static_adnl_disabled: HashSet::new(),
+            cache_refresh_secs: default_cache_refresh_secs(),
         }
     }
 }
