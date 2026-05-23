@@ -14,6 +14,7 @@ pub mod block_proof;
 pub mod boot;
 pub mod collator_test_bundle;
 pub mod config;
+pub mod confirmed_blocks;
 pub mod engine;
 pub mod engine_operations;
 pub mod engine_traits;

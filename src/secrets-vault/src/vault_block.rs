@@ -389,3 +389,7 @@ pub fn get_key_option_factory() -> &'static VaultKeyOptionFactory {
         Box::new(res)
     })
 }
+
+pub fn get_vault() -> Option<Arc<SecretVault>> {
+    get_key_option_factory().vault.clone()
+}
