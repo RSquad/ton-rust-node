@@ -31,8 +31,7 @@ use secrets_vault::{
         store_mode::StoreMode as SecretStoreMode,
     },
     vault::SecretVault,
-    vault_block::{get_key_option_factory, BlockCryptoFactory},
-    vault_builder::SecretVaultBuilder,
+    vault_block::{get_key_option_factory, get_vault, BlockCryptoFactory},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -237,12 +236,6 @@ impl SecretsVaultConfig {
     const TYPE_PRIVATE_KEY: &str = "private_key";
     const TYPE_VALIDATOR_KEY: &str = "validator_key";
 
-    async fn open_vault() -> Result<Option<Arc<SecretVault>>> {
-        let vault =
-            SecretVaultBuilder::from_url_or_env(None, BlockCryptoFactory {}.new_crypto()?).await?;
-        Ok(vault)
-    }
-
     async fn on_drop(key_id: &str) -> Result<()> {
         async fn delete(vault: &SecretVault, sid: &str, key_id: &str) -> Option<anyhow::Error> {
             let secret_id = make_secret_id!(sid, key_id);
@@ -255,7 +248,7 @@ impl SecretsVaultConfig {
             })
         }
 
-        let Some(vault) = Self::open_vault().await? else {
+        let Some(vault) = get_vault() else {
             return Ok(());
         };
         log::info!("Drop key from the vault: {key_id}");
@@ -269,7 +262,7 @@ impl SecretsVaultConfig {
     }
 
     pub async fn on_load(config: &mut TonNodeConfig) -> Result<()> {
-        let Some(vault) = Self::open_vault().await? else {
+        let Some(vault) = get_vault() else {
             return Ok(());
         };
 
@@ -338,7 +331,7 @@ impl SecretsVaultConfig {
         if key_config.vault.is_none() {
             return Ok(());
         }
-        let Some(vault) = Self::open_vault().await? else {
+        let Some(vault) = get_vault() else {
             return Ok(());
         };
 
@@ -369,7 +362,7 @@ impl SecretsVaultConfig {
             snapshots.push((key_id_b64, pvt));
         }
 
-        let Some(vault) = Self::open_vault().await? else {
+        let Some(vault) = get_vault() else {
             return Ok(());
         };
 
@@ -402,7 +395,7 @@ impl SecretsVaultConfig {
     }
 
     pub async fn save_validator_key(key: &ValidatorKeysJson) -> Result<()> {
-        let Some(vault) = Self::open_vault().await? else {
+        let Some(vault) = get_vault() else {
             return Ok(());
         };
 
@@ -1768,7 +1761,13 @@ impl NodeConfigHandler {
             if let Some(key_config) = validator_key_ring.get(&base64_encode(key_id)) {
                 match get_key_option_factory().from_private_key_json(key_config) {
                     Ok(key) => return Some(key),
-                    _ => return None,
+                    Err(e) => {
+                        log::error!(
+                            "get_key {}: from_private_key_json failed: {e}",
+                            base64_encode(key_id),
+                        );
+                        return None;
+                    }
                 }
             }
         }

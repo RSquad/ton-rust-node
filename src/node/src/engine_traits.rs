@@ -12,6 +12,7 @@ use crate::{
     block::BlockStuff,
     block_proof::BlockProofStuff,
     config::{CollatorConfig, CollatorTestBundlesGeneralConfig, TonNodeConfig},
+    confirmed_blocks::ConfirmedBlockEvents,
     engine::{EngineFlags, SplitQueues},
     internal_db::BlockResult,
     shard_state::ShardStateStuff,
@@ -733,6 +734,9 @@ pub trait EngineOperations: Sync + Send {
         to_delete: &[UInt256],
     ) -> Result<()> {
         unimplemented!()
+    }
+    fn confirmed_block_events(&self) -> Option<ConfirmedBlockEvents> {
+        None
     }
 
     // Utils

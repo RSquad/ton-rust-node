@@ -12,6 +12,7 @@ use crate::{
     block::BlockStuff,
     block_proof::BlockProofStuff,
     config::{CollatorConfig, CollatorTestBundlesGeneralConfig},
+    confirmed_blocks::ConfirmedBlockEvents,
     engine::{Engine, EngineFlags, SplitQueues},
     engine_traits::{
         EngineAlloc, EngineOperations, PrivateOverlayOperations, ValidatorKeyBinding,
@@ -1112,6 +1113,10 @@ impl EngineOperations for Engine {
         to_delete: &[UInt256],
     ) -> Result<()> {
         self.external_messages().complete_messages(to_delay, to_delete, self.now())
+    }
+
+    fn confirmed_block_events(&self) -> Option<ConfirmedBlockEvents> {
+        Some(self.confirmed_block_events())
     }
 
     // Get current list of new shard blocks with respect to last mc block.
