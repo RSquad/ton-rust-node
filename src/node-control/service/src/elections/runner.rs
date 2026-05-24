@@ -254,7 +254,7 @@ pub(crate) struct ElectionRunner {
     past_elections: Vec<PastElections>,
     /// Election ID the cache (past_elections + pool addresses) is keyed on.
     past_elections_cache_id: u64,
-    /// Wall-clock of the last cache refresh.
+    /// Unix timestamp of the last cache refresh.
     cache_refreshed_at: u64,
     /// Cache TTL; `0` disables the time-based refresh (only election_id changes invalidate).
     cache_refresh_secs: u64,
@@ -536,9 +536,6 @@ impl ElectionRunner {
 
         let mut skip_tick_nodes = vec![];
 
-        // TTL refresh defends against stale snapshots cached for the whole round when the
-        // initial fetch hit a lagging RPC endpoint. TONCore pool address alternates per
-        // cycle, so uniform invalidation is required.
         let now_ts = self.clock.now();
         let cache_expired = self.cache_refresh_secs > 0
             && now_ts.saturating_sub(self.cache_refreshed_at) >= self.cache_refresh_secs;
@@ -601,7 +598,7 @@ impl ElectionRunner {
                 .first()
                 .and_then(|pe| pe.frozen_map.values().min_by_key(|f| f.stake).map(|f| f.stake));
             tracing::info!(
-                "past_elections cache refreshed (reason={}, entries={}, election_id={})",
+                "past_elections cache refreshed: reason={}, entries={}, election_id={}",
                 reason,
                 self.past_elections.len(),
                 election_id

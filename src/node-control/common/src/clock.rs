@@ -25,7 +25,6 @@ impl Clock for SystemClock {
     }
 }
 
-/// Clones share state, so a test can advance time after handing the clock to the SUT.
 #[derive(Clone, Default)]
 pub struct MockClock {
     now: Arc<AtomicU64>,
