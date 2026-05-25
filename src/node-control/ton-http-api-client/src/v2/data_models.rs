@@ -124,7 +124,7 @@ pub struct TransactionId {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct BlockIdExt {
-    #[serde(rename = "@type")]
+    #[serde(rename = "@type", skip_serializing)]
     pub r#type: String,
     pub workchain: i32,
 
