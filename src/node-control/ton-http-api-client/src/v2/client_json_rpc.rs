@@ -171,7 +171,11 @@ impl ClientJsonRpc {
     ///    refreshed lazily (probe = `getMasterchainInfo` + `getBlockHeader`,
     ///    rate-limited by `freshness_cfg.probe_interval_secs`). Endpoints whose
     ///    masterchain block view is older than `freshness_cfg.max_lag_secs`
-    ///    are skipped. Each attempt is bounded by [`EndpointTimeouts::total`].
+    ///    are skipped. Each individual RPC (probe call or business call) is
+    ///    bounded by [`EndpointTimeouts::total`]; when a probe runs, an attempt
+    ///    may therefore consume up to ~3× that budget (2 probe RPCs + 1
+    ///    business RPC). Once an endpoint is known fresh (probe within TTL),
+    ///    only the business RPC runs and the attempt is bounded by 1× budget.
     /// 3. On success the response is returned immediately. On total failure
     ///    the error is `ENDPOINTS_STALE_TAG` when every endpoint was skipped
     ///    because of staleness, otherwise `ENDPOINTS_UNREACHABLE_TAG`.
@@ -290,8 +294,12 @@ impl ClientJsonRpc {
     /// `observed_at == 0` (never probed) is intentionally treated as fresh: probe failures
     /// are handled by the caller (`json_rpc` continues to the next endpoint), so this branch
     /// only fires when probing is disabled via [`FreshnessConfig::disabled`].
+    ///
+    /// The `Acquire` load of `observed_at` pairs with the `Release` store in
+    /// [`Self::refresh_endpoint_freshness`] so the matching `gen_utime` is guaranteed to be
+    /// the one published alongside this `observed_at` value (no torn snapshot).
     fn is_endpoint_stale(&self, idx: usize) -> bool {
-        let observed_at = self.endpoints[idx].freshness.observed_at.load(Ordering::Relaxed);
+        let observed_at = self.endpoints[idx].freshness.observed_at.load(Ordering::Acquire);
         if observed_at == 0 {
             return false;
         }
@@ -331,8 +339,10 @@ impl ClientJsonRpc {
 
         let now = self.clock.now();
         let endpoint = &self.endpoints[idx];
+        // Publish gen_utime first, then observed_at with Release so an Acquire reader of
+        // observed_at sees the matching gen_utime (no torn snapshot).
         endpoint.freshness.gen_utime.store(header.gen_utime, Ordering::Relaxed);
-        endpoint.freshness.observed_at.store(now, Ordering::Relaxed);
+        endpoint.freshness.observed_at.store(now, Ordering::Release);
         Ok(())
     }
 
