@@ -5,6 +5,14 @@ All notable changes to the nodectl Helm chart will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the Helm chart release tags (e.g. `helm/nodectl/v0.1.0`).
 
+## [0.3.1] - 2026-05-25
+
+appVersion: `v0.5.1`
+
+### Changed
+
+- Default image updated to nodectl `v0.5.1`
+
 ## [0.3.0] - 2026-05-19
 
 appVersion: `v0.5.0`
