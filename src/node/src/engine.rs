@@ -15,6 +15,7 @@ use crate::{
     config::{
         CollatorConfig, CollatorTestBundlesGeneralConfig, TonNodeConfig, ValidatorManagerConfig,
     },
+    confirmed_blocks::{ConfirmedBlockEvent, ConfirmedBlockEvents, ConfirmedBlockSource},
     engine_traits::{EngineAlloc, EngineOperations, PrivateOverlayOperations},
     ext_messages::MessagesPool,
     full_node::{
@@ -101,6 +102,7 @@ pub struct Engine {
     next_block_applying_awaiters: AwaitersPool<BlockIdExt, BlockIdExt>,
     download_block_awaiters: AwaitersPool<BlockIdExt, (BlockStuff, BlockProofStuff)>,
     external_messages: Arc<MessagesPool>,
+    confirmed_block_events: ConfirmedBlockEvents,
 
     servers: lockfree::queue::Queue<Box<dyn Stoppable>>,
     stopper: Arc<Stopper>,
@@ -699,6 +701,7 @@ impl Engine {
                 engine_allocated.clone(),
             ),
             external_messages: Arc::new(ext_messages_pool),
+            confirmed_block_events: ConfirmedBlockEvents::new(),
 
             servers: lockfree::queue::Queue::new(),
             stopper,
@@ -763,6 +766,10 @@ impl Engine {
 
     pub fn get_last_applied_mc_seqno(&self) -> u32 {
         self.last_applied_mc_block_seqno.load(Ordering::Relaxed)
+    }
+
+    pub fn confirmed_block_events(&self) -> ConfirmedBlockEvents {
+        self.confirmed_block_events.clone()
     }
 
     pub fn set_sync_status(&self, status: u32) {
@@ -1276,6 +1283,19 @@ impl Engine {
             recursion_depth,
         )
         .await?;
+
+        if !id.shard().is_masterchain() {
+            let source = if pre_apply {
+                ConfirmedBlockSource::PRE_APPLIED
+            } else {
+                ConfirmedBlockSource::APPLIED
+            };
+            self.confirmed_block_events.notify(ConfirmedBlockEvent {
+                id: id.clone(),
+                data: block.data_arc(),
+                source,
+            });
+        }
 
         if !pre_apply {
             self.external_messages().push_applied_block(Arc::new(block.clone()));

@@ -12,11 +12,12 @@ use crate::collator_test_bundle::create_engine_telemetry;
 use crate::{
     collator_test_bundle::create_engine_allocated,
     config::{JsonRpcServerConfig, JsonRpcServerConfigJson},
+    confirmed_blocks::{ConfirmedBlockEvent, ConfirmedBlockEvents, ConfirmedBlockSource},
     engine_traits::{EngineOperations, Stoppable},
     internal_db::state_gc_resolver::AllowStateGcSmartResolver,
     rpc_server::{
-        jsonrpc_handler, rest_ok, wallets::WalletLibrary, Ctx, JsonRpcRequest, RpcRegistry,
-        RpcServer,
+        confirmed_block_events_handler, jsonrpc_handler, rest_ok, wallets::WalletLibrary,
+        ConfirmedBlockEventsQuery, Ctx, JsonRpcRequest, RpcRegistry, RpcServer,
     },
     shard_state::ShardStateStuff,
     shard_states_keeper::PinnedShardStateGuard,
@@ -36,6 +37,7 @@ struct MockEngine {
     zerostate_id: BlockIdExt,
     states: HashMap<BlockIdExt, Arc<ShardStateStuff>>,
     lookup_by_seqno: HashMap<(AccountIdPrefixFull, u32), (BlockIdExt, Vec<u8>)>,
+    confirmed_block_events: ConfirmedBlockEvents,
     gc_resolver: Arc<AllowStateGcSmartResolver>,
 }
 
@@ -52,6 +54,7 @@ impl MockEngine {
             zerostate_id: last_state_id,
             states: state_map,
             lookup_by_seqno: HashMap::new(),
+            confirmed_block_events: ConfirmedBlockEvents::new(),
             gc_resolver: Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
         }
     }
@@ -72,6 +75,10 @@ impl MockEngine {
             .get(block_id)
             .cloned()
             .ok_or_else(|| error!("state {block_id} not found in mock engine"))
+    }
+
+    fn confirmed_block_events(&self) -> ConfirmedBlockEvents {
+        self.confirmed_block_events.clone()
     }
 }
 
@@ -119,6 +126,10 @@ impl EngineOperations for MockEngine {
         seqno: u32,
     ) -> Result<Option<(BlockIdExt, Vec<u8>)>> {
         Ok(self.lookup_by_seqno.get(&(prefix.clone(), seqno)).cloned())
+    }
+
+    fn confirmed_block_events(&self) -> Option<ConfirmedBlockEvents> {
+        Some(self.confirmed_block_events())
     }
 }
 
@@ -501,6 +512,137 @@ async fn http_test_jsonrpc() {
     let server = Box::new(RpcServer::start_with_listener(listener, engine).await.unwrap());
     http_server_test_client_jsonrpc(httpaddr.clone(), accaddr.clone()).await;
     server.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_block_events_handler_streams_block_data() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine = MockEngine::new(vec![master_state]);
+    let events = engine.confirmed_block_events();
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
+        77,
+        UInt256::from([2; 32]),
+        UInt256::from([3; 32]),
+    );
+    let block_data = vec![9, 8, 7];
+    let block_id_2 = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(0, 0xc000_0000_0000_0000).unwrap(),
+        78,
+        UInt256::from([4; 32]),
+        UInt256::from([5; 32]),
+    );
+    let block_data_2 = vec![6, 5, 4];
+    let engine: Arc<dyn EngineOperations> = Arc::new(engine);
+    let ctx = ctx_with_engine(engine);
+    let response = confirmed_block_events_handler(
+        ConfirmedBlockEventsQuery { include_data: None, limit: Some(2) },
+        ctx,
+    )
+    .await
+    .expect("SSE handler failed");
+
+    events.notify(ConfirmedBlockEvent {
+        id: block_id.clone(),
+        data: Arc::new(block_data.clone()),
+        source: ConfirmedBlockSource::PRE_APPLIED,
+    });
+    events.notify(ConfirmedBlockEvent {
+        id: block_id_2.clone(),
+        data: Arc::new(block_data_2.clone()),
+        source: ConfirmedBlockSource::PRE_APPLIED,
+    });
+
+    let body = read_sse_response_body(response).await;
+    assert!(body.contains("confirmed_block"));
+    let payloads = sse_payloads(&body);
+    pretty_assertions::assert_eq!(payloads.len(), 2);
+
+    pretty_assertions::assert_eq!(payloads[0]["status"], serde_json::json!("confirmed"));
+    pretty_assertions::assert_eq!(
+        payloads[0]["block"]["@type"],
+        serde_json::json!("liteServer.blockData")
+    );
+    pretty_assertions::assert_eq!(payloads[0]["block"]["id"], serialize_block_id(&block_id));
+    pretty_assertions::assert_eq!(
+        payloads[0]["block"]["data"],
+        serde_json::json!(base64_encode(&block_data))
+    );
+    pretty_assertions::assert_eq!(payloads[1]["block"]["id"], serialize_block_id(&block_id_2));
+    pretty_assertions::assert_eq!(
+        payloads[1]["block"]["data"],
+        serde_json::json!(base64_encode(&block_data_2))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_block_events_handler_can_omit_block_data() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine = MockEngine::new(vec![master_state]);
+    let events = engine.confirmed_block_events();
+    let block_id = BlockIdExt::with_params(
+        ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
+        79,
+        UInt256::from([6; 32]),
+        UInt256::from([7; 32]),
+    );
+    let engine: Arc<dyn EngineOperations> = Arc::new(engine);
+    let ctx = ctx_with_engine(engine);
+    let response = confirmed_block_events_handler(
+        ConfirmedBlockEventsQuery { include_data: Some(false), limit: Some(1) },
+        ctx,
+    )
+    .await
+    .expect("SSE handler failed");
+
+    events.notify(ConfirmedBlockEvent {
+        id: block_id.clone(),
+        data: Arc::new(Vec::new()),
+        source: ConfirmedBlockSource::PRE_APPLIED,
+    });
+
+    let body = read_sse_response_body(response).await;
+    let payloads = sse_payloads(&body);
+    pretty_assertions::assert_eq!(payloads.len(), 1);
+    pretty_assertions::assert_eq!(payloads[0]["status"], serde_json::json!("confirmed"));
+    pretty_assertions::assert_eq!(payloads[0]["block"]["id"], serialize_block_id(&block_id));
+    assert!(payloads[0]["block"].get("data").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_block_events_handler_rejects_zero_limit() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+    let ctx = ctx_with_engine(engine);
+
+    let response = confirmed_block_events_handler(
+        ConfirmedBlockEventsQuery { include_data: None, limit: Some(0) },
+        ctx,
+    )
+    .await
+    .expect("SSE handler failed");
+
+    pretty_assertions::assert_eq!(response.status(), warp::http::StatusCode::BAD_REQUEST);
+}
+
+async fn read_sse_response_body(response: warp::reply::Response) -> String {
+    let collected =
+        tokio::time::timeout(std::time::Duration::from_secs(3), response.into_body().collect())
+            .await
+            .expect("SSE response timed out")
+            .expect("SSE response failed");
+    String::from_utf8(collected.to_bytes().to_vec()).expect("SSE body must be UTF-8")
+}
+
+fn sse_payloads(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter(|line| line.starts_with("data:"))
+        .map(|line| line.trim_start_matches("data:").trim_start())
+        .map(|data| serde_json::from_str(data).expect("SSE data must be JSON"))
+        .collect()
 }
 
 async fn http_server_test_client_jsonrpc(address: std::net::SocketAddr, _account: MsgAddressInt) {
