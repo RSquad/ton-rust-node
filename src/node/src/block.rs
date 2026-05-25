@@ -106,6 +106,10 @@ impl BlockStuff {
         &self.data
     }
 
+    pub fn data_arc(&self) -> Arc<Vec<u8>> {
+        self.data.clone()
+    }
+
     // Unused
     //    pub fn is_masterchain(&self) -> bool {
     //        self.id.shard().is_masterchain()

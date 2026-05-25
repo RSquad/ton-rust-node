@@ -8,10 +8,19 @@
  */
 use crate::{
     config::JsonRpcServerConfig,
+    confirmed_blocks::ConfirmedBlockEvent,
     engine_traits::{EngineOperations, Stoppable},
 };
-use std::{collections::HashMap, error::Error, future::Future, sync::Arc};
-use ton_block::{error, Result};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    error::Error,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+use ton_block::{base64_encode, error, Result};
 use warp::{Filter, Reply};
 
 mod handlers;
@@ -22,6 +31,7 @@ mod wallets;
 /// Maximum size of an incoming JSON-RPC / REST request body, in bytes.
 /// This bounds the size of any BOC accepted via the public API.
 const MAX_BODY_SIZE: u64 = 16 << 20;
+const SSE_PENDING_EVENT_CAPACITY: usize = 16;
 
 pub struct RpcServer {
     shutdown: tokio::sync::oneshot::Sender<()>,
@@ -241,6 +251,159 @@ async fn health_handler() -> std::result::Result<warp::reply::Response, warp::Re
     Ok(warp::reply::with_status("OK", warp::http::StatusCode::OK).into_response())
 }
 
+async fn confirmed_block_events_handler(
+    query: ConfirmedBlockEventsQuery,
+    ctx: Ctx,
+) -> std::result::Result<warp::reply::Response, warp::Rejection> {
+    let Some(events) = ctx.engine.confirmed_block_events() else {
+        return Ok(json_status(
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            "confirmed block stream is not available",
+        ));
+    };
+    if query.limit == Some(0) {
+        return Ok(json_status(
+            warp::http::StatusCode::BAD_REQUEST,
+            "limit must be greater than 0",
+        ));
+    }
+
+    let rx = events.subscribe();
+    let (sender, stream) = SseEventStream::new();
+    tokio::spawn(forward_confirmed_block_sse_events(
+        rx,
+        sender,
+        query.include_data.unwrap_or(true),
+        query.limit,
+    ));
+
+    let reply = warp::sse::reply(warp::sse::keep_alive().stream(stream));
+    let reply = warp::reply::with_header(reply, warp::http::header::CACHE_CONTROL, "no-cache");
+    let reply = warp::reply::with_header(reply, "X-Accel-Buffering", "no");
+    Ok(reply.into_response())
+}
+
+fn json_status(
+    status: warp::http::StatusCode,
+    message: impl Into<String>,
+) -> warp::reply::Response {
+    let body = warp::reply::json(&serde_json::json!({
+        "ok": false,
+        "error": message.into(),
+        "code": status.as_u16(),
+    }));
+    warp::reply::with_status(body, status).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ConfirmedBlockEventsQuery {
+    include_data: Option<bool>,
+    limit: Option<usize>,
+}
+
+async fn forward_confirmed_block_sse_events(
+    mut rx: tokio::sync::broadcast::Receiver<ConfirmedBlockEvent>,
+    sender: SseEventSender,
+    include_data: bool,
+    limit: Option<usize>,
+) {
+    let mut sent = 0usize;
+    loop {
+        tokio::select! {
+            _ = sender.closed() => return,
+            result = rx.recv() => {
+                match result {
+                    Ok(block_event) => {
+                        if let Some(event) = confirmed_block_sse_event(block_event, include_data) {
+                            if !sender.send(event) {
+                                return;
+                            }
+                            sent += 1;
+                            if limit.map_or(false, |limit| sent >= limit) {
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("confirmed block SSE receiver lagged by {skipped} block id(s)");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SseEventSender {
+    tx: tokio::sync::mpsc::Sender<warp::sse::Event>,
+}
+
+struct SseEventStream {
+    rx: tokio::sync::mpsc::Receiver<warp::sse::Event>,
+}
+
+impl SseEventStream {
+    fn new() -> (SseEventSender, Self) {
+        let (tx, rx) = tokio::sync::mpsc::channel(SSE_PENDING_EVENT_CAPACITY);
+        (SseEventSender { tx }, Self { rx })
+    }
+}
+
+impl SseEventSender {
+    fn send(&self, event: warp::sse::Event) -> bool {
+        match self.tx.try_send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                log::warn!(
+                    "confirmed block SSE client is too slow; closing stream with {SSE_PENDING_EVENT_CAPACITY} pending event(s)"
+                );
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    async fn closed(&self) {
+        self.tx.closed().await;
+    }
+}
+
+impl futures::Stream for SseEventStream {
+    type Item = std::result::Result<warp::sse::Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx).map(|event| event.map(Ok))
+    }
+}
+
+fn confirmed_block_sse_event(
+    event: ConfirmedBlockEvent,
+    include_data: bool,
+) -> Option<warp::sse::Event> {
+    let block_id = event.id;
+    if block_id.shard().is_masterchain() {
+        return None;
+    }
+    let event_id = block_id.to_string();
+    let mut block = serde_json::json!({
+        "@type": "liteServer.blockData",
+        "id": serializers::serialize_block_id(&block_id),
+    });
+    if include_data {
+        block["data"] = serde_json::json!(base64_encode(event.data.as_slice()));
+    }
+    let payload = serde_json::json!({
+        "status": "confirmed",
+        "block": block,
+    });
+    let data = serde_json::to_string(&payload)
+        .unwrap_or_else(|_| r#"{"status":"confirmed","serialization_error":true}"#.to_string());
+    Some(warp::sse::Event::default().event("confirmed_block").id(event_id).data(data))
+}
+
 async fn handle_rejection(
     err: warp::Rejection,
 ) -> std::result::Result<warp::reply::Response, std::convert::Infallible> {
@@ -286,8 +449,19 @@ fn build_routes(ctx: Ctx) -> RestFilter {
     let openapi_json =
         warp::path("openapi.json".to_string()).and_then(openapi_json_handler).boxed();
     let health_route = warp::path("health".to_string()).and_then(health_handler).boxed();
+    let events_ctx = registry.ctx.clone();
+    let confirmed_block_events_route = warp::path("jsonRPC".to_string())
+        .and(warp::path("events".to_string()))
+        .and(warp::path("confirmed-blocks".to_string()))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ConfirmedBlockEventsQuery>())
+        .and(warp::any().map(move || events_ctx.clone()))
+        .and_then(confirmed_block_events_handler)
+        .boxed();
 
     let jsonrpc_route = warp::path("jsonRPC".to_string())
+        .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::content_length_limit(MAX_BODY_SIZE))
         .and(warp::body::json())
@@ -295,6 +469,8 @@ fn build_routes(ctx: Ctx) -> RestFilter {
         .and_then(jsonrpc_handler)
         .boxed();
     root.or(openapi_json)
+        .unify()
+        .or(confirmed_block_events_route)
         .unify()
         .or(jsonrpc_route)
         .unify()
