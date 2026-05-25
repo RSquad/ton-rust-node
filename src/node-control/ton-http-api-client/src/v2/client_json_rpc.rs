@@ -520,7 +520,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept connection");
             request_count.fetch_add(1, Ordering::SeqCst);
 
-            let mut buf = [0_u8; 4096];
+            let mut buf = [0_u8; MOCK_READ_BUF];
             let mut acc = Vec::new();
             loop {
                 let n = socket.read(&mut buf).await.expect("read request");
@@ -553,7 +553,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept connection");
 
-            let mut buf = [0_u8; 4096];
+            let mut buf = [0_u8; MOCK_READ_BUF];
             let mut acc = Vec::new();
             loop {
                 let n = socket.read(&mut buf).await.expect("read request");
@@ -775,7 +775,26 @@ mod tests {
         c_handle.abort();
     }
 
+    // ---- Mock server tunables ----
+
+    /// Per-read buffer for the in-process mock HTTP servers.
+    const MOCK_READ_BUF: usize = 4096;
+    /// Safety cap on accumulated request bytes before the mock gives up trying to
+    /// detect the JSON-RPC method (well above any payload we send in tests).
+    const MOCK_MAX_BODY_BYTES: usize = 8192;
+
     // ---- Freshness probe tests ----
+
+    /// Arbitrary "current chain head" Unix timestamp used by the freshness tests.
+    /// Picked so wall-clock vs `gen_utime` math is readable; the value itself is irrelevant.
+    const CHAIN_NOW_SECS: u32 = 1_700_000_000;
+    /// Offset that makes a mock endpoint look stale: 5 minutes behind, well past the
+    /// default `max_lag_secs` (60s).
+    const STALE_LAG_SECS: u32 = 300;
+    /// Clock advance smaller than the default `probe_interval_secs` (30s) — no re-probe expected.
+    const ADVANCE_WITHIN_TTL_SECS: u64 = 10;
+    /// Clock advance just past the default `probe_interval_secs` (30s) — re-probe expected.
+    const ADVANCE_PAST_TTL_SECS: u64 = 31;
 
     #[derive(Default)]
     struct ProbeStats {
@@ -806,8 +825,8 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else { return };
                 let stats = stats.clone();
                 tokio::spawn(async move {
-                    let mut acc = Vec::with_capacity(4096);
-                    let mut buf = [0_u8; 4096];
+                    let mut acc = Vec::with_capacity(MOCK_READ_BUF);
+                    let mut buf = [0_u8; MOCK_READ_BUF];
                     loop {
                         let n = match socket.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
@@ -818,7 +837,7 @@ mod tests {
                         if s.contains("\"method\"") {
                             break;
                         }
-                        if acc.len() > 8192 {
+                        if acc.len() > MOCK_MAX_BODY_BYTES {
                             break;
                         }
                     }
@@ -882,8 +901,8 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else { return };
                 let stats = stats.clone();
                 tokio::spawn(async move {
-                    let mut acc = Vec::with_capacity(4096);
-                    let mut buf = [0_u8; 4096];
+                    let mut acc = Vec::with_capacity(MOCK_READ_BUF);
+                    let mut buf = [0_u8; MOCK_READ_BUF];
                     loop {
                         let n = match socket.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
@@ -893,7 +912,7 @@ mod tests {
                         if std::str::from_utf8(&acc).unwrap_or("").contains("\"method\"") {
                             break;
                         }
-                        if acc.len() > 8192 {
+                        if acc.len() > MOCK_MAX_BODY_BYTES {
                             break;
                         }
                     }
@@ -947,7 +966,7 @@ mod tests {
     async fn probe_updates_freshness_and_endpoint_serves_business_request() {
         let stats = Arc::new(ProbeStats::default());
         // gen_utime equal to the clock → 0s of lag → fresh.
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (url, handle) = spawn_freshness_server(chain_now, stats.clone()).await;
 
         let mut client = ClientJsonRpc::connect_many(
@@ -976,10 +995,10 @@ mod tests {
     async fn all_endpoints_stale_returns_dedicated_error() {
         let s1 = Arc::new(ProbeStats::default());
         let s2 = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
-        // gen_utime 5 minutes behind the clock → stale (default max_lag_secs=60).
-        let (u1, h1) = spawn_freshness_server(chain_now - 300, s1.clone()).await;
-        let (u2, h2) = spawn_freshness_server(chain_now - 300, s2.clone()).await;
+        let chain_now = CHAIN_NOW_SECS;
+        let stale_gen_utime = chain_now - STALE_LAG_SECS;
+        let (u1, h1) = spawn_freshness_server(stale_gen_utime, s1.clone()).await;
+        let (u2, h2) = spawn_freshness_server(stale_gen_utime, s2.clone()).await;
 
         let mut client = ClientJsonRpc::connect_many(
             vec![(u1.clone(), None), (u2.clone(), None)],
@@ -1015,8 +1034,9 @@ mod tests {
     async fn stale_endpoint_skipped_and_fresh_endpoint_used() {
         let s_stale = Arc::new(ProbeStats::default());
         let s_fresh = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
-        let (u_stale, h_stale) = spawn_freshness_server(chain_now - 300, s_stale.clone()).await;
+        let chain_now = CHAIN_NOW_SECS;
+        let (u_stale, h_stale) =
+            spawn_freshness_server(chain_now - STALE_LAG_SECS, s_stale.clone()).await;
         let (u_fresh, h_fresh) = spawn_freshness_server(chain_now, s_fresh.clone()).await;
 
         let mut client = ClientJsonRpc::connect_many(
@@ -1046,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_probe_within_ttl_skips_reprobe() {
         let stats = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (url, handle) = spawn_freshness_server(chain_now, stats.clone()).await;
 
         let clock = mock_clock_at(chain_now);
@@ -1063,8 +1083,7 @@ mod tests {
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
             .expect("first business call");
-        // Within TTL (default 30s).
-        clock.advance(10);
+        clock.advance(ADVANCE_WITHIN_TTL_SECS);
         client
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
@@ -1081,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_probe_after_ttl_reprobes() {
         let stats = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (url, handle) = spawn_freshness_server(chain_now, stats.clone()).await;
 
         let clock = mock_clock_at(chain_now);
@@ -1098,8 +1117,7 @@ mod tests {
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
             .expect("first business call");
-        // Beyond TTL (default 30s).
-        clock.advance(31);
+        clock.advance(ADVANCE_PAST_TTL_SECS);
         client
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
@@ -1116,7 +1134,7 @@ mod tests {
     async fn probe_failure_skips_endpoint_and_fails_over() {
         let s_bad = Arc::new(ProbeStats::default());
         let s_good = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (u_bad, h_bad) = spawn_probe_failing_server(s_bad.clone()).await;
         let (u_good, h_good) = spawn_freshness_server(chain_now, s_good.clone()).await;
 
