@@ -3464,7 +3464,7 @@ async fn test_static_adnl_auto_generated_when_missing() {
 }
 
 // =====================================================
-// TEST: static_adnl_disabled -> ephemeral path (new_adnl_addr) (SMA-87)
+// TEST: static_adnl_disabled -> ephemeral path (new_adnl_addr)
 // =====================================================
 
 #[tokio::test]
@@ -3494,7 +3494,7 @@ async fn test_static_adnl_disabled_uses_ephemeral() {
 }
 
 // =====================================================
-// TEST: failed generation aborts node's tick but other nodes proceed (SMA-87)
+// TEST: failed generation aborts node's tick but other nodes proceed
 // =====================================================
 
 #[tokio::test]
@@ -3540,7 +3540,7 @@ async fn test_static_adnl_generation_failure_aborts_node_only() {
 }
 
 // =====================================================
-// TTL-based cache refresh (SMA-98)
+// TTL-based cache refresh
 // =====================================================
 
 /// Like `setup_default_elector` but asserts an exact `past_elections()` call count.

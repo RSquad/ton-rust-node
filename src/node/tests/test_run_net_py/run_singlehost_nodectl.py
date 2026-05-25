@@ -1103,7 +1103,8 @@ class Bootstrap:
         cfg_json["tick_interval"] = 20
         cfg_json["automation"]["tick_interval_sec"] = 20
         self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
-        self.log.info("  global tick_interval → 20")
+        self.log.info("  global tick_interval → 20; wait 10s until config hot-reload")
+        time.sleep(10)
 
         self._add_wallets()
         master_addr = self._resolve_master_wallet()
