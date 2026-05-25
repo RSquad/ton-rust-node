@@ -934,6 +934,13 @@ class Bootstrap:
         self.log.info("  config generate...")
         self._nctl("config", "generate", "--output", str(self.paths.nodectl_config), "--force")
 
+        # Short past_elections cache TTL so e2e can observe periodic refresh in the logs
+        # (search for `past_elections cache refreshed (reason=ttl, ...)`).
+        cfg_json = json.loads(self.paths.nodectl_config.read_text())
+        cfg_json.setdefault("elections", {})["cache_refresh_secs"] = 60
+        self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
+        self.log.info("  elections.cache_refresh_secs → 60")
+
         # Create the key used by nodes 3+ (nodes 1-2 get per-node keys in phase 6)
         self.log.info("  key add control-client-secret...")
         self._nctl("key", "add", "-n", "control-client-secret", "-e")
