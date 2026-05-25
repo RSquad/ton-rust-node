@@ -20,7 +20,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 use ton_block::{ConfigParamEnum, MsgAddressInt, read_boc};
@@ -67,7 +67,6 @@ pub struct ClientJsonRpc {
     timeouts: EndpointTimeouts,
     freshness_cfg: FreshnessConfig,
     clock: Arc<dyn Clock>,
-    rr_cursor: AtomicUsize,
 }
 
 impl ClientJsonRpc {
@@ -140,7 +139,6 @@ impl ClientJsonRpc {
             timeouts,
             freshness_cfg,
             clock: Arc::new(SystemClock),
-            rr_cursor: AtomicUsize::new(0),
         })
     }
 
@@ -161,38 +159,39 @@ impl ClientJsonRpc {
         self.endpoints.iter().map(|e| e.url.clone()).collect()
     }
 
-    /// Executes a JSON-RPC call with round-robin failover across all endpoints.
+    /// Executes a JSON-RPC call with priority-based failover across all endpoints.
     ///
     /// Algorithm:
-    /// 1. An atomic cursor picks a per-request start endpoint so that
-    ///    successive calls are spread across endpoints in round-robin order.
-    /// 2. Starting from that endpoint, each endpoint is tried once in
-    ///    cyclic order. Before each attempt the endpoint's freshness is
-    ///    refreshed lazily (probe = `getMasterchainInfo` + `getBlockHeader`,
-    ///    rate-limited by `freshness_cfg.probe_interval_secs`). Endpoints whose
-    ///    masterchain block view is older than `freshness_cfg.max_lag_secs`
-    ///    are skipped. Each individual RPC (probe call or business call) is
-    ///    bounded by [`EndpointTimeouts::total`]; when a probe runs, an attempt
-    ///    may therefore consume up to ~3× that budget (2 probe RPCs + 1
-    ///    business RPC). Once an endpoint is known fresh (probe within TTL),
-    ///    only the business RPC runs and the attempt is bounded by 1× budget.
-    /// 3. On success the response is returned immediately. On total failure
-    ///    the error is `ENDPOINTS_STALE_TAG` when every endpoint was skipped
-    ///    because of staleness, otherwise `ENDPOINTS_UNREACHABLE_TAG`.
+    /// 1. Endpoints are tried in declared config order. The first entry is the primary
+    ///    and carries all traffic while healthy; subsequent entries are fallbacks used
+    ///    only on error or detected staleness.
+    /// 2. Before each attempt the endpoint's freshness is refreshed lazily
+    ///    (probe = `getMasterchainInfo` + `getBlockHeader`, rate-limited by
+    ///    `freshness_cfg.probe_interval_secs`). Endpoints whose masterchain block view
+    ///    is older than `freshness_cfg.max_lag_secs` are skipped. Each individual RPC
+    ///    is bounded by [`EndpointTimeouts::total`]; when a probe runs, an attempt may
+    ///    therefore consume up to ~3× that budget (2 probe RPCs + 1 business RPC). Once
+    ///    an endpoint is known fresh (probe within TTL), only the business RPC runs and
+    ///    the attempt is bounded by 1× budget.
+    /// 3. On success the response is returned immediately. On total failure the error
+    ///    is `ENDPOINTS_STALE_TAG` when every endpoint was skipped because of staleness,
+    ///    otherwise `ENDPOINTS_UNREACHABLE_TAG`.
+    ///
+    /// Operator guidance: list endpoints in trust/freshness order — the most up-to-date
+    /// or most-controlled endpoint goes first; lagging or less-trusted endpoints belong
+    /// later as fallbacks.
     async fn json_rpc(
         &self,
         method: &'static str,
         params: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let total = self.endpoints.len();
-        let start = self.rr_cursor.fetch_add(1, Ordering::Relaxed) % total;
         let request_id = serde_json::json!(uuid::Uuid::new_v4().to_string());
         let per_endpoint_budget = self.timeouts.total();
         let mut failures: Vec<(String, String)> = Vec::with_capacity(total);
         let mut stale_count: usize = 0;
 
-        for attempt in 0..total {
-            let idx = (start + attempt) % total;
+        for idx in 0..total {
             let endpoint = &self.endpoints[idx];
 
             if self.needs_freshness_refresh(idx)
@@ -201,7 +200,7 @@ impl ClientJsonRpc {
                 tracing::debug!(
                     method,
                     endpoint = %endpoint.url,
-                    attempt = attempt + 1,
+                    attempt = idx + 1,
                     error = %e,
                     "ton-http-api freshness probe failed"
                 );
@@ -213,7 +212,7 @@ impl ClientJsonRpc {
                 tracing::debug!(
                     method,
                     endpoint = %endpoint.url,
-                    attempt = attempt + 1,
+                    attempt = idx + 1,
                     "ton-http-api endpoint is stale, skipping"
                 );
                 failures.push((endpoint.url.clone(), "stale chain view".to_string()));
@@ -223,12 +222,12 @@ impl ClientJsonRpc {
             let call = endpoint.client.json_rpc(method, params.clone(), request_id.clone());
             match tokio::time::timeout(per_endpoint_budget, call).await {
                 Ok(Ok(response)) => {
-                    if attempt > 0 {
+                    if idx > 0 {
                         tracing::debug!(
                             method,
                             used_endpoint = %endpoint.url,
-                            attempt = attempt + 1,
-                            "ton-http-api failover succeeded"
+                            attempt = idx + 1,
+                            "ton-http-api priority failover succeeded"
                         );
                     }
                     return Ok(response);
@@ -238,7 +237,7 @@ impl ClientJsonRpc {
                     tracing::debug!(
                         method,
                         endpoint = %endpoint.url,
-                        attempt = attempt + 1,
+                        attempt = idx + 1,
                         total_attempts = total,
                         error = %reason,
                         "ton-http-api request failed"
@@ -250,7 +249,7 @@ impl ClientJsonRpc {
                     tracing::debug!(
                         method,
                         endpoint = %endpoint.url,
-                        attempt = attempt + 1,
+                        attempt = idx + 1,
                         total_attempts = total,
                         timeout_secs = per_endpoint_budget.as_secs(),
                         "ton-http-api request timed out"
@@ -521,7 +520,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept connection");
             request_count.fetch_add(1, Ordering::SeqCst);
 
-            let mut buf = [0_u8; 4096];
+            let mut buf = [0_u8; MOCK_READ_BUF];
             let mut acc = Vec::new();
             loop {
                 let n = socket.read(&mut buf).await.expect("read request");
@@ -554,7 +553,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept connection");
 
-            let mut buf = [0_u8; 4096];
+            let mut buf = [0_u8; MOCK_READ_BUF];
             let mut acc = Vec::new();
             loop {
                 let n = socket.read(&mut buf).await.expect("read request");
@@ -606,14 +605,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_rpc_round_robin_starts_from_first_endpoint() {
-        let first_count = Arc::new(AtomicUsize::new(0));
-        let second_count = Arc::new(AtomicUsize::new(0));
-        let (first_url, first_handle) =
-            spawn_jsonrpc_ok_server(serde_json::json!({"from":"first"}), first_count.clone()).await;
-        let (second_url, second_handle) =
-            spawn_jsonrpc_ok_server(serde_json::json!({"from":"second"}), second_count.clone())
-                .await;
+    async fn json_rpc_priority_uses_first_endpoint_when_healthy() {
+        // With priority routing, every call hits the first endpoint when it is healthy;
+        // secondaries stay cold. We use the freshness server (multi-connection capable)
+        // with probing disabled so only business calls run.
+        let s1 = Arc::new(ProbeStats::default());
+        let s2 = Arc::new(ProbeStats::default());
+        let (first_url, first_handle) = spawn_freshness_server(0, s1.clone()).await;
+        let (second_url, second_handle) = spawn_freshness_server(0, s2.clone()).await;
 
         let client = ClientJsonRpc::connect_many(
             vec![(first_url, None), (second_url, None)],
@@ -623,22 +622,18 @@ mod tests {
         )
         .expect("client");
 
-        let first_response = client
-            .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
-            .await
-            .expect("first request should succeed");
-        let second_response = client
-            .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
-            .await
-            .expect("second request should succeed");
+        for _ in 0..3 {
+            client
+                .json_rpc("getAddressInformation", serde_json::json!({"address": "x"}))
+                .await
+                .expect("request should succeed against primary");
+        }
 
-        assert_eq!(first_response["from"], "first");
-        assert_eq!(second_response["from"], "second");
-        assert_eq!(first_count.load(Ordering::SeqCst), 1, "first endpoint request count");
-        assert_eq!(second_count.load(Ordering::SeqCst), 1, "second endpoint request count");
+        assert_eq!(s1.other.load(Ordering::Relaxed), 3, "all calls must hit the primary");
+        assert_eq!(s2.other.load(Ordering::Relaxed), 0, "secondary stays cold");
 
-        first_handle.await.expect("first server task");
-        second_handle.await.expect("second server task");
+        first_handle.abort();
+        second_handle.abort();
     }
 
     #[tokio::test]
@@ -780,7 +775,26 @@ mod tests {
         c_handle.abort();
     }
 
+    // ---- Mock server tunables ----
+
+    /// Per-read buffer for the in-process mock HTTP servers.
+    const MOCK_READ_BUF: usize = 4096;
+    /// Safety cap on accumulated request bytes before the mock gives up trying to
+    /// detect the JSON-RPC method (well above any payload we send in tests).
+    const MOCK_MAX_BODY_BYTES: usize = 8192;
+
     // ---- Freshness probe tests ----
+
+    /// Arbitrary "current chain head" Unix timestamp used by the freshness tests.
+    /// Picked so wall-clock vs `gen_utime` math is readable; the value itself is irrelevant.
+    const CHAIN_NOW_SECS: u32 = 1_700_000_000;
+    /// Offset that makes a mock endpoint look stale: 5 minutes behind, well past the
+    /// default `max_lag_secs` (60s).
+    const STALE_LAG_SECS: u32 = 300;
+    /// Clock advance smaller than the default `probe_interval_secs` (30s) — no re-probe expected.
+    const ADVANCE_WITHIN_TTL_SECS: u64 = 10;
+    /// Clock advance just past the default `probe_interval_secs` (30s) — re-probe expected.
+    const ADVANCE_PAST_TTL_SECS: u64 = 31;
 
     #[derive(Default)]
     struct ProbeStats {
@@ -811,8 +825,8 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else { return };
                 let stats = stats.clone();
                 tokio::spawn(async move {
-                    let mut acc = Vec::with_capacity(4096);
-                    let mut buf = [0_u8; 4096];
+                    let mut acc = Vec::with_capacity(MOCK_READ_BUF);
+                    let mut buf = [0_u8; MOCK_READ_BUF];
                     loop {
                         let n = match socket.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
@@ -823,7 +837,7 @@ mod tests {
                         if s.contains("\"method\"") {
                             break;
                         }
-                        if acc.len() > 8192 {
+                        if acc.len() > MOCK_MAX_BODY_BYTES {
                             break;
                         }
                     }
@@ -887,8 +901,8 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept().await else { return };
                 let stats = stats.clone();
                 tokio::spawn(async move {
-                    let mut acc = Vec::with_capacity(4096);
-                    let mut buf = [0_u8; 4096];
+                    let mut acc = Vec::with_capacity(MOCK_READ_BUF);
+                    let mut buf = [0_u8; MOCK_READ_BUF];
                     loop {
                         let n = match socket.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
@@ -898,7 +912,7 @@ mod tests {
                         if std::str::from_utf8(&acc).unwrap_or("").contains("\"method\"") {
                             break;
                         }
-                        if acc.len() > 8192 {
+                        if acc.len() > MOCK_MAX_BODY_BYTES {
                             break;
                         }
                     }
@@ -952,7 +966,7 @@ mod tests {
     async fn probe_updates_freshness_and_endpoint_serves_business_request() {
         let stats = Arc::new(ProbeStats::default());
         // gen_utime equal to the clock → 0s of lag → fresh.
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (url, handle) = spawn_freshness_server(chain_now, stats.clone()).await;
 
         let mut client = ClientJsonRpc::connect_many(
@@ -981,10 +995,10 @@ mod tests {
     async fn all_endpoints_stale_returns_dedicated_error() {
         let s1 = Arc::new(ProbeStats::default());
         let s2 = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
-        // gen_utime 5 minutes behind the clock → stale (default max_lag_secs=60).
-        let (u1, h1) = spawn_freshness_server(chain_now - 300, s1.clone()).await;
-        let (u2, h2) = spawn_freshness_server(chain_now - 300, s2.clone()).await;
+        let chain_now = CHAIN_NOW_SECS;
+        let stale_gen_utime = chain_now - STALE_LAG_SECS;
+        let (u1, h1) = spawn_freshness_server(stale_gen_utime, s1.clone()).await;
+        let (u2, h2) = spawn_freshness_server(stale_gen_utime, s2.clone()).await;
 
         let mut client = ClientJsonRpc::connect_many(
             vec![(u1.clone(), None), (u2.clone(), None)],
@@ -1020,8 +1034,9 @@ mod tests {
     async fn stale_endpoint_skipped_and_fresh_endpoint_used() {
         let s_stale = Arc::new(ProbeStats::default());
         let s_fresh = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
-        let (u_stale, h_stale) = spawn_freshness_server(chain_now - 300, s_stale.clone()).await;
+        let chain_now = CHAIN_NOW_SECS;
+        let (u_stale, h_stale) =
+            spawn_freshness_server(chain_now - STALE_LAG_SECS, s_stale.clone()).await;
         let (u_fresh, h_fresh) = spawn_freshness_server(chain_now, s_fresh.clone()).await;
 
         let mut client = ClientJsonRpc::connect_many(
@@ -1051,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_probe_within_ttl_skips_reprobe() {
         let stats = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (url, handle) = spawn_freshness_server(chain_now, stats.clone()).await;
 
         let clock = mock_clock_at(chain_now);
@@ -1068,8 +1083,7 @@ mod tests {
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
             .expect("first business call");
-        // Within TTL (default 30s).
-        clock.advance(10);
+        clock.advance(ADVANCE_WITHIN_TTL_SECS);
         client
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
@@ -1086,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_probe_after_ttl_reprobes() {
         let stats = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (url, handle) = spawn_freshness_server(chain_now, stats.clone()).await;
 
         let clock = mock_clock_at(chain_now);
@@ -1103,8 +1117,7 @@ mod tests {
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
             .expect("first business call");
-        // Beyond TTL (default 30s).
-        clock.advance(31);
+        clock.advance(ADVANCE_PAST_TTL_SECS);
         client
             .json_rpc("getAddressInformation", serde_json::json!({"address":"x"}))
             .await
@@ -1121,7 +1134,7 @@ mod tests {
     async fn probe_failure_skips_endpoint_and_fails_over() {
         let s_bad = Arc::new(ProbeStats::default());
         let s_good = Arc::new(ProbeStats::default());
-        let chain_now: u32 = 1_700_000_000;
+        let chain_now = CHAIN_NOW_SECS;
         let (u_bad, h_bad) = spawn_probe_failing_server(s_bad.clone()).await;
         let (u_good, h_good) = spawn_freshness_server(chain_now, s_good.clone()).await;
 

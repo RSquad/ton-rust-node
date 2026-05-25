@@ -494,8 +494,7 @@ impl ElectionRunner {
         let cfg15 = self.election_parameters().await?;
         self.snapshot_cache.update_next_elections_range(&cfg15);
 
-        let election_id =
-            self.elector.get_active_election_id().await.context("get_active_election_id")?;
+        let election_id = self.elector.get_active_election_id().await?;
         if election_id == 0 {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
             tracing::info!("no active elections");
@@ -837,18 +836,20 @@ impl ElectionRunner {
         // If the elector already has our stake, mark it accepted early
         // so that `calc_stake` uses the correct current_stake (not 0).
         if let Some(participant) = participant.as_ref() {
-            tracing::info!(
-                "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
-                node_id,
-                display_tons(participant.stake),
-                hex::encode(&participant.wallet_addr),
-                hex::encode(participant.pub_key.as_slice()),
-                base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    participant.adnl_addr.as_slice(),
-                ),
-                participant.election_id
-            );
+            if !node.stake_accepted {
+                tracing::info!(
+                    "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
+                    node_id,
+                    display_tons(participant.stake),
+                    hex::encode(&participant.wallet_addr),
+                    hex::encode(participant.pub_key.as_slice()),
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        participant.adnl_addr.as_slice(),
+                    ),
+                    participant.election_id
+                );
+            }
             node.stake_accepted = true;
             node.accepted_stake_amount = Some(participant.stake);
         }

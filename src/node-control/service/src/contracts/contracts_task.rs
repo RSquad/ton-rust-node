@@ -480,11 +480,6 @@ impl ContractsMonitor {
     async fn ensure_pool_validator_sets_updated(&self) -> anyhow::Result<bool> {
         let provider = contract_provider!(self.rpc_client.clone());
         let mut all_updated = true;
-        tracing::info!(
-            target: "contracts",
-            "ensure_pool_validator_sets_updated: checking {} nodes",
-            self.pools.len()
-        );
         for (node_id, pool_binding) in
             self.pools.iter().filter(|(_, b)| b.pool_kind() == PoolKind::TONCore)
         {
