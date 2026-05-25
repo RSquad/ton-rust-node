@@ -41,6 +41,7 @@ impl GetConfigParamCmd {
             app_cfg.ton_http_api.resolved_endpoints(),
             app_cfg.ton_http_api.api_key.clone(),
             app_cfg.ton_http_api.resolved_timeouts(),
+            app_cfg.ton_http_api.resolved_freshness(),
         )?;
 
         let config = rpc_client

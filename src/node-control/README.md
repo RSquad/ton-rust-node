@@ -529,6 +529,17 @@ nodectl config ton-http-api add \
   --endpoint "https://backup2.example/api/v2/jsonRpc"
 ```
 
+##### Freshness probing
+
+Before each request the client lazily probes every endpoint it is about to use to verify it isn't lagging behind the chain. The probe runs `getMasterchainInfo` + `getBlockHeader`, then compares the block's `gen_utime` against wall-clock time. Endpoints whose chain view exceeds `freshness_max_lag_secs` are skipped; if **every** endpoint is stale the client returns a dedicated error (`is_endpoints_stale(err) == true`) instead of silently serving stale data.
+
+The probe is rate-limited: each endpoint is re-probed at most once per `freshness_probe_interval_secs`. Both values live under `ton_http_api` in the config file and there is no CLI command for them — edit the JSON directly. They are hot-reloaded with the rest of the config (file watch interval ≤10s).
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `ton_http_api.freshness_probe_interval_secs` | `30` | How often (seconds) the freshness probe runs per endpoint. |
+| `ton_http_api.freshness_max_lag_secs` | `60` | Maximum tolerated chain-tip lag (seconds) before the endpoint is treated as stale. |
+
 ---
 
 #### `config master-wallet`

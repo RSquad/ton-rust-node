@@ -799,7 +799,15 @@ mod tests {
         master_wallet: Arc<dyn TonWallet>,
         wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     ) -> ContractsMonitor {
-        let rpc_client = Arc::new(ClientJsonRpc::connect(rpc_url, None).unwrap());
+        let rpc_client = Arc::new(
+            ClientJsonRpc::connect_many(
+                vec![(rpc_url, None)],
+                None,
+                common::app_config::EndpointTimeouts::default(),
+                common::app_config::FreshnessConfig::disabled(),
+            )
+            .unwrap(),
+        );
         ContractsMonitor {
             master_wallet,
             pools: Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),

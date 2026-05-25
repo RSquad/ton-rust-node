@@ -198,6 +198,18 @@ impl Display for WalletType {
     }
 }
 
+/// Subset of the `getMasterchainInfo` response — only the `last` block id is captured.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct GetMasterchainInfoRes {
+    pub last: BlockIdExt,
+}
+
+/// Subset of the `getBlockHeader` response — only `gen_utime` is captured.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct GetBlockHeaderRes {
+    pub gen_utime: u32,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct GetWalletInformationRes {
     #[serde(rename = "@type")]
