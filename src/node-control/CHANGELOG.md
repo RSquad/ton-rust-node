@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-05-25
+
+### Added
+
+- **Lagging JSON-RPC endpoint detection** — the ton-http-api client now checks endpoint freshness before each request by reading the masterchain tip and comparing its timestamp against wall-clock time. Endpoints whose chain view exceeds the configured lag threshold are skipped, preventing stale data from a lagging RPC from propagating into election decisions.
+
+### Changed
+
+- **Priority-based JSON-RPC endpoint failover** — the ton-http-api client now follows strict priority order instead of round-robin: the first configured endpoint is the primary and carries all traffic when healthy; subsequent entries are fallbacks used only on error or when the primary is detected as lagging.
+
+### Fixed
+
+- **Past-elections cache refreshed periodically** — the elections runner now refreshes its past-elections and pool-address caches on a TTL instead of only invalidating when the election round changes. Prevents a stale snapshot from a lagging RPC endpoint from persisting for an entire round and distorting frozen-stake accounting.
+
 ## [0.5.0] - 2026-05-18
 
 ### Added
