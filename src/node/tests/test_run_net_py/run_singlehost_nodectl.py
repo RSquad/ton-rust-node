@@ -1084,6 +1084,20 @@ class Bootstrap:
         self.log.info("  config ton-http-api set...")
         self._nctl("config", "ton-http-api", "set", "-e", self.cfg.http_api_url)
 
+        # Add the remaining per-node ton-http-api endpoints as priority fallbacks
+        # (ports 3302, 3303, ..., 3300 + node_cnt). Each singlehost node runs its own
+        # ton-http-api instance, so multi-endpoint behaviour (priority routing, stale
+        # detection, failover) can be exercised manually by stopping/lagging the primary.
+        if self.cfg.node_cnt > 1:
+            base_port = 3301
+            add_args = ["config", "ton-http-api", "add"]
+            for i in range(1, self.cfg.node_cnt):
+                add_args.extend(["-e", f"http://127.0.0.1:{base_port + i}"])
+            self._nctl(*add_args)
+            self.log.info(
+                f"  ton-http-api failover endpoints added: ports {base_port + 1}-{base_port + self.cfg.node_cnt - 1}"
+            )
+
         # Patch global tick_interval — no CLI command exists for this field
         cfg_json = json.loads(self.paths.nodectl_config.read_text())
         cfg_json["tick_interval"] = 20

@@ -529,6 +529,10 @@ nodectl config ton-http-api add \
   --endpoint "https://backup2.example/api/v2/jsonRpc"
 ```
 
+##### Endpoint priority
+
+Endpoints are tried **in the order they appear in the config**. The first entry is the primary and carries all traffic when healthy; subsequent entries are fallbacks used only on error or detected staleness. List endpoints in trust / freshness order — the most up-to-date or most-controlled endpoint goes first; lagging or less-trusted third-party endpoints belong later as fallbacks.
+
 ##### Freshness probing
 
 Before each request the client lazily probes every endpoint it is about to use to verify it isn't lagging behind the chain. The probe runs `getMasterchainInfo` + `getBlockHeader`, then compares the block's `gen_utime` against wall-clock time. Endpoints whose chain view exceeds `freshness_max_lag_secs` are skipped; if **every** endpoint is stale the client returns a dedicated error (`is_endpoints_stale(err) == true`) instead of silently serving stale data.
