@@ -16,6 +16,7 @@ use contracts::{
     NominatorWrapper, PoolKind, TonWallet, contract_provider,
     nominator::ton_core_pool as tc_messages,
 };
+use control_client::config_params::config_param_cell_repr_hash;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -31,6 +32,10 @@ const WALLET_GAS: u64 = 100_000_000; // 0.1 TON
 /// Masterchain gas prices are ~25x basechain; 0.1 TON is not enough
 /// for load_data + get_current_validator_set + cell_hash + save_data.
 const POOL_OP_GAS: u64 = 500_000_000; // 0.5 TON
+
+fn should_send_update_validator_set(saved_hash: &[u8; 32], current_hash: &[u8; 32]) -> bool {
+    saved_hash != current_hash
+}
 
 pub(crate) async fn run(
     cancellation_ctx: CancellationCtx,
@@ -477,9 +482,13 @@ impl ContractsMonitor {
     ///
     /// The message is sent from the **validator wallet** for the pool's node (`self.wallets[node_id]`),
     /// not the master wallet — by staking time that wallet is deployed and typically topped up.
+    ///
+    /// Skips op 6 when config param 34 cell hash matches the pool's `saved_validator_set_hash`
+    /// (same check as on-chain op 6).
     async fn ensure_pool_validator_sets_updated(&self) -> anyhow::Result<bool> {
         let provider = contract_provider!(self.rpc_client.clone());
         let mut all_updated = true;
+        let mut current_vset_hash = None;
         for (node_id, pool_binding) in
             self.pools.iter().filter(|(_, b)| b.pool_kind() == PoolKind::TONCore)
         {
@@ -520,6 +529,39 @@ impl ContractsMonitor {
                 );
 
                 if pool_data.state != 2 || pool_data.validator_set_changes_count >= 2 {
+                    continue;
+                }
+
+                let current_vset_hash = match current_vset_hash {
+                    Some(hash) => hash,
+                    None => match self.rpc_client.get_config_param_cell(34).await {
+                        Ok(cell) => {
+                            let hash = config_param_cell_repr_hash(&cell);
+                            current_vset_hash = Some(hash);
+                            hash
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "contracts",
+                                "update_validator_set: config param 34 unavailable, skipping pools that may need update: {:#}",
+                                e
+                            );
+                            return Ok(false);
+                        }
+                    },
+                };
+
+                if !should_send_update_validator_set(
+                    &pool_data.saved_validator_set_hash,
+                    &current_vset_hash,
+                ) {
+                    tracing::debug!(
+                        target: "contracts",
+                        "[{}] skip update_validator_set: pool={}, vsc_count={}, validator set unchanged",
+                        node_id,
+                        pool_addr,
+                        pool_data.validator_set_changes_count,
+                    );
                     continue;
                 }
 
@@ -564,7 +606,7 @@ impl ContractsMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::ContractsMonitor;
+    use super::{ContractsMonitor, should_send_update_validator_set};
     use crate::runtime_config::RuntimeConfig;
     use axum::{Json, Router, extract::State, routing::post};
     use common::app_config::{AppConfig, ContractsAutomationConfig, HttpConfig, TonHttpApiConfig};
@@ -810,6 +852,19 @@ mod tests {
             rpc_client,
             runtime_cfg: Arc::new(CfgRuntime(test_app_config())) as Arc<dyn RuntimeConfig>,
         }
+    }
+
+    #[test]
+    fn should_send_update_validator_set_when_hash_changed() {
+        let saved = [1u8; 32];
+        let current = [2u8; 32];
+        assert!(should_send_update_validator_set(&saved, &current));
+    }
+
+    #[test]
+    fn should_skip_update_validator_set_when_hash_unchanged() {
+        let hash = [7u8; 32];
+        assert!(!should_send_update_validator_set(&hash, &hash));
     }
 
     #[tokio::test]

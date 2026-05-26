@@ -9,9 +9,16 @@
 use anyhow::Context;
 use std::str::FromStr;
 use ton_block::{
-    Coins, ConfigParam15, ConfigParam16, ConfigParam17, SigPubKey, UInt256, ValidatorDescr,
+    Cell, Coins, ConfigParam15, ConfigParam16, ConfigParam17, SigPubKey, UInt256, ValidatorDescr,
     ValidatorSet,
 };
+
+/// Repr hash of a config param cell — matches nominator-pool `cell_hash(vset)` for param 34.
+pub fn config_param_cell_repr_hash(cell: &Cell) -> [u8; 32] {
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(cell.repr_hash().as_slice());
+    hash
+}
 
 pub fn parse_config_param_15(bytes: &[u8]) -> anyhow::Result<ConfigParam15> {
     let param: serde_json::Value =
