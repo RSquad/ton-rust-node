@@ -42,8 +42,6 @@ pub struct StorageTelemetry {
 
     pub loaded_cells_from_db: Arc<MetricBuilder>,
     pub load_cell_from_db_time_nanos: Arc<Metric>,
-    pub load_cell_from_cache_time_nanos: Arc<Metric>,
-    pub store_cell_to_cache_time_nanos: Arc<Metric>,
     pub stored_new_cells: Arc<MetricBuilder>,
     pub deleted_cells: Arc<MetricBuilder>,
 
@@ -90,8 +88,6 @@ impl Default for StorageTelemetry {
                 1000000000,
             ),
             load_cell_from_db_time_nanos: Metric::with_total_average("", 1),
-            load_cell_from_cache_time_nanos: Metric::with_total_average("", 1),
-            store_cell_to_cache_time_nanos: Metric::with_total_average("", 1),
             stored_new_cells: MetricBuilder::with_metric_and_period(
                 Metric::with_total_amount("", 1),
                 1000000000,

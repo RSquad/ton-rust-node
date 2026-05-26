@@ -11,102 +11,90 @@
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
-    cell_db::CellDb,
-    db::rocksdb::RocksDb,
-    shardstate_db_async::CellsDbConfig,
-    types::{serialize_stored_cell, STORED_CELL_MAX_RAW_LEN},
-    StorageAlloc, TARGET,
+    cell_db::CellDb, db::rocksdb::RocksDb, shardstate_db_async::CellsDbConfig,
+    types::serialize_stored_cell, StorageAlloc, TARGET,
 };
 use std::{
-    io::Cursor,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::Instant,
 };
 use ton_block::{
-    error, fail, ByteOrderRead, Cell, CellLoader, CellsFactory, CellsTempStorage, Result, UInt256,
-    MAX_LEVEL, MAX_REFERENCES_COUNT,
+    error, fail, Cell, CellLoader, CellsFactory, CellsTempStorage, Result, UInt256, MAX_LEVEL,
+    MAX_REFERENCES_COUNT,
 };
 
 #[derive(Debug, PartialEq, Eq)]
-enum VisitedCell {
-    New { cell: Cell, parents_count: u32 },
-    Updated { parents_count: u32 },
+pub(crate) enum VisitedCell {
+    /// Brand new cell — not in DB before this operation.
+    /// `inc` is the number of parent references added in this operation.
+    /// On commit: Put cell data + Merge(inc) to counters_cf.
+    New { cell: Cell, inc: u32 },
+    /// Existing-in-DB cell touched by save. `inc` is the number of parent references
+    /// added in this operation. On commit: Merge(inc) to counters_cf — no base value needed.
+    Inc { inc: u32 },
+    /// Existing-in-DB cell touched by delete. `refs` is the absolute
+    /// new counter after the decrements applied during traversal.
+    /// On commit: Put(refs) if > 0, Delete if 0.
+    Updated { refs: u32 },
 }
 
 impl VisitedCell {
-    fn with_raw_counter(parents_count: &[u8]) -> Result<Self> {
-        let mut reader = Cursor::new(parents_count);
-        Ok(Self::Updated { parents_count: reader.read_le_u32()? })
-    }
-
-    fn with_counter(parents_count: u32) -> Self {
-        Self::Updated { parents_count }
+    /// Placeholder used during save traversal for a cell known/suspected to be in DB.
+    /// It will either become `Inc { inc: >0 }` via `inc()` from parent's Phase B,
+    /// or be replaced by `New` if the recursion finds the cell is actually new.
+    fn placeholder() -> Self {
+        Self::Inc { inc: 0 }
     }
 
     fn with_new_cell(cell: Cell) -> Self {
-        Self::New { cell, parents_count: 1 }
+        Self::New { cell, inc: 1 }
     }
 
-    fn inc_parents_count(&mut self) -> Result<u32> {
-        let parents_count = match self {
-            VisitedCell::New { parents_count, .. } => parents_count,
-            VisitedCell::Updated { parents_count, .. } => parents_count,
-        };
-        if *parents_count == u32::MAX {
-            fail!("Parents count has reached the maximum value");
-        }
-        *parents_count += 1;
-        Ok(*parents_count)
-    }
-
-    fn dec_parents_count(&mut self) -> Result<u32> {
-        let parents_count = match self {
-            VisitedCell::New { parents_count, .. } => parents_count,
-            VisitedCell::Updated { parents_count, .. } => parents_count,
-        };
-        if *parents_count == 0 {
-            fail!("Can't decrement - parents count is already zero");
-        }
-        *parents_count -= 1;
-        Ok(*parents_count)
-    }
-
-    fn parents_count(&self) -> u32 {
+    /// Increment the reference counter on the save path.
+    /// Works on `New` and `Inc` (both bump `inc`).
+    fn inc(&mut self) -> Result<()> {
         match self {
-            VisitedCell::New { parents_count, .. } => *parents_count,
-            VisitedCell::Updated { parents_count, .. } => *parents_count,
-        }
-    }
-
-    fn serialize_counter(&self) -> [u8; 4] {
-        self.parents_count().to_le_bytes()
-    }
-
-    fn serialize_cell(&self) -> Result<Option<smallvec::SmallVec<[u8; STORED_CELL_MAX_RAW_LEN]>>> {
-        match self {
-            VisitedCell::Updated { .. } => Ok(None),
-            VisitedCell::New { cell, .. } => {
-                let data = serialize_stored_cell(cell)?;
-                Ok(Some(data))
+            Self::New { inc, .. } => {
+                *inc = inc.checked_add(1).ok_or_else(|| error!("inc overflow"))?;
             }
+            Self::Inc { inc } => {
+                *inc = inc.checked_add(1).ok_or_else(|| error!("inc overflow"))?;
+            }
+            Self::Updated { .. } => fail!("inc on Updated variant"),
         }
+        Ok(())
     }
 
-    fn cell(&self) -> Option<&Cell> {
+    /// Decrement the reference counter on the delete path. Only valid for `Updated`.
+    fn dec(&mut self) -> Result<u32> {
         match self {
-            VisitedCell::New { cell, .. } => Some(cell),
-            VisitedCell::Updated { .. } => None,
+            Self::Updated { refs } => {
+                *refs = refs.checked_sub(1).ok_or_else(|| error!("refs underflow"))?;
+                Ok(*refs)
+            }
+            _ => fail!("dec on non-Updated variant"),
         }
     }
 }
+
+const VISITED_MAP_CHUNKS: usize = 512;
+/// Sentinel value stored in the counter cache to mean "counter is unknown
+/// (e.g. evicted between save start and post-commit flush)". Never appears in DB.
+const UNKNOWN_COUNTER: u32 = u32::MAX;
+/// Maximum refcnt value that can be stored on disk. One short of `u32::MAX` so that
+/// a valid counter is never confused with `UNKNOWN_COUNTER` after a cache reload.
+const MAX_REFCNT: u32 = u32::MAX - 1;
+
+type VisitedMap = dashmap::DashMap<UInt256, VisitedCell, ahash::RandomState>;
 
 pub struct DynamicBocDb {
     cell_db: Arc<CellDb>,
     counters_cf_name: String,
     cell_counter_cache: quick_cache::sync::Cache<UInt256, Arc<AtomicU32>>,
+    save_cells_threadpool: rayon::ThreadPool,
 }
 
 impl DynamicBocDb {
@@ -131,10 +119,20 @@ impl DynamicBocDb {
             db.create_cf(counters_cf_name, &options)?;
             db.register_cache(cache);
         }
+
+        let save_cells_threadpool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("save-cells-worker-{i}"))
+            .stack_size(8 * 1024 * 1024)
+            .panic_handler(|payload| {
+                log::error!(target: TARGET, "save-cells-worker panic: {payload:?}");
+            })
+            .build()?;
+
         Ok(Self {
             cell_db: Arc::new(cell_db),
             counters_cf_name: counters_cf_name.to_string(),
             cell_counter_cache: quick_cache::sync::Cache::new(config.counters_lru_cache_capacity),
+            save_cells_threadpool,
         })
     }
 
@@ -147,7 +145,42 @@ impl DynamicBocDb {
     }
 
     pub fn build_counters_cf_options(config: &CellsDbConfig) -> (rocksdb::Options, rocksdb::Cache) {
-        CellDb::build_cf_options(config.counters_cache_size_bytes)
+        let (mut opts, cache) = CellDb::build_cf_options(config.counters_cache_size_bytes);
+        opts.set_merge_operator_associative("refcnt_merge", Self::refcnt_merge);
+        (opts, cache)
+    }
+
+    /// Merge operator for refcnt counters.
+    /// Existing value (if any) and each operand are 4-byte little-endian u32.
+    /// Result is the sum, saturated to `MAX_REFCNT`.
+    fn refcnt_merge(
+        _key: &[u8],
+        existing: Option<&[u8]>,
+        operands: &rocksdb::MergeOperands,
+    ) -> Option<Vec<u8>> {
+        let mut counter: u32 = match existing {
+            Some(bytes) if bytes.len() == 4 => u32::from_le_bytes(bytes.try_into().unwrap()),
+            Some(_) => {
+                log::error!(target: TARGET, "refcnt_merge: corrupted existing value (len != 4)");
+                return None;
+            }
+            None => 0,
+        };
+        for op in operands {
+            if op.len() == 4 {
+                let diff = u32::from_le_bytes(op.try_into().unwrap());
+                let sum = counter.saturating_add(diff);
+                if sum >= MAX_REFCNT {
+                    log::error!(target: TARGET, "CRITICAL: refcnt_merge: counter saturated at MAX_REFCNT");
+                    counter = MAX_REFCNT;
+                } else {
+                    counter = sum;
+                }
+            } else {
+                log::error!(target: TARGET, "refcnt_merge: corrupted operand (len != 4)");
+            }
+        }
+        Some(counter.to_le_bytes().to_vec())
     }
 
     pub(crate) fn load_cell(&self, cell_id: &UInt256) -> Result<Cell> {
@@ -194,61 +227,140 @@ impl DynamicBocDb {
             return Ok(existing);
         }
 
+        //
+        // Traverse cells
+        //
         let now = std::time::Instant::now();
         let counters_cf = self.counters_cf()?;
-        let mut visited = fnv::FnvHashMap::default();
-        let _ = self.save_cells_recursive(
-            &root_cell,
-            &mut visited,
-            &root_id,
-            check_stop,
-            &counters_cf,
-        )?;
+        let visited =
+            VisitedMap::with_hasher_and_shard_amount(ahash::RandomState::new(), VISITED_MAP_CHUNKS);
+        let inc_error = AtomicBool::new(false);
+        self.save_cells_threadpool.scope(|scope| {
+            self.save_cells_parallel(
+                &root_cell,
+                &visited,
+                &root_id,
+                check_stop,
+                scope,
+                &inc_error,
+                counters_cf.clone(),
+            )
+        })?;
+        if inc_error.load(Ordering::Relaxed) {
+            fail!("save_cells_parallel: update_child_inc failed for some child cell")
+        }
         let cells_traverse_time = now.elapsed().as_micros();
+        let visited = visited.into_read_only();
 
+        // Single pass over `visited` (dashmap iteration is the expensive part).
+        // During this pass:
+        //   - Build the RocksDB write batch directly.
+        //   - Capture the root cell if it appears as a `New` entry.
+        //   - Record per-entry post-commit work into a plain Vec so subsequent
+        //     iterations (counter cache flush, storing-cells cleanup) traverse
+        //     a contiguous structure instead of the sharded dashmap.
+        //
+        // Write batch semantics:
+        // - New cells: Put cell data + Merge counter (from base 0, gives absolute inc).
+        // - Inc entries: Merge counter only. `inc == 0` is a leftover placeholder
+        //   for a known-in-DB cell that no new parent ended up referencing —
+        //   shouldn't happen often, and merging 0 is harmless.
         let now2 = std::time::Instant::now();
-        let mut wrote_cells = 0;
+        let mut wrote_cells: usize = 0;
         #[cfg(feature = "telemetry")]
-        let wrote_counters = visited.len();
+        let mut wrote_counters: usize = 0;
         let mut transaction = rocksdb::WriteBatch::default();
+        let mut saved_root: Option<Cell> = None;
+        let mut stored_refs_inc = Vec::new();
+        let mut stored_cells = Vec::new();
+        let mut stored_ids = Vec::new();
         for (id, vc) in visited.iter() {
-            // cell
-            if let Some(data) = vc.serialize_cell()? {
-                transaction.put_cf(&cells_cf, id.as_slice(), &data);
-                wrote_cells += 1;
-            }
-
-            // counter
-            transaction.put_cf(&counters_cf, id.as_slice(), vc.serialize_counter());
+            match vc {
+                VisitedCell::New { cell, inc } => {
+                    let data = serialize_stored_cell(cell)?;
+                    transaction.put_cf(&cells_cf, id.as_slice(), &data);
+                    // For brand-new cells the counters_cf has no entry, so Merge from base 0
+                    // produces exactly `inc`.
+                    transaction.merge_cf(&counters_cf, id.as_slice(), inc.to_le_bytes());
+                    wrote_cells += 1;
+                    #[cfg(feature = "telemetry")]
+                    {
+                        wrote_counters += 1;
+                    }
+                    if id == root_id {
+                        saved_root = Some(cell.clone());
+                    }
+                    let stored_cell = Cell::with_cell_and_loader(
+                        cell.clone(),
+                        self.cell_db.stored_loader(),
+                        None,
+                    )?;
+                    stored_cells.push((id.clone(), (stored_cell), *inc));
+                    stored_ids.push(id.clone());
+                }
+                VisitedCell::Inc { inc } => {
+                    if *inc > 0 {
+                        transaction.merge_cf(&counters_cf, id.as_slice(), inc.to_le_bytes());
+                        #[cfg(feature = "telemetry")]
+                        {
+                            wrote_counters += 1;
+                        }
+                        stored_refs_inc.push((id.clone(), *inc));
+                    }
+                    // It is used to cleanup storing cells. This cells may be with zero inc.
+                    stored_ids.push(id.clone());
+                }
+                VisitedCell::Updated { .. } => {
+                    fail!(
+                        "DynamicBocDb::save_boc  {:x}  unexpected Updated variant for {:x}",
+                        root_id,
+                        id,
+                    );
+                }
+            };
         }
         let tr_build_time = now2.elapsed().as_micros();
 
+        //
+        // Commit transaction
+        //
         let now3 = Instant::now();
         self.cell_db.db().write(transaction)?;
         #[cfg(feature = "telemetry")]
-        if !visited.is_empty() {
+        if wrote_counters > 0 {
             self.cell_db.telemetry().boc_db_element_write_nanos.update(
                 now3.elapsed().as_nanos() as u64 / (wrote_cells as u64 + wrote_counters as u64),
             );
         }
         let tr_commit_time = now3.elapsed().as_micros();
 
-        // Counter cache is flushed only after the DB commit succeeds.
-        // Eager updates during traversal would diverge from the DB on any
-        // failure before this point and would compound across retries.
-        for (id, vc) in visited.iter() {
-            self.set_cached_counter(id, vc.parents_count());
-        }
-
+        //
+        // Update caches and cleanup.
+        //
         let now4 = Instant::now();
-        self.cell_db.cleanup_storing_cells(visited.keys());
+
+        for (id, inc) in stored_refs_inc {
+            if let Err(e) = self.set_cached_counter_inc(&id, inc) {
+                // It is better to log and continue than fail here,
+                // because the BOC is already stored in DB,
+                log::error!(
+                    target: TARGET,
+                    "DynamicBocDb::save_boc  {:x}  update counter cache failed for {id:x}: {e}",
+                    root_id
+                );
+            }
+        }
+        for (id, stored_cell, refs) in stored_cells {
+            self.set_cached_counter(&id, refs);
+            self.cell_db.add_to_cache(id, stored_cell);
+        }
+        self.cell_db.cleanup_storing_cells(stored_ids.iter());
         let storing_cells_cleanup_time = now4.elapsed().as_micros();
 
-        let saved_root = if let Some(c) = visited.get(&root_id).and_then(|vc| vc.cell()) {
-            c.clone()
-        } else {
-            // only if the root cell was already saved (just updated counter) - we need to load it here
-            self.cell_db.load_cell(&root_id)?
+        let saved_root = match saved_root {
+            Some(c) => c,
+            // Root was already saved (counter-only update) — load it back.
+            None => self.cell_db.load_cell(&root_id)?,
         };
 
         let updated = visited.len() - wrote_cells;
@@ -290,35 +402,65 @@ impl DynamicBocDb {
 
         #[cfg(feature = "telemetry")]
         let now = Instant::now();
-        let mut visited = fnv::FnvHashMap::default();
-        self.delete_cells_recursive(root_cell_id, &mut visited, root_cell_id, check_stop)?;
+        let visited =
+            VisitedMap::with_hasher_and_shard_amount(ahash::RandomState::new(), VISITED_MAP_CHUNKS);
+        let dec_error = AtomicBool::new(false);
+        self.save_cells_threadpool.scope(|scope| {
+            self.delete_cells_parallel(
+                root_cell_id,
+                &visited,
+                root_cell_id,
+                check_stop,
+                scope,
+                &dec_error,
+            )
+        })?;
+        if dec_error.load(Ordering::Relaxed) {
+            fail!("delete_cells_parallel: failed for some child cell")
+        }
         #[cfg(feature = "telemetry")]
         let traverse_time = now.elapsed().as_micros();
+        let visited = visited.into_read_only();
 
+        // Single pass over `visited` (dashmap iteration is the expensive part).
+        // During this pass:
+        //   - Build the RocksDB write batch directly.
+        //   - Record per-entry post-commit cache actions into a plain Vec, so the
+        //     post-commit loop iterates a contiguous structure instead of the
+        //     sharded dashmap.
+        //
+        // Write batch semantics (delete path):
+        // - Updated{0}: Delete cell + Delete counter.
+        // - Updated{n>0}: Put counter = n.
+        // delete_cells_parallel only produces Updated entries with the final
+        // absolute counter computed during traversal.
         #[cfg(feature = "telemetry")]
         let now2 = std::time::Instant::now();
         let cells_cf = self.cell_db.cells_cf()?;
         let counters_cf = self.counters_cf()?;
         let mut deleted = 0;
         let mut transaction = rocksdb::WriteBatch::default();
-        for (id, cell) in visited.iter() {
-            let counter = cell.parents_count();
-            if counter == 0 {
-                transaction.delete_cf(&cells_cf, id.as_slice());
-                // if there is no counter with the key, then it will be just ignored
-                transaction.delete_cf(&counters_cf, id.as_slice());
-                // Remove from cell_cache so that save_boc won't treat this cell
-                // as still persisted in DB
-                self.cell_db.remove_from_cache(id);
-                deleted += 1;
-            } else {
-                transaction.put_cf(&counters_cf, id.as_slice(), counter.to_le_bytes());
-
-                // update old format cell
-                if let Some(cell) = cell.serialize_cell()? {
-                    transaction.put(id, &cell);
+        let mut deleted_cells = Vec::new();
+        for (id, vc) in visited.iter() {
+            let refs = match vc {
+                VisitedCell::Updated { refs } => *refs,
+                _ => {
+                    fail!(
+                        "DynamicBocDb::delete_boc  {:x}  unexpected variant for {:x}",
+                        root_cell_id,
+                        id,
+                    );
                 }
-            }
+            };
+            if refs == 0 {
+                transaction.delete_cf(&cells_cf, id.as_slice());
+                transaction.delete_cf(&counters_cf, id.as_slice());
+                deleted += 1;
+                deleted_cells.push(id.clone());
+            } else {
+                transaction.put_cf(&counters_cf, id.as_slice(), refs.to_le_bytes());
+                self.set_cached_counter(id, refs);
+            };
         }
         #[cfg(feature = "telemetry")]
         let tr_build_time = now2.elapsed().as_micros();
@@ -333,15 +475,10 @@ impl DynamicBocDb {
         #[cfg(feature = "telemetry")]
         let tr_commit_time = now3.elapsed().as_micros();
 
-        // Counter cache is flushed only after the DB commit succeeds.
-        // See the same comment in `save_boc`.
-        for (id, vc) in visited.iter() {
-            let counter = vc.parents_count();
-            if counter == 0 {
-                self.remove_cached_counter(id);
-            } else {
-                self.set_cached_counter(id, counter);
-            }
+        // Counter and cell caches are flushed only after the DB commit succeeds.
+        for id in deleted_cells.iter() {
+            self.cell_db.remove_from_cache(id);
+            self.cell_counter_cache.remove(id);
         }
         #[cfg(feature = "telemetry")]
         let total_time = now.elapsed().as_micros() as u64;
@@ -395,24 +532,73 @@ impl DynamicBocDb {
     }
 
     fn set_cached_counter(&self, cell_id: &UInt256, value: u32) {
-        use quick_cache::GuardResult;
         match self.cell_counter_cache.get_value_or_guard(cell_id, None) {
-            GuardResult::Value(atomic) => {
+            quick_cache::GuardResult::Value(atomic) => {
                 atomic.store(value, Ordering::Relaxed);
             }
-            GuardResult::Guard(guard) => {
+            quick_cache::GuardResult::Guard(guard) => {
                 let _ = guard.insert(Arc::new(AtomicU32::new(value)));
             }
-            GuardResult::Timeout => unreachable!(),
+            quick_cache::GuardResult::Timeout => unreachable!(),
         }
         #[cfg(feature = "telemetry")]
         self.cell_db.telemetry().counter_cache_len.update(self.cell_counter_cache.len() as u64);
     }
 
-    fn remove_cached_counter(&self, cell_id: &UInt256) {
-        self.cell_counter_cache.remove(cell_id);
+    fn set_cached_counter_inc(&self, cell_id: &UInt256, inc: u32) -> Result<()> {
+        match self.cell_counter_cache.get_value_or_guard(cell_id, None) {
+            quick_cache::GuardResult::Value(atomic) => {
+                if let Err(prev) =
+                    atomic.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        if current == UNKNOWN_COUNTER {
+                            None // evicted between save start and now, skip
+                        } else {
+                            if let Some(new) = current.checked_add(inc) {
+                                if new <= MAX_REFCNT {
+                                    return Some(new);
+                                }
+                            }
+                            None
+                        }
+                    })
+                {
+                    if prev != UNKNOWN_COUNTER {
+                        fail!("counter overflow for {cell_id:x} during inc update: {prev} + {inc}");
+                    }
+                }
+            }
+            quick_cache::GuardResult::Guard(guard) => {
+                let _ = guard.insert(Arc::new(AtomicU32::new(UNKNOWN_COUNTER)));
+            }
+            quick_cache::GuardResult::Timeout => unreachable!(),
+        }
         #[cfg(feature = "telemetry")]
         self.cell_db.telemetry().counter_cache_len.update(self.cell_counter_cache.len() as u64);
+        Ok(())
+    }
+
+    /// Returns true if the cell is known to be in DB (cache hit or DB Get confirms).
+    /// Counter cache is NOT populated here — that's deferred to the post-commit flush.
+    fn check_in_db(
+        &self,
+        cell_id: &UInt256,
+        counters_cf: &impl rocksdb::AsColumnFamilyRef,
+    ) -> Result<bool> {
+        if self.cell_counter_cache.peek(cell_id).is_some() {
+            return Ok(true);
+        }
+        #[cfg(feature = "telemetry")]
+        let now = Instant::now();
+        let exists = self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())?.is_some();
+        #[cfg(feature = "telemetry")]
+        if exists {
+            self.cell_db
+                .telemetry()
+                .load_counter_time_nanos
+                .update(now.elapsed().as_nanos() as u64);
+            self.cell_db.telemetry().loaded_counters.update(1);
+        }
+        Ok(exists)
     }
 
     // This method minimizes number of DB queries by checking internal cell type (storage or not).
@@ -422,135 +608,172 @@ impl DynamicBocDb {
     //    (is not a storage or was not visited during this save operation)
     // 3) If at least one reference is new, then this cell is definitely new too,
     //    so we DO NOT NEED to query DB for its counter
-    // Returns true if the cell is new (not existing in DB and not visited during this save operation), false otherwise.
-    fn save_cells_recursive(
-        self: &Arc<DynamicBocDb>,
+    /// Returns: `true` if cell is new (not in DB before this operation), `false` otherwise.
+    fn save_cells_parallel<'scope>(
+        self: &'scope Arc<DynamicBocDb>,
         cell: &Cell,
-        visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>,
-        root_id: &UInt256,
-        check_stop: &(dyn Fn() -> Result<()> + Sync),
-        counters_cf: &impl rocksdb::AsColumnFamilyRef,
-    ) -> Result<(bool, Option<u32>)> {
-        let try_load_counter = |cell_id: &UInt256| -> Result<Option<u32>> {
-            if let Some(counter) = self.get_cached_counter(cell_id) {
-                return Ok(Some(counter));
+        visited: &'scope VisitedMap,
+        root_id: &'scope UInt256,
+        check_stop: &'scope (dyn Fn() -> Result<()> + Sync),
+        scope: &rayon::Scope<'scope>,
+        inc_error: &'scope AtomicBool,
+        counters_cf: Arc<rocksdb::BoundColumnFamily<'scope>>,
+    ) -> Result<bool> {
+        /// Inserts a placeholder for a cell known to be in DB, without bumping its inc.
+        /// If a placeholder was already inserted (e.g. by parent's claim), nothing happens.
+        fn mark_in_db(cell_id: &UInt256, visited: &VisitedMap) {
+            if let dashmap::mapref::entry::Entry::Vacant(entry) = visited.entry(cell_id.clone()) {
+                entry.insert(VisitedCell::placeholder());
             }
-            #[cfg(feature = "telemetry")]
-            let now = Instant::now();
-            if let Some(raw) = self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())? {
-                // Cell is existing
-                #[cfg(feature = "telemetry")]
-                {
-                    self.cell_db
-                        .telemetry()
-                        .load_counter_time_nanos
-                        .update(now.elapsed().as_nanos() as u64);
-                    self.cell_db.telemetry().loaded_counters.update(1);
+        }
+
+        /// Increment inc for an existing-in-DB child cell.
+        /// Creates an `Inc { inc: 1 }` if not in visited yet.
+        fn update_child_inc(cell_id: &UInt256, visited: &VisitedMap) -> Result<()> {
+            match visited.entry(cell_id.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    entry.get_mut().inc()?;
                 }
-                let mut reader = Cursor::new(raw);
-                let counter = reader.read_le_u32()?;
-                self.set_cached_counter(cell_id, counter);
-                return Ok(Some(counter));
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(VisitedCell::Inc { inc: 1 });
+                }
             }
-            Ok(None)
-        };
+            Ok(())
+        }
 
         check_stop()?;
 
         let cell_id = cell.repr_hash();
-        let mut skip_counter_check = false;
+        let mut skip_db_check = false;
 
-        if cell.is_lazy() || self.cell_db().is_stored_cell(cell) {
-            // This cell is possibly in DB, trying to load counter
-            if let Some(counter) = try_load_counter(cell_id)? {
-                return Ok((false, Some(counter)));
+        //
+        // If cell is lazy or stored — it may exist in DB.
+        //
+        if cell.is_lazy() {
+            // Lazy cell is pruned branch from merkle update, so it must be in DB.
+            mark_in_db(cell_id, visited);
+            return Ok(false);
+        }
+        if self.cell_db().is_stored_cell(cell) {
+            if self.check_in_db(cell_id, &counters_cf)? {
+                mark_in_db(cell_id, visited);
+                return Ok(false);
             }
-            skip_counter_check = true; // already checked, not in DB
+            // Confirmed not in DB
+            skip_db_check = true;
         }
 
-        let mut is_new_cell = false;
-        let mut ref_verdicts = [(false, None); MAX_REFERENCES_COUNT];
-        for i in 0..cell.references_count() {
-            if visited.contains_key(&cell.reference_repr_hash(i)?) {
-                // Reference is visited during this save operation, so it is new
-                ref_verdicts[i] = (false, None);
-            } else {
-                let reference = cell.reference(i)?;
-                ref_verdicts[i] = self.save_cells_recursive(
-                    &reference,
-                    visited,
-                    root_id,
-                    check_stop,
-                    counters_cf,
-                )?;
-                if ref_verdicts[i].0 {
-                    is_new_cell = true;
-                }
-            }
-        }
+        //
+        // The cell seems new (not in DB)
+        // Make recursive calls for refs (in parallel)
+        //
+        let ref_count = cell.references_count();
+        let mut ref_results: [Result<bool>; MAX_REFERENCES_COUNT] =
+            std::array::from_fn(|_| Ok(false));
 
-        if !is_new_cell && !skip_counter_check {
-            // This cell is possibly existing
-            if let Some(counter) = try_load_counter(cell_id)? {
-                return Ok((false, Some(counter)));
-            }
-        }
-
-        // This cell is definitely new
-
-        // Update counters for old (existing) children
-        for i in 0..cell.references_count() {
-            if !ref_verdicts[i].0 {
-                let ref_hash = cell.reference_repr_hash(i)?;
-
-                if let Some(counter) = ref_verdicts[i].1 {
-                    // If we already know counter - just update, do not query DB second time.
-                    // Counter cache is NOT updated here: it would diverge from the DB
-                    // on any failure before the WriteBatch commits. The cache is
-                    // refreshed from `visited` in `save_boc` after `db.write`.
-                    match visited.entry(ref_hash.clone()) {
-                        std::collections::hash_map::Entry::Occupied(mut entry) => {
-                            let new_counter = entry.get_mut().inc_parents_count()?;
-                            log::trace!(
-                                target: TARGET,
-                                "DynamicBocDb::save_cells_recursive  {:x}  update visited {}  root_cell_id {:x}",
-                                ref_hash, new_counter, root_id
-                            );
-                        }
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(VisitedCell::with_counter(counter + 1));
-                            log::trace!(
-                                target: TARGET,
-                                "DynamicBocDb::save_cells_recursive  {:x}  update counter {}  root_cell_id {:x}",
-                                ref_hash, counter + 1, root_id
-                            );
+        self.save_cells_threadpool.scope(|s| {
+            for (i, verdict) in ref_results.iter_mut().take(ref_count).enumerate() {
+                let counters_cf = counters_cf.clone();
+                let task = move || -> Result<bool> {
+                    let ref_hash = cell.reference_repr_hash(i)?;
+                    match visited.entry(ref_hash) {
+                        dashmap::mapref::entry::Entry::Occupied(_) => return Ok(false),
+                        dashmap::mapref::entry::Entry::Vacant(entry) => {
+                            // Placeholder to prevent parallel processing of the same cell.
+                            entry.insert(VisitedCell::placeholder());
                         }
                     }
-                } else {
-                    // This call will query DB for counter.
-                    self.try_update_cell(
-                        counters_cf,
-                        &ref_hash,
+                    let reference = cell.reference(i)?;
+                    self.save_cells_parallel(
+                        &reference,
                         visited,
                         root_id,
-                        |visited_cell| visited_cell.inc_parents_count(),
-                        "DynamicBocDb::save_cells_recursive",
-                    )?;
+                        check_stop,
+                        scope,
+                        inc_error,
+                        counters_cf,
+                    )
+                };
+
+                if i == ref_count - 1 {
+                    *verdict = task();
+                } else {
+                    s.spawn(move |_| *verdict = task());
+                }
+            }
+        });
+
+        let mut is_new_cell = false;
+        let mut old_refs = 0usize;
+        let mut ref_verdicts = [false; MAX_REFERENCES_COUNT];
+        for (verdict, result) in ref_verdicts.iter_mut().zip(ref_results).take(ref_count) {
+            *verdict = result?;
+            if *verdict {
+                is_new_cell = true;
+            } else {
+                old_refs += 1;
+            }
+        }
+
+        //
+        // Late membership check: if cell wasn't lazy/stored but all its children are old,
+        // it might still be in DB (e.g. constructed in memory with a hash that already exists).
+        //
+        if !is_new_cell && !skip_db_check && self.check_in_db(cell_id, &counters_cf)? {
+            mark_in_db(cell_id, visited);
+            return Ok(false);
+        }
+
+        //
+        // The cell is definitely new.
+        // Increment inc counters for its existing (in-DB) children in parallel.
+        //
+        let mut processed = 0usize;
+        for i in 0..ref_count {
+            if !ref_verdicts[i] {
+                let ref_hash = cell.reference_repr_hash(i)?;
+                if processed + 1 == old_refs {
+                    // Last non-new ref — handle inline (avoid unnecessary spawn)
+                    update_child_inc(&ref_hash, visited)?;
+                } else {
+                    scope.spawn(move |_| {
+                        if let Err(e) = update_child_inc(&ref_hash, visited) {
+                            log::error!(
+                                target: TARGET,
+                                "DynamicBocDb::save_cells_parallel  {:x}  update child inc failed: {e}",
+                                root_id
+                            );
+                            inc_error.store(true, Ordering::Relaxed);
+                        }
+                    });
+                    processed += 1;
                 }
             }
         }
 
-        // Add this cell as new. Counter cache is deferred to the post-commit
-        // flush in `save_boc`.
-        let c = VisitedCell::with_new_cell(cell.clone());
-        visited.insert(cell_id.clone(), c);
-        log::trace!(
-            target: TARGET,
-            "DynamicBocDb::save_cells_recursive  {:x}  new cell  root_cell_id {:x}",
-            cell_id, root_id
-        );
+        //
+        // Add this cell to visited as new, or bump inc if a placeholder/parallel visit got here first.
+        //
+        match visited.entry(cell_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                // The placeholder must be Inc (from claim or sibling inc).
+                let prev_inc = match entry.get() {
+                    VisitedCell::Inc { inc } => *inc,
+                    other => {
+                        fail!("unexpected variant before new claim for {cell_id:x}: {other:?}")
+                    }
+                };
+                let inc = prev_inc
+                    .checked_add(1)
+                    .ok_or_else(|| error!("inc overflow for {cell_id:x}"))?;
+                *entry.get_mut() = VisitedCell::New { cell: cell.clone(), inc };
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(VisitedCell::with_new_cell(cell.clone()));
+            }
+        }
 
-        Ok((true, None))
+        Ok(true)
     }
 
     fn save_one_cell(
@@ -560,161 +783,155 @@ impl DynamicBocDb {
         root_id: &UInt256,
     ) -> Result<()> {
         let counters_cf = self.counters_cf()?;
-
         let cell_id = cell.repr_hash();
 
-        let (counter, _cell) = self.try_update_cell(
-            &counters_cf,
-            &cell_id,
-            visited,
-            root_id,
-            |visited_cell| visited_cell.inc_parents_count(),
-            "DynamicBocDb::save_cells_recursive",
-        )?;
-        if counter.is_none() {
-            // New cell. Counter cache is deferred to the post-commit flush
-            // in the caller (see `AsyncCellsStorageAdapter::new` commit).
-            let c = VisitedCell::with_new_cell(cell.clone());
-            visited.insert(cell_id.clone(), c);
-            log::trace!(
-                target: TARGET,
-                "DynamicBocDb::save_one_cell  {:x}  new cell  root_cell_id {:x}",
-                cell_id, root_id
-            );
+        if self.touch_cell_for_save(cell_id, &counters_cf, visited)? {
+            // Already known — inc incremented, nothing else to do.
+            return Ok(());
+        }
 
-            for i in 0..cell.references_count() {
-                let ref_hash = cell.reference_repr_hash(i)?;
+        // Brand new cell. Insert as New with inc = 1.
+        visited.insert(cell_id.clone(), VisitedCell::with_new_cell(cell.clone()));
+        log::trace!(
+            target: TARGET,
+            "DynamicBocDb::save_one_cell  {:x}  new cell  root_cell_id {:x}",
+            cell_id, root_id
+        );
 
-                let (counter, _) = self.try_update_cell(
-                    &counters_cf,
-                    &ref_hash,
-                    visited,
-                    root_id,
-                    |visited_cell| visited_cell.inc_parents_count(),
-                    "DynamicBocDb::save_cells_recursive",
-                )?;
-                if counter.is_none() {
-                    fail!("save_one_cell supports only cell with all references already saved");
-                }
+        // Every reference must be already saved (precondition of save_one_cell).
+        for i in 0..cell.references_count() {
+            let ref_hash = cell.reference_repr_hash(i)?;
+            if !self.touch_cell_for_save(&ref_hash, &counters_cf, visited)? {
+                fail!("save_one_cell supports only cells with all references already saved");
             }
         }
         Ok(())
     }
 
-    fn delete_cells_recursive(
-        self: &Arc<Self>,
+    /// For save_one_cell path: increment inc in visited if cell is known to be in DB.
+    /// Returns true if the cell was found (either in visited, in cache, or in DB).
+    /// Returns false if the cell is brand new (visited unchanged).
+    /// Counter cache is NOT populated here — that's deferred to the post-commit flush.
+    fn touch_cell_for_save(
+        &self,
         cell_id: &UInt256,
-        visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>,
-        root_id: &UInt256,
-        check_stop: &(dyn Fn() -> Result<()> + Sync),
-    ) -> Result<()> {
-        let counters_cf = self.counters_cf()?;
-        let mut stack = vec![cell_id.clone()];
-        while let Some(cell_id) = stack.pop() {
-            check_stop()?;
-
-            if let (Some(counter), cell) = self.try_update_cell(
-                &counters_cf,
-                &cell_id,
-                visited,
-                root_id,
-                |visited_cell| visited_cell.dec_parents_count(),
-                "DynamicBocDb::delete_cells_recursive",
-            )? {
-                if counter == 0 {
-                    // Counter cache eviction is deferred to the post-commit
-                    // flush in `delete_boc`.
-
-                    let cell = if let Some(c) = cell {
-                        c
-                    } else {
-                        match self.cell_db.load_cell(&cell_id) {
-                            Ok(cell) => cell,
-                            Err(e) => {
-                                log::warn!("DynamicBocDb::delete_cells_recursive  {:?}", e);
-                                continue;
-                            }
-                        }
-                    };
-
-                    for i in 0..cell.references_count() {
-                        stack.push(cell.reference_repr_hash(i)?);
-                    }
-                }
-            } else {
-                log::warn!(
-                    "DynamicBocDb::delete_cells_recursive  unknown cell with id {:x}  root_cell_id {:x}",
-                    cell_id, root_id
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    fn try_update_cell(
-        self: &Arc<Self>,
         counters_cf: &impl rocksdb::AsColumnFamilyRef,
-        cell_id: &UInt256,
         visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>,
-        root_id: &UInt256,
-        update_cell: impl Fn(&mut VisitedCell) -> Result<u32>,
-        op_name: &str,
-    ) -> Result<(Option<u32>, Option<Cell>)> {
-        // Counter cache mutations are deferred: callers flush from `visited`
-        // after the DB WriteBatch commits.
-        if let Some(visited_cell) = visited.get_mut(cell_id) {
-            // Cell was already updated while this operation, just update counter
-            let new_counter = update_cell(visited_cell)?;
-            log::trace!(
-                target: TARGET,
-                "{}  {:x}  update visited {}  root_cell_id {:x}",
-                op_name, cell_id, new_counter, root_id
-            );
-            return Ok((Some(new_counter), visited_cell.cell().cloned()));
+    ) -> Result<bool> {
+        if let Some(vc) = visited.get_mut(cell_id) {
+            vc.inc()?;
+            return Ok(true);
         }
+        if self.check_in_db(cell_id, counters_cf)? {
+            visited.insert(cell_id.clone(), VisitedCell::Inc { inc: 1 });
+            return Ok(true);
+        }
+        Ok(false)
+    }
 
-        // Check LRU counter cache
+    /// Loads the base DB value of a counter for the delete path: cache first, then RocksDB.
+    /// Counter cache is NOT populated here — that's deferred to the post-commit flush.
+    fn load_counter_base(
+        &self,
+        cell_id: &UInt256,
+        counters_cf: &impl rocksdb::AsColumnFamilyRef,
+    ) -> Result<u32> {
         if let Some(counter) = self.get_cached_counter(cell_id) {
-            let mut visited_cell = VisitedCell::with_counter(counter);
-            let new_counter = update_cell(&mut visited_cell)?;
-            visited.insert(cell_id.clone(), visited_cell);
-            log::trace!(
-                target: TARGET,
-                "{}  {:x}  update cached counter {}  root_cell_id {:x}",
-                op_name, cell_id, new_counter, root_id
-            );
-            return Ok((Some(new_counter), None));
+            if counter != UNKNOWN_COUNTER {
+                return Ok(counter);
+            }
         }
-
-        // Fallback to DB
         #[cfg(feature = "telemetry")]
         let now = Instant::now();
-        if let Some(counter_raw) =
-            self.cell_db.db().get_pinned_cf(counters_cf, cell_id.as_slice())?
+        let raw = self
+            .cell_db
+            .db()
+            .get_pinned_cf(counters_cf, cell_id.as_slice())?
+            .ok_or_else(|| error!("DB doesn't have counter for existing cell {cell_id:x}"))?;
+        if raw.len() != 4 {
+            fail!("malformed counter for {cell_id:x}: expected 4 bytes, got {}", raw.len());
+        }
+        #[cfg(feature = "telemetry")]
         {
-            #[cfg(feature = "telemetry")]
-            {
-                self.cell_db
-                    .telemetry()
-                    .load_counter_time_nanos
-                    .update(now.elapsed().as_nanos() as u64);
-                self.cell_db.telemetry().loaded_counters.update(1);
+            self.cell_db
+                .telemetry()
+                .load_counter_time_nanos
+                .update(now.elapsed().as_nanos() as u64);
+            self.cell_db.telemetry().loaded_counters.update(1);
+        }
+        let counter = u32::from_le_bytes(
+            raw[..4].try_into().map_err(|_| error!("malformed counter for {cell_id:x}"))?,
+        );
+        Ok(counter)
+    }
+
+    fn delete_cells_parallel<'scope>(
+        self: &'scope Arc<DynamicBocDb>,
+        cell_id: &UInt256,
+        visited: &'scope VisitedMap,
+        root_id: &'scope UInt256,
+        check_stop: &'scope (dyn Fn() -> Result<()> + Sync),
+        scope: &rayon::Scope<'scope>,
+        dec_error: &'scope AtomicBool,
+    ) -> Result<()> {
+        check_stop()?;
+
+        let counters_cf = self.counters_cf()?;
+
+        // Decrement under the dashmap entry lock so threads reaching the same
+        // cell via different paths within this delete operation can't race.
+        // First touch loads the base value and stores Updated{base - 1};
+        // subsequent touches just decrement the stored absolute counter.
+        let new_count = match visited.entry(cell_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => entry.get_mut().dec()?,
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let base = self.load_counter_base(cell_id, &counters_cf)?;
+                let new_count = base
+                    .checked_sub(1)
+                    .ok_or_else(|| error!("refcnt underflow for {cell_id:x} (root {root_id:x})"))?;
+                entry.insert(VisitedCell::Updated { refs: new_count });
+                new_count
             }
+        };
 
-            let mut visited_cell = VisitedCell::with_raw_counter(&counter_raw)?;
-            let counter = update_cell(&mut visited_cell)?;
-            visited.insert(cell_id.clone(), visited_cell);
-            log::trace!(
-                target: TARGET,
-                "{}  {:x}  load counter {}  root_cell_id {:x}",
-                op_name, cell_id, counter, root_id
-            );
-
-            return Ok((Some(counter), None));
+        if new_count > 0 {
+            return Ok(());
         }
 
-        Ok((None, None))
+        // Counter dropped to zero — recurse into children to decrement them too.
+        let cell = match self.cell_db.load_cell(cell_id) {
+            Ok(cell) => cell,
+            Err(e) => {
+                log::warn!(target: TARGET, "DynamicBocDb::delete_cells_parallel  load_cell failed: {e:?}");
+                return Ok(());
+            }
+        };
+
+        let ref_count = cell.references_count();
+        for i in 0..ref_count {
+            let ref_hash = cell.reference_repr_hash(i)?;
+            if i == ref_count - 1 {
+                // Process the last reference in the current thread to avoid unnecessary task spawn.
+                self.delete_cells_parallel(
+                    &ref_hash, visited, root_id, check_stop, scope, dec_error,
+                )?;
+            } else {
+                scope.spawn(move |s| {
+                    if let Err(e) = self.delete_cells_parallel(
+                        &ref_hash, visited, root_id, check_stop, s, dec_error,
+                    ) {
+                        log::error!(
+                            target: TARGET,
+                            "DynamicBocDb::delete_cells_parallel  {:x}  child delete failed with error: {e}",
+                            root_id
+                        );
+                        dec_error.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -745,18 +962,54 @@ impl AsyncCellsStorageAdapter {
                 let commit = |visited: &mut fnv::FnvHashMap<UInt256, VisitedCell>| -> Result<()> {
                     let mut transaction = rocksdb::WriteBatch::default();
                     for (id, vc) in visited.iter() {
-                        // cell
-                        if let Some(data) = vc.serialize_cell()? {
-                            transaction.put_cf(&cells_cf, id.as_slice(), &data);
+                        match vc {
+                            VisitedCell::New { cell, inc } => {
+                                let data = serialize_stored_cell(cell)?;
+                                transaction.put_cf(&cells_cf, id.as_slice(), &data);
+                                transaction.merge_cf(
+                                    &counters_cf,
+                                    id.as_slice(),
+                                    inc.to_le_bytes(),
+                                );
+                            }
+                            VisitedCell::Inc { inc } => {
+                                if *inc > 0 {
+                                    transaction.merge_cf(
+                                        &counters_cf,
+                                        id.as_slice(),
+                                        inc.to_le_bytes(),
+                                    );
+                                }
+                            }
+                            VisitedCell::Updated { .. } => {
+                                log::error!(
+                                    target: TARGET,
+                                    "AsyncCellsStorageAdapter::commit  unexpected Updated variant for {:x}",
+                                    id,
+                                );
+                            }
                         }
-                        // counter
-                        transaction.put_cf(&counters_cf, id.as_slice(), vc.serialize_counter());
                     }
                     boc_db_clone.cell_db.db().write(transaction)?;
-                    // Counter cache is flushed only after the DB commit
-                    // succeeds. See `save_boc` for the rationale.
+                    // Counter cache flush is done only after the DB commit succeeds.
                     for (id, vc) in visited.iter() {
-                        boc_db_clone.set_cached_counter(id, vc.parents_count());
+                        match vc {
+                            VisitedCell::New { inc, .. } => {
+                                boc_db_clone.set_cached_counter(id, *inc);
+                            }
+                            VisitedCell::Inc { inc } if *inc > 0 => {
+                                if let Some(atomic) = boc_db_clone.cell_counter_cache.get(id) {
+                                    let _ = atomic.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                        if v == UNKNOWN_COUNTER {
+                                            None
+                                        } else {
+                                            v.checked_add(*inc)
+                                        }
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     visited.clear();
                     Ok(())

@@ -229,10 +229,6 @@ impl CellDb {
                             .storing_cells_bytes
                             .update(_bytes.saturating_sub(alloc_size));
                     }
-
-                    // Evict from cell_cache so next load gets stored_loader version
-                    self.cell_cache.remove(&id);
-
                     for i in 0..removed.val().references_count() {
                         if let Ok(ref_hash) = removed.val().reference_repr_hash(i) {
                             stack.push(ref_hash);
@@ -253,6 +249,12 @@ impl CellDb {
         self.cell_cache.remove(cell_id);
     }
 
+    pub fn add_to_cache(&self, cell_id: UInt256, cell: Cell) {
+        self.cell_cache.insert(cell_id, cell);
+        #[cfg(feature = "telemetry")]
+        self.telemetry.cell_cache_len.update(self.cell_cache.len() as u64);
+    }
+
     #[cfg(test)]
     pub fn count(&self) -> usize {
         if let Ok(cf) = self.cells_cf() {
@@ -263,32 +265,23 @@ impl CellDb {
     }
 
     pub(crate) fn load_cell(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
-        #[cfg(feature = "telemetry")]
-        let now = Instant::now();
         if let Some(cell) = self.cell_cache.get(cell_id) {
             #[cfg(feature = "telemetry")]
-            {
-                self.telemetry.cell_cache_hits.update(1);
-                self.telemetry
-                    .load_cell_from_cache_time_nanos
-                    .update(now.elapsed().as_nanos() as u64);
+            self.telemetry.cell_cache_hits.update(1);
+            Ok(cell)
+        } else {
+            #[cfg(feature = "telemetry")]
+            self.telemetry.cell_cache_misses.update(1);
+
+            let cell = self.load_cell_uncached(cell_id)?;
+
+            if self.is_stored_cell(&cell) {
+                // do not cache storing cells, they are already in storing_cells map
+                self.add_to_cache(cell_id.clone(), cell.clone());
             }
-            return Ok(cell);
+
+            Ok(cell)
         }
-        #[cfg(feature = "telemetry")]
-        self.telemetry.cell_cache_misses.update(1);
-        let cell = self.load_cell_uncached(cell_id)?;
-        #[cfg(feature = "telemetry")]
-        let now_insert = Instant::now();
-        self.cell_cache.insert(cell_id.clone(), cell.clone());
-        #[cfg(feature = "telemetry")]
-        {
-            self.telemetry
-                .store_cell_to_cache_time_nanos
-                .update(now_insert.elapsed().as_nanos() as u64);
-            self.telemetry.cell_cache_len.update(self.cell_cache.len() as u64);
-        }
-        Ok(cell)
     }
 
     fn load_cell_uncached(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
