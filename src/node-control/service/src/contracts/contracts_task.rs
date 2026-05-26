@@ -1107,6 +1107,14 @@ mod tests {
 
         assert!(!all_updated);
         assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            monitor
+                .last_update_sent_at
+                .get("node-a")
+                .and_then(|by_pool| by_pool.get(&addr(4)))
+                .is_some(),
+            "send on Available branch must record last_update_sent_at"
+        );
 
         server.shutdown().await;
     }
