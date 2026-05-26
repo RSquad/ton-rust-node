@@ -77,7 +77,8 @@ pub const LAST_UNNEEDED_KEY_BLOCK: &str = storage::db::rocksdb::LAST_UNNEEDED_KE
 pub const DB_VERSION: &str = "DbVersion";
 
 pub const DB_VERSION_7: u32 = 7; // with block indexes
-pub const CURRENT_DB_VERSION: u32 = DB_VERSION_7;
+pub const DB_VERSION_8: u32 = 8; // with merge operator in counters CF
+pub const CURRENT_DB_VERSION: u32 = DB_VERSION_8;
 
 pub const SHARDSTATE_DB_NAME: &str = "shardstate_db";
 const CELLS_CF_NAME: &str = "cells_db_v6";
