@@ -365,7 +365,9 @@ impl ClientJsonRpc {
             .ok_or_else(|| anyhow::anyhow!(r#"missing "config.bytes" string"#))?;
 
         let boc = base64::engine::general_purpose::STANDARD.decode(b64)?;
-        read_boc(boc)?.withdraw_single_root().context("config param BOC root")
+        read_boc(boc)?
+            .withdraw_single_root()
+            .with_context(|| format!("config param {} BOC root", param_id))
     }
 
     pub async fn get_config_param(&self, param_id: u32) -> anyhow::Result<ConfigParamEnum> {
