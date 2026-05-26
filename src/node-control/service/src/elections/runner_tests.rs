@@ -2862,7 +2862,7 @@ async fn test_toncore_nominator_both_pools_busy_skips_elections() {
 
     let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
-    // Both pools busy → router's address() returns "no one pool is ready".
+    // Both pools busy → router's address() returns "no pool ready".
     // Node is excluded from the current tick; run() still succeeds.
     result.expect("run() should succeed — busy node is just skipped");
     assert_eq!(runner.past_elections_cache_id, ELECTION_ID);

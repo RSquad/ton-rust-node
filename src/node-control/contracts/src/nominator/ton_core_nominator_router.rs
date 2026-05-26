@@ -71,7 +71,9 @@ impl TonCoreNominatorRouter {
         {
             return Ok(pool.clone());
         }
-        anyhow::bail!("no one pool is ready");
+        anyhow::bail!(
+            "no pool ready: none matches stake_at={election_id} and none is idle/recoverable",
+        );
     }
 
     pub fn new(provider: Arc<dyn ContractProvider>, pools: [Option<MsgAddressInt>; 2]) -> Self {

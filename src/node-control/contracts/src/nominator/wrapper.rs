@@ -34,10 +34,10 @@ pub enum PoolKind {
 #[async_trait::async_trait]
 pub trait NominatorWrapper: SmartContract + Send + Sync {
     /// Set the current election cycle id so multi-pool routers (TONCore) can stably resolve
-    /// the active slot for the cycle. Single-pool wrappers ignore this. Must be called by the
-    /// client code at the start of each new elections before any other operation that depends on
-    /// active-pool resolution; otherwise [`TonCoreNominatorRouter`](crate::nominator::TonCoreNominatorRouter)
-    /// will fail with an explicit error rather than silently picking a slot.
+    /// the active slot for the cycle. SNP wrappers ignore this.
+    ///
+    /// Pass `0` (or never call this) to release the pin: the router then falls back to legacy
+    /// state-based selection.
     fn set_election_id(&self, _election_id: u64) {}
     /// Get the owner and validator addresses stored in the contract
     async fn get_roles(&self) -> anyhow::Result<NominatorRoles>;
