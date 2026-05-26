@@ -23,7 +23,7 @@ use std::{
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
-use ton_block::{ConfigParamEnum, MsgAddressInt, read_boc};
+use ton_block::{Cell, ConfigParamEnum, MsgAddressInt, read_boc};
 use toncenter_rs::client::{
     ApiClientV2 as TonApiClientV2, ApiKey as TonApiKey, Network as TonNetwork,
 };
@@ -345,7 +345,7 @@ impl ClientJsonRpc {
         Ok(())
     }
 
-    pub async fn get_config_param(&self, param_id: u32) -> anyhow::Result<ConfigParamEnum> {
+    pub async fn get_config_param_cell(&self, param_id: u32) -> anyhow::Result<Cell> {
         let json_params: serde_json::Value = serde_json::json!({
             "config_id": param_id,
         });
@@ -365,10 +365,15 @@ impl ClientJsonRpc {
             .ok_or_else(|| anyhow::anyhow!(r#"missing "config.bytes" string"#))?;
 
         let boc = base64::engine::general_purpose::STANDARD.decode(b64)?;
-        let cell = read_boc(boc)?.withdraw_single_root()?;
+        read_boc(boc)?
+            .withdraw_single_root()
+            .with_context(|| format!("config param {} BOC root", param_id))
+    }
 
-        let config_param = ConfigParamEnum::construct_from_cell_and_number(cell, param_id)?;
-        Ok(config_param)
+    pub async fn get_config_param(&self, param_id: u32) -> anyhow::Result<ConfigParamEnum> {
+        let cell = self.get_config_param_cell(param_id).await?;
+        ConfigParamEnum::construct_from_cell_and_number(cell, param_id)
+            .context("parse config param cell")
     }
 
     pub async fn run_get_method(
