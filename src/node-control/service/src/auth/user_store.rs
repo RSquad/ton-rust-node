@@ -389,6 +389,7 @@ mod tests {
                     vec![("http://127.0.0.1:3301/".to_owned(), None)],
                     None,
                     common::app_config::EndpointTimeouts::default(),
+                    common::app_config::FreshnessConfig::disabled(),
                 )
                 .unwrap(),
             )

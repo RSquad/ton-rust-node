@@ -934,6 +934,13 @@ class Bootstrap:
         self.log.info("  config generate...")
         self._nctl("config", "generate", "--output", str(self.paths.nodectl_config), "--force")
 
+        # Short past_elections cache TTL so e2e can observe periodic refresh in the logs
+        # (search for `past_elections cache refreshed (reason=ttl, ...)`).
+        cfg_json = json.loads(self.paths.nodectl_config.read_text())
+        cfg_json.setdefault("elections", {})["cache_refresh_secs"] = 60
+        self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
+        self.log.info("  elections.cache_refresh_secs → 60")
+
         # Create the key used by nodes 3+ (nodes 1-2 get per-node keys in phase 6)
         self.log.info("  key add control-client-secret...")
         self._nctl("key", "add", "-n", "control-client-secret", "-e")
@@ -1077,12 +1084,27 @@ class Bootstrap:
         self.log.info("  config ton-http-api set...")
         self._nctl("config", "ton-http-api", "set", "-e", self.cfg.http_api_url)
 
+        # Add the remaining per-node ton-http-api endpoints as priority fallbacks
+        # (ports 3302, 3303, ..., 3300 + node_cnt). Each singlehost node runs its own
+        # ton-http-api instance, so multi-endpoint behaviour (priority routing, stale
+        # detection, failover) can be exercised manually by stopping/lagging the primary.
+        if self.cfg.node_cnt > 1:
+            base_port = 3301
+            add_args = ["config", "ton-http-api", "add"]
+            for i in range(1, self.cfg.node_cnt):
+                add_args.extend(["-e", f"http://127.0.0.1:{base_port + i}"])
+            self._nctl(*add_args)
+            self.log.info(
+                f"  ton-http-api failover endpoints added: ports {base_port + 1}-{base_port + self.cfg.node_cnt - 1}"
+            )
+
         # Patch global tick_interval — no CLI command exists for this field
         cfg_json = json.loads(self.paths.nodectl_config.read_text())
         cfg_json["tick_interval"] = 20
         cfg_json["automation"]["tick_interval_sec"] = 20
         self.paths.nodectl_config.write_text(json.dumps(cfg_json, indent=2))
-        self.log.info("  global tick_interval → 20")
+        self.log.info("  global tick_interval → 20; wait 10s until config hot-reload")
+        time.sleep(10)
 
         self._add_wallets()
         master_addr = self._resolve_master_wallet()
