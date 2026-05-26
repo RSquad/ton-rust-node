@@ -498,6 +498,13 @@ impl ElectionRunner {
         if election_id == 0 {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
             tracing::info!("no active elections");
+            // Release the cycle pin on all pool routers — non-election callers that share the
+            // router via `Arc` should fall back to legacy state-based selection between cycles.
+            for node in self.nodes.values() {
+                if let Some(pool) = &node.pool {
+                    pool.set_election_id(0);
+                }
+            }
             return Ok(());
         }
         tracing::info!(
@@ -534,6 +541,13 @@ impl ElectionRunner {
         self.build_elections_snapshot(election_id, &cfg15, &elections_info, &cfg17).await;
 
         let mut skip_tick_nodes = vec![];
+
+        // Pin Nominator Pool to the current election cycle BEFORE any operation.
+        for node in self.nodes.values() {
+            if let Some(pool) = &node.pool {
+                pool.set_election_id(election_id);
+            }
+        }
 
         let now_ts = self.clock.now();
         let cache_expired = self.cache_refresh_secs > 0

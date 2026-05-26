@@ -33,6 +33,12 @@ pub enum PoolKind {
 /// vec (the pool itself is the only physical contract).
 #[async_trait::async_trait]
 pub trait NominatorWrapper: SmartContract + Send + Sync {
+    /// Set the current election cycle id so multi-pool routers (TONCore) can stably resolve
+    /// the active slot for the cycle. SNP wrappers ignore this.
+    ///
+    /// Pass `0` (or never call this) to release the pin: the router then falls back to legacy
+    /// state-based selection.
+    fn set_election_id(&self, _election_id: u64) {}
     /// Get the owner and validator addresses stored in the contract
     async fn get_roles(&self) -> anyhow::Result<NominatorRoles>;
     /// Get pool data (parsed persistent storage of nominator)

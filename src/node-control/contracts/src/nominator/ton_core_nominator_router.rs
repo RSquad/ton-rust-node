@@ -16,7 +16,10 @@ use super::{
 };
 use crate::{ContractProvider, SmartContract, TonWallet};
 use anyhow::Context;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use ton_block::{Cell, MsgAddressInt, StateInit};
 
 /// TONCore nominator binding: two pool contracts (even/odd validation rounds).
@@ -25,24 +28,52 @@ use ton_block::{Cell, MsgAddressInt, StateInit};
 /// node; use [`NominatorWrapper::inner_pools`] to iterate both contracts (deploy, RPC).
 pub struct TonCoreNominatorRouter {
     pools: [Option<Arc<dyn NominatorWrapper>>; 2],
+    /// Current election id; pins active-slot selection to the cycle being serviced.
+    /// `0` means "not set" — falls back to legacy state-based selection (used by non-election
+    /// callers like the HTTP config handler that share the router via `Arc`). The election
+    /// runner short-circuits at `election_id == 0`, so `0` is never a real cycle id and the
+    /// sentinel is unambiguous.
+    current_election_id: AtomicU64,
 }
 
 impl TonCoreNominatorRouter {
+    /// Resolve the active slot for the current election cycle.
+    ///
+    /// Rules (applied in order):
+    /// 1. `election_id` set and one of the pools has `stake_at == election_id` → that pool.
+    ///    `pool.fc` writes `stake_at` immediately on `op::new_stake` (before the elector
+    ///    reply), so this match remains valid across the in-cycle `state` transitions
+    ///    (0→1→2): once the runner submits a bid, every subsequent call returns the same slot.
+    /// 2. Otherwise return the first pool that is either idle (`state == 0`) or has finished
+    ///    its previous cycle and is ready to be recovered (`state == 2 && vsc >= 2`). This
+    ///    branch is also the fallback for non-election callers (where `election_id` is unset).
+    /// 3. Neither rule matches → no pool is ready; error.
     async fn active_pool(&self) -> anyhow::Result<Arc<dyn NominatorWrapper>> {
-        // TONCore: pick the first pool that is not currently staking or is ready to recover stake.
+        let election_id = self.current_election_id.load(Ordering::Relaxed);
+
+        let mut entries: Vec<(Arc<dyn NominatorWrapper>, PoolData)> = Vec::with_capacity(2);
         for pool in self.pools.iter().flatten() {
             let data = pool.get_pool_data().await.context("get_pool_data failed")?;
-            if data.state == 0 // pool is not staking
-            // pool has sent stake (state=2) earlier and is ready to recover it (validator_set_changes_count >= 2)
-                || (data.state == 2 && data.validator_set_changes_count >= 2)
-            {
-                return Ok(pool.clone());
-            }
+            entries.push((pool.clone(), data));
         }
-        if self.pools.iter().any(|p| p.is_some()) {
-            anyhow::bail!("no one pool is ready");
+        if entries.is_empty() {
+            anyhow::bail!("no pools configured");
         }
-        anyhow::bail!("no pools configured")
+
+        if election_id != 0
+            && let Some((pool, _)) = entries.iter().find(|(_, d)| d.stake_at as u64 == election_id)
+        {
+            return Ok(pool.clone());
+        }
+        if let Some((pool, _)) = entries
+            .iter()
+            .find(|(_, d)| d.state == 0 || (d.state == 2 && d.validator_set_changes_count >= 2))
+        {
+            return Ok(pool.clone());
+        }
+        anyhow::bail!(
+            "no pool ready: none matches stake_at={election_id} and none is idle/recoverable",
+        );
     }
 
     pub fn new(provider: Arc<dyn ContractProvider>, pools: [Option<MsgAddressInt>; 2]) -> Self {
@@ -52,12 +83,12 @@ impl TonCoreNominatorRouter {
                     as Arc<dyn NominatorWrapper>
             })
         });
-        Self { pools }
+        Self { pools, current_election_id: AtomicU64::new(0) }
     }
 
     /// Build a router from optional per-slot pool wrappers (e.g. from config).
     pub fn from_wrappers(pools: [Option<Arc<dyn NominatorWrapper>>; 2]) -> Self {
-        Self { pools }
+        Self { pools, current_election_id: AtomicU64::new(0) }
     }
 }
 
@@ -74,6 +105,10 @@ impl SmartContract for TonCoreNominatorRouter {
 
 #[async_trait::async_trait]
 impl NominatorWrapper for TonCoreNominatorRouter {
+    fn set_election_id(&self, election_id: u64) {
+        self.current_election_id.store(election_id, Ordering::Relaxed);
+    }
+
     fn pool_kind(&self) -> PoolKind {
         PoolKind::TONCore
     }
