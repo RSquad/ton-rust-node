@@ -2871,6 +2871,57 @@ async fn test_toncore_nominator_both_pools_busy_skips_elections() {
     assert!(!node.stake_accepted);
 }
 
+/// Regression: once a pool has bid for the current cycle (`stake_at == election_id`), the
+/// router must keep returning that pool even after its `state` transitions away from `0`.
+/// Under the previous rule (`state == 0 || (state == 2 && vsc >= 2)`) the router would
+/// switch to the idle slot mid-cycle as soon as the cache was refreshed by the TTL.
+#[tokio::test]
+async fn test_toncore_nominator_active_slot_stable_after_stake_submission() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+
+    // pool[0]: just submitted for the current cycle. state=2 (accepted), stake_at=ELECTION_ID.
+    // Under the old rule this pool would be skipped (state==2 && vsc==0 fails the second arm),
+    // and pool[1] (state==0) would be chosen instead — switching slots mid-cycle.
+    p0.expect_address().returning(|| Ok(pool_address()));
+    p0.expect_get_pool_data().returning(|| {
+        Ok(PoolData { state: 2, stake_at: ELECTION_ID as u32, ..Default::default() })
+    });
+    p0.expect_storage_reserve().returning(|| TONCORE_STORAGE_RESERVE);
+    p0.expect_pool_kind().returning(|| PoolKind::TONCore);
+    p0.expect_has_withdraw_requests().returning(|| Ok(false));
+
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    // Cached address must still point at pool[0] — the slot that owns the current cycle.
+    assert_eq!(
+        node.pool_addr_cache.as_ref().map(|a| a.to_string()),
+        Some(pool_address().to_string()),
+        "router must keep returning the cycle-owning slot after state goes 0→2"
+    );
+}
+
 #[tokio::test]
 async fn test_toncore_nominator_recover_stake_uses_cached_pool_address() {
     let node_id = "node-1";

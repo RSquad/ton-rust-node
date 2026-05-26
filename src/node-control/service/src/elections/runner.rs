@@ -535,6 +535,13 @@ impl ElectionRunner {
 
         let mut skip_tick_nodes = vec![];
 
+        // Pin Nominator Pool to the current election cycle BEFORE any operation.
+        for node in self.nodes.values() {
+            if let Some(pool) = &node.pool {
+                pool.set_election_id(election_id);
+            }
+        }
+
         let now_ts = self.clock.now();
         let cache_expired = self.cache_refresh_secs > 0
             && now_ts.saturating_sub(self.cache_refreshed_at) >= self.cache_refresh_secs;
