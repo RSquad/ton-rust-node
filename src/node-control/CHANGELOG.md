@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Past-elections cache refreshed periodically** — the elections runner now refreshes its past-elections and pool-address caches on a TTL instead of only invalidating when the election round changes. Prevents a stale snapshot from a lagging RPC endpoint from persisting for an entire round and distorting frozen-stake accounting.
+- **Nominator Pool active slot stays the same for the whole election cycle** — for two-pool Nominator Pool setups, the router could switch to the idle sibling pool a few minutes after stake submission once the pool-address cache refreshed, so subsequent balance and stake-recovery lookups acted on the wrong pool. The active slot is now pinned to the cycle being serviced and stays consistent until the next election cycle.
+- **Nominator Pool: skip redundant validator-set update transactions** — the contracts task no longer sends `update_validator_set` to a Nominator Pool when the on-chain validator set has not changed since the last update. Removes a no-op masterchain transaction on every automation tick.
 
 ## [0.5.0] - 2026-05-18
 
