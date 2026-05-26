@@ -1502,12 +1502,6 @@ impl Engine {
             load_cell_from_db_time_nanos: create_metric_with_total_average(
                 "NODE cell load time from db, nanos",
             ),
-            load_cell_from_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell load time from cache, nanos",
-            ),
-            store_cell_to_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell store time to cache, nanos",
-            ),
             stored_new_cells: create_metric_per_sec("NODE stored new cells & counters/sec"),
             deleted_cells: create_metric_per_sec("NODE deleted cells & counters/sec"),
 
@@ -1564,7 +1558,7 @@ impl Engine {
             cells: create_metric("Alloc NODE cells"),
             cells_mb: create_metric("Alloc NODE cells, MB"),
             arena_cells: create_metric("Alloc NODE arena cells"),
-            arena_bytes_mb: create_metric("Alloc NODE arena bytes, MB"),
+            arena_bytes_mb: create_metric("Alloc NODE arena size, MB"),
             jemalloc_allocated_mb: create_metric("Alloc NODE jemalloc allocated, MB"),
             jemalloc_resident_mb: create_metric("Alloc NODE jemalloc resident, MB"),
             jemalloc_mapped_mb: create_metric("Alloc NODE jemalloc mapped, MB"),
@@ -1586,8 +1580,6 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells_from_db.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_db_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_cache_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.store_cell_to_cache_time_nanos.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.stored_new_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.deleted_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_counters.clone()),

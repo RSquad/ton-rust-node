@@ -59,59 +59,50 @@ impl RocksDb {
         let mut spec_cf_opts = spec_cf_opts.into().unwrap_or_default();
         let options = Self::build_db_options();
 
-        let mut iteration = 1;
-        loop {
-            let cfs =
-                DBWithThreadMode::<MultiThreaded>::list_cf(&options, &path).unwrap_or_default();
+        let cfs = DBWithThreadMode::<MultiThreaded>::list_cf(&options, &path).unwrap_or_default();
 
-            log::info!(
-                target: TARGET,
-                "Opening DB {} (mode: {:?}) with {} cfs (iteration {})",
-                name, access_type, cfs.len(), iteration
-            );
-            iteration += 1;
+        log::info!(
+            target: TARGET,
+            "Opening DB {} (mode: {:?}) with {} cfs",
+            name, access_type, cfs.len()
+        );
 
-            let cfs_opt = cfs.clone().into_iter().map(|cf| {
-                let opt = spec_cf_opts.remove(&cf).unwrap_or_default();
-                rocksdb::ColumnFamilyDescriptor::new(cf, opt)
-            });
-            let db = match &access_type {
-                AccessType::ReadWrite => DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(
-                    &options, &path, cfs_opt,
-                )?,
-                AccessType::ReadOnly => {
-                    DBWithThreadMode::<MultiThreaded>::open_cf_descriptors_read_only(
-                        &options, &path, cfs_opt, false,
-                    )?
-                }
-                AccessType::Secondary(secondary_path) => {
-                    DBWithThreadMode::<MultiThreaded>::open_cf_descriptors_as_secondary(
-                        &options,
-                        &path,
-                        secondary_path,
-                        cfs_opt,
-                    )?
-                }
-            };
-
-            // Clean up CF from old archives
-            if !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
-                && cfs.len() > 100
-                && iteration <= 3
-                && Self::clean_up_old_cf(&db, &cfs)
-                    .map_err(|e| error!("Error while clean_up_old_cf: {}", e))?
-            {
-                drop(db);
-                continue;
+        let cfs_opt = cfs.clone().into_iter().map(|cf| {
+            let opt = spec_cf_opts.remove(&cf).unwrap_or_default();
+            rocksdb::ColumnFamilyDescriptor::new(cf, opt)
+        });
+        let db = match &access_type {
+            AccessType::ReadWrite => {
+                DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&options, &path, cfs_opt)?
             }
+            AccessType::ReadOnly => {
+                DBWithThreadMode::<MultiThreaded>::open_cf_descriptors_read_only(
+                    &options, &path, cfs_opt, false,
+                )?
+            }
+            AccessType::Secondary(secondary_path) => {
+                DBWithThreadMode::<MultiThreaded>::open_cf_descriptors_as_secondary(
+                    &options,
+                    &path,
+                    secondary_path,
+                    cfs_opt,
+                )?
+            }
+        };
 
-            let db = Self {
-                db: Some(db),
-                locks: lockfree::map::Map::new(),
-                caches: Mutex::new(Vec::new()),
-            };
-            return Ok(Arc::new(db));
+        // Clean up CFs from old archives in-place.
+        if !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
+            && cfs.len() > 100
+        {
+            Self::clean_up_old_cf(&db, &cfs)
+                .map_err(|e| error!("Error while clean_up_old_cf: {}", e))?;
         }
+
+        Ok(Arc::new(Self {
+            db: Some(db),
+            locks: lockfree::map::Map::new(),
+            caches: Mutex::new(Vec::new()),
+        }))
     }
 
     fn build_db_options() -> Options {
