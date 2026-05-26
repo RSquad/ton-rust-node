@@ -32,19 +32,9 @@ const WALLET_GAS: u64 = 100_000_000; // 0.1 TON
 /// Masterchain gas prices are ~25x basechain; 0.1 TON is not enough
 /// for load_data + get_current_validator_set + cell_hash + save_data.
 const POOL_OP_GAS: u64 = 500_000_000; // 0.5 TON
-/// Fallback op6 rate limit when validator-set hash is unavailable.
+/// Minimum interval between op6 sends to the same pool (fallback when p34 unavailable,
+/// and de-duplication while a previous op6 is still in flight).
 const UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC: u64 = 10 * 60;
-
-#[derive(Clone, Copy)]
-enum VsetHashState {
-    Unknown,
-    Available([u8; 32]),
-    Unavailable,
-}
-
-fn fallback_update_key(node_id: &str, pool_addr: &MsgAddressInt) -> String {
-    format!("{node_id}:{pool_addr}")
-}
 
 pub(crate) async fn run(
     cancellation_ctx: CancellationCtx,
@@ -61,7 +51,7 @@ pub(crate) async fn run(
         wallets,
         rpc_client,
         runtime_cfg,
-        fallback_update_sent_at: HashMap::new(),
+        last_update_sent_at: HashMap::new(),
     };
     monitor.run_loop(cancellation_ctx).await
 }
@@ -72,7 +62,8 @@ struct ContractsMonitor {
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     rpc_client: Arc<ClientJsonRpc>,
     runtime_cfg: Arc<dyn RuntimeConfig>,
-    fallback_update_sent_at: HashMap<String, u64>,
+    /// Last op6 broadcast time per node and pool address (no string formatting on lookup).
+    last_update_sent_at: HashMap<String, HashMap<MsgAddressInt, u64>>,
 }
 
 impl ContractsMonitor {
@@ -501,12 +492,33 @@ impl ContractsMonitor {
     /// not the master wallet — by staking time that wallet is deployed and typically topped up.
     ///
     /// Skips op 6 when config param 34 cell hash matches the pool's `saved_validator_set_hash`
-    /// (same check as on-chain op 6).
+    /// (same check as on-chain op 6). When config param 34 cannot be fetched, falls back to a
+    /// per-pool rate-limited send every `UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC`.
     async fn ensure_pool_validator_sets_updated(&mut self) -> anyhow::Result<bool> {
         let provider = contract_provider!(self.rpc_client.clone());
         let mut all_updated = true;
-        let mut vset_hash_state = VsetHashState::Unknown;
-        let now = time_format::now();
+
+        // Fetch once per tick. None → fall back to per-pool rate-limited send.
+        let current_vset_hash: Option<[u8; 32]> = match self
+            .rpc_client
+            .get_config_param_cell(34)
+            .await
+        {
+            Ok(cell) => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(cell.repr_hash().as_slice());
+                Some(hash)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "contracts",
+                    "update_validator_set: config param 34 unavailable, proceeding with rate-limited fallback: {:#}",
+                    e
+                );
+                None
+            }
+        };
+
         for (node_id, pool_binding) in
             self.pools.iter().filter(|(_, b)| b.pool_kind() == PoolKind::TONCore)
         {
@@ -528,7 +540,6 @@ impl ContractsMonitor {
 
             for pool in pool_binding.inner_pools() {
                 let pool_addr = pool.address().await?;
-                let fallback_key = fallback_update_key(node_id, &pool_addr);
                 let pool_data = match pool.get_pool_data().await {
                     Ok(d) => d,
                     Err(e) => {
@@ -551,31 +562,9 @@ impl ContractsMonitor {
                     continue;
                 }
 
-                let current_hash = match vset_hash_state {
-                    VsetHashState::Available(hash) => Some(hash),
-                    VsetHashState::Unavailable => None,
-                    VsetHashState::Unknown => match self.rpc_client.get_config_param_cell(34).await
-                    {
-                        Ok(cell) => {
-                            let mut hash = [0u8; 32];
-                            hash.copy_from_slice(cell.repr_hash().as_slice());
-                            vset_hash_state = VsetHashState::Available(hash);
-                            Some(hash)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "contracts",
-                                "update_validator_set: config param 34 unavailable, proceeding with rate-limited fallback: {:#}",
-                                e
-                            );
-                            vset_hash_state = VsetHashState::Unavailable;
-                            None
-                        }
-                    },
-                };
-
-                if let Some(current_hash) = current_hash {
-                    if current_hash == pool_data.saved_validator_set_hash {
+                // Decide skip vs. send. Falling out of this block means "send".
+                if let Some(current) = current_vset_hash {
+                    if current == pool_data.saved_validator_set_hash {
                         tracing::debug!(
                             target: "contracts",
                             "[{}] skip update_validator_set: pool={}, vsc_count={}, validator set unchanged",
@@ -585,25 +574,25 @@ impl ContractsMonitor {
                         );
                         continue;
                     }
-                } else {
-                    if let Some(last_sent_at) =
-                        self.fallback_update_sent_at.get(&fallback_key).copied()
-                    {
-                        if now.saturating_sub(last_sent_at)
-                            < UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC
-                        {
-                            tracing::debug!(
-                                target: "contracts",
-                                "[{}] skip fallback update_validator_set: pool={}, vsc_count={}, sent {}s ago",
-                                node_id,
-                                pool_addr,
-                                pool_data.validator_set_changes_count,
-                                now.saturating_sub(last_sent_at),
-                            );
-                            // Pool still needs update_validator_set, but fallback is rate-limited.
-                            all_updated = false;
-                            continue;
-                        }
+                } else if let Some(last_sent_at) = self
+                    .last_update_sent_at
+                    .get(node_id)
+                    .and_then(|by_pool| by_pool.get(&pool_addr))
+                    .copied()
+                {
+                    let now = time_format::now();
+                    let elapsed = now.saturating_sub(last_sent_at);
+                    if elapsed < UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC {
+                        tracing::debug!(
+                            target: "contracts",
+                            "[{}] skip fallback update_validator_set: pool={}, vsc_count={}, sent {}s ago",
+                            node_id,
+                            pool_addr,
+                            pool_data.validator_set_changes_count,
+                            elapsed,
+                        );
+                        all_updated = false;
+                        continue;
                     }
                 }
 
@@ -638,9 +627,10 @@ impl ContractsMonitor {
                     )
                     .await?;
                 self.broadcast(&msg).await?;
-                if matches!(vset_hash_state, VsetHashState::Unavailable) {
-                    self.fallback_update_sent_at.insert(fallback_key, now);
-                }
+                self.last_update_sent_at
+                    .entry(node_id.clone())
+                    .or_default()
+                    .insert(pool_addr.clone(), time_format::now());
                 seqno = Some(current_seqno + 1);
                 all_updated = false;
             }
@@ -651,9 +641,7 @@ impl ContractsMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ContractsMonitor, UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC, fallback_update_key,
-    };
+    use super::{ContractsMonitor, UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC};
     use crate::runtime_config::RuntimeConfig;
     use axum::{Json, Router, extract::State, routing::post};
     use base64::Engine;
@@ -1056,7 +1044,7 @@ mod tests {
             wallets,
             rpc_client,
             runtime_cfg: Arc::new(CfgRuntime(test_app_config())) as Arc<dyn RuntimeConfig>,
-            fallback_update_sent_at: HashMap::new(),
+            last_update_sent_at: HashMap::new(),
         }
     }
 
@@ -1171,8 +1159,8 @@ mod tests {
 
         // Simulate passage of fallback interval and verify the next call is allowed.
         let pool_addr = addr(4);
-        monitor.fallback_update_sent_at.insert(
-            fallback_update_key("node-a", &pool_addr),
+        monitor.last_update_sent_at.entry("node-a".to_string()).or_default().insert(
+            pool_addr,
             time_format::now().saturating_sub(UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC + 1),
         );
         let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
