@@ -456,11 +456,10 @@ impl DynamicBocDb {
                 transaction.delete_cf(&cells_cf, id.as_slice());
                 transaction.delete_cf(&counters_cf, id.as_slice());
                 deleted += 1;
-                deleted_cells.push(id.clone());
             } else {
                 transaction.put_cf(&counters_cf, id.as_slice(), refs.to_le_bytes());
-                self.set_cached_counter(id, refs);
             };
+            deleted_cells.push((id.clone(), refs));
         }
         #[cfg(feature = "telemetry")]
         let tr_build_time = now2.elapsed().as_micros();
@@ -476,9 +475,13 @@ impl DynamicBocDb {
         let tr_commit_time = now3.elapsed().as_micros();
 
         // Counter and cell caches are flushed only after the DB commit succeeds.
-        for id in deleted_cells.iter() {
-            self.cell_db.remove_from_cache(id);
-            self.cell_counter_cache.remove(id);
+        for (id, refs) in deleted_cells.iter() {
+            if *refs == 0 {
+                self.cell_db.remove_from_cache(id);
+                self.cell_counter_cache.remove(id);
+            } else {
+                self.set_cached_counter(id, *refs);
+            }
         }
         #[cfg(feature = "telemetry")]
         let total_time = now.elapsed().as_micros() as u64;
