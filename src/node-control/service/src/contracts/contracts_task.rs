@@ -600,6 +600,8 @@ impl ContractsMonitor {
                                 pool_data.validator_set_changes_count,
                                 now.saturating_sub(last_sent_at),
                             );
+                            // Pool still needs update_validator_set, but fallback is rate-limited.
+                            all_updated = false;
                             continue;
                         }
                     }
@@ -1176,6 +1178,33 @@ mod tests {
         let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
         let third_calls = server.send_boc_calls.load(Ordering::Relaxed);
         assert_eq!(third_calls, 2);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_marks_not_ready_when_fallback_is_rate_limited() {
+        let server =
+            MockRpcServer::start_with_config_param_mode("active", 0, Cell::default(), true).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding([0u8; 32]))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+
+        // First call sends fallback op6 and records the timestamp.
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        // Second call is rate-limited fallback: no send, but still should report not-ready.
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        assert!(!all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
 
         server.shutdown().await;
     }
