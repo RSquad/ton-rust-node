@@ -26,6 +26,8 @@ utoipa = "4"
 axum = "0.8"
 jsonwebtoken = "9"
 base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 mockall = "0.13"

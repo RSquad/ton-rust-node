@@ -1,0 +1,28 @@
+/*
+ * Copyright (C) 2025-2026 RSquad Blockchain Lab.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See the LICENSE file in the root of this repository.
+ *
+ * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ */
+use crate::audit::enums::{AuditActorKind, AuditSubjectKind};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditActor {
+    pub kind: AuditActorKind,
+    pub id: Option<String>,
+    pub role: Option<String>,
+    pub ip: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditSubject {
+    pub kind: AuditSubjectKind,
+    pub id: Option<String>,
+    pub election_id: Option<u64>, // first-class for hot filtering
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+}

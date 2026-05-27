@@ -6,12 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-pub mod audit;
-pub mod auth;
-pub mod contracts;
-pub mod elections;
-pub mod http;
-pub mod runtime_config;
-pub mod service_main_task;
-pub mod task;
-pub mod voting;
+pub mod config;
+pub mod enums;
+pub mod event;
+pub mod participant;

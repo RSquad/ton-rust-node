@@ -4930,6 +4930,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "common",
  "contracts",
  "control-client",
@@ -4947,6 +4948,7 @@ dependencies = [
  "tower",
  "tracing",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]
