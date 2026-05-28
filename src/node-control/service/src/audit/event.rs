@@ -7,14 +7,14 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::audit::{
-    enums::{AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, AuditSubjectKind},
+    enums::{AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource},
     participant::{AuditActor, AuditSubject},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub schema_version: u16,
     pub id: Uuid,
@@ -24,6 +24,7 @@ pub struct AuditEvent {
     pub outcome: AuditOutcome,
     pub actor: AuditActor,
     pub subject: AuditSubject,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(flatten)]
     pub payload: AuditEventPayload,
@@ -34,7 +35,7 @@ mod tests {
     use super::*;
     use crate::audit::{
         config::AuditLogConfig,
-        enums::{AuditActorKind, AuditEventPayload, StakeSkipReason},
+        enums::{AuditActorKind, AuditEventPayload, AuditSubjectKind, StakeSkipReason},
     };
     use serde_json::{Value, json};
     use std::{collections::BTreeMap, path::PathBuf};
@@ -78,6 +79,7 @@ mod tests {
             },
             message: None,
             payload: AuditEventPayload::ElectionsStakeSubmitted {
+                election_id: 1_779_265_552,
                 stake_nanotons: "50000000000000".into(),
                 max_factor: 196_608,
                 policy: "adaptive_split50".into(),
@@ -96,18 +98,16 @@ mod tests {
                 "outcome": "success",
                 "actor": {
                     "kind": "service",
-                    "id": "elections-task",
-                    "role": null,
-                    "ip": null
+                    "id": "elections-task"
                 },
                 "subject": {
                     "kind": "node",
                     "id": "node1",
                     "election_id": 1779265552
                 },
-                "message": null,
                 "event_type": "elections.stake_submitted",
                 "data": {
+                    "election_id": 1779265552,
                     "stake_nanotons": "50000000000000",
                     "max_factor": 196608,
                     "policy": "adaptive_split50",
@@ -140,6 +140,7 @@ mod tests {
             },
             message: None,
             payload: AuditEventPayload::ElectionsStakeSkipped {
+                election_id: 1_779_265_552,
                 reason: StakeSkipReason::LowWalletBalance,
                 required_nanotons: Some("1200000000".into()),
                 available_nanotons: Some("900000000".into()),
@@ -157,18 +158,16 @@ mod tests {
                 "outcome": "skipped",
                 "actor": {
                     "kind": "service",
-                    "id": "elections-task",
-                    "role": null,
-                    "ip": null
+                    "id": "elections-task"
                 },
                 "subject": {
                     "kind": "node",
                     "id": "node6",
                     "election_id": 1779265552
                 },
-                "message": null,
                 "event_type": "elections.stake_skipped",
                 "data": {
+                    "election_id": 1779265552,
                     "reason": "low_wallet_balance",
                     "required_nanotons": "1200000000",
                     "available_nanotons": "900000000"
@@ -220,15 +219,12 @@ mod tests {
                 "actor": {
                     "kind": "user",
                     "id": "admin",
-                    "role": "operator",
-                    "ip": null
+                    "role": "operator"
                 },
                 "subject": {
                     "kind": "config",
-                    "id": "elections",
-                    "election_id": null
+                    "id": "elections"
                 },
-                "message": null,
                 "event_type": "rest_api.config_updated",
                 "data": {
                     "operation": "elections.wait_updated",
@@ -262,23 +258,38 @@ mod tests {
     }
 
     fn all_payload_variants() -> Vec<AuditEventPayload> {
+        const ELECTION_ID: u64 = 1_779_265_552;
         vec![
-            AuditEventPayload::ElectionsTickStarted { election_id: 1 },
-            AuditEventPayload::ElectionsTickCompleted { election_id: 1, duration_ms: 42 },
-            AuditEventPayload::ElectionsTickFailed { election_id: Some(1), error: "boom".into() },
+            AuditEventPayload::ElectionsKeyGenerated {
+                election_id: ELECTION_ID,
+                pubkey: Some("aabb".into()),
+            },
             AuditEventPayload::ElectionsStakeSubmitted {
+                election_id: ELECTION_ID,
                 stake_nanotons: "1".into(),
                 max_factor: 1,
                 policy: "all".into(),
                 submission_time: 1,
             },
+            AuditEventPayload::ElectionsStakeAccepted {
+                election_id: ELECTION_ID,
+                stake_nanotons: "50000000000000".into(),
+            },
             AuditEventPayload::ElectionsStakeSkipped {
+                election_id: ELECTION_ID,
                 reason: StakeSkipReason::WithdrawRequestsPending,
                 required_nanotons: None,
                 available_nanotons: None,
             },
-            AuditEventPayload::ElectionsWithdrawProcessed { tx_hash: "abc".into() },
-            AuditEventPayload::ElectionsWithdrawProcessFailed { error: "oops".into() },
+            AuditEventPayload::ElectionsWithdrawProcessed {
+                election_id: ELECTION_ID,
+                tx_hash: "abc".into(),
+            },
+            AuditEventPayload::ElectionsStakeRecovered {
+                election_id: ELECTION_ID,
+                amount_nanotons: "50000000000000".into(),
+                tx_hash: Some("def".into()),
+            },
             AuditEventPayload::RestApiConfigUpdated {
                 operation: "patch".into(),
                 changes: json!({ "path": "/v1/elections/settings" }),
@@ -302,11 +313,9 @@ mod tests {
     fn round_trip_all_variants() {
         for payload in all_payload_variants() {
             let event = sample_event(payload);
-            let expected = serde_json::to_value(&event).expect("serialize");
-            let json = serde_json::to_string(&event).expect("serialize string");
+            let json = serde_json::to_string(&event).expect("serialize");
             let restored: AuditEvent = serde_json::from_str(&json).expect("deserialize");
-            let actual = serde_json::to_value(&restored).expect("reserialize");
-            assert_eq!(expected, actual, "json: {json}");
+            assert_eq!(event, restored, "json: {json}");
         }
     }
 
@@ -327,7 +336,10 @@ mod tests {
                 labels: BTreeMap::new(),
             },
             message: None,
-            payload: AuditEventPayload::ElectionsTickStarted { election_id: 1 },
+            payload: AuditEventPayload::ElectionsWithdrawProcessed {
+                election_id: 1_779_265_552,
+                tx_hash: "abc".into(),
+            },
         };
 
         let value = serde_json::to_value(&event).expect("serialize");

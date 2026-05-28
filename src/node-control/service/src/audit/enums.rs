@@ -8,39 +8,49 @@
  */
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditEventPayload {
-    #[serde(rename = "elections.tick_started")]
-    ElectionsTickStarted { election_id: u64 },
-
-    #[serde(rename = "elections.tick_completed")]
-    ElectionsTickCompleted { election_id: u64, duration_ms: u64 },
-
-    #[serde(rename = "elections.tick_failed")]
-    ElectionsTickFailed { election_id: Option<u64>, error: String },
+    #[serde(rename = "elections.key_generated")]
+    ElectionsKeyGenerated {
+        election_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pubkey: Option<String>,
+    },
 
     #[serde(rename = "elections.stake_submitted")]
     ElectionsStakeSubmitted {
+        election_id: u64,
         stake_nanotons: String,
         max_factor: u32,
         policy: String,
         submission_time: u64,
     },
 
+    #[serde(rename = "elections.stake_accepted")]
+    ElectionsStakeAccepted { election_id: u64, stake_nanotons: String },
+
     #[serde(rename = "elections.stake_skipped")]
     ElectionsStakeSkipped {
+        election_id: u64,
         reason: StakeSkipReason,
+        #[serde(skip_serializing_if = "Option::is_none")]
         required_nanotons: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         available_nanotons: Option<String>,
     },
 
     #[serde(rename = "elections.withdraw_processed")]
-    ElectionsWithdrawProcessed { tx_hash: String },
+    ElectionsWithdrawProcessed { election_id: u64, tx_hash: String },
 
-    #[serde(rename = "elections.withdraw_process_failed")]
-    ElectionsWithdrawProcessFailed { error: String },
+    #[serde(rename = "elections.stake_recovered")]
+    ElectionsStakeRecovered {
+        election_id: u64,
+        amount_nanotons: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tx_hash: Option<String>,
+    },
 
     #[serde(rename = "rest_api.config_updated")]
     RestApiConfigUpdated {
@@ -67,8 +77,9 @@ pub enum AuditEventPayload {
     SystemAuditEventsDropped { dropped_events: u64, reason: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StakeSkipReason {
     LowWalletBalance,
     WithdrawRequestsPending,
@@ -76,7 +87,7 @@ pub enum StakeSkipReason {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSource {
     Elections,
@@ -86,7 +97,7 @@ pub enum AuditSource {
     System,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSeverity {
     Debug,
@@ -95,7 +106,7 @@ pub enum AuditSeverity {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     Success,
@@ -103,7 +114,7 @@ pub enum AuditOutcome {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditActorKind {
     Service,
@@ -112,7 +123,7 @@ pub enum AuditActorKind {
     System,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSubjectKind {
     Node,

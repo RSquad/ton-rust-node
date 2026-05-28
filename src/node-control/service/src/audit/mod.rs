@@ -10,3 +10,11 @@ pub mod config;
 pub mod enums;
 pub mod event;
 pub mod participant;
+
+pub use config::AuditLogConfig;
+pub use enums::{
+    AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, AuditSubjectKind,
+    StakeSkipReason,
+};
+pub use event::AuditEvent;
+pub use participant::{AuditActor, AuditSubject};
