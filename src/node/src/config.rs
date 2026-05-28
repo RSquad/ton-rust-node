@@ -1028,6 +1028,7 @@ impl TonNodeConfig {
                 "skip_public_msg_send".to_string(),
                 serde_json::Value::Bool((&overlay.skip_public_msg_send).into()),
             );
+            map.insert("use_quic".to_string(), serde_json::Value::Bool((&overlay.use_quic).into()));
             list.push(serde_json::Value::Object(map));
         }
         let mut map = serde_json::Map::new();
@@ -1077,11 +1078,19 @@ impl TonNodeConfig {
         }
         let name = overlay_json.get_str("name")?.to_string();
         let skip_public_msg_send = overlay_json.get_bool("skip_public_msg_send")?;
+        // Optional: absent => false, but a present non-boolean is a config error.
+        let use_quic = match overlay_json.get_item("use_quic") {
+            Ok(value) => value
+                .as_bool()
+                .ok_or_else(|| error!("custom overlay `use_quic` must be boolean"))?,
+            Err(_) => false,
+        };
         let overlay = CustomOverlay {
             name,
             nodes,
             sender_shards,
             skip_public_msg_send: skip_public_msg_send.into(),
+            use_quic: use_quic.into(),
         };
         Ok(overlay)
     }

@@ -35,11 +35,13 @@ async fn test_custom_overlays_serde() -> Result<()> {
             }
             let name = format!("overlay_{}", UInt256::rand().to_hex_string());
             let skip_public_msg_send = rand::random::<bool>();
+            let use_quic = rand::random::<bool>();
             let overlay = CustomOverlay {
                 name,
                 nodes,
                 sender_shards,
                 skip_public_msg_send: skip_public_msg_send.into(),
+                use_quic: use_quic.into(),
             };
             overlays.push(overlay);
         }
