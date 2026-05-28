@@ -13,6 +13,7 @@ mod block_proof;
 mod boot;
 mod collator_test_bundle;
 mod config;
+mod confirmed_blocks;
 mod engine;
 mod engine_operations;
 mod engine_traits;

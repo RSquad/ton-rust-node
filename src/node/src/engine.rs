@@ -15,6 +15,7 @@ use crate::{
     config::{
         CollatorConfig, CollatorTestBundlesGeneralConfig, TonNodeConfig, ValidatorManagerConfig,
     },
+    confirmed_blocks::{ConfirmedBlockEvent, ConfirmedBlockEvents, ConfirmedBlockSource},
     engine_traits::{EngineAlloc, EngineOperations, PrivateOverlayOperations},
     ext_messages::MessagesPool,
     full_node::{
@@ -101,6 +102,7 @@ pub struct Engine {
     next_block_applying_awaiters: AwaitersPool<BlockIdExt, BlockIdExt>,
     download_block_awaiters: AwaitersPool<BlockIdExt, (BlockStuff, BlockProofStuff)>,
     external_messages: Arc<MessagesPool>,
+    confirmed_block_events: ConfirmedBlockEvents,
 
     servers: lockfree::queue::Queue<Box<dyn Stoppable>>,
     stopper: Arc<Stopper>,
@@ -699,6 +701,7 @@ impl Engine {
                 engine_allocated.clone(),
             ),
             external_messages: Arc::new(ext_messages_pool),
+            confirmed_block_events: ConfirmedBlockEvents::new(),
 
             servers: lockfree::queue::Queue::new(),
             stopper,
@@ -763,6 +766,10 @@ impl Engine {
 
     pub fn get_last_applied_mc_seqno(&self) -> u32 {
         self.last_applied_mc_block_seqno.load(Ordering::Relaxed)
+    }
+
+    pub fn confirmed_block_events(&self) -> ConfirmedBlockEvents {
+        self.confirmed_block_events.clone()
     }
 
     pub fn set_sync_status(&self, status: u32) {
@@ -1277,6 +1284,19 @@ impl Engine {
         )
         .await?;
 
+        if !id.shard().is_masterchain() {
+            let source = if pre_apply {
+                ConfirmedBlockSource::PRE_APPLIED
+            } else {
+                ConfirmedBlockSource::APPLIED
+            };
+            self.confirmed_block_events.notify(ConfirmedBlockEvent {
+                id: id.clone(),
+                data: block.data_arc(),
+                source,
+            });
+        }
+
         if !pre_apply {
             self.external_messages().push_applied_block(Arc::new(block.clone()));
         }
@@ -1482,12 +1502,6 @@ impl Engine {
             load_cell_from_db_time_nanos: create_metric_with_total_average(
                 "NODE cell load time from db, nanos",
             ),
-            load_cell_from_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell load time from cache, nanos",
-            ),
-            store_cell_to_cache_time_nanos: create_metric_with_total_average(
-                "NODE cell store time to cache, nanos",
-            ),
             stored_new_cells: create_metric_per_sec("NODE stored new cells & counters/sec"),
             deleted_cells: create_metric_per_sec("NODE deleted cells & counters/sec"),
 
@@ -1544,7 +1558,7 @@ impl Engine {
             cells: create_metric("Alloc NODE cells"),
             cells_mb: create_metric("Alloc NODE cells, MB"),
             arena_cells: create_metric("Alloc NODE arena cells"),
-            arena_bytes_mb: create_metric("Alloc NODE arena bytes, MB"),
+            arena_bytes_mb: create_metric("Alloc NODE arena size, MB"),
             jemalloc_allocated_mb: create_metric("Alloc NODE jemalloc allocated, MB"),
             jemalloc_resident_mb: create_metric("Alloc NODE jemalloc resident, MB"),
             jemalloc_mapped_mb: create_metric("Alloc NODE jemalloc mapped, MB"),
@@ -1566,8 +1580,6 @@ impl Engine {
             TelemetryItem::Metric(engine_telemetry.storage.shardstates_queue.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_cells_from_db.clone()),
             TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_db_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.load_cell_from_cache_time_nanos.clone()),
-            TelemetryItem::Metric(engine_telemetry.storage.store_cell_to_cache_time_nanos.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.stored_new_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.deleted_cells.clone()),
             TelemetryItem::MetricBuilder(engine_telemetry.storage.loaded_counters.clone()),

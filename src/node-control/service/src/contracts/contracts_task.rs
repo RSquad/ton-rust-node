@@ -11,6 +11,7 @@ use anyhow::Context;
 use common::{
     app_config::{AppConfig, ContractsAutomationConfig},
     task_cancellation::CancellationCtx,
+    time_format,
 };
 use contracts::{
     NominatorWrapper, PoolKind, TonWallet, contract_provider,
@@ -31,6 +32,9 @@ const WALLET_GAS: u64 = 100_000_000; // 0.1 TON
 /// Masterchain gas prices are ~25x basechain; 0.1 TON is not enough
 /// for load_data + get_current_validator_set + cell_hash + save_data.
 const POOL_OP_GAS: u64 = 500_000_000; // 0.5 TON
+/// Minimum interval between op6 sends to the same pool (fallback when p34 unavailable,
+/// and de-duplication while a previous op6 is still in flight).
+const UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC: u64 = 10 * 60;
 
 pub(crate) async fn run(
     cancellation_ctx: CancellationCtx,
@@ -41,7 +45,14 @@ pub(crate) async fn run(
     let pools = runtime_cfg.pools();
     let wallets = runtime_cfg.wallets();
     let rpc_client = runtime_cfg.rpc_client();
-    let monitor = ContractsMonitor { master_wallet, pools, wallets, rpc_client, runtime_cfg };
+    let mut monitor = ContractsMonitor {
+        master_wallet,
+        pools,
+        wallets,
+        rpc_client,
+        runtime_cfg,
+        last_update_sent_at: HashMap::new(),
+    };
     monitor.run_loop(cancellation_ctx).await
 }
 
@@ -51,6 +62,8 @@ struct ContractsMonitor {
     wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     rpc_client: Arc<ClientJsonRpc>,
     runtime_cfg: Arc<dyn RuntimeConfig>,
+    /// Last op6 broadcast time per node and pool address (no string formatting on lookup).
+    last_update_sent_at: HashMap<String, HashMap<MsgAddressInt, u64>>,
 }
 
 impl ContractsMonitor {
@@ -58,7 +71,7 @@ impl ContractsMonitor {
         self.runtime_cfg.get().automation.clone()
     }
 
-    async fn run_loop(&self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
+    async fn run_loop(&mut self, cancellation_ctx: CancellationCtx) -> anyhow::Result<()> {
         let mut cancel = cancellation_ctx.subscribe();
         let mut tick_secs = self.automation().tick_interval_sec.max(1);
         let mut ticker = time::interval(Duration::from_secs(tick_secs));
@@ -90,7 +103,7 @@ impl ContractsMonitor {
         }
     }
 
-    async fn run(&self) -> anyhow::Result<()> {
+    async fn run(&mut self) -> anyhow::Result<()> {
         let auto = self.automation();
         // Master is only needed for deploy/top-up paths. TonCore `update_validator_set` uses the
         // per-node validator wallet, so observe-only mode can run without a funded master.
@@ -477,14 +490,35 @@ impl ContractsMonitor {
     ///
     /// The message is sent from the **validator wallet** for the pool's node (`self.wallets[node_id]`),
     /// not the master wallet — by staking time that wallet is deployed and typically topped up.
-    async fn ensure_pool_validator_sets_updated(&self) -> anyhow::Result<bool> {
+    ///
+    /// Skips op 6 when config param 34 cell hash matches the pool's `saved_validator_set_hash`
+    /// (same check as on-chain op 6). When config param 34 cannot be fetched, falls back to a
+    /// per-pool rate-limited send every `UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC`.
+    async fn ensure_pool_validator_sets_updated(&mut self) -> anyhow::Result<bool> {
         let provider = contract_provider!(self.rpc_client.clone());
         let mut all_updated = true;
-        tracing::info!(
-            target: "contracts",
-            "ensure_pool_validator_sets_updated: checking {} nodes",
-            self.pools.len()
-        );
+
+        // Fetch once per tick. None → fall back to per-pool rate-limited send.
+        let current_vset_hash: Option<[u8; 32]> = match self
+            .rpc_client
+            .get_config_param_cell(34)
+            .await
+        {
+            Ok(cell) => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(cell.repr_hash().as_slice());
+                Some(hash)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "contracts",
+                    "update_validator_set: config param 34 unavailable, proceeding with rate-limited fallback: {:#}",
+                    e
+                );
+                None
+            }
+        };
+
         for (node_id, pool_binding) in
             self.pools.iter().filter(|(_, b)| b.pool_kind() == PoolKind::TONCore)
         {
@@ -528,6 +562,40 @@ impl ContractsMonitor {
                     continue;
                 }
 
+                // Decide skip vs. send. Falling out of this block means "send".
+                if let Some(current) = current_vset_hash {
+                    if current == pool_data.saved_validator_set_hash {
+                        tracing::debug!(
+                            target: "contracts",
+                            "[{}] skip update_validator_set: pool={}, vsc_count={}, validator set unchanged",
+                            node_id,
+                            pool_addr,
+                            pool_data.validator_set_changes_count,
+                        );
+                        continue;
+                    }
+                } else if let Some(last_sent_at) = self
+                    .last_update_sent_at
+                    .get(node_id)
+                    .and_then(|by_pool| by_pool.get(&pool_addr))
+                    .copied()
+                {
+                    let now = time_format::now();
+                    let elapsed = now.saturating_sub(last_sent_at);
+                    if elapsed < UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC {
+                        tracing::debug!(
+                            target: "contracts",
+                            "[{}] skip fallback update_validator_set: pool={}, vsc_count={}, sent {}s ago",
+                            node_id,
+                            pool_addr,
+                            pool_data.validator_set_changes_count,
+                            elapsed,
+                        );
+                        all_updated = false;
+                        continue;
+                    }
+                }
+
                 let current_seqno = match seqno {
                     Some(s) => s,
                     None => provider
@@ -549,7 +617,7 @@ impl ContractsMonitor {
                 let body = tc_messages::update_validator_set(0)?;
                 let msg = validator_wallet
                     .build_message(
-                        pool_addr,
+                        pool_addr.clone(),
                         POOL_OP_GAS,
                         body,
                         true,
@@ -559,6 +627,10 @@ impl ContractsMonitor {
                     )
                     .await?;
                 self.broadcast(&msg).await?;
+                self.last_update_sent_at
+                    .entry(node_id.clone())
+                    .or_default()
+                    .insert(pool_addr.clone(), time_format::now());
                 seqno = Some(current_seqno + 1);
                 all_updated = false;
             }
@@ -569,11 +641,18 @@ impl ContractsMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::ContractsMonitor;
+    use super::{ContractsMonitor, UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC};
     use crate::runtime_config::RuntimeConfig;
     use axum::{Json, Router, extract::State, routing::post};
-    use common::app_config::{AppConfig, ContractsAutomationConfig, HttpConfig, TonHttpApiConfig};
-    use contracts::{NominatorWrapper, SmartContract, TonWallet};
+    use base64::Engine;
+    use common::{
+        app_config::{AppConfig, ContractsAutomationConfig, HttpConfig, TonHttpApiConfig},
+        time_format,
+    };
+    use contracts::{
+        NominatorWrapper, PoolKind, SmartContract, TonWallet,
+        nominator::{NominatorRoles, PoolData},
+    };
     use secrets_vault::vault::SecretVault;
     use std::{
         collections::HashMap,
@@ -582,7 +661,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
     };
-    use ton_block::{Cell, MsgAddressInt, StateInit};
+    use ton_block::{Cell, MsgAddressInt, StateInit, write_boc};
     use ton_http_api_client::v2::client_json_rpc::ClientJsonRpc;
 
     /// Minimal [`RuntimeConfig`] for unit tests that only call `get()`.
@@ -642,6 +721,8 @@ mod tests {
     struct MockRpcState {
         account_state: &'static str,
         account_balance: u64,
+        config_param_cell: Cell,
+        fail_config_param: bool,
         send_boc_calls: Arc<AtomicUsize>,
     }
 
@@ -654,10 +735,35 @@ mod tests {
 
     impl MockRpcServer {
         async fn start(account_state: &'static str, account_balance: u64) -> Self {
+            Self::start_with_config_param(account_state, account_balance, Cell::default()).await
+        }
+
+        async fn start_with_config_param(
+            account_state: &'static str,
+            account_balance: u64,
+            config_param_cell: Cell,
+        ) -> Self {
+            Self::start_with_config_param_mode(
+                account_state,
+                account_balance,
+                config_param_cell,
+                false,
+            )
+            .await
+        }
+
+        async fn start_with_config_param_mode(
+            account_state: &'static str,
+            account_balance: u64,
+            config_param_cell: Cell,
+            fail_config_param: bool,
+        ) -> Self {
             let send_boc_calls = Arc::new(AtomicUsize::new(0));
             let state = MockRpcState {
                 account_state,
                 account_balance,
+                config_param_cell,
+                fail_config_param,
                 send_boc_calls: send_boc_calls.clone(),
             };
             let app = Router::new().route("/jsonRPC", post(mock_jsonrpc)).with_state(state);
@@ -715,6 +821,39 @@ mod tests {
                     "frozen_hash": "",
                     "sync_utime": 0,
                     "state": state.account_state
+                },
+                "jsonrpc": "2.0",
+                "id": id
+            }),
+            "getConfigParam" => {
+                if state.fail_config_param {
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "error": "forced getConfigParam failure",
+                        "code": 500,
+                        "jsonrpc": "2.0",
+                        "id": id
+                    }));
+                }
+                let boc = write_boc(&state.config_param_cell).expect("write config param boc");
+                let b64 = base64::engine::general_purpose::STANDARD.encode(boc);
+                serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "config": { "bytes": b64 }
+                    },
+                    "jsonrpc": "2.0",
+                    "id": id
+                })
+            }
+            "runGetMethod" => serde_json::json!({
+                "ok": true,
+                "result": {
+                    "gas_used": 0,
+                    "stack": [["num", 1]],
+                    "exit_code": 0,
+                    "last_transaction_id": null,
+                    "block_id": null
                 },
                 "jsonrpc": "2.0",
                 "id": id
@@ -790,6 +929,83 @@ mod tests {
         }
     }
 
+    struct MockTonCoreRouter {
+        inner: Vec<Arc<dyn NominatorWrapper>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SmartContract for MockTonCoreRouter {
+        async fn balance(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+
+        async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+            Ok(addr(10))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NominatorWrapper for MockTonCoreRouter {
+        async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {
+            unimplemented!("not used by contracts_task tests")
+        }
+
+        async fn get_pool_data(&self) -> anyhow::Result<PoolData> {
+            unimplemented!("router pool data is not used by contracts_task tests")
+        }
+
+        fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
+            self.inner.clone()
+        }
+
+        fn storage_reserve(&self) -> u64 {
+            0
+        }
+
+        fn pool_kind(&self) -> PoolKind {
+            PoolKind::TONCore
+        }
+    }
+
+    struct MockTonCorePool {
+        addr: MsgAddressInt,
+        data: PoolData,
+    }
+
+    #[async_trait::async_trait]
+    impl SmartContract for MockTonCorePool {
+        async fn balance(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+
+        async fn address(&self) -> anyhow::Result<MsgAddressInt> {
+            Ok(self.addr.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NominatorWrapper for MockTonCorePool {
+        async fn get_roles(&self) -> anyhow::Result<NominatorRoles> {
+            unimplemented!("not used by contracts_task tests")
+        }
+
+        async fn get_pool_data(&self) -> anyhow::Result<PoolData> {
+            Ok(self.data.clone())
+        }
+
+        fn inner_pools(&self) -> Vec<Arc<dyn NominatorWrapper>> {
+            vec![]
+        }
+
+        fn storage_reserve(&self) -> u64 {
+            0
+        }
+
+        fn pool_kind(&self) -> PoolKind {
+            PoolKind::TONCore
+        }
+    }
+
     fn addr(byte: u8) -> MsgAddressInt {
         MsgAddressInt::with_standart(None, -1, [byte; 32].into()).unwrap()
     }
@@ -799,14 +1015,194 @@ mod tests {
         master_wallet: Arc<dyn TonWallet>,
         wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
     ) -> ContractsMonitor {
-        let rpc_client = Arc::new(ClientJsonRpc::connect(rpc_url, None).unwrap());
+        build_monitor_with_pools(
+            rpc_url,
+            master_wallet,
+            wallets,
+            Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),
+        )
+    }
+
+    fn build_monitor_with_pools(
+        rpc_url: String,
+        master_wallet: Arc<dyn TonWallet>,
+        wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
+        pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
+    ) -> ContractsMonitor {
+        let rpc_client = Arc::new(
+            ClientJsonRpc::connect_many(
+                vec![(rpc_url, None)],
+                None,
+                common::app_config::EndpointTimeouts::default(),
+                common::app_config::FreshnessConfig::disabled(),
+            )
+            .unwrap(),
+        );
         ContractsMonitor {
             master_wallet,
-            pools: Arc::<HashMap<String, Arc<dyn NominatorWrapper>>>::default(),
+            pools,
             wallets,
             rpc_client,
             runtime_cfg: Arc::new(CfgRuntime(test_app_config())) as Arc<dyn RuntimeConfig>,
+            last_update_sent_at: HashMap::new(),
         }
+    }
+
+    fn toncore_pool_binding(saved_hash: [u8; 32]) -> Arc<dyn NominatorWrapper> {
+        let data = PoolData {
+            state: 2,
+            validator_set_changes_count: 0,
+            saved_validator_set_hash: saved_hash,
+            ..Default::default()
+        };
+        let pool: Arc<dyn NominatorWrapper> = Arc::new(MockTonCorePool { addr: addr(4), data });
+        Arc::new(MockTonCoreRouter { inner: vec![pool] })
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_skips_broadcast_when_hash_matches() {
+        let config_param_cell = Cell::default();
+        let mut current_hash = [0u8; 32];
+        current_hash.copy_from_slice(config_param_cell.repr_hash().as_slice());
+        let server = MockRpcServer::start_with_config_param("active", 0, config_param_cell).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding(current_hash))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        assert!(all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 0);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_broadcasts_when_hash_differs() {
+        let config_param_cell = Cell::default();
+        let mut current_hash = [0u8; 32];
+        current_hash.copy_from_slice(config_param_cell.repr_hash().as_slice());
+        let mut saved_hash = current_hash;
+        saved_hash[0] ^= 0xff;
+        let server = MockRpcServer::start_with_config_param("active", 0, config_param_cell).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding(saved_hash))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        assert!(!all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            monitor
+                .last_update_sent_at
+                .get("node-a")
+                .and_then(|by_pool| by_pool.get(&addr(4)))
+                .is_some(),
+            "send on Available branch must record last_update_sent_at"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_falls_back_when_config_param_unavailable() {
+        let server =
+            MockRpcServer::start_with_config_param_mode("active", 0, Cell::default(), true).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        // Equal hash would normally skip, but with missing p34 we fall back to sending op6.
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding([0u8; 32]))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        assert!(!all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_rate_limits_fallback_when_config_unavailable() {
+        let server =
+            MockRpcServer::start_with_config_param_mode("active", 0, Cell::default(), true).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding([0u8; 32]))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        let first_calls = server.send_boc_calls.load(Ordering::Relaxed);
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        let second_calls = server.send_boc_calls.load(Ordering::Relaxed);
+        assert_eq!(first_calls, 1);
+        assert_eq!(second_calls, 1);
+
+        // Simulate passage of fallback interval and verify the next call is allowed.
+        let pool_addr = addr(4);
+        monitor.last_update_sent_at.entry("node-a".to_string()).or_default().insert(
+            pool_addr,
+            time_format::now().saturating_sub(UPDATE_VALIDATOR_SET_FALLBACK_INTERVAL_SEC + 1),
+        );
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        let third_calls = server.send_boc_calls.load(Ordering::Relaxed);
+        assert_eq!(third_calls, 2);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_pool_validator_sets_updated_marks_not_ready_when_fallback_is_rate_limited() {
+        let server =
+            MockRpcServer::start_with_config_param_mode("active", 0, Cell::default(), true).await;
+
+        let wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(3), state_init: Some(StateInit::default()) });
+        let wallets = Arc::new(HashMap::from([("node-a".to_string(), wallet.clone())]));
+        let pools =
+            Arc::new(HashMap::from([("node-a".to_string(), toncore_pool_binding([0u8; 32]))]));
+        let master_wallet: Arc<dyn TonWallet> =
+            Arc::new(DummyWallet { addr: addr(9), state_init: Some(StateInit::default()) });
+
+        let mut monitor =
+            build_monitor_with_pools(server.url.clone(), master_wallet, wallets, pools);
+
+        // First call sends fallback op6 and records the timestamp.
+        let _ = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+
+        // Second call is rate-limited fallback: no send, but still should report not-ready.
+        let all_updated = monitor.ensure_pool_validator_sets_updated().await.unwrap();
+        assert!(!all_updated);
+        assert_eq!(server.send_boc_calls.load(Ordering::Relaxed), 1);
+
+        server.shutdown().await;
     }
 
     #[tokio::test]

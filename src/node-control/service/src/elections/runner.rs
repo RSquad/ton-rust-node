@@ -14,6 +14,7 @@ use super::{
 use anyhow::Context as _;
 use common::{
     app_config::{BindingStatus, ElectionsConfig, NodeBinding, StakePolicy},
+    clock::{Clock, SystemClock},
     snapshot::{
         ElectionsParticipantSnapshot, ElectionsSnapshot, ElectionsStatus, OurElectionParticipant,
         ParticipationStatus, SnapshotStore, StakeSubmission, TimeRange, ValidatorNodeSnapshot,
@@ -251,9 +252,12 @@ pub(crate) struct ElectionRunner {
     default_max_factor: f32,
     default_stake_policy: StakePolicy,
     past_elections: Vec<PastElections>,
-    /// Election ID for which `past_elections` and `cached_prev_min_eff` were fetched.
-    /// Used to avoid redundant RPC calls within the same election round.
+    /// Election ID the cache (past_elections + pool addresses) is keyed on.
     past_elections_cache_id: u64,
+    /// Unix timestamp of the last cache refresh.
+    cache_refreshed_at: u64,
+    /// Cache TTL; `0` disables the time-based refresh (only election_id changes invalidate).
+    cache_refresh_secs: u64,
     /// Cached prev_min_eff_stake computed from past_elections.
     cached_prev_min_eff: Option<u64>,
     // Snapshot cache updated during tick execution and published to SnapshotStore in run_loop().
@@ -265,6 +269,7 @@ pub(crate) struct ElectionRunner {
     /// Callback to persist freshly generated static ADNL addresses into runtime config.
     /// `None` in tests that don't care about persistence.
     persist_static_adnls: Option<PersistStaticAdnls>,
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Default)]
@@ -417,11 +422,19 @@ impl ElectionRunner {
             snapshot_cache: SnapshotCache::default(),
             past_elections: vec![],
             past_elections_cache_id: 0,
+            cache_refreshed_at: 0,
+            cache_refresh_secs: elections_config.cache_refresh_secs,
             cached_prev_min_eff: None,
             sleep_pct: elections_config.sleep_period_pct,
             waiting_pct: elections_config.waiting_period_pct,
             persist_static_adnls,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
     }
 
     pub async fn run_loop(
@@ -481,11 +494,17 @@ impl ElectionRunner {
         let cfg15 = self.election_parameters().await?;
         self.snapshot_cache.update_next_elections_range(&cfg15);
 
-        let election_id =
-            self.elector.get_active_election_id().await.context("get_active_election_id")?;
+        let election_id = self.elector.get_active_election_id().await?;
         if election_id == 0 {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Closed;
             tracing::info!("no active elections");
+            // Release the cycle pin on all pool routers — non-election callers that share the
+            // router via `Arc` should fall back to legacy state-based selection between cycles.
+            for node in self.nodes.values() {
+                if let Some(pool) = &node.pool {
+                    pool.set_election_id(0);
+                }
+            }
             return Ok(());
         }
         tracing::info!(
@@ -523,21 +542,26 @@ impl ElectionRunner {
 
         let mut skip_tick_nodes = vec![];
 
-        // Pool address cache must be valid before any branch that uses `stake_addr`/`pool_target`
-        // (the finished branch below included). TONCore router pool address changes per election
-        // cycle (the router alternates between two pools), so invalidate the cache on election_id
-        // transition. SNP pool addresses are stable but invalidating uniformly is cheap.
-        // Also covers elections-task restart: `past_elections_cache_id` is 0 after start, so the
-        // first tick lands here and re-resolves.
-        if self.past_elections_cache_id != election_id {
+        // Pin Nominator Pool to the current election cycle BEFORE any operation.
+        for node in self.nodes.values() {
+            if let Some(pool) = &node.pool {
+                pool.set_election_id(election_id);
+            }
+        }
+
+        let now_ts = self.clock.now();
+        let cache_expired = self.cache_refresh_secs > 0
+            && now_ts.saturating_sub(self.cache_refreshed_at) >= self.cache_refresh_secs;
+        let should_refresh_cache = self.past_elections_cache_id != election_id || cache_expired;
+        if should_refresh_cache {
             for node in self.nodes.values_mut() {
                 if node.pool.is_some() {
                     node.pool_addr_cache = None;
                 }
             }
         }
-        // Resolve pool address for any node where it isn't cached yet. On election_id transition
-        // the cache was just invalidated above; on other ticks this recovers from a transient
+        // Resolve pool address for any node where it isn't cached yet. On cache invalidation
+        // the cache was just cleared above; on other ticks this recovers from a transient
         // `pool.address()` failure (e.g. a `get_pool_data` parse error on TONCore).
         for (node_id, node) in self.nodes.iter_mut() {
             Self::resolve_pool_addr(node_id, node, &mut skip_tick_nodes).await;
@@ -578,14 +602,20 @@ impl ElectionRunner {
             self.snapshot_cache.last_elections_status = ElectionsStatus::Postponed;
         }
 
-        // Fetch past_elections only when election_id changes (cache across ticks).
-        if self.past_elections_cache_id != election_id {
+        if should_refresh_cache {
+            let reason =
+                if self.past_elections_cache_id != election_id { "election_id" } else { "ttl" };
             self.past_elections = self.elector.past_elections().await.context("past_elections")?;
             self.cached_prev_min_eff = self
                 .past_elections
                 .first()
                 .and_then(|pe| pe.frozen_map.values().min_by_key(|f| f.stake).map(|f| f.stake));
-
+            tracing::info!(
+                "past_elections cache refreshed: reason={}, entries={}, election_id={}",
+                reason,
+                self.past_elections.len(),
+                election_id
+            );
             if let Some(prev) = self.cached_prev_min_eff {
                 tracing::info!(
                     "prev_min_eff_stake from past elections: {} TON",
@@ -593,6 +623,7 @@ impl ElectionRunner {
                 );
             }
             self.past_elections_cache_id = election_id;
+            self.cache_refreshed_at = now_ts;
         }
 
         // walk through the nodes and try to participate in the elections
@@ -819,18 +850,20 @@ impl ElectionRunner {
         // If the elector already has our stake, mark it accepted early
         // so that `calc_stake` uses the correct current_stake (not 0).
         if let Some(participant) = participant.as_ref() {
-            tracing::info!(
-                "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
-                node_id,
-                display_tons(participant.stake),
-                hex::encode(&participant.wallet_addr),
-                hex::encode(participant.pub_key.as_slice()),
-                base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    participant.adnl_addr.as_slice(),
-                ),
-                participant.election_id
-            );
+            if !node.stake_accepted {
+                tracing::info!(
+                    "node [{}] stake found in elector: stake={} TON, sender_addr=-1:{}, pubkey={}, adnl={}, election_id={}",
+                    node_id,
+                    display_tons(participant.stake),
+                    hex::encode(&participant.wallet_addr),
+                    hex::encode(participant.pub_key.as_slice()),
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        participant.adnl_addr.as_slice(),
+                    ),
+                    participant.election_id
+                );
+            }
             node.stake_accepted = true;
             node.accepted_stake_amount = Some(participant.stake);
         }

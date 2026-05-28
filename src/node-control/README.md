@@ -529,6 +529,21 @@ nodectl config ton-http-api add \
   --endpoint "https://backup2.example/api/v2/jsonRpc"
 ```
 
+##### Endpoint priority
+
+Endpoints are tried **in the order they appear in the config**. The first entry is the primary and carries all traffic when healthy; subsequent entries are fallbacks used only on error or detected staleness. List endpoints in trust / freshness order — the most up-to-date or most-controlled endpoint goes first; lagging or less-trusted third-party endpoints belong later as fallbacks.
+
+##### Freshness probing
+
+Before each request the client lazily probes every endpoint it is about to use to verify it isn't lagging behind the chain. The probe runs `getMasterchainInfo` + `getBlockHeader`, then compares the block's `gen_utime` against wall-clock time. Endpoints whose chain view exceeds `freshness_max_lag_secs` are skipped; if **every** endpoint is stale the client returns a dedicated error (`is_endpoints_stale(err) == true`) instead of silently serving stale data.
+
+The probe is rate-limited: each endpoint is re-probed at most once per `freshness_probe_interval_secs`. Both values live under `ton_http_api` in the config file and there is no CLI command for them — edit the JSON directly. They are hot-reloaded with the rest of the config (file watch interval ≤10s).
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `ton_http_api.freshness_probe_interval_secs` | `30` | How often (seconds) the freshness probe runs per endpoint. |
+| `ton_http_api.freshness_max_lag_secs` | `60` | Maximum tolerated chain-tip lag (seconds) before the endpoint is treated as stale. |
+
 ---
 
 #### `config master-wallet`
@@ -2113,7 +2128,7 @@ In service mode, nodectl runs as a daemon, automatically executing tasks on sche
 2. **Get election parameters**
    - Configuration `#15` — election time parameters
    - Configuration `#34` — current validators
-   - Query `past_elections` to the Elector contract
+   - Query `past_elections` to the Elector contract (cached per election round; see [Cache refresh](#cache-refresh) below)
 
 3. **For each enabled binding:**
    - **Stake recovery** — check and request return of frozen stake
@@ -2144,6 +2159,19 @@ Each binding resolves its effective stake policy by checking for a per-node over
 > **TONCore nominator caveat.** `Split50` and `AdaptiveSplit50` are ignored on bindings backed by a TONCore nominator — the two pools stake in different rounds, so there is nothing to split. The runner stakes the full liquid balance of the selected pool instead (still floored at `min_stake`). Use `Fixed` or `Minimum` if you need to cap per-round exposure on TONCore.
 
 > **TONCore nominator: process pending withdraws before staking.** Every tick, the elections runner probes the active TONCore pool's `has_withdraw_requests` getter. When the queue is non-empty it sends `process_withdraw_requests` (op = 2, limit = 10, message value = 1 TON) between `recover_stake` and `participate`, then skips this tick's stake submission to let the pool drain; the next tick re-probes and either resends op = 2 (new requests appeared) or proceeds to stake. This frees up locked liquidity from nominators who already requested withdrawal so it does not get re-staked. The corresponding participant status surfaced in the snapshot is `processing_withdraw_requests`. The step is a no-op for SNP and direct staking.
+
+#### Cache refresh
+
+`past_elections` and pool addresses are cached per election round (the round can run for hours, so refetching every tick is wasteful). The cache is invalidated when:
+
+- `election_id` changes (new round), **or**
+- `elections.cache_refresh_secs` seconds elapsed since the last refresh.
+
+The TTL refresh defends against a stale snapshot cached for the entire round when the initial fetch hits a lagging RPC endpoint (a real incident on mainnet caused inflated `frozen_stake` until the next round). On each refresh the runner logs `past_elections cache refreshed (reason=election_id|ttl, entries=N, election_id=...)`.
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `elections.cache_refresh_secs` | `300` (5 min) | Set to `0` to disable the time-based refresh (only `election_id` changes invalidate). Config-file only; not exposed via REST. Picked up on next file reload (≤10s). |
 
 ### Logging
 

@@ -298,12 +298,6 @@ async fn pools_toncore_slot_with_no_address_is_not_deployed_with_config_fallback
 
 #[tokio::test]
 async fn pools_toncore_both_slots_with_addresses_rpc_unreachable() {
-    // Both slots have addresses but no live RPC. With the SMA-95 fix, the handler
-    // must surface this as 503 Service Unavailable carrying the upstream error,
-    // rather than silently returning slot rows with state="error".
-    // Use addresses that parse on every platform (MsgAddressInt::from_str
-    // rejects some short/zero forms) so the handler actually reaches the RPC
-    // call and the unreachable-upstream branch is exercised.
     let mut pools = HashMap::new();
     pools.insert(
         "core2".to_string(),
