@@ -3,7 +3,7 @@ build = '../common/build/build.rs'
 edition = '2021'
 license = 'GPL-3.0'
 name = 'node'
-version = '0.7.0'
+version = '0.8.0'
 
 [[bin]]
 name = 'adnl_resolve'
@@ -56,7 +56,7 @@ clap = { version = "4.5", features = ["derive"] }
 colored = '2.0'
 crossbeam-channel = '0.5'
 ctrlc = { features = ['termination'], version = '3.4' }
-dashmap = '5.4'
+dashmap = '6'
 deflate = '1.0'
 dirs = '2.0'
 enum-as-inner = '0.6'

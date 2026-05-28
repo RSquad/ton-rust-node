@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-05-25
+
+### Added
+
+- **Lagging JSON-RPC endpoint detection** — the ton-http-api client now checks endpoint freshness before each request by reading the masterchain tip and comparing its timestamp against wall-clock time. Endpoints whose chain view exceeds the configured lag threshold are skipped, preventing stale data from a lagging RPC from propagating into election decisions.
+
+### Changed
+
+- **Priority-based JSON-RPC endpoint failover** — the ton-http-api client now follows strict priority order instead of round-robin: the first configured endpoint is the primary and carries all traffic when healthy; subsequent entries are fallbacks used only on error or when the primary is detected as lagging.
+
+### Fixed
+
+- **Past-elections cache refreshed periodically** — the elections runner now refreshes its past-elections and pool-address caches on a TTL instead of only invalidating when the election round changes. Prevents a stale snapshot from a lagging RPC endpoint from persisting for an entire round and distorting frozen-stake accounting.
+- **Nominator Pool active slot stays the same for the whole election cycle** — for two-pool Nominator Pool setups, the router could switch to the idle sibling pool a few minutes after stake submission once the pool-address cache refreshed, so subsequent balance and stake-recovery lookups acted on the wrong pool. The active slot is now pinned to the cycle being serviced and stays consistent until the next election cycle.
+- **Nominator Pool: skip redundant validator-set update transactions** — the contracts task no longer sends `update_validator_set` to a Nominator Pool when the on-chain validator set has not changed since the last update. Removes a no-op masterchain transaction on every automation tick.
+
 ## [0.5.0] - 2026-05-18
 
 ### Added
@@ -23,9 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Static ADNL is now the default across elections** — previously nodectl generated a fresh ADNL address every election cycle. The new default aligns nodectl with the behavior of mytonctrl-managed C++ nodes, which reuse the same ADNL across all validation rounds; a single persistent ADNL address also enables fastsync for the Rust node. nodectl now generates and persists a static ADNL per node on the first election cycle and reuses it thereafter. Existing `elections.static_adnls` entries are honored unchanged. If a node's control server is briefly unreachable during generation, the rest of the nodes proceed normally and the failing one retries next tick. Use the new `--disable` flag (or `DELETE /v1/elections/static-adnl/{node}`) to opt a node back into pre-v0.5 per-cycle behavior.
 - **Nominator Pool: process pending withdraws before each new stake** — before submitting a new stake, the elections runner now checks the active TONCore pool for pending nominator withdraw requests. If any are queued, it triggers the pool to process them and skips staking for that tick so the pool can drain; the next tick re-checks and either continues draining or proceeds to stake. This frees up locked liquidity from nominators who already requested a withdrawal so it does not get re-staked. A new participant status `processing_withdraw_requests` is surfaced in `/v1/elections` and `/v1/validators` snapshots. No-op for SNP nominator pools and direct staking.
 - **Nominator Pool validator deposit fee is now added automatically** — `config pool deposit-validator` sends `stake + 1 TON processing fee` so the requested stake amount actually arrives at the pool. Previously operators had to account for the 1 TON fee themselves.
-- **`config pool ls` shows TONCore pools as `not deployed` instead of an RPC error** (SMA-55, #128) — when a TONCore pool contract is uninitialized or not yet on-chain, the row now reads `not deployed` and the configured pool parameters from local config are still shown so you can see the planned layout before deploy.
+- **`config pool ls` shows TONCore pools as `not deployed` instead of an RPC error** — when a TONCore pool contract is uninitialized or not yet on-chain, the row now reads `not deployed` and the configured pool parameters from local config are still shown so you can see the planned layout before deploy.
 - **Voting moved to the REST API** (SMA-85, #132) — config-proposal voting is now served by `GET /v1/voting/config`, `GET /v1/voting/proposals`, `GET /v1/voting/proposals/{hash}`, `POST /v1/voting/proposals`, `DELETE /v1/voting/proposals/{hash}` (reads available to nominators and operators; mutations operator-only). `nodectl vote ls|inspect|add|rm` is now a thin REST client and uses the same `--url` / token / config resolution as other REST commands — the service must be running, same as other `config` mutations since v0.4.0.
-- **`config wallet ls` always shows bounceable URL-safe base64 addresses** (SMA-84, #116) — table and JSON output stay consistent regardless of how the service serializes addresses internally.
+- **`config wallet ls` always shows bounceable URL-safe base64 addresses**  — table and JSON output stay consistent regardless of how the service serializes addresses internally.
 - **`--validator-share-percent` on `nodectl config pool add core`** — accept the Nominator Pool validator share as a human percent (e.g. `40`) instead of basis points.
 
 ### Fixed

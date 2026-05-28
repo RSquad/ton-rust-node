@@ -643,7 +643,13 @@ impl ShardStatesKeeper {
             let cf = self.db.cells_factory()?;
             let state = tokio::task::spawn_blocking(move || -> Result<Arc<ShardStateStuff>> {
                 let now = std::time::Instant::now();
-                let (root, _) = merkle_update.apply_with_factory(&prev_root, &cf)?;
+                let (root, _) = match merkle_update.apply_with_factory(&prev_root, &cf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::debug!("Error in merkle update apply while restoring state {id}: {e}");
+                        merkle_update.apply_for(&prev_root)?
+                    }
+                };
                 log::trace!(
                     "TIME: restore_state_recursive: applied Merkle update {}ms   {}",
                     now.elapsed().as_millis(),

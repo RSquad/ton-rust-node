@@ -243,6 +243,7 @@ impl RuntimeConfigStore {
                 app_config.ton_http_api.resolved_endpoints(),
                 app_config.ton_http_api.api_key.clone(),
                 app_config.ton_http_api.resolved_timeouts(),
+                app_config.ton_http_api.resolved_freshness(),
             )
             .unwrap(),
         );
@@ -462,6 +463,7 @@ impl RuntimeConfigStore {
                 resolved.clone(),
                 app_cfg.ton_http_api.api_key.clone(),
                 app_cfg.ton_http_api.resolved_timeouts(),
+                app_cfg.ton_http_api.resolved_freshness(),
             )
             .context("ton api connection error")?,
         );

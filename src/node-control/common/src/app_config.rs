@@ -37,6 +37,39 @@ fn default_ton_http_api_url() -> String {
 pub const DEFAULT_TON_HTTP_API_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// Default per-endpoint request timeout for ton-http-api calls (seconds).
 pub const DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS: u64 = 5;
+/// Default interval (seconds) between freshness probes for a single endpoint.
+pub const DEFAULT_FRESHNESS_PROBE_INTERVAL_SECS: u64 = 30;
+/// Default maximum masterchain block gen_utime lag (seconds) tolerated before an endpoint is treated as stale.
+pub const DEFAULT_FRESHNESS_MAX_LAG_SECS: u64 = 60;
+
+/// Per-endpoint freshness policy for the ton-http-api JSON-RPC client.
+#[derive(Copy, Clone, Debug)]
+pub struct FreshnessConfig {
+    /// Controls how often the client probes an endpoint's masterchain block
+    pub probe_interval_secs: u64,
+    /// Absolute age (now - block gen_utime) above which the endpoint is
+    /// considered stale and skipped.
+    pub max_lag_secs: u64,
+}
+
+impl Default for FreshnessConfig {
+    fn default() -> Self {
+        Self {
+            probe_interval_secs: DEFAULT_FRESHNESS_PROBE_INTERVAL_SECS,
+            max_lag_secs: DEFAULT_FRESHNESS_MAX_LAG_SECS,
+        }
+    }
+}
+
+impl FreshnessConfig {
+    /// Effectively disables probing: the probe interval never elapses and the lag
+    /// threshold is unreachable. Used in tests and code paths that must not depend
+    /// on `getMasterchainInfo`/`getBlockHeader` (e.g. lightweight CLI commands).
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self { probe_interval_secs: u64::MAX, max_lag_secs: u64::MAX }
+    }
+}
 
 /// Resolved per-endpoint timeouts for the ton-http-api JSON-RPC client.
 ///
@@ -121,6 +154,14 @@ pub struct TonHttpApiConfig {
     /// Defaults to [`DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS`] when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<u64>,
+    /// Interval (seconds) between freshness probes per endpoint.
+    /// Defaults to [`DEFAULT_FRESHNESS_PROBE_INTERVAL_SECS`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_probe_interval_secs: Option<u64>,
+    /// Maximum masterchain gen_utime lag (seconds) before an endpoint is treated as stale.
+    /// Defaults to [`DEFAULT_FRESHNESS_MAX_LAG_SECS`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_max_lag_secs: Option<u64>,
 }
 
 impl Default for TonHttpApiConfig {
@@ -131,6 +172,8 @@ impl Default for TonHttpApiConfig {
             api_key: None,
             connect_timeout_secs: None,
             request_timeout_secs: None,
+            freshness_probe_interval_secs: None,
+            freshness_max_lag_secs: None,
         }
     }
 }
@@ -193,6 +236,17 @@ impl TonHttpApiConfig {
             request: Duration::from_secs(
                 self.request_timeout_secs.unwrap_or(DEFAULT_TON_HTTP_API_REQUEST_TIMEOUT_SECS),
             ),
+        }
+    }
+
+    /// Returns the resolved freshness policy, filling in defaults for unset fields.
+    #[must_use]
+    pub fn resolved_freshness(&self) -> FreshnessConfig {
+        FreshnessConfig {
+            probe_interval_secs: self
+                .freshness_probe_interval_secs
+                .unwrap_or(DEFAULT_FRESHNESS_PROBE_INTERVAL_SECS),
+            max_lag_secs: self.freshness_max_lag_secs.unwrap_or(DEFAULT_FRESHNESS_MAX_LAG_SECS),
         }
     }
 }
@@ -652,6 +706,10 @@ fn default_sleep_pct() -> f64 {
     0.2
 }
 
+fn default_cache_refresh_secs() -> u64 {
+    300
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct ElectionsConfig {
     #[serde(default)]
@@ -684,6 +742,11 @@ pub struct ElectionsConfig {
     /// ephemeral ADNL address every cycle for them (pre-v0.5 behavior).
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub static_adnl_disabled: HashSet<String>,
+    /// TTL (seconds) for `past_elections` and pool-address caches. `0` disables the
+    /// time-based refresh (only election_id changes invalidate). Defends against
+    /// stale snapshots cached for the whole round after a bad initial fetch.
+    #[serde(default = "default_cache_refresh_secs")]
+    pub cache_refresh_secs: u64,
 }
 
 impl ElectionsConfig {
@@ -735,6 +798,7 @@ impl Default for ElectionsConfig {
             waiting_period_pct: default_waiting_pct(),
             static_adnls: HashMap::new(),
             static_adnl_disabled: HashSet::new(),
+            cache_refresh_secs: default_cache_refresh_secs(),
         }
     }
 }

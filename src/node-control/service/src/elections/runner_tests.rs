@@ -9,6 +9,7 @@
 use super::*;
 use common::{
     app_config::{ElectionsConfig, NodeBinding, StakePolicy},
+    clock::MockClock,
     snapshot::SnapshotStore,
     task_cancellation::{CancellationCtx, CancellationReason},
     time_format,
@@ -396,6 +397,7 @@ impl TestHarness {
                 waiting_period_pct: 0.3,
                 static_adnls: HashMap::new(),
                 static_adnl_disabled: HashSet::new(),
+                cache_refresh_secs: 300,
             },
             bindings: HashMap::new(),
             persisted_static_adnls: None,
@@ -1335,6 +1337,7 @@ async fn test_multiple_nodes_one_excluded() {
         waiting_period_pct: 0.3,
         static_adnls: HashMap::new(),
         static_adnl_disabled: HashSet::from(["node-1".to_string(), "node-2".to_string()]),
+        cache_refresh_secs: 300,
     };
 
     let mut bindings = HashMap::new();
@@ -1775,6 +1778,7 @@ async fn test_node_without_wallet_skipped() {
         waiting_period_pct: 0.3,
         static_adnls: HashMap::new(),
         static_adnl_disabled: HashSet::new(),
+        cache_refresh_secs: 300,
     };
 
     let mut bindings = HashMap::new();
@@ -2858,13 +2862,64 @@ async fn test_toncore_nominator_both_pools_busy_skips_elections() {
 
     let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
-    // Both pools busy → router's address() returns "no one pool is ready".
+    // Both pools busy → router's address() returns "no pool ready".
     // Node is excluded from the current tick; run() still succeeds.
     result.expect("run() should succeed — busy node is just skipped");
     assert_eq!(runner.past_elections_cache_id, ELECTION_ID);
     let node = runner.nodes.get(node_id).unwrap();
     assert!(node.pool_addr_cache.is_none());
     assert!(!node.stake_accepted);
+}
+
+/// Regression: once a pool has bid for the current cycle (`stake_at == election_id`), the
+/// router must keep returning that pool even after its `state` transitions away from `0`.
+/// Under the previous rule (`state == 0 || (state == 2 && vsc >= 2)`) the router would
+/// switch to the idle slot mid-cycle as soon as the cache was refreshed by the TTL.
+#[tokio::test]
+async fn test_toncore_nominator_active_slot_stable_after_stake_submission() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_toncore_nominator_pair();
+
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
+    setup_wallet(&mut harness.wallet_mock);
+    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
+
+    let (p0, p1) = harness.toncore_nominator_mocks.as_mut().unwrap();
+
+    // pool[0]: just submitted for the current cycle. state=2 (accepted), stake_at=ELECTION_ID.
+    // Under the old rule this pool would be skipped (state==2 && vsc==0 fails the second arm),
+    // and pool[1] (state==0) would be chosen instead — switching slots mid-cycle.
+    p0.expect_address().returning(|| Ok(pool_address()));
+    p0.expect_get_pool_data().returning(|| {
+        Ok(PoolData { state: 2, stake_at: ELECTION_ID as u32, ..Default::default() })
+    });
+    p0.expect_storage_reserve().returning(|| TONCORE_STORAGE_RESERVE);
+    p0.expect_pool_kind().returning(|| PoolKind::TONCore);
+    p0.expect_has_withdraw_requests().returning(|| Ok(false));
+
+    setup_toncore_nominator_slot(p1, pool_address_1(), 0);
+
+    let pool0_hex = hex::encode(POOL_ADDR);
+    harness.provider_mock.expect_account().returning(move |address| {
+        if address.contains(&pool0_hex) {
+            Ok(fake_account(POOL_BALANCE))
+        } else {
+            Ok(fake_account(WALLET_BALANCE))
+        }
+    });
+    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
+
+    let mut runner = harness.build(node_id).await;
+    let result = runner.run().await;
+    assert!(result.is_ok(), "run() failed: {:?}", result.err());
+
+    let node = runner.nodes.get(node_id).unwrap();
+    // Cached address must still point at pool[0] — the slot that owns the current cycle.
+    assert_eq!(
+        node.pool_addr_cache.as_ref().map(|a| a.to_string()),
+        Some(pool_address().to_string()),
+        "router must keep returning the cycle-owning slot after state goes 0→2"
+    );
 }
 
 #[tokio::test]
@@ -3460,7 +3515,7 @@ async fn test_static_adnl_auto_generated_when_missing() {
 }
 
 // =====================================================
-// TEST: static_adnl_disabled -> ephemeral path (new_adnl_addr) (SMA-87)
+// TEST: static_adnl_disabled -> ephemeral path (new_adnl_addr)
 // =====================================================
 
 #[tokio::test]
@@ -3490,7 +3545,7 @@ async fn test_static_adnl_disabled_uses_ephemeral() {
 }
 
 // =====================================================
-// TEST: failed generation aborts node's tick but other nodes proceed (SMA-87)
+// TEST: failed generation aborts node's tick but other nodes proceed
 // =====================================================
 
 #[tokio::test]
@@ -3533,4 +3588,184 @@ async fn test_static_adnl_generation_failure_aborts_node_only() {
     assert!(node.participant.is_none(), "no participant when ADNL generation failed");
     let saved = persisted.lock().unwrap();
     assert!(saved.is_empty(), "nothing should be persisted on failure");
+}
+
+// =====================================================
+// TTL-based cache refresh
+// =====================================================
+
+/// Like `setup_default_elector` but asserts an exact `past_elections()` call count.
+fn setup_elector_with_past_elections_times(
+    elector: &mut MockElectorWrapperImpl,
+    election_id: u64,
+    times: usize,
+) {
+    elector.expect_address().returning(|| Ok(elector_address()));
+    elector.expect_get_active_election_id().returning(move || Ok(election_id));
+    elector.expect_elections_info().returning(move || {
+        Ok(ElectionsInfo {
+            election_id,
+            elect_close: election_id - 300,
+            min_stake: MIN_STAKE,
+            total_stake: 0,
+            failed: false,
+            finished: false,
+            participants: vec![],
+        })
+    });
+    elector.expect_past_elections().times(times).returning(|| Ok(vec![]));
+    elector.expect_compute_returned_stake().returning(|_addr| Ok(0));
+}
+
+#[tokio::test]
+async fn cache_refetched_after_ttl_within_same_election() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.cache_refresh_secs = 60;
+
+    // Two ticks at the same election_id; TTL elapses between them → past_elections() twice.
+    setup_elector_with_past_elections_times(&mut harness.elector_mock, ELECTION_ID, 2);
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id).await;
+    let clock = MockClock::new(1_000);
+    runner.set_clock(Arc::new(clock.clone()));
+
+    let _ = runner.run().await;
+    clock.advance(61);
+    let _ = runner.run().await;
+}
+
+#[tokio::test]
+async fn cache_not_refetched_before_ttl() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.cache_refresh_secs = 60;
+
+    setup_elector_with_past_elections_times(&mut harness.elector_mock, ELECTION_ID, 1);
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id).await;
+    let clock = MockClock::new(1_000);
+    runner.set_clock(Arc::new(clock.clone()));
+
+    let _ = runner.run().await;
+    clock.advance(30);
+    let _ = runner.run().await;
+}
+
+#[tokio::test]
+async fn cache_refresh_disabled_when_ttl_zero() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.cache_refresh_secs = 0;
+
+    // Even with a huge clock jump the cache must not be refetched while election_id is stable.
+    setup_elector_with_past_elections_times(&mut harness.elector_mock, ELECTION_ID, 1);
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id).await;
+    let clock = MockClock::new(1_000);
+    runner.set_clock(Arc::new(clock.clone()));
+
+    let _ = runner.run().await;
+    clock.advance(86_400);
+    let _ = runner.run().await;
+}
+
+#[tokio::test]
+async fn ttl_refresh_invalidates_pool_address_cache() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new().with_pool();
+    harness.elections_config.cache_refresh_secs = 60;
+
+    setup_elector_with_past_elections_times(&mut harness.elector_mock, ELECTION_ID, 2);
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, Some(POOL_BALANCE));
+    setup_wallet(&mut harness.wallet_mock);
+
+    // Pool::address() must be queried again after TTL refresh — twice across two ticks.
+    let pool = harness.pool_mock.as_mut().unwrap();
+    pool.expect_address().times(2).returning(|| Ok(pool_address()));
+    pool.expect_inner_pools().returning(|| vec![]);
+    pool.expect_storage_reserve().returning(|| SNP_STORAGE_RESERVE);
+    pool.expect_pool_kind().returning(|| PoolKind::SNP);
+    pool.expect_has_withdraw_requests().returning(|| Ok(false));
+
+    let mut runner = harness.build(node_id).await;
+    let clock = MockClock::new(1_000);
+    runner.set_clock(Arc::new(clock.clone()));
+
+    let _ = runner.run().await;
+    assert!(runner.nodes.get(node_id).unwrap().pool_addr_cache.is_some());
+
+    clock.advance(61);
+    let _ = runner.run().await;
+    assert!(
+        runner.nodes.get(node_id).unwrap().pool_addr_cache.is_some(),
+        "pool address must be re-resolved after TTL expiry"
+    );
+}
+
+#[tokio::test]
+async fn cached_prev_min_eff_updates_on_refresh() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+    harness.elections_config.cache_refresh_secs = 60;
+
+    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
+    harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
+    harness.elector_mock.expect_elections_info().returning(|| {
+        Ok(ElectionsInfo {
+            election_id: ELECTION_ID,
+            elect_close: ELECTION_ID - 300,
+            min_stake: MIN_STAKE,
+            total_stake: 0,
+            failed: false,
+            finished: false,
+            participants: vec![],
+        })
+    });
+    harness.elector_mock.expect_compute_returned_stake().returning(|_addr| Ok(0));
+
+    let call_idx = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let call_idx_for_mock = call_idx.clone();
+    harness.elector_mock.expect_past_elections().times(2).returning(move || {
+        let n = call_idx_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stake = if n == 0 { 100_000 * NANO } else { 50_000 * NANO };
+        let mut frozen_map = HashMap::new();
+        frozen_map.insert(
+            [0xAA; 32],
+            FrozenParticipant { wallet_addr: [0xBB; 32], weight: 1, stake, banned: false },
+        );
+        Ok(vec![PastElections {
+            election_id: ELECTION_ID - 3600,
+            unfreeze_at: ELECTION_ID,
+            stake_held: 7200,
+            vset_hash: vec![],
+            frozen_map,
+            total_stake: stake,
+            bonuses: 0,
+        }])
+    });
+
+    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let mut runner = harness.build(node_id).await;
+    let clock = MockClock::new(1_000);
+    runner.set_clock(Arc::new(clock.clone()));
+
+    let _ = runner.run().await;
+    assert_eq!(runner.cached_prev_min_eff, Some(100_000 * NANO));
+
+    clock.advance(61);
+    let _ = runner.run().await;
+    assert_eq!(
+        runner.cached_prev_min_eff,
+        Some(50_000 * NANO),
+        "cached_prev_min_eff must reflect the refreshed past_elections snapshot"
+    );
 }
