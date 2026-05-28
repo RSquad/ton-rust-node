@@ -34,7 +34,7 @@ pub struct AuditEvent {
 mod tests {
     use super::*;
     use crate::audit::{
-        config::AuditLogConfig,
+        AuditLogConfig,
         enums::{AuditActorKind, AuditEventPayload, AuditSubjectKind, StakeSkipReason},
     };
     use serde_json::{Value, json};

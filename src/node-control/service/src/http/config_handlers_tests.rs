@@ -59,6 +59,7 @@ fn empty_app_cfg() -> Arc<AppConfig> {
         tick_interval: 30,
         automation: Default::default(),
         log: Some(Default::default()),
+        audit_log: Default::default(),
     })
 }
 
@@ -73,6 +74,7 @@ async fn state_from_cfg(cfg: AppConfig) -> AppState {
         user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
         config_changed: Arc::new(tokio::sync::Notify::new()),
+        audit: Arc::new(crate::audit::log::NoopAuditLog),
     }
 }
 

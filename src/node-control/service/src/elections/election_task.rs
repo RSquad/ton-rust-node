@@ -10,7 +10,7 @@ use super::{
     providers::{DefaultElectionsProvider, ElectionsProvider},
     runner::{ElectionRunner, PersistStaticAdnls},
 };
-use crate::runtime_config::RuntimeConfig;
+use crate::{audit::log::AuditLog, runtime_config::RuntimeConfig};
 use anyhow::Context;
 use common::{
     app_config::{AppConfig, BindingStatus, ElectionsConfig},
@@ -29,6 +29,7 @@ pub async fn run(
     runtime_cfg: Arc<dyn RuntimeConfig>,
     store: Arc<SnapshotStore>,
     on_status_change: Option<BindingStatusCallback>,
+    _audit: Arc<dyn AuditLog>,
 ) -> anyhow::Result<()> {
     let Some(config) = app_config.elections.as_ref() else {
         anyhow::bail!("elections config is empty");

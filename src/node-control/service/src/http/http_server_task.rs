@@ -23,6 +23,7 @@ use super::{
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
 use crate::{
+    audit::log::AuditLog,
     auth::{
         Claims,
         jwt::JwtAuth,
@@ -53,6 +54,7 @@ pub struct AppState {
     /// Signalled by mutation handlers after structural config changes
     /// (entity CRUD, ton-http-api) so the service loop can rebuild caches.
     pub config_changed: Arc<tokio::sync::Notify>,
+    pub audit: Arc<dyn AuditLog>,
 }
 
 pub async fn run(
@@ -61,6 +63,7 @@ pub async fn run(
     runtime_cfg: Arc<RuntimeConfigStore>,
     tasks: HashMap<&'static str, Arc<TaskController>>,
     config_changed: Arc<tokio::sync::Notify>,
+    audit: Arc<dyn AuditLog>,
 ) {
     tracing::info!("http-server task started");
 
@@ -118,6 +121,7 @@ pub async fn run(
         user_store,
         login_rate_limiter,
         config_changed,
+        audit,
     };
     let app = routes(enable_swagger, state);
 
@@ -1000,7 +1004,9 @@ pub struct ApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime_config::RuntimeConfigStore, task::task_manager::ServiceTask};
+    use crate::{
+        audit::NoopAuditLog, runtime_config::RuntimeConfigStore, task::task_manager::ServiceTask,
+    };
     use axum::body::Body;
     use base64::Engine;
     use common::{
@@ -1058,6 +1064,7 @@ mod tests {
             user_store,
             login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
             config_changed: Arc::new(tokio::sync::Notify::new()),
+            audit: Arc::new(NoopAuditLog),
         }
     }
 
@@ -1082,6 +1089,7 @@ mod tests {
             tick_interval: 30,
             automation: Default::default(),
             log: Some(LogConfig::default()),
+            audit_log: Default::default(),
         })
     }
 
@@ -1099,6 +1107,7 @@ mod tests {
             tick_interval: 30,
             automation: Default::default(),
             log: Some(LogConfig::default()),
+            audit_log: Default::default(),
         })
     }
 
