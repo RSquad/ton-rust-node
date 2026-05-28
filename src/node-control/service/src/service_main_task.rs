@@ -54,9 +54,8 @@ pub async fn run_with_config(
         .context("initialize runtime config store")?;
     let runtime_cfg = Arc::new(runtime_cfg);
 
-    let audit = AuditLogFactory::from_config(&app_cfg.audit_log)
-        .await
-        .map_err(|e| anyhow::anyhow!("audit log init failed: {e}"))?;
+    let audit =
+        AuditLogFactory::from_config(&app_cfg.audit_log).await.context("audit log init failed")?;
 
     let store = Arc::new(SnapshotStore::new());
 
