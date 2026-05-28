@@ -4,7 +4,7 @@ Each TON node replica requires its own `config.json` — the main configuration 
 
 In this chart, per-node configs are provided via the `nodeConfigs` map in values (or an existing Secret). The keys must follow the naming convention `node-N.json` where N matches the StatefulSet replica index (0-based). At startup, the init container copies `node-<pod-index>.json` into `/main/config.json`.
 
-> **Note on keys:** All keys in the config are 256-bit Ed25519 keys encoded as base64 strings. Private keys (ADNL, control server, liteserver) are stored as plaintext in `config.json`. This is acceptable for fullnode deployments. For validators, [nodectl](../../nodectl/README.md) provides an encrypted vault for key management.
+> **Note on keys:** All keys in the config are 256-bit Ed25519 keys encoded as base64 strings. Each private key can be written either as a plaintext `pvt_key` inside `config.json` or as a `vault` reference to a secret stored in the configured vault (v0.7.0+). For validators, vault-referenced keys are strongly recommended. See [Key storage](#key-storage) for the schema and a vault-referenced example, and [vault.md](vault.md) for backend setup.
 
 ## Table of contents
 
@@ -13,6 +13,7 @@ In this chart, per-node configs are provided via the `nodeConfigs` map in values
 - [Minimal example (fullnode / liteserver)](#minimal-example-fullnode--liteserver)
 - [Minimal example (validator)](#minimal-example-validator)
 - [Generating keys](#generating-keys)
+- [Key storage](#key-storage)
 - [Archival node](#archival-node)
 - [Field reference](#field-reference)
 - [Validator-specific sections](#validator-specific-sections)
@@ -231,6 +232,171 @@ For a validator, add `control-server` and `control-client` to the loop.
 
 > **Important:** Each key must be unique. Do not reuse the same key for different purposes (e.g. DHT and overlay). Do not share keys between different nodes.
 
+Once generated, write each key into `config.json` either inline as
+`pvt_key` or — recommended for validators — store it in a vault and
+reference it by name. See [Key storage](#key-storage).
+
+
+## Key storage
+
+Every private key referenced from `config.json` can be written in one of
+two shapes. You pick per key, by choosing which field to write:
+
+| Shape | `config.json` field | Where the private key actually lives | Availability |
+|-------|---------------------|--------------------------------------|--------------|
+| **Plaintext** | `pvt_key: "<base64>"` | Inside `config.json` itself | Always supported |
+| **Vault reference** | `vault: "<name>"` | The secrets vault — file backend or HashiCorp — selected by `VAULT_URL` (see [vault.md](vault.md)) | Added in v0.7.0 |
+
+You can mix the two shapes within one config — each key chooses its own
+shape independently of the others.
+
+> **For validators, use vault references for all private keys.**
+> Plaintext `pvt_key` in a validator's `config.json` means the signing
+> key is recoverable by anyone with read access to the Kubernetes
+> Secret that mounts the config.
+
+> **Public keys are always inline.** `control_server.clients.list[].pub_key`
+> and the public half of any disclosed key stay as `pub_key` strings in
+> `config.json` regardless of which shape is used for the private keys.
+
+### `KeyOptionJson` schema
+
+Every key slot in the config (`adnl_node.keys[].data`,
+`control_server.server_key`, `lite_server.server_key`, entries of
+`control_server.clients.list[]`, and entries of `validator_key_ring` —
+the auto-managed map of election keys the control server adds during
+validator rotations; see [Auto-managed fields](#auto-managed-fields))
+shares the same schema:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `type_id` | integer | Always `1209251014` (Ed25519 — the only supported type) |
+| `pvt_key` | string (base64) | Raw 32-byte private key. Plaintext shape. Mutually exclusive with `vault` |
+| `pub_key` | string (base64) | Raw 32-byte public key. Used for public-key entries (e.g. control clients) |
+| `vault` | string | Name under which the secret is stored in the configured vault. Vault-reference shape. Mutually exclusive with `pvt_key` |
+
+The `vault` field is just a string — the node passes it straight to the
+vault backend as the secret name. You choose it when you put the key
+into the vault, and you write the same string into `config.json`.
+
+#### Examples of `vault` names
+
+```json
+{ "type_id": 1209251014, "vault": "dht-key" }
+{ "type_id": 1209251014, "vault": "control-server-key" }
+{ "type_id": 1209251014, "vault": "lite-server-key" }
+```
+
+Any string the vault backend accepts as a secret name will work. The
+node passes the string verbatim to the backend — with the HashiCorp
+backend it is appended to your configured `kv_prefix` (KV) and
+`transit_prefix` (Transit); with the file backend it is just a key
+inside the encrypted JSON file.
+
+> **Avoid `/` in `vault` names for Ed25519 keys.** ADNL DHT / overlay,
+> `control_server.server_key`, and `lite_server.server_key` are stored
+> through HashiCorp's Transit engine, which does not accept `/` in key
+> names. Use `-`, `_`, or `.` as separators instead. The file backend
+> tolerates either, so picking a non-slash separator keeps the same
+> name working across both backends.
+
+### What lives where
+
+When `VAULT_URL` is set and the operator uses vault references in
+`config.json`:
+
+| Material | Shape in `config.json` |
+|----------|------------------------|
+| ADNL DHT key (`adnl_node.keys` tag 1) | `vault: "<name you chose>"` |
+| ADNL overlay key (`adnl_node.keys` tag 2) | `vault: "<name you chose>"` |
+| `control_server.server_key` | `vault: "<name you chose>"` |
+| `lite_server.server_key` | `vault: "<name you chose>"` |
+| `control_server.clients.list[].pub_key` | Inline (public key) |
+| `validator_keys` (election metadata: `election_id`, `expire_at`, `validator_key_id`, `validator_adnl_key_id`) | Present as before — an array of metadata records, no key material |
+| `validator_key_ring` (election keys created at runtime by the control server) | Present, but each entry is a vault reference: `{ "type_id": 1209251014, "vault": "private_keys.<key-id>" }`. The private key bytes live in the vault, not in the config |
+
+You do not need to pre-create entries for election keys. When the node
+is running with `VAULT_URL` set and the control server generates a new
+validator key during an election cycle, the node automatically:
+
+- stores the private key in the vault under the name
+  `private_keys.<key-id>`, and
+- writes the corresponding `validator_key_ring` entry into `config.json`
+  in vault-reference form: `{ "type_id": 1209251014, "vault": "private_keys.<key-id>" }`.
+
+No raw `pvt_key` ever lands in `config.json` while the vault is attached.
+The node picks the name; you don't manage it by hand. The same
+`kv_prefix` / `transit_prefix` rules from [Examples of `vault` names](#examples-of-vault-names)
+apply — auto-generated secrets land flat under the prefix.
+
+If a slot uses the plaintext `pvt_key` shape instead, the same slot
+carries a raw base64 string, and `validator_key_ring` entries hold the
+private key bytes directly. Pre-v0.7.0 nodes only support this shape.
+
+### Example — vault-referenced validator config
+
+Same content as the [plaintext validator example](#minimal-example-validator)
+above, with each static private key replaced by a vault reference. The
+secrets named in `vault` must already exist in the configured vault
+before the node starts.
+
+```json
+{
+  "log_config_name": "/main/logs.config.yml",
+  "ton_global_config_name": "/main/global.config.json",
+  "internal_db_path": "/db",
+  "sync_by_archives": true,
+  "states_cache_mode": "Moderate",
+  "adnl_node": {
+    "ip_address": "<your-external-ip>:30303",
+    "keys": [
+      { "tag": 1, "data": { "type_id": 1209251014, "vault": "dht-key" } },
+      { "tag": 2, "data": { "type_id": 1209251014, "vault": "overlay-key" } }
+    ]
+  },
+  "control_server": {
+    "address": "0.0.0.0:50000",
+    "server_key": { "type_id": 1209251014, "vault": "control-server-key" },
+    "clients": {
+      "list": [
+        { "type_id": 1209251014, "pub_key": "<control-client-public-key-base64>" }
+      ]
+    }
+  },
+  "metrics": {
+    "address": "0.0.0.0:9100",
+    "global_labels": { "network": "mainnet", "node_id": "validator-0" }
+  },
+  "collator_config": {
+    "cutoff_timeout_ms": 1000,
+    "stop_timeout_ms": 1500,
+    "max_collate_threads": 10,
+    "retry_if_empty": false,
+    "finalize_empty_after_ms": 800,
+    "empty_collation_sleep_ms": 100,
+    "external_messages_maximum_queue_length": 25600
+  },
+  "gc": {
+    "enable_for_archives": true,
+    "archives_life_time_hours": 48,
+    "enable_for_shard_state_persistent": true,
+    "cells_gc_config": {
+      "gc_interval_sec": 900,
+      "cells_lifetime_sec": 86400
+    }
+  },
+  "cells_db_config": {
+    "states_db_queue_len": 1000,
+    "prefill_cells_counters": false,
+    "cells_cache_size_bytes": 4000000000,
+    "counters_cache_size_bytes": 4000000000
+  }
+}
+```
+
+See [vault.md](vault.md) for backend setup. For inserting the static
+keys into the vault, use the secrets-vault CLI under
+`src/secrets-vault/cli/`.
 
 ## Archival node
 
@@ -815,9 +981,15 @@ The following fields are written by the node itself (via the control server) and
 | Field | Description |
 |-------|-------------|
 | `validator_keys` | Validator key records with election IDs and expiration timestamps |
-| `validator_key_ring` | Private key storage for validator keys |
+| `validator_key_ring` | Map of election-key entries written by the control server during validator rotations. With a vault attached, each entry is a vault reference (`vault: "private_keys.<key-id>"`); without a vault, it holds the private key bytes inline. See [Key storage](#key-storage) for the shape and lifecycle |
 
-In practice these fields are only relevant for testing. During validator elections the node rotates keys and writes them back to `config.json`, but in a Kubernetes environment this is a no-op: the config lives in a Secret, and any pod restart or Helm upgrade overwrites it. You can treat these fields as either immutable or initialization-only — the node will regenerate them as needed via the control server.
+The node rotates these fields during elections and writes them back to
+`config.json`. Without a vault, that write is effectively a no-op in
+Kubernetes — `config.json` is mounted from a Secret and any pod restart
+or Helm upgrade overwrites the in-pod copy, so the rotated state is
+lost. With `VAULT_URL` set, the actual key material lives in the vault
+instead and persists across restarts; on next boot the node rehydrates
+`validator_keys` / `validator_key_ring` from vault metadata.
 
 ---
 
