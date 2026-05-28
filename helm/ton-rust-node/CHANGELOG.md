@@ -16,6 +16,7 @@ appVersion: `v0.8.0`
 ### Documentation
 
 - Consolidated HashiCorp Vault setup guide in `docs/vault.md`
+- Documented vault-referenced key shape (`vault: "<name>"`) in `docs/node-config.md`, with schema, naming guidance, and a validator example
 
 ## [0.4.7] - 2026-04-21
 
