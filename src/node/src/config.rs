@@ -2257,6 +2257,7 @@ impl TonNodeGlobalConfigJson {
     }
 }
 
+#[derive(Clone)]
 pub struct ValidatorManagerConfig {
     pub update_interval: Duration,
     pub unsafe_resync_catchains: HashSet<u32>,
