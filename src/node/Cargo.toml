@@ -3,7 +3,7 @@ build = '../common/build/build.rs'
 edition = '2021'
 license = 'GPL-3.0'
 name = 'node'
-version = '0.8.0'
+version = '0.8.1'
 
 [[bin]]
 name = 'adnl_resolve'
