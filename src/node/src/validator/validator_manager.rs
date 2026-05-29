@@ -2703,7 +2703,7 @@ pub fn start_validator_manager(
             let Err(e) = res else { break };
             log::error!(
                 target: "validator_manager",
-                "Validator manager error, restarting: {e}"
+                "FATAL!!! Unexpected error in validator manager, restarting: {e}"
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
