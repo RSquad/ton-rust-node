@@ -2691,25 +2691,23 @@ pub fn start_validator_manager(
         }
 
         log::trace!(target: "validator_manager", "Starting validator manager");
-        let mut manager = ValidatorManagerImpl::create(engine.clone(), runtime.clone(), config);
 
         loop {
-            match manager.invoke().await {
-                Ok(()) => break, // shutdown requested
-                Err(e) => {
-                    log::error!(
-                        target: "validator_manager",
-                        "Validator manager error, restarting: {e}"
-                    );
-                    if engine.check_stop() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
+            if engine.check_stop() {
+                break;
             }
+            let mut manager =
+                ValidatorManagerImpl::create(engine.clone(), runtime.clone(), config.clone());
+            let res = manager.invoke().await;
+            manager.stop_validation().await;
+            let Err(e) = res else { break };
+            log::error!(
+                target: "validator_manager",
+                "Validator manager error, restarting: {e}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        manager.stop_validation().await;
         log::info!(target: "validator_manager", "Exiting, validator manager is stopped");
         engine.release_stop(Engine::MASK_SERVICE_VALIDATOR_MANAGER);
     });
