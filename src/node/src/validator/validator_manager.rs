@@ -2701,6 +2701,9 @@ pub fn start_validator_manager(
                         target: "validator_manager",
                         "Validator manager error, restarting: {e}"
                     );
+                    if engine.check_stop() {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
