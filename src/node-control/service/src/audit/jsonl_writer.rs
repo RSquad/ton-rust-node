@@ -29,11 +29,12 @@ use uuid::Uuid;
 
 pub(crate) enum AuditCommand {
     Event(Box<AuditEvent>),
+    Shutdown,
+
     /// Forces an immediate flush of buffered events. Used only by tests to make
     /// assertions deterministic without waiting for the batch interval.
     #[cfg(test)]
     Flush,
-    Shutdown,
 }
 
 pub(crate) struct AuditWriter {
@@ -86,8 +87,8 @@ impl AuditWriter {
     }
 
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<AuditCommand>) {
-        let mut interval =
-            tokio::time::interval(Duration::from_millis(self.config.batch_interval_ms));
+        let interval_ms = self.config.batch_interval_ms.max(1);
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut buffered: Vec<AuditEvent> = Vec::with_capacity(self.config.batch_max_events);
 
@@ -101,13 +102,13 @@ impl AuditWriter {
                                 self.flush(&mut buffered).await;
                             }
                         }
-                        #[cfg(test)]
-                        Some(AuditCommand::Flush) => self.flush(&mut buffered).await,
                         Some(AuditCommand::Shutdown) | None => {
                             self.flush(&mut buffered).await;
                             self.maybe_emit_dropped_recovery().await;
                             return;
                         }
+                        #[cfg(test)]
+                        Some(AuditCommand::Flush) => self.flush(&mut buffered).await,
                     }
                 }
                 _ = interval.tick() => {
@@ -186,8 +187,19 @@ impl AuditWriter {
         tracing::error!(error = %err, "{context}");
     }
 
+    async fn reopen_live_append(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.append(true).create(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let file = opts.open(path).await?;
+        self.current_size = file.metadata().await?.len();
+        self.file = Some(file);
+        Ok(())
+    }
+
     async fn rotate(&mut self) -> std::io::Result<()> {
-        let path = &self.config.path;
+        let path = self.config.path.clone();
         // Total retained files (including the live one) is at least 1; the
         // number of rotated history segments is `max - 1`. Guarding against 0
         // avoids an arithmetic underflow on `max - 1`.
@@ -214,6 +226,20 @@ impl AuditWriter {
         // is valid on platforms that forbid renaming an open file.
         self.file = None;
 
+        if let Err(e) = self.rotate_inner(&path, max).await {
+            // Best-effort: reopen the live file so subsequent writes can continue
+            // instead of failing forever with a `None` handle until restart.
+            if let Err(reopen_err) = self.reopen_live_append(&path).await {
+                Self::io_failed("audit reopen after rotation failure failed", reopen_err);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Performs the on-disk swap and opens a fresh live file. The caller is
+    /// responsible for recovering the handle if this returns an error.
+    async fn rotate_inner(&mut self, path: &std::path::Path, max: usize) -> std::io::Result<()> {
         let mut opts = tokio::fs::OpenOptions::new();
         if max > 1 {
             // Preserve history: rename current -> .1, then open a fresh live file.

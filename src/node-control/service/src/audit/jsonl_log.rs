@@ -59,12 +59,15 @@ impl JsonlAuditLog {
         write_delay: Duration,
     ) -> Result<Arc<Self>, AuditInitError> {
         let config = Arc::new(config);
-        std::fs::create_dir_all(config.path.parent().ok_or_else(|| {
-            AuditInitError::InvalidPath(config.path.to_string_lossy().to_string())
-        })?)
-        .map_err(AuditInitError::DirCreate)?;
+        if let Some(parent) = config.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await.map_err(AuditInitError::DirCreate)?;
+            }
+        } else {
+            return Err(AuditInitError::InvalidPath(config.path.to_string_lossy().to_string()));
+        }
 
-        let (tx, rx) = mpsc::channel(config.queue_capacity);
+        let (tx, rx) = mpsc::channel(config.queue_capacity.max(1));
         let dropped_events = Arc::new(AtomicU64::new(0));
 
         let writer = AuditWriter::open(config.clone(), dropped_events.clone(), write_delay).await?;
