@@ -260,6 +260,20 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
+    /// Writer tests perform real async file I/O. When the full `service` crate
+    /// runs in parallel (as in CI), contention on Tokio's blocking pool can
+    /// cause rare empty reads after an otherwise successful shutdown.
+    static WRITER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    async fn run_writer_test<F, Fut>(f: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _guard = WRITER_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f().await;
+    }
+
     fn sample_event(tag: &str) -> AuditEvent {
         AuditEvent {
             schema_version: 1,
@@ -339,288 +353,328 @@ mod tests {
 
     #[tokio::test]
     async fn writes_single_event_to_file() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                batch_interval_ms: 60_000,
-                batch_max_events: 100,
-                ..AuditLogConfig::default()
-            },
-        );
-        let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    batch_interval_ms: 60_000,
+                    batch_max_events: 100,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
 
-        send_event(&tx, sample_event("one")).await;
-        flush(&tx).await;
-        shutdown(tx, handle).await;
+            send_event(&tx, sample_event("one")).await;
+            flush(&tx).await;
+            shutdown(tx, handle).await;
 
-        let lines = read_json_lines(&path);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["data"]["version"], "one");
+            let lines = read_json_lines(&path);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0]["data"]["version"], "one");
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn batches_events_within_interval() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                batch_interval_ms: 50,
-                batch_max_events: 100,
-                ..AuditLogConfig::default()
-            },
-        );
-        let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    batch_interval_ms: 50,
+                    batch_max_events: 100,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
 
-        for i in 0..5 {
-            send_event(&tx, sample_event(&format!("ev-{i}"))).await;
-        }
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        shutdown(tx, handle).await;
+            for i in 0..5 {
+                send_event(&tx, sample_event(&format!("ev-{i}"))).await;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            shutdown(tx, handle).await;
 
-        let lines = read_json_lines(&path);
-        assert_eq!(lines.len(), 5);
+            let lines = read_json_lines(&path);
+            assert_eq!(lines.len(), 5);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn rotates_at_max_size() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                max_size_bytes: 1024,
-                batch_interval_ms: 60_000,
-                batch_max_events: 1,
-                ..AuditLogConfig::default()
-            },
-        );
-        let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    max_size_bytes: 1024,
+                    batch_interval_ms: 60_000,
+                    batch_max_events: 1,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
 
-        for _ in 0..8 {
-            send_event(&tx, large_event(1)).await;
-            flush(&tx).await;
-        }
-        shutdown(tx, handle).await;
+            for _ in 0..8 {
+                send_event(&tx, large_event(1)).await;
+                flush(&tx).await;
+            }
+            shutdown(tx, handle).await;
 
-        let rotated = path.with_extension("jsonl.1");
-        assert!(rotated.exists(), "expected rotated file at {}", rotated.display());
+            let rotated = path.with_extension("jsonl.1");
+            assert!(rotated.exists(), "expected rotated file at {}", rotated.display());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn retains_only_max_files() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                max_size_bytes: 512,
-                max_files: 3,
-                batch_interval_ms: 60_000,
-                batch_max_events: 1,
-                ..AuditLogConfig::default()
-            },
-        );
-        let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    max_size_bytes: 512,
+                    max_files: 3,
+                    batch_interval_ms: 60_000,
+                    batch_max_events: 1,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
 
-        for _ in 0..12 {
-            send_event(&tx, large_event(1)).await;
-            flush(&tx).await;
-        }
-        shutdown(tx, handle).await;
+            for _ in 0..12 {
+                send_event(&tx, large_event(1)).await;
+                flush(&tx).await;
+            }
+            shutdown(tx, handle).await;
 
-        let rotated_count = count_rotated_files(dir.path());
-        assert!(
-            rotated_count <= 2,
-            "expected at most max_files-1 rotated segments, got {rotated_count}"
-        );
-        assert!(path.exists());
+            let rotated_count = count_rotated_files(dir.path());
+            assert!(
+                rotated_count <= 2,
+                "expected at most max_files-1 rotated segments, got {rotated_count}"
+            );
+            assert!(path.exists());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn max_files_one_keeps_no_history() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                max_size_bytes: 512,
-                max_files: 1,
-                batch_interval_ms: 60_000,
-                batch_max_events: 1,
-                ..AuditLogConfig::default()
-            },
-        );
-        let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    max_size_bytes: 512,
+                    max_files: 1,
+                    batch_interval_ms: 60_000,
+                    batch_max_events: 1,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
 
-        for _ in 0..6 {
-            send_event(&tx, large_event(1)).await;
-            flush(&tx).await;
-        }
-        shutdown(tx, handle).await;
+            for _ in 0..6 {
+                send_event(&tx, large_event(1)).await;
+                flush(&tx).await;
+            }
+            shutdown(tx, handle).await;
 
-        assert!(path.exists(), "live audit.jsonl must exist");
-        assert_eq!(count_rotated_files(dir.path()), 0, "max_files=1 must keep no rotated segments");
+            assert!(path.exists(), "live audit.jsonl must exist");
+            assert_eq!(
+                count_rotated_files(dir.path()),
+                0,
+                "max_files=1 must keep no rotated segments"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn recovers_when_live_file_missing_on_restart() {
-        // Models the crash window between `rename(path -> .1)` and opening the
-        // new live file: on restart only the rotated segment exists. A fresh
-        // writer must recreate `audit.jsonl` via create(true) and write to it.
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                batch_interval_ms: 60_000,
-                batch_max_events: 1,
-                ..AuditLogConfig::default()
-            },
-        );
-        let path = dir.path().join("audit.jsonl");
+        run_writer_test(|| async {
+            // Models the crash window between `rename(path -> .1)` and opening the
+            // new live file: on restart only the rotated segment exists. A fresh
+            // writer must recreate `audit.jsonl` via create(true) and write to it.
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    batch_interval_ms: 60_000,
+                    batch_max_events: 1,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let path = dir.path().join("audit.jsonl");
 
-        // First run persists one event, then we simulate the post-rename state:
-        // move the live file aside so no `audit.jsonl` exists.
-        let (tx, _dropped, handle, _) = spawn_writer(cfg.clone(), Duration::ZERO).await;
-        send_event(&tx, sample_event("first-run")).await;
-        flush(&tx).await;
-        shutdown(tx, handle).await;
-        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
-        assert!(!path.exists(), "precondition: live file moved aside");
+            // First run persists one event, then we simulate the post-rename state:
+            // move the live file aside so no `audit.jsonl` exists.
+            let (tx, _dropped, handle, _) = spawn_writer(cfg.clone(), Duration::ZERO).await;
+            send_event(&tx, sample_event("first-run")).await;
+            flush(&tx).await;
+            shutdown(tx, handle).await;
+            std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+            assert!(!path.exists(), "precondition: live file moved aside");
 
-        // Second run must recreate the live file and write into it.
-        let (tx, _dropped, handle, _) = spawn_writer(cfg, Duration::ZERO).await;
-        send_event(&tx, sample_event("after-restart")).await;
-        flush(&tx).await;
-        shutdown(tx, handle).await;
+            // Second run must recreate the live file and write into it.
+            let (tx, _dropped, handle, _) = spawn_writer(cfg, Duration::ZERO).await;
+            send_event(&tx, sample_event("after-restart")).await;
+            flush(&tx).await;
+            shutdown(tx, handle).await;
 
-        assert!(path.exists(), "writer must recreate the live file on restart");
-        let lines = read_json_lines(&path);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["data"]["version"], "after-restart");
+            assert!(path.exists(), "writer must recreate the live file on restart");
+            let lines = read_json_lines(&path);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0]["data"]["version"], "after-restart");
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn concurrent_writers_no_data_loss() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                queue_capacity: 10_000,
-                batch_interval_ms: 20,
-                batch_max_events: 200,
-                max_size_bytes: 50 * 1024 * 1024,
-                ..AuditLogConfig::default()
-            },
-        );
-        let log = JsonlAuditLog::start(cfg).await.unwrap();
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    queue_capacity: 10_000,
+                    batch_interval_ms: 20,
+                    batch_max_events: 200,
+                    max_size_bytes: 50 * 1024 * 1024,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let log = JsonlAuditLog::start(cfg).await.unwrap();
 
-        let mut tasks = Vec::new();
-        for producer in 0..10 {
-            let log = log.clone();
-            tasks.push(tokio::spawn(async move {
-                for seq in 0..100 {
-                    log.record(sample_event(&format!("p{producer}-s{seq}"))).await;
-                }
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
+            let mut tasks = Vec::new();
+            for producer in 0..10 {
+                let log = log.clone();
+                tasks.push(tokio::spawn(async move {
+                    for seq in 0..100 {
+                        log.record(sample_event(&format!("p{producer}-s{seq}"))).await;
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+            log.shutdown().await;
 
-        let path = dir.path().join("audit.jsonl");
-        let lines = read_json_lines(&path);
-        assert_eq!(lines.len(), 1000, "expected 1000 audit lines, got {}", lines.len());
+            let path = dir.path().join("audit.jsonl");
+            let lines = read_json_lines(&path);
+            assert_eq!(lines.len(), 1000, "expected 1000 audit lines, got {}", lines.len());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn queue_full_drops_and_increments_counter() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                queue_capacity: 1,
-                queue_full_timeout_ms: 10,
-                batch_interval_ms: 60_000,
-                batch_max_events: 10_000,
-                ..AuditLogConfig::default()
-            },
-        );
-        let log =
-            JsonlAuditLog::start_with_write_delay(cfg, Duration::from_millis(500)).await.unwrap();
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    queue_capacity: 1,
+                    queue_full_timeout_ms: 10,
+                    batch_interval_ms: 60_000,
+                    batch_max_events: 1,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let log = JsonlAuditLog::start_with_write_delay(cfg, Duration::from_millis(500))
+                .await
+                .unwrap();
 
-        for i in 0..50 {
-            log.record(sample_event(&format!("drop-{i}"))).await;
-        }
+            for i in 0..50 {
+                log.record(sample_event(&format!("drop-{i}"))).await;
+            }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(log.dropped_events() > 0, "expected dropped events counter > 0");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(log.dropped_events() > 0, "expected dropped events counter > 0");
+            log.shutdown().await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn shutdown_flushes_pending() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                batch_interval_ms: 60_000,
-                batch_max_events: 100,
-                ..AuditLogConfig::default()
-            },
-        );
-        let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    batch_interval_ms: 60_000,
+                    batch_max_events: 100,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
 
-        for i in 0..3 {
-            send_event(&tx, sample_event(&format!("pending-{i}"))).await;
-        }
-        shutdown(tx, handle).await;
+            for i in 0..3 {
+                send_event(&tx, sample_event(&format!("pending-{i}"))).await;
+            }
+            shutdown(tx, handle).await;
 
-        let lines = read_json_lines(&path);
-        assert_eq!(lines.len(), 3);
+            let lines = read_json_lines(&path);
+            assert_eq!(lines.len(), 3);
+        })
+        .await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn file_mode_0600_on_unix() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig { batch_interval_ms: 60_000, ..AuditLogConfig::default() },
-        );
-        let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-        send_event(&tx, sample_event("perm")).await;
-        flush(&tx).await;
-        shutdown(tx, handle).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig { batch_interval_ms: 60_000, ..AuditLogConfig::default() },
+            );
+            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+            send_event(&tx, sample_event("perm")).await;
+            flush(&tx).await;
+            shutdown(tx, handle).await;
 
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn synthetic_dropped_event_emitted_after_drops() {
-        let dir = tempdir().unwrap();
-        let cfg = test_config(
-            dir.path(),
-            AuditLogConfig {
-                batch_interval_ms: 50,
-                batch_max_events: 100,
-                ..AuditLogConfig::default()
-            },
-        );
-        let (tx, dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
+        run_writer_test(|| async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(
+                dir.path(),
+                AuditLogConfig {
+                    batch_interval_ms: 50,
+                    batch_max_events: 100,
+                    ..AuditLogConfig::default()
+                },
+            );
+            let (tx, dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
 
-        dropped.store(7, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        shutdown(tx, handle).await;
+            dropped.store(7, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            shutdown(tx, handle).await;
 
-        let lines = read_json_lines(&path);
-        let dropped_line = lines
-            .iter()
-            .find(|line| {
-                line.get("event_type") == Some(&Value::String("system.audit_events_dropped".into()))
-            })
-            .expect("system.audit_events_dropped line");
-        assert_eq!(dropped_line["data"]["dropped_events"], 7);
-        assert_eq!(dropped_line["data"]["reason"], "queue_full_after_timeout");
+            let lines = read_json_lines(&path);
+            let dropped_line = lines
+                .iter()
+                .find(|line| {
+                    line.get("event_type")
+                        == Some(&Value::String("system.audit_events_dropped".into()))
+                })
+                .expect("system.audit_events_dropped line");
+            assert_eq!(dropped_line["data"]["dropped_events"], 7);
+            assert_eq!(dropped_line["data"]["reason"], "queue_full_after_timeout");
+        })
+        .await;
     }
 }
