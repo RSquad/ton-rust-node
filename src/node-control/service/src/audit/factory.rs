@@ -16,9 +16,10 @@ use thiserror::Error;
 pub struct AuditLogFactory;
 
 impl AuditLogFactory {
-    pub async fn from_config(config: &AuditLogConfig) -> Result<Arc<dyn AuditLog>, AuditInitError> {
-        // SMA-99.3: spawn JsonlAuditLog writer from `config`.
-        let _ = config;
+    pub async fn from_config(
+        _config: &AuditLogConfig,
+    ) -> Result<Arc<dyn AuditLog>, AuditInitError> {
+        // SMA-99.3: spawn JsonlAuditLog writer from `_config`.
         tracing::info!("audit log: NoopAuditLog (JsonlAuditLog wiring is SMA-99.3)");
         Ok(Arc::new(NoopAuditLog))
     }
