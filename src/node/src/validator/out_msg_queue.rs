@@ -14,7 +14,6 @@ use crate::{
     engine_traits::EngineOperations,
     shard_state::{ShardHashesStuff, ShardStateStuff},
     types::messages::MsgEnqueueStuff,
-    validator::validator_group::PipelineContext,
     CHECK,
 };
 use std::{
@@ -1502,7 +1501,7 @@ impl MsgQueueManager {
 
 pub struct StatesManager {
     engine: Arc<dyn EngineOperations>,
-    pipeline_context: PipelineContext,
+    blocks: HashMap<BlockIdExt, Block>,
     states: HashMap<ShardIdent, BTreeMap<u32, Arc<ShardStateStuff>>>,
     state_usages: HashMap<BlockIdExt, UsageTree>,
     block_proofs: HashMap<BlockIdExt, Cell>,
@@ -1513,42 +1512,42 @@ pub struct StatesManager {
 impl StatesManager {
     pub fn with_collator_data(
         engine: Arc<dyn EngineOperations>,
-        pipeline_context: PipelineContext,
+        prev_chain: Vec<(Arc<ShardStateStuff>, Block)>,
         collect_proofs: bool,
     ) -> Result<Self> {
         let mut cs = Self {
             engine,
-            pipeline_context: PipelineContext::default(),
+            blocks: HashMap::new(),
             states: Default::default(),
             state_usages: Default::default(),
             block_proofs: Default::default(),
             collect_proofs,
             preloaded_states_only: false,
         };
-        for (state, block) in pipeline_context.states_with_blocks() {
-            let state = if collect_proofs && !state.shard().is_masterchain() {
+        for (state, block) in prev_chain {
+            let usage_state = if collect_proofs && !state.shard().is_masterchain() {
                 if state.seq_no() > 0 {
                     cs.block_proofs
-                        .insert(state.block_id().clone(), Self::create_block_state_proof(block)?);
+                        .insert(state.block_id().clone(), Self::create_block_state_proof(&block)?);
                 }
                 // TODO: include only used states into usages
-                cs.add_state_usage(state)?
+                cs.add_state_usage(&state)?
             } else {
                 state.clone()
             };
+            cs.blocks.insert(state.block_id().clone(), block);
             cs.states
-                .entry(state.shard().clone())
+                .entry(usage_state.shard().clone())
                 .or_default()
-                .insert(state.seq_no(), state.clone());
+                .insert(usage_state.seq_no(), usage_state);
         }
-        cs.pipeline_context = pipeline_context;
         Ok(cs)
     }
 
     pub fn with_validator_data(engine: Arc<dyn EngineOperations>) -> Self {
         Self {
             engine,
-            pipeline_context: PipelineContext::default(),
+            blocks: HashMap::new(),
             states: Default::default(),
             state_usages: Default::default(),
             block_proofs: Default::default(),
@@ -1590,7 +1589,7 @@ impl StatesManager {
         }
         Ok(Self {
             engine,
-            pipeline_context: PipelineContext::default(),
+            blocks: HashMap::new(),
             states,
             state_usages: Default::default(),
             block_proofs: Default::default(),
@@ -1678,29 +1677,26 @@ impl StatesManager {
         MerkleProof::create_by_usage_tree(&usage_tree.original_root(), &usage_tree)?.serialize()
     }
 
-    async fn load_and_create_block_state_proof(
-        engine: &Arc<dyn EngineOperations>,
-        block_id: &BlockIdExt,
-    ) -> Result<Cell> {
-        let block_handle = engine
+    async fn load_and_create_block_state_proof(&self, block_id: &BlockIdExt) -> Result<Cell> {
+        if let Some(block) = self.blocks.get(block_id) {
+            return Self::create_block_state_proof(block);
+        }
+        let block_handle = self
+            .engine
             .load_block_handle(block_id)?
             .ok_or_else(|| error!("cannot load block handle for neighbor {}", block_id))?;
-        let block_stuff = engine.load_block(&block_handle).await?;
+        let block_stuff = self.engine.load_block(&block_handle).await?;
         let usage_tree = UsageTree::with_params(block_stuff.root_cell().clone(), true);
         let block = Block::construct_from_cell(usage_tree.root_cell())?;
         block.read_state_update()?;
-        let proof = MerkleProof::create_by_usage_tree(&usage_tree.original_root(), &usage_tree)?
-            .serialize()?;
-        Ok(proof)
+        MerkleProof::create_by_usage_tree(&usage_tree.original_root(), &usage_tree)?.serialize()
     }
 
     pub async fn insert(&mut self, state: &Arc<ShardStateStuff>) -> Result<Arc<ShardStateStuff>> {
         let state = if self.collect_proofs && !state.shard().is_masterchain() {
             if state.seq_no() > 0 && !self.block_proofs.contains_key(state.block_id()) {
-                self.block_proofs.insert(
-                    state.block_id().clone(),
-                    Self::load_and_create_block_state_proof(&self.engine, state.block_id()).await?,
-                );
+                let proof = self.load_and_create_block_state_proof(state.block_id()).await?;
+                self.block_proofs.insert(state.block_id().clone(), proof);
             }
             self.add_state_usage(state)?
         } else {
@@ -1824,15 +1820,19 @@ impl StatesManager {
 
         // TODO: simplify
         let block_id = loop {
-            let (prev1, prev2) =
-                if let Some(ids) = self.pipeline_context.get_prev_for(&closest_block_id) {
-                    (
-                        ids.get(0).cloned().ok_or_else(|| error!("INTERNAL ERROR: no prev1"))?,
-                        ids.get(1).cloned(),
-                    )
-                } else {
-                    (self.engine.load_block_prev1(&closest_block_id)?, None)
-                };
+            let cached_prev_ids = self
+                .blocks
+                .get(&closest_block_id)
+                .and_then(|b| b.read_info().ok())
+                .and_then(|info| info.read_prev_ids().ok());
+            let (prev1, prev2) = if let Some(ids) = cached_prev_ids {
+                (
+                    ids.get(0).cloned().ok_or_else(|| error!("INTERNAL ERROR: no prev1"))?,
+                    ids.get(1).cloned(),
+                )
+            } else {
+                (self.engine.load_block_prev1(&closest_block_id)?, None)
+            };
 
             log::trace!("Found prev1 for {shard}:{seq_no} = {prev1}");
 

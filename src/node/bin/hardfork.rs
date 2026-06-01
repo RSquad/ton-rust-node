@@ -20,7 +20,6 @@ use node::{
     validator::{
         collator::{CollateResult, Collator},
         state_resolver_cache::StateResolverCache,
-        validator_group::PipelineContext,
         validator_utils::{calc_subset_for_masterchain, PrevBlockHistory},
         CollatorSettings,
     },
@@ -40,8 +39,8 @@ use std::{
 };
 use storage::{block_handle_db::BlockHandle, db::rocksdb::AccessType};
 use ton_block::{
-    base64_encode, error, fail, AccountIdPrefixFull, BlockIdExt, ConfigParams, Message, Result,
-    ShardIdent, UInt256,
+    error, fail, AccountIdPrefixFull, BlockIdExt, ConfigParams, Message, Result, ShardIdent,
+    UInt256,
 };
 
 // include!("../../common/src/log.rs");
@@ -291,8 +290,8 @@ async fn run(args: clap::ArgMatches) -> Result<()> {
             "workchain": -1,
             "shard": -9223372036854775808i64,
             "seqno": mc_block_id.seq_no,
-            "root_hash": base64_encode(mc_block_id.root_hash.as_slice()),
-            "file_hash": base64_encode(mc_block_id.file_hash.as_slice())
+            "root_hash": mc_block_id.root_hash.as_base64(false),
+            "file_hash": mc_block_id.file_hash.as_base64(false)
         });
         println!("{:#}", id);
         let caps = mc_state.config_params().unwrap().get_global_version().unwrap();
@@ -327,7 +326,6 @@ async fn run(args: clap::ArgMatches) -> Result<()> {
             shard,
             seqno,
             &prev,
-            PipelineContext::new(),
             Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             v_set,
             UInt256::default(),
@@ -335,7 +333,7 @@ async fn run(args: clap::ArgMatches) -> Result<()> {
             None,
             CollatorSettings::default(),
         )?;
-        let (block, state, id, data) = match collator.collate().await {
+        let (block, state, id, data) = match collator.collate(&prev.get_prevs()[0]).await {
             Err(e) => fail!("Cannot craft hardfork block: {}", e),
             Ok(CollateResult::Err { err, .. }) => fail!("Cannot craft hardfork block: {}", err),
             Ok(CollateResult::Ok { new_block, new_state, candidate, .. }) => {
@@ -358,8 +356,8 @@ async fn run(args: clap::ArgMatches) -> Result<()> {
                 "workchain": -1,
                 "shard": -9223372036854775808i64,
                 "seqno": id.seq_no,
-                "root_hash": base64_encode(id.root_hash.as_slice()),
-                "file_hash": base64_encode(id.file_hash.as_slice())
+                "root_hash": id.root_hash.as_base64(false),
+                "file_hash": id.file_hash.as_base64(false)
             }]
         });
         println!("{:#}", id);

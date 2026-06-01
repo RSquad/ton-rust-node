@@ -27,21 +27,19 @@ use crate::{
         collator::{CollateResult, Collator},
         state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
-        validator_group::PipelineContext,
         validator_utils::PrevBlockHistory,
         BlockCandidate, CollatorSettings,
     },
 };
 use std::{sync::Arc, time::SystemTime};
 use ton_block::{
-    Block, BlockIdExt, BlockSignaturesVariant, Cell, Deserializable, Message, Result, ShardIdent,
-    UInt256, UsageTree, ValidatorSet,
+    error, Block, BlockIdExt, BlockSignaturesVariant, Cell, Deserializable, Message, Result,
+    ShardIdent, UInt256, UsageTree, ValidatorSet,
 };
 
 pub async fn run_validate_query_any_candidate(
     block_candidate: BlockCandidate,
     engine: Arc<dyn EngineOperations>,
-    pipeline_context: PipelineContext,
     state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     is_simplex: bool,
 ) -> Result<SystemTime> {
@@ -85,7 +83,6 @@ pub async fn run_validate_query_any_candidate(
         info.shard().clone(),
         min_mc_seqno,
         prev_blocks_ids,
-        pipeline_context,
         if is_simplex { Some(state_resolver_cache.clone()) } else { None },
         block_candidate,
         validator_set,
@@ -207,7 +204,6 @@ pub async fn run_validate_query(
         shard.clone(),
         min_masterchain_block_id.seq_no(),
         prev.get_prevs().to_vec(),
-        Default::default(),
         None,
         block,
         set,
@@ -284,7 +280,6 @@ pub async fn run_collate_query(
     min_ts: SystemTime,
     min_mc_seqno: u32,
     prev: &PrevBlockHistory,
-    pipeline_context: PipelineContext,
     state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     collator_id: PublicKey,
     set: ValidatorSet,
@@ -300,7 +295,6 @@ pub async fn run_collate_query(
         shard.clone(),
         min_mc_seqno,
         prev,
-        pipeline_context,
         state_resolver_cache,
         set,
         UInt256::from(collator_id.pub_key()?),
@@ -315,7 +309,10 @@ pub async fn run_collate_query(
             ..Default::default()
         },
     )?;
-    let collate_result = collator.collate().await;
+    let mc_state_id = engine
+        .load_last_applied_mc_block_id()?
+        .ok_or_else(|| error!("INTERNAL ERROR: No last applied MC block id set"))?;
+    let collate_result = collator.collate(&mc_state_id).await;
 
     let labels = [("shard", shard.to_string())];
     metrics::gauge!("ton_node_collator_active", &labels).decrement(1.0);
