@@ -16,12 +16,13 @@ use thiserror::Error;
 pub struct AuditLogFactory;
 
 impl AuditLogFactory {
-    pub async fn from_config(
-        _config: &AuditLogConfig,
-    ) -> Result<Arc<dyn AuditLog>, AuditInitError> {
-        // SMA-99.3: spawn JsonlAuditLog writer from `_config`.
-        tracing::info!("audit log: NoopAuditLog (JsonlAuditLog wiring is SMA-99.3)");
-        Ok(Arc::new(NoopAuditLog))
+    pub async fn from_config(config: &AuditLogConfig) -> Result<Arc<dyn AuditLog>, AuditInitError> {
+        if !config.enabled {
+            return Ok(Arc::new(NoopAuditLog));
+        }
+        unimplemented!(
+            "JsonlAuditLog writer is not implemented yet; set audit_log.enabled = false to disable"
+        );
     }
 }
 
@@ -71,14 +72,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_returns_audit_log_that_accepts_events() {
-        let cfg = AuditLogConfig {
-            path: PathBuf::from("/tmp/custom-audit.jsonl"),
-            max_size_bytes: 1,
-            ..AuditLogConfig::default()
-        };
+    async fn factory_returns_noop_when_disabled() {
+        let cfg = AuditLogConfig { enabled: false, ..AuditLogConfig::default() };
         let log = AuditLogFactory::from_config(&cfg).await.expect("factory init");
         log.record(sample_event()).await;
-        log.record(sample_event()).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "JsonlAuditLog writer is not implemented yet")]
+    async fn factory_panics_when_enabled_without_jsonl_writer() {
+        let cfg = AuditLogConfig { enabled: true, ..AuditLogConfig::default() };
+        let _ = AuditLogFactory::from_config(&cfg).await;
     }
 }
