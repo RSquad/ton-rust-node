@@ -1077,6 +1077,7 @@ quic.answer data:bytes = quic.Response;
 //
 // Overlay and session identification
 consensus.overlayId session_id:int256 nodes:(vector int256) = consensus.OverlayId;
+consensus.blockSyncOverlayId session_id:int256 = consensus.BlockOverlayId;
 consensus.dataToSign session_id:int256 data:bytes = consensus.DataToSign;
 
 // Candidate identification (slot + hash pair)

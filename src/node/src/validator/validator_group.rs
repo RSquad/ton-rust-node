@@ -594,10 +594,15 @@ impl ValidatorGroupImpl {
             .map(validatordescr_to_session_node)
             .collect::<Result<_>>()?;
 
+        let block_sync_params_with_identity = g
+            .block_sync_overlay_params
+            .clone()
+            .map(|p| p.with_identity(g.shard.clone(), g.session_id.clone()));
         let overlay_manager: ConsensusOverlayManagerPtr =
             Arc::new(ConsensusOverlayManagerImpl::new(
                 g.engine.validator_network(),
                 g.validator_list_id.clone(),
+                block_sync_params_with_identity,
             ));
 
         let db_root = format!("{}/catchains", g.engine.db_root_dir()?);
@@ -824,6 +829,9 @@ pub struct ValidatorGroup {
     accepted_mc_block_tx: tokio::sync::watch::Sender<Option<BlockIdExt>>,
     /// Set by the validation queue on prolonged inactivity, cleared on any action.
     pub stalled: Arc<AtomicBool>,
+    /// Block-sync overlay membership and authorization; `Some` only when this shard has
+    /// `simplex_config_v2.enable_observers=true`
+    block_sync_overlay_params: Option<consensus_common::BlockSyncOverlayParams>,
 }
 
 impl ResolverBackend for ValidatorGroup {
@@ -876,6 +884,7 @@ impl ValidatorGroup {
         consensus_options: ConsensusOptions,
         engine: Arc<dyn EngineOperations>,
         allow_unsafe_self_blocks_resync: bool,
+        block_sync_overlay_params: Option<consensus_common::BlockSyncOverlayParams>,
     ) -> Self {
         let consensus_type = consensus_options.consensus_type();
         let is_accelerated = consensus_options.is_accelerated_consensus_enabled();
@@ -922,6 +931,7 @@ impl ValidatorGroup {
             accepted_mc_seqno_tx,
             accepted_mc_block_tx,
             stalled: Arc::new(AtomicBool::new(false)),
+            block_sync_overlay_params,
         }
     }
 
@@ -1227,6 +1237,42 @@ impl ValidatorGroup {
             flags.local_collated,
             flags.body_present,
         );
+
+        // Pre-BlockSync the handle was written implicitly by
+        // `run_validate_query_any_candidate` -> `store_validated_block`, but only
+        // when this node actually validated the candidate. With the block-sync
+        // overlay carrying candidate bodies, simplex may receive a body it does
+        // not validate (consensus quorum already reached)
+        if flags.body_present {
+            let block_bytes = data.data().to_vec();
+            match crate::block::BlockStuff::deserialize_block(
+                block_id.clone(),
+                std::sync::Arc::new(block_bytes),
+            ) {
+                Ok(block_stuff) => {
+                    if let Err(e) = self.engine.store_block(&block_stuff).await {
+                        log::debug!(
+                            target: "simplex_resolver",
+                            "on_candidate_observed: store_block failed (non-fatal) for {}: {}",
+                            block_id, e
+                        );
+                    } else {
+                        log::trace!(
+                            target: "simplex_resolver",
+                            "on_candidate_observed: stored block handle eagerly for {}",
+                            block_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "simplex_resolver",
+                        "on_candidate_observed: deserialize_block failed for {}: {}",
+                        block_id, e
+                    );
+                }
+            }
+        }
 
         self.state_resolver_cache.lock().await.upsert_observed_candidate(
             block_id,

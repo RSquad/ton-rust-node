@@ -193,7 +193,12 @@ impl ConsensusOverlayListener for LossyOverlayListener {
         }
     }
 
-    fn on_broadcast(&self, source_key_hash: PublicKeyHash, data: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        source_key_hash: PublicKeyHash,
+        data: &BlockPayloadPtr,
+        source: crate::BroadcastSource,
+    ) {
         // Check for broadcast loss
         if Self::should_drop(self.opts.lost_broadcast_probability) {
             log::trace!(
@@ -211,7 +216,7 @@ impl ConsensusOverlayListener for LossyOverlayListener {
         if delay.is_zero() {
             // No delay, forward immediately
             if let Some(inner) = self.inner.upgrade() {
-                inner.on_broadcast(source_key_hash, data);
+                inner.on_broadcast(source_key_hash, data, source);
             }
         } else {
             // Apply delay
@@ -228,7 +233,7 @@ impl ConsensusOverlayListener for LossyOverlayListener {
             std::thread::spawn(move || {
                 thread::sleep(delay);
                 if let Some(inner) = inner.upgrade() {
-                    inner.on_broadcast(source_key_hash, &data);
+                    inner.on_broadcast(source_key_hash, &data, source);
                 } else {
                     log::trace!(
                         "LossyOverlayListener {}: broadcast from {} dropped (listener gone after {:?} delay)",
@@ -331,6 +336,7 @@ impl ConsensusOverlayManager for LossyOverlayManager {
         overlay_listener: ConsensusOverlayListenerPtr,
         log_replay_listener: ConsensusOverlayLogReplayListenerPtr,
         transport_type: OverlayTransportType,
+        block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
         let lossy_listener = Arc::new(LossyOverlayListener {
             inner: overlay_listener,
@@ -346,6 +352,7 @@ impl ConsensusOverlayManager for LossyOverlayManager {
             lossy_listener_weak,
             log_replay_listener,
             transport_type,
+            block_sync_params,
         )?;
 
         self.listeners

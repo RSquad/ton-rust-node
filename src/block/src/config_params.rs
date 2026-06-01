@@ -3893,6 +3893,7 @@ impl NoncriticalParams {
 /// timing/rate parameters live inside `noncritical_params`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimplexConfig {
+    pub enable_observers: bool,
     pub use_quic: bool,
     pub slots_per_leader_window: u32,
     pub noncritical_params: NoncriticalParams,
@@ -3901,6 +3902,7 @@ pub struct SimplexConfig {
 impl Default for SimplexConfig {
     fn default() -> Self {
         Self {
+            enable_observers: false,
             use_quic: false,
             slots_per_leader_window: 4,
             noncritical_params: NoncriticalParams::default(),
@@ -3915,7 +3917,9 @@ const NONCRITICAL_PARAMS_MAX_KEY: u8 = 14;
 impl Serializable for SimplexConfig {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
         cell.append_u8(SIMPLEX_CONFIG_V2_TAG)?;
-        let flags_byte = if self.use_quic { 1u8 } else { 0u8 };
+        // TL-B layout: 6 zero flag bits, then enable_observers (bit 1), then use_quic (bit 0).
+        let flags_byte =
+            (if self.enable_observers { 1u8 } else { 0u8 }) << 1 | (self.use_quic as u8);
         cell.append_u8(flags_byte)?;
         self.slots_per_leader_window.write_to(cell)?;
         let raw_map = self.noncritical_params.to_raw_map();
@@ -3937,6 +3941,7 @@ impl Deserializable for SimplexConfig {
         let tag = slice.get_next_byte()?;
         match tag {
             SIMPLEX_CONFIG_TAG => {
+                // Legacy v1: bit 0 = use_quic; enable_observers did not exist.
                 let flags_byte = slice.get_next_byte()?;
                 let use_quic = (flags_byte & 1) != 0;
                 let target_rate_ms = u32::construct_from(slice)?;
@@ -3944,6 +3949,7 @@ impl Deserializable for SimplexConfig {
                 let first_block_timeout_ms = u32::construct_from(slice)?;
                 let max_leader_window_desync = u32::construct_from(slice)?;
                 Ok(Self {
+                    enable_observers: false,
                     use_quic,
                     slots_per_leader_window,
                     noncritical_params: NoncriticalParams {
@@ -3955,8 +3961,10 @@ impl Deserializable for SimplexConfig {
                 })
             }
             SIMPLEX_CONFIG_V2_TAG => {
+                // v2 flag-byte layout (BlockSync): 6 zero flag bits, enable_observers (bit 1), use_quic (bit 0).
                 let flags_byte = slice.get_next_byte()?;
-                let use_quic = (flags_byte & 1) != 0;
+                let use_quic = (flags_byte & 0x01) != 0;
+                let enable_observers = (flags_byte & 0x02) != 0;
                 let slots_per_leader_window = u32::construct_from(slice)?;
                 let has_params = slice.get_next_bit()?;
                 let params_cell =
@@ -3970,6 +3978,7 @@ impl Deserializable for SimplexConfig {
                     }
                 }
                 Ok(Self {
+                    enable_observers,
                     use_quic,
                     slots_per_leader_window,
                     noncritical_params: NoncriticalParams::from_raw_map(&raw),

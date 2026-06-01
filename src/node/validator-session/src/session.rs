@@ -386,6 +386,7 @@ impl CatchainOverlayManager for LoopbackOverlayManager {
         overlay_listener: CatchainOverlayListenerPtr,
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         _transport_type: consensus_common::OverlayTransportType,
+        _block_sync_params: Option<consensus_common::BlockSyncOverlayParams>,
     ) -> Result<CatchainOverlayPtr> {
         if let Err(_prev) =
             self.overlay_created.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)

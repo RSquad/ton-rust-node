@@ -119,6 +119,7 @@ fn make_simplex_group_for_resolver_tests() -> Arc<ValidatorGroup> {
         ConsensusOptions::Simplex(Default::default()),
         Arc::new(DummyEngine),
         false,
+        None,
     );
     Arc::new(group)
 }

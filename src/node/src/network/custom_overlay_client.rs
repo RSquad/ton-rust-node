@@ -136,7 +136,7 @@ impl CustomOverlayClient {
             let params =
                 OverlayParams { flags: 0, hops: None, overlay_id: &self.id, runtime: None };
             if let Err(e) =
-                self.stack.overlay.add_private_overlay(params, &key, &peers, self.use_quic)
+                self.stack.overlay.add_private_overlay(params, &key, &peers, self.use_quic, None)
             {
                 attempt += 1;
                 if attempt >= 10 {

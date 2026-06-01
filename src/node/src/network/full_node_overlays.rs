@@ -68,13 +68,13 @@ use ton_block::{
 /// classes, overlays are physical entities not tied to shards or other blockchain entities.
 ///
 /// ValidatorManager  Collator  ValidatorQuery  etc.   <- high level node commponents
-///       ↓              ↓             ↓
+///       v              v             v
 ///                 Engine
-///                  ↓ ↑
+///                  v ^
 ///         **FullNodeOverlaysRouter** contains list of FullNodeOverlayClient
-///                    ↓
+///                    v
 ///               NodeNetwork                   <- low level node components
-///                    ↓
+///                    v
 ///            network protocols
 pub struct FullNodeOverlaysRouter {
     engine: Arc<dyn EngineOperations>,
@@ -989,7 +989,7 @@ impl FullNodeOverlaysRouter {
         }
         let fast_sync_client = self.fast_sync_overlay(id.shard());
         if !custom_overlays.is_empty() || fast_sync_client.is_some() {
-            log::debug!("Sending block candidate broadcast {}...", id);
+            log::debug!("Sending block candidate broadcast {id}...");
             let broadcast = build_block_candidate_broadcast_compressed(
                 id.clone(),
                 cc_seqno,

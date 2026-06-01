@@ -1016,6 +1016,7 @@ impl PrivateOverlayOperations for NodeNetwork {
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         broadcast_hops: Option<u8>,
         transport_type: consensus_common::OverlayTransportType,
+        block_sync_params: Option<consensus_common::BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>> {
         let validator_set_context =
             self.validator_context.sets_contexts.get(&validator_list_id).ok_or_else(|| {
@@ -1047,6 +1048,7 @@ impl PrivateOverlayOperations for NodeNetwork {
                 listener,
                 _log_replay_listener,
                 transport_type,
+                block_sync_params,
             )?;
 
             self.validator_context

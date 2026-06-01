@@ -31,7 +31,7 @@ use adnl::PrivateOverlayShortId;
 use catchain::{
     CatchainNode, CatchainOverlay, CatchainOverlayListenerPtr, CatchainOverlayLogReplayListenerPtr,
 };
-use consensus_common::OverlayTransportType;
+use consensus_common::{BlockSyncOverlayParams, OverlayTransportType};
 use std::{
     collections::HashSet,
     sync::{atomic::AtomicU64, Arc},
@@ -148,6 +148,9 @@ pub trait PrivateOverlayOperations: Sync + Send {
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         broadcast_hops: Option<u8>,
         transport_type: OverlayTransportType,
+        // Block-sync overlay membership/auth + overlay_id (Some only when
+        // simplex session has `enable_observers=true`).
+        block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>>;
 
     fn stop_catchain_client(&self, overlay_short_id: &Arc<PrivateOverlayShortId>);
@@ -195,6 +198,21 @@ pub trait EngineOperations: Sync + Send {
 
     fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> {
         unimplemented!()
+    }
+
+    /// returns the underlying `adnl::OverlayNode`
+    /// Used by `BlockSyncObserver` to join the block-sync overlay directly
+    /// (bypasses the consensus-private-overlay creation path used by validators).
+    /// Default `None` for test stubs; the real `Engine` impl returns `Some`
+    fn overlay_node(&self) -> Option<Arc<adnl::OverlayNode>> {
+        None
+    }
+
+    /// look up a local ADNL key by its short id.
+    /// Used by `BlockSyncObserver` activation to resolve the validator-class ADNL key
+    /// that joins the block-sync overlay. Default `None` for test stubs
+    fn adnl_key_by_id(&self, _id: &Arc<ton_block::KeyId>) -> Option<Arc<dyn ton_block::KeyOption>> {
+        None
     }
 
     fn validation_status(&self) -> ValidationStatus {
@@ -266,6 +284,7 @@ pub trait EngineOperations: Sync + Send {
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         broadcast_hops: Option<u8>,
         _transport_type: OverlayTransportType,
+        _block_sync_params: Option<BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>> {
         unimplemented!()
     }
