@@ -137,10 +137,10 @@ impl AuditWriter {
             let needed = line.len() + 1;
             if self.current_size + needed as u64 > self.config.max_size_bytes {
                 if let Err(e) = self.write_batch_and_clear().await {
-                    tracing::error!(error = %e, "audit write before rotation failed");
+                    Self::io_failed("audit write before rotation failed", e);
                 }
                 if let Err(e) = self.rotate().await {
-                    tracing::error!(error = %e, "audit rotation failed");
+                    Self::io_failed("audit rotation failed", e);
                     continue;
                 }
             }
@@ -150,7 +150,7 @@ impl AuditWriter {
         }
 
         if let Err(e) = self.write_batch_and_clear().await {
-            tracing::error!(error = %e, "audit batch write failed");
+            Self::io_failed("audit batch write failed", e);
         }
     }
 
@@ -170,8 +170,20 @@ impl AuditWriter {
         if self.config.fsync_on_batch {
             file.sync_data().await?;
         }
+        #[cfg(test)]
+        file.sync_all().await?;
         self.batch.clear();
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn io_failed(context: &str, err: std::io::Error) {
+        panic!("{context}: {err}");
+    }
+
+    #[cfg(not(test))]
+    fn io_failed(context: &str, err: std::io::Error) {
+        tracing::error!(error = %err, "{context}");
     }
 
     async fn rotate(&mut self) -> std::io::Result<()> {
@@ -308,17 +320,32 @@ mod tests {
         cfg
     }
 
-    async fn spawn_writer(
+    async fn run_writer_session<F, Fut>(
         config: AuditLogConfig,
         write_delay: Duration,
-    ) -> (mpsc::Sender<AuditCommand>, Arc<AtomicU64>, tokio::task::JoinHandle<()>, PathBuf) {
+        f: F,
+    ) -> (Arc<AtomicU64>, PathBuf)
+    where
+        F: FnOnce(mpsc::Sender<AuditCommand>, PathBuf, Arc<AtomicU64>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let config = Arc::new(config);
         let dropped = Arc::new(AtomicU64::new(0));
-        let (tx, rx) = mpsc::channel(config.queue_capacity);
-        let writer = AuditWriter::open(config.clone(), dropped.clone(), write_delay).await.unwrap();
         let path = config.path.clone();
-        let handle = tokio::spawn(writer.run(rx));
-        (tx, dropped, handle, path)
+        let (tx, rx) = mpsc::channel(config.queue_capacity);
+        let writer = AuditWriter::open(config, dropped.clone(), write_delay).await.unwrap();
+
+        // Drive the writer on the same task set as the producer (via `join!`) so
+        // shutdown/flush completes before assertions — no spawned-task scheduling
+        // races under CI parallel test load.
+        let dropped_out = dropped.clone();
+        let path_out = path.clone();
+        tokio::join!(
+            async move { writer.run(rx).await },
+            async move { f(tx, path, dropped).await },
+        );
+
+        (dropped_out, path_out)
     }
 
     async fn send_event(tx: &mpsc::Sender<AuditCommand>, event: AuditEvent) {
@@ -329,13 +356,13 @@ mod tests {
         tx.send(AuditCommand::Flush).await.unwrap();
     }
 
-    async fn shutdown(tx: mpsc::Sender<AuditCommand>, handle: tokio::task::JoinHandle<()>) {
-        let _ = tx.send(AuditCommand::Shutdown).await;
-        let _ = handle.await;
+    async fn stop(tx: &mpsc::Sender<AuditCommand>) {
+        tx.send(AuditCommand::Shutdown).await.unwrap();
     }
 
     fn read_json_lines(path: &Path) -> Vec<Value> {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(path.exists(), "audit file missing at {}", path.display());
+        let content = std::fs::read_to_string(path).unwrap();
         content
             .lines()
             .filter(|line| !line.is_empty())
@@ -351,7 +378,7 @@ mod tests {
             .count()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn writes_single_event_to_file() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -363,11 +390,13 @@ mod tests {
                     ..AuditLogConfig::default()
                 },
             );
-            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-
-            send_event(&tx, sample_event("one")).await;
-            flush(&tx).await;
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    send_event(&tx, sample_event("one")).await;
+                    flush(&tx).await;
+                    stop(&tx).await;
+                })
+                .await;
 
             let lines = read_json_lines(&path);
             assert_eq!(lines.len(), 1);
@@ -376,7 +405,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn batches_events_within_interval() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -388,13 +417,15 @@ mod tests {
                     ..AuditLogConfig::default()
                 },
             );
-            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-
-            for i in 0..5 {
-                send_event(&tx, sample_event(&format!("ev-{i}"))).await;
-            }
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    for i in 0..5 {
+                        send_event(&tx, sample_event(&format!("ev-{i}"))).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    stop(&tx).await;
+                })
+                .await;
 
             let lines = read_json_lines(&path);
             assert_eq!(lines.len(), 5);
@@ -402,7 +433,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn rotates_at_max_size() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -415,13 +446,15 @@ mod tests {
                     ..AuditLogConfig::default()
                 },
             );
-            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-
-            for _ in 0..8 {
-                send_event(&tx, large_event(1)).await;
-                flush(&tx).await;
-            }
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    for _ in 0..8 {
+                        send_event(&tx, large_event(1)).await;
+                        flush(&tx).await;
+                    }
+                    stop(&tx).await;
+                })
+                .await;
 
             let rotated = path.with_extension("jsonl.1");
             assert!(rotated.exists(), "expected rotated file at {}", rotated.display());
@@ -429,7 +462,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn retains_only_max_files() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -443,13 +476,15 @@ mod tests {
                     ..AuditLogConfig::default()
                 },
             );
-            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-
-            for _ in 0..12 {
-                send_event(&tx, large_event(1)).await;
-                flush(&tx).await;
-            }
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    for _ in 0..12 {
+                        send_event(&tx, large_event(1)).await;
+                        flush(&tx).await;
+                    }
+                    stop(&tx).await;
+                })
+                .await;
 
             let rotated_count = count_rotated_files(dir.path());
             assert!(
@@ -461,7 +496,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn max_files_one_keeps_no_history() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -475,13 +510,15 @@ mod tests {
                     ..AuditLogConfig::default()
                 },
             );
-            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-
-            for _ in 0..6 {
-                send_event(&tx, large_event(1)).await;
-                flush(&tx).await;
-            }
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    for _ in 0..6 {
+                        send_event(&tx, large_event(1)).await;
+                        flush(&tx).await;
+                    }
+                    stop(&tx).await;
+                })
+                .await;
 
             assert!(path.exists(), "live audit.jsonl must exist");
             assert_eq!(
@@ -493,7 +530,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn recovers_when_live_file_missing_on_restart() {
         run_writer_test(|| async {
             // Models the crash window between `rename(path -> .1)` and opening the
@@ -512,18 +549,23 @@ mod tests {
 
             // First run persists one event, then we simulate the post-rename state:
             // move the live file aside so no `audit.jsonl` exists.
-            let (tx, _dropped, handle, _) = spawn_writer(cfg.clone(), Duration::ZERO).await;
-            send_event(&tx, sample_event("first-run")).await;
-            flush(&tx).await;
-            shutdown(tx, handle).await;
+            run_writer_session(cfg.clone(), Duration::ZERO, |tx, _path, _dropped| async move {
+                send_event(&tx, sample_event("first-run")).await;
+                flush(&tx).await;
+                stop(&tx).await;
+            })
+            .await;
             std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
             assert!(!path.exists(), "precondition: live file moved aside");
 
             // Second run must recreate the live file and write into it.
-            let (tx, _dropped, handle, _) = spawn_writer(cfg, Duration::ZERO).await;
-            send_event(&tx, sample_event("after-restart")).await;
-            flush(&tx).await;
-            shutdown(tx, handle).await;
+            let (_dropped, _) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    send_event(&tx, sample_event("after-restart")).await;
+                    flush(&tx).await;
+                    stop(&tx).await;
+                })
+                .await;
 
             assert!(path.exists(), "writer must recreate the live file on restart");
             let lines = read_json_lines(&path);
@@ -533,7 +575,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn concurrent_writers_no_data_loss() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -571,7 +613,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn queue_full_drops_and_increments_counter() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -600,7 +642,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn shutdown_flushes_pending() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -612,12 +654,14 @@ mod tests {
                     ..AuditLogConfig::default()
                 },
             );
-            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-
-            for i in 0..3 {
-                send_event(&tx, sample_event(&format!("pending-{i}"))).await;
-            }
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    for i in 0..3 {
+                        send_event(&tx, sample_event(&format!("pending-{i}"))).await;
+                    }
+                    stop(&tx).await;
+                })
+                .await;
 
             let lines = read_json_lines(&path);
             assert_eq!(lines.len(), 3);
@@ -626,7 +670,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn file_mode_0600_on_unix() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -634,10 +678,13 @@ mod tests {
                 dir.path(),
                 AuditLogConfig { batch_interval_ms: 60_000, ..AuditLogConfig::default() },
             );
-            let (tx, _dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-            send_event(&tx, sample_event("perm")).await;
-            flush(&tx).await;
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, _dropped| async move {
+                    send_event(&tx, sample_event("perm")).await;
+                    flush(&tx).await;
+                    stop(&tx).await;
+                })
+                .await;
 
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -646,7 +693,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn synthetic_dropped_event_emitted_after_drops() {
         run_writer_test(|| async {
             let dir = tempdir().unwrap();
@@ -658,11 +705,13 @@ mod tests {
                     ..AuditLogConfig::default()
                 },
             );
-            let (tx, dropped, handle, path) = spawn_writer(cfg, Duration::ZERO).await;
-
-            dropped.store(7, Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            shutdown(tx, handle).await;
+            let (_dropped, path) =
+                run_writer_session(cfg, Duration::ZERO, |tx, _path, dropped| async move {
+                    dropped.store(7, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    stop(&tx).await;
+                })
+                .await;
 
             let lines = read_json_lines(&path);
             let dropped_line = lines
