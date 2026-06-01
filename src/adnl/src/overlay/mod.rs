@@ -750,15 +750,10 @@ impl Overlay {
                 BroadcastSendMethod::QuicOrRldp => {
                     if let Some(quic) = self.quic.as_ref() {
                         quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
+                    } else if let Some(rldp) = self.rldp.as_ref() {
+                        rldp.message(data, peers, true, None).await.err()
                     } else {
-                        let Some(_rldp) = self.rldp.as_ref() else {
-                            fail!(
-                                "Neither QUIC nor RLDP sender is set in overlay {}",
-                                self.overlay_id
-                            );
-                        };
-                        //rldp.message(data, peers, true, None).await.err()
-                        None
+                        fail!("Neither QUIC nor RLDP sender is set in overlay {}", self.overlay_id);
                     }
                 }
                 BroadcastSendMethod::Safe => {

@@ -697,8 +697,9 @@ impl RldpNode {
             .unwrap_or_else(|e| {
                 log::warn!(
                     target: TARGET,
-                    "ERROR: Incoming {rldp}: {e}, transfer {}",
-                    base64_encode(&context.transfer_id)
+                    "ERROR: Incoming {rldp}: {e}, transfer {} from {}",
+                    base64_encode(&context.transfer_id),
+                    context.peers.other()
                 );
                 None
             });
@@ -1209,6 +1210,8 @@ impl RldpNode {
         let spin = Duration::from_millis(Self::ACK_DELAY_MS);
         let start = std::time::Instant::now();
         let mut last_diag = start;
+        let mut packets_received: u32 = 0;
+        let mut confirmations_sent: u32 = 0;
         loop {
             if (start.elapsed() > Duration::from_millis(Self::TIMEOUT_MAX_MS))
                 && (last_diag.elapsed() > Duration::from_millis(Self::TIMEOUT_WARN_MS))
@@ -1217,7 +1220,8 @@ impl RldpNode {
                 let total = context.recv_transfer.total_size.unwrap_or(0);
                 log::warn!(
                     target: TARGET,
-                    "{rldp} receive_loop {transfer_str} running {} ms, {received}/{total} bytes",
+                    "{rldp} receive_loop {transfer_str} running {} ms, {received}/{total} bytes, \
+                    packets_received={packets_received}, confirmations_sent={confirmations_sent}",
                     start.elapsed().as_millis()
                 );
                 last_diag = std::time::Instant::now();
@@ -1227,13 +1231,27 @@ impl RldpNode {
                 Ok(None) => break,
                 Err(_) => {
                     if v2 {
-                        if let Err(e) = context.send_confirmations().await {
-                            log::warn!(target: TARGET, "{rldp} confirmation error: {e}")
+                        match context.send_confirmations().await {
+                            Ok(sent) => {
+                                confirmations_sent = confirmations_sent.saturating_add(sent)
+                            }
+                            Err(e) => log::warn!(target: TARGET, "{rldp} confirmation error: {e}"),
                         }
                     }
                     continue;
                 }
             };
+            packets_received = packets_received.saturating_add(1);
+            let (chunk_v2, chunk_part, chunk_seqno, chunk_data_len) = match &job {
+                Chunk::V1(RldpMessagePart(c)) => (false, c.part, c.seqno, c.data.len()),
+                Chunk::V2(Rldp2MessagePart(c)) => (true, c.part, c.seqno, c.data.len()),
+            };
+            log::debug!(
+                target: TARGET,
+                "{rldp} packet {transfer_str} part={chunk_part} seqno={chunk_seqno} \
+                data_len={chunk_data_len} v2={chunk_v2} \
+                (#{packets_received} in transfer)"
+            );
             #[cfg(feature = "debug")]
             if context.loss_fn.map_or(false, |loss_fn| loss_fn(&job)) {
                 continue;

@@ -198,13 +198,28 @@ impl NodeNetwork {
         NodeNetwork::periodic_store_ip_addr(dht.clone(), dht_key, None, cancellation_token.clone());
 
         let overlay_key = adnl.key_by_tag(Self::TAG_OVERLAY_KEY)?;
+        // Bind QUIC immediately on the default overlay ADNL key, validator key will be added later
+        if let Some(quic) = &quic {
+            let adnl_ip = adnl.ip_address_adnl();
+            match Self::compute_quic_bind_addr(adnl_ip, quic_address) {
+                Ok((_quic_addr, bind_addr)) => {
+                    if let Err(e) = Self::bind_quic_key(quic, &overlay_key, bind_addr) {
+                        log::warn!(
+                            "Cannot register default ADNL key {} on QUIC: {e}",
+                            overlay_key.id()
+                        );
+                    }
+                }
+                Err(e) => log::warn!("Skipping default QUIC identity: {e}"),
+            }
+        }
+
         NodeNetwork::periodic_store_ip_addr(
             dht.clone(),
             overlay_key,
             None,
             cancellation_token.clone(),
         );
-
         NodeNetwork::find_dht_nodes(dht.clone(), cancellation_token.clone());
 
         let (config_handler, config_handler_context) =
@@ -338,6 +353,54 @@ impl NodeNetwork {
         Self::periodic_store_ip_addr(dht, node_key, None, cancellation_token);
     }
 
+    fn bind_quic_key(
+        quic: &Arc<adnl::QuicNode>,
+        key: &Arc<dyn KeyOption>,
+        bind_addr: SocketAddr,
+    ) -> Result<()> {
+        let pvt_key = key.pvt_key()?.lock()?;
+        quic.add_key(pvt_key.as_ref().try_into()?, key.id(), bind_addr)
+    }
+
+    fn compute_quic_bind_addr(
+        adnl_ip: &adnl::node::IpAddress,
+        quic_address: Option<SocketAddr>,
+    ) -> Result<(SocketAddr, SocketAddr)> {
+        let quic_addr = if let Some(addr) = quic_address {
+            addr
+        } else {
+            let quic_port = adnl_ip
+                .port()
+                .checked_add(adnl::QuicNode::OFFSET_PORT)
+                .ok_or_else(|| error!("QUIC port overflow for ADNL port {}", adnl_ip.port()))?;
+            SocketAddr::new(Ipv4Addr::from(adnl_ip.ip()).into(), quic_port)
+        };
+        let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_addr.port());
+        if quic_addr.ip() != IpAddr::from(Ipv4Addr::UNSPECIFIED)
+            && quic_addr.ip() != IpAddr::from(Ipv4Addr::from(adnl_ip.ip()))
+        {
+            log::warn!(
+                "QUIC configured address {quic_addr} differs from ADNL IP {adnl_ip}; \
+                 binding to {bind_addr} but advertising {quic_addr}"
+            );
+        }
+        Ok((quic_addr, bind_addr))
+    }
+
+    fn find_dht_nodes(dht: Arc<DhtNode>, cancellation_token: tokio_util::sync::CancellationToken) {
+        spawn_cancelable(cancellation_token, async move {
+            loop {
+                let mut iter = None;
+                while let Some(id) = dht.get_known_peer(&mut iter) {
+                    if let Err(e) = dht.find_dht_nodes(&id).await {
+                        log::warn!("find_dht_nodes result: {:?}", e)
+                    }
+                }
+                tokio::time::sleep(Self::TIMEOUT_FIND_DHT_NODES).await;
+            }
+        });
+    }
+
     fn periodic_store_ip_addr(
         dht: Arc<DhtNode>,
         node_key: Arc<dyn KeyOption>,
@@ -360,20 +423,6 @@ impl NodeNetwork {
                         break;
                     }
                 }
-            }
-        });
-    }
-
-    fn find_dht_nodes(dht: Arc<DhtNode>, cancellation_token: tokio_util::sync::CancellationToken) {
-        spawn_cancelable(cancellation_token, async move {
-            loop {
-                let mut iter = None;
-                while let Some(id) = dht.get_known_peer(&mut iter) {
-                    if let Err(e) = dht.find_dht_nodes(&id).await {
-                        log::warn!("find_dht_nodes result: {:?}", e)
-                    }
-                }
-                tokio::time::sleep(Self::TIMEOUT_FIND_DHT_NODES).await;
             }
         });
     }
@@ -604,40 +653,16 @@ impl NodeNetwork {
         )?;
         if let Some(quic) = &self.network_context.stack.quic {
             let adnl_ip = self.network_context.stack.adnl.ip_address_adnl();
-            let quic_addr = if let Some(addr) = self.network_context.quic_address {
-                addr
-            } else {
-                let Some(quic_port) = adnl_ip.port().checked_add(adnl::QuicNode::OFFSET_PORT)
-                else {
-                    log::warn!(
-                        "QUIC port overflow for ADNL port {}, skipping QUIC key {key_id}",
-                        adnl_ip.port()
-                    );
-                    return Ok(true);
-                };
-                SocketAddr::new(Ipv4Addr::from(adnl_ip.ip()).into(), quic_port)
-            };
-            let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), quic_addr.port());
-            if quic_addr.ip() != IpAddr::from(Ipv4Addr::UNSPECIFIED)
-                && quic_addr.ip() != IpAddr::from(Ipv4Addr::from(adnl_ip.ip()))
-            {
-                log::warn!(
-                    "QUIC configured address {} differs from ADNL IP {}; \
-                     binding to {} but advertising {}",
-                    quic_addr,
-                    adnl_ip,
-                    bind_addr,
-                    quic_addr
-                );
-            }
-            match adnl_key.pvt_key() {
-                Ok(pvt_key) => {
-                    let pvt_key_data: &[u8] = &pvt_key.lock()?;
-                    if let Err(e) = quic.add_key(pvt_key_data.try_into()?, &key_id, bind_addr) {
-                        log::warn!("Cannot add validator ADNL key {key_id} to QUIC: {e}");
+            let (_quic_addr, bind_addr) =
+                match Self::compute_quic_bind_addr(adnl_ip, self.network_context.quic_address) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("Skipping QUIC key {key_id}: {e}");
+                        return Ok(true);
                     }
-                }
-                Err(e) => log::warn!("Cannot get private key for QUIC key {key_id}: {e}"),
+                };
+            if let Err(e) = Self::bind_quic_key(quic, &adnl_key, bind_addr) {
+                log::warn!("Cannot add validator ADNL key {key_id} to QUIC: {e}");
             }
         }
         NodeNetwork::periodic_store_ip_addr(
