@@ -12,6 +12,12 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait AuditLog: Send + Sync {
     async fn record(&self, event: AuditEvent);
+
+    /// Drains pending events and flushes the final batch.
+    ///
+    /// Called from the composition-root shutdown sequence. Implementations that
+    /// hold no buffered state (e.g. [`NoopAuditLog`]) keep the default no-op.
+    async fn shutdown(&self) {}
 }
 
 pub struct NoopAuditLog;

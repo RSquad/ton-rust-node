@@ -168,5 +168,9 @@ pub async fn run_with_config(
         let _ = task.disable().await;
     }
     let _ = http_task_handle.await;
+
+    // Drain and flush the audit log after all producers have stopped, so the
+    // final batch is persisted before the process exits.
+    audit.shutdown().await;
     Ok(())
 }

@@ -9,6 +9,8 @@
 pub mod enums;
 pub mod event;
 pub mod factory;
+pub mod jsonl_log;
+pub mod jsonl_writer;
 pub mod log;
 pub mod participant;
 
@@ -18,6 +20,7 @@ pub use enums::{
     StakeSkipReason,
 };
 pub use event::AuditEvent;
-pub use factory::{AuditInitError, AuditLogFactory};
+pub use factory::AuditLogFactory;
+pub use jsonl_log::AuditInitError;
 pub use log::{AuditLog, NoopAuditLog};
 pub use participant::{AuditActor, AuditSubject};
