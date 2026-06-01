@@ -963,8 +963,14 @@ fn default_audit_ring_buffer_capacity() -> usize {
     10_000
 }
 
+fn default_audit_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct AuditLogConfig {
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_audit_log_path")]
     pub path: PathBuf,
     #[serde(default = "default_audit_max_size_bytes")]
@@ -994,6 +1000,7 @@ pub struct AuditLogConfig {
 impl Default for AuditLogConfig {
     fn default() -> Self {
         Self {
+            enabled: default_audit_enabled(),
             path: default_audit_log_path(),
             max_size_bytes: default_audit_max_size_bytes(),
             max_files: default_audit_max_files(),

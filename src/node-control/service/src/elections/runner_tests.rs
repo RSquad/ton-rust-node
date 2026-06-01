@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use super::*;
+use crate::audit::log::{AuditLog, NoopAuditLog};
 use common::{
     app_config::{ElectionsConfig, NodeBinding, StakePolicy},
     clock::MockClock,
@@ -363,6 +364,10 @@ fn validate_message_parameters(
 
 // ---- Builder helpers ----
 
+fn noop_audit() -> Arc<dyn AuditLog> {
+    Arc::new(NoopAuditLog)
+}
+
 fn default_binding(enable: bool) -> NodeBinding {
     NodeBinding { wallet: "wallet".to_string(), pool: None, enable, status: Default::default() }
 }
@@ -475,6 +480,7 @@ impl TestHarness {
             Arc::new(wallets),
             Arc::new(pools),
             persist,
+            noop_audit(),
         )
     }
 }
@@ -1400,6 +1406,7 @@ async fn test_multiple_nodes_one_excluded() {
         Arc::new(wallets),
         Arc::new(pools),
         None,
+        noop_audit(),
     );
 
     let result = runner.run().await;
@@ -1802,6 +1809,7 @@ async fn test_node_without_wallet_skipped() {
         Arc::new(wallets),
         Arc::new(pools),
         None,
+        noop_audit(),
     );
 
     assert!(

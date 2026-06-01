@@ -29,7 +29,7 @@ pub async fn run(
     runtime_cfg: Arc<dyn RuntimeConfig>,
     store: Arc<SnapshotStore>,
     on_status_change: Option<BindingStatusCallback>,
-    _audit: Arc<dyn AuditLog>,
+    audit: Arc<dyn AuditLog>,
 ) -> anyhow::Result<()> {
     let Some(config) = app_config.elections.as_ref() else {
         anyhow::bail!("elections config is empty");
@@ -90,6 +90,7 @@ pub async fn run(
         runtime_cfg.wallets(),
         runtime_cfg.pools(),
         Some(persist_static_adnls),
+        audit,
     );
     runner
         .run_loop(

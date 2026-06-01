@@ -351,6 +351,7 @@ mod tests {
     fn default_config_matches_spec_defaults() {
         let cfg = AuditLogConfig::default();
         assert_eq!(cfg.path, PathBuf::from("./logs/audit.jsonl"));
+        assert!(cfg.enabled);
         assert_eq!(cfg.max_size_bytes, 100 * 1024 * 1024);
         assert_eq!(cfg.max_files, 10);
         assert_eq!(cfg.batch_interval_ms, 1000);
