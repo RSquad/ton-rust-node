@@ -927,6 +927,96 @@ impl Default for LogConfig {
     }
 }
 
+fn default_audit_log_path() -> PathBuf {
+    PathBuf::from("./logs/audit.jsonl")
+}
+
+fn default_audit_max_size_bytes() -> u64 {
+    100 * 1024 * 1024
+}
+
+fn default_audit_max_files() -> usize {
+    10
+}
+
+fn default_audit_batch_interval_ms() -> u64 {
+    1000
+}
+
+fn default_audit_batch_max_events() -> usize {
+    100
+}
+
+fn default_audit_queue_capacity() -> usize {
+    10_000
+}
+
+fn default_audit_queue_full_timeout_ms() -> u64 {
+    250
+}
+
+fn default_audit_include_payload() -> bool {
+    true
+}
+
+fn default_audit_ring_buffer_capacity() -> usize {
+    10_000
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct AuditLogConfig {
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_audit_log_path")]
+    pub path: PathBuf,
+    #[serde(default = "default_audit_max_size_bytes")]
+    pub max_size_bytes: u64,
+    #[serde(default = "default_audit_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_audit_batch_interval_ms")]
+    pub batch_interval_ms: u64,
+    #[serde(default = "default_audit_batch_max_events")]
+    pub batch_max_events: usize,
+    #[serde(default = "default_audit_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_audit_queue_full_timeout_ms")]
+    pub queue_full_timeout_ms: u64,
+    #[serde(default)]
+    pub fsync_on_batch: bool,
+    #[serde(default = "default_audit_include_payload")]
+    pub include_payload: bool,
+    #[serde(default)]
+    pub record_client_ip: bool,
+    #[serde(default)]
+    pub ip_anonymize: bool,
+    #[serde(default = "default_audit_ring_buffer_capacity")]
+    pub ring_buffer_capacity: usize,
+}
+
+impl Default for AuditLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            path: default_audit_log_path(),
+            max_size_bytes: default_audit_max_size_bytes(),
+            max_files: default_audit_max_files(),
+            batch_interval_ms: default_audit_batch_interval_ms(),
+            batch_max_events: default_audit_batch_max_events(),
+            queue_capacity: default_audit_queue_capacity(),
+            queue_full_timeout_ms: default_audit_queue_full_timeout_ms(),
+            fsync_on_batch: false,
+            include_payload: default_audit_include_payload(),
+            record_client_ip: false,
+            ip_anonymize: false,
+            ring_buffer_capacity: default_audit_ring_buffer_capacity(),
+        }
+    }
+}
+
 // Defaults aligned with `service/src/contracts/contracts_task.rs` (contracts task).
 
 fn default_contracts_wallet_deploy() -> u64 {
@@ -1101,6 +1191,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub automation: ContractsAutomationConfig,
     pub log: Option<LogConfig>,
+    #[serde(default)]
+    pub audit_log: AuditLogConfig,
 }
 
 impl AppConfig {
@@ -1755,5 +1847,16 @@ mod tests {
         assert_eq!(c.wallet.topup, 10_000_000_000);
         assert_eq!(c.wallet.threshold, 5_000_000_000);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn app_config_deserializes_without_audit_log_field() {
+        let json = r#"{
+            "nodes": {},
+            "ton_http_api": {},
+            "http": {}
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.audit_log, AuditLogConfig::default());
     }
 }

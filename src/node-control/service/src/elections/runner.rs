@@ -11,6 +11,7 @@ use super::{
     election_emulator::ParticipantStake,
     providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry},
 };
+use crate::audit::log::AuditLog;
 use anyhow::Context as _;
 use common::{
     app_config::{BindingStatus, ElectionsConfig, NodeBinding, StakePolicy},
@@ -269,6 +270,9 @@ pub(crate) struct ElectionRunner {
     /// Callback to persist freshly generated static ADNL addresses into runtime config.
     /// `None` in tests that don't care about persistence.
     persist_static_adnls: Option<PersistStaticAdnls>,
+    /// Reserved for elections audit events (SMA-99.4 call sites).
+    #[allow(dead_code)]
+    audit: Arc<dyn AuditLog>,
     clock: Arc<dyn Clock>,
 }
 
@@ -364,6 +368,7 @@ impl ElectionRunner {
         wallets: Arc<HashMap<String, Arc<dyn TonWallet>>>,
         pools: Arc<HashMap<String, Arc<dyn NominatorWrapper>>>,
         persist_static_adnls: Option<PersistStaticAdnls>,
+        audit: Arc<dyn AuditLog>,
     ) -> Self {
         let mut nodes = HashMap::new();
         for (node_id, provider) in providers {
@@ -428,6 +433,7 @@ impl ElectionRunner {
             sleep_pct: elections_config.sleep_period_pct,
             waiting_pct: elections_config.waiting_period_pct,
             persist_static_adnls,
+            audit,
             clock: Arc::new(SystemClock),
         }
     }

@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    audit::AuditLogFactory,
     elections::election_task::BindingStatusCallback,
     http::http_server_task,
     runtime_config::RuntimeConfigStore,
@@ -52,6 +53,10 @@ pub async fn run_with_config(
         .await
         .context("initialize runtime config store")?;
     let runtime_cfg = Arc::new(runtime_cfg);
+
+    let audit =
+        AuditLogFactory::from_config(&app_cfg.audit_log).await.context("audit log init failed")?;
+
     let store = Arc::new(SnapshotStore::new());
 
     // Status callback: when the elections runner detects binding status changes,
@@ -83,7 +88,12 @@ pub async fn run_with_config(
         "elections",
         Arc::new(TaskController::new(
             "elections",
-            ElectionsTask::new(runtime_cfg.clone(), store.clone(), Some(on_status_change)),
+            ElectionsTask::new(
+                runtime_cfg.clone(),
+                store.clone(),
+                Some(on_status_change),
+                audit.clone(),
+            ),
             runtime_cfg.clone(),
         )),
     );
@@ -113,6 +123,7 @@ pub async fn run_with_config(
         runtime_cfg.clone(),
         tasks.clone(),
         config_changed.clone(),
+        audit.clone(),
     ));
 
     let max_wait = std::time::Duration::from_secs(10);

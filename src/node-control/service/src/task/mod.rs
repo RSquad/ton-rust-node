@@ -9,7 +9,10 @@
 pub mod task_macro;
 pub mod task_manager;
 
-use crate::{elections::election_task::BindingStatusCallback, runtime_config::RuntimeConfig, task};
+use crate::{
+    audit::log::AuditLog, elections::election_task::BindingStatusCallback,
+    runtime_config::RuntimeConfig, task,
+};
 use common::snapshot::SnapshotStore;
 use std::sync::Arc;
 
@@ -25,4 +28,5 @@ task!(ElectionsTask, crate::elections::election_task::run {
     runtime_cfg: Arc<dyn RuntimeConfig>,
     store: Arc<SnapshotStore>,
     on_status_change: Option<BindingStatusCallback>,
+    audit: Arc<dyn AuditLog>,
 });

@@ -6,15 +6,18 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-pub mod config;
 pub mod enums;
 pub mod event;
+pub mod factory;
+pub mod log;
 pub mod participant;
 
-pub use config::AuditLogConfig;
+pub use common::app_config::AuditLogConfig;
 pub use enums::{
     AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, AuditSubjectKind,
     StakeSkipReason,
 };
 pub use event::AuditEvent;
+pub use factory::{AuditInitError, AuditLogFactory};
+pub use log::{AuditLog, NoopAuditLog};
 pub use participant::{AuditActor, AuditSubject};
