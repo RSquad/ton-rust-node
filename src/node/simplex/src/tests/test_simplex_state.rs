@@ -976,8 +976,8 @@ fn test_window_cleanup_after_finalization() {
     let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
 
     // Ensure windows 0 and 1 exist
-    state.ensure_window_exists(WindowIndex::new(0));
-    state.ensure_window_exists(WindowIndex::new(1));
+    state.ensure_window_exists(WindowIndex::new(0), WindowAlloc::BoundedByHorizon);
+    state.ensure_window_exists(WindowIndex::new(1), WindowAlloc::BoundedByHorizon);
     assert_eq!(state.leader_windows.len(), 2);
 
     let block = BlockIdExt::default();
@@ -1253,7 +1253,7 @@ fn test_has_available_parent_first_slot_no_bases() {
     let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
 
     // Create window 1 (slot 2 is first in window 1). Base is unknown by default.
-    state.ensure_window_exists(WindowIndex::new(1));
+    state.ensure_window_exists(WindowIndex::new(1), WindowAlloc::BoundedByHorizon);
 
     assert!(
         !state.has_available_parent(&desc, SlotIndex::new(2)),
@@ -4122,7 +4122,10 @@ fn test_is_slot_progressed_requires_notar_or_skip_markers() {
         "slot without notar/skip markers must not be considered progressed"
     );
 
-    state.get_slot_mut(&desc, SlotIndex::new(5)).expect("slot 5 exists").skipped = true;
+    state
+        .get_slot_mut(&desc, SlotIndex::new(5), WindowAlloc::BoundedByHorizon)
+        .expect("slot 5 exists")
+        .skipped = true;
     assert!(
         state.is_slot_progressed(&desc, SlotIndex::new(5)),
         "skip marker must mark the slot as progressed"
@@ -4135,7 +4138,7 @@ fn test_slot_accessors_hide_finalized_slots_like_cpp() {
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
 
     assert!(state.get_slot_ref(&desc, SlotIndex::new(0)).is_some());
-    assert!(state.get_slot_mut(&desc, SlotIndex::new(0)).is_some());
+    assert!(state.get_slot_mut(&desc, SlotIndex::new(0), WindowAlloc::BoundedByHorizon).is_some());
 
     state.set_first_non_finalized_slot(SlotIndex::new(1));
 
@@ -4144,7 +4147,7 @@ fn test_slot_accessors_hide_finalized_slots_like_cpp() {
         "finalized slots must be hidden just like C++ state.slot_at()"
     );
     assert!(
-        state.get_slot_mut(&desc, SlotIndex::new(0)).is_none(),
+        state.get_slot_mut(&desc, SlotIndex::new(0), WindowAlloc::BoundedByHorizon).is_none(),
         "finalized slots must not be mutable through parity accessors"
     );
 }
@@ -4156,7 +4159,10 @@ fn test_tracked_slots_interval_uses_highest_materialized_slot_cpp_parity() {
 
     assert_eq!(state.get_tracked_slots_interval(), (0, 1), "genesis base materializes only slot 0");
 
-    state.get_slot_mut(&desc, SlotIndex::new(4)).expect("slot 4 exists").skipped = true;
+    state
+        .get_slot_mut(&desc, SlotIndex::new(4), WindowAlloc::BoundedByHorizon)
+        .expect("slot 4 exists")
+        .skipped = true;
     assert_eq!(
         state.get_tracked_slots_interval(),
         (0, 5),
@@ -4194,9 +4200,15 @@ fn test_set_finalize_certificate_does_not_walk_progress_when_cursor_already_ahea
 
     let finalized_slot = SlotIndex::new(0);
     let block_hash = UInt256::from([0xC2; 32]);
-    state.get_slot_mut(&desc, finalized_slot).expect("slot 0 exists").observed_notar_certificate =
+    state
+        .get_slot_mut(&desc, finalized_slot, WindowAlloc::BoundedByHorizon)
+        .expect("slot 0 exists")
+        .observed_notar_certificate =
         Some(CandidateParentInfo { slot: finalized_slot, hash: block_hash.clone() });
-    state.get_slot_mut(&desc, SlotIndex::new(2)).expect("slot 2 exists").skipped = true;
+    state
+        .get_slot_mut(&desc, SlotIndex::new(2), WindowAlloc::BoundedByHorizon)
+        .expect("slot 2 exists")
+        .skipped = true;
     state.first_non_progressed_slot = SlotIndex::new(2);
 
     let final_cert = create_test_final_cert(&desc, finalized_slot, block_hash.clone(), &signers);
@@ -4395,7 +4407,7 @@ fn test_ensure_window_exists_capped() {
 
     // Try to create a window way beyond the cap
     let huge_window = WindowIndex::new(1_000_000);
-    state.ensure_window_exists(huge_window);
+    state.ensure_window_exists(huge_window, WindowAlloc::BoundedByHorizon);
 
     // Window count should NOT have grown to 1M
     assert_eq!(
@@ -4730,10 +4742,14 @@ fn test_available_base_skip_propagates_max_merge() {
     // Seed direct competing bases:
     // - slot1 (to be skipped) has higher base
     // - slot2 (target) already has lower base
-    state.get_slot_mut(&desc, SlotIndex::new(1)).expect("slot1 exists").available_base =
-        Some(Some(high_base.clone()));
-    state.get_slot_mut(&desc, SlotIndex::new(2)).expect("slot2 exists").available_base =
-        Some(Some(low_base));
+    state
+        .get_slot_mut(&desc, SlotIndex::new(1), WindowAlloc::BoundedByHorizon)
+        .expect("slot1 exists")
+        .available_base = Some(Some(high_base.clone()));
+    state
+        .get_slot_mut(&desc, SlotIndex::new(2), WindowAlloc::BoundedByHorizon)
+        .expect("slot2 exists")
+        .available_base = Some(Some(low_base));
 
     // After skip-cert propagation from slot1 -> slot2, max-merge must upgrade slot2.
     state.propagate_base_after_skip_cert(&desc, SlotIndex::new(1));
@@ -5301,7 +5317,10 @@ fn test_skip_base_propagation_holds_progress_until_base_known() {
     let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
 
     // Corrupt slot 0 base to emulate the invariant break discovered in incident analysis.
-    state.get_slot_mut(&desc, SlotIndex::new(0)).expect("slot 0 exists").available_base = None;
+    state
+        .get_slot_mut(&desc, SlotIndex::new(0), WindowAlloc::BoundedByHorizon)
+        .expect("slot 0 exists")
+        .available_base = None;
 
     let cert0 = create_test_skip_cert(&desc, SlotIndex::new(0), &signers);
     state
@@ -5328,7 +5347,10 @@ fn test_skip_base_missing_does_not_panic_on_window_boundary_crossing() {
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
     let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
 
-    state.get_slot_mut(&desc, SlotIndex::new(0)).expect("slot 0 exists").available_base = None;
+    state
+        .get_slot_mut(&desc, SlotIndex::new(0), WindowAlloc::BoundedByHorizon)
+        .expect("slot 0 exists")
+        .available_base = None;
 
     state
         .set_skip_certificate(
@@ -5357,7 +5379,7 @@ fn test_skip_base_missing_does_not_panic_on_window_boundary_crossing() {
     );
     assert!(
         state
-            .get_slot_mut(&desc, SlotIndex::new(2))
+            .get_slot_mut(&desc, SlotIndex::new(2), WindowAlloc::BoundedByHorizon)
             .expect("slot 2 exists")
             .available_base
             .is_none(),
@@ -6202,5 +6224,202 @@ fn test_second_leader_collates_after_full_first_window_skip() {
         state.first_non_progressed_slot > SlotIndex::new(2),
         "progress cursor must advance past notarized slot 2, got {}",
         state.first_non_progressed_slot
+    );
+}
+
+/*
+    ========================================================================
+    PCursor base invariant regression
+    ========================================================================
+
+    The crash signature observed was:
+
+        FATAL PANIC ... base unknown for progress cursor slot s120 (now_window=w15)
+        ... C++ CHECK(maybe_base.has_value()) in pool.cpp advance_present()
+        backtrace: advance_leader_window_on_progress_cursor ->
+                   set_finalize_certificate -> SessionProcessor::on_certificate
+
+    The session that first hit this had `slots_per_leader_window=8`,
+    `max_leader_window_desync=2`, and the local progress cursor was around
+    `s32` after recovery (window 4 of 7). A FinalCert for `s119/w14`
+    (referencing parent `s120/w15`) was accepted via the external cert
+    path; the same call then advanced `first_non_progressed_slot` past
+    the rejected window and panicked once the now-acceptable window
+    materialized without a base.
+
+    The tests below pin down the non-atomic interaction so any fix must
+    preserve the post-condition: no panic and no chain-invariant break.
+*/
+
+/// Releasenet incident parameters: 5 validators, 8 slots/window, desync 2.
+fn create_releasenet_pcursor_test_desc() -> SessionDescription {
+    let mut opts = crate::SessionOptions::default();
+    opts.max_leader_window_desync = 2;
+    create_test_desc_with_options(5, 8, opts)
+}
+
+#[test]
+fn test_tn1362_far_future_final_cert_setup_matches_incident() {
+    // Sanity-check the harness reproduces the exact bound math from the
+    // incident report: max acceptable slot = s48, max allocatable window = w7.
+    let desc = create_releasenet_pcursor_test_desc();
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    state.set_first_non_finalized_slot(SlotIndex::new(32));
+    state.first_non_progressed_slot = SlotIndex::new(32);
+
+    assert_eq!(
+        state.max_acceptable_slot(),
+        SlotIndex::new(48),
+        "incident bound: pcursor s32 + 2 windows of 8 slots == s48"
+    );
+    let max_window = WindowIndex::new(state.max_acceptable_slot().value() / 8 + 1);
+    assert_eq!(max_window, WindowIndex::new(7), "incident bound: max allocatable window == w7");
+
+    // The far-future FinalCert from the first failing panic referenced s119 / w14.
+    let far_slot = SlotIndex::new(119);
+    let far_window = desc.get_window_idx(far_slot);
+    assert_eq!(far_window, WindowIndex::new(14), "harness uses the same s119/w14 cert as incident");
+    assert!(
+        state.is_slot_too_far_ahead(far_slot),
+        "harness target s119 must be past max_acceptable_slot for the repro to load-bear"
+    );
+}
+
+fn assert_tn1362_far_future_final_cert_repaired_state(
+    state: &mut SimplexState,
+    desc: &SessionDescription,
+    finalized_slot: SlotIndex,
+    block_hash: UInt256,
+) {
+    let progress_slot = finalized_slot + 1;
+    let expected_parent = CandidateParentInfo { slot: finalized_slot, hash: block_hash };
+
+    assert_eq!(state.first_non_finalized_slot, progress_slot);
+    assert_eq!(state.first_non_progressed_slot, progress_slot);
+    assert_eq!(
+        state.get_slot_ref(desc, progress_slot).expect("progress slot must materialize").available_base,
+        Some(Some(expected_parent.clone())),
+        "FinalCert must publish the finalized candidate as successor base before cursor publication"
+    );
+
+    let now_window = desc.get_window_idx(progress_slot);
+    assert_eq!(
+        state.current_leader_window_idx, now_window,
+        "leader window must advance to the progress cursor window"
+    );
+    assert!(
+        state
+            .get_window(now_window)
+            .expect("progress cursor window must exist")
+            .available_bases
+            .contains(&Some(expected_parent)),
+        "new leader window must publish the same base used by the progress cursor"
+    );
+}
+
+#[test]
+fn test_tn1362_far_future_final_cert_materializes_successor_before_pcursor_jump() {
+    // Sequence (matches incident backtrace):
+    //   1. `set_finalize_certificate(s119, _, cert)` stores the FinalCert in
+    //      `slot_votes` (HashMap path, no allocation guard).
+    //   2. Certificate-only materialization creates w14/w15 despite the normal
+    //      candidate horizon being capped at w7.
+    //   3. The successor base is written to s120 before the finalized/progress
+    //      cursors move.
+    //   4. `advance_leader_window_on_progress_cursor` reads the base and does
+    //      not panic on the C++ parity invariant.
+
+    let desc = create_releasenet_pcursor_test_desc();
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    // Local validator recovered near window 4 (slot 32) just like the failing
+    // releasenet pod after `filter_finalized_chain` dropped 30 records but
+    // kept votes/certs and pool_state.
+    state.set_first_non_finalized_slot(SlotIndex::new(32));
+    state.first_non_progressed_slot = SlotIndex::new(32);
+
+    let far_slot = SlotIndex::new(119);
+    let block_hash = UInt256::from([0xFCu8; 32]);
+    let signers = vec![
+        ValidatorIndex::new(0),
+        ValidatorIndex::new(1),
+        ValidatorIndex::new(2),
+        ValidatorIndex::new(3),
+    ];
+    let cert = create_test_final_cert(&desc, far_slot, block_hash.clone(), &signers);
+
+    let stored = state
+        .set_finalize_certificate(&desc, far_slot, &block_hash, cert)
+        .expect("set_finalize_certificate must not panic or conflict");
+    assert!(stored, "new FinalCert must be stored");
+
+    assert_tn1362_far_future_final_cert_repaired_state(&mut state, &desc, far_slot, block_hash);
+}
+
+#[test]
+fn test_tn1362_far_future_final_cert_repairs_already_notarized_slot_successor_base() {
+    // Same root cause as
+    // `test_tn1362_far_future_final_cert_materializes_successor_before_pcursor_jump`,
+    // but with the finalized slot pre-marked as notarized via the slot-state
+    // marker. This forces the `missing_notar_marker == false` branch, so the
+    // FinalCert path must still repair the successor base before publishing the
+    // progress cursor. In C++, an already-notarized slot would already have run
+    // `next_nonskipped_slot_after(id.slot).state->add_available_base(id)`;
+    // Rust restart recovery can retain the marker without that successor write.
+
+    let desc = create_releasenet_pcursor_test_desc();
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    state.set_first_non_finalized_slot(SlotIndex::new(32));
+    state.first_non_progressed_slot = SlotIndex::new(32);
+
+    let far_slot = SlotIndex::new(119);
+    let block_hash = UInt256::from([0xC5u8; 32]);
+    let parent_info = CandidateParentInfo { slot: far_slot, hash: block_hash.clone() };
+    state
+        .get_slot_mut(&desc, far_slot, WindowAlloc::VerifiedCertificate)
+        .expect("verified certificate materialization must create far slot")
+        .observed_notar_certificate = Some(parent_info);
+    assert!(
+        state
+            .get_slot_mut(&desc, SlotIndex::new(120), WindowAlloc::VerifiedCertificate)
+            .expect("verified certificate materialization must create successor slot")
+            .available_base
+            .is_none(),
+        "precondition: successor base is still missing before FinalCert repair"
+    );
+
+    let signers = vec![
+        ValidatorIndex::new(0),
+        ValidatorIndex::new(1),
+        ValidatorIndex::new(2),
+        ValidatorIndex::new(3),
+    ];
+    let cert = create_test_final_cert(&desc, far_slot, block_hash.clone(), &signers);
+
+    let stored = state
+        .set_finalize_certificate(&desc, far_slot, &block_hash, cert)
+        .expect("set_finalize_certificate must not panic or conflict");
+    assert!(stored, "new FinalCert must be stored");
+
+    assert_tn1362_far_future_final_cert_repaired_state(&mut state, &desc, far_slot, block_hash);
+}
+
+#[test]
+fn test_tn1362_verified_certificate_materializer_ignores_finalized_slots_like_cpp_slot_at() {
+    let desc = create_releasenet_pcursor_test_desc();
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    state.set_first_non_finalized_slot(SlotIndex::new(32));
+    state.first_non_progressed_slot = SlotIndex::new(32);
+
+    assert!(
+        state.get_slot_mut(&desc, SlotIndex::new(31), WindowAlloc::VerifiedCertificate).is_none(),
+        "certificate materialization must still hide slots below first_non_finalized_slot"
+    );
+    assert!(
+        state.get_slot_mut(&desc, SlotIndex::new(32), WindowAlloc::VerifiedCertificate).is_some(),
+        "certificate materialization must allow the first tracked slot"
     );
 }

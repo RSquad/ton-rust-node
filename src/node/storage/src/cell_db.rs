@@ -285,21 +285,27 @@ impl CellDb {
     }
 
     fn load_cell_uncached(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
+        // Check storing_cells before the DB. Cells are inserted into
+        // storing_cells by CellsFactory::create_cell (during save_boc traversal)
+        // and removed by cleanup_storing_cells strictly after the DB commit.
+        // If we checked the DB first, a reader could hit DB before the commit
+        // (miss) and then hit storing_cells after the cleanup (also miss),
+        // even though the cell is already in the DB by then.
+        if let Some(guard) = self.storing_cells.get(cell_id) {
+            log::trace!(
+                target: TARGET,
+                "CellDb::load_cell from storing_cells by id {cell_id:x}",
+            );
+            return Ok(guard.val().clone());
+        }
+
         #[cfg(feature = "telemetry")]
         let now = Instant::now();
-        let storage_cell_data = match self.db.get_pinned_cf(&self.cells_cf()?, cell_id.as_slice()) {
-            Ok(Some(data)) => data,
-            _ => {
-                if let Some(guard) = self.storing_cells.get(cell_id) {
-                    log::trace!(
-                        target: TARGET,
-                        "CellDb::load_cell from storing_cells by id {cell_id:x}",
-                    );
-                    return Ok(guard.val().clone());
-                }
-                fail!("Can't load cell {:x} from db", cell_id);
-            }
-        };
+        let storage_cell_data =
+            match self.db.get_pinned_cf(&self.cells_cf()?, cell_id.as_slice())? {
+                Some(data) => data,
+                None => fail!("Can't load cell {:x} from db", cell_id),
+            };
 
         #[cfg(feature = "telemetry")]
         let load_cell_from_db_time_nanos = now.elapsed().as_nanos() as u64;

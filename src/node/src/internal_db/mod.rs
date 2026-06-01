@@ -62,8 +62,8 @@ use storage::{
 };
 use ton_block::{
     error, fail, time_checker, AccountIdPrefixFull, BigBocWriter, Block, BlockIdExt, BocFlags,
-    BocWriter, Cell, CellsFactory, CellsStorage, Result, ShardIdent, UInt256, INVALID_WORKCHAIN_ID,
-    MAX_SAFE_DEPTH,
+    BocWriter, Cell, CellsFactory, CellsStorage, ChunkedBocWriter, Result, ShardIdent, UInt256,
+    INVALID_WORKCHAIN_ID, MAX_SAFE_DEPTH,
 };
 
 /// Full node state keys
@@ -934,8 +934,12 @@ impl InternalDb {
         let id_owned = id.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let now = std::time::Instant::now();
-            let writer =
-                BocWriter::with_params([root], MAX_SAFE_DEPTH, BocFlags::all(), abort.deref())?;
+            let writer = ChunkedBocWriter::with_params(
+                [root],
+                MAX_SAFE_DEPTH,
+                BocFlags::all(),
+                abort.deref(),
+            )?;
             let cells_count = writer.cells_count();
             let arrange_time = now.elapsed();
             let mut dest = shard_state_persistent_db.get_write_object(&db_key)?;

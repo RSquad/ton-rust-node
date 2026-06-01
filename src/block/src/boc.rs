@@ -925,119 +925,143 @@ macro_rules! define_BocWriter {
     }
 }
 
-define_BocWriter! {BocWriter, CellInfo<Cell>, Vec<CellInfo<Cell>>, }
-impl BocWriter<'_> {
-    pub fn with_root(root_cell: &Cell) -> Result<Self> {
-        Self::with_roots([root_cell.clone()])
-    }
-
-    pub fn with_roots(root_cells: impl IntoIterator<Item = Cell>) -> Result<Self> {
-        fn default_abort() -> bool {
-            false
-        }
-        Self::with_params(root_cells, MAX_SAFE_DEPTH, BocFlags::None, &default_abort)
-    }
-
-    pub fn with_flags(root_cells: impl IntoIterator<Item = Cell>, flags: BocFlags) -> Result<Self> {
-        fn default_abort() -> bool {
-            false
-        }
-        Self::with_params(root_cells, MAX_SAFE_DEPTH, flags, &default_abort)
-    }
-
-    // Primary tree traversal where cells are arranged into a list (cells_list).
-    // Duplicate cells are added to the list only once.
-    // Child cells are always placed before their parents.
-    // Cell weights are initialized by the total number of child cells (recursively) + 1,
-    // but no more than 255.
-    fn arrange_cells(&mut self, cell: Cell) -> Result<u32> {
-        let repr_hash = cell.repr_hash().clone();
-
-        if cell.virtualization() != 0 {
-            fail!("Virtual cells serialization is prohibited");
-        }
-
-        // TODO try to use cells_index.entry api
-        if let Some(i) = self.cells_index.get(&repr_hash).cloned() {
-            self.cells[i as usize].flags |= CellInfoFlags::SHOULD_CACHE;
-            return Ok(i);
-        }
-
-        let mut weight = 1;
-        let mut refs = [0; MAX_REFERENCES_COUNT];
-        for (i, child_cell) in cell.clone_references()?.into_iter().enumerate() {
-            let child_rev_index = self.arrange_cells(child_cell)?;
-            refs[i] = child_rev_index;
-            weight += self.cells[child_rev_index as usize].weight as u32;
-        }
-
-        self.update_counters(&cell)?;
-
-        let cell_info = CellInfo::<Cell>::with_cell(cell, weight.min(MAX_CELL_WEIGHT) as u8, refs);
-
-        let rev_index = self.cells.len();
-        self.cells.push(cell_info);
-        self.cells_index.insert(repr_hash, rev_index as u32);
-
-        if rev_index & CHECK_ABORT_EACH == 0 {
-            check_abort(self.abort)?;
-        }
-
-        Ok(rev_index as u32)
-    }
-
-    fn write_cell_data<T: Write>(&self, cell: &CellInfo<Cell>, dest: &mut T) -> Result<()> {
-        // Cell layout:
-        // [D1] [D2] (hashes: 0..4 big endian u256) (depths: 0..4 big endian u16) [data: 0..128 bytes]
-
-        let cell_raw_data = cell.cell.raw_data()?;
-        let needs_hashes = self.flags.contains(BocFlags::IntHashes) && cell.weight == 0
-            || self.flags.contains(BocFlags::TopHash)
-                && cell.flags.contains(CellInfoFlags::IS_ROOT);
-        let has_hashes = cell::store_hashes(cell_raw_data);
-        match (needs_hashes, has_hashes) {
-            (true, true) | (false, false) => {
-                // write as is
-                dest.write_all(cell_raw_data)?;
+macro_rules! define_BocWriter_cell_impl {
+    ($writer:ident) => {
+        impl $writer<'_> {
+            pub fn with_root(root_cell: &Cell) -> Result<Self> {
+                Self::with_roots([root_cell.clone()])
             }
-            (true, false) => {
-                // repack with hashes
-                let d1 = cell::calc_d1(
-                    cell::level_mask(cell_raw_data),
-                    true,
-                    cell::cell_type(cell_raw_data),
-                    cell::refs_count(cell_raw_data),
-                );
-                dest.write_all(&[d1])?;
-                dest.write_all(&cell_raw_data[1..2])?; // D2
-                for hash in cell.cell.hashes() {
-                    dest.write_all(hash.as_slice())?;
+
+            pub fn with_roots(root_cells: impl IntoIterator<Item = Cell>) -> Result<Self> {
+                fn default_abort() -> bool {
+                    false
                 }
-                for depth in cell.cell.depths() {
-                    dest.write_all(&depth.to_be_bytes())?;
-                }
-                dest.write_all(&cell_raw_data[2..])?; // data
+                Self::with_params(root_cells, MAX_SAFE_DEPTH, BocFlags::None, &default_abort)
             }
-            (false, true) => {
-                // repack without hashes
-                let d1 = cell::calc_d1(
-                    cell::level_mask(cell_raw_data),
-                    false,
-                    cell::cell_type(cell_raw_data),
-                    cell::refs_count(cell_raw_data),
-                );
-                dest.write_all(&[d1])?;
-                dest.write_all(&cell_raw_data[1..2])?; // D2
-                let hashes_len = (SHA256_SIZE + DEPTH_SIZE) * cell::hashes_count(cell_raw_data);
-                dest.write_all(&cell_raw_data[2 + hashes_len..])?; // data
+
+            pub fn with_flags(
+                root_cells: impl IntoIterator<Item = Cell>,
+                flags: BocFlags,
+            ) -> Result<Self> {
+                fn default_abort() -> bool {
+                    false
+                }
+                Self::with_params(root_cells, MAX_SAFE_DEPTH, flags, &default_abort)
+            }
+
+            // Primary tree traversal where cells are arranged into a list (cells_list).
+            // Duplicate cells are added to the list only once.
+            // Child cells are always placed before their parents.
+            // Cell weights are initialized by the total number of child cells (recursively) + 1,
+            // but no more than 255.
+            fn arrange_cells(&mut self, cell: Cell) -> Result<u32> {
+                let repr_hash = cell.repr_hash().clone();
+
+                if cell.virtualization() != 0 {
+                    fail!("Virtual cells serialization is prohibited");
+                }
+
+                // TODO try to use cells_index.entry api
+                if let Some(i) = self.cells_index.get(&repr_hash).cloned() {
+                    self.cells[i as usize].flags |= CellInfoFlags::SHOULD_CACHE;
+                    return Ok(i);
+                }
+
+                let mut weight = 1;
+                let mut refs = [0; MAX_REFERENCES_COUNT];
+                for (i, child_cell) in cell.clone_references()?.into_iter().enumerate() {
+                    let child_rev_index = self.arrange_cells(child_cell)?;
+                    refs[i] = child_rev_index;
+                    weight += self.cells[child_rev_index as usize].weight as u32;
+                }
+
+                self.update_counters(&cell)?;
+
+                let cell_info =
+                    CellInfo::<Cell>::with_cell(cell, weight.min(MAX_CELL_WEIGHT) as u8, refs);
+
+                let rev_index = self.cells.len();
+                self.cells.push(cell_info);
+                self.cells_index.insert(repr_hash, rev_index as u32);
+
+                if rev_index & CHECK_ABORT_EACH == 0 {
+                    check_abort(self.abort)?;
+                }
+
+                Ok(rev_index as u32)
+            }
+
+            fn write_cell_data<T: Write>(&self, cell: &CellInfo<Cell>, dest: &mut T) -> Result<()> {
+                // Cell layout:
+                // [D1] [D2] (hashes: 0..4 big endian u256) (depths: 0..4 big endian u16) [data: 0..128 bytes]
+
+                let cell_raw_data = cell.cell.raw_data()?;
+                let needs_hashes = self.flags.contains(BocFlags::IntHashes) && cell.weight == 0
+                    || self.flags.contains(BocFlags::TopHash)
+                        && cell.flags.contains(CellInfoFlags::IS_ROOT);
+                let has_hashes = cell::store_hashes(cell_raw_data);
+                match (needs_hashes, has_hashes) {
+                    (true, true) | (false, false) => {
+                        // write as is
+                        dest.write_all(cell_raw_data)?;
+                    }
+                    (true, false) => {
+                        // repack with hashes
+                        let d1 = cell::calc_d1(
+                            cell::level_mask(cell_raw_data),
+                            true,
+                            cell::cell_type(cell_raw_data),
+                            cell::refs_count(cell_raw_data),
+                        );
+                        dest.write_all(&[d1])?;
+                        dest.write_all(&cell_raw_data[1..2])?; // D2
+                        for hash in cell.cell.hashes() {
+                            dest.write_all(hash.as_slice())?;
+                        }
+                        for depth in cell.cell.depths() {
+                            dest.write_all(&depth.to_be_bytes())?;
+                        }
+                        dest.write_all(&cell_raw_data[2..])?; // data
+                    }
+                    (false, true) => {
+                        // repack without hashes
+                        let d1 = cell::calc_d1(
+                            cell::level_mask(cell_raw_data),
+                            false,
+                            cell::cell_type(cell_raw_data),
+                            cell::refs_count(cell_raw_data),
+                        );
+                        dest.write_all(&[d1])?;
+                        dest.write_all(&cell_raw_data[1..2])?; // D2
+                        let hashes_len =
+                            (SHA256_SIZE + DEPTH_SIZE) * cell::hashes_count(cell_raw_data);
+                        dest.write_all(&cell_raw_data[2 + hashes_len..])?; // data
+                    }
+                }
+                Ok(())
             }
         }
-        Ok(())
-    }
+    };
 }
 
+define_BocWriter! {BocWriter, CellInfo<Cell>, Vec<CellInfo<Cell>>, }
+define_BocWriter_cell_impl!(BocWriter);
+
+// Chunk size for ChunkedBocWriter. CellInfo<Cell> is ~40 bytes, so one chunk is ~320 KB:
+// large enough to keep per-chunk overhead and index arithmetic low, small enough to avoid
+// the costly reallocations a single growing Vec would incur on the trees PSS produces.
+const CHUNKED_BOC_WRITER_CHUNK_SIZE: usize = 8192;
+
+// Chunk size for BigBocWriter, which streams trees from key-value storage and can hold
+// millions of CellInfo<UInt256> (~64 bytes each). Smaller 1024-element chunks (~64 KB)
+// trade a bit of indexing overhead for lower peak allocation pressure on huge trees.
+const BIG_BOC_WRITER_CHUNK_SIZE: usize = 1024;
+
+define_BocWriter! {ChunkedBocWriter, CellInfo<Cell>, ChunkedVec<CellInfo<Cell>, CHUNKED_BOC_WRITER_CHUNK_SIZE>, }
+define_BocWriter_cell_impl!(ChunkedBocWriter);
+
 // This implementation is optimised for working with big tree of cells stored in key-value.
-define_BocWriter! {BigBocWriter, CellInfo<UInt256>, ChunkedVec<CellInfo<UInt256>, 1024>, cells_storage: Arc<dyn CellsStorage> }
+define_BocWriter! {BigBocWriter, CellInfo<UInt256>, ChunkedVec<CellInfo<UInt256>, BIG_BOC_WRITER_CHUNK_SIZE>, cells_storage: Arc<dyn CellsStorage> }
 impl BigBocWriter<'_> {
     // Primary tree traversal where cells are arranged into a list (cells_list).
     // Duplicate cells are added to the list only once.
