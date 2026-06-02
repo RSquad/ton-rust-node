@@ -866,6 +866,7 @@ impl ValidatorManagerImpl {
         mc_state: &ShardStateStuff,
         bs_params: consensus_common::BlockSyncOverlayParams,
         use_quic: bool,
+        proto_version: u32,
     ) -> Result<()> {
         // (1) Confirm we hold a key in any of prev/curr/next mc sets.
         // Build the union and call `find_local_validator_key` (which scans
@@ -903,8 +904,7 @@ impl ValidatorManagerImpl {
             error!("local ADNL key {local_adnl_id} not registered with adnl node yet")
         })?;
 
-        // (4) Spawn the observer. Proto version 5 matches the simplex receiver
-        // default (effective_proto in extract_block_info_from_candidate)
+        // (4) Spawn the observer with the session's negotiated proto version
         let observer = super::block_sync_observer::BlockSyncObserver::create(
             self.rt.clone(),
             overlay_node,
@@ -915,7 +915,7 @@ impl ValidatorManagerImpl {
             self.engine.clone(),
             use_quic,
             /*broadcast_hops*/ None,
-            /*proto_version*/ 5,
+            proto_version,
         )?;
         log::info!(
             target: "validator_manager",
@@ -1876,14 +1876,16 @@ impl ValidatorManagerImpl {
                 if let Some(bs_params) = block_sync_overlay_params.as_ref() {
                     touched_observer_sessions.insert(session_id.clone());
                     if !self.block_sync_observers.contains_key(&session_id) {
-                        let use_quic =
-                            consensus_options.as_simplex().map(|o| o.use_quic).unwrap_or(false);
+                        let simplex = consensus_options.as_simplex();
+                        let use_quic = simplex.map(|o| o.use_quic).unwrap_or(false);
+                        let proto_version = simplex.map(|o| o.proto_version).unwrap_or(5);
                         if let Err(e) = self.try_spawn_observer(
                             &ident,
                             &session_id,
                             mc_state,
                             bs_params.clone(),
                             use_quic,
+                            proto_version,
                         ) {
                             log::warn!(
                                 target: "validator_manager",
