@@ -1246,6 +1246,7 @@ fn test_stop() {
             &ctx_test.adnl.key_by_tag(KEY_TAG_OVERLAY).unwrap(),
             &Vec::new(),
             false,
+            None,
         )
         .unwrap();
     assert!(added);

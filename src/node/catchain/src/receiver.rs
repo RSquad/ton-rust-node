@@ -3505,6 +3505,8 @@ impl ReceiverImpl {
             Arc::downgrade(&overlay_data_listener),
             Arc::downgrade(&overlay_replay_listener),
             transport_type,
+            // catchain consensus does not run a block-sync overlay
+            None,
         )?;
 
         //TODO: stop overlay in case of error
@@ -3733,9 +3735,14 @@ impl CatchainOverlayListener for OverlayListenerImpl {
         }));
     }
 
-    fn on_broadcast(&self, source_key_hash: PublicKeyHash, data: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        source_key_hash: PublicKeyHash,
+        data: &BlockPayloadPtr,
+        _source: consensus_common::BroadcastSource,
+    ) {
         instrument!();
-
+        // `_source` ignored; the block-sync overlay is simplex-only
         if !self.allow_broadcasts.load(Ordering::SeqCst) {
             log::debug!(
                 "Skip broadcast from overlay for source: {}",

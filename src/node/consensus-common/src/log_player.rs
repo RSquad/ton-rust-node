@@ -237,6 +237,7 @@ impl ConsensusOverlayManager for LogPlayerOverlayManager {
         listener: ConsensusOverlayListenerPtr,
         overlay_log_replay_listener: ConsensusOverlayLogReplayListenerPtr,
         _transport_type: OverlayTransportType,
+        _block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
         let should_stop_flag = Arc::new(AtomicBool::new(false));
         let is_stopped_flag = Arc::new(AtomicBool::new(false));
@@ -563,6 +564,8 @@ impl LogPlayerImpl {
                     "broadcast" => listener.on_broadcast(
                         source_id.clone(),
                         &ConsensusCommonFactory::create_block_payload(bytes),
+                        // Replayed traffic is attributed to the consensus overlay
+                        crate::BroadcastSource::ConsensusOverlay,
                     ),
                     _ => log::warn!("...unknown message type {}", message_type),
                 }

@@ -13,7 +13,7 @@ use crate::{
     },
     declare_counted,
     node::PeerHistory,
-    overlay::{Overlay, OverlayNode, TARGET, TARGET_BROADCAST},
+    overlay::{Overlay, OverlayNode, OverlayType, TARGET, TARGET_BROADCAST},
     rldp::{RaptorqDecoder, RaptorqEncoder},
 };
 #[cfg(feature = "telemetry")]
@@ -786,6 +786,21 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         let stats = ctx.overlay.get_per_transfer_stats(bcast_id)?;
         #[cfg(feature = "telemetry")]
         stats.income.fetch_add(1, Ordering::Relaxed);
+        // on_recv check if any runs on first FEC part, before reassembly
+        if ctx.overlay.owned_broadcasts.get(bcast_id).is_none() {
+            if let OverlayType::Private { bcast_check: Some(check), .. } = &ctx.overlay.overlay_type
+            {
+                if let Err(reason) = check.on_recv(bcast.src_key()?.id(), bcast.extra()) {
+                    log::warn!(
+                        target: TARGET,
+                        "precheck rejected broadcast {} in overlay {}: {reason}",
+                        base64_encode(bcast_id),
+                        ctx.overlay.overlay_id
+                    );
+                    return Ok((None, false));
+                }
+            }
+        }
         let bcast_type = Self::broadcast_type();
         let transfer = loop {
             if let Some(transfer) = ctx.overlay.owned_broadcasts.get(bcast_id) {
@@ -2061,8 +2076,21 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
         &self,
         bcast: BroadcastTwostepSimple,
         ctx: &mut BroadcastRecvContext,
-        _bcast_id: &BroadcastId,
+        bcast_id: &BroadcastId,
     ) -> Result<(Option<BroadcastRecvInfo>, bool)> {
+        // on_recv check if any runs on simple two-step path too (matches FEC path)
+        if let OverlayType::Private { bcast_check: Some(check), .. } = &ctx.overlay.overlay_type {
+            if let Err(reason) = check.on_recv(bcast.src_key()?.id(), Some(&bcast.extra)) {
+                log::warn!(
+                    target: TARGET,
+                    "precheck rejected twostep-simple broadcast {} in overlay {}: {reason}",
+                    base64_encode(bcast_id),
+                    ctx.overlay.overlay_id
+                );
+                ctx.overlay.owned_broadcasts.remove(bcast_id);
+                return Ok((None, false));
+            }
+        }
         let src_adnl_key_id = KeyId::from_data(*bcast.src_adnl_id.as_slice());
         let resend = ctx.peers.other() == &src_adnl_key_id;
         let info = BroadcastRecvInfo {

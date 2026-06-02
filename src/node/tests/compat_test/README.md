@@ -39,7 +39,9 @@ compat_test/
 │   ├── test_quic_transport.rs        # QUIC transport: raw queries, large messages, TLS
 │   ├── test_quic_overlay.rs          # QUIC overlay: messages and queries via QUIC
 │   ├── test_quic_private_overlay.rs  # QUIC private overlay: ADNL vs QUIC transport
-│   └── test_raptorq.rs              # RaptorQ FEC codec cross-implementation tests
+│   ├── test_raptorq.rs              # RaptorQ FEC codec cross-implementation tests
+│   ├── test_block_sync_overlay_id.rs # consensus.blockSyncOverlayId wire compat
+│   └── test_simplex_config_v2_wire.rs # simplex_config_v2 flag-byte layout compat
 └── build/                 # Build artifacts (gitignored)
     └── cpp/               # C++ binary output
 ```
@@ -81,6 +83,7 @@ CPP_SRC_PATH=/path/to/ton-cpp-testnet make build
 make clean
 ```
 
+
 ## Compatibility Status
 
 | Test Suite | Tests | Pass | Ignored | Status |
@@ -99,7 +102,9 @@ make clean
 | `test_quic_overlay` | 4 | 4 | 0 | Compatible |
 | `test_quic_private_overlay` | 5 | 5 | 0 | Compatible |
 | `test_raptorq` | 14 | 14 | 0 | Compatible |
-| **Total** | **67** | **66** | **1** | |
+| `test_block_sync_overlay_id` | 3 | 3 | 0 | Compatible |
+| `test_simplex_config_v2_wire` | 2 | 2 | 0 | Compatible |
+| **Total** | **71** | **70** | **1** | |
 
 ## Test Suites
 
@@ -226,6 +231,19 @@ Cross-implementation RaptorQ encode/decode — symbols produced by one side are 
 | `test_4mb_cpp_encode_rust_decode` | C++ → Rust | 4 MB | 4/8/16/32/64 symbols (>=64KB each), SHA-256 verified | PASS |
 | `test_4mb_large_symbol_params_match` | Both | 4 MB | Parameters identical for all 5 symbol counts | PASS |
 | `test_4mb_large_symbol_source_identical` | Both | 4 MB | Source symbols byte-identical for all 5 symbol counts | PASS |
+
+### 15. Block-Sync Overlay ID (`test_block_sync_overlay_id`)
+Wire-format test for the `consensus.blockSyncOverlayId` TL type:
+- Boxed seed bytes for `consensus.blockSyncOverlayId{session_id}` are byte-equal between Rust and C++ (constructor `0x9d792212` + 32-byte session_id).
+- The derived `OverlayIdShort` (SHA256 of `pub.overlay{name = seed}`) matches.
+- The block-sync overlay short-id is distinct from the legacy `consensus.overlayId` short-id for the same `session_id` (so the two overlays don't collide).
+
+### 16. SimplexConfig v2 Wire (`test_simplex_config_v2_wire`)
+Bit-layout test for the v2 flag byte. The flag byte goes from `flags:(## 7) use_quic:Bool` to `flags:(## 6) enable_observers:Bool use_quic:Bool`. Both directions are exercised across all 4 `(enable_observers, use_quic)` combinations:
+- Rust-built `simplex_config_v2#22` cells unpack on C++ to the same field values.
+- C++-built cells deserialize on Rust to the same field values.
+
+Catches silent bit-order mistakes that single-implementation tests can't see.
 
 ## Environment Variables
 

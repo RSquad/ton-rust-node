@@ -169,6 +169,12 @@ impl<N1: Borrow<NodeV1>, N2: Borrow<NodeV2>> OverlayNodeInfo<N1, N2> {
 pub type OverlayShortId = KeyId;
 pub type PrivateOverlayShortId = KeyId;
 
+/// Broadcast auth hooks for a private overlay (C++ `OverlayPrivacyRules`).
+pub trait BroadcastCheck: Send + Sync {
+    fn on_send(&self, src: &Arc<KeyId>, payload_size: usize) -> Result<()>;
+    fn on_recv(&self, src: &Arc<KeyId>, extra: Option<&[u8]>) -> Result<()>;
+}
+
 /// Overlay utilities
 pub struct OverlayUtils;
 
@@ -351,10 +357,11 @@ struct SlaveInfo {
 
 enum OverlayType {
     Public,
-    // Overlay with fixed members set
+    // Overlay with fixed members set; optional broadcast auth via BroadcastCheck
     Private {
         key: Arc<dyn KeyOption>,
         use_quic: bool,
+        bcast_check: Option<Arc<dyn BroadcastCheck>>,
     },
     // Overlay with externally certified members
     CertifiedMembers {
@@ -603,8 +610,9 @@ impl Overlay {
     ) -> Vec<Arc<KeyId>> {
         let root_adnl_ids = match &self.overlay_type {
             OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            // Private overlays: iterate all known_peers
             OverlayType::Private { .. } => None,
-            _ => {
+            OverlayType::Public => {
                 let mut neighbours = Vec::new();
                 let (mut iter, mut neighbour) = self.neighbours.first();
                 while let Some(node) = neighbour {
@@ -642,8 +650,9 @@ impl Overlay {
     fn calc_broadcast_twostep_neighbours(&self) -> u32 {
         let root_adnl_ids = match &self.overlay_type {
             OverlayType::CertifiedMembers { root_adnl_ids, .. } => Some(root_adnl_ids),
+            // Private overlays: count all known_peers
             OverlayType::Private { .. } => None,
-            _ => return self.neighbours.count(),
+            OverlayType::Public => return self.neighbours.count(),
         };
         let mut count = 0u32;
         let mut iter = None;
@@ -868,7 +877,7 @@ impl Overlay {
         match &self.overlay_type {
             OverlayType::Private { key, .. } => Some(key),
             OverlayType::CertifiedMembers { key, .. } => key.as_ref(),
-            _ => None,
+            OverlayType::Public => None,
         }
     }
 
@@ -1475,8 +1484,9 @@ impl OverlayNode {
         overlay_key: &Arc<dyn KeyOption>,
         peers: &[Arc<KeyId>],
         use_quic: bool,
+        bcast_check: Option<Arc<dyn BroadcastCheck>>,
     ) -> Result<bool> {
-        let overlay_type = OverlayType::Private { key: overlay_key.clone(), use_quic };
+        let overlay_type = OverlayType::Private { key: overlay_key.clone(), use_quic, bcast_check };
         self.add_typed_private_overlay(overlay_type, params, peers)
     }
 
@@ -1626,6 +1636,10 @@ impl OverlayNode {
             src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
+        // Outgoing broadcast auth (C++ `OverlayPrivacyRules`, all paths).
+        if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
+            check.on_send(ctx.src_key.id(), data.object.len())?;
+        }
         if let AdnlSendMethod::Fast = &method {
             if data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST {
                 return BroadcastFecProtocol::for_send(&ctx).send(ctx).await;
@@ -1658,6 +1672,10 @@ impl OverlayNode {
             src_key: self.calc_src_key_for_broadcast(&overlay, src_key),
             src_adnl_key_id: overlay.overlay_key().unwrap_or(&self.node_key).id(),
         };
+        // Outgoing broadcast auth (C++ `OverlayPrivacyRules`).
+        if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
+            check.on_send(ctx.src_key.id(), data.object.len())?;
+        }
         let neighbours = overlay.calc_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
         let reliable = big_data || overlay.overlay_type.quic_requested();
@@ -2204,8 +2222,8 @@ impl OverlayNode {
                     timeout_pending_peers += tick_ms;
                     timeout_ping += tick_ms;
                 }
-                // Reduce inbound cap for pending peers of Private overlays additionally
-                // to known peers.
+                // Reduce inbound cap for pending peers of Private overlays
+                // additionally to known peers
                 if !matches!(overlay.overlay_type, OverlayType::Private { .. }) {
                     return;
                 }

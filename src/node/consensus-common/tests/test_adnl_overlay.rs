@@ -147,7 +147,12 @@ impl ConsensusOverlayListener for TestListener {
         );
         self.query_count.fetch_add(1, Ordering::SeqCst);
     }
-    fn on_broadcast(&self, from: PublicKeyHash, payload: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        from: PublicKeyHash,
+        payload: &BlockPayloadPtr,
+        _source: consensus_common::BroadcastSource,
+    ) {
         log::trace!(
             target: "adnl_overlay_test",
             "on_broadcast called (local_id: {}, from: {from}, msg_size: {})",
@@ -324,6 +329,7 @@ fn run_overlay_test(
             weak_listener,
             make_log_replay_listener(),
             transport_type,
+            None,
         )?;
         overlays.push(overlay);
         listeners.push(listener);
@@ -532,6 +538,7 @@ fn test_adnl_overlay_network_disable_toggle() -> Result<()> {
             weak_listener,
             make_log_replay_listener(),
             TRANSPORT_TYPE,
+            None,
         )?;
         overlays.push(overlay);
         listeners.push(listener);
@@ -632,7 +639,12 @@ impl ConsensusOverlayListener for PerformanceTestListener {
         std::thread::sleep(CALLBACK_SLEEP_TIME);
     }
 
-    fn on_broadcast(&self, _from: PublicKeyHash, payload: &BlockPayloadPtr) {
+    fn on_broadcast(
+        &self,
+        _from: PublicKeyHash,
+        payload: &BlockPayloadPtr,
+        _source: consensus_common::BroadcastSource,
+    ) {
         let latency =
             SystemTime::now().duration_since(payload.get_creation_time()).unwrap_or_default();
         self.broadcast_latencies.lock().unwrap().push(latency);
@@ -722,6 +734,7 @@ fn run_adnl_overlay_performance_test(
             weak_listener,
             make_log_replay_listener(),
             transport_type,
+            None,
         )?;
         overlays.push(overlay);
         all_listeners.push(listener);

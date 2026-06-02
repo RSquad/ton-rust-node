@@ -48,7 +48,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 #[cfg(test)]
 use ton_block::{base64_encode, write_boc, UsageTree};
@@ -7210,11 +7210,26 @@ impl ValidateQuery {
         };
         let gas_used = base.gas_used.load(Ordering::Relaxed);
         let ratio = gas_used.checked_div(duration).unwrap_or(gas_used);
+        // Candidate age: now - gen_utime_ms (from ConsensusExtraData, simplex only).
+        // Reported as "AGE: -" for catchain candidates (no per-block ms timestamp).
+        // Negative ages (clock skew) are clamped to 0
+        let age_ms_str = match base.now_ms {
+            Some(gen_ms) => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(gen_ms);
+                let age = now_ms.saturating_sub(gen_ms);
+                format!("{age}ms")
+            }
+            None => "-".to_string(),
+        };
         log::info!(
-            "({}): ASYNC VALIDATED {} TIME {}ms GAS_RATE: {}",
+            "({}): ASYNC VALIDATED {} TIME {}ms AGE: {} GAS_RATE: {}",
             self.next_block_descr,
             base.block_id(),
             duration,
+            age_ms_str,
             ratio
         );
 
