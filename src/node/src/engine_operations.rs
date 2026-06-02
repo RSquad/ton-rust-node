@@ -129,6 +129,16 @@ impl EngineOperations for Engine {
         Engine::validator_network(self)
     }
 
+    /// expose the OverlayNode for `BlockSyncObserver`
+    fn overlay_node(&self) -> Option<Arc<adnl::OverlayNode>> {
+        Some(self.network().context().stack.overlay.clone())
+    }
+
+    /// look up a local ADNL key by short id
+    fn adnl_key_by_id(&self, id: &Arc<ton_block::KeyId>) -> Option<Arc<dyn ton_block::KeyOption>> {
+        self.network().context().stack.adnl.key_by_id(id).ok()
+    }
+
     /// Register the local node's participation in a validator list and update network overlays.
     ///
     /// Delegates to [`PrivateOverlayOperations::set_validator_list`] for key matching and
@@ -227,6 +237,7 @@ impl EngineOperations for Engine {
         _log_replay_listener: CatchainOverlayLogReplayListenerPtr,
         broadcast_hops: Option<u8>,
         transport_type: consensus_common::OverlayTransportType,
+        block_sync_params: Option<consensus_common::BlockSyncOverlayParams>,
     ) -> Result<Arc<dyn CatchainOverlay + Send>> {
         self.validator_network().create_catchain_client(
             validator_list_id,
@@ -237,6 +248,7 @@ impl EngineOperations for Engine {
             _log_replay_listener,
             broadcast_hops,
             transport_type,
+            block_sync_params,
         )
     }
 
@@ -1075,7 +1087,7 @@ impl EngineOperations for Engine {
         validator_set_hash: u32,
         block_root: &Cell,
     ) -> Result<()> {
-        log::trace!("send_block_candidate_broadcast {}", id);
+        log::trace!("send_block_candidate_broadcast {id}");
         self.cache_block_candidate(
             id,
             BocWriter::with_flags([block_root.clone()], BocFlags::all())?.write_to_vec()?,

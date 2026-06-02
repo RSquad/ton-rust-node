@@ -878,6 +878,12 @@ pub async fn find_prev_pss(
 
         log::trace!("find_prev_pss: prev key block is {}", prev_key_block_id);
 
+        // First stored state right after zerostate is small, fast path is not worth it.
+        if prev_key_block_id.seq_no() == 0 {
+            log::trace!("find_prev_pss: prev key block is zerostate, no prev PSS available");
+            return Ok(None);
+        }
+
         let Some(prev_handle) = db.load_block_handle(&prev_key_block_id)? else {
             log::warn!(
                 "Cannot load handle for prev key block {} when searching prev pss",

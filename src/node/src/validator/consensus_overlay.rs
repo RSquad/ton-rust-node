@@ -12,17 +12,24 @@ use super::consensus::{
 };
 use crate::engine_traits::PrivateOverlayOperations;
 use adnl::PrivateOverlayShortId;
+use consensus_common::BlockSyncOverlayParams;
 use std::sync::Arc;
 use ton_block::{Result, UInt256};
 
 pub(crate) struct ConsensusOverlayManagerImpl {
     network: Arc<dyn PrivateOverlayOperations>,
     validator_list_id: UInt256,
+    /// Block-sync overlay membership and authorization; `None` for catchain or when observers disabled
+    block_sync_params: Option<BlockSyncOverlayParams>,
 }
 
 impl ConsensusOverlayManagerImpl {
-    pub fn new(network: Arc<dyn PrivateOverlayOperations>, validator_list_id: UInt256) -> Self {
-        Self { network, validator_list_id }
+    pub fn new(
+        network: Arc<dyn PrivateOverlayOperations>,
+        validator_list_id: UInt256,
+        block_sync_params: Option<BlockSyncOverlayParams>,
+    ) -> Self {
+        Self { network, validator_list_id, block_sync_params }
     }
 }
 
@@ -35,6 +42,8 @@ impl ConsensusOverlayManager for ConsensusOverlayManagerImpl {
         listener: ConsensusOverlayListenerPtr,
         replay_listener: ConsensusOverlayLogReplayListenerPtr,
         transport_type: OverlayTransportType,
+        // simplex passes None; the real params live on self.block_sync_params.
+        _block_sync_params_unused: Option<BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
         self.network.create_catchain_client(
             self.validator_list_id.clone(),
@@ -45,6 +54,7 @@ impl ConsensusOverlayManager for ConsensusOverlayManagerImpl {
             replay_listener,
             None,
             transport_type,
+            self.block_sync_params.clone(),
         )
     }
 

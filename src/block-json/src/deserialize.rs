@@ -667,6 +667,7 @@ impl StateParser {
     fn parse_simplex_config(p: &PathMap) -> Result<SimplexConfig> {
         let d = NoncriticalParams::default();
         Ok(SimplexConfig {
+            enable_observers: p.get_num32("enable_observers").unwrap_or(0) != 0,
             use_quic: p.get_num32("use_quic").unwrap_or(0) != 0,
             slots_per_leader_window: p.get_num32("slots_per_leader_window")?,
             noncritical_params: NoncriticalParams {

@@ -115,6 +115,7 @@ impl ConsensusOverlayManager for DummyConsensusOverlayManager {
         _overlay_listener: ConsensusOverlayListenerPtr,
         _log_replay_listener: ConsensusOverlayLogReplayListenerPtr,
         _transport_type: OverlayTransportType,
+        _block_sync_params: Option<crate::BlockSyncOverlayParams>,
     ) -> Result<ConsensusOverlayPtr> {
         Ok(Arc::new(DummyConsensusOverlay))
     }

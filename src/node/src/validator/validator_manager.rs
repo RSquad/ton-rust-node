@@ -140,6 +140,7 @@ fn build_runtime_simplex_session_options(
         max_collated_data_size: catchain_options.max_collated_data_size as usize,
         use_callback_thread: false,
         use_quic: cfg.use_quic,
+        enable_observers: cfg.enable_observers,
         no_empty_blocks_on_error_timeout: Duration::from_millis(
             np.no_empty_blocks_on_error_timeout_ms as u64,
         ),
@@ -674,8 +675,11 @@ struct ValidatorListStatus {
     known_lists: HashMap<ValidatorListHash, LocalValidatorListEntry>,
     curr: Option<ValidatorListHash>,
     next: Option<ValidatorListHash>,
+    /// for observer mode keeps the local ADNL key alive
+    prev: Option<ValidatorListHash>,
     curr_utime_since: Option<u32>,
     next_utime_since: Option<u32>,
+    prev_utime_since: Option<u32>,
 }
 
 impl ValidatorListStatus {
@@ -699,8 +703,25 @@ impl ValidatorListStatus {
         self.get_list(list_id).map(|entry| entry.keys.as_slice())
     }
 
+    /// Local validator keys for the validator arm (curr-only); prev keys are reachable
+    /// via `get_all_local_keys` for observer-mode lookups
     fn get_local_keys(&self) -> Option<&[PublicKey]> {
         self.curr.as_ref().and_then(|current_list| self.get_local_keys_for_list(current_list))
+    }
+
+    /// Union of local keys across curr|next|prev; deduped by `KeyOption::id`
+    fn get_all_local_keys(&self) -> Vec<PublicKey> {
+        let mut out: Vec<PublicKey> = Vec::new();
+        for list_id in [&self.curr, &self.next, &self.prev].into_iter().flatten() {
+            if let Some(keys) = self.get_local_keys_for_list(list_id) {
+                for k in keys {
+                    if !out.iter().any(|existing| existing.id() == k.id()) {
+                        out.push(k.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn actual_or_coming(&self, list_id: &ValidatorListHash) -> bool {
@@ -708,9 +729,12 @@ impl ValidatorListStatus {
             Some(curr_id) if list_id == curr_id => return true,
             _ => (),
         };
-
         match &self.next {
-            Some(next_id) => list_id == next_id,
+            Some(next_id) if list_id == next_id => return true,
+            _ => (),
+        };
+        match &self.prev {
+            Some(prev_id) => list_id == prev_id,
             _ => false,
         }
     }
@@ -754,6 +778,8 @@ struct ValidatorManagerImpl {
     sync_complete: bool,
     /// Wall-clock timestamp of the last full metrics dump.
     last_metrics_dump: tokio::time::Instant,
+    /// active block-sync observers, keyed by session_id
+    block_sync_observers: HashMap<UInt256, Arc<super::block_sync_observer::BlockSyncObserver>>,
 }
 
 impl ValidatorManagerImpl {
@@ -775,6 +801,7 @@ impl ValidatorManagerImpl {
             destroyed_sessions: HashSet::new(),
             sync_complete: false,
             last_metrics_dump: tokio::time::Instant::now(),
+            block_sync_observers: HashMap::new(),
         }
     }
 
@@ -826,6 +853,77 @@ impl ValidatorManagerImpl {
     /// Used for active-session creation in `start_sessions`.
     fn find_us(&self, validators: &[ValidatorDescr]) -> Option<PublicKey> {
         find_local_validator_key(validators, self.validator_list_status.get_local_keys())
+    }
+
+    /// Try to spawn a `BlockSyncObserver` for a shard we are not validating
+    ///
+    /// Requires `enable_observers=true` (caller has already checked via `Some(bs_params)`)
+    /// and a validator-class key in any of prev|curr|next mc sets. `Err` carries a reason
+    fn try_spawn_observer(
+        &mut self,
+        shard: &ShardIdent,
+        session_id: &UInt256,
+        mc_state: &ShardStateStuff,
+        bs_params: consensus_common::BlockSyncOverlayParams,
+        use_quic: bool,
+        proto_version: u32,
+    ) -> Result<()> {
+        // (1) Confirm we hold a key in any of prev/curr/next mc sets.
+        // Build the union and call `find_local_validator_key` (which scans
+        // our temp+permanent keys against ValidatorDescr pubkey hashes).
+        let config_params = mc_state.config_params()?;
+        let prev = config_params.prev_validator_set().unwrap_or_default();
+        let curr = config_params.validator_set()?;
+        let next = config_params.next_validator_set().unwrap_or_default();
+        let mut union: Vec<ValidatorDescr> = Vec::new();
+        union.extend(prev.list().iter().cloned());
+        union.extend(curr.list().iter().cloned());
+        union.extend(next.list().iter().cloned());
+        let all_keys = self.validator_list_status.get_all_local_keys();
+        let local_validator_key =
+            find_local_validator_key(&union, Some(&all_keys)).ok_or_else(|| {
+                error!("we hold no validator-class key in any of prev|curr|next mc sets")
+            })?;
+
+        // (2) Resolve the corresponding ADNL id from `union` so we can pick a
+        // local ADNL key the observer can join with. The ADNL id is whichever
+        // ValidatorDescr in `union` matches our local validator pubkey
+        let local_pkhash = local_validator_key.id().data();
+        let local_adnl_id = union
+            .iter()
+            .find(|v| v.compute_node_id_short().as_slice() == local_pkhash)
+            .map(|v| v.adnl_addr())
+            .ok_or_else(|| error!("local pubkey not found in union (logic error)"))?;
+
+        // (3) Resolve the ADNL KeyOption from the adnl node.
+        let overlay_node = self
+            .engine
+            .overlay_node()
+            .ok_or_else(|| error!("engine.overlay_node() returned None"))?;
+        let local_adnl_key = self.engine.adnl_key_by_id(&local_adnl_id).ok_or_else(|| {
+            error!("local ADNL key {local_adnl_id} not registered with adnl node yet")
+        })?;
+
+        // (4) Spawn the observer with the session's negotiated proto version
+        let observer = super::block_sync_observer::BlockSyncObserver::create(
+            self.rt.clone(),
+            overlay_node,
+            local_adnl_key,
+            bs_params,
+            session_id.clone(),
+            shard.clone(),
+            self.engine.clone(),
+            use_quic,
+            /*broadcast_hops*/ None,
+            proto_version,
+        )?;
+        log::info!(
+            target: "validator_manager",
+            "SESSION_LIFECYCLE: observer_started shard={shard} session_id={:x}",
+            session_id,
+        );
+        self.block_sync_observers.insert(session_id.clone(), observer);
+        Ok(())
     }
 
     /// Register the local node in a validator list and return its hash if matched.
@@ -902,10 +1000,15 @@ impl ValidatorManagerImpl {
     /// Mirrors the implicit list-management in C++ `update_shards()` where `get_validator()`
     /// is called per-shard. In Rust, we pre-resolve membership once per update round.
     async fn update_validator_lists(&mut self, mc_state: &ShardStateStuff) -> Result<bool> {
-        let (validator_set, next_validator_set) = match mc_state.state()?.read_custom()? {
-            None => return Ok(false),
-            Some(state) => (state.config.validator_set()?, state.config.next_validator_set()?),
-        };
+        let (validator_set, next_validator_set, prev_validator_set) =
+            match mc_state.state()?.read_custom()? {
+                None => return Ok(false),
+                Some(state) => (
+                    state.config.validator_set()?,
+                    state.config.next_validator_set()?,
+                    state.config.prev_validator_set()?,
+                ),
+            };
 
         self.validator_list_status.curr =
             self.update_single_validator_list(validator_set.list(), "current").await?;
@@ -925,11 +1028,20 @@ impl ValidatorManagerImpl {
             self.update_single_validator_list(next_validator_set.list(), "next").await?;
         self.validator_list_status.next_utime_since = Some(next_validator_set.utime_since());
 
+        // Register prev to keep the local ADNL key alive for prev-only observer mode
+        self.validator_list_status.prev =
+            self.update_single_validator_list(prev_validator_set.list(), "prev").await?;
+        self.validator_list_status.prev_utime_since = Some(prev_validator_set.utime_since());
+
         metrics::gauge!("ton_node_validator_in_current_set")
             .set(self.validator_list_status.curr.is_some() as u8 as f64);
         metrics::gauge!("ton_node_validator_in_next_set")
             .set(self.validator_list_status.next.is_some() as u8 as f64);
-        Ok(self.validator_list_status.curr.is_some() || self.validator_list_status.next.is_some())
+        metrics::gauge!("ton_node_validator_in_prev_set")
+            .set(self.validator_list_status.prev.is_some() as u8 as f64);
+        Ok(self.validator_list_status.curr.is_some()
+            || self.validator_list_status.next.is_some()
+            || self.validator_list_status.prev.is_some())
     }
 
     async fn is_active_shard(&self, shard: &ShardIdent) -> bool {
@@ -1259,11 +1371,13 @@ impl ValidatorManagerImpl {
     ///   `ValidatorManagerOptionsImpl::get_noncritical_params`
     fn select_consensus_options(
         &self,
+        session_id: &UInt256,
         shard: &ShardIdent,
         mc_state: &ShardStateStuff,
         catchain_options: &CatchainSessionOptions,
         _cc_seqno: u32,
-    ) -> ConsensusOptions {
+        cur_subset: &ValidatorSet,
+    ) -> Result<(ConsensusOptions, Option<consensus_common::BlockSyncOverlayParams>)> {
         // C++ ref: mc-config.cpp — Config::get_new_consensus_config reads ConfigParam 30
         // directly without checking global_version.  Absence of the param
         // (or a parse error) falls through to the catchain path below.
@@ -1275,13 +1389,13 @@ impl ValidatorManagerImpl {
                     "Could not get config_params from mc_state: {}, using catchain",
                     e
                 );
-                return ConsensusOptions::Catchain(catchain_options.clone());
+                return Ok((ConsensusOptions::Catchain(catchain_options.clone()), None));
             }
         };
 
         // C++ ref: get_new_consensus_config(wc) selects mc or shard inner config,
         // then tries simplex_config#21 / simplex_config_v2#22.
-        // Absence → catchain fallback (the node must stay catchain-compatible).
+        // Absence -> catchain fallback (the node must stay catchain-compatible).
         let simplex_cfg: Option<SimplexConfig> = if shard.is_masterchain() {
             config_params.get_mc_simplex_config().ok().flatten()
         } else {
@@ -1305,10 +1419,39 @@ impl ValidatorManagerImpl {
             // TODO: C++ also applies per-shard/cc_seqno overrides here via
             // get_noncritical_params() in validator-options.hpp.
             let opts = build_runtime_simplex_session_options(shard, &cfg, catchain_options);
-            return ConsensusOptions::Simplex(opts);
+
+            // when enable_observers=true for this shard, compute the
+            // block-sync overlay membership + authorization from the masterchain
+            // ConfigParams (prev|curr|next validator sets, current-set authz).
+            // C++ parity: manager.cpp builds overlay_members + block-sync-overlay.cpp
+            // builds authorized_keys from bus.validator_set (current set only)
+            // Network requires observers - fail loudly if we can't honour it.
+            let block_sync_params = if cfg.enable_observers {
+                let p = consensus_common::BlockSyncOverlayParams::from_config(
+                    config_params,
+                    cfg.slots_per_leader_window,
+                    cur_subset,
+                )
+                .map_err(|e| error!("Block-sync params build failed for {shard}: {e}"))?;
+                let overlay_id = simplex::utils::compute_block_sync_overlay_short_id(session_id)
+                    .map_err(|e| error!("Block-sync overlay id for {shard}: {e}"))?;
+                log::debug!(
+                    target: "validator_manager",
+                    "Block-sync overlay params built for {}: members={}, authorized={}, \
+                     leader_window={}",
+                    shard,
+                    p.members.len(),
+                    p.authorized_keys.len(),
+                    p.slots_per_leader_window,
+                );
+                Some(p.with_overlay_id(overlay_id))
+            } else {
+                None
+            };
+            return Ok((ConsensusOptions::Simplex(opts), block_sync_params));
         }
 
-        // No simplex config → catchain fallback.
+        // No simplex config -> catchain fallback.
         // This is the expected path when testnet has empty ConfigParam 30 or when
         // ConfigParam 30 contains null_consensus_config#20.
         log::trace!(
@@ -1316,7 +1459,7 @@ impl ValidatorManagerImpl {
             "No simplex config for {}, using catchain",
             shard
         );
-        ConsensusOptions::Catchain(catchain_options.clone())
+        Ok((ConsensusOptions::Catchain(catchain_options.clone()), None))
     }
 
     async fn update_validation_status(
@@ -1499,6 +1642,12 @@ impl ValidatorManagerImpl {
         // We retain only sessions selected by the current shard iteration and swap atomically
         // at the end. Old current entries that are not selected are stopped right after swap.
         let mut new_current_sessions: HashMap<UInt256, Arc<ValidatorGroup>> = HashMap::new();
+        // same pattern for block-sync observers.
+        // Session ids touched this pass survive the swap; the rest are
+        // reaped (stop + remove). D3 lifecycle: an observer dies when
+        // we start validating its shard (session_id won't appear in this pass)
+        // or the session simply ends
+        let mut touched_observer_sessions: HashSet<UInt256> = HashSet::new();
 
         for (ident, prev_blocks) in new_shards {
             let cc_seqno_from_state = if ident.is_masterchain() {
@@ -1591,6 +1740,30 @@ impl ValidatorManagerImpl {
                 continue;
             }
 
+            // Select consensus type based on ConfigParam 30. Computed
+            // unconditionally so the observer branch (below) can also see
+            // `block_sync_overlay_params` when we're NOT in this shard's
+            // validator subset
+            let current_session_options = sessions_options.get_session_options(&ident);
+            let (consensus_options, block_sync_overlay_params) = match self
+                .select_consensus_options(
+                    &session_id,
+                    &ident,
+                    mc_state,
+                    current_session_options,
+                    cc_seqno,
+                    &vsubset,
+                ) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!(
+                        target: "validator_manager",
+                        "Skipping session {session_id:x} for shard {ident}: {e}"
+                    );
+                    continue;
+                }
+            };
+
             if let Some(local_id) = &local_id_option {
                 log::debug!(
                     target: "validator_manager",
@@ -1605,15 +1778,6 @@ impl ValidatorManagerImpl {
                 let engine = self.engine.clone();
                 let allow_unsafe_self_blocks_resync =
                     self.config.unsafe_resync_catchains.contains(&cc_seqno);
-                let current_session_options = sessions_options.get_session_options(&ident);
-
-                // Select consensus type based on ConfigParam 30
-                let consensus_options = self.select_consensus_options(
-                    &ident,
-                    mc_state,
-                    current_session_options,
-                    cc_seqno,
-                );
 
                 let session = match select_existing_session_for_current_map(
                     &session_id,
@@ -1665,6 +1829,7 @@ impl ValidatorManagerImpl {
                             consensus_options.clone(),
                             engine,
                             allow_unsafe_self_blocks_resync,
+                            block_sync_overlay_params.clone(),
                         ))
                     }
                 };
@@ -1706,6 +1871,29 @@ impl ValidatorManagerImpl {
                 }
             } else {
                 log::trace!(target: "validator_manager", "We are not in subset for {}", ident);
+                // Observer mode for shards we don't validate
+                // (C++ `manager.cpp:2462-2554`, `get_or_make_next_group` is_validator=false)
+                if let Some(bs_params) = block_sync_overlay_params.as_ref() {
+                    touched_observer_sessions.insert(session_id.clone());
+                    if !self.block_sync_observers.contains_key(&session_id) {
+                        let simplex = consensus_options.as_simplex();
+                        let use_quic = simplex.map(|o| o.use_quic).unwrap_or(false);
+                        let proto_version = simplex.map(|o| o.proto_version).unwrap_or(5);
+                        if let Err(e) = self.try_spawn_observer(
+                            &ident,
+                            &session_id,
+                            mc_state,
+                            bs_params.clone(),
+                            use_quic,
+                            proto_version,
+                        ) {
+                            log::warn!(
+                                target: "validator_manager",
+                                "observer not spawned for shard={ident} session={session_id:x}: {e}"
+                            );
+                        }
+                    }
+                }
             }
             log::trace!(target: "validator_manager", "Session {} started (if necessary)", ident);
         }
@@ -1758,6 +1946,27 @@ impl ValidatorManagerImpl {
             old_current_count,
             self.current_sessions.len()
         );
+
+        // reap observers whose session_id wasn't touched this pass.
+        // Triggers when we begin validating a previously-observed
+        // shard (the local_id_option arm fires instead of the observer arm)
+        // or when the shard simply rotates out
+        let stale_observer_ids: Vec<UInt256> = self
+            .block_sync_observers
+            .keys()
+            .filter(|sid| !touched_observer_sessions.contains(*sid))
+            .cloned()
+            .collect();
+        for sid in stale_observer_ids {
+            if let Some(observer) = self.block_sync_observers.remove(&sid) {
+                log::info!(
+                    target: "validator_manager",
+                    "SESSION_LIFECYCLE: observer_stopped shard={} session_id={:x}",
+                    observer.shard(), sid,
+                );
+                observer.stop();
+            }
+        }
         Ok(())
     }
 
@@ -1785,9 +1994,20 @@ impl ValidatorManagerImpl {
 
         if !self.update_validator_lists(&mc_state).await? {
             log::info!(target: "validator_manager",
-                "VALIDATION_STATUS: not a validator (not in current or next set), disabling");
+                "VALIDATION_STATUS: not a validator (not in prev/curr/next set), disabling");
             self.disable_validation(true).await?;
             return Ok(());
+        }
+
+        // Observer-only path: we hold a key in prev only (rotated out of curr/next).
+        // Validator groups stay disabled, but the per-shard loop still runs so the
+        // observer arm and the observer reaper at the bottom rotate session_ids
+        let observer_only =
+            self.validator_list_status.curr.is_none() && self.validator_list_status.next.is_none();
+        if observer_only {
+            log::info!(target: "validator_manager",
+                "VALIDATION_STATUS: prev-only (observer mode), validator groups disabled");
+            self.disable_validation(true).await?;
         }
 
         let last_masterchain_block = mc_state.block_id();
@@ -1802,9 +2022,10 @@ impl ValidatorManagerImpl {
         };
         let mc_now = mc_state.state()?.gen_time();
 
-        self.enable_validation();
-
-        self.update_validation_status(&mc_state, mc_state_extra).await?;
+        if !observer_only {
+            self.enable_validation();
+            self.update_validation_status(&mc_state, mc_state_extra).await?;
+        }
 
         let master_cc_range = master_cc_seqno..=master_cc_seqno; // Todo: compute always
 
@@ -2041,12 +2262,24 @@ impl ValidatorManagerImpl {
                 gc_validator_sessions.remove(&session_id);
 
                 // Select consensus type based on ConfigParam 30
-                let consensus_options = self.select_consensus_options(
-                    &ident,
-                    mc_state.as_ref(),
-                    current_session_options,
-                    *next_cc_seqno,
-                );
+                let (consensus_options, block_sync_overlay_params) = match self
+                    .select_consensus_options(
+                        &session_id,
+                        &ident,
+                        mc_state.as_ref(),
+                        current_session_options,
+                        *next_cc_seqno,
+                        &vsubset,
+                    ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!(
+                            target: "validator_manager",
+                            "Skipping future session {session_id:x} for shard {ident}: {e}"
+                        );
+                        continue;
+                    }
+                };
 
                 if self.current_sessions.contains_key(&session_id) {
                     log::trace!(
@@ -2084,6 +2317,7 @@ impl ValidatorManagerImpl {
                             consensus_options.clone(),
                             self.engine.clone(),
                             self.config.unsafe_resync_catchains.contains(next_cc_seqno),
+                            block_sync_overlay_params.clone(),
                         ))
                     })
                     .clone();

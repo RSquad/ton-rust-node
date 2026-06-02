@@ -194,7 +194,7 @@ impl RustTestNode {
             runtime: Some(self.rt.handle().clone()),
         };
         self.overlay
-            .add_private_overlay(params, &local_key, peers, use_quic)
+            .add_private_overlay(params, &local_key, peers, use_quic, None)
             .expect("add_private_overlay failed");
     }
 
@@ -836,7 +836,7 @@ impl RustQuicTestNode {
             runtime: Some(self.rt.handle().clone()),
         };
         self.overlay
-            .add_private_overlay(params, &local_key, peers, use_quic)
+            .add_private_overlay(params, &local_key, peers, use_quic, None)
             .expect("add_private_overlay failed");
     }
 

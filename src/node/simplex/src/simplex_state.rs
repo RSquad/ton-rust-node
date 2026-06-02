@@ -445,6 +445,29 @@ fn candidate_parent_ge(a: &CandidateParent, b: &CandidateParent) -> bool {
     Reference: C++ LeaderWindow struct in consensus.cpp
 */
 
+/// Window/slot allocation policy.
+///
+/// Distinguishes between unverified input (candidates, votes — must respect
+/// `max_acceptable_slot()`) and quorum-verified certificate ingestion
+/// (C++ `slot_at()` parity — must materialize so the parent-chain repair in
+/// `set_finalize_certificate()` can write the successor base atomically before
+/// the progress cursor moves).
+///
+/// C++ parity:
+/// - `BoundedByHorizon` mirrors the defense-in-depth on top of the message-boundary
+///   `first_too_new_slot` check (`pool.cpp` `handle(IncomingProtocolMessage)`).
+/// - `VerifiedCertificate` mirrors C++ `state.slot_at()` invoked from
+///   `handle_typed_saved_certificate(FinalCertRef)` after quorum/storage acceptance.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WindowAlloc {
+    /// Apply the `max_acceptable_slot()` defense-in-depth guard.
+    /// Use for candidates, votes, and any unverified input.
+    BoundedByHorizon,
+    /// Bypass the horizon guard. C++ `slot_at()` parity.
+    /// Use ONLY after the certificate passed quorum/storage checks.
+    VerifiedCertificate,
+}
+
 /// Leader window containing slots
 ///
 /// Reference: C++ `struct LeaderWindow` in consensus.cpp
@@ -1153,16 +1176,27 @@ impl SimplexState {
         self.get_window(window_idx).map(|w| &w.slots[offset])
     }
 
-    /// Returns a mutable reference to per-slot state (if the slot is still tracked).
+    /// Returns a mutable reference to per-slot state, materializing the slot's
+    /// window under `alloc` policy (see [`WindowAlloc`]).
     ///
-    /// Ensures the window exists when `slot` is in the tracked range.
-    fn get_slot_mut(&mut self, desc: &SessionDescription, slot: SlotIndex) -> Option<&mut Slot> {
+    /// Use `WindowAlloc::BoundedByHorizon` for candidate/vote/normal window paths
+    /// (keeps the `max_acceptable_slot()` allocation guard).
+    ///
+    /// Use `WindowAlloc::VerifiedCertificate` only after a certificate has passed
+    /// storage/conflict checks — this is the C++ `state.slot_at()` parity path that
+    /// materializes the cert's referenced slot before applying state transitions.
+    fn get_slot_mut(
+        &mut self,
+        desc: &SessionDescription,
+        slot: SlotIndex,
+        alloc: WindowAlloc,
+    ) -> Option<&mut Slot> {
         if slot < self.first_non_finalized_slot {
             return None;
         }
         let window_idx = desc.get_window_idx(slot);
         let offset = desc.get_slot_offset_in_window(slot) as usize;
-        self.ensure_window_exists(window_idx);
+        self.ensure_window_exists(window_idx, alloc);
         self.get_window_mut(window_idx).map(|w| &mut w.slots[offset])
     }
 
@@ -1191,25 +1225,30 @@ impl SimplexState {
         self.get_slot_ref(desc, slot).map(|s| s.skipped).unwrap_or(false)
     }
 
-    /// Ensure window exists at index.
+    /// Ensure window exists at index, honoring the requested allocation policy.
     ///
-    /// Defense-in-depth: refuses to allocate beyond configured future horizon
-    /// even if the caller forgot to pre-validate.
-    fn ensure_window_exists(&mut self, idx: WindowIndex) {
-        let max_slot = self.max_acceptable_slot().value();
-        let max_window = WindowIndex(max_slot / self.slots_per_leader_window + 1);
-        if idx > max_window {
-            self.window_reject_count += 1;
-            if self.window_reject_count <= 3 || self.window_reject_count % 10000 == 0 {
-                log::warn!(
-                    "SimplexState::ensure_window_exists: REJECTED window {} > max {} \
-                    (defense-in-depth, occurrence #{})",
-                    idx,
-                    max_window,
-                    self.window_reject_count,
-                );
+    /// - `WindowAlloc::BoundedByHorizon`: defense-in-depth — refuses to allocate
+    ///   beyond `max_acceptable_slot()` even if the caller forgot to pre-validate.
+    /// - `WindowAlloc::VerifiedCertificate`: bypasses the horizon guard so verified
+    ///   FinalCert handling can materialize the cert's referenced slot atomically
+    ///   (C++ `slot_at()` parity, see `pool.cpp handle_typed_saved_certificate`).
+    fn ensure_window_exists(&mut self, idx: WindowIndex, alloc: WindowAlloc) {
+        if alloc == WindowAlloc::BoundedByHorizon {
+            let max_slot = self.max_acceptable_slot().value();
+            let max_window = WindowIndex(max_slot / self.slots_per_leader_window + 1);
+            if idx > max_window {
+                self.window_reject_count += 1;
+                if self.window_reject_count <= 3 || self.window_reject_count % 10000 == 0 {
+                    log::warn!(
+                        "SimplexState::ensure_window_exists: REJECTED window {} > max {} \
+                        (defense-in-depth, occurrence #{})",
+                        idx,
+                        max_window,
+                        self.window_reject_count,
+                    );
+                }
+                return;
             }
-            return;
         }
 
         while idx >= self.leader_window_offset + self.leader_windows.len() as u32 {
@@ -1218,7 +1257,8 @@ impl SimplexState {
             let end_slot = start_slot + self.slots_per_leader_window - 1;
 
             log::trace!(
-                "SimplexState::ensure_window_exists: created {} ({}..{})",
+                "SimplexState::ensure_window_exists[{:?}]: created {} ({}..{})",
+                alloc,
                 new_idx,
                 start_slot,
                 end_slot
@@ -1252,7 +1292,7 @@ impl SimplexState {
 
     /// Alias for get_window_mut that also ensures window exists
     fn window_at_mut(&mut self, idx: WindowIndex) -> Option<&mut LeaderWindow> {
-        self.ensure_window_exists(idx);
+        self.ensure_window_exists(idx, WindowAlloc::BoundedByHorizon);
         self.get_window_mut(idx)
     }
 
@@ -1867,7 +1907,7 @@ impl SimplexState {
             let offset = desc.get_slot_offset_in_window(slot_id) as usize;
 
             // Ensure window exists
-            self.ensure_window_exists(window_idx);
+            self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
             // C++ alarm() checks voted_final and fires once per window (one-shot alarm).
             // Rust process_timeouts fires per-slot, so we must also check voted_skip to
@@ -2104,7 +2144,7 @@ impl SimplexState {
         else {
             let offset = desc.get_slot_offset_in_window(slot) as usize;
 
-            self.ensure_window_exists(window_idx);
+            self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
             // C++ consensus.cpp CandidateReceived only gates on voted_notar (line 170),
             // NOT voted_skip. A local skip vote must NOT prevent storing a candidate as
@@ -2899,7 +2939,9 @@ impl SimplexState {
                             window_idx,
                             slot_id
                         );
-                        if let Some(s) = self.get_slot_mut(desc, slot_id) {
+                        if let Some(s) =
+                            self.get_slot_mut(desc, slot_id, WindowAlloc::BoundedByHorizon)
+                        {
                             s.observed_notar_certificate = Some(parent_info.clone());
                         }
                         self.propagate_base_after_notarization(desc, parent_info.clone());
@@ -3051,7 +3093,7 @@ impl SimplexState {
             &block_hash.to_hex_string()[..8]
         );
 
-        self.ensure_window_exists(window_idx);
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
         // Record observed notarization certificate in slot state.
         if let Some(window) = self.get_window_mut(window_idx) {
@@ -3187,7 +3229,7 @@ impl SimplexState {
             return Ok(());
         }
 
-        self.ensure_window_exists(window_idx);
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
         // Store newly available parent base for this window.
         if let Some(window) = self.get_window_mut(window_idx) {
@@ -3309,7 +3351,7 @@ impl SimplexState {
         let window_idx = desc.get_window_idx(slot);
         let offset = desc.get_slot_offset_in_window(slot) as usize;
 
-        self.ensure_window_exists(window_idx);
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
         // C++ parity: consensus.cpp on_candidate_to_notarize checks only voted_notar,
         // allowing Notarize after Skip.
@@ -3394,7 +3436,7 @@ impl SimplexState {
         let window_idx = desc.get_window_idx(slot);
         let offset = desc.get_slot_offset_in_window(slot) as usize;
 
-        self.ensure_window_exists(window_idx);
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
         let should_vote_final = if let Some(window) = self.get_window(window_idx) {
             let slot_state = &window.slots[offset];
@@ -3558,7 +3600,7 @@ impl SimplexState {
     ///         pendingBlocks[k] ← ⊥
     /// ```
     fn try_skip_window(&mut self, window_idx: WindowIndex) {
-        self.ensure_window_exists(window_idx);
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
 
         let start_slot = window_idx * self.slots_per_leader_window;
         let num_slots = self.slots_per_leader_window as usize;
@@ -4321,33 +4363,23 @@ impl SimplexState {
                 treat FinalCert as notarization for parent-chain tracking (missing marker)",
                 &block_hash.to_hex_string()[..8],
             );
-
-            let mut observed_marker_set = false;
-            if let Some(s) = self.get_slot_mut(desc, slot) {
-                if s.observed_notar_certificate.is_none() {
-                    s.observed_notar_certificate = Some(parent_info.clone());
-                    observed_marker_set = true;
-                }
-            } else {
-                // Should not happen for non-old slots; keep trace only (avoid panic in foreign cert ingestion).
-                log::trace!(
-                    "SimplexState::set_finalize_certificate: \
-                    slot={slot} block={} missing notar marker but slot state is missing",
-                    &block_hash.to_hex_string()[..8],
-                );
-            }
-
-            self.propagate_base_after_notarization(desc, parent_info.clone());
-
+        } else {
             log::trace!(
                 "SimplexState::set_finalize_certificate: slot={slot} block={} \
-                FinalCert-as-notar applied (observed_marker_set={observed_marker_set}, \
-                first_non_progressed_slot={}, first_non_finalized_slot={})",
+                already has notar marker; repairing successor base before cursor movement",
                 &block_hash.to_hex_string()[..8],
-                self.first_non_progressed_slot,
-                self.first_non_finalized_slot,
             );
         }
+        self.apply_final_cert_parent_chain_for_verified_certificate(desc, parent_info.clone());
+
+        log::trace!(
+            "SimplexState::set_finalize_certificate: slot={slot} block={} \
+            FinalCert parent-chain applied \
+            (first_non_progressed_slot={}, first_non_finalized_slot={})",
+            &block_hash.to_hex_string()[..8],
+            self.first_non_progressed_slot,
+            self.first_non_finalized_slot,
+        );
 
         // Update finalized boundary (C++ notify_finalized/handle_certificate parity).
         let next_slot = SlotIndex::new(slot.value() + 1);
@@ -4479,7 +4511,7 @@ impl SimplexState {
         // Update slot state to mark as skipped
         let window_idx = slot.window_index(self.slots_per_leader_window);
         let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
-        self.ensure_window_exists(window_idx);
+        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
         if let Some(window) = self.get_window_mut(window_idx) {
             if offset < window.slots.len() {
                 window.slots[offset].skipped = true;
@@ -4607,8 +4639,10 @@ impl SimplexState {
         desc: &SessionDescription,
         parent_info: CandidateParentInfo,
     ) {
-        let next_slot = self.find_next_nonskipped_slot(desc, parent_info.slot);
-        if let Some(slot_state) = self.get_slot_mut(desc, next_slot) {
+        let next_slot =
+            self.find_next_nonskipped_slot(desc, parent_info.slot, WindowAlloc::BoundedByHorizon);
+        if let Some(slot_state) = self.get_slot_mut(desc, next_slot, WindowAlloc::BoundedByHorizon)
+        {
             log::trace!(
                 "SimplexState: propagating base {}:{} -> slot {} (after notarization, max-merge)",
                 parent_info.slot,
@@ -4622,6 +4656,55 @@ impl SimplexState {
         self.advance_progress_cursor(desc);
 
         // Base propagation can make pending blocks voteable immediately.
+        self.check_pending_blocks(desc);
+    }
+
+    /// C++ FinalCert parity for verified certificate ingestion.
+    ///
+    /// `pool.cpp::handle_typed_saved_certificate(FinalCertRef)` writes the finalized
+    /// candidate as the base of `next_nonskipped_slot_after(id.slot)` before moving
+    /// `now_` and calling `advance_present()`. This path must bypass the normal
+    /// candidate-horizon allocation guard because the certificate is already accepted.
+    fn apply_final_cert_parent_chain_for_verified_certificate(
+        &mut self,
+        desc: &SessionDescription,
+        parent_info: CandidateParentInfo,
+    ) {
+        let mut observed_marker_set = false;
+        if let Some(slot_state) =
+            self.get_slot_mut(desc, parent_info.slot, WindowAlloc::VerifiedCertificate)
+        {
+            if slot_state.observed_notar_certificate.is_none() {
+                slot_state.observed_notar_certificate = Some(parent_info.clone());
+                observed_marker_set = true;
+            }
+        } else {
+            log::trace!(
+                "SimplexState::apply_final_cert_parent_chain_for_verified_certificate: \
+                slot {} is already finalized, skipping",
+                parent_info.slot
+            );
+            return;
+        }
+
+        let next_slot = self.find_next_nonskipped_slot(
+            desc,
+            parent_info.slot,
+            WindowAlloc::VerifiedCertificate,
+        );
+        if let Some(next_state) =
+            self.get_slot_mut(desc, next_slot, WindowAlloc::VerifiedCertificate)
+        {
+            log::trace!(
+                "SimplexState: verified FinalCert parent {}:{} -> slot {} \
+                (observed_marker_set={observed_marker_set}, max-merge)",
+                parent_info.slot,
+                &parent_info.hash.to_hex_string()[..8],
+                next_slot
+            );
+            next_state.add_available_base_max(Some(parent_info));
+        }
+
         self.check_pending_blocks(desc);
     }
 
@@ -4639,7 +4722,8 @@ impl SimplexState {
         parent_info: CandidateParentInfo,
     ) {
         let next_slot = self.first_non_finalized_slot;
-        if let Some(slot_state) = self.get_slot_mut(desc, next_slot) {
+        if let Some(slot_state) = self.get_slot_mut(desc, next_slot, WindowAlloc::BoundedByHorizon)
+        {
             log::trace!(
                 "SimplexState::set_available_base_after_restart: setting base {}:{} for slot {}",
                 parent_info.slot,
@@ -4673,7 +4757,7 @@ impl SimplexState {
     /// This is always called when a slot is skipped.
     fn propagate_base_after_skip_cert(&mut self, desc: &SessionDescription, slot: SlotIndex) {
         // Mark slot as skipped (skip certificate reached)
-        if let Some(slot_state) = self.get_slot_mut(desc, slot) {
+        if let Some(slot_state) = self.get_slot_mut(desc, slot, WindowAlloc::BoundedByHorizon) {
             slot_state.skipped = true;
 
             log::trace!(
@@ -4682,7 +4766,8 @@ impl SimplexState {
             );
         }
 
-        let first_non_skipped_slot = self.find_next_nonskipped_slot(desc, slot);
+        let first_non_skipped_slot =
+            self.find_next_nonskipped_slot(desc, slot, WindowAlloc::BoundedByHorizon);
         self.update_skip_intervals_after_skip_cert(slot, first_non_skipped_slot);
 
         let Some(base) = self.get_slot_available_base(desc, slot) else {
@@ -4697,7 +4782,9 @@ impl SimplexState {
             return;
         };
 
-        if let Some(next_state) = self.get_slot_mut(desc, first_non_skipped_slot) {
+        if let Some(next_state) =
+            self.get_slot_mut(desc, first_non_skipped_slot, WindowAlloc::BoundedByHorizon)
+        {
             log::trace!(
                 "SimplexState: propagating base from skipped slot {} -> slot {} (max-merge)",
                 slot,
@@ -4762,33 +4849,60 @@ impl SimplexState {
             .unwrap_or(false)
     }
 
-    /// Find next non-skipped slot after a given slot
+    /// Find next non-skipped slot after a given slot.
     ///
-    /// Reference: C++ pool.cpp next_nonskipped_slot_after() uses skip_intervals_.lower_bound()
+    /// Reference: C++ pool.cpp `next_nonskipped_slot_after()` uses
+    /// `skip_intervals_.lower_bound()`.
+    ///
+    /// `alloc` controls whether the inspected slots are materialized:
+    /// - `WindowAlloc::BoundedByHorizon`: read-only walk over existing windows.
+    /// - `WindowAlloc::VerifiedCertificate`: materialize on demand so a future
+    ///   FinalCert can publish the successor base before moving the progress cursor.
     fn find_next_nonskipped_slot(
         &mut self,
         desc: &SessionDescription,
         slot: SlotIndex,
+        alloc: WindowAlloc,
     ) -> SlotIndex {
         let next_slot = slot + 1;
-        if !self.is_slot_skipped_cert(desc, next_slot) {
+        if !self.is_slot_skipped_cert_at(desc, next_slot, alloc) {
             return next_slot;
         }
 
         let Some(boundary) = self.skip_intervals.range(next_slot..).next().copied() else {
             panic!(
-                "SimplexState::find_next_nonskipped_slot: skip interval boundary missing \
-                 after slot {} (next_slot={}, first_non_finalized={}, first_non_progressed={})",
+                "SimplexState::find_next_nonskipped_slot[{alloc:?}]: skip interval boundary \
+                 missing after slot {} (next_slot={}, first_non_finalized={}, first_non_progressed={})",
                 slot, next_slot, self.first_non_finalized_slot, self.first_non_progressed_slot
             );
         };
 
         assert!(
-            !self.is_slot_skipped_cert(desc, boundary),
-            "SimplexState::find_next_nonskipped_slot: skip interval boundary {} is still skipped",
+            !self.is_slot_skipped_cert_at(desc, boundary, alloc),
+            "SimplexState::find_next_nonskipped_slot[{alloc:?}]: skip interval boundary {} is still skipped",
             boundary
         );
         boundary
+    }
+
+    /// Policy-aware variant of `is_slot_skipped_cert`.
+    ///
+    /// For `BoundedByHorizon`, delegates to the read-only `&self` predicate (never
+    /// allocates). For `VerifiedCertificate`, forces materialization via
+    /// `get_slot_mut(.., VerifiedCertificate)` so subsequent FinalCert state
+    /// transitions can observe and mutate the slot.
+    fn is_slot_skipped_cert_at(
+        &mut self,
+        desc: &SessionDescription,
+        slot: SlotIndex,
+        alloc: WindowAlloc,
+    ) -> bool {
+        match alloc {
+            WindowAlloc::BoundedByHorizon => self.is_slot_skipped_cert(desc, slot),
+            WindowAlloc::VerifiedCertificate => {
+                self.get_slot_mut(desc, slot, alloc).map(|s| s.skipped).unwrap_or(false)
+            }
+        }
     }
 
     fn update_skip_intervals_after_skip_cert(&mut self, slot: SlotIndex, next_slot: SlotIndex) {
@@ -4859,12 +4973,12 @@ impl SimplexState {
         // calls start_generation(event->base, ...). In Rust the FSM handles this
         // directly: the base is inserted into the window's available_bases set so
         // that check_collation() -> has_available_parent() sees it.
-        self.ensure_window_exists(now_window);
+        self.ensure_window_exists(now_window, WindowAlloc::BoundedByHorizon);
         if let Some(window) = self.get_window_mut(now_window) {
             window.available_bases.insert(base.clone());
         }
         let first_slot = now_window.window_start(self.slots_per_leader_window);
-        if let Some(slot) = self.get_slot_mut(desc, first_slot) {
+        if let Some(slot) = self.get_slot_mut(desc, first_slot, WindowAlloc::BoundedByHorizon) {
             if slot.available_base.is_none() {
                 slot.available_base = Some(base.clone());
             }
@@ -4893,7 +5007,8 @@ impl SimplexState {
 
         let progress_slot = self.first_non_progressed_slot;
         let leader_window_offset = self.leader_window_offset;
-        let slot_state = match self.get_slot_mut(desc, progress_slot) {
+        let slot_state = match self.get_slot_mut(desc, progress_slot, WindowAlloc::BoundedByHorizon)
+        {
             Some(slot_state) => slot_state,
             None => {
                 panic!(

@@ -285,11 +285,12 @@ impl CellDb {
     }
 
     fn load_cell_uncached(self: &Arc<Self>, cell_id: &UInt256) -> Result<Cell> {
-        // Check storing_cells before the DB. save_boc inserts the cell via
-        // create_cell before traversal and removes it from storing_cells strictly
-        // after the DB commit. If we checked the DB first, a reader could hit DB
-        // before the commit (miss) and then hit storing_cells after the cleanup
-        // (also miss), even though the cell is already in the DB by then.
+        // Check storing_cells before the DB. Cells are inserted into
+        // storing_cells by CellsFactory::create_cell (during save_boc traversal)
+        // and removed by cleanup_storing_cells strictly after the DB commit.
+        // If we checked the DB first, a reader could hit DB before the commit
+        // (miss) and then hit storing_cells after the cleanup (also miss),
+        // even though the cell is already in the DB by then.
         if let Some(guard) = self.storing_cells.get(cell_id) {
             log::trace!(
                 target: TARGET,

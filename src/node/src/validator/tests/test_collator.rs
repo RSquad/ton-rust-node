@@ -132,12 +132,15 @@ impl EngineOperations for TestPipelineCollatorEngine {
         fail!("There is not state for block {}", block_id)
     }
 
+    fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        let lock = self.last_mc_state.lock().unwrap();
+        Ok(self.states.get(&lock).map(|s| Arc::new(s.val().block_id().clone())))
+    }
+
     async fn load_last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
-        if let Some(s) = self.states.get(&self.last_mc_state.lock().unwrap()) {
-            Ok(s.val().clone())
-        } else {
-            fail!("Can't load last applied masterchain state by id");
-        }
+        self.states
+            .get_cloned(&self.last_mc_state.lock().unwrap())
+            .ok_or_else(|| error!("Can't load last applied masterchain state by id"))
     }
 
     async fn wait_state(
@@ -310,9 +313,10 @@ async fn test_pipeline_collator() {
         let engine = bundle.clone() as Arc<dyn EngineOperations>;
         let result = crate::collator_test_bundle::try_collate(
             engine,
+            &bundle.load_last_applied_mc_block_id().unwrap().unwrap(),
             bundle.block_id().shard().clone(),
             bundle.prev_blocks_ids().clone(),
-            PipelineContext::new(),
+            None,
             None,
             None,
             true,
@@ -351,15 +355,15 @@ async fn test_pipeline_collator() {
         )?);
         engine.set_last_mc(mc_id);
 
-        // let mut prev_states = vec![bundle.load_state(&prev_blocks_ids[0]).await?];
-        let mut context = PipelineContext::new();
-        for _ in 0..6 {
-            let CollateResult::Ok { candidate, new_state, new_block, .. } =
+        let state_resolver_cache = Arc::new(tokio::sync::Mutex::new(StateResolverCache::new()));
+        for i in 0..6 {
+            let CollateResult::Ok { candidate, new_state, .. } =
                 crate::collator_test_bundle::try_collate(
                     engine.clone(),
+                    &engine.load_last_applied_mc_block_id().unwrap().unwrap(),
                     ShardIdent::with_workchain_id(0)?,
                     prev_blocks_ids.clone(),
-                    context.clone(),
+                    Some(state_resolver_cache.clone()),
                     None,
                     None,
                     false,
@@ -370,14 +374,37 @@ async fn test_pipeline_collator() {
             else {
                 fail!("Failed to collate block");
             };
-            prev_blocks_ids = vec![candidate.block_id.clone()];
-            let state = ShardStateStuff::from_state(
+
+            // Publish into resolver the same way ValidatorGroup::on_generate_slot does
+            let next_state = ShardStateStuff::from_state(
                 candidate.block_id.clone(),
                 new_state,
+                #[cfg(feature = "telemetry")]
                 engine.engine_telemetry(),
                 engine.engine_allocated(),
             )?;
-            context.add(state, new_block, 10);
+            {
+                let mut cache = state_resolver_cache.lock().await;
+                cache.upsert_observed_candidate(
+                    candidate.block_id.clone(),
+                    ConsensusCommonFactory::create_block_payload(candidate.data.clone()),
+                    ConsensusCommonFactory::create_block_payload(candidate.collated_data.clone()),
+                    CandidateObservedFlags {
+                        body_present: true,
+                        parent_ready: true,
+                        local_collated: true,
+                    },
+                    None,
+                );
+                cache.store_validated_state(&candidate.block_id, next_state);
+                assert_eq!(
+                    cache.collect_local_chain_from(&candidate.block_id).len(),
+                    i + 1,
+                    "resolver chain must grow by one entry per collation iteration"
+                );
+            }
+
+            prev_blocks_ids = vec![candidate.block_id.clone()];
             engine.add_block(BlockStuff::deserialize_block(
                 candidate.block_id,
                 Arc::new(candidate.data),
@@ -443,7 +470,6 @@ async fn test_simplex_wait_prev_state_uses_resolver_cache_before_engine() {
             shard,
             0,
             &prev_blocks_history,
-            PipelineContext::new(),
             state_resolver_cache,
             validator_set,
             UInt256::default(),
@@ -474,9 +500,10 @@ async fn test_simplex_wait_prev_state_materializes_state_from_cached_chain() {
         );
         let collate_result = crate::collator_test_bundle::try_collate(
             bundle.clone() as Arc<dyn EngineOperations>,
+            &bundle.load_last_applied_mc_block_id().unwrap().unwrap(),
             bundle.block_id().shard().clone(),
             bundle.prev_blocks_ids().clone(),
-            PipelineContext::new(),
+            None,
             None,
             None,
             true,
@@ -534,6 +561,7 @@ async fn test_simplex_wait_prev_state_materializes_state_from_cached_chain() {
                     parent_ready: true,
                     local_collated: false,
                 },
+                None,
             );
             cache.store_validated_state(&parent_id, parent_state);
             cache.upsert_observed_candidate(
@@ -545,6 +573,7 @@ async fn test_simplex_wait_prev_state_materializes_state_from_cached_chain() {
                     parent_ready: true,
                     local_collated: false,
                 },
+                None,
             );
         }
 
@@ -555,7 +584,6 @@ async fn test_simplex_wait_prev_state_materializes_state_from_cached_chain() {
             shard,
             0,
             &prev_blocks_history,
-            PipelineContext::new(),
             state_resolver_cache.clone(),
             validator_set,
             UInt256::default(),
@@ -661,9 +689,10 @@ async fn try_collate_by_bundle(
     let engine = bundle.clone() as Arc<dyn EngineOperations>;
     let collate_result = crate::collator_test_bundle::try_collate(
         engine,
+        &bundle.load_last_applied_mc_block_id().unwrap().unwrap(),
         bundle.block_id().shard().clone(),
         bundle.prev_blocks_ids().clone(),
-        PipelineContext::new(),
+        None,
         Some(bundle.created_by().clone()),
         match &block_stuff_opt {
             Some(block) => Some(block.block()?.read_extra().unwrap().rand_seed().clone()),
@@ -744,9 +773,10 @@ async fn test_masterchain_collation_bootstrap_fallback_on_speculative_parent_mc_
 
         let first_result = crate::collator_test_bundle::try_collate(
             bundle.clone() as Arc<dyn EngineOperations>,
+            &bundle.load_last_applied_mc_block_id().unwrap().unwrap(),
             bundle.block_id().shard().clone(),
             bundle.prev_blocks_ids().clone(),
-            PipelineContext::new(),
+            None,
             None,
             None,
             true,
@@ -791,9 +821,10 @@ async fn test_masterchain_collation_bootstrap_fallback_on_speculative_parent_mc_
 
         let result = crate::collator_test_bundle::try_collate(
             engine.clone() as Arc<dyn EngineOperations>,
+            &engine.load_last_applied_mc_block_id().unwrap().unwrap(),
             ShardIdent::masterchain(),
             vec![speculative_parent_id.clone()],
-            PipelineContext::new(),
+            None,
             None,
             None,
             true,

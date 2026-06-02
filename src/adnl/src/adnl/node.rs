@@ -4539,9 +4539,13 @@ impl AdnlNode {
             },
             message,
             messages: messages.map(|messages| messages.into()),
-            address: Some(
-                self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS_SEC))?,
-            ),
+            address: Some({
+                let mut addr_list =
+                    self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS_SEC))?;
+                // Sync addr_list reinit_date with packet reinit_date (epoch).
+                addr_list.reinit_date = peer.recv_state.reinit_date();
+                addr_list
+            }),
             priority_address: None,
             seqno: Some(peer.send_state.next_seqno(&method) as i64),
             confirm_seqno: Some(peer.recv_state.seqno(&method) as i64),
