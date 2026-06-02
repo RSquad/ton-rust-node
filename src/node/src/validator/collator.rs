@@ -26,10 +26,9 @@ use crate::{
         supported_capabilities, supported_version, UNREGISTERED_CHAIN_MAX_LEN,
     },
     validator::{
-        consensus::{BlockPayloadPtr, ResolverPurpose},
+        consensus::ResolverPurpose,
         out_msg_queue::{MsgQueueManager, OutMsgQueueInfoStuff, StatesManager},
-        state_resolver_cache::StateResolverCache,
-        validator_group::PipelineContext,
+        state_resolver_cache::{self, StateResolverCache},
         validator_utils::{calc_subset_for_masterchain, PrevBlockHistory},
         BlockCandidate, CollatorSettings, McData,
     },
@@ -1313,7 +1312,6 @@ pub struct Collator {
     shard: ShardIdent,
     min_mc_seqno: u32,
     prev_blocks_ids: Vec<BlockIdExt>,
-    pipeline_context: PipelineContext,
     state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     new_block_id_part: BlockIdExt,
     created_by: UInt256,
@@ -1338,7 +1336,6 @@ impl Collator {
         shard: ShardIdent,
         min_mc_seqno: u32,
         prev_blocks_history: &PrevBlockHistory,
-        pipeline_context: PipelineContext,
         state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
         validator_set: ValidatorSet,
         created_by: UInt256,
@@ -1349,7 +1346,6 @@ impl Collator {
         let prev_blocks_ids = prev_blocks_history.get_prevs().to_vec();
         let collated_block_descr = Arc::new(prev_blocks_history.get_next_block_descr(None));
         log::trace!("{}: new", collated_block_descr);
-        log::debug!("{} pipeline context: {}", collated_block_descr, pipeline_context);
         log::debug!("{} prev_blocks_ids:{}", collated_block_descr, prev_blocks_history);
 
         let new_block_seqno = match prev_blocks_ids.len() {
@@ -1431,7 +1427,6 @@ impl Collator {
             shard,
             min_mc_seqno,
             prev_blocks_ids,
-            pipeline_context,
             state_resolver_cache,
             created_by,
             after_merge,
@@ -1447,7 +1442,7 @@ impl Collator {
         })
     }
 
-    pub async fn collate(mut self) -> Result<CollateResult> {
+    pub async fn collate(mut self, mc_state_id: &BlockIdExt) -> Result<CollateResult> {
         log::info!(
             "{}: COLLATE min_mc_seqno = {}, prev_blocks_ids: {} {}",
             self.collated_block_descr,
@@ -1470,7 +1465,7 @@ impl Collator {
             let attempt_started = Instant::now();
 
             // load required data including masterchain and shards states
-            let imported_data = self.import_data().await.inspect_err(|e| {
+            let imported_data = self.import_data(mc_state_id).await.inspect_err(|e| {
                 log::warn!(
                     "{}: COLLATION FAILED: TIME: {}ms import_data: {:?}",
                     self.collated_block_descr,
@@ -1590,8 +1585,8 @@ impl Collator {
         Ok(collate_result)
     }
 
-    async fn import_data(&self) -> Result<ImportedData> {
-        log::trace!("{}: import_data", self.collated_block_descr);
+    async fn import_data(&self, mc_state_id: &BlockIdExt) -> Result<ImportedData> {
+        log::trace!("{}: import_data with mc state id {mc_state_id}", self.collated_block_descr);
 
         if self.shard.is_masterchain() {
             let (prev_states, prev_ext_blocks_refs) = self.import_prev_stuff().await?;
@@ -1655,7 +1650,7 @@ impl Collator {
             #[cfg(not(feature = "xp25"))]
             {
                 let (mc_state, (prev_states, prev_ext_blocks_refs)) =
-                    try_join!(self.import_mc_stuff(), self.import_prev_stuff())?;
+                    try_join!(self.import_mc_stuff(mc_state_id), self.import_prev_stuff())?;
 
                 Ok(ImportedData {
                     mc_state,
@@ -1668,7 +1663,7 @@ impl Collator {
             #[cfg(feature = "xp25")]
             loop {
                 let (mc_state, (prev_states, prev_ext_blocks_refs)) =
-                    try_join!(self.import_mc_stuff(), self.import_prev_stuff())?;
+                    try_join!(self.import_mc_stuff(mc_state_id), self.import_prev_stuff())?;
 
                 let top_shard_blocks_descr = {
                     // Wait until all blocks referenced in master are applied.
@@ -2147,16 +2142,14 @@ impl Collator {
     // import
     //
 
-    async fn import_mc_stuff(&self) -> Result<Arc<ShardStateStuff>> {
-        log::trace!("{}: import_mc_stuff", self.collated_block_descr);
-        let mc_state = self.engine.load_last_applied_mc_state().await?;
-
-        if mc_state.block_id().seq_no() < self.min_mc_seqno {
+    async fn import_mc_stuff(&self, mc_state_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
+        log::trace!("{}: import_mc_stuff with {mc_state_id}", self.collated_block_descr);
+        if mc_state_id.seq_no() < self.min_mc_seqno {
             fail!(
                 "requested to create a block referring to a non-existent future masterchain block"
             );
         }
-        Ok(mc_state)
+        self.engine.load_state(mc_state_id).await
     }
 
     async fn import_prev_stuff(&self) -> Result<(Vec<Arc<ShardStateStuff>>, Vec<ExtBlkRef>)> {
@@ -2167,15 +2160,10 @@ impl Collator {
             let prev_state = if self.collator_settings.is_simplex {
                 self.wait_prev_state_via_engine_or_cache(prev_id).await?
             } else {
-                match self.pipeline_context.try_get_state(prev_id) {
-                    Some(state) => state,
-                    None => {
-                        self.engine
-                            .clone()
-                            .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
-                            .await?
-                    }
-                }
+                self.engine
+                    .clone()
+                    .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
+                    .await?
             };
 
             let end_lt = prev_state.state()?.gen_lt();
@@ -2228,204 +2216,14 @@ impl Collator {
         &self,
         prev_id: &BlockIdExt,
     ) -> Result<Arc<ShardStateStuff>> {
-        let prev_id = prev_id.clone();
-
-        if let Some(state) = {
-            let cache = self.state_resolver_cache.lock().await;
-            cache.try_get_state(&prev_id)
-        } {
-            metrics::counter!("ton_node_resolver_wait_result_total", "source" => "cache_hit")
-                .increment(1);
-            return Ok(state);
-        }
-
-        // Forward-apply resolver chain (C++ parity path): if we have a resolved
-        // ancestor and all intermediate candidate bodies, materialize states in-memory.
-        if let Some(state) = self.try_materialize_prev_state_from_cache(&prev_id).await {
-            metrics::counter!("ton_node_resolver_wait_result_total", "source" => "materialized")
-                .increment(1);
-            return Ok(state);
-        }
-
-        let mut cache_rx = {
-            let mut cache = self.state_resolver_cache.lock().await;
-            cache.request_availability(&prev_id, ResolverPurpose::SimplexCollationParent);
-            cache.subscribe_state(&prev_id)
-        };
-
-        let cache_wait = async {
-            loop {
-                if let Some(state) = cache_rx.borrow().clone() {
-                    return Some(state);
-                }
-                if cache_rx.changed().await.is_err() {
-                    return None;
-                }
-            }
-        };
-
-        tokio::select! {
-            engine_state = self
-                .engine
-                .clone()
-                .wait_state(&prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true) => {
-                    metrics::counter!("ton_node_resolver_wait_result_total", "source" => "engine").increment(1);
-                    engine_state
-                },
-            cache_state = cache_wait => {
-                if let Some(state) = cache_state {
-                    metrics::counter!("ton_node_resolver_wait_result_total", "source" => "cache_async").increment(1);
-                    Ok(state)
-                } else {
-                    metrics::counter!("ton_node_resolver_wait_result_total", "source" => "engine_fallback").increment(1);
-                    self.engine
-                        .clone()
-                        .wait_state(&prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
-                        .await
-                }
-            }
-        }
-    }
-
-    /// Try to compute `target_id` state by applying cached candidate Merkle updates
-    /// forward from the nearest resolved ancestor in the resolver cache.
-    async fn try_materialize_prev_state_from_cache(
-        &self,
-        target_id: &BlockIdExt,
-    ) -> Option<Arc<ShardStateStuff>> {
-        let (chain_to_apply, mut current_state) = {
-            let mut cache = self.state_resolver_cache.lock().await;
-
-            if cache.is_materializing(target_id) {
-                return None;
-            }
-
-            let (chain_ids, base_state) = cache.collect_unresolved_chain(target_id);
-            let base_state = base_state?;
-
-            if chain_ids.is_empty() {
-                return Some(base_state);
-            }
-
-            // Validate every chain entry before claiming the materializing slot.
-            // `collect_unresolved_chain` doesn't filter by `body_present`, so any
-            // missing body must abort here — and the marker is only released by
-            // `store_validated_state()`, which won't fire if we early-return.
-            // Setting the marker first would permanently flag `target_id` as
-            // "in flight" and block every retry until pruning.
-            let mut chain = Vec::with_capacity(chain_ids.len());
-            for block_id in chain_ids {
-                let Some(entry) = cache.try_get_entry(&block_id) else {
-                    return None;
-                };
-                if !entry.flags.body_present || entry.data.data().is_empty() {
-                    return None;
-                }
-                chain.push((block_id, entry.data.clone()));
-            }
-
-            cache.try_start_materializing(target_id);
-
-            (chain, base_state)
-        };
-
-        let mut resolved_states = Vec::with_capacity(chain_to_apply.len());
-        for (block_id, block_data) in chain_to_apply {
-            let next_state = match self
-                .apply_candidate_state_update_from_cache(&block_id, &block_data, current_state)
-                .await
-            {
-                Ok(state) => state,
-                Err(err) => {
-                    log::warn!(
-                        target: "simplex_resolver",
-                        "failed to materialize resolver state for {}: {}",
-                        block_id,
-                        err,
-                    );
-                    self.state_resolver_cache.lock().await.finish_materializing(target_id);
-                    return None;
-                }
-            };
-            resolved_states.push((block_id.clone(), next_state.clone()));
-            current_state = next_state;
-        }
-
-        if !resolved_states.is_empty() {
-            let mut cache = self.state_resolver_cache.lock().await;
-            for (block_id, state) in &resolved_states {
-                cache.store_validated_state(block_id, state.clone());
-            }
-            // `store_validated_state(target_id, ...)` above clears the marker
-            // for `target_id` (it's the last entry in the chain). The explicit
-            // call here is defense-in-depth in case the chain shape ever changes.
-            cache.finish_materializing(target_id);
-            metrics::counter!("ton_node_resolver_materialized_total")
-                .increment(resolved_states.len() as u64);
-            log::info!(
-                target: "simplex_resolver",
-                "materialized resolver state chain target={} chain_len={}",
-                target_id,
-                resolved_states.len(),
-            );
-        }
-
-        Some(current_state)
-    }
-
-    async fn apply_candidate_state_update_from_cache(
-        &self,
-        block_id: &BlockIdExt,
-        block_data: &BlockPayloadPtr,
-        prev_state: Arc<ShardStateStuff>,
-    ) -> Result<Arc<ShardStateStuff>> {
-        let block = Block::construct_from_bytes(block_data.data())?;
-        let state_update = block.read_state_update()?;
-        let prev_state_root = prev_state.root_cell().clone();
-        let engine = self.engine.clone();
-        let materialized_block_id = block_id.clone();
-        let log_block_id = block_id.clone();
-
-        let (next_state_root, _) = tokio::task::spawn_blocking(move || {
-            let fast_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                engine
-                    .db_cells_factory()
-                    .and_then(|cf| state_update.apply_with_factory(&prev_state_root, &cf))
-            }))
-            .unwrap_or_else(|_| {
-                Err(error!(
-                    "resolver fast Merkle apply path unavailable for {}; falling back",
-                    log_block_id
-                ))
-            });
-
-            match fast_result {
-                Ok(result) => Ok(result),
-                Err(err) => {
-                    log::debug!(
-                        target: "simplex_resolver",
-                        "resolver fast Merkle apply failed for {}: {}. Falling back to apply_for()",
-                        log_block_id,
-                        err,
-                    );
-                    state_update.apply_for(&prev_state_root).map_err(|apply_err| {
-                        error!(
-                            "cannot apply Merkle update for resolver materialization {}: {}",
-                            log_block_id, apply_err
-                        )
-                    })
-                }
-            }
-        })
-        .await??;
-
-        ShardStateStuff::from_root_cell(
-            materialized_block_id,
-            next_state_root,
-            #[cfg(feature = "telemetry")]
-            self.engine.engine_telemetry(),
-            self.engine.engine_allocated(),
+        state_resolver_cache::wait_prev_state(
+            &self.state_resolver_cache,
+            &self.engine,
+            prev_id,
+            ResolverPurpose::SimplexCollationParent,
+            PREV_STATE_WAIT_TIMEOUT_MS,
         )
+        .await
     }
 
     //
@@ -2705,9 +2503,17 @@ impl Collator {
         collator_data: &mut CollatorData,
     ) -> Result<MsgQueueManager> {
         log::debug!("{}: request_neighbor_msg_queues", self.collated_block_descr);
+        let prev_chain = if self.collator_settings.is_simplex && self.prev_blocks_ids.len() == 1 {
+            self.state_resolver_cache
+                .lock()
+                .await
+                .collect_local_chain_from(&self.prev_blocks_ids[0])
+        } else {
+            Vec::new()
+        };
         let states_manager = StatesManager::with_collator_data(
             self.engine.clone(),
-            self.pipeline_context.clone(),
+            prev_chain,
             collator_data.config.has_capability(GlobalCapabilities::CapFullCollatedData),
         )?;
         MsgQueueManager::init(
@@ -5244,7 +5050,7 @@ impl Collator {
         &self,
         collator_data: &CollatorData,
         prev_data: &PrevData,
-        accounts: impl Iterator<Item = &'a ShardAccountStuff>,
+        accounts: impl Iterator<Item = &'a ShardAccountStuff> + Clone,
         output_queue_manager: &MsgQueueManager,
     ) -> Result<Vec<u8>> {
         let mut roots = Vec::new();
@@ -5318,6 +5124,13 @@ impl Collator {
                     Ok(true)
                 },
             )?;
+            for account in accounts.clone() {
+                let _ = output_queue_manager
+                    .prev()
+                    .out_queue_extra()
+                    .dispatch_queue()
+                    .get(account.account_id())?;
+            }
         }
 
         // 2. Proofs for hashes of states: previous states + neighbors

@@ -8,7 +8,8 @@
  */
 
 use super::{
-    super::consensus::BlockPayloadPtr, ResolverBackend, StateResolverCache, StateResolverEntry,
+    super::consensus::BlockPayloadPtr, ChainAnchor, ResolverBackend, StateResolverCache,
+    StateResolverEntry,
 };
 use consensus_common::{
     BlockPayload, CandidateObservedFlags, EnsureCandidateAvailabilityOptions, RawBuffer,
@@ -18,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
     time::SystemTime,
 };
-use ton_block::{BlockIdExt, ShardIdent, UInt256};
+use ton_block::{Block, BlockIdExt, Serializable, ShardIdent, UInt256};
 
 #[derive(Debug)]
 struct MockPayload {
@@ -38,6 +39,13 @@ impl BlockPayload for MockPayload {
 
 fn payload(bytes: Vec<u8>) -> BlockPayloadPtr {
     Arc::new(MockPayload { data: bytes, created_at: SystemTime::UNIX_EPOCH })
+}
+
+/// A payload carrying a real, parseable block (distinguished by `global_id`).
+fn block_payload(global_id: i32) -> BlockPayloadPtr {
+    let mut block = Block::default();
+    block.set_global_id(global_id);
+    payload(block.write_to_bytes().expect("serialize block"))
 }
 
 fn block_id(seq_no: u32, shard: &ShardIdent) -> BlockIdExt {
@@ -74,12 +82,14 @@ fn upsert_observed_candidate_or_merges_flags() {
         payload(Vec::new()),
         payload(Vec::new()),
         CandidateObservedFlags { body_present: false, parent_ready: false, local_collated: true },
+        None,
     );
     cache.upsert_observed_candidate(
         id.clone(),
         payload(vec![1, 2, 3]), // invalid BOC is fine; parent extraction becomes None.
         payload(Vec::new()),
         CandidateObservedFlags { body_present: true, parent_ready: true, local_collated: false },
+        None,
     );
 
     let entry = cache.try_get_entry(&id).expect("entry must exist");
@@ -128,11 +138,12 @@ fn collect_unresolved_chain_returns_target_when_no_parents_known() {
         payload(Vec::new()),
         payload(Vec::new()),
         CandidateObservedFlags::default(),
+        None,
     );
 
-    let (chain, base_state) = cache.collect_unresolved_chain(&id);
+    let (chain, anchor) = cache.collect_unresolved_chain(&id);
     assert_eq!(chain, vec![id]);
-    assert!(base_state.is_none());
+    assert!(matches!(anchor, ChainAnchor::Unresolvable));
 }
 
 #[test]
@@ -150,7 +161,7 @@ fn collect_unresolved_chain_orders_from_oldest_to_target() {
         root.clone(),
         StateResolverEntry {
             block_id: root.clone(),
-            data: payload(Vec::new()),
+            data: None,
             collated_data: payload(Vec::new()),
             flags: flags.clone(),
             parent_ids: Some(Vec::new()),
@@ -162,7 +173,7 @@ fn collect_unresolved_chain_orders_from_oldest_to_target() {
         parent.clone(),
         StateResolverEntry {
             block_id: parent.clone(),
-            data: payload(Vec::new()),
+            data: None,
             collated_data: payload(Vec::new()),
             flags: flags.clone(),
             parent_ids: Some(vec![root.clone()]),
@@ -174,7 +185,7 @@ fn collect_unresolved_chain_orders_from_oldest_to_target() {
         child.clone(),
         StateResolverEntry {
             block_id: child.clone(),
-            data: payload(Vec::new()),
+            data: None,
             collated_data: payload(Vec::new()),
             flags,
             parent_ids: Some(vec![parent.clone()]),
@@ -183,9 +194,52 @@ fn collect_unresolved_chain_orders_from_oldest_to_target() {
         },
     );
 
-    let (chain, base_state) = cache.collect_unresolved_chain(&child);
+    let (chain, anchor) = cache.collect_unresolved_chain(&child);
     assert_eq!(chain, vec![root, parent, child]);
-    assert!(base_state.is_none());
+    assert!(matches!(anchor, ChainAnchor::Unresolvable));
+}
+
+#[test]
+fn collect_unresolved_chain_anchors_on_block_whose_parent_was_pruned() {
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).expect("valid shard");
+    // `finalized` is the block retained by prune_finalized; its parent (seq 9)
+    // was pruned and is absent from the cache.
+    let finalized = block_id(10, &shard);
+    let pruned_parent = block_id(9, &shard);
+    let child = block_id(11, &shard);
+    let grandchild = block_id(12, &shard);
+    let mut cache = StateResolverCache::new();
+
+    let flags =
+        CandidateObservedFlags { body_present: true, parent_ready: true, local_collated: false };
+
+    for (id, parent) in [(&finalized, &pruned_parent), (&child, &finalized), (&grandchild, &child)]
+    {
+        cache.entries.insert(
+            id.clone(),
+            StateResolverEntry {
+                block_id: id.clone(),
+                data: None,
+                collated_data: payload(Vec::new()),
+                flags: flags.clone(),
+                parent_ids: Some(vec![parent.clone()]),
+                state: None,
+                observed_at: SystemTime::UNIX_EPOCH,
+            },
+        );
+    }
+
+    let (chain, anchor) = cache.collect_unresolved_chain(&grandchild);
+
+    assert_eq!(
+        chain,
+        vec![child, grandchild],
+        "the retained finalized block must be the base, not part of the apply chain"
+    );
+    match anchor {
+        ChainAnchor::Engine(id) => assert_eq!(id, finalized, "base must be the finalized block"),
+        _ => panic!("expected Engine(finalized) anchor"),
+    }
 }
 
 #[test]
@@ -194,13 +248,14 @@ fn upsert_observed_candidate_does_not_wipe_body_on_flag_only_followup() {
     let id = block_id(7, &shard);
     let mut cache = StateResolverCache::new();
 
-    let body_bytes = vec![1, 2, 3, 4];
+    let body = block_payload(42);
     let collated_bytes = vec![9, 8, 7];
     cache.upsert_observed_candidate(
         id.clone(),
-        payload(body_bytes.clone()),
+        body.clone(),
         payload(collated_bytes.clone()),
         CandidateObservedFlags { body_present: true, parent_ready: false, local_collated: false },
+        None,
     );
 
     cache.upsert_observed_candidate(
@@ -208,12 +263,14 @@ fn upsert_observed_candidate_does_not_wipe_body_on_flag_only_followup() {
         payload(Vec::new()),
         payload(Vec::new()),
         CandidateObservedFlags { body_present: false, parent_ready: true, local_collated: false },
+        None,
     );
 
     let entry = cache.try_get_entry(&id).expect("entry must exist");
     assert!(entry.flags.body_present, "body_present must remain OR-merged true");
     assert!(entry.flags.parent_ready, "parent_ready must be merged true");
-    assert_eq!(entry.data.data(), body_bytes.as_slice(), "body payload must not be wiped");
+    let (stored, _block) = entry.data.as_ref().expect("body must not be wiped");
+    assert_eq!(stored.data(), body.data(), "body payload must not be wiped");
     assert_eq!(
         entry.collated_data.data(),
         collated_bytes.as_slice(),
@@ -229,22 +286,25 @@ fn upsert_observed_candidate_overwrites_payload_when_new_observation_carries_bod
 
     cache.upsert_observed_candidate(
         id.clone(),
-        payload(vec![1, 2, 3]),
+        block_payload(1),
         payload(vec![9, 8]),
         CandidateObservedFlags { body_present: true, parent_ready: false, local_collated: false },
+        None,
     );
 
-    let new_body = vec![10, 20, 30, 40];
+    let new_body = block_payload(2);
     let new_collated = vec![5, 5, 5];
     cache.upsert_observed_candidate(
         id.clone(),
-        payload(new_body.clone()),
+        new_body.clone(),
         payload(new_collated.clone()),
         CandidateObservedFlags { body_present: true, parent_ready: true, local_collated: false },
+        None,
     );
 
     let entry = cache.try_get_entry(&id).expect("entry must exist");
-    assert_eq!(entry.data.data(), new_body.as_slice(), "body must be replaced by new body");
+    let (stored, _block) = entry.data.as_ref().expect("body present");
+    assert_eq!(stored.data(), new_body.data(), "body must be replaced by new body");
     assert_eq!(
         entry.collated_data.data(),
         new_collated.as_slice(),
@@ -267,7 +327,7 @@ fn collect_unresolved_chain_bails_on_multi_parent_merge_block() {
         merge.clone(),
         StateResolverEntry {
             block_id: merge.clone(),
-            data: payload(Vec::new()),
+            data: None,
             collated_data: payload(Vec::new()),
             flags,
             // Two prev_ids = shard merge: must not be walked via parent_ids[0].
@@ -277,10 +337,13 @@ fn collect_unresolved_chain_bails_on_multi_parent_merge_block() {
         },
     );
 
-    let (chain, base_state) = cache.collect_unresolved_chain(&merge);
+    let (chain, anchor) = cache.collect_unresolved_chain(&merge);
 
     assert_eq!(chain, vec![merge], "merge block must be returned without walking either parent");
-    assert!(base_state.is_none(), "multi-parent walk must defer to engine, not pick parent_ids[0]");
+    assert!(
+        matches!(anchor, ChainAnchor::Unresolvable),
+        "multi-parent walk must defer to engine, not pick parent_ids[0]"
+    );
 }
 
 #[test]
@@ -320,13 +383,15 @@ fn prune_finalized_removes_only_old_entries_in_same_shard() {
             payload(Vec::new()),
             payload(Vec::new()),
             CandidateObservedFlags::default(),
+            None,
         );
     }
 
     cache.prune_finalized(&id_a_11);
 
-    assert!(cache.try_get_entry(&id_a_10).is_none());
-    assert!(cache.try_get_entry(&id_a_11).is_none());
-    assert!(cache.try_get_entry(&id_a_12).is_some());
-    assert!(cache.try_get_entry(&id_b_11).is_some());
+    assert!(cache.try_get_entry(&id_a_10).is_none(), "older ancestor pruned");
+    // The finalized block itself is kept as an anchor for forward apply.
+    assert!(cache.try_get_entry(&id_a_11).is_some(), "finalized block retained as anchor");
+    assert!(cache.try_get_entry(&id_a_12).is_some(), "newer block retained");
+    assert!(cache.try_get_entry(&id_b_11).is_some(), "other shard untouched");
 }

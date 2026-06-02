@@ -23,7 +23,6 @@ use crate::{
         out_msg_queue::{OutMsgQueueInfoStuff, StatesManager},
         state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
-        validator_group::PipelineContext,
         validator_utils::{compute_validator_set_cc, PrevBlockHistory},
         BlockCandidate, CollatorSettings,
     },
@@ -735,7 +734,7 @@ impl CollatorTestBundle {
 
         // TODO: fill caches states
         let mut states_manger =
-            StatesManager::with_collator_data(engine.clone(), PipelineContext::new(), false)?;
+            StatesManager::with_collator_data(engine.clone(), Vec::new(), false)?;
 
         let mut state_proofs = HashMap::new();
         let is_master = prev_blocks_ids[0].shard().is_masterchain();
@@ -750,8 +749,13 @@ impl CollatorTestBundle {
         //
         // last mc state
         //
-        let mc_state = engine.load_last_applied_mc_state().await?;
-        let last_mc_id = mc_state.block_id().clone();
+        let last_mc_id = if is_master {
+            prev_blocks_ids[0].clone()
+        } else {
+            let block = Self::load_block_by_id(engine, &prev_blocks_ids[0]).await?;
+            block.get_master_id()?.master_block_id().1
+        };
+        let mc_state = engine.load_state(&last_mc_id).await?;
 
         //
         // top shard blocks
@@ -784,9 +788,10 @@ impl CollatorTestBundle {
             // try to collate block
             let result = try_collate(
                 engine.clone(),
+                &last_mc_id,
                 shard.clone(),
                 prev_blocks_ids.clone(),
-                PipelineContext::new(),
+                None,
                 None,
                 None,
                 #[cfg(test)]
@@ -1222,7 +1227,7 @@ impl CollatorTestBundle {
 
         // TODO: fill caches states
         let mut states_manger =
-            StatesManager::with_collator_data(engine.clone(), PipelineContext::new(), false)?;
+            StatesManager::with_collator_data(engine.clone(), Vec::new(), false)?;
 
         let mut state_proofs = HashMap::new();
         let is_master = block.id().shard().is_masterchain();
@@ -1543,7 +1548,7 @@ impl CollatorTestBundle {
 
     fn build_filename(prefix: &str, block_id: &BlockIdExt) -> String {
         format!(
-            "{}/{}.{}_{}_{:x}{:x}{:x}{:x}_collator_test_bundle",
+            "{}/{}.{}_{}_{:02x}{:02x}{:02x}{:02x}_collator_test_bundle",
             prefix,
             block_id.shard().workchain_id(),
             block_id.shard().shard_prefix_as_str_with_tag(),
@@ -1608,6 +1613,10 @@ impl EngineOperations for CollatorTestBundle {
             return Ok(b.clone());
         }
         fail!("bundle doesn't contain block {}", handle.id())
+    }
+
+    fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(Some(Arc::new(self.index.last_mc_state.clone())))
     }
 
     async fn load_last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
@@ -1753,16 +1762,17 @@ impl EngineOperations for CollatorTestBundle {
 
 pub async fn try_collate(
     engine: Arc<dyn EngineOperations>,
+    mc_state_id: &BlockIdExt,
     shard: ShardIdent,
     prev_blocks_ids: Vec<BlockIdExt>,
-    pipeline_context: PipelineContext,
+    state_resolver_cache: Option<Arc<tokio::sync::Mutex<StateResolverCache>>>,
     created_by_opt: Option<UInt256>,
     rand_seed_opt: Option<UInt256>,
     #[cfg(test)] is_bundle: bool,
     check_validation: bool,
     lt_compatible: bool,
 ) -> Result<CollateResult> {
-    let mc_state = engine.load_last_applied_mc_state().await?;
+    let mc_state = engine.load_state(mc_state_id).await?;
     let mc_state_extra = mc_state.shard_state_extra()?;
     let prev_blocks_history = PrevBlockHistory::with_prevs(&shard, prev_blocks_ids);
     let mut cc_seqno_with_delta = 0;
@@ -1784,12 +1794,19 @@ pub async fn try_collate(
 
     log::info!("TRY COLLATE block {}", shard);
 
+    let is_simplex = state_resolver_cache.is_some();
+    let state_resolver_cache = state_resolver_cache
+        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())));
+
     let min_mc_seqno = if prev_blocks_history.get_prevs()[0].seq_no() == 0 {
         0
-    } else if let Some(prev_state) = pipeline_context.states().iter().last() {
-        prev_state.state()?.min_ref_mc_seqno()
     } else {
-        let state = engine.load_state(&prev_blocks_history.get_prevs()[0]).await?;
+        let prev_id = &prev_blocks_history.get_prevs()[0];
+        let cached_state = state_resolver_cache.lock().await.try_get_state(prev_id);
+        let state = match cached_state {
+            Some(s) => s,
+            None => engine.load_state(prev_id).await?,
+        };
         state.state()?.min_ref_mc_seqno()
     };
 
@@ -1797,21 +1814,21 @@ pub async fn try_collate(
         #[cfg(test)]
         is_bundle,
         lt_compatible,
+        is_simplex,
         ..Default::default()
     };
     let collator = Collator::new(
         shard.clone(),
         min_mc_seqno,
         &prev_blocks_history,
-        pipeline_context,
-        Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
+        state_resolver_cache,
         validator_set.clone(),
         created_by_opt.unwrap_or_default(),
         engine.clone(),
         rand_seed_opt,
         collator_settings,
     )?;
-    let collate_result = collator.collate().await?;
+    let collate_result = collator.collate(mc_state_id).await?;
     if check_validation {
         if let CollateResult::Ok { candidate, .. } = &collate_result {
             // let new_block = Block::construct_from_bytes(&candidate.data).unwrap();
@@ -1822,14 +1839,13 @@ pub async fn try_collate(
                 shard.clone(),
                 min_mc_seqno,
                 prev_blocks_history.get_prevs().to_vec(),
-                Default::default(),
                 None,
                 candidate.clone(),
                 validator_set.clone(),
                 engine,
                 true,
                 true,
-                false,
+                is_simplex,
             );
             validator_query.try_validate().await?;
         }
@@ -1850,7 +1866,12 @@ pub async fn try_validate(
     let prev_blocks_ids = info.read_prev_ids()?;
     let shard = block_stuff.id().shard().clone();
     let min_mc_seqno = info.min_ref_mc_seqno() - 1;
-    let mc_state = engine.load_last_applied_mc_state().await?;
+    let mc_state_id = if shard.is_masterchain() {
+        prev_blocks_ids[0].clone()
+    } else {
+        info.read_master_id()?.master_block_id().1
+    };
+    let mc_state = engine.load_state(&mc_state_id).await?;
     let mc_state_extra = mc_state.shard_state_extra()?;
     let mut cc_seqno_with_delta = 0;
     let cc_seqno_from_state = if shard.is_masterchain() {
@@ -1871,7 +1892,6 @@ pub async fn try_validate(
         shard,
         min_mc_seqno,
         prev_blocks_ids,
-        Default::default(),
         None,
         block_candidate,
         validator_set,

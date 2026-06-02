@@ -30,7 +30,6 @@ use crate::{
         collator::{CollateResult, Collator},
         state_resolver_cache::StateResolverCache,
         validate_query::ValidateQuery,
-        validator_group::PipelineContext,
         validator_utils::{compute_validator_set_cc, PrevBlockHistory},
         BlockCandidate,
     },
@@ -813,7 +812,6 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids.clone(),
-            Default::default(),
             None,
             block_candidate,
             validator_set.clone(),
@@ -834,8 +832,8 @@ impl TestEngine {
     ) -> Result<()> {
         let info = block_stuff.block()?.read_info()?;
         let extra = block_stuff.block()?.read_extra()?;
-        let (_, block_id) = info.read_master_id()?.master_block_id();
-        self.save_last_applied_mc_block_id(&block_id)?;
+        let (_, mc_state_id) = info.read_master_id()?.master_block_id();
+        self.save_last_applied_mc_block_id(&mc_state_id)?;
 
         let min_mc_seqno = info.min_ref_mc_seqno() - 1;
 
@@ -856,7 +854,6 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids.clone(),
-            Default::default(),
             None,
             block_candidate,
             validator_set.clone(),
@@ -874,7 +871,6 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             &prev,
-            PipelineContext::new(),
             Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())),
             validator_set.clone(),
             extra.created_by().clone(),
@@ -883,7 +879,7 @@ impl TestEngine {
             Default::default(),
         )?;
 
-        let (block_candidate, new_state) = match collator.collate().await? {
+        let (block_candidate, new_state) = match collator.collate(&mc_state_id).await? {
             CollateResult::Ok { candidate, new_state, .. } => (candidate, new_state),
             CollateResult::Err { err, .. } => return Err(err),
         };
@@ -969,7 +965,6 @@ impl TestEngine {
             block_stuff.id().shard().clone(),
             min_mc_seqno,
             prev_blocks_ids,
-            Default::default(),
             None,
             block_candidate.clone(),
             validator_set,
