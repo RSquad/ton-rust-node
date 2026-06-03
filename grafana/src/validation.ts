@@ -9,7 +9,7 @@ export const collatorSuccessesTotal = (): TimeseriesBuilder =>
     .decimals(0)
     .withTarget(
       promQuery(
-        `max by(node_id) (ton_node_collator_successes_total{${F}})`,
+        `sum by(node_id) (ton_node_collator_successes_total{${F}})`,
         "{{node_id}}",
       ),
     );
