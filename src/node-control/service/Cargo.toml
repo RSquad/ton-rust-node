@@ -28,7 +28,7 @@ jsonwebtoken = "9"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]
 mockall = "0.13"

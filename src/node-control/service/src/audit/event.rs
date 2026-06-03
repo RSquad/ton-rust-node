@@ -7,38 +7,230 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::audit::{
-    enums::{AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource},
-    participant::{AuditActor, AuditSubject},
+    enums::{AuditEventPayload, AuditOutcome, StakeSkipReason},
+    participant::{AuditActor, AuditTarget},
 };
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
+/// Renders timestamps as RFC3339 with millisecond precision and a trailing `Z`
+/// (e.g. `2026-05-22T12:10:30.123Z`), used for `ts` and `started_at`.
+mod ts_millis_rfc3339 {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&ts.to_rfc3339_opts(SecondsFormat::Millis, true))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let raw = String::deserialize(d)?;
+        DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// First JSONL line of every (rotated) audit file. Readers distinguish it from
+/// events by the absence of an `event_type` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditFileHeader {
+    pub schema_version: u16,
+    /// Logical service name, e.g. `"nodectl"`.
+    pub service: String,
+    /// Service semver.
+    pub service_version: String,
+    pub host: String,
+    #[serde(with = "ts_millis_rfc3339")]
+    pub started_at: DateTime<Utc>,
+}
+
+/// A single audit record.
+///
+/// Wire shape: `id`, `ts`, `outcome`, the flattened payload
+/// (`event_type` + `data`), `actor`, `target`. `severity`/`source` are derived
+/// from the payload at the display layer and `schema_version` lives in
+/// [`AuditFileHeader`], so none of them are stored per event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
-    pub schema_version: u16,
+    /// UUID v7 — sortable by creation time.
     pub id: Uuid,
+    #[serde(with = "ts_millis_rfc3339")]
     pub ts: DateTime<Utc>,
-    pub source: AuditSource,
-    pub severity: AuditSeverity,
     pub outcome: AuditOutcome,
-    pub actor: AuditActor,
-    pub subject: AuditSubject,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     #[serde(flatten)]
     pub payload: AuditEventPayload,
+    pub actor: AuditActor,
+    pub target: AuditTarget,
+}
+
+impl AuditEvent {
+    /// Internal constructor that stamps `id`/`ts`. Crate-private so call sites
+    /// must go through the typed constructors below, which bake the canonical
+    /// outcome per event type.
+    pub(crate) fn new(
+        actor: AuditActor,
+        target: AuditTarget,
+        outcome: AuditOutcome,
+        payload: AuditEventPayload,
+    ) -> Self {
+        Self { id: Uuid::now_v7(), ts: Utc::now(), outcome, payload, actor, target }
+    }
+
+    /// `target` for a per-node election event: always `Node { election_id }`.
+    fn node_target(node_id: impl Into<String>, election_id: u64) -> AuditTarget {
+        AuditTarget::Node { id: node_id.into(), election_id: Some(election_id) }
+    }
+
+    pub fn elections_tick_failed(
+        actor: AuditActor,
+        election_id: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Self {
+        // A tick can fail before the active election id is known; fall back to a
+        // system target in that case (source still resolves to `elections`).
+        let target = election_id
+            .map(|election_id| AuditTarget::Elections { election_id })
+            .unwrap_or(AuditTarget::System);
+        Self::new(
+            actor,
+            target,
+            AuditOutcome::Failure,
+            AuditEventPayload::ElectionsTickFailed { reason: reason.into() },
+        )
+    }
+
+    pub fn elections_key_generated(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        pubkey: Option<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsKeyGenerated { pubkey },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn elections_stake_submitted(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        stake_nanotons: impl Into<String>,
+        max_factor: u32,
+        policy: impl Into<String>,
+        submission_time: u64,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsStakeSubmitted {
+                stake_nanotons: stake_nanotons.into(),
+                max_factor,
+                policy: policy.into(),
+                submission_time,
+            },
+        )
+    }
+
+    pub fn elections_stake_skipped(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        reason: StakeSkipReason,
+        required_nanotons: Option<String>,
+        available_nanotons: Option<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Skipped,
+            AuditEventPayload::ElectionsStakeSkipped {
+                reason,
+                required_nanotons,
+                available_nanotons,
+            },
+        )
+    }
+
+    pub fn elections_stake_recovered(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        amount_nanotons: impl Into<String>,
+        tx_hash: Option<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsStakeRecovered {
+                amount_nanotons: amount_nanotons.into(),
+                tx_hash,
+            },
+        )
+    }
+
+    pub fn elections_withdraw_processed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        tx_hash: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsWithdrawProcessed { tx_hash: tx_hash.into() },
+        )
+    }
+
+    pub fn elections_withdraw_process_failed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Failure,
+            AuditEventPayload::ElectionsWithdrawProcessFailed { reason: reason.into() },
+        )
+    }
+
+    pub fn system_service_started(version: impl Into<String>) -> Self {
+        Self::new(
+            AuditActor::System,
+            AuditTarget::System,
+            AuditOutcome::Success,
+            AuditEventPayload::SystemServiceStarted { version: version.into() },
+        )
+    }
+
+    pub fn system_audit_events_dropped(dropped: u64) -> Self {
+        Self::new(
+            AuditActor::System,
+            AuditTarget::System,
+            AuditOutcome::Failure,
+            AuditEventPayload::SystemAuditEventsDropped {
+                dropped_events: dropped,
+                reason: "queue_full_after_timeout".into(),
+            },
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{
-        AuditLogConfig,
-        enums::{AuditActorKind, AuditEventPayload, AuditSubjectKind, StakeSkipReason},
-    };
+    use crate::audit::{AuditLogConfig, enums::ConfigFieldChange};
     use serde_json::{Value, json};
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::path::PathBuf;
 
     const FIXTURE_ID: &str = "9b6c2b5a-9f9d-4a9f-bc31-9a89b0e9d111";
     const FIXTURE_TS: &str = "2026-05-22T12:10:30.123Z";
@@ -56,260 +248,156 @@ mod tests {
         assert_eq!(actual_value, expected);
     }
 
+    fn fixed(
+        outcome: AuditOutcome,
+        actor: AuditActor,
+        target: AuditTarget,
+        payload: AuditEventPayload,
+    ) -> AuditEvent {
+        AuditEvent { id: fixture_id(), ts: fixture_ts(), outcome, payload, actor, target }
+    }
+
     #[test]
     fn serializes_stake_submitted_to_expected_json() {
-        let event = AuditEvent {
-            schema_version: 1,
-            id: fixture_id(),
-            ts: fixture_ts(),
-            source: AuditSource::Elections,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor {
-                kind: AuditActorKind::Service,
-                id: Some("elections-task".into()),
-                role: None,
-                ip: None,
-            },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Node,
-                id: Some("node1".into()),
-                election_id: Some(1_779_265_552),
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::ElectionsStakeSubmitted {
-                election_id: 1_779_265_552,
+        let event = fixed(
+            AuditOutcome::Success,
+            AuditActor::service("elections-task"),
+            AuditTarget::Node { id: "node1".into(), election_id: Some(1_779_265_552) },
+            AuditEventPayload::ElectionsStakeSubmitted {
                 stake_nanotons: "50000000000000".into(),
                 max_factor: 196_608,
                 policy: "adaptive_split50".into(),
                 submission_time: 1_779_265_400,
             },
-        };
+        );
 
         assert_json_eq(
             &event,
             json!({
-                "schema_version": 1,
                 "id": FIXTURE_ID,
                 "ts": FIXTURE_TS,
-                "source": "elections",
-                "severity": "info",
                 "outcome": "success",
-                "actor": {
-                    "kind": "service",
-                    "id": "elections-task"
-                },
-                "subject": {
-                    "kind": "node",
-                    "id": "node1",
-                    "election_id": 1779265552
-                },
                 "event_type": "elections.stake_submitted",
                 "data": {
-                    "election_id": 1779265552,
                     "stake_nanotons": "50000000000000",
                     "max_factor": 196608,
                     "policy": "adaptive_split50",
                     "submission_time": 1779265400
-                }
+                },
+                "actor": { "kind": "service", "id": "elections-task" },
+                "target": { "kind": "node", "id": "node1", "election_id": 1779265552 }
             }),
         );
     }
 
     #[test]
     fn serializes_stake_skipped_to_expected_json() {
-        let event = AuditEvent {
-            schema_version: 1,
-            id: fixture_id(),
-            ts: fixture_ts(),
-            source: AuditSource::Elections,
-            severity: AuditSeverity::Warn,
-            outcome: AuditOutcome::Skipped,
-            actor: AuditActor {
-                kind: AuditActorKind::Service,
-                id: Some("elections-task".into()),
-                role: None,
-                ip: None,
-            },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Node,
-                id: Some("node6".into()),
-                election_id: Some(1_779_265_552),
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::ElectionsStakeSkipped {
-                election_id: 1_779_265_552,
+        let event = fixed(
+            AuditOutcome::Skipped,
+            AuditActor::service("elections-task"),
+            AuditTarget::Node { id: "node6".into(), election_id: Some(1_779_265_552) },
+            AuditEventPayload::ElectionsStakeSkipped {
                 reason: StakeSkipReason::LowWalletBalance,
                 required_nanotons: Some("1200000000".into()),
                 available_nanotons: Some("900000000".into()),
             },
-        };
+        );
 
         assert_json_eq(
             &event,
             json!({
-                "schema_version": 1,
                 "id": FIXTURE_ID,
                 "ts": FIXTURE_TS,
-                "source": "elections",
-                "severity": "warn",
                 "outcome": "skipped",
-                "actor": {
-                    "kind": "service",
-                    "id": "elections-task"
-                },
-                "subject": {
-                    "kind": "node",
-                    "id": "node6",
-                    "election_id": 1779265552
-                },
                 "event_type": "elections.stake_skipped",
                 "data": {
-                    "election_id": 1779265552,
                     "reason": "low_wallet_balance",
                     "required_nanotons": "1200000000",
                     "available_nanotons": "900000000"
-                }
+                },
+                "actor": { "kind": "service", "id": "elections-task" },
+                "target": { "kind": "node", "id": "node6", "election_id": 1779265552 }
             }),
         );
     }
 
     #[test]
-    fn serializes_config_updated_to_expected_json() {
-        let event = AuditEvent {
+    fn file_header_serializes_with_millis_ts() {
+        let header = AuditFileHeader {
             schema_version: 1,
-            id: fixture_id(),
-            ts: fixture_ts(),
-            source: AuditSource::RestApi,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor {
-                kind: AuditActorKind::User,
-                id: Some("admin".into()),
-                role: Some("operator".into()),
-                ip: None,
-            },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Config,
-                id: Some("elections".into()),
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::RestApiConfigUpdated {
-                operation: "elections.wait_updated".into(),
-                changes: json!({
-                    "sleep_period_pct": { "old": 0.2, "new": 0.9 },
-                    "waiting_period_pct": { "old": 0.4, "new": 0.95 }
-                }),
-            },
+            service: "nodectl".into(),
+            service_version: "0.5.1".into(),
+            host: "node-host".into(),
+            started_at: fixture_ts(),
         };
-
-        assert_json_eq(
-            &event,
+        let value = serde_json::to_value(&header).expect("serialize header");
+        assert_eq!(
+            value,
             json!({
                 "schema_version": 1,
-                "id": FIXTURE_ID,
-                "ts": FIXTURE_TS,
-                "source": "rest_api",
-                "severity": "info",
-                "outcome": "success",
-                "actor": {
-                    "kind": "user",
-                    "id": "admin",
-                    "role": "operator"
-                },
-                "subject": {
-                    "kind": "config",
-                    "id": "elections"
-                },
-                "event_type": "rest_api.config_updated",
-                "data": {
-                    "operation": "elections.wait_updated",
-                    "changes": {
-                        "sleep_period_pct": { "old": 0.2, "new": 0.9 },
-                        "waiting_period_pct": { "old": 0.4, "new": 0.95 }
-                    }
-                }
-            }),
+                "service": "nodectl",
+                "service_version": "0.5.1",
+                "host": "node-host",
+                "started_at": FIXTURE_TS
+            })
         );
+        // Header has no event_type — that is how readers tell it apart from events.
+        assert!(value.get("event_type").is_none());
     }
 
     fn sample_event(payload: AuditEventPayload) -> AuditEvent {
-        AuditEvent {
-            schema_version: 1,
-            id: fixture_id(),
-            ts: fixture_ts(),
-            source: AuditSource::System,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Node,
-                id: Some("node1".into()),
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: None,
+        fixed(
+            AuditOutcome::Success,
+            AuditActor::System,
+            AuditTarget::Node { id: "node1".into(), election_id: Some(1_779_265_552) },
             payload,
-        }
+        )
     }
 
     fn all_payload_variants() -> Vec<AuditEventPayload> {
-        const ELECTION_ID: u64 = 1_779_265_552;
         vec![
-            AuditEventPayload::ElectionsTickFailed {
-                election_id: Some(ELECTION_ID),
-                error: "tick error".into(),
-            },
-            AuditEventPayload::ElectionsKeyGenerated {
-                election_id: ELECTION_ID,
-                pubkey: Some("aabb".into()),
-            },
+            AuditEventPayload::ElectionsTickFailed { reason: "tick error".into() },
+            AuditEventPayload::ElectionsKeyGenerated { pubkey: Some("aabb".into()) },
             AuditEventPayload::ElectionsStakeSubmitted {
-                election_id: ELECTION_ID,
                 stake_nanotons: "1".into(),
                 max_factor: 1,
                 policy: "all".into(),
                 submission_time: 1,
             },
-            AuditEventPayload::ElectionsStakeAccepted {
-                election_id: ELECTION_ID,
-                stake_nanotons: "50000000000000".into(),
-            },
+            AuditEventPayload::ElectionsStakeAccepted { stake_nanotons: "50000000000000".into() },
             AuditEventPayload::ElectionsStakeSkipped {
-                election_id: ELECTION_ID,
                 reason: StakeSkipReason::WithdrawRequestsPending,
                 required_nanotons: None,
                 available_nanotons: None,
             },
-            AuditEventPayload::ElectionsWithdrawProcessed {
-                election_id: ELECTION_ID,
-                tx_hash: "abc".into(),
-            },
-            AuditEventPayload::ElectionsWithdrawProcessFailed {
-                election_id: ELECTION_ID,
-                error: "send failed".into(),
-            },
+            AuditEventPayload::ElectionsWithdrawProcessed { tx_hash: "abc".into() },
+            AuditEventPayload::ElectionsWithdrawProcessFailed { reason: "send failed".into() },
             AuditEventPayload::ElectionsStakeRecovered {
-                election_id: ELECTION_ID,
                 amount_nanotons: "50000000000000".into(),
                 tx_hash: Some("def".into()),
             },
+            AuditEventPayload::RewardsDistributionStarted { recipients_count: 3 },
+            AuditEventPayload::RewardsDistributionCompleted {
+                recipients_count: 3,
+                total_nanotons: "9".into(),
+            },
+            AuditEventPayload::RewardsDistributionFailed { reason: "rpc".into() },
+            AuditEventPayload::RewardsRecipientSkipped { reason: "below_min".into() },
             AuditEventPayload::RestApiConfigUpdated {
                 operation: "patch".into(),
-                changes: json!({ "path": "/v1/elections/settings" }),
+                changes: vec![ConfigFieldChange {
+                    field: "elections.x".into(),
+                    old: json!(1),
+                    new: json!(2),
+                }],
             },
-            AuditEventPayload::RestApiAuthLoginSuccess { username: "admin".into() },
-            AuditEventPayload::RestApiAuthLoginRejected {
-                username: "admin".into(),
-                reason: "bad password".into(),
-            },
+            AuditEventPayload::RestApiAuthLoginSuccess {},
+            AuditEventPayload::RestApiAuthLoginRejected { reason: "bad password".into() },
             AuditEventPayload::RestApiTokenRejected { reason: "expired".into() },
+            AuditEventPayload::VaultKeyCreated {},
+            AuditEventPayload::VaultKeyRemoved {},
             AuditEventPayload::SystemServiceStarted { version: "0.5.0".into() },
-            AuditEventPayload::SystemServiceStopped,
+            AuditEventPayload::SystemServiceStopped {},
             AuditEventPayload::SystemAuditEventsDropped {
                 dropped_events: 3,
                 reason: "queue_full_after_timeout".into(),
@@ -328,31 +416,24 @@ mod tests {
     }
 
     #[test]
-    fn subject_labels_omitted_when_empty() {
-        let event = AuditEvent {
-            schema_version: 1,
-            id: fixture_id(),
-            ts: fixture_ts(),
-            source: AuditSource::Elections,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor { kind: AuditActorKind::Service, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Node,
-                id: Some("node1".into()),
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::ElectionsWithdrawProcessed {
-                election_id: 1_779_265_552,
-                tx_hash: "abc".into(),
-            },
-        };
+    fn canonical_outcome_is_baked_into_constructors() {
+        let skipped = AuditEvent::elections_stake_skipped(
+            AuditActor::service("elections-task"),
+            "node1",
+            1,
+            StakeSkipReason::PoolNotReady,
+            None,
+            None,
+        );
+        assert_eq!(skipped.outcome, AuditOutcome::Skipped);
 
-        let value = serde_json::to_value(&event).expect("serialize");
-        let subject = value.get("subject").expect("subject").as_object().expect("object");
-        assert!(!subject.contains_key("labels"), "empty labels must not appear in JSON: {value}");
+        let failed = AuditEvent::elections_tick_failed(
+            AuditActor::scheduler("elections-task"),
+            None,
+            "boom",
+        );
+        assert_eq!(failed.outcome, AuditOutcome::Failure);
+        assert_eq!(failed.target, AuditTarget::System);
     }
 
     #[test]

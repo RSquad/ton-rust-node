@@ -18,13 +18,12 @@ pub mod participant;
 
 pub use common::app_config::AuditLogConfig;
 pub use enums::{
-    AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, AuditSubjectKind,
-    StakeSkipReason,
+    AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, ConfigFieldChange, StakeSkipReason,
 };
-pub use event::AuditEvent;
+pub use event::{AuditEvent, AuditFileHeader};
 pub use factory::AuditLogFactory;
 #[cfg(test)]
 pub use in_memory::InMemoryAuditLog;
 pub use jsonl_log::AuditInitError;
 pub use log::{AuditLog, NoopAuditLog};
-pub use participant::{AuditActor, AuditSubject};
+pub use participant::{AuditActor, AuditTarget};

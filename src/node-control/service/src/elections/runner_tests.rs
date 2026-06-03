@@ -8,11 +8,8 @@
  */
 use super::*;
 use crate::audit::{
-    AuditEvent, InMemoryAuditLog,
-    enums::{
-        AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, AuditSubjectKind,
-        StakeSkipReason,
-    },
+    AuditEvent, AuditTarget, InMemoryAuditLog,
+    enums::{AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, StakeSkipReason},
 };
 use common::{
     app_config::{ElectionsConfig, NodeBinding, StakePolicy},
@@ -395,6 +392,17 @@ fn payload_stake_skipped(payload: &AuditEventPayload) -> &AuditEventPayload {
     match payload {
         AuditEventPayload::ElectionsStakeSkipped { .. } => payload,
         other => panic!("expected ElectionsStakeSkipped, got {other:?}"),
+    }
+}
+
+/// Asserts the event targets the expected node and election.
+fn assert_node_target(target: &AuditTarget, node_id: &str, election_id: u64) {
+    match target {
+        AuditTarget::Node { id, election_id: eid } => {
+            assert_eq!(id, node_id, "unexpected node id in target");
+            assert_eq!(*eid, Some(election_id), "unexpected election_id in target");
+        }
+        other => panic!("expected node target, got {other:?}"),
     }
 }
 
@@ -3869,13 +3877,13 @@ async fn tick_emits_failed_on_error() {
     let failed =
         find_audit_event(&events, |p| matches!(p, AuditEventPayload::ElectionsTickFailed { .. }));
 
-    assert_eq!(failed.severity, AuditSeverity::Error);
+    assert_eq!(failed.payload.severity(), AuditSeverity::Error);
     assert_eq!(failed.outcome, AuditOutcome::Failure);
-    let AuditEventPayload::ElectionsTickFailed { election_id, error } = &failed.payload else {
+    assert_eq!(failed.target, AuditTarget::Elections { election_id: ELECTION_ID });
+    let AuditEventPayload::ElectionsTickFailed { reason } = &failed.payload else {
         unreachable!();
     };
-    assert_eq!(*election_id, Some(ELECTION_ID));
-    assert!(error.contains("simulated elections_info failure"));
+    assert!(reason.contains("simulated elections_info failure"));
 }
 
 #[tokio::test]
@@ -3900,15 +3908,12 @@ async fn stake_submitted_event_contains_correct_payload() {
     });
     payload_stake_submitted(&ev.payload);
 
-    assert_eq!(ev.source, AuditSource::Elections);
-    assert_eq!(ev.severity, AuditSeverity::Info);
+    assert_eq!(ev.payload.source(), AuditSource::Elections);
+    assert_eq!(ev.payload.severity(), AuditSeverity::Info);
     assert_eq!(ev.outcome, AuditOutcome::Success);
-    assert_eq!(ev.subject.kind, AuditSubjectKind::Node);
-    assert_eq!(ev.subject.id.as_deref(), Some(node_id));
-    assert_eq!(ev.subject.election_id, Some(ELECTION_ID));
+    assert_node_target(&ev.target, node_id, ELECTION_ID);
 
     let AuditEventPayload::ElectionsStakeSubmitted {
-        election_id,
         stake_nanotons,
         max_factor,
         policy,
@@ -3917,7 +3922,6 @@ async fn stake_submitted_event_contains_correct_payload() {
     else {
         unreachable!();
     };
-    assert_eq!(*election_id, ELECTION_ID);
     assert_eq!(stake_nanotons, &expected_stake.to_string());
     assert_eq!(*max_factor, 196608);
     assert_eq!(policy, "split50");
@@ -3954,9 +3958,9 @@ async fn stake_skipped_event_has_skipped_outcome_and_warn_severity() {
     });
     payload_stake_skipped(&ev.payload);
 
-    assert_eq!(ev.severity, AuditSeverity::Warn);
+    assert_eq!(ev.payload.severity(), AuditSeverity::Warn);
     assert_eq!(ev.outcome, AuditOutcome::Skipped);
-    assert_eq!(ev.subject.election_id, Some(ELECTION_ID));
+    assert_node_target(&ev.target, node_id, ELECTION_ID);
 }
 
 #[tokio::test]
@@ -3993,12 +3997,11 @@ async fn withdraw_processed_emits_tx_hash() {
     });
 
     assert_eq!(ev.outcome, AuditOutcome::Success);
-    assert_eq!(ev.subject.election_id, Some(ELECTION_ID));
+    assert_node_target(&ev.target, node_id, ELECTION_ID);
 
-    let AuditEventPayload::ElectionsWithdrawProcessed { election_id, tx_hash } = &ev.payload else {
+    let AuditEventPayload::ElectionsWithdrawProcessed { tx_hash } = &ev.payload else {
         unreachable!();
     };
-    assert_eq!(*election_id, ELECTION_ID);
     assert!(!tx_hash.is_empty(), "tx_hash must be the sent message cell hash");
 }
 
@@ -4043,16 +4046,14 @@ async fn withdraw_failed_emits_error_string() {
         matches!(p, AuditEventPayload::ElectionsWithdrawProcessFailed { .. })
     });
 
-    assert_eq!(ev.severity, AuditSeverity::Error);
+    assert_eq!(ev.payload.severity(), AuditSeverity::Error);
     assert_eq!(ev.outcome, AuditOutcome::Failure);
-    assert_eq!(ev.subject.election_id, Some(ELECTION_ID));
+    assert_node_target(&ev.target, node_id, ELECTION_ID);
 
-    let AuditEventPayload::ElectionsWithdrawProcessFailed { election_id, error } = &ev.payload
-    else {
+    let AuditEventPayload::ElectionsWithdrawProcessFailed { reason } = &ev.payload else {
         unreachable!();
     };
-    assert_eq!(*election_id, ELECTION_ID);
-    assert!(error.contains("simulated withdraw send_boc failure"));
+    assert!(reason.contains("simulated withdraw send_boc failure"));
 }
 
 #[tokio::test]
@@ -4072,7 +4073,7 @@ async fn subject_election_id_populated_for_election_events() {
     let events = audit.drain();
     let election_events: Vec<_> = events
         .iter()
-        .filter(|ev| ev.source == AuditSource::Elections)
+        .filter(|ev| ev.payload.source() == AuditSource::Elections)
         .filter(|ev| {
             matches!(
                 ev.payload,
@@ -4087,11 +4088,6 @@ async fn subject_election_id_populated_for_election_events() {
         "expected at least key_generated and stake_submitted audit events"
     );
     for ev in election_events {
-        assert_eq!(
-            ev.subject.election_id,
-            Some(ELECTION_ID),
-            "event {:?} missing subject.election_id",
-            ev.payload
-        );
+        assert_node_target(&ev.target, node_id, ELECTION_ID);
     }
 }

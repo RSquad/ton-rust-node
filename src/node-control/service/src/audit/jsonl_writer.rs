@@ -6,18 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::audit::{
-    AuditEvent, AuditLogConfig,
-    enums::{
-        AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource,
-        AuditSubjectKind,
-    },
-    jsonl_log::AuditInitError,
-    participant::{AuditActor, AuditSubject},
-};
+use crate::audit::{AuditEvent, AuditFileHeader, AuditLogConfig, jsonl_log::AuditInitError};
 use chrono::Utc;
 use std::{
-    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -25,7 +16,9 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
-use uuid::Uuid;
+
+/// Schema version stamped into the per-file [`AuditFileHeader`].
+const AUDIT_SCHEMA_VERSION: u16 = 1;
 
 pub(crate) enum AuditCommand {
     Event(Box<AuditEvent>),
@@ -75,7 +68,7 @@ impl AuditWriter {
 
         let current_size = file.metadata().await.map_err(AuditInitError::FileOpen)?.len();
 
-        Ok(Self {
+        let mut writer = Self {
             config,
             file: Some(file),
             current_size,
@@ -83,7 +76,51 @@ impl AuditWriter {
             dropped_events: dropped,
             last_dropped_seen: 0,
             write_delay,
-        })
+        };
+        // A brand-new (empty) live file starts with a header line so each file is
+        // self-describing. An existing non-empty file already has one.
+        writer.write_header_if_empty().await.map_err(AuditInitError::FileOpen)?;
+        Ok(writer)
+    }
+
+    fn file_header() -> AuditFileHeader {
+        AuditFileHeader {
+            schema_version: AUDIT_SCHEMA_VERSION,
+            service: "nodectl".into(),
+            service_version: env!("CARGO_PKG_VERSION").into(),
+            host: Self::hostname(),
+            started_at: Utc::now(),
+        }
+    }
+
+    fn hostname() -> String {
+        std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Writes the file header as the first line, but only when the live segment
+    /// is empty (fresh file or just-rotated/truncated). No-op otherwise.
+    async fn write_header_if_empty(&mut self) -> std::io::Result<()> {
+        if self.current_size != 0 {
+            return Ok(());
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut line = serde_json::to_vec(&Self::file_header())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("audit file handle not open"))?;
+        file.write_all(&line).await?;
+        if self.config.fsync_on_batch {
+            file.sync_data().await?;
+        }
+        self.current_size += line.len() as u64;
+        Ok(())
     }
 
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<AuditCommand>) {
@@ -254,6 +291,8 @@ impl AuditWriter {
         opts.mode(0o600);
         self.file = Some(opts.open(path).await?);
         self.current_size = 0;
+        // Fresh segment: re-emit the file header as the first line.
+        self.write_header_if_empty().await?;
         Ok(())
     }
 
@@ -265,27 +304,7 @@ impl AuditWriter {
         }
         self.last_dropped_seen = current;
 
-        let event = AuditEvent {
-            schema_version: 1,
-            id: Uuid::new_v4(),
-            ts: Utc::now(),
-            source: AuditSource::System,
-            severity: AuditSeverity::Warn,
-            outcome: AuditOutcome::Failure,
-            actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Config,
-                id: None,
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: Some("audit events dropped".into()),
-            payload: AuditEventPayload::SystemAuditEventsDropped {
-                dropped_events: delta,
-                reason: "queue_full_after_timeout".into(),
-            },
-        };
-        let mut buf = vec![event];
+        let mut buf = vec![AuditEvent::system_audit_events_dropped(delta)];
         self.flush(&mut buf).await;
     }
 }
@@ -313,32 +332,12 @@ mod tests {
     }
 
     fn sample_event(tag: &str) -> AuditEvent {
-        AuditEvent {
-            schema_version: 1,
-            id: Uuid::new_v4(),
-            ts: Utc::now(),
-            source: AuditSource::System,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Config,
-                id: Some(tag.into()),
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::SystemServiceStarted { version: tag.into() },
-        }
+        // `system.service_started` carries `data.version`, which tests assert on.
+        AuditEvent::system_service_started(tag)
     }
 
     fn large_event(payload_kb: usize) -> AuditEvent {
-        let mut event = sample_event("large");
-        event.payload = AuditEventPayload::RestApiConfigUpdated {
-            operation: "update".into(),
-            changes: serde_json::json!({ "blob": "x".repeat(payload_kb * 1024) }),
-        };
-        event
+        AuditEvent::system_service_started("x".repeat(payload_kb * 1024))
     }
 
     fn test_config(dir: &Path, mut cfg: AuditLogConfig) -> AuditLogConfig {
@@ -386,13 +385,16 @@ mod tests {
         tx.send(AuditCommand::Shutdown).await.unwrap();
     }
 
+    /// Reads event lines, skipping the per-file [`AuditFileHeader`] (the only
+    /// line without an `event_type` field).
     fn read_json_lines(path: &Path) -> Vec<Value> {
         assert!(path.exists(), "audit file missing at {}", path.display());
         let content = std::fs::read_to_string(path).unwrap();
         content
             .lines()
             .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str(line).expect("valid json line"))
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid json line"))
+            .filter(|value| value.get("event_type").is_some())
             .collect()
     }
 

@@ -98,30 +98,23 @@ impl AuditLog for JsonlAuditLog {
     }
 
     async fn record(&self, event: AuditEvent) {
+        // Capture diagnostics up front so a dropped event can still be attributed
+        // to its id/source after the event is moved into the send future.
+        let event_id = event.id;
+        let source = event.payload.source();
         let cmd = AuditCommand::Event(Box::new(event));
 
         match self.sender.try_send(cmd) {
             Ok(()) => return,
             Err(mpsc::error::TrySendError::Full(cmd)) => {
-                // Capture diagnostics before `cmd` is moved into the send future,
-                // so a dropped event can be attributed to its source/subject.
-                let diag = match &cmd {
-                    AuditCommand::Event(ev) => Some((ev.id, ev.source, ev.subject.kind)),
-                    _ => None,
-                };
                 let timeout = Duration::from_millis(self.config.queue_full_timeout_ms);
                 match tokio::time::timeout(timeout, self.sender.send(cmd)).await {
                     Ok(Ok(())) => return,
                     _ => {
                         self.dropped_events.fetch_add(1, Ordering::Relaxed);
-                        let (event_id, source, subject) = match diag {
-                            Some((id, source, subject)) => (Some(id), Some(source), Some(subject)),
-                            None => (None, None, None),
-                        };
                         tracing::warn!(
                             ?event_id,
                             ?source,
-                            ?subject,
                             "audit event dropped: queue full after timeout"
                         );
                     }

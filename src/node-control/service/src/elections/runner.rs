@@ -11,17 +11,8 @@ use super::{
     election_emulator::ParticipantStake,
     providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry},
 };
-use crate::audit::{
-    AuditEvent, StakeSkipReason,
-    enums::{
-        AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource,
-        AuditSubjectKind,
-    },
-    log::AuditLog,
-    participant::{AuditActor, AuditSubject},
-};
+use crate::audit::{AuditEvent, StakeSkipReason, log::AuditLog, participant::AuditActor};
 use anyhow::Context as _;
-use chrono::Utc;
 use common::{
     app_config::{BindingStatus, ElectionsConfig, NodeBinding, StakePolicy},
     clock::{Clock, SystemClock},
@@ -42,7 +33,7 @@ use contracts::{
     elector::PastElections, nominator,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -51,7 +42,6 @@ use ton_block::{
     config_params::{ConfigParam16, ConfigParam17},
     write_boc,
 };
-use uuid::Uuid;
 
 #[cfg(test)]
 #[path = "runner_tests.rs"]
@@ -368,27 +358,6 @@ impl ElectionRunner {
         }
     }
 
-    async fn audit_emit(
-        &self,
-        severity: AuditSeverity,
-        outcome: AuditOutcome,
-        election_id: Option<u64>,
-        node_id: Option<String>,
-        message: &str,
-        payload: AuditEventPayload,
-    ) {
-        elections_audit_emit(
-            &self.audit,
-            severity,
-            outcome,
-            election_id,
-            node_id,
-            message,
-            payload,
-        )
-        .await;
-    }
-
     async fn audit_stake_skipped(
         &self,
         election_id: u64,
@@ -559,19 +528,13 @@ impl ElectionRunner {
                             let id = self.past_elections_cache_id;
                             (id > 0).then_some(id)
                         });
-                        elections_audit_emit(
-                            &audit,
-                            AuditSeverity::Error,
-                            AuditOutcome::Failure,
-                            election_id,
-                            None,
-                            "Election tick failed",
-                            AuditEventPayload::ElectionsTickFailed {
+                        audit
+                            .record(AuditEvent::elections_tick_failed(
+                                elections_audit_actor(),
                                 election_id,
-                                error: format!("{e:#}"),
-                            },
-                        )
-                        .await;
+                                format!("{e:#}"),
+                            ))
+                            .await;
                         tracing::error!("runner tick error: {:#}", e);
                     }
 
@@ -1105,19 +1068,14 @@ impl ElectionRunner {
                     max_factor,
                 });
                 node.key_id = key_id;
-                elections_audit_emit(
-                    &audit,
-                    AuditSeverity::Info,
-                    AuditOutcome::Success,
-                    Some(election_id),
-                    Some(node_id.to_string()),
-                    "Validator key generated",
-                    AuditEventPayload::ElectionsKeyGenerated {
+                audit
+                    .record(AuditEvent::elections_key_generated(
+                        elections_audit_actor(),
+                        node_id,
                         election_id,
-                        pubkey: Some(pubkey_hex),
-                    },
-                )
-                .await;
+                        Some(pubkey_hex),
+                    ))
+                    .await;
                 if let Err(e) = Self::send_stake(node_id, node, stake, to_addr).await {
                     let (required, available) = parse_balance_error(&e.to_string());
                     elections_audit_stake_skipped(
@@ -1362,18 +1320,14 @@ impl ElectionRunner {
         };
 
         if let Err(e) = send_result {
-            self.audit_emit(
-                AuditSeverity::Error,
-                AuditOutcome::Failure,
-                Some(election_id),
-                Some(node_id.to_string()),
-                "Withdraw process failed",
-                AuditEventPayload::ElectionsWithdrawProcessFailed {
+            self.audit
+                .record(AuditEvent::elections_withdraw_process_failed(
+                    elections_audit_actor(),
+                    node_id,
                     election_id,
-                    error: format!("{e:#}"),
-                },
-            )
-            .await;
+                    format!("{e:#}"),
+                ))
+                .await;
             return Err(e);
         }
 
@@ -1383,15 +1337,14 @@ impl ElectionRunner {
             WITHDRAW_PROCESS_LIMIT,
             election_id
         );
-        self.audit_emit(
-            AuditSeverity::Info,
-            AuditOutcome::Success,
-            Some(election_id),
-            Some(node_id.to_string()),
-            "Withdraw requests processed",
-            AuditEventPayload::ElectionsWithdrawProcessed { election_id, tx_hash },
-        )
-        .await;
+        self.audit
+            .record(AuditEvent::elections_withdraw_processed(
+                elections_audit_actor(),
+                node_id,
+                election_id,
+                tx_hash,
+            ))
+            .await;
         Ok(true)
     }
 
@@ -1427,19 +1380,15 @@ impl ElectionRunner {
             let tx_hash = format!("{:x}", msg.repr_hash());
             let msg_boc = write_boc(&msg)?;
             node.api.send_boc(&msg_boc).await?;
-            self.audit_emit(
-                AuditSeverity::Info,
-                AuditOutcome::Success,
-                Some(election_id),
-                Some(node_id.to_string()),
-                "Stake recovered",
-                AuditEventPayload::ElectionsStakeRecovered {
+            self.audit
+                .record(AuditEvent::elections_stake_recovered(
+                    elections_audit_actor(),
+                    node_id,
                     election_id,
-                    amount_nanotons: nanotons_to_dec_string(amount),
-                    tx_hash: Some(tx_hash),
-                },
-            )
-            .await;
+                    nanotons_to_dec_string(amount),
+                    Some(tx_hash),
+                ))
+                .await;
         }
         Ok(amount)
     }
@@ -2078,46 +2027,7 @@ impl ElectionRunner {
 }
 
 fn elections_audit_actor() -> AuditActor {
-    AuditActor {
-        kind: AuditActorKind::Service,
-        id: Some("elections-task".into()),
-        role: None,
-        ip: None,
-    }
-}
-
-async fn elections_audit_emit(
-    audit: &Arc<dyn AuditLog>,
-    severity: AuditSeverity,
-    outcome: AuditOutcome,
-    election_id: Option<u64>,
-    node_id: Option<String>,
-    message: &str,
-    payload: AuditEventPayload,
-) {
-    audit
-        .record(AuditEvent {
-            schema_version: 1,
-            id: Uuid::new_v4(),
-            ts: Utc::now(),
-            source: AuditSource::Elections,
-            severity,
-            outcome,
-            actor: elections_audit_actor(),
-            subject: AuditSubject {
-                kind: if node_id.is_some() {
-                    AuditSubjectKind::Node
-                } else {
-                    AuditSubjectKind::Elections
-                },
-                id: node_id,
-                election_id,
-                labels: BTreeMap::new(),
-            },
-            message: Some(message.into()),
-            payload,
-        })
-        .await;
+    AuditActor::service("elections-task")
 }
 
 async fn elections_audit_stake_skipped(
@@ -2128,21 +2038,16 @@ async fn elections_audit_stake_skipped(
     required_nanotons: Option<u64>,
     available_nanotons: Option<u64>,
 ) {
-    elections_audit_emit(
-        audit,
-        AuditSeverity::Warn,
-        AuditOutcome::Skipped,
-        Some(election_id),
-        Some(node_id.to_string()),
-        "Stake skipped",
-        AuditEventPayload::ElectionsStakeSkipped {
+    audit
+        .record(AuditEvent::elections_stake_skipped(
+            elections_audit_actor(),
+            node_id,
             election_id,
             reason,
-            required_nanotons: required_nanotons.map(nanotons_to_dec_string),
-            available_nanotons: available_nanotons.map(nanotons_to_dec_string),
-        },
-    )
-    .await;
+            required_nanotons.map(nanotons_to_dec_string),
+            available_nanotons.map(nanotons_to_dec_string),
+        ))
+        .await;
 }
 
 async fn elections_audit_stake_submitted(
@@ -2155,22 +2060,17 @@ async fn elections_audit_stake_submitted(
         return;
     };
     let submission_time = node.submission_time.unwrap_or_else(time_format::now);
-    elections_audit_emit(
-        audit,
-        AuditSeverity::Info,
-        AuditOutcome::Success,
-        Some(participant.election_id),
-        Some(node_id.to_string()),
-        "Stake submitted",
-        AuditEventPayload::ElectionsStakeSubmitted {
-            election_id: participant.election_id,
-            stake_nanotons: nanotons_to_dec_string(stake),
-            max_factor: participant.max_factor,
-            policy: node.stake_policy.to_string(),
+    audit
+        .record(AuditEvent::elections_stake_submitted(
+            elections_audit_actor(),
+            node_id,
+            participant.election_id,
+            nanotons_to_dec_string(stake),
+            participant.max_factor,
+            node.stake_policy.to_string(),
             submission_time,
-        },
-    )
-    .await;
+        ))
+        .await;
 }
 
 /// Parses `required=` / `available=` TON amounts from runner balance error strings.
