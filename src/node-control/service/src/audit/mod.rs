@@ -9,6 +9,8 @@
 pub mod enums;
 pub mod event;
 pub mod factory;
+#[cfg(test)]
+pub mod in_memory;
 pub mod jsonl_log;
 pub mod jsonl_writer;
 pub mod log;
@@ -21,6 +23,8 @@ pub use enums::{
 };
 pub use event::AuditEvent;
 pub use factory::AuditLogFactory;
+#[cfg(test)]
+pub use in_memory::InMemoryAuditLog;
 pub use jsonl_log::AuditInitError;
 pub use log::{AuditLog, NoopAuditLog};
 pub use participant::{AuditActor, AuditSubject};

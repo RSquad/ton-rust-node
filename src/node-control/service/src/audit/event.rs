@@ -260,6 +260,10 @@ mod tests {
     fn all_payload_variants() -> Vec<AuditEventPayload> {
         const ELECTION_ID: u64 = 1_779_265_552;
         vec![
+            AuditEventPayload::ElectionsTickFailed {
+                election_id: Some(ELECTION_ID),
+                error: "tick error".into(),
+            },
             AuditEventPayload::ElectionsKeyGenerated {
                 election_id: ELECTION_ID,
                 pubkey: Some("aabb".into()),
@@ -284,6 +288,10 @@ mod tests {
             AuditEventPayload::ElectionsWithdrawProcessed {
                 election_id: ELECTION_ID,
                 tx_hash: "abc".into(),
+            },
+            AuditEventPayload::ElectionsWithdrawProcessFailed {
+                election_id: ELECTION_ID,
+                error: "send failed".into(),
             },
             AuditEventPayload::ElectionsStakeRecovered {
                 election_id: ELECTION_ID,

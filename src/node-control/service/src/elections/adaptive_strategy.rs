@@ -15,6 +15,13 @@ use ton_block::config_params::{ConfigParam16, ConfigParam17};
 /// AdaptiveSplit50 wait logic: check whether enough time has passed and enough
 /// participants have joined before proceeding with stake calculation.
 ///
+/// Why AdaptiveSplit50 defers staking for this tick (`calc_stake` returns 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveDeferReason {
+    SleepPeriod,
+    WaitingForParticipants,
+}
+
 /// Returns `true` if staking should proceed, `false` if we should defer (return 0).
 pub(crate) fn is_adaptive_split50_ready(
     node_id: &str,
@@ -65,6 +72,36 @@ pub(crate) fn is_adaptive_split50_ready(
     }
 
     true
+}
+
+/// When [`is_adaptive_split50_ready`] would return `false`, reports which wait gate blocked.
+pub(crate) fn adaptive_split50_defer_reason(
+    elections_info: &ElectionsInfo,
+    cfg15_start_before: u32,
+    cfg15_end_before: u32,
+    cfg16: &ConfigParam16,
+    sleep_pct: f64,
+    waiting_pct: f64,
+) -> Option<AdaptiveDeferReason> {
+    let min_validators = cfg16.min_validators.as_u16() as usize;
+    let participants_count = elections_info.participants.len();
+    let election_duration = cfg15_start_before.saturating_sub(cfg15_end_before) as u64;
+    if election_duration == 0 {
+        return None;
+    }
+
+    let election_start = elections_info.elect_close.saturating_sub(election_duration);
+    let sleep_deadline = election_start + (election_duration as f64 * sleep_pct) as u64;
+    let wait_deadline = election_start + (election_duration as f64 * waiting_pct) as u64;
+    let now = common::time_format::now();
+
+    if now < sleep_deadline {
+        return Some(AdaptiveDeferReason::SleepPeriod);
+    }
+    if participants_count < min_validators && now < wait_deadline {
+        return Some(AdaptiveDeferReason::WaitingForParticipants);
+    }
+    None
 }
 
 /// Calculate stake for AdaptiveSplit50 policy.

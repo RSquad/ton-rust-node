@@ -12,6 +12,13 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "event_type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditEventPayload {
+    #[serde(rename = "elections.tick_failed")]
+    ElectionsTickFailed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        election_id: Option<u64>,
+        error: String,
+    },
+
     #[serde(rename = "elections.key_generated")]
     ElectionsKeyGenerated {
         election_id: u64,
@@ -43,6 +50,9 @@ pub enum AuditEventPayload {
 
     #[serde(rename = "elections.withdraw_processed")]
     ElectionsWithdrawProcessed { election_id: u64, tx_hash: String },
+
+    #[serde(rename = "elections.withdraw_process_failed")]
+    ElectionsWithdrawProcessFailed { election_id: u64, error: String },
 
     #[serde(rename = "elections.stake_recovered")]
     ElectionsStakeRecovered {
@@ -84,7 +94,11 @@ pub enum StakeSkipReason {
     LowWalletBalance,
     WithdrawRequestsPending,
     PoolNotReady,
-    Other,
+    AdaptiveSleepPeriod,
+    AdaptiveWaitingPeriod,
+    NodeExcluded,
+    RecoverPending,
+    InsufficientStakeFunds,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
