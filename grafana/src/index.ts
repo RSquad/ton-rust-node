@@ -55,6 +55,7 @@ const builder = new DashboardBuilder("TON Node Overview")
 
   // Validation & Collation
   .withRow(new RowBuilder("Validation & Collation"))
+  .withPanel(validation.collatorSuccessesTotal().span(12).height(8))
   .withPanel(validation.activeValidatorsCollators().span(12).height(8))
   .withPanel(validation.validationResults().span(12).height(8))
   .withPanel(validation.collationDuration().span(12).height(8))

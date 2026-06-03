@@ -3,6 +3,17 @@ import { PanelBuilder as TimeseriesBuilder } from "@grafana/grafana-foundation-s
 import * as units from "@grafana/grafana-foundation-sdk/units";
 import { defaultTimeseries, promQuery, histogramP, F } from "./common";
 
+export const collatorSuccessesTotal = (): TimeseriesBuilder =>
+  defaultTimeseries()
+    .title("Successful Collations (total)")
+    .decimals(0)
+    .withTarget(
+      promQuery(
+        `sum by(node_id) (ton_node_collator_successes_total{${F}})`,
+        "{{node_id}}",
+      ),
+    );
+
 export const activeValidatorsCollators = (): TimeseriesBuilder =>
   defaultTimeseries()
     .title("Active Validators & Collators")
