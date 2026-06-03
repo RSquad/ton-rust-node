@@ -134,4 +134,5 @@ pub enum AuditSubjectKind {
     User,
     RewardRound,
     Recipient,
+    System,
 }

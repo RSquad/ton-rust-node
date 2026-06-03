@@ -24,11 +24,18 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+#[derive(Debug)]
 pub(crate) enum AuditCommand {
     Event(Box<AuditEvent>),
+
+    /// Explicit shutdown signal on the event channel. Production drives shutdown
+    /// through a dedicated `oneshot` (see [`JsonlAuditLog::shutdown`]) and via
+    /// channel close, so this command exists only for tests that need to stop
+    /// the writer deterministically in event order on the mpsc channel.
+    #[cfg(test)]
     Shutdown,
 
     /// Forces an immediate flush of buffered events. Used only by tests to make
@@ -53,11 +60,51 @@ pub(crate) struct AuditWriter {
 }
 
 impl AuditWriter {
+    fn rotated_path(path: &std::path::Path, n: usize) -> std::path::PathBuf {
+        let filename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "audit".to_string());
+        path.with_file_name(format!("{filename}.{n}"))
+    }
+
     pub(crate) async fn open(
+        config: Arc<AuditLogConfig>,
+        dropped: Arc<AtomicU64>,
+    ) -> Result<Self, AuditInitError> {
+        Self::open_inner(config, dropped, Duration::ZERO).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_with_write_delay(
         config: Arc<AuditLogConfig>,
         dropped: Arc<AtomicU64>,
         write_delay: Duration,
     ) -> Result<Self, AuditInitError> {
+        Self::open_inner(config, dropped, write_delay).await
+    }
+
+    async fn open_inner(
+        config: Arc<AuditLogConfig>,
+        dropped: Arc<AtomicU64>,
+        write_delay: Duration,
+    ) -> Result<Self, AuditInitError> {
+        if config.max_size_bytes == 0 {
+            tracing::warn!(
+                "audit_log.max_size_bytes=0 is invalid for rotation; clamping to 1 byte at runtime"
+            );
+        }
+        if config.batch_max_events == 0 {
+            tracing::warn!(
+                "audit_log.batch_max_events=0 is invalid for batching; clamping to 1 at runtime"
+            );
+        }
+        if config.max_files <= 1 {
+            tracing::warn!(
+                "audit_log.max_files=1 truncates the live file in place on rotation; \
+                 external tailers may lose position (prefer max_files > 1)"
+            );
+        }
         let path = &config.path;
         let mut opts = tokio::fs::OpenOptions::new();
         opts.append(true).create(true);
@@ -70,10 +117,10 @@ impl AuditWriter {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .await
-                .map_err(AuditInitError::FileOpen)?;
+                .map_err(AuditInitError::SetPermissions)?;
         }
 
-        let current_size = file.metadata().await.map_err(AuditInitError::FileOpen)?.len();
+        let current_size = file.metadata().await.map_err(AuditInitError::Metadata)?.len();
 
         Ok(Self {
             config,
@@ -86,25 +133,79 @@ impl AuditWriter {
         })
     }
 
-    pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<AuditCommand>) {
+    async fn drain_pending_commands(
+        &mut self,
+        rx: &mut mpsc::Receiver<AuditCommand>,
+        buffered: &mut Vec<AuditEvent>,
+    ) {
+        let batch_max_events = self.config.batch_max_events.max(1);
+        loop {
+            match rx.try_recv() {
+                Ok(AuditCommand::Event(ev)) => {
+                    buffered.push(*ev);
+                    if buffered.len() >= batch_max_events {
+                        self.flush(buffered).await;
+                    }
+                }
+                #[cfg(test)]
+                Ok(AuditCommand::Shutdown) => {}
+                #[cfg(test)]
+                Ok(AuditCommand::Flush) => self.flush(buffered).await,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    async fn finish_shutdown(
+        &mut self,
+        rx: &mut mpsc::Receiver<AuditCommand>,
+        buffered: &mut Vec<AuditEvent>,
+    ) {
+        self.drain_pending_commands(rx, buffered).await;
+        self.flush(buffered).await;
+        self.maybe_emit_dropped_recovery().await;
+    }
+
+    pub(crate) async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<AuditCommand>,
+        mut shutdown_rx: oneshot::Receiver<()>,
+    ) {
         let interval_ms = self.config.batch_interval_ms.max(1);
-        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+        let batch_max_events = self.config.batch_max_events.max(1);
+        let interval_duration = Duration::from_millis(interval_ms);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + interval_duration,
+            interval_duration,
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut buffered: Vec<AuditEvent> = Vec::with_capacity(self.config.batch_max_events);
+        let mut buffered: Vec<AuditEvent> = Vec::with_capacity(batch_max_events);
 
         loop {
             tokio::select! {
+                biased;
+                shutdown = &mut shutdown_rx => {
+                    if shutdown.is_ok() {
+                        self.finish_shutdown(&mut rx, &mut buffered).await;
+                        return;
+                    }
+                }
                 cmd = rx.recv() => {
                     match cmd {
                         Some(AuditCommand::Event(ev)) => {
                             buffered.push(*ev);
-                            if buffered.len() >= self.config.batch_max_events {
+                            if buffered.len() >= batch_max_events {
                                 self.flush(&mut buffered).await;
                             }
                         }
-                        Some(AuditCommand::Shutdown) | None => {
-                            self.flush(&mut buffered).await;
-                            self.maybe_emit_dropped_recovery().await;
+                        None => {
+                            self.finish_shutdown(&mut rx, &mut buffered).await;
+                            return;
+                        }
+                        #[cfg(test)]
+                        Some(AuditCommand::Shutdown) => {
+                            self.finish_shutdown(&mut rx, &mut buffered).await;
                             return;
                         }
                         #[cfg(test)]
@@ -125,33 +226,62 @@ impl AuditWriter {
         if buffered.is_empty() {
             return;
         }
+        let max_size_bytes = self.config.max_size_bytes.max(1);
 
         self.batch.clear();
         for ev in buffered.drain(..) {
-            let line = match serde_json::to_vec(&ev) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to serialize audit event");
-                    continue;
-                }
-            };
-            let needed = line.len() + 1;
-            if self.current_size + needed as u64 > self.config.max_size_bytes {
+            let batch_before = self.batch.len();
+            if let Err(e) = serde_json::to_writer(&mut self.batch, &ev) {
+                self.batch.truncate(batch_before);
+                tracing::error!(error = %e, "failed to serialize audit event");
+                continue;
+            }
+            self.batch.push(b'\n');
+            let needed = self.batch.len() - batch_before;
+
+            if self.current_size + needed as u64 > max_size_bytes {
+                // This event belongs to the next segment: rollback from the
+                // current batch, flush current segment, rotate, then append again.
+                self.batch.truncate(batch_before);
                 if let Err(e) = self.write_batch_and_clear().await {
+                    self.recover_after_write_failure().await;
                     Self::io_failed("audit write before rotation failed", e);
                 }
                 if let Err(e) = self.rotate().await {
                     Self::io_failed("audit rotation failed", e);
                     continue;
                 }
+                let rotated_before = self.batch.len();
+                if let Err(e) = serde_json::to_writer(&mut self.batch, &ev) {
+                    self.batch.truncate(rotated_before);
+                    tracing::error!(error = %e, "failed to serialize audit event");
+                    continue;
+                }
+                self.batch.push(b'\n');
+                let rotated_needed = self.batch.len() - rotated_before;
+                self.current_size += rotated_needed as u64;
+                continue;
             }
-            self.batch.extend_from_slice(&line);
-            self.batch.push(b'\n');
+
             self.current_size += needed as u64;
         }
 
         if let Err(e) = self.write_batch_and_clear().await {
+            self.recover_after_write_failure().await;
             Self::io_failed("audit batch write failed", e);
+        }
+    }
+
+    /// On a write failure the batch may be dropped by the caller, so restore
+    /// `current_size` to an on-disk value and clear staged bytes.
+    async fn recover_after_write_failure(&mut self) {
+        self.batch.clear();
+        if let Some(file) = self.file.as_ref() {
+            if let Ok(meta) = file.metadata().await {
+                self.current_size = meta.len();
+            } else {
+                tracing::warn!("audit: failed to read file size after write failure");
+            }
         }
     }
 
@@ -168,21 +298,19 @@ impl AuditWriter {
             .as_mut()
             .ok_or_else(|| std::io::Error::other("audit file handle not open"))?;
         file.write_all(&self.batch).await?;
+        // `tokio::fs::File::write_all` can return while the final chunk's blocking
+        // write is still in flight in the file's internal state machine. Flush to
+        // force that pending operation to complete, so the bytes are visible to
+        // other readers (e.g. log tailers, or `std::fs` reads in tests) even when
+        // `fsync_on_batch` is disabled.
+        file.flush().await?;
         if self.config.fsync_on_batch {
             file.sync_data().await?;
         }
-        #[cfg(test)]
-        file.sync_all().await?;
         self.batch.clear();
         Ok(())
     }
 
-    #[cfg(test)]
-    fn io_failed(context: &str, err: std::io::Error) {
-        panic!("{context}: {err}");
-    }
-
-    #[cfg(not(test))]
     fn io_failed(context: &str, err: std::io::Error) {
         tracing::error!(error = %err, "{context}");
     }
@@ -193,6 +321,11 @@ impl AuditWriter {
         #[cfg(unix)]
         opts.mode(0o600);
         let file = opts.open(path).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
         self.current_size = file.metadata().await?.len();
         self.file = Some(file);
         Ok(())
@@ -207,15 +340,15 @@ impl AuditWriter {
 
         if max > 1 {
             // Remove the oldest segment (.{max-1}) if present.
-            let oldest = path.with_extension(format!("jsonl.{}", max - 1));
+            let oldest = Self::rotated_path(&path, max - 1);
             if tokio::fs::try_exists(&oldest).await? {
                 tokio::fs::remove_file(&oldest).await?;
             }
 
             // Shift .n -> .n+1, from the oldest down to .1.
             for n in (1..max - 1).rev() {
-                let from = path.with_extension(format!("jsonl.{}", n));
-                let to = path.with_extension(format!("jsonl.{}", n + 1));
+                let from = Self::rotated_path(&path, n);
+                let to = Self::rotated_path(&path, n + 1);
                 if tokio::fs::try_exists(&from).await? {
                     tokio::fs::rename(&from, &to).await?;
                 }
@@ -243,7 +376,7 @@ impl AuditWriter {
         let mut opts = tokio::fs::OpenOptions::new();
         if max > 1 {
             // Preserve history: rename current -> .1, then open a fresh live file.
-            let rotated = path.with_extension("jsonl.1");
+            let rotated = Self::rotated_path(path, 1);
             tokio::fs::rename(path, &rotated).await?;
             opts.append(true).create(true);
         } else {
@@ -252,7 +385,13 @@ impl AuditWriter {
         }
         #[cfg(unix)]
         opts.mode(0o600);
-        self.file = Some(opts.open(path).await?);
+        let file = opts.open(path).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+        self.file = Some(file);
         self.current_size = 0;
         Ok(())
     }
@@ -274,7 +413,7 @@ impl AuditWriter {
             outcome: AuditOutcome::Failure,
             actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
             subject: AuditSubject {
-                kind: AuditSubjectKind::Config,
+                kind: AuditSubjectKind::System,
                 id: None,
                 election_id: None,
                 labels: BTreeMap::new(),
@@ -298,17 +437,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
-    /// Writer tests perform real async file I/O. When the full `service` crate
-    /// runs in parallel (as in CI), contention on Tokio's blocking pool can
-    /// cause rare empty reads after an otherwise successful shutdown.
-    static WRITER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     async fn run_writer_test<F, Fut>(f: F)
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let _guard = WRITER_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f().await;
     }
 
@@ -359,17 +492,22 @@ mod tests {
         let dropped = Arc::new(AtomicU64::new(0));
         let path = config.path.clone();
         let (tx, rx) = mpsc::channel(config.queue_capacity);
-        let writer = AuditWriter::open(config, dropped.clone(), write_delay).await.unwrap();
+        // Keep test shutdown signal unsent; tests stop the writer via
+        // `AuditCommand::Shutdown` on the mpsc channel to avoid races with
+        // producer commands.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let writer =
+            AuditWriter::open_with_write_delay(config, dropped.clone(), write_delay).await.unwrap();
 
         // Drive the writer on the same task set as the producer (via `join!`) so
         // shutdown/flush completes before assertions — no spawned-task scheduling
         // races under CI parallel test load.
         let dropped_out = dropped.clone();
         let path_out = path.clone();
-        tokio::join!(
-            async move { writer.run(rx).await },
-            async move { f(tx, path, dropped).await },
-        );
+        tokio::join!(async move { writer.run(rx, shutdown_rx).await }, async move {
+            f(tx, path, dropped).await
+        },);
+        drop(shutdown_tx);
 
         (dropped_out, path_out)
     }
