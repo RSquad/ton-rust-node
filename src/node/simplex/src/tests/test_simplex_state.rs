@@ -3491,6 +3491,62 @@ fn test_notarized_parent_chain_skipped_slot_is_skipped_by_next_nonskipped_on_not
     );
 }
 
+#[test]
+fn test_tn1401_restart_base_repair_crosses_already_skipped_slot() {
+    // Releasenet-style ordering:
+    // 1. restart/standstill already knows a skip certificate for first_non_finalized;
+    // 2. the slot's available_base is still unknown at that moment;
+    // 3. recovery later seeds the finalized boundary as the slot base.
+    //
+    // C++ pool.cpp source of truth:
+    // handle_typed_saved_certificate(SkipCertRef) forwards slot.available_base to
+    // next_nonskipped_slot_after(slot), and advance_present() CHECKs that the
+    // resulting present slot has a base before LeaderWindowObserved is published.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+
+    // Simulate recovery after slot0 was finalized. This prunes slot0; slot1 is
+    // now the first non-finalized/progress slot and has no base yet.
+    state.set_first_non_finalized_slot(SlotIndex::new(1));
+    state.first_non_progressed_slot = SlotIndex::new(1);
+    state.ensure_window_exists(WindowIndex::new(0), WindowAlloc::BoundedByHorizon);
+
+    let skip1 = Vote::Skip(SkipVote { slot: SlotIndex::new(1) });
+    state.on_vote_test(&desc, ValidatorIndex::new(0), skip1.clone(), vec![1]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(1), skip1.clone(), vec![2]).unwrap();
+    state.on_vote_test(&desc, ValidatorIndex::new(2), skip1, vec![3]).unwrap();
+    drain_events(&mut state);
+
+    assert_eq!(
+        state.first_non_progressed_slot,
+        SlotIndex::new(1),
+        "base-less skipped slot must not publish progress yet"
+    );
+    assert!(
+        !state.has_available_parent(&desc, SlotIndex::new(2)),
+        "slot2 parent is unknown before recovery seeds slot1 base"
+    );
+
+    let finalized_parent =
+        CandidateParentInfo { slot: SlotIndex::new(0), hash: UInt256::from([0xC1u8; 32]) };
+    state.set_available_base_after_restart(&desc, finalized_parent.clone());
+
+    assert_eq!(
+        state.get_slot_available_base(&desc, SlotIndex::new(2)),
+        Some(Some(finalized_parent)),
+        "restart base repair must cross already-skipped slot1 and publish slot2 base"
+    );
+    assert_eq!(
+        state.first_non_progressed_slot,
+        SlotIndex::new(2),
+        "progress cursor can advance only after slot2 has a base"
+    );
+    assert!(
+        state.has_available_parent(&desc, SlotIndex::new(2)),
+        "next leader must have a parent after skipped-slot base repair"
+    );
+}
+
 /*
     ========================================================================
     External Certificate Handling Tests

@@ -12,7 +12,6 @@ use crate::{fail, ExceptionCode, Result, Sha256, UInt256};
 use std::{
     alloc::Layout,
     cmp::{max, min},
-    collections::HashSet,
     fmt::{self, Display, Formatter},
     hash,
     io::{Read, Write},
@@ -3111,8 +3110,8 @@ impl UsageTree {
     pub fn build_visited_subtree(
         &self,
         is_include: &impl Fn(&UInt256) -> bool,
-    ) -> Result<HashSet<UInt256>> {
-        let mut subvisited = HashSet::new();
+    ) -> Result<ahash::AHashSet<UInt256>> {
+        let mut subvisited = ahash::AHashSet::default();
         for guard in self.visited.iter() {
             if is_include(guard.key()) {
                 self.visit_subtree(guard.val(), &mut subvisited)?
@@ -3121,7 +3120,7 @@ impl UsageTree {
         Ok(subvisited)
     }
 
-    fn visit_subtree(&self, cell: &Cell, subvisited: &mut HashSet<UInt256>) -> Result<()> {
+    fn visit_subtree(&self, cell: &Cell, subvisited: &mut ahash::AHashSet<UInt256>) -> Result<()> {
         if subvisited.insert(cell.repr_hash().clone()) {
             for i in 0..cell.references_count() {
                 let child_hash = cell.reference_repr_hash(i)?;
@@ -3133,8 +3132,8 @@ impl UsageTree {
         Ok(())
     }
 
-    pub fn build_visited_set(&self) -> HashSet<UInt256> {
-        let mut visited = HashSet::new();
+    pub fn build_visited_set(&self) -> ahash::AHashSet<UInt256> {
+        let mut visited = ahash::AHashSet::default();
         for guard in self.visited.iter() {
             visited.insert(guard.key().clone());
         }
@@ -3178,32 +3177,137 @@ impl UsageTree {
         cell.bit_length().div_ceil(8) + 2 + cell.references_count() * 3 + 3
     }
 
-    fn add_branch_internal(
-        cell: &Cell,
-        visited: &mut HashSet<UInt256>,
-        is_include: &impl Fn(&UInt256) -> bool,
-    ) -> Result<isize> {
-        let mut size = (Self::PRUNNED_SIZE * cell.references_count()) as isize;
-        for i in 0..cell.references_count() {
-            size +=
-                Self::add_branch_internal(&cell.reference_without_usage(i)?, visited, is_include)?;
+    /// Seeds a [`ProofStorageStat`] from the collation usage tree: each visited cell becomes
+    /// `Loaded`, its children `Pruned` (mirrors C++ `vm::ProofStorageStat`).
+    pub fn build_proof_stat(&self) -> Result<ProofStorageStat> {
+        let mut stat = ProofStorageStat::default();
+        for guard in self.visited.iter() {
+            stat.add_loaded_cell(guard.val())?;
         }
-        if !is_include(cell.repr_hash()) {
-            Ok(0)
-        } else {
-            if visited.insert(cell.repr_hash().clone()) {
-                size += Self::estimate_serialized_size(cell) as isize - Self::PRUNNED_SIZE as isize;
-            }
-            Ok(size)
-        }
+        Ok(stat)
+    }
+}
+
+/// Cell status in a Merkle proof; absence from the map is the third state (not in the proof).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CellStatus {
+    /// Pruned boundary: referenced by a loaded cell but not loaded itself.
+    Pruned,
+    Loaded,
+}
+
+/// Tracks which cells are full / pruned / absent in the Merkle proof
+#[derive(Default, Clone)]
+pub struct ProofStorageStat {
+    cells: ahash::AHashMap<UInt256, CellStatus>,
+}
+
+impl ProofStorageStat {
+    fn include_all(_: &UInt256) -> bool {
+        true
     }
 
-    pub fn add_branch_to_visited(
-        cell: &Cell,
-        visited: &mut HashSet<UInt256>,
-        is_include: &impl Fn(&UInt256) -> bool,
-    ) -> Result<usize> {
-        Ok(std::cmp::max(Self::add_branch_internal(cell, visited, is_include)?, 0) as usize)
+    /// Whether `hash` is fully present in the proof.
+    pub fn is_loaded(&self, hash: &UInt256) -> bool {
+        matches!(self.cells.get(hash), Some(CellStatus::Loaded))
+    }
+
+    /// Marks a bare hash loaded
+    pub fn set_loaded_hash(&mut self, hash: UInt256) {
+        self.cells.insert(hash, CellStatus::Loaded);
+    }
+
+    /// Marks `cell` loaded and its children pruned.
+    pub fn add_loaded_cell(&mut self, cell: &Cell) -> Result<()> {
+        if self.cells.insert(cell.repr_hash().clone(), CellStatus::Loaded)
+            == Some(CellStatus::Loaded)
+        {
+            return Ok(());
+        }
+        for i in 0..cell.references_count() {
+            self.cells.entry(cell.reference_repr_hash(i)?).or_insert(CellStatus::Pruned);
+        }
+        Ok(())
+    }
+
+    /// Commits `roots`' `is_include_subtree` cells and their descendants as `Loaded` and returns `true`
+    /// if that grows the proof by at most `dict_proof_size`; otherwise leaves the stat untouched and returns `false`.
+    pub fn try_load_branches(
+        &mut self,
+        roots: &[Cell],
+        is_include_subtree: &impl Fn(&UInt256) -> bool,
+        dict_proof_size: usize,
+    ) -> Result<bool> {
+        let mut visited = ahash::AHashSet::default();
+        let mut to_load = Vec::new();
+        let limit = dict_proof_size.min(isize::MAX as usize) as isize;
+        let mut size = 0;
+        for root in roots {
+            size += self.size_diff_traverse(
+                root.clone(),
+                &mut visited,
+                &mut to_load,
+                limit,
+                is_include_subtree,
+            )?;
+            if size > limit {
+                return Ok(false);
+            }
+        }
+        // No child-pruning on commit: an included cell's children are all included too, so they
+        // are in `to_load` as well (`add_loaded_cell`'s pruning is only for seeding).
+        self.cells.extend(to_load.into_iter().map(|hash| (hash, CellStatus::Loaded)));
+
+        Ok(true)
+    }
+
+    /// Size the proof would grow by including this subtree's `is_include` cells as full, queueing
+    /// them into `to_load`. Once it exceeds `limit` the walk bails and the result is only `> limit`:
+    /// the size doubles as the early-exit marker (its exact value is then irrelevant).
+    fn size_diff_traverse(
+        &self,
+        cell: Cell,
+        visited: &mut ahash::AHashSet<UInt256>,
+        to_load: &mut Vec<UInt256>,
+        limit: isize,
+        is_include_subtree: &impl Fn(&UInt256) -> bool,
+    ) -> Result<isize> {
+        let hash = cell.repr_hash();
+        if !visited.insert(hash.clone()) {
+            return Ok(0);
+        }
+        let is_include = is_include_subtree(hash);
+        let mut size = 0;
+        for i in 0..cell.references_count() {
+            let child = cell.reference_without_usage(i)?;
+            size += if is_include {
+                self.size_diff_traverse(child, visited, to_load, limit, &Self::include_all)?
+            } else {
+                self.size_diff_traverse(child, visited, to_load, limit, is_include_subtree)?
+            };
+            if size > limit {
+                return Ok(size);
+            }
+        }
+        if is_include {
+            // Cost by frozen status: absent → +full, pruned boundary → +full − PRUNNED (replaces
+            // the placeholder), loaded → 0.
+            size += match self.cells.get(hash) {
+                Some(CellStatus::Loaded) => 0,
+                Some(CellStatus::Pruned) => {
+                    let cost = UsageTree::estimate_serialized_size(&cell) as isize
+                        - UsageTree::PRUNNED_SIZE as isize;
+                    to_load.push(hash.clone());
+                    cost
+                }
+                None => {
+                    let cost = UsageTree::estimate_serialized_size(&cell) as isize;
+                    to_load.push(hash.clone());
+                    cost
+                }
+            };
+        }
+        Ok(size)
     }
 }
 

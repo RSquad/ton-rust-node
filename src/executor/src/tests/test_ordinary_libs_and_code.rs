@@ -421,7 +421,7 @@ fn storage_fee_instruction(
     if let TrComputePhase::Vm(vm) = descr.compute_phase_ref().unwrap() {
         assert_eq!(vm.exit_code, 62, "{:#?}", descr);
     } else {
-        panic!("wrong transaction desciption")
+        panic!("wrong transaction description")
     }
 
     let storage_ph = get_tr_descr(&trans).storage_ph.unwrap();

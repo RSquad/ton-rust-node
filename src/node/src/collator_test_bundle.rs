@@ -1718,7 +1718,7 @@ impl EngineOperations for CollatorTestBundle {
         before_split_block: &BlockIdExt,
         queue0: OutMsgQueue,
         queue1: OutMsgQueue,
-        visited_cells: HashSet<UInt256>,
+        visited_cells: ahash::AHashSet<UInt256>,
     ) {
         self.split_queues_cache
             .insert(before_split_block.clone(), Some((queue0, queue1, visited_cells)));
@@ -1760,6 +1760,18 @@ impl EngineOperations for CollatorTestBundle {
     }
 }
 
+/// Detect whether the simplex consensus protocol is enabled, the same way the node does
+/// (`validator_manager::select_consensus_options`): ConfigParam 30 — `get_mc_simplex_config`
+/// for the masterchain, `get_shard_simplex_config` otherwise. Present → simplex, absent → catchain.
+fn detect_simplex(mc_state: &ShardStateStuff, shard: &ShardIdent) -> Result<bool> {
+    let config = mc_state.config_params()?;
+    Ok(if shard.is_masterchain() {
+        config.get_mc_simplex_config()?.is_some()
+    } else {
+        config.get_shard_simplex_config()?.is_some()
+    })
+}
+
 pub async fn try_collate(
     engine: Arc<dyn EngineOperations>,
     mc_state_id: &BlockIdExt,
@@ -1794,7 +1806,10 @@ pub async fn try_collate(
 
     log::info!("TRY COLLATE block {}", shard);
 
-    let is_simplex = state_resolver_cache.is_some();
+    // A caller-provided state resolver cache forces the simplex pipeline (used by tests that
+    // collate against a synthetic engine without an on-chain consensus config); otherwise fall
+    // back to detecting simplex from ConfigParam 30, like the node does.
+    let is_simplex = state_resolver_cache.is_some() || detect_simplex(&mc_state, &shard)?;
     let state_resolver_cache = state_resolver_cache
         .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(StateResolverCache::new())));
 
@@ -1888,6 +1903,7 @@ pub async fn try_validate(
     )?;
     let validator_set = ValidatorSet::with_cc_seqno(0, 0, 0, cc_seqno_with_delta, nodes)?;
 
+    let is_simplex = detect_simplex(&mc_state, &shard)?;
     let validator_query = ValidateQuery::new(
         shard,
         min_mc_seqno,
@@ -1898,7 +1914,7 @@ pub async fn try_validate(
         engine,
         true,
         false,
-        false,
+        is_simplex,
     );
     validator_query.try_validate().await
 }

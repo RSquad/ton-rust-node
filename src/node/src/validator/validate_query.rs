@@ -5549,7 +5549,11 @@ impl ValidateQuery {
         let mut error = None;
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
-                *storage_dict = account.calc_storage_stat_dict(dict_hash_min_cells)?;
+                // For an account whose storage roots are unchanged we can just update `used` info
+                // without dictionary reconstruction
+                if account.precalc_storage_stat()?.map(|stat| stat.is_changed()).unwrap_or(false) {
+                    *storage_dict = account.calc_storage_stat_dict(dict_hash_min_cells)?;
+                }
                 #[cfg(test)]
                 if block_version < 12 {
                     account.del_storage_stat();
@@ -5727,7 +5731,10 @@ impl ValidateQuery {
                 error!("at least one Transaction of account {account_addr:x} is invalid : {err}",)
             })?;
         if let Some(dict) = storage_dict {
-            if new_account.dict_hash().is_some() {
+            if new_account.dict_hash().is_some()
+                && !base.shard().is_masterchain()
+                && !base.full_collated_data
+            {
                 let size = new_account.storage_info_cells();
                 log::trace!(
                     target: "validate_query",
@@ -5973,9 +5980,7 @@ impl ValidateQuery {
             )
         }
         let (src, dst) = match (&header.src_ref(), &header.dst) {
-            (Some(MsgAddressInt::AddrStd(src)), MsgAddressInt::AddrStd(dst)) => {
-                (src, dst)
-            }
+            (Some(MsgAddressInt::AddrStd(src)), MsgAddressInt::AddrStd(dst)) => (src, dst),
             _ => reject_query!(
                 "cannot unpack source and destination addresses of special message with hash {msg_hash:x}",
             ),

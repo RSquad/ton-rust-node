@@ -39,6 +39,7 @@ use ton_block::{fail, ExceptionCode, Mask, Status};
 const CALLX: u8 = 0x40; // CALLX to found value
 const SWITCH: u8 = 0x80; // SWITCH to found value
 const PREPARE: u8 = 0xC0; // pass found value to stack
+const TVM_VERSION_14: u32 = 14;
 
 // Utilities ******************************************************************
 
@@ -205,6 +206,16 @@ fn save(engine: &mut Engine, index: usize) -> Status {
     } else {
         Ok(())
     }
+}
+
+fn is_filled_savelist_slot_for_v14(
+    block_version: u32,
+    cont: &ContinuationData,
+    creg: usize,
+) -> bool {
+    block_version >= TVM_VERSION_14
+        && SaveList::REGS.contains(&creg)
+        && cont.savelist.get(creg).is_some()
 }
 
 // (x1 ... xR y {R N} - continuation), y->continuation, continuation.stack.push(x1 ... xR)
@@ -1027,6 +1038,11 @@ pub(super) fn execute_setaltctr(engine: &mut Engine) -> Status {
     )?;
     fetch_stack(engine, 1)?;
     let creg = engine.cmd.creg();
+    if let Some(c1) = engine.ctrls.get(1).and_then(|c1| c1.as_continuation().ok()) {
+        if is_filled_savelist_slot_for_v14(engine.block_version(), c1, creg) {
+            return Ok(());
+        }
+    }
     swap(engine, var!(0), savelist!(ctrl!(1), creg))
 }
 
@@ -1056,8 +1072,15 @@ pub(super) fn execute_setcontctr(engine: &mut Engine) -> Status {
         Instruction::new("SETCONTCTR").set_opts(InstructionOptions::ControlRegister),
     )?;
     fetch_stack(engine, 2)?;
-    engine.cmd.var(0).as_continuation()?;
     let creg = engine.cmd.creg();
+    let skip = {
+        let cont = engine.cmd.var(0).as_continuation()?;
+        is_filled_savelist_slot_for_v14(engine.block_version(), cont, creg)
+    };
+    if skip {
+        engine.cc.stack.push(engine.cmd.vars.remove(0));
+        return Ok(());
+    }
     swap(engine, var!(1), savelist!(var!(0), creg))?;
     engine.cc.stack.push(engine.cmd.vars.remove(0));
     Ok(())
@@ -1071,7 +1094,14 @@ pub(super) fn execute_setcontctrx(engine: &mut Engine) -> Status {
     if !SaveList::REGS.contains(&(creg as usize)) {
         fail!(ExceptionCode::RangeCheckError)
     }
-    engine.cmd.var(1).as_continuation()?;
+    let skip = {
+        let cont = engine.cmd.var(1).as_continuation()?;
+        is_filled_savelist_slot_for_v14(engine.block_version(), cont, creg as usize)
+    };
+    if skip {
+        engine.cc.stack.push(engine.cmd.vars.remove(1));
+        return Ok(());
+    }
     swap(engine, var!(2), savelist!(var!(1), creg))?;
     engine.cc.stack.push(engine.cmd.vars.remove(1));
     Ok(())
@@ -1086,7 +1116,9 @@ fn setcontctrmany_helper(engine: &mut Engine, x: usize) -> Status {
         let mask = 1 << i;
         if x & mask != 0 {
             if let Some(var) = engine.ctrls.get(i).cloned() {
-                cont.put_to_savelist(i, var)?;
+                if !is_filled_savelist_slot_for_v14(engine.block_version(), &cont, i) {
+                    cont.put_to_savelist(i, var)?;
+                }
             }
         }
     }
@@ -1132,6 +1164,11 @@ pub(super) fn execute_setretctr(engine: &mut Engine) -> Status {
     )?;
     fetch_stack(engine, 1)?;
     let creg = engine.cmd.creg();
+    if let Some(c0) = engine.ctrls.get(0).and_then(|c0| c0.as_continuation().ok()) {
+        if is_filled_savelist_slot_for_v14(engine.block_version(), c0, creg) {
+            return Ok(());
+        }
+    }
     swap(engine, var!(0), savelist!(ctrl!(0), creg))
 }
 
