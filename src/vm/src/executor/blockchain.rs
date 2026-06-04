@@ -136,20 +136,27 @@ pub(super) fn execute_send_msg(engine: &mut Engine) -> Status {
         SizeLimitsConfig::default()
     };
 
+    let mut legacy_fwd_fee_lower_bound = None;
     if let Some(hdr) = msg.int_header_mut() {
         if x & SENDMSG_ALL_BALANCE != 0 {
             hdr.value.coins = engine.smci_extra_param(7, 0)?.as_coins()?.try_into()?
         } else if x & SENDMSG_REMAINING_MSG_BALANCE != 0 {
             hdr.value.coins += engine.smci_extra_param(11, 0)?.as_coins()?
         }
-        let fwd_full_fees = prices.lump_price.into();
-        let fwd_mine_fees = prices.mine_fee_checked(&fwd_full_fees)?;
-        hdr.fwd_fee = hdr.fwd_fee.max(fwd_full_fees - fwd_mine_fees);
+        if engine.block_version() < 14 {
+            legacy_fwd_fee_lower_bound = Some(hdr.fwd_fee.clone());
+            let fwd_full_fees = prices.lump_price.into();
+            let fwd_mine_fees = prices.mine_fee_checked(&fwd_full_fees)?;
+            hdr.fwd_fee = hdr.fwd_fee.max(fwd_full_fees - fwd_mine_fees);
+        }
     }
     // TODO: need to remove extra load when cpp is fixed
     engine.load_cell(cell.clone())?;
     let msg_storage = calc_storage_used_short(engine, &msg, &limits)?;
-    let fee = prices.calc_fwd_fee(msg_storage.bits(), msg_storage.cells());
+    let mut fee = prices.calc_fwd_fee(msg_storage.bits(), msg_storage.cells());
+    if let Some(fwd_fee) = legacy_fwd_fee_lower_bound {
+        fee = fee.max(fwd_fee.as_u128());
+    }
     engine.cc.stack.push(StackItem::int(fee));
     if send {
         let suffix = BuilderData::with_raw(vec![x], 8)?;

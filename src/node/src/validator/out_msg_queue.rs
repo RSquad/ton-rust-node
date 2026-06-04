@@ -20,7 +20,7 @@ use std::{
     cmp::{max, min},
     collections::{
         btree_map::{self, BTreeMap},
-        HashMap, HashSet,
+        HashMap,
     },
     fmt::{Debug, Display, Formatter},
     iter::Iterator,
@@ -437,7 +437,7 @@ impl OutMsgQueueInfoStuff {
         subshard: ShardIdent,
         engine: &Arc<dyn EngineOperations>,
         usage_tree: Option<&UsageTree>,
-        imported_visited: Option<&mut HashSet<UInt256>>,
+        imported_visited: Option<&mut ahash::AHashSet<UInt256>>,
     ) -> Result<Self> {
         let shard = self.block_id().shard().clone();
         let (s0, _s1) = shard.split()?;
@@ -843,7 +843,7 @@ impl MsgQueueManager {
         after_split: bool,
         stop_flag: Option<&tokio_util::sync::CancellationToken>,
         usage_tree: Option<&UsageTree>,
-        imported_visited: Option<&mut HashSet<UInt256>>,
+        imported_visited: Option<&mut ahash::AHashSet<UInt256>>,
         block_descr: Option<Arc<String>>,
         mut states_manager: StatesManager,
     ) -> Result<Self> {

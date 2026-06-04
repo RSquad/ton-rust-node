@@ -1039,7 +1039,7 @@ async fn check_bundle(bundle: &str, collated_roots: usize) {
 async fn test_collated_data2() {
     init_test_log();
     check_bundle("src/tests/static/test_collated_data", 10).await;
-    check_bundle("src/tests/static/0.8000000000000000_56703839_5b25cdef_collator_test_bundle", 11)
+    check_bundle("src/tests/static/0.8000000000000000_56703839_5b25cdef_collator_test_bundle", 10)
         .await;
     check_bundle("src/tests/static/0.8000000000000000_57120589_921aa09f_collator_test_bundle", 4)
         .await;
@@ -1066,4 +1066,13 @@ async fn test_collated_data_xp25() {
         .unwrap(),
     );
     try_validate_by_bundle(bundle).await.unwrap();
+}
+
+#[cfg(not(feature = "xp25"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_collated_data_validate_unchanged_account() {
+    init_test_log();
+    let path = "src/tests/static/0.8000000000000000_66163599_2bc2034d_collator_test_bundle";
+    let bundle = CollatorTestBundle::load(path).unwrap();
+    try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
 }

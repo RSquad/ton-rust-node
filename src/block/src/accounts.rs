@@ -19,8 +19,8 @@ use crate::{
     shard_accounts::DepthBalanceInfo,
     types::{AddSub, ChildCell, Coins, CurrencyCollection, Number5, VarUInteger7},
     AccountId, AccountStorageStat, BuilderData, Cell, ConfigParams, Deserializable, GasConsumer,
-    GetRepresentationHash, HashmapType, IBitstring, Serializable, SliceData, UInt256, UsageTree,
-    DICT_HASH_MIN_CELLS,
+    GetRepresentationHash, HashmapType, IBitstring, Serializable, SliceData, StorageRoots, UInt256,
+    UsageTree, DICT_HASH_MIN_CELLS,
 };
 use std::{collections::HashSet, fmt};
 
@@ -540,12 +540,19 @@ impl fmt::Display for AccountState {
     }
 }
 
+///////////////////////////////////////////////////////////////////////////////
+/// 4.1.6. Account description.
+///
+/// account_none$0 = Account;
+/// account$1 addr:MsgAddressInt storage_info:StorageInfo
+/// storage:AccountStorage = Account;
 #[derive(Clone, Default)]
 struct AccountStuff {
     addr: MsgAddressInt,
     storage_info: StorageInfo,
     storage: AccountStorage,
 
+    // not serialized, storage stat calculation cache and dict builder
     storage_stat: AccountStorageStat,
 }
 
@@ -625,6 +632,11 @@ impl AccountStuff {
             AccountStorageStat::try_from_dict(dict, &self.storage, &self.storage_info.used)?;
         Ok(())
     }
+
+    fn precalc_storage_stat(&mut self) -> Result<&AccountStorageStat> {
+        self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
+        Ok(&self.storage_stat)
+    }
 }
 
 impl Serializable for AccountStuff {
@@ -673,12 +685,11 @@ impl Account {
         state_init: StateInit,
         dict_hash_min_cells: u32,
     ) -> Result<Self> {
-        let mut account = Account::with_stuff(AccountStuff {
-            addr,
-            storage_info: StorageInfo::with_values(last_paid, None),
-            storage: AccountStorage::active(last_trans_lt, balance, state_init),
-            storage_stat: AccountStorageStat::new(),
-        });
+        let storage_info = StorageInfo::with_values(last_paid, None);
+        let storage = AccountStorage::active(last_trans_lt, balance, state_init);
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        let mut account =
+            Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat });
         account.calc_storage_stat_dict(dict_hash_min_cells)?;
         Ok(account)
     }
@@ -705,11 +716,14 @@ impl Account {
     /// create unintialized account, only with address and balance
     ///
     pub fn with_address_and_ballance(addr: &MsgAddressInt, balance: &CurrencyCollection) -> Self {
+        let storage_info = StorageInfo::default();
+        let storage = AccountStorage::with_balance(balance.clone());
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         Account::with_stuff(AccountStuff {
             addr: addr.clone(),
-            storage_info: StorageInfo::default(),
-            storage: AccountStorage::with_balance(balance.clone()),
-            storage_stat: AccountStorageStat::new(),
+            storage_info,
+            storage,
+            storage_stat,
         })
     }
 
@@ -717,12 +731,10 @@ impl Account {
     /// Create unintialize account with zero balance
     ///
     pub fn with_address(addr: MsgAddressInt) -> Self {
-        Account::with_stuff(AccountStuff {
-            addr,
-            storage_info: StorageInfo::new(),
-            storage: AccountStorage::new(),
-            storage_stat: AccountStorageStat::new(),
-        })
+        let storage_info = StorageInfo::new();
+        let storage = AccountStorage::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat })
     }
 
     ///
@@ -740,11 +752,13 @@ impl Account {
         } else if hdr.bounce {
             return None;
         }
+        let storage_info = StorageInfo::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let account = Account::with_stuff(AccountStuff {
             addr: hdr.dst.clone(),
-            storage_info: StorageInfo::new(),
+            storage_info,
             storage,
-            storage_stat: AccountStorageStat::new(),
+            storage_stat,
         });
         Some(account)
     }
@@ -786,7 +800,7 @@ impl Account {
             last_paid,
             due_payment,
         };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Account::with_stuff(stuff)
     }
@@ -824,7 +838,7 @@ impl Account {
             last_paid,
             due_payment: None,
         };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Account::with_stuff(stuff)
     }
@@ -849,11 +863,12 @@ impl Account {
         storage_info: &StorageInfo,
         storage: &AccountStorage,
     ) -> Self {
+        let storage_stat = AccountStorageStat::new(storage, &storage_info.used);
         Account::with_stuff(AccountStuff {
             addr: addr.clone(),
             storage_info: storage_info.clone(),
             storage: storage.clone(),
-            storage_stat: AccountStorageStat::new(),
+            storage_stat,
         })
     }
 
@@ -926,12 +941,10 @@ impl Account {
     }
 
     pub fn precalc_storage_stat(&mut self) -> Result<Option<&AccountStorageStat>> {
-        self.stuff_mut()
-            .map(|stuff| {
-                stuff.storage_stat.calc_stat(&stuff.storage)?;
-                Ok(&stuff.storage_stat)
-            })
-            .transpose()
+        match self.stuff_mut() {
+            Some(stuff) => stuff.precalc_storage_stat().map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn del_storage_stat(&mut self) {
@@ -970,6 +983,11 @@ impl Account {
             Some(AccountState::AccountActive { state_init }) => Some(state_init),
             _ => None,
         }
+    }
+
+    /// Storage roots (code/data/library) counted by the storage stat.
+    pub fn storage_roots(&self) -> StorageRoots {
+        AccountStorageStat::get_roots(self.state_init())
     }
 
     pub fn state_init_mut(&mut self) -> Option<&mut StateInit> {
@@ -1212,23 +1230,23 @@ impl Account {
 
     fn read_original_format(slice: &mut SliceData) -> Result<Self> {
         let addr = Deserializable::construct_from(slice)?;
-        let storage_info = Deserializable::construct_from(slice)?;
+        let storage_info: StorageInfo = Deserializable::construct_from(slice)?;
         let last_trans_lt = Deserializable::construct_from(slice)?; //last_trans_lt:uint64
         let balance = Deserializable::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         Ok(Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat }))
     }
 
     fn read_version(slice: &mut SliceData, _version: u32) -> Result<Self> {
         let addr = Deserializable::construct_from(slice)?;
-        let storage_info = Deserializable::construct_from(slice)?;
+        let storage_info: StorageInfo = Deserializable::construct_from(slice)?;
         let last_trans_lt = Deserializable::construct_from(slice)?; //last_trans_lt:uint64
         let balance = CurrencyCollection::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new();
+        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Ok(Account::with_stuff(stuff))
     }

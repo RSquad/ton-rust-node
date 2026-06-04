@@ -276,7 +276,7 @@ async fn test_sync() -> Result<()> {
             let client = self.get_client(&id.shard_id).await?;
             let mut attempts = 1;
             loop {
-                match client.download_block_full(id).await {
+                match client.download_block_full(id, false).await {
                     Ok(ret) => break Ok(ret),
                     Err(e) => println!("Error downloading block {}: {}", id, e),
                 }

@@ -2211,3 +2211,162 @@ fn test_arena_concurrent_contains() {
         h.join().unwrap();
     }
 }
+
+// Cell-status proof-size model (mirrors C++ vm::ProofStorageStat).
+//
+// `ProofStorageStat` tracks each cell's status in the previous-state Merkle proof:
+//
+//   absent  - not in the proof at all (no loaded ancestor references it)
+//   pruned  - a pruned-branch placeholder: a *loaded* cell references it, but it is not loaded
+//             itself (it costs PRUNNED_SIZE = 41 bytes in the proof)
+//   loaded  - the full cell is in the proof
+//
+// `add_loaded_cell(c)` marks `c` loaded and each of its children pruned (seeds the boundary).
+// The size delta of *including* (loading) a cell is then a read-only, order-independent lookup of
+// its frozen status:
+//
+//   absent -> +full           (add the whole cell)
+//   pruned -> +full - PRUNNED  (replace the 41-byte placeholder with the full cell)
+//   loaded -> 0               (already present)
+//
+// where full = estimate_serialized_size(cell). `try_load_branch(roots, is_include, budget)` sums
+// that delta over the `is_include` cells reachable from `roots`; if it fits the budget it commits
+// them (loads, returns true), otherwise it leaves the stat untouched and bails to a dict proof
+// (returns false). Each case below pins an exact delta by bracketing the budget: `diff - 1` bails,
+// `diff` loads. Cells are drawn as trees; `(status)` is the status at walk time.
+#[test]
+fn test_proof_storage_stat() {
+    // > PRUNNED_SIZE bytes per cell so deltas are positive and distinguishable.
+    fn big(tag: u32, child: Option<Cell>) -> Cell {
+        let mut b = BuilderData::new();
+        for _ in 0..20 {
+            b.append_u32(tag).unwrap();
+        }
+        if let Some(c) = child {
+            b.checked_append_reference(c).unwrap();
+        }
+        b.into_cell().unwrap()
+    }
+    let full = |c: &Cell| UsageTree::estimate_serialized_size(c) as isize;
+    let pr = UsageTree::PRUNNED_SIZE as isize;
+    let all = |_: &UInt256| true;
+
+    // try_load_branch commits a branch iff the budget covers its exact size delta: budget = diff
+    // loads (returns true), budget = diff-1 bails to a dict proof (false). Bracketing both ways
+    // pins the exact delta; `seed` rebuilds a fresh stat because the loading path mutates.
+    fn assert_exact_diff(
+        mut seed: impl FnMut() -> ProofStorageStat,
+        roots: &[Cell],
+        is_include: &impl Fn(&UInt256) -> bool,
+        exact: isize,
+    ) {
+        let budget = exact as usize;
+        assert!(
+            !seed().try_load_branches(roots, is_include, budget - 1).unwrap(),
+            "over budget → dict proof",
+        );
+        assert!(
+            seed().try_load_branches(roots, is_include, budget).unwrap(),
+            "exact budget → loads cells",
+        );
+    }
+
+    // Case 1 - a loaded cell's child is a pruned boundary, its grandchild is absent:
+    //
+    //     storage  (loaded)   <- add_loaded_cell(storage)
+    //        |
+    //        v
+    //        D      (pruned)   <- child of a loaded cell, not loaded itself
+    //        |
+    //        v
+    //        L      (absent)   <- D was never loaded, so its child was never seeded
+    //
+    // Walk [D] including everything: D -> +full(D) - PRUNNED, L -> +full(L).
+    // This also exercises the commit side: a rejected branch leaves the stat untouched, an
+    // accepted one marks the cells loaded, and re-walking an already-loaded branch then costs 0.
+    let l = big(0xAAAA, None);
+    let d = big(0xBBBB, Some(l.clone()));
+    let storage = big(0x5707, Some(d.clone()));
+    let exact_dl = (full(&d) + full(&l) - pr) as usize;
+    let mut rejected = ProofStorageStat::default();
+    rejected.add_loaded_cell(&storage).unwrap();
+    assert!(
+        !rejected.try_load_branches(&[d.clone()], &all, exact_dl - 1).unwrap(),
+        "over budget → dict"
+    );
+    assert!(
+        !rejected.is_loaded(d.repr_hash()) && !rejected.is_loaded(l.repr_hash()),
+        "rejected branch leaves stat untouched",
+    );
+    let mut loaded = ProofStorageStat::default();
+    loaded.add_loaded_cell(&storage).unwrap();
+    assert!(
+        loaded.try_load_branches(&[d.clone()], &all, exact_dl).unwrap(),
+        "exact budget → loads"
+    );
+    assert!(
+        loaded.is_loaded(d.repr_hash()) && loaded.is_loaded(l.repr_hash()),
+        "committed branch is loaded",
+    );
+    assert!(
+        loaded.try_load_branches(&[d.clone()], &all, 0).unwrap(),
+        "re-walk of a loaded branch → delta 0"
+    );
+
+    // Case 2 - a cell shared by two parents; one parent is loaded but off the walk path, the
+    // other is the walked root:
+    //
+    //     P1 (loaded) --> C <-- P2 (walk root)
+    //
+    // C is shared; P1's add_loaded_cell seeded C as pruned. We walk [P2] including only C (P2
+    // itself is not included). C -> +full(C) - PRUNNED: the boundary discount applies even though
+    // C is reached via P2, because its status was frozen by the off-path P1.
+    // (The old add_branch_to_usage missed this when the loaded parent was off the walk path.)
+    let c = big(0xCCCC, None);
+    let p1 = big(0x1111, Some(c.clone()));
+    let p2 = big(0x2222, Some(c.clone()));
+    let c_hash = c.repr_hash().clone();
+    let only_c = |h: &UInt256| h == &c_hash;
+    assert_exact_diff(
+        || {
+            let mut s = ProofStorageStat::default();
+            s.add_loaded_cell(&p1).unwrap();
+            s
+        },
+        &[p2.clone()],
+        &only_c,
+        full(&c) - pr,
+    );
+
+    // Case 3 - a brand-new (not-in-dict) parent over two cells, nothing loaded:
+    //
+    //     new_data  (walk root)
+    //        |
+    //        v
+    //        G       (absent)
+    //        |
+    //        v
+    //        M       (absent)
+    //
+    // G and M are old dict cells, but reached here under a new parent that no loaded cell
+    // references. Walk [new_data] including {G, M}: G -> +full(G), M -> +full(M) - both absent, so
+    // no boundary discount.
+    let m = big(0xDDDD, None);
+    let g = big(0xEEEE, Some(m.clone()));
+    let new_data = big(0xFFFF, Some(g.clone()));
+    let g_hash = g.repr_hash().clone();
+    let m_hash = m.repr_hash().clone();
+    let g_or_m = |h: &UInt256| h == &g_hash || h == &m_hash;
+    assert_exact_diff(ProofStorageStat::default, &[new_data.clone()], &g_or_m, full(&g) + full(&m));
+
+    // add_loaded_cell is order-independent: storage-then-D and D-then-storage agree.
+    let mut a = ProofStorageStat::default();
+    a.add_loaded_cell(&storage).unwrap();
+    a.add_loaded_cell(&d).unwrap();
+    let mut b = ProofStorageStat::default();
+    b.add_loaded_cell(&d).unwrap();
+    b.add_loaded_cell(&storage).unwrap();
+    for h in [storage.repr_hash(), d.repr_hash(), l.repr_hash()] {
+        assert_eq!(a.is_loaded(h), b.is_loaded(h), "order-independent load");
+    }
+}

@@ -631,9 +631,14 @@ impl Stack {
         self.push(StackItem::continuation(item));
         self
     }
-    /// pushes an ineger as new var to stack
+    /// pushes an integer as new var to stack
     pub fn push_int(&mut self, item: impl Into<IntegerData>) -> &mut Stack {
         self.push(StackItem::int(item));
+        self
+    }
+    /// pushes an integer NaN as new var to stack
+    pub fn push_nan(&mut self) -> &mut Stack {
+        self.push(StackItem::int(IntegerData::nan()));
         self
     }
     /// pushes a none

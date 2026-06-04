@@ -990,7 +990,7 @@ pub trait EngineOperations: Sync + Send {
         before_split_block: &BlockIdExt,
         queue0: OutMsgQueue,
         queue1: OutMsgQueue,
-        visited_cells: HashSet<UInt256>,
+        visited_cells: ahash::AHashSet<UInt256>,
     ) {
         unimplemented!();
     }

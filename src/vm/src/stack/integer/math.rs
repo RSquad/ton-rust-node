@@ -10,10 +10,7 @@
  */
 use crate::stack::integer::{
     behavior::OperationBehavior,
-    utils::{
-        binary_op, construct_double_nan, construct_single_nan, process_double_result,
-        process_single_result, unary_op,
-    },
+    utils::{binary_op, process_double_result, process_single_result, unary_op},
     IntegerData,
 };
 use num_traits::Zero;
@@ -29,15 +26,15 @@ pub enum Round {
     Nearest = 2,                 // | r |   =<   | y/2 |
 }
 
+#[inline]
+fn construct_double_nan() -> (IntegerData, IntegerData) {
+    (IntegerData::nan(), IntegerData::nan())
+}
+
 impl IntegerData {
     /// Creates and returns a copy of the same value with a sign changed to an opposite.
     pub fn neg<T: OperationBehavior>(&self) -> Result<IntegerData> {
-        unary_op::<T, _, _, _, _, _>(
-            self,
-            |x| -x,
-            construct_single_nan,
-            process_single_result::<T, _>,
-        )
+        unary_op::<T, _, _, _, _, _>(self, |x| -x, IntegerData::nan, process_single_result::<T, _>)
     }
 
     pub fn add<T: OperationBehavior>(&self, other: &IntegerData) -> Result<IntegerData> {
@@ -45,7 +42,7 @@ impl IntegerData {
             self,
             other,
             |x, y| x + y,
-            construct_single_nan,
+            IntegerData::nan,
             process_single_result::<T, _>,
         )
     }
@@ -54,7 +51,7 @@ impl IntegerData {
         let lhs = match &mut self.value {
             None => {
                 on_nan_parameter!(T)?;
-                *self = construct_single_nan();
+                *self = IntegerData::nan();
                 return Ok(());
             }
             Some(v) => v,
@@ -62,7 +59,7 @@ impl IntegerData {
         let rhs = match &other.value {
             None => {
                 on_nan_parameter!(T)?;
-                *self = construct_single_nan();
+                *self = IntegerData::nan();
                 return Ok(());
             }
             Some(v) => v,
@@ -70,7 +67,7 @@ impl IntegerData {
         lhs.add_assign(rhs);
         if !super::utils::check_overflow(lhs) {
             on_integer_overflow!(T)?;
-            *self = construct_single_nan();
+            *self = IntegerData::nan();
         }
         Ok(())
     }
@@ -79,7 +76,7 @@ impl IntegerData {
         unary_op::<T, _, _, _, _, _>(
             self,
             |x| x + other,
-            construct_single_nan,
+            IntegerData::nan,
             process_single_result::<T, _>,
         )
     }
@@ -89,7 +86,7 @@ impl IntegerData {
             self,
             other,
             |x, y| x - y,
-            construct_single_nan,
+            IntegerData::nan,
             process_single_result::<T, _>,
         )
     }
@@ -98,7 +95,7 @@ impl IntegerData {
         unary_op::<T, _, _, _, _, _>(
             self,
             |x| x - other,
-            construct_single_nan,
+            IntegerData::nan,
             process_single_result::<T, _>,
         )
     }
@@ -108,7 +105,7 @@ impl IntegerData {
             self,
             other,
             |x, y| x * y,
-            construct_single_nan,
+            IntegerData::nan,
             process_single_result::<T, _>,
         )
     }
@@ -118,7 +115,7 @@ impl IntegerData {
             self,
             other,
             |x, y| (x * y) >> 256,
-            construct_single_nan,
+            IntegerData::nan,
             process_single_result::<T, _>,
         )
     }
@@ -127,7 +124,7 @@ impl IntegerData {
         unary_op::<T, _, _, _, _, _>(
             self,
             |x| x * other,
-            construct_single_nan,
+            IntegerData::nan,
             process_single_result::<T, _>,
         )
     }
@@ -142,13 +139,10 @@ impl IntegerData {
             on_integer_overflow!(T)?;
             return Ok(construct_double_nan());
         }
+        let dividend = self;
+        let dividend = extract_value!(T, dividend, construct_double_nan);
 
-        unary_op::<T, _, _, _, _, _>(
-            self,
-            |dividend| utils::divmod(dividend, divisor, rounding),
-            construct_double_nan,
-            process_double_result::<T, _>,
-        )
+        process_double_result::<T>(utils::divmod(dividend, divisor, rounding))
     }
 
     pub fn div_by_shift<T: OperationBehavior>(
@@ -156,12 +150,9 @@ impl IntegerData {
         shift: usize,
         rounding: Round,
     ) -> Result<(IntegerData, IntegerData)> {
-        unary_op::<T, _, _, _, _, _>(
-            self,
-            |dividend| utils::div_by_shift(dividend, shift, rounding),
-            construct_double_nan,
-            process_double_result::<T, _>,
-        )
+        let dividend = self;
+        let dividend = extract_value!(T, dividend, construct_double_nan);
+        process_double_result::<T>(utils::div_by_shift(dividend, shift, rounding))
     }
 }
 

@@ -256,7 +256,7 @@ struct CollatorData {
     rejected_ext_messages: Vec<UInt256>,
     usage_tree: UsageTree,
     external_messages: Vec<(Arc<Message>, UInt256)>, // for bundle in case of error
-    imported_visited: HashSet<UInt256>,
+    imported_visited: ahash::AHashSet<UInt256>,
     last_dispatch_queue_emitted_lt: HashMap<AccountId, u64>,
     unprocessed_deferred_messages: HashMap<AccountId, usize>, // number of messages from dispatch queue in new_msgs
     sender_generated_messages_count: HashMap<AccountId, usize>,
@@ -337,7 +337,7 @@ impl CollatorData {
             rejected_ext_messages: Default::default(),
             usage_tree,
             external_messages: Vec::new(),
-            imported_visited: HashSet::new(),
+            imported_visited: ahash::AHashSet::default(),
             unprocessed_deferred_messages: HashMap::new(),
             sender_generated_messages_count: HashMap::new(),
             last_dispatch_queue_emitted_lt: HashMap::new(),
@@ -941,7 +941,7 @@ impl ExecutionManager {
         let handle = tokio::spawn(async move {
             let lt = lt.max(min_lt.load(Ordering::Relaxed));
             let full_collated_data = config.has_capability(GlobalCapabilities::CapFullCollatedData);
-            let mut shard_acc = tokio::task::spawn_blocking(move || {
+            let init = tokio::task::spawn_blocking(move || {
                 ShardAccountStuff::init(
                     &engine,
                     account_id,
@@ -952,7 +952,20 @@ impl ExecutionManager {
                     dict_hash_min_cells,
                 )
             })
-            .await??;
+            .await
+            .map_err(|join_err| join_err.into())
+            .flatten();
+            let mut shard_acc = match init {
+                Ok(shard_acc) => shard_acc,
+                Err(err) => {
+                    receiver.close();
+                    // If initialization of shard account stuff failed, we should respond to all pending messages and exit.
+                    while receiver.recv().await.is_some() {
+                        wait_tr.respond(None);
+                    }
+                    return Err(err);
+                }
+            };
             while let Some((new_msg, msg_metadata)) = receiver.recv().await {
                 log::trace!(
                     "{}: new message for {:x}",
@@ -5169,26 +5182,28 @@ impl Collator {
         // 4. Previous state proof (only shadchains) and storage dict proofs
         if !self.shard.is_masterchain() {
             let mut roots_to_include = HashSet::new();
-            let mut ss_visited = collator_data.usage_tree.build_visited_set();
-            // extend with visited cells from neighbour msg queues to properly calculate previous state proof size difference:
-            // if some cell is already included in neighbour msg queue proof, it should not be counted again
-            // and we also include message queue from the previous state into the proof
-            ss_visited.extend(neighbours_msg_queue_visited.into_iter().flatten());
+            // Cell-status model of the previous-state proof: every cell loaded during
+            // collation is `Loaded`, its children `Pruned`.
+            let mut stat = collator_data.usage_tree.build_proof_stat()?;
+            for visited in neighbours_msg_queue_visited {
+                for hash in visited {
+                    stat.set_loaded_hash(hash);
+                }
+            }
             for account_stuff in accounts {
                 if let Some(dict_usage) = account_stuff.storage_dict_usage() {
                     let dict_proof_size = dict_usage.estimate_proof_serialized_size()?;
                     let dict = StorageStatDict::with_hashmap(Some(dict_usage.original_root()))
                         .export_keys::<UInt256>()?;
-                    let mut ss_visited_update = ss_visited.clone();
-                    let mut ss_proof_size_diff = 0;
-                    for update in account_stuff.account_updates() {
-                        ss_proof_size_diff += UsageTree::add_branch_to_visited(
-                            update,
-                            &mut ss_visited_update,
-                            &|hash| dict.contains(hash),
-                        )?;
-                    }
-                    if ss_proof_size_diff > dict_proof_size {
+                    let updates = account_stuff.account_updates();
+                    // Single walk with early-exit: if keeping the account's cells in the state
+                    // proof is no larger than the dict proof, it commits them and returns true;
+                    // otherwise it bails out as soon as that's known and we emit the dict proof.
+                    if !stat.try_load_branches(
+                        updates,
+                        &|hash| dict.contains(hash),
+                        dict_proof_size,
+                    )? {
                         let proof = MerkleProof::create_by_usage_tree(
                             &dict_usage.original_root(),
                             dict_usage,
@@ -5201,20 +5216,18 @@ impl Collator {
                             dict_usage.original_root().repr_hash(),
                             account_stuff.account_id(),
                         );
-                    } else {
-                        ss_visited = ss_visited_update;
                     }
-                } else {
+                } else if account_stuff.has_root_change() {
                     log::debug!("Added full account state {:x} ", account_stuff.account_id());
                     roots_to_include.insert(account_stuff.original_root().repr_hash());
                 }
+                // else: a non-dict account whose storage roots never changed in this block —
+                // no data needed
             }
             for state in prev_states {
                 let proof = MerkleProof::create_with_subtrees(
                     &state,
-                    |hash| {
-                        ss_visited.contains(hash) || collator_data.imported_visited.contains(hash)
-                    },
+                    |hash| stat.is_loaded(hash) || collator_data.imported_visited.contains(hash),
                     |hash| roots_to_include.contains(hash),
                 )?;
                 roots.push(proof.serialize()?);

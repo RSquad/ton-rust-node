@@ -24,7 +24,7 @@ pub mod gas_state;
 
 fn gramtogas(engine: &Engine, nanocoins: &IntegerData) -> Result<i64> {
     let gas_price = IntegerData::from_i64(engine.get_gas().get_gas_price());
-    let gas = nanocoins.div::<Quiet>(&gas_price, Round::FloorToZero)?.0;
+    let (gas, _) = nanocoins.div::<Quiet>(&gas_price, Round::FloorToZero)?;
     let ret = gas.take_value_of(|x| i64::from_int(x).ok()).unwrap_or(i64::MAX);
     Ok(ret)
 }

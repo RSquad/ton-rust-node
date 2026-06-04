@@ -4722,6 +4722,7 @@ impl SimplexState {
         parent_info: CandidateParentInfo,
     ) {
         let next_slot = self.first_non_finalized_slot;
+        let mut slot_was_skipped = false;
         if let Some(slot_state) = self.get_slot_mut(desc, next_slot, WindowAlloc::BoundedByHorizon)
         {
             log::trace!(
@@ -4731,11 +4732,25 @@ impl SimplexState {
                 next_slot
             );
             slot_state.available_base = Some(Some(parent_info));
+            slot_was_skipped = slot_state.skipped;
         } else {
             log::warn!(
                 "SimplexState::set_available_base_after_restart: slot {} not found in FSM",
                 next_slot
             );
+        }
+
+        // C++ pool.cpp parity: once a skipped slot has an available_base,
+        // handle_typed_saved_certificate(SkipCertRef) forwards that base to
+        // next_nonskipped_slot_after(slot), and advance_present() only publishes
+        // LeaderWindowObserved when the present slot has a base. During restart
+        // recovery Rust may learn the skip certificate before this boundary base,
+        // so repair the skipped run immediately after seeding it.
+        if slot_was_skipped {
+            self.propagate_base_after_skip_cert(desc, next_slot);
+            self.advance_leader_window_on_progress_cursor(desc);
+        } else {
+            self.check_pending_blocks(desc);
         }
     }
 

@@ -265,6 +265,72 @@ async fn test_import_resume() -> Result<()> {
     Ok(())
 }
 
+/// Regression for the resume bug: when the archive MC index is ahead of the shard
+/// client (the node applied MC blocks the shard client hasn't reached yet), run_import
+/// must clamp the resume point to SHARD_CLIENT_MC_BLOCK and RE-IMPORT those groups
+/// instead of skipping them. Skipping leaves the shard tops of those MC blocks without
+/// handles, which later breaks shard-chain stitching ("Block handle not found" /
+/// "Shard chain break").
+///
+/// Observable check: after rewinding SHARD_CLIENT to the top of the first group, a
+/// move-mode re-import must consume (move away) group 00000's source files — proving it
+/// was re-imported. A buggy resume by the archive max would skip 00000, leaving them.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_import_resume_respects_shard_client() -> Result<()> {
+    init_test_log();
+    let dir = tempfile::tempdir().unwrap();
+    let archives = dir.path().join("archives");
+    prepare_archives(&archives).unwrap(); // groups 00000 (0..=99) and 00100 (100..=199)
+
+    // First import of both groups (copy — keep source files for the second import).
+    let mut cfg1 = import_config(dir.path(), archives.clone());
+    cfg1.move_files = false;
+    let node_db = run_import(cfg1).await?;
+    wait_for_db_release(node_db).await;
+
+    // Simulate shard-client lag: rewind SHARD_CLIENT_MC_BLOCK to the top of the first
+    // group (seqno 99) while the archive index / LAST_APPLIED stay at 199.
+    {
+        let db = open_db(dir.path()).await?;
+        assert_eq!(db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.unwrap().seq_no(), 199);
+        let mc99 = db
+            .lookup_block_by_seqno(&AccountIdPrefixFull::any_masterchain(), 99)
+            .await?
+            .expect("MC block 99 must exist after first import")
+            .0;
+        db.save_full_node_state(SHARD_CLIENT_MC_BLOCK, &mc99)?;
+        db.stop_states_db().await;
+    }
+
+    // Second import in move mode. Correct resume clamps to the shard client (99) and
+    // re-imports group 00000 (moving its source files away). A buggy resume by the
+    // archive max (199) would skip group 00000, leaving its source files in place.
+    let mut cfg2 = import_config(dir.path(), archives.clone());
+    cfg2.move_files = true;
+    let node_db2 = run_import(cfg2).await?;
+    wait_for_db_release(node_db2).await;
+
+    let leftover: Vec<String> = std::fs::read_dir(&archives)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("archive.00000."))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "run_import must clamp resume to SHARD_CLIENT_MC_BLOCK and re-import group 00000; \
+         leftover source files mean it was wrongly skipped: {:?}",
+        leftover,
+    );
+
+    // Final state must still be complete.
+    let db = open_db(dir.path()).await?;
+    assert_eq!(db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.unwrap().seq_no(), 199);
+    let shard_client = db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?.unwrap();
+    assert_eq!(shard_client.seq_no(), 199, "second import must re-advance the shard client");
+    db.stop_states_db().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_import_skip_validation() -> Result<()> {
     init_test_log();

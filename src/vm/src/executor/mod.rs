@@ -25,6 +25,7 @@ mod exceptions;
 pub mod gas;
 mod globals;
 mod math;
+pub use math::DivMode;
 mod null;
 mod rand;
 mod serialization;
