@@ -789,6 +789,9 @@ pub trait TransactionExecutor {
         if let Some(new_data) = new_data {
             acc_copy.set_data(new_data);
         }
+        // Roots the stat ran over : the candidate state — tentative on
+        // a limit rollback, final on success.
+        tr.set_account_updates(acc_copy.storage_roots());
         if !is_special && !check_account_size_limits(limits, &mut acc_copy)? {
             log::debug!(
                 target: "executor",
@@ -1945,10 +1948,12 @@ pub(super) fn check_account_size_limits(cfg: &SizeLimitsConfig, acc: &mut Accoun
         log::debug!(target: "executor", "account has too many cells {} (max cells = {})", stat.total_cells(), max_acc_state_cells);
         return Ok(false);
     }
-    let max_merkle_depth = stat.max_merkle_depth()?;
-    if max_merkle_depth > MAX_MERKLE_DEPTH {
-        log::debug!(target: "executor", "account has too big merkle depth {max_merkle_depth}");
-        return Ok(false);
+    if stat.is_changed() {
+        let max_merkle_depth = stat.max_merkle_depth()?;
+        if max_merkle_depth > MAX_MERKLE_DEPTH {
+            log::debug!(target: "executor", "account has too big merkle depth {max_merkle_depth}");
+            return Ok(false);
+        }
     }
     Ok(true)
 }

@@ -11,10 +11,10 @@
 use crate::engine_traits::EngineOperations;
 use std::sync::Arc;
 use ton_block::{
-    fail, time_checker, Account, AccountBlock, AccountId, AccountStorageStat, Augmentation, Cell,
-    EmptyValue, HashUpdate, HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries,
-    Result, Serializable, ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions,
-    UInt256, UsageTree,
+    fail, time_checker, Account, AccountBlock, AccountId, Augmentation, Cell, EmptyValue,
+    HashUpdate, HashmapAugType, HashmapRemover, HashmapType, LibDescr, Libraries, Result,
+    Serializable, ShardAccount, ShardAccounts, StateInitLib, Transaction, Transactions, UInt256,
+    UsageTree,
 };
 
 const STAT_UPDATE_THRESHOLD: u64 = 100;
@@ -30,6 +30,9 @@ pub struct ShardAccountStuff {
     storage_dict: Option<Cell>,
     storage_dict_usage: Option<UsageTree>,
     account_updates: Vec<Cell>,
+    /// True if any transaction in this block changed the account's storage roots
+    /// (code/data/library), or had its action phase rolled back due to size/merkle limits.
+    has_root_change: bool,
     original_root: Cell,
     lt_compatible: bool,
     dict_hash_min_cells: u32,
@@ -85,6 +88,7 @@ impl ShardAccountStuff {
             storage_dict,
             storage_dict_usage,
             account_updates: Vec::new(),
+            has_root_change: false,
             lt_compatible,
             dict_hash_min_cells,
         })
@@ -128,6 +132,9 @@ impl ShardAccountStuff {
     pub fn account_updates(&self) -> &[Cell] {
         &self.account_updates
     }
+    pub fn has_root_change(&self) -> bool {
+        self.has_root_change
+    }
 
     pub fn original_root(&self) -> &Cell {
         &self.original_root
@@ -145,6 +152,7 @@ impl ShardAccountStuff {
         transaction.set_prev_trans_hash(self.shard_acc.last_trans_hash().clone());
         transaction.set_prev_trans_lt(self.shard_acc.last_trans_lt());
         // log::trace!("{} {}", self.collated_block_descr, debug_transaction(transaction.clone())?);
+        let old_roots = self.account.storage_roots();
         self.account = account;
 
         let tc = time_checker!(
@@ -154,7 +162,16 @@ impl ShardAccountStuff {
         self.storage_dict = self.account.calc_storage_stat_dict(self.dict_hash_min_cells)?;
         drop(tc);
 
-        self.account_updates.extend(AccountStorageStat::get_roots(self.account.state_init()));
+        // Roots the executor's stat ran over
+        let updates = if transaction.account_updates().is_empty() {
+            self.account.storage_roots()
+        } else {
+            transaction.account_updates().into()
+        };
+        if updates != old_roots {
+            self.has_root_change = true;
+        }
+        self.account_updates.extend(updates);
         self.shard_acc.write_account(&self.account)?;
         let new_hash = self.shard_acc.account_hash();
         let old_hash = std::mem::replace(&mut self.state_update.new_hash, new_hash.clone());

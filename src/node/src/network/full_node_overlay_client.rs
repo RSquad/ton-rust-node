@@ -23,8 +23,7 @@ use adnl::{
     node::AdnlSendMethod,
     OverlayNode,
 };
-use rand::seq::IteratorRandom;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use storage::types::PersistentStatePartId;
 #[cfg(feature = "telemetry")]
 use ton_api::Constructor;
@@ -33,13 +32,14 @@ use ton_api::{
         rpc::ton_node::{
             DownloadBlockFull, DownloadBlockProof, DownloadBlockProofLink, DownloadKeyBlockProof,
             DownloadKeyBlockProofLink, DownloadNextBlockFull, DownloadPersistentStateSliceV2,
-            DownloadZeroState, GetArchiveInfo, GetArchiveSlice, GetNextKeyBlockIds,
-            GetPersistentStateSizeV2, GetShardArchiveInfo, PrepareBlock, PrepareBlockProof,
-            PrepareKeyBlockProof, PreparePersistentState, PrepareZeroState,
+            DownloadZeroState, GetArchiveInfo, GetArchiveSlice, GetNextBlockDescription,
+            GetNextKeyBlockIds, GetPersistentStateSizeV2, GetShardArchiveInfo, PrepareBlock,
+            PrepareBlockProof, PrepareKeyBlockProof, PreparePersistentState, PrepareZeroState,
         },
         ton_node::{
-            persistentstateidv2::PersistentStateIdV2, shardid::ShardId, ArchiveInfo, Broadcast,
-            DataFull, KeyBlocks, PersistentStateSize, Prepared, PreparedProof, PreparedState,
+            persistentstateidv2::PersistentStateIdV2, shardid::ShardId, ArchiveInfo,
+            BlockDescription, Broadcast, DataFull, KeyBlocks, PersistentStateSize, Prepared,
+            PreparedProof, PreparedState,
         },
     },
     AnyBoxedSerialize, BoxedSerialize,
@@ -60,7 +60,7 @@ pub struct FullNodeOverlayClient {
 
 impl FullNodeOverlayClient {
     const TIMEOUT_PREPARE: u64 = 6000; // Milliseconds
-    const TIMEOUT_NO_NEIGHBOURS: u64 = 1000; // Milliseconds
+    const FAN_OUT_PEERS: usize = 5;
 
     pub(crate) fn new(
         engine: Arc<dyn EngineOperations>,
@@ -266,101 +266,107 @@ impl FullNodeOverlayClient {
     pub async fn download_block_full(
         &self,
         id: &BlockIdExt,
+        fan_out_prepare: bool,
     ) -> Result<(BlockStuff, BlockProofStuff)> {
-        // Prepare
-        let (prepare, peer): (Prepared, _) = self
+        let (peer, was_active) = if fan_out_prepare {
+            // Probe FAN_OUT_PEERS in parallel with PrepareBlock; pick the
+            // first peer that says it has the block, then RLDP from it.
+            // The fan-out helper deliberately does not insert the winner into
+            // active_peers — promotion happens below on full success.
+            let request = PrepareBlock { block: id.clone() }.into_tl_object().into();
+            let (_prepare, peer): (Prepared, _) = self
+                .client
+                .send_adnl_query_fan_out(
+                    &request,
+                    Self::FAN_OUT_PEERS,
+                    Some(Self::TIMEOUT_PREPARE),
+                    |p: &Prepared| matches!(p, &Prepared::TonNode_Prepared),
+                    &self.active_peers,
+                )
+                .await?;
+            (peer, false)
+        } else {
+            // Skip the prepare round-trip: pick a neighbour and RLDP directly.
+            self.client.choose_peer(Some(&self.active_peers)).await?
+        };
+        log::debug!(
+            "download_block_full: sending RLDP to peer {}, id: {}, fan_out={fan_out_prepare}",
+            peer.id(),
+            id
+        );
+        let result = self
             .client
-            .send_adnl_query(
-                &PrepareBlock { block: id.clone() }.into_tl_object().into(),
-                Some(1), // 1 attempt
-                None,    // default timeout
-                Some(&self.active_peers),
+            .send_rldp_query_typed(
+                &TaggedObject {
+                    object: DownloadBlockFull { block: id.clone() },
+                    #[cfg(feature = "telemetry")]
+                    tag: DownloadBlockFull::constructor_const(),
+                },
+                &peer,
+                0,
+                true,
             )
-            .await?;
-        log::debug!("download_block_full: USE PEER {}, PREPARE {} FINISHED", peer, id);
-        // Download
-        match prepare {
-            Prepared::TonNode_NotFound => {
-                self.active_peers.remove(peer.id());
-                fail!("Got `TonNode_NotFound` from {}", peer.id())
+            .await;
+        log::debug!(
+            "download_block_full: got {}, peer {}, id: {}",
+            if result.is_ok() { "OK" } else { "ERR" },
+            peer.id(),
+            id
+        );
+        let data_full: DataFull = result.inspect_err(|_| {
+            self.active_peers.remove(peer.id());
+        })?;
+        let id = id.clone();
+        let deserialized: Result<(BlockStuff, BlockProofStuff)> =
+            tokio::task::block_in_place(|| {
+                let (block_data, proof_data, is_link) = match data_full {
+                    DataFull::TonNode_DataFull(data_full) => {
+                        if id != data_full.id {
+                            fail!("Block with another id was received");
+                        }
+                        (data_full.block, data_full.proof, data_full.is_link.into())
+                    }
+                    DataFull::TonNode_DataFullCompressed(data_full) => {
+                        if id != data_full.id {
+                            fail!("Block with another id was received");
+                        }
+                        let decompressed = lz4_decompress(
+                            &data_full.compressed,
+                            Lz4DecompressMode::WithMaxSize(MAX_COMPRESSED_SIZE as i32),
+                        )?;
+                        let mut roots = read_boc(&decompressed)?.roots;
+                        if roots.len() != 2 {
+                            fail!("DataFullCompressed contains {} roots instead of 2", roots.len());
+                        }
+                        let proof_data = write_boc(&roots.remove(0))?;
+                        // Block's boc here must be serialized absolutely
+                        // the same way as in collator, because of file hash concept.
+                        let mut block_data = Vec::new();
+                        BocWriter::with_flags(roots, BocFlags::all())?.write(&mut block_data)?;
+                        (block_data, proof_data, data_full.is_link.into())
+                    }
+                    DataFull::TonNode_DataFullEmpty => {
+                        fail!("DownloadBlockFull returned DataFullEmpty from {}", peer.id())
+                    }
+                };
+                let proof =
+                    BlockProofStuff::deserialize(&id, proof_data, is_link).map_err(|e| {
+                        error!("Error deserializing block proof from {}: {}", peer.id(), e)
+                    })?;
+                let block = BlockStuff::deserialize_block_checked(id, Arc::new(block_data))
+                    .map_err(|e| error!("Error deserializing block from {}: {}", peer.id(), e))?;
+                Ok((block, proof))
+            });
+        match deserialized {
+            Ok(pair) => {
+                if !was_active {
+                    self.active_peers.insert(peer.id().clone()).ok();
+                }
+                Ok(pair)
             }
-            Prepared::TonNode_Prepared => {
-                log::debug!("download_block_full: sending RLDP to peer {}, id: {}", peer.id(), id);
-                let result = self
-                    .client
-                    .send_rldp_query_typed(
-                        &TaggedObject {
-                            object: DownloadBlockFull { block: id.clone() },
-                            #[cfg(feature = "telemetry")]
-                            tag: DownloadBlockFull::constructor_const(),
-                        },
-                        &peer,
-                        0,
-                        true,
-                    )
-                    .await;
-                log::debug!(
-                    "download_block_full: got {}, peer {}, id: {}",
-                    if result.is_ok() { "OK" } else { "ERR" },
-                    peer.id(),
-                    id
-                );
-                let data_full: DataFull = result?;
-                let peer_copy = peer.clone();
-                let id = id.clone();
-                tokio::task::spawn_blocking(move || {
-                    let (block_data, proof_data, is_link) = match data_full {
-                        DataFull::TonNode_DataFull(data_full) => {
-                            if id != data_full.id {
-                                fail!("Block with another id was received");
-                            }
-                            (data_full.block, data_full.proof, data_full.is_link.into())
-                        }
-                        DataFull::TonNode_DataFullCompressed(data_full) => {
-                            if id != data_full.id {
-                                fail!("Block with another id was received");
-                            }
-                            let decompressed = lz4_decompress(
-                                &data_full.compressed,
-                                Lz4DecompressMode::WithMaxSize(MAX_COMPRESSED_SIZE as i32),
-                            )?;
-                            let mut roots = read_boc(&decompressed)?.roots;
-                            if roots.len() != 2 {
-                                fail!(
-                                    "DataFullCompressed contains {} roots instead of 2",
-                                    roots.len()
-                                );
-                            }
-                            let proof_data = write_boc(&roots.remove(0))?;
-                            // Block's boc here must be serialized absolutely
-                            // the same way as in collator, because of file hash concept.
-                            let mut block_data = Vec::new();
-                            BocWriter::with_flags(roots, BocFlags::all())?
-                                .write(&mut block_data)?;
-                            (block_data, proof_data, data_full.is_link.into())
-                        }
-                        DataFull::TonNode_DataFullEmpty => {
-                            fail!(
-                                "PrepareBlock returned Prepared, but DownloadBlockFull \
-                                    returned DataFullEmpty from {}",
-                                peer.id()
-                            )
-                        }
-                    };
-                    let proof =
-                        BlockProofStuff::deserialize(&id, proof_data, is_link).map_err(|e| {
-                            error!("Error deserializing block proof from {}: {}", peer.id(), e)
-                        })?;
-                    let block = BlockStuff::deserialize_block_checked(id, Arc::new(block_data))
-                        .map_err(|e| {
-                            error!("Error deserializing block from {}: {}", peer.id(), e)
-                        })?;
-                    Ok((block, proof))
-                })
-                .await?
-                .inspect_err(|_| {
-                    self.active_peers.remove(peer_copy.id());
-                })
+            Err(e) => {
+                self.active_peers.remove(peer.id());
+                Err(e)
             }
         }
     }
@@ -515,30 +521,41 @@ impl FullNodeOverlayClient {
     pub async fn download_next_block_full(
         &self,
         prev_id: &BlockIdExt,
+        fan_out_prepare: bool,
     ) -> Result<(BlockStuff, BlockProofStuff)> {
-        let request = TaggedObject {
-            object: DownloadNextBlockFull { prev_block: prev_id.clone() },
-            #[cfg(feature = "telemetry")]
-            tag: DownloadNextBlockFull::constructor_const(),
-        };
-        let peer = loop {
-            if let Some(p) = self.active_peers.iter().choose(&mut rand::thread_rng()) {
-                if let Some(n) = self.client.neighbours().peer(&p) {
-                    break n;
-                }
-            }
-            if let Some(n) = self.client.neighbours().choose_neighbour()? {
-                break n;
-            } else {
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_NO_NEIGHBOURS)).await;
-                fail!("neighbour is not found!")
-            }
+        let (peer, was_active) = if fan_out_prepare {
+            // Fan-out a cheap GetNextBlockDescription probe to find a peer that
+            // already knows the next block, then RLDP-download from that peer.
+            // The fan-out helper does not promote the winner — that happens
+            // below on full success.
+            let probe =
+                GetNextBlockDescription { prev_block: prev_id.clone() }.into_tl_object().into();
+            let (_description, peer): (BlockDescription, _) = self
+                .client
+                .send_adnl_query_fan_out(
+                    &probe,
+                    Self::FAN_OUT_PEERS,
+                    Some(Self::TIMEOUT_PREPARE),
+                    |d: &BlockDescription| {
+                        matches!(d, BlockDescription::TonNode_BlockDescription(_))
+                    },
+                    &self.active_peers,
+                )
+                .await?;
+            (peer, false)
+        } else {
+            self.client.choose_peer(Some(&self.active_peers)).await?
         };
         log::debug!(
             "download_next_block_full: sending RLDP to peer {}, prev: {}",
             peer.id(),
             prev_id
         );
+        let request = TaggedObject {
+            object: DownloadNextBlockFull { prev_block: prev_id.clone() },
+            #[cfg(feature = "telemetry")]
+            tag: DownloadNextBlockFull::constructor_const(),
+        };
         let result = self.client.send_rldp_query_typed(&request, &peer, 0, true).await;
         log::debug!(
             "download_next_block_full: got {}, peer {}, prev: {}",
@@ -546,36 +563,64 @@ impl FullNodeOverlayClient {
             peer.id(),
             prev_id
         );
-        let data_full: DataFull = result?;
-        match data_full {
-            DataFull::TonNode_DataFull(data_full) => {
-                let proof = BlockProofStuff::deserialize(
-                    &data_full.id,
-                    data_full.proof.to_vec(),
-                    data_full.is_link.clone().into(),
-                )
-                .map_err(|e| {
-                    self.active_peers.remove(peer.id());
-                    error!("Failed to deserialize block proof from peer {}: {:?}", peer.id(), e)
-                })?;
-                let block = BlockStuff::deserialize_block_checked(
-                    data_full.id.clone(),
-                    Arc::new(data_full.block),
-                )
-                .map_err(|e| {
-                    self.active_peers.remove(peer.id());
-                    error!("Failed to deserialize block from peer {}: {:?}", peer.id(), e)
-                })?;
+        let data_full: DataFull = result.inspect_err(|_| {
+            self.active_peers.remove(peer.id());
+        })?;
+        // DataFullEmpty is normally a "not yet" signal — the next block may
+        // simply not exist yet, so the peer is not logically bad. But when
+        // fan_out_prepare is set, the caller believes the block should already
+        // be on the network (we've been lagging), so a peer returning Empty is
+        // logically stale and we evict it from active_peers.
+        if matches!(data_full, DataFull::TonNode_DataFullEmpty) {
+            if fan_out_prepare {
+                self.active_peers.remove(peer.id());
+            }
+            return Err(error!("Got DataFullEmpty from {}", peer.id()));
+        }
+        let deserialized: Result<(BlockStuff, BlockProofStuff)> =
+            tokio::task::block_in_place(|| {
+                let (block_data, proof_data, id, is_link) = match data_full {
+                    DataFull::TonNode_DataFull(data_full) => {
+                        (data_full.block, data_full.proof, data_full.id, data_full.is_link.into())
+                    }
+                    DataFull::TonNode_DataFullCompressed(data_full) => {
+                        let decompressed = lz4_decompress(
+                            &data_full.compressed,
+                            Lz4DecompressMode::WithMaxSize(MAX_COMPRESSED_SIZE as i32),
+                        )?;
+                        let mut roots = read_boc(&decompressed)?.roots;
+                        if roots.len() != 2 {
+                            fail!("DataFullCompressed contains {} roots instead of 2", roots.len());
+                        }
+                        let proof_data = write_boc(&roots.remove(0))?;
+                        // Block's boc here must be serialized absolutely
+                        // the same way as in collator, because of file hash concept.
+                        let mut block_data = Vec::new();
+                        BocWriter::with_flags(roots, BocFlags::all())?.write(&mut block_data)?;
+                        (block_data, proof_data, data_full.id, data_full.is_link.into())
+                    }
+                    DataFull::TonNode_DataFullEmpty => unreachable!(),
+                };
+                let proof =
+                    BlockProofStuff::deserialize(&id, proof_data, is_link).map_err(|e| {
+                        error!("Failed to deserialize block proof from peer {}: {:?}", peer.id(), e)
+                    })?;
+                let block = BlockStuff::deserialize_block_checked(id, Arc::new(block_data))
+                    .map_err(|e| {
+                        error!("Failed to deserialize block from peer {}: {:?}", peer.id(), e)
+                    })?;
                 Ok((block, proof))
+            });
+        match deserialized {
+            Ok(pair) => {
+                if !was_active {
+                    self.active_peers.insert(peer.id().clone()).ok();
+                }
+                Ok(pair)
             }
-            DataFull::TonNode_DataFullCompressed(_) => {
-                fail!("Got DataFullCompressed from {}, not supported", peer.id())
-            }
-            DataFull::TonNode_DataFullEmpty => {
-                // Do not delete peer from active_peers,
-                // because next block may be not yet created.
-
-                fail!("Got DataFullEmpty from {}", peer.id())
+            Err(e) => {
+                self.active_peers.remove(peer.id());
+                Err(e)
             }
         }
     }

@@ -1,0 +1,22 @@
+{
+  "id": "(0:8000000000000000, 66163599, rh 2bc2034d35d9beea3332e4464d587014cd58166bc96813f685f3d894ca28236e, fh 2ce3aa73d92191454ffe5f7c9befc1769273f7a829902bfa417c594078592ab7)",
+  "top_shard_blocks": [],
+  "external_messages": [
+    "22d53077e8aeb5be01a43cce9e9862f8521c707231dc9afadeeef9b3e0611c08"
+  ],
+  "last_mc_state": "(-1:8000000000000000, 60869923, rh ac477fc92222888011731eb4144a3d6a8084f42d0f605cd6da509ca648a68da5, fh f08655f03a03c36475fa83bdb1c48d5dc10ddb6c41dec37481a1044e43502317)",
+  "min_ref_mc_seqno": 60869921,
+  "mc_states": [
+    "(-1:8000000000000000, 60869923, rh ac477fc92222888011731eb4144a3d6a8084f42d0f605cd6da509ca648a68da5, fh f08655f03a03c36475fa83bdb1c48d5dc10ddb6c41dec37481a1044e43502317)",
+    "(-1:8000000000000000, 60869921, rh 8df4dc2dba98657669404106da92d7125f485e78e1f1852a1cee750ce30b0365, fh 73e8943913e87d3596a19ad386e8781a94f9c30767c7d0b10b483bc99f3301e8)",
+    "(-1:8000000000000000, 60869922, rh add263208ea9856d93796994742b97119d72f10c031f9b1873f011c8815b5cdb, fh 1b80427fff1addebb954f70dc5e38ea5a488bd3f24004c430b62b52c7a5dc431)"
+  ],
+  "neighbors": [],
+  "prev_blocks": [],
+  "created_by": "34834676b1554c3a99a886e6f0385ee5f2c8e3daaf6c4fcb7366e5055f559227",
+  "rand_seed": "0000000000000000000000000000000000000000000000000000000000000000",
+  "now": 1779737495,
+  "contains_ethalon": false,
+  "contains_candidate": true,
+  "notes": "=====> node/src/validator/validate_query.rs:5912 at least one Transaction of account fa6bebb28e2017f20466b4f8b6ced75e044962c3a1ab05ae9d40178cf309507c is invalid : =====> node/src/validator/validate_query.rs:5745 40e1897fc4ed7b15251617397d767d08b17bcc9eb04d522eeb7f0c6a8e1f4b17 transaction 72086576000007 of fa6bebb28e2017f20466b4f8b6ced75e044962c3a1ab05ae9d40178cf309507c is invalid: it claims that the new account state hash is 15f02be472b65871dd106a7492fdc95a9edd78ccb988ba8d045bd4ee4e1950cb but the re-computed value is 3de3754db33f3e5d2c3a4a780a27e014b7fff8c275a0e67943563616c5b16ff5, account: Account { stuff: Some(AccountStuff { addr: AddrStd(MsgAddrStd { anycast: None, workchain_id: 0, address: fa6bebb28e2017f20466b4f8b6ced75e044962c3a1ab05ae9d40178cf309507c }), storage_info: StorageInfo { used: StorageUsed { cells: VarUInteger7(4), bits: VarUInteger7(805) }, storage_extra: StorageExtraInfo { dict_hash: None }, last_paid: 1779737495, due_payment: None }, storage: AccountStorage { last_trans_lt: 72086576000008, balance: CurrencyCollection { coins: Coins(163186557149), other: ExtraCurrencyCollection(HashmapE { bit_len: 32, data: None }) }, state: AccountActive { state_init: StateInit { fixed_prefix_length: None, special: None, code: Some(20834b7b72b112147e1b2fb457b84e74d1a30f04f737d4f62a668e9552d2b72f), data: Some(680ec65854b729ef0e70d8ff2ffa5da9d78d48d0308ca959e43722e412759520), library: StateInitLib(HashmapE { bit_len: 256, data: None }) } } } }) }"
+}

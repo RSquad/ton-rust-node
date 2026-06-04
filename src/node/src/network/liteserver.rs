@@ -123,8 +123,10 @@ const WANT_PROOF: i32 = 0x20;
 const REVERSE_ORDER: i32 = 0x40;
 const AFTER_PRESENT: i32 = 0x80;
 const LS_VERSION: i32 = 0x101;
-const LS_CAPABILITIES: i64 = 7;
+const LS_CAPABILITIES: i64 = 15;
 const SKIP_EXTERNALS_QUEUE_SIZE: i32 = 1000;
+
+const MC_INFO_EXT_SHARD_CLIENT_STATE: i32 = 0x1;
 
 const CFG_NEED_PREV_BLOCKS: i32 = 0x80;
 const CFG_FROM_PREV_KEY_BLOCK: i32 = 0x8000; // read the config from the previous key block
@@ -1589,7 +1591,19 @@ impl LiteServerQuerySubscriber {
         engine: &Arc<dyn EngineOperations>,
         mode: i32,
     ) -> Result<MasterchainInfoExt> {
-        let mc_block_id = get_last_liteserver_state_block(engine)?;
+        if mode & !MC_INFO_EXT_SHARD_CLIENT_STATE != 0 {
+            fail!(BlockError::InvalidArg(format!(
+                "unsupported getMasterchainInfoExt mode: {mode:#x}"
+            )));
+        }
+
+        let mc_block_id = if mode & MC_INFO_EXT_SHARD_CLIENT_STATE != 0 {
+            engine
+                .load_shard_client_mc_block_id()?
+                .ok_or_else(|| error!("shard client state is not ready"))?
+        } else {
+            get_last_liteserver_state_block(engine)?
+        };
 
         let mc_state = engine.load_state(&mc_block_id).await?;
         let state_root_hash = mc_state.root_cell().repr_hash().clone();
@@ -1602,12 +1616,11 @@ impl LiteServerQuerySubscriber {
 
         let last_utime = mc_state.state()?.gen_time() as i32;
         let now = engine.now() as i32;
-        let gv = mc_state.shard_state_extra()?.config().get_global_version()?;
 
         Ok(MasterchainInfoExt {
             mode,
-            version: gv.version as i32,
-            capabilities: gv.capabilities as i64,
+            version: LS_VERSION,
+            capabilities: LS_CAPABILITIES,
             last: (*mc_block_id).clone(),
             last_utime,
             now,

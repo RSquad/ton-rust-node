@@ -284,7 +284,12 @@ pub(in crate::executor) fn fetch_reference(engine: &mut Engine, src: u16) -> Sta
 // ctx.cmd.push_var(CC.stack[0..depth])
 pub(in crate::executor) fn fetch_stack(engine: &mut Engine, depth: usize) -> Status {
     if engine.cc.stack.depth() < depth {
-        fail!(ExceptionCode::StackUnderflow)
+        fail!(
+            ExceptionCode::StackUnderflow,
+            "fetch_stack: depth: {}, stack depth: {}",
+            depth,
+            engine.cc.stack.depth()
+        )
     } else {
         engine.cmd.vars.append(&mut engine.cc.stack.drop_range(0..depth)?);
         Ok(())

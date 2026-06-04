@@ -10,7 +10,7 @@
  */
 use ton_assembler::compile_code_to_cell;
 use ton_block::{
-    ed25519_generate_private_key, AnycastInfo, BuilderData, Cell, CurrencyCollection,
+    ed25519_generate_private_key, AnycastInfo, BuilderData, Cell, Coins, CurrencyCollection,
     ExceptionCode, HashmapE, HashmapType, IBitstring, InternalMessageHeader, Message, MsgAddress,
     MsgAddressInt, Result, Serializable, Sha256, SliceData, StateInit, StorageUsageCalc,
     ACTION_CHANGE_LIB, ACTION_RESERVE, ACTION_SEND_MSG, ACTION_SET_CODE, ED25519_PUBLIC_KEY_LENGTH,
@@ -157,6 +157,34 @@ fn test_chksignu_always() {
     ")
     .with_behavior_modifiers(modifiers)
     .expect_stack(Stack::new().push(int!(-1)));
+}
+
+#[test]
+fn test_chksig_identity_pubkey_rejected() {
+    let forged_identity_signature = concat!(
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+
+    test_case(format!(
+        "
+        ZERO
+        PUSHSLICE x{forged_identity_signature}
+        PUSHPOW2 248
+        CHKSIGNU
+    "
+    ))
+    .expect_int_stack(&[0]);
+
+    test_case(format!(
+        "
+        PUSHSLICE xaf82
+        PUSHSLICE x{forged_identity_signature}
+        PUSHPOW2 248
+        CHKSIGNS
+    "
+    ))
+    .expect_int_stack(&[0]);
 }
 
 #[test]
@@ -651,6 +679,44 @@ fn test_send_msg() {
             .with_message_cell(msg_cell.clone())
             .expect_int_stack(&[len, fee, fee, fee]);
     }
+}
+
+#[test]
+fn test_send_msg_ignores_user_fwd_fee_lower_bound_in_v14() {
+    let dst = MsgAddressInt::standard(0, [0x22; 32]);
+    let header = InternalMessageHeader {
+        ihr_disabled: true,
+        dst,
+        value: CurrencyCollection::with_coins(6789),
+        ..Default::default()
+    };
+    let msg_cell = Message::with_int_header(header.clone()).serialize().unwrap();
+
+    let mut inflated_header = header;
+    inflated_header.fwd_fee = Coins::from(1_000_000_000_000_000u64);
+    let inflated_msg_cell = Message::with_int_header(inflated_header).serialize().unwrap();
+
+    let estimate_fee = |msg_cell: Cell, block_version| {
+        test_case_with_ref("PUSHREF PUSHINT 1024 SENDMSG", msg_cell)
+            .with_mc_state(MC_STATE_ROOT.clone())
+            .with_account(SHARD_ACCOUNT.clone())
+            .with_block_version(block_version)
+            .stack()
+            .get(0)
+            .unwrap()
+            .as_integer_value(0..=u64::MAX)
+            .unwrap()
+    };
+
+    let normal_fee_v14 = estimate_fee(msg_cell.clone(), 14);
+    assert_eq!(estimate_fee(inflated_msg_cell.clone(), 14), normal_fee_v14);
+
+    let normal_fee_v13 = estimate_fee(msg_cell, 13);
+    let inflated_fee_v13 = estimate_fee(inflated_msg_cell, 13);
+    assert!(
+        inflated_fee_v13 > normal_fee_v13,
+        "legacy SENDMSG should still include user fwd_fee in the estimate path"
+    );
 }
 
 #[test]
@@ -1568,6 +1634,12 @@ fn test_store_opt_std_address() {
     expect_exception("NEWC ZERO STOPTSTDADDRQ", ExceptionCode::TypeCheckError);
     test_case("NEWC NEWC STOPTSTDADDRQ").expect_stack(
         Stack::new()
+            .push_builder(Default::default())
+            .push_builder(Default::default())
+            .push_bool(true),
+    );
+    test_case("NEWC NEWC STOPTSTDADDRQ").with_block_version(13).expect_stack(
+        Stack::new()
             .push_slice(Default::default())
             .push_builder(Default::default())
             .push_bool(true),
@@ -1787,6 +1859,33 @@ mod secp256k1 {
             .push(boolean!(true))
         );
 
+        test_case("
+            PUSHINT 22331814027392488307105736075480205742348666473969333634173732071459215699411
+            PUSHINT 28
+            PUSHINT 72188030107017171866617227647805629756021428596569046199967415849707266278927
+            PUSHINT 13282575217854591023620411938469150084981210273956175544447397945087449567053
+            ECRECOVER
+        ")
+        .expect_stack(
+            Stack::new()
+            .push(int!(4))
+            .push(int!(parse "21072357408343070128712378251742180313787053800286652796374427952533996402375"))
+            .push(int!(parse "90884071343725393946073044816555309859522368395601566415999734440459367428202"))
+            .push(boolean!(true))
+        );
+
+        test_case(
+            "
+            PUSHINT 22331814027392488307105736075480205742348666473969333634173732071459215699411
+            PUSHINT 28
+            PUSHINT 72188030107017171866617227647805629756021428596569046199967415849707266278927
+            PUSHINT 13282575217854591023620411938469150084981210273956175544447397945087449567053
+            ECRECOVER
+        ",
+        )
+        .with_block_version(13)
+        .expect_int_stack(&[0]);
+
         test_case(
             "
             PUSHINT 22331814027392488307105736075480205742348666473969333634173732071459215699411
@@ -2002,6 +2101,7 @@ mod ristretto {
         expect_exception("NULL ZERO RIST255_MUL", ExceptionCode::TypeCheckError);
         expect_exception("ZERO NULL RIST255_MUL", ExceptionCode::TypeCheckError);
         expect_exception("ONE ONE RIST255_MUL", ExceptionCode::RangeCheckError);
+        expect_exception("ONE ZERO RIST255_MUL", ExceptionCode::RangeCheckError);
 
         expect_exception("RIST255_QMUL", ExceptionCode::StackUnderflow);
         expect_exception("ZERO RIST255_QMUL", ExceptionCode::StackUnderflow);
@@ -2014,6 +2114,11 @@ mod ristretto {
     fn test_mul_good() {
         test_case("ZERO ZERO RIST255_MUL").expect_int_stack(&[0]);
         test_case("ZERO ZERO RIST255_QMUL").expect_int_stack(&[0, -1]);
+        test_case("ZERO ONE RIST255_MUL").expect_int_stack(&[0]);
+        test_case("ZERO ONE RIST255_QMUL").expect_int_stack(&[0, -1]);
+        test_case("ONE ZERO RIST255_QMUL").expect_int_stack(&[0]);
+        test_case("ONE ZERO RIST255_MUL").with_block_version(13).expect_int_stack(&[0]);
+        test_case("ONE ZERO RIST255_QMUL").with_block_version(13).expect_int_stack(&[0, -1]);
 
         test_case("
             PUSHINT 106766070510617938807695755472512202883645982493097127265543572015867144473941

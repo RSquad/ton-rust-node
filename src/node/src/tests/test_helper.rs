@@ -37,7 +37,6 @@ use crate::{
 #[cfg(feature = "telemetry")]
 use crate::{collator_test_bundle::create_engine_telemetry, engine_traits::EngineTelemetry};
 use std::{
-    collections::HashSet,
     fs::copy,
     future::Future,
     path::Path,
@@ -1289,7 +1288,7 @@ impl EngineOperations for TestEngine {
         _before_split_block: &BlockIdExt,
         _queue0: OutMsgQueue,
         _queue1: OutMsgQueue,
-        _visited_cells: HashSet<UInt256>,
+        _visited_cells: ahash::AHashSet<UInt256>,
     ) {
     }
 

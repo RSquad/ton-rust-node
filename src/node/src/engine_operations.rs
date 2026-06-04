@@ -1245,7 +1245,7 @@ impl EngineOperations for Engine {
         before_split_block: &BlockIdExt,
         queue0: OutMsgQueue,
         queue1: OutMsgQueue,
-        visited_cells: HashSet<UInt256>,
+        visited_cells: ahash::AHashSet<UInt256>,
     ) {
         self.split_queues_cache()
             .insert(before_split_block.clone(), Some((queue0, queue1, visited_cells)));

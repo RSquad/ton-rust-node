@@ -63,7 +63,7 @@ use catchain::SessionId;
 #[cfg(feature = "telemetry")]
 use std::fmt::Write;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ops::Deref,
     path::Path,
     sync::{
@@ -90,7 +90,7 @@ struct StorageDictInfo {
     size: u64,
 }
 
-pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, HashSet<UInt256>)>;
+pub type SplitQueues = Option<(OutMsgQueue, OutMsgQueue, ahash::AHashSet<UInt256>)>;
 pub struct Engine {
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
@@ -115,6 +115,7 @@ pub struct Engine {
     shard_blocks: ShardBlocksPool,
     candidates_cache: parking_lot::Mutex<lru::LruCache<BlockIdExt, Arc<Vec<u8>>>>,
     last_applied_mc_block_seqno: AtomicU32,
+    last_applied_mc_block_utime: AtomicU32,
     last_known_mc_block_seqno: AtomicU32,
     last_known_keyblock_seqno: AtomicU32,
     will_validate: AtomicBool,
@@ -176,7 +177,7 @@ impl<T> DownloadContext<'_, T> {
             if self.engine.check_stop() {
                 fail!("{} id: {}, stop flag was set", self.name, self.id);
             }
-            match self.downloader.try_download(self).await {
+            match self.downloader.try_download(self, attempt).await {
                 Err(e) => self.log(e.to_string().as_str(), attempt),
                 Ok(ret) => break Ok(ret),
             }
@@ -207,10 +208,23 @@ impl<T> DownloadContext<'_, T> {
     }
 }
 
+// Switch to fan-out prepare after the first unsuccessful attempt for both
+// download_block_full and the "stale" branch of download_next_block_full.
+const FAN_OUT_AFTER_ATTEMPT: u32 = 1;
+// For download_next_block_full when our last applied MC block is fresh
+// (network is healthy), avoid fan-out until we've already failed 10 times.
+const FAN_OUT_AFTER_ATTEMPT_FRESH: u32 = 10;
+// MC block is considered "stale" if gen_utime is older than this many seconds.
+const MC_BLOCK_STALE_THRESHOLD_SECS: u32 = 10;
+
 #[async_trait::async_trait]
 trait Downloader: Send + Sync {
     type Item;
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item>;
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        attempt: u32,
+    ) -> Result<Self::Item>;
 }
 
 struct BlockDownloader;
@@ -218,7 +232,11 @@ struct BlockDownloader;
 #[async_trait::async_trait]
 impl Downloader for BlockDownloader {
     type Item = (BlockStuff, BlockProofStuff);
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(handle) = context.engine.db.load_block_handle(context.id)? {
             let mut is_link = false;
             if handle.has_data() && handle.has_proof_or_link(&mut is_link) {
@@ -258,7 +276,8 @@ impl Downloader for BlockDownloader {
         }
         #[cfg(feature = "telemetry")]
         context.engine.full_node_telemetry.new_downloading_block_attempt(context.id);
-        let ret = context.client.download_block_full(context.id).await;
+        let fan_out_prepare = attempt > FAN_OUT_AFTER_ATTEMPT;
+        let ret = context.client.download_block_full(context.id, fan_out_prepare).await;
         #[cfg(feature = "telemetry")]
         if ret.is_ok() {
             context.engine.full_node_telemetry.new_downloaded_block(context.id);
@@ -275,7 +294,11 @@ struct BlockProofDownloader {
 #[async_trait::async_trait]
 impl Downloader for BlockProofDownloader {
     type Item = BlockProofStuff;
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        _attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(handle) = context.engine.db.load_block_handle(context.id)? {
             let mut is_link = false;
             if handle.has_proof_or_link(&mut is_link) {
@@ -291,7 +314,11 @@ struct NextBlockDownloader;
 #[async_trait::async_trait]
 impl Downloader for NextBlockDownloader {
     type Item = (BlockStuff, BlockProofStuff);
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(prev_handle) = context.engine.db.load_block_handle(context.id)? {
             if prev_handle.has_next1() {
                 let next_id = context.engine.db.load_block_next1(context.id)?;
@@ -306,7 +333,18 @@ impl Downloader for NextBlockDownloader {
                 }
             }
         }
-        context.client.download_next_block_full(context.id).await
+        // If we're trailing the network, peers are likely behind us too and the
+        // single-peer probe often hits a node that doesn't have the next block
+        // yet. Switch to fan-out earlier (after attempt 1) in that case.
+        let last_mc_utime = context.engine.get_last_applied_mc_utime();
+        let mc_age = (UnixTime::now() as u32).saturating_sub(last_mc_utime);
+        let threshold = if mc_age > MC_BLOCK_STALE_THRESHOLD_SECS {
+            FAN_OUT_AFTER_ATTEMPT
+        } else {
+            FAN_OUT_AFTER_ATTEMPT_FRESH
+        };
+        let fan_out_prepare = attempt > threshold;
+        context.client.download_next_block_full(context.id, fan_out_prepare).await
     }
 }
 
@@ -315,7 +353,11 @@ struct ZeroStateDownloader;
 #[async_trait::async_trait]
 impl Downloader for ZeroStateDownloader {
     type Item = (Arc<ShardStateStuff>, Vec<u8>);
-    async fn try_download(&self, context: &DownloadContext<'_, Self::Item>) -> Result<Self::Item> {
+    async fn try_download(
+        &self,
+        context: &DownloadContext<'_, Self::Item>,
+        _attempt: u32,
+    ) -> Result<Self::Item> {
         if let Some(handle) = context.engine.db.load_block_handle(context.id)? {
             if handle.has_state() {
                 let zs = context.engine.db.load_shard_state_dynamic(context.id)?;
@@ -717,6 +759,7 @@ impl Engine {
                 Self::CANDIDATES_CACHE_SIZE.try_into()?,
             )),
             last_applied_mc_block_seqno: AtomicU32::new(0),
+            last_applied_mc_block_utime: AtomicU32::new(0),
             last_known_mc_block_seqno: AtomicU32::new(0),
             last_known_keyblock_seqno: AtomicU32::new(0),
             will_validate: AtomicBool::new(false),
@@ -766,6 +809,10 @@ impl Engine {
 
     pub fn get_last_applied_mc_seqno(&self) -> u32 {
         self.last_applied_mc_block_seqno.load(Ordering::Relaxed)
+    }
+
+    pub fn get_last_applied_mc_utime(&self) -> u32 {
+        self.last_applied_mc_block_utime.load(Ordering::Relaxed)
     }
 
     pub fn confirmed_block_events(&self) -> ConfirmedBlockEvents {
@@ -1223,6 +1270,7 @@ impl Engine {
         let gen_utime = block.gen_utime()?;
         let ago = UnixTime::now() as i32 - gen_utime as i32;
         self.save_last_applied_mc_block_id(block.id())?;
+        self.last_applied_mc_block_utime.store(gen_utime, Ordering::Relaxed);
         metrics::gauge!("ton_node_engine_last_mc_block_seqno").set(block.id().seq_no() as f64);
         metrics::gauge!("ton_node_engine_timediff_seconds").set(ago as f64);
         metrics::gauge!("ton_node_engine_last_mc_block_utime").set(gen_utime as f64);
@@ -1318,6 +1366,7 @@ impl Engine {
                         log::error!("Can't save last applied mc block {}: {}", block.id(), e);
                     }
                 }
+                self.last_applied_mc_block_utime.store(gen_utime, Ordering::Relaxed);
                 metrics::gauge!("ton_node_engine_last_mc_block_seqno")
                     .set(block.id().seq_no() as f64);
                 metrics::gauge!("ton_node_engine_timediff_seconds").set(ago as f64);

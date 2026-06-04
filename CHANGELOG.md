@@ -6,6 +6,14 @@ For Helm chart changes, see [helm/ton-rust-node/CHANGELOG.md](helm/ton-rust-node
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 Versions follow the node release tags (e.g. `v0.1.2-mainnet`).
 
+## [v0.8.3] - 2026-06-04
+
+Image: `ghcr.io/rsquad/ton-rust-node/node:v0.8.3`
+
+### Added
+
+- Support of block version 14 (changes in TVM, executor, blockchain structures)
+
 ## [v0.8.2] - 2026-06-02
 
 Image: `ghcr.io/rsquad/ton-rust-node/node:v0.8.2`
