@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+pub mod actor_builder;
 pub mod enums;
 pub mod event;
 pub mod factory;
@@ -16,6 +17,7 @@ pub mod jsonl_writer;
 pub mod log;
 pub mod participant;
 
+pub use actor_builder::{AuditActorBuilder, client_ip_from_headers};
 pub use common::app_config::AuditLogConfig;
 pub use enums::{
     AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, ConfigFieldChange, StakeSkipReason,

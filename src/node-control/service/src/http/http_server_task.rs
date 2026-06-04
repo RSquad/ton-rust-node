@@ -23,7 +23,7 @@ use super::{
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
 use crate::{
-    audit::log::AuditLog,
+    audit::{AuditActorBuilder, log::AuditLog},
     auth::{
         Claims,
         jwt::JwtAuth,
@@ -55,6 +55,7 @@ pub struct AppState {
     /// (entity CRUD, ton-http-api) so the service loop can rebuild caches.
     pub config_changed: Arc<tokio::sync::Notify>,
     pub audit: Arc<dyn AuditLog>,
+    pub actor_builder: Arc<AuditActorBuilder>,
 }
 
 pub async fn run(
@@ -113,6 +114,7 @@ pub async fn run(
     let elections_task = tasks.get("elections").cloned().expect("elections task is not registered");
 
     let login_rate_limiter = Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default()));
+    let actor_builder = Arc::new(AuditActorBuilder::new(runtime_cfg.clone()));
     let state = AppState {
         store,
         runtime_cfg,
@@ -122,6 +124,7 @@ pub async fn run(
         login_rate_limiter,
         config_changed,
         audit,
+        actor_builder,
     };
     let app = routes(enable_swagger, state);
 
@@ -508,6 +511,8 @@ pub async fn v1_elections_handler(
 )]
 pub async fn v1_elections_exclude_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<NodeListRequest>,
 ) -> Result<axum::Json<ElectionsExcludeResponse>, AppError> {
     if state.runtime_cfg.get().elections.is_none() {
@@ -541,6 +546,26 @@ pub async fn v1_elections_exclude_handler(
         .collect();
     tracing::info!("elections excluded: {}", excluded.join(", "));
 
+    let changes: Vec<_> = to_exclude
+        .iter()
+        .map(|node| {
+            super::rest_audit::config_field(
+                format!("bindings.{node}.enable"),
+                serde_json::json!(true),
+                serde_json::json!(false),
+            )
+        })
+        .collect();
+    super::rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "elections",
+        "elections.exclude",
+        changes,
+    )
+    .await;
+
     let applied = ElectionsExcludeResult { excluded, updated_at: state.runtime_cfg.updated_at() };
     Ok(axum::Json(ElectionsExcludeResponse { ok: true, result: applied }))
 }
@@ -559,6 +584,8 @@ pub async fn v1_elections_exclude_handler(
 )]
 pub async fn v1_elections_include_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<NodeListRequest>,
 ) -> Result<axum::Json<ElectionsExcludeResponse>, AppError> {
     if state.runtime_cfg.get().elections.is_none() {
@@ -591,6 +618,26 @@ pub async fn v1_elections_include_handler(
         .map(|(name, _)| name.clone())
         .collect();
     tracing::info!("elections excluded: {}", excluded.join(", "));
+
+    let changes: Vec<_> = to_include
+        .iter()
+        .map(|node| {
+            super::rest_audit::config_field(
+                format!("bindings.{node}.enable"),
+                serde_json::json!(false),
+                serde_json::json!(true),
+            )
+        })
+        .collect();
+    super::rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "elections",
+        "elections.include",
+        changes,
+    )
+    .await;
 
     let applied = ElectionsExcludeResult { excluded, updated_at: state.runtime_cfg.updated_at() };
     Ok(axum::Json(ElectionsExcludeResponse { ok: true, result: applied }))
@@ -728,6 +775,13 @@ pub async fn login_handler(
                 rate_limit_key = %limiter_key,
                 "login rejected"
             );
+            super::rest_audit::record_login_rejected(
+                &state,
+                &req.username,
+                "rate_limited",
+                &headers,
+            )
+            .await;
             return Err(AppError::too_many_requests("too many login attempts, try again later"));
         }
     }
@@ -765,6 +819,13 @@ pub async fn login_handler(
                     rate_limit_key = %limiter_key,
                     "login rejected"
                 );
+                super::rest_audit::record_login_rejected(
+                    &state,
+                    &req.username,
+                    "rate_limited",
+                    &headers,
+                )
+                .await;
                 return Err(AppError::too_many_requests(
                     "too many login attempts, try again later",
                 ));
@@ -778,6 +839,13 @@ pub async fn login_handler(
                 rate_limit_key = %limiter_key,
                 "login rejected"
             );
+            super::rest_audit::record_login_rejected(
+                &state,
+                &req.username,
+                "invalid_credentials",
+                &headers,
+            )
+            .await;
             return Err(AppError::unauthorized("invalid username or password"));
         }
     };
@@ -798,6 +866,9 @@ pub async fn login_handler(
         );
         AppError::internal("token generation failed")
     })?;
+
+    super::rest_audit::record_login_success(&state, &req.username, &role.to_string(), &headers)
+        .await;
 
     Ok(axum::Json(LoginResponse { ok: true, token, expires_in, role: role.to_string() }))
 }
@@ -1058,13 +1129,14 @@ mod tests {
         let user_store = Arc::new(UserStore::new(runtime_cfg.clone() as Arc<dyn RuntimeConfig>));
         AppState {
             store,
-            runtime_cfg,
+            runtime_cfg: runtime_cfg.clone(),
             elections_task,
             jwt_auth: test_jwt_auth().await,
             user_store,
             login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
             config_changed: Arc::new(tokio::sync::Notify::new()),
             audit: Arc::new(NoopAuditLog),
+            actor_builder: Arc::new(AuditActorBuilder::new(runtime_cfg)),
         }
     }
 

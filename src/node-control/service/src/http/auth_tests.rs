@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    audit::{AuditActorBuilder, AuditEventPayload, in_memory::InMemoryAuditLog, log::AuditLog},
     auth::{Role, jwt::JwtAuth, user_store::UserStore},
     http::http_server_task::*,
     runtime_config::{RuntimeConfig, RuntimeConfigStore},
@@ -170,11 +171,31 @@ async fn state_with_auth() -> AppState {
         runtime_cfg: rt.clone(),
         elections_task: elections_task(rt.clone()),
         jwt_auth: test_jwt_auth().await,
-        user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
+        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
         config_changed: Arc::new(tokio::sync::Notify::new()),
         audit: Arc::new(crate::audit::log::NoopAuditLog),
+        actor_builder: Arc::new(AuditActorBuilder::new(rt.clone())),
     }
+}
+
+async fn state_with_auth_audited() -> (AppState, Arc<InMemoryAuditLog>) {
+    let cfg = auth_config();
+    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(cfg.clone())));
+    let audit_mem = Arc::new(InMemoryAuditLog::new());
+    let audit: Arc<dyn AuditLog> = audit_mem.clone();
+    let state = AppState {
+        store: Arc::new(SnapshotStore::new()),
+        runtime_cfg: rt.clone(),
+        elections_task: elections_task(rt.clone()),
+        jwt_auth: test_jwt_auth().await,
+        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
+        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        config_changed: Arc::new(tokio::sync::Notify::new()),
+        audit,
+        actor_builder: Arc::new(AuditActorBuilder::new(rt)),
+    };
+    (state, audit_mem)
 }
 
 async fn state_no_auth() -> AppState {
@@ -188,6 +209,7 @@ async fn state_no_auth() -> AppState {
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
         config_changed: Arc::new(tokio::sync::Notify::new()),
         audit: Arc::new(crate::audit::log::NoopAuditLog),
+        actor_builder: Arc::new(AuditActorBuilder::new(rt)),
     }
 }
 
@@ -680,4 +702,58 @@ async fn delete_user_via_rest_returns_404() {
 
     let resp = app(st).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+// --- Audit emission ---
+
+#[tokio::test]
+async fn login_success_emits_audit_event() {
+    let (st, audit) = state_with_auth_audited().await;
+    let resp = app(st.clone())
+        .oneshot(post_json(
+            "/auth/login",
+            &LoginRequest { username: "op".into(), password: "pass1".into() },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].payload, AuditEventPayload::RestApiAuthLoginSuccess {}));
+    let body = serde_json::to_string(&events[0]).unwrap();
+    assert!(!body.contains("pass1"));
+}
+
+#[tokio::test]
+async fn login_failure_emits_rejected_event_without_password() {
+    let (st, audit) = state_with_auth_audited().await;
+    let resp = app(st)
+        .oneshot(post_json(
+            "/auth/login",
+            &LoginRequest { username: "op".into(), password: "wrong".into() },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    let AuditEventPayload::RestApiAuthLoginRejected { reason } = &events[0].payload else {
+        panic!("expected login rejected payload");
+    };
+    assert_eq!(reason, "invalid_credentials");
+    let body = serde_json::to_string(&events[0]).unwrap();
+    assert!(!body.contains("wrong"));
+}
+
+#[tokio::test]
+async fn invalid_token_emits_token_rejected_event() {
+    let (st, audit) = state_with_auth_audited().await;
+    let resp = app(st).oneshot(get_bearer("/v1/elections", "not.a.jwt")).await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].payload, AuditEventPayload::RestApiTokenRejected { .. }));
 }

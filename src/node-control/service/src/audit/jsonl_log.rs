@@ -11,7 +11,6 @@ use crate::audit::{
     jsonl_writer::{AuditCommand, AuditWriter},
     log::AuditLog,
 };
-use async_trait::async_trait;
 use std::{
     sync::{
         Arc, Mutex,
@@ -19,15 +18,10 @@ use std::{
     },
     time::Duration,
 };
-use thiserror::Error;
-use tokio::{
-    sync::{Mutex as AsyncMutex, mpsc, oneshot},
-    task::JoinHandle,
-};
 
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum AuditInitError {
     #[error("failed to create audit directory: {0}")]
     DirCreate(#[source] std::io::Error),
@@ -40,15 +34,15 @@ pub enum AuditInitError {
 }
 
 pub struct JsonlAuditLog {
-    sender: mpsc::Sender<AuditCommand>,
-    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    sender: tokio::sync::mpsc::Sender<AuditCommand>,
+    shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Serializes `shutdown()` so all concurrent callers observe completion.
-    shutdown_gate: AsyncMutex<()>,
+    shutdown_gate: tokio::sync::Mutex<()>,
     dropped_events: Arc<AtomicU64>,
     config: Arc<AuditLogConfig>,
     /// Writer task handle, consumed by the first [`AuditLog::shutdown`] call so
     /// callers can await the final drain/flush. `None` after shutdown.
-    writer: Mutex<Option<JoinHandle<()>>>,
+    writer: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl JsonlAuditLog {
@@ -97,14 +91,14 @@ impl JsonlAuditLog {
         dropped_events: Arc<AtomicU64>,
         writer: AuditWriter,
     ) -> Arc<Self> {
-        let (tx, rx) = mpsc::channel(config.queue_capacity.max(1));
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(config.queue_capacity.max(1));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(writer.run(rx, shutdown_rx));
 
         Arc::new(Self {
             sender: tx,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
-            shutdown_gate: AsyncMutex::new(()),
+            shutdown_gate: tokio::sync::Mutex::new(()),
             dropped_events,
             config,
             writer: Mutex::new(Some(handle)),
@@ -117,7 +111,7 @@ impl JsonlAuditLog {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl AuditLog for JsonlAuditLog {
     async fn shutdown(&self) {
         let _shutdown_guard = self.shutdown_gate.lock().await;
@@ -159,7 +153,7 @@ impl AuditLog for JsonlAuditLog {
 
         match self.sender.try_send(cmd) {
             Ok(()) => return,
-            Err(mpsc::error::TrySendError::Full(cmd)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
                 let timeout = Duration::from_millis(self.config.queue_full_timeout_ms);
                 match tokio::time::timeout(timeout, self.sender.send(cmd)).await {
                     Ok(Ok(())) => return,
@@ -176,7 +170,7 @@ impl AuditLog for JsonlAuditLog {
                     }
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.dropped_events.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("audit log channel closed; service likely shutting down");
             }
