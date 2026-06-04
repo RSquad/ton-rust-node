@@ -22,6 +22,22 @@ pub(crate) enum AdaptiveDeferReason {
     WaitingForParticipants,
 }
 
+/// Why AdaptiveSplit50 returns zero stake after the defer window has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveStakeZero {
+    /// Stake already meets min effective — no top-up this tick (not an error).
+    NoTopUpNeeded,
+    /// Free pool balance is below the required delta to min effective stake.
+    InsufficientFree { required: u64, available: u64 },
+}
+
+/// Outcome of [`calc_adaptive_stake`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveStakeResult {
+    Stake(u64),
+    Zero(AdaptiveStakeZero),
+}
+
 /// Returns `true` if staking should proceed, `false` if we should defer (return 0).
 pub(crate) fn is_adaptive_split50_ready(
     node_id: &str,
@@ -121,7 +137,7 @@ pub(crate) fn calc_adaptive_stake(
     cfg16: &ConfigParam16,
     cfg17: &ConfigParam17,
     prev_min_stake: Option<u64>,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<AdaptiveStakeResult> {
     let min_validators = cfg16.min_validators.as_u16();
     let max_validators = cfg16.max_validators.as_u16();
     let max_stake_factor = cfg17.max_stake_factor;
@@ -192,7 +208,7 @@ pub(crate) fn calc_adaptive_stake(
             nanotons_to_tons_f64(current_stake),
             nanotons_to_tons_f64(min_eff_stake)
         );
-        return Ok(0);
+        return Ok(AdaptiveStakeResult::Zero(AdaptiveStakeZero::NoTopUpNeeded));
     }
 
     // Insufficient funds guard — if the pool doesn't have enough free
@@ -208,7 +224,10 @@ pub(crate) fn calc_adaptive_stake(
             nanotons_to_tons_f64(required),
             nanotons_to_tons_f64(min_eff_stake),
         );
-        return Ok(0);
+        return Ok(AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree {
+            required,
+            available: free_balance,
+        }));
     }
 
     // Decide between staking half or min_eff_stake.
@@ -232,9 +251,12 @@ pub(crate) fn calc_adaptive_stake(
                 nanotons_to_tons_f64(stake),
                 nanotons_to_tons_f64(free_balance),
             );
-            return Ok(0);
+            return Ok(AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree {
+                required: stake,
+                available: free_balance,
+            }));
         }
-        Ok(stake)
+        Ok(AdaptiveStakeResult::Stake(stake))
     } else {
         // half < min_eff — splitting is not viable.
         // Since half < min_eff, it follows that total < 2 * min_eff,
@@ -247,13 +269,21 @@ pub(crate) fn calc_adaptive_stake(
             nanotons_to_tons_f64(min_eff_stake),
             nanotons_to_tons_f64(free_balance),
         );
-        Ok(free_balance)
+        Ok(AdaptiveStakeResult::Stake(free_balance))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stake_amount(r: AdaptiveStakeResult) -> u64 {
+        match r {
+            AdaptiveStakeResult::Stake(s) => s,
+            other => panic!("expected stake, got {other:?}"),
+        }
+    }
+
     use ton_block::{
         Coins, Number16,
         config_params::{ConfigParam16, ConfigParam17},
@@ -312,7 +342,7 @@ mod tests {
         .unwrap();
 
         let half = total_balance / 2;
-        assert_eq!(result, half, "should stake half");
+        assert_eq!(stake_amount(result), half, "should stake half");
     }
 
     // ---- half < min_eff → stake all ----
@@ -346,7 +376,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, free_balance, "should stake all free_balance when half < min_eff");
+        assert_eq!(
+            stake_amount(result),
+            free_balance,
+            "should stake all free_balance when half < min_eff"
+        );
     }
 
     // ---- current_stake >= min_eff → no top-up ----
@@ -375,7 +409,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, 0, "should return 0 when current_stake >= min_eff");
+        assert_eq!(result, AdaptiveStakeResult::Zero(AdaptiveStakeZero::NoTopUpNeeded));
     }
 
     // ---- insufficient funds guard ----
@@ -405,7 +439,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, 0, "should skip when free_balance < min_eff_stake");
+        assert!(matches!(
+            result,
+            AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree { .. })
+        ));
     }
 
     // ---- cap to free_balance when half > free_balance ----
@@ -438,7 +475,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, 0, "should skip when free_balance < half (operator should top up pool)");
+        assert!(matches!(
+            result,
+            AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree { .. })
+        ));
     }
 
     // ---- curr vs prev selection ----
@@ -469,7 +509,7 @@ mod tests {
         .unwrap();
 
         let half = total_balance / 2;
-        assert_eq!(result, half, "should use curr_min_eff and stake half");
+        assert_eq!(stake_amount(result), half, "should use curr_min_eff and stake half");
     }
 
     #[test]
@@ -500,7 +540,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            result, free_balance,
+            stake_amount(result),
+            free_balance,
             "should use curr_min_eff (not prev) and stake all when half < curr"
         );
     }
@@ -533,7 +574,11 @@ mod tests {
         .unwrap();
 
         let half = total_balance / 2;
-        assert_eq!(result, half, "should fallback to prev_min_eff when not enough participants");
+        assert_eq!(
+            stake_amount(result),
+            half,
+            "should fallback to prev_min_eff when not enough participants"
+        );
     }
 
     // ---- both None → error ----
@@ -593,6 +638,6 @@ mod tests {
         .unwrap();
 
         let expected = total_balance / 2 - current_stake;
-        assert_eq!(result, expected, "should top up to half");
+        assert_eq!(stake_amount(result), expected, "should top up to half");
     }
 }

@@ -110,7 +110,10 @@ impl AuditLog for JsonlAuditLog {
                 let timeout = Duration::from_millis(self.config.queue_full_timeout_ms);
                 match tokio::time::timeout(timeout, self.sender.send(cmd)).await {
                     Ok(Ok(())) => return,
-                    _ => {
+                    Ok(Err(_)) => {
+                        tracing::error!("audit log channel closed; service likely shutting down");
+                    }
+                    Err(_) => {
                         self.dropped_events.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             ?event_id,
