@@ -167,6 +167,12 @@ pub async fn run_with_config(
     for task in tasks.values() {
         let _ = task.disable().await;
     }
-    let _ = http_task_handle.await;
+    if let Err(e) = http_task_handle.await {
+        tracing::error!("http server task join failed during shutdown: {e}");
+    }
+
+    // Drain and flush the audit log after all producers have stopped, so the
+    // final batch is persisted before the process exits.
+    audit.shutdown().await;
     Ok(())
 }

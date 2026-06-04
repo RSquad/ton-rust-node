@@ -12,6 +12,7 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait AuditLog: Send + Sync {
     async fn record(&self, event: AuditEvent);
+    async fn shutdown(&self) {}
 }
 
 pub struct NoopAuditLog;

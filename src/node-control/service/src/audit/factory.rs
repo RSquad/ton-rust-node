@@ -8,10 +8,10 @@
  */
 use crate::audit::{
     AuditLogConfig,
+    jsonl_log::{AuditInitError, JsonlAuditLog},
     log::{AuditLog, NoopAuditLog},
 };
 use std::sync::Arc;
-use thiserror::Error;
 
 pub struct AuditLogFactory;
 
@@ -20,20 +20,9 @@ impl AuditLogFactory {
         if !config.enabled {
             return Ok(Arc::new(NoopAuditLog));
         }
-        unimplemented!(
-            "JsonlAuditLog writer is not implemented yet; set audit_log.enabled = false to disable"
-        );
+        let log = JsonlAuditLog::start(config.clone()).await?;
+        Ok(log)
     }
-}
-
-#[derive(Debug, Error)]
-pub enum AuditInitError {
-    #[error("audit log path is invalid: {0}")]
-    InvalidPath(String),
-    #[error("failed to create audit directory: {0}")]
-    DirCreate(#[source] std::io::Error),
-    #[error("failed to open audit file: {0}")]
-    FileOpen(#[source] std::io::Error),
 }
 
 #[cfg(test)]
@@ -48,7 +37,8 @@ mod tests {
         participant::{AuditActor, AuditSubject},
     };
     use chrono::Utc;
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
     use uuid::Uuid;
 
     fn sample_event() -> AuditEvent {
@@ -79,9 +69,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "JsonlAuditLog writer is not implemented yet")]
-    async fn factory_panics_when_enabled_without_jsonl_writer() {
-        let cfg = AuditLogConfig { enabled: true, ..AuditLogConfig::default() };
-        let _ = AuditLogFactory::from_config(&cfg).await;
+    async fn factory_starts_jsonl_when_enabled() {
+        let dir = tempdir().unwrap();
+        let mut cfg = AuditLogConfig { enabled: true, ..AuditLogConfig::default() };
+        cfg.path = dir.path().join("audit.jsonl");
+        let log = AuditLogFactory::from_config(&cfg).await.expect("factory init");
+        log.record(sample_event()).await;
+        log.shutdown().await;
     }
 }
