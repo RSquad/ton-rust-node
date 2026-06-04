@@ -6,10 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::audit::{
-    AuditEvent, AuditFileHeader, AuditLogConfig, enums::AuditEventPayload,
-    jsonl_log::AuditInitError,
-};
+use crate::audit::{AuditEvent, AuditFileHeader, AuditLogConfig, jsonl_log::AuditInitError};
 use chrono::Utc;
 use std::{
     sync::{

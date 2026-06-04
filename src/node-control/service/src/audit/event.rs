@@ -427,11 +427,8 @@ mod tests {
         );
         assert_eq!(skipped.outcome, AuditOutcome::Skipped);
 
-        let failed = AuditEvent::elections_tick_failed(
-            AuditActor::scheduler("elections-task"),
-            None,
-            "boom",
-        );
+        let failed =
+            AuditEvent::elections_tick_failed(AuditActor::service("elections-task"), None, "boom");
         assert_eq!(failed.outcome, AuditOutcome::Failure);
         assert_eq!(failed.target, AuditTarget::System);
     }
