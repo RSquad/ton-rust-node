@@ -20,20 +20,30 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{Mutex as AsyncMutex, mpsc, oneshot},
+    task::JoinHandle,
+};
+
+const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum AuditInitError {
-    #[error("audit log path is invalid: {0}")]
-    InvalidPath(String),
     #[error("failed to create audit directory: {0}")]
     DirCreate(#[source] std::io::Error),
     #[error("failed to open audit file: {0}")]
     FileOpen(#[source] std::io::Error),
+    #[error("failed to set audit file permissions: {0}")]
+    SetPermissions(#[source] std::io::Error),
+    #[error("failed to read audit file metadata: {0}")]
+    Metadata(#[source] std::io::Error),
 }
 
 pub struct JsonlAuditLog {
     sender: mpsc::Sender<AuditCommand>,
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// Serializes `shutdown()` so all concurrent callers observe completion.
+    shutdown_gate: AsyncMutex<()>,
     dropped_events: Arc<AtomicU64>,
     config: Arc<AuditLogConfig>,
     /// Writer task handle, consumed by the first [`AuditLog::shutdown`] call so
@@ -43,7 +53,7 @@ pub struct JsonlAuditLog {
 
 impl JsonlAuditLog {
     pub async fn start(config: AuditLogConfig) -> Result<Arc<Self>, AuditInitError> {
-        Self::start_inner(config, Duration::ZERO).await
+        Self::start_inner(config).await
     }
 
     #[cfg(test)]
@@ -51,29 +61,54 @@ impl JsonlAuditLog {
         config: AuditLogConfig,
         write_delay: Duration,
     ) -> Result<Arc<Self>, AuditInitError> {
-        Self::start_inner(config, write_delay).await
+        let config = Arc::new(config);
+        Self::ensure_parent_dir(&config).await?;
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let writer =
+            AuditWriter::open_with_write_delay(config.clone(), dropped_events.clone(), write_delay)
+                .await?;
+        Ok(Self::spawn_writer(config, dropped_events, writer))
     }
 
-    async fn start_inner(
-        config: AuditLogConfig,
-        write_delay: Duration,
-    ) -> Result<Arc<Self>, AuditInitError> {
+    async fn start_inner(config: AuditLogConfig) -> Result<Arc<Self>, AuditInitError> {
         let config = Arc::new(config);
-        if let Some(parent) = config.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await.map_err(AuditInitError::DirCreate)?;
-            }
-        } else {
-            return Err(AuditInitError::InvalidPath(config.path.to_string_lossy().to_string()));
-        }
-
-        let (tx, rx) = mpsc::channel(config.queue_capacity.max(1));
+        Self::ensure_parent_dir(&config).await?;
         let dropped_events = Arc::new(AtomicU64::new(0));
+        let writer = AuditWriter::open(config.clone(), dropped_events.clone()).await?;
+        Ok(Self::spawn_writer(config, dropped_events, writer))
+    }
 
-        let writer = AuditWriter::open(config.clone(), dropped_events.clone(), write_delay).await?;
-        let handle = tokio::spawn(writer.run(rx));
+    async fn ensure_parent_dir(config: &AuditLogConfig) -> Result<(), AuditInitError> {
+        match config.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                tokio::fs::create_dir_all(parent).await.map_err(AuditInitError::DirCreate)
+            }
+            Some(_) => Ok(()),
+            None => Err(AuditInitError::DirCreate(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("audit log path has no parent: {}", config.path.to_string_lossy()),
+            ))),
+        }
+    }
 
-        Ok(Arc::new(Self { sender: tx, dropped_events, config, writer: Mutex::new(Some(handle)) }))
+    /// Wires the channels and spawns the writer task for an already-opened writer.
+    fn spawn_writer(
+        config: Arc<AuditLogConfig>,
+        dropped_events: Arc<AtomicU64>,
+        writer: AuditWriter,
+    ) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel(config.queue_capacity.max(1));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(writer.run(rx, shutdown_rx));
+
+        Arc::new(Self {
+            sender: tx,
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            shutdown_gate: AsyncMutex::new(()),
+            dropped_events,
+            config,
+            writer: Mutex::new(Some(handle)),
+        })
     }
 
     #[cfg(test)]
@@ -85,21 +120,39 @@ impl JsonlAuditLog {
 #[async_trait]
 impl AuditLog for JsonlAuditLog {
     async fn shutdown(&self) {
-        // Signal the writer to drain and flush the final batch. The writer also
-        // stops on channel close, but sending an explicit command lets us await
-        // the flush deterministically.
-        let _ = self.sender.send(AuditCommand::Shutdown).await;
+        let _shutdown_guard = self.shutdown_gate.lock().await;
+
+        // Use a dedicated shutdown signal that cannot block behind a full event
+        // queue. The writer still handles channel-close and Shutdown command
+        // for compatibility with existing tests.
+        let shutdown = self.shutdown_tx.lock().expect("audit shutdown lock poisoned").take();
+        if let Some(shutdown) = shutdown {
+            let _ = shutdown.send(());
+        }
 
         // Take the handle without holding the lock across the await.
         let handle = self.writer.lock().expect("audit writer lock poisoned").take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        if let Some(mut handle) = handle {
+            match tokio::time::timeout(WRITER_SHUTDOWN_TIMEOUT, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("audit writer task join failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = WRITER_SHUTDOWN_TIMEOUT.as_secs(),
+                        "audit writer shutdown timed out; aborting writer task"
+                    );
+                    handle.abort();
+                    if let Err(e) = handle.await {
+                        tracing::error!("audit writer task join failed after abort: {e}");
+                    }
+                }
+            }
         }
     }
 
     async fn record(&self, event: AuditEvent) {
-        // Capture diagnostics up front so a dropped event can still be attributed
-        // to its id/source after the event is moved into the send future.
         let event_id = event.id;
         let source = event.payload.source();
         let cmd = AuditCommand::Event(Box::new(event));
@@ -124,8 +177,51 @@ impl AuditLog for JsonlAuditLog {
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.dropped_events.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("audit log channel closed; service likely shutting down");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::{AuditEvent, log::AuditLog};
+    use std::{path::PathBuf, time::Instant};
+    use tempfile::tempdir;
+
+    fn sample_event(tag: &str) -> AuditEvent {
+        AuditEvent::system_service_started(tag)
+    }
+
+    fn test_config(path: PathBuf) -> AuditLogConfig {
+        AuditLogConfig {
+            path,
+            queue_capacity: 1,
+            queue_full_timeout_ms: 10,
+            batch_interval_ms: 60_000,
+            batch_max_events: 100,
+            ..AuditLogConfig::default()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_does_not_block_when_writer_is_slow_and_queue_is_full() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(dir.path().join("audit.jsonl"));
+        let log =
+            JsonlAuditLog::start_with_write_delay(cfg, Duration::from_secs(30)).await.unwrap();
+
+        for i in 0..50 {
+            log.record(sample_event(&format!("ev-{i}"))).await;
+        }
+
+        let started = Instant::now();
+        log.shutdown().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "shutdown should not block indefinitely behind queue backpressure"
+        );
     }
 }
