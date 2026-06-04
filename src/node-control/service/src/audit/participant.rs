@@ -8,16 +8,10 @@
  */
 use serde::{Deserialize, Serialize};
 
-/// Who initiated the action. Internally tagged: the wire shape is
-/// `{ "kind": "...", ...variant fields }`, so illegal field combinations
-/// (e.g. a `role` on a scheduler) are unrepresentable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditActor {
     Service {
-        id: String,
-    },
-    Scheduler {
         id: String,
     },
     User {
@@ -33,10 +27,6 @@ pub enum AuditActor {
 impl AuditActor {
     pub fn service(id: impl Into<String>) -> Self {
         Self::Service { id: id.into() }
-    }
-
-    pub fn scheduler(id: impl Into<String>) -> Self {
-        Self::Scheduler { id: id.into() }
     }
 
     pub fn user(id: impl Into<String>, role: Option<String>, ip: Option<String>) -> Self {

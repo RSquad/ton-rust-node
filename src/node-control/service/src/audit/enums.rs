@@ -8,17 +8,10 @@
  */
 use serde::{Deserialize, Serialize};
 
-/// Typed event payload. The wire shape is
-/// `{ "event_type": "elections.stake_submitted", "data": { ... } }`.
-///
-/// `election_id` is intentionally absent from the variants: it lives on the
-/// event `target` (`AuditTarget::Node { election_id }` /
-/// `AuditTarget::Elections { election_id }`), so it is never duplicated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditEventPayload {
-    // ── elections ──────────────────────────────────────────────────────────
     #[serde(rename = "elections.tick_failed")]
     ElectionsTickFailed { reason: String },
 
@@ -136,8 +129,6 @@ pub enum AuditOutcome {
     Failure,
     Skipped,
 }
-
-// ── Derived properties — kept in code, never serialized onto the wire ────────
 
 /// Log-level-like severity, derived from the event type at the display layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
