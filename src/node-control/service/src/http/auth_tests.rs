@@ -174,6 +174,7 @@ async fn state_with_auth() -> AppState {
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
         config_changed: Arc::new(tokio::sync::Notify::new()),
         audit: Arc::new(crate::audit::log::NoopAuditLog),
+        audit_ring: crate::audit::AuditEventBuffer::new(0),
     }
 }
 
@@ -188,6 +189,7 @@ async fn state_no_auth() -> AppState {
         login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
         config_changed: Arc::new(tokio::sync::Notify::new()),
         audit: Arc::new(crate::audit::log::NoopAuditLog),
+        audit_ring: crate::audit::AuditEventBuffer::new(0),
     }
 }
 

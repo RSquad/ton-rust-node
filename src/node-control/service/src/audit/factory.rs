@@ -10,18 +10,31 @@ use crate::audit::{
     AuditLogConfig,
     jsonl_log::{AuditInitError, JsonlAuditLog},
     log::{AuditLog, NoopAuditLog},
+    ring_buffer::AuditEventBuffer,
 };
 use std::sync::Arc;
+
+/// Output of [`AuditLogFactory::from_config`]: the write handle and a separate ring
+/// buffer for the REST read-path. Both are always present; the ring is empty (capacity 0
+/// is normalised to 1) when `config.enabled` is false.
+pub struct AuditComponents {
+    pub log: Arc<dyn AuditLog>,
+    pub ring: Arc<AuditEventBuffer>,
+}
 
 pub struct AuditLogFactory;
 
 impl AuditLogFactory {
-    pub async fn from_config(config: &AuditLogConfig) -> Result<Arc<dyn AuditLog>, AuditInitError> {
+    pub async fn from_config(config: &AuditLogConfig) -> Result<AuditComponents, AuditInitError> {
         if !config.enabled {
-            return Ok(Arc::new(NoopAuditLog));
+            return Ok(AuditComponents {
+                log: Arc::new(NoopAuditLog),
+                ring: AuditEventBuffer::new(0),
+            });
         }
         let log = JsonlAuditLog::start(config.clone()).await?;
-        Ok(log)
+        let ring = log.ring();
+        Ok(AuditComponents { log, ring })
     }
 }
 
@@ -38,8 +51,11 @@ mod tests {
     #[tokio::test]
     async fn factory_returns_noop_when_disabled() {
         let cfg = AuditLogConfig { enabled: false, ..AuditLogConfig::default() };
-        let log = AuditLogFactory::from_config(&cfg).await.expect("factory init");
+        let AuditComponents { log, ring } =
+            AuditLogFactory::from_config(&cfg).await.expect("factory init");
         log.record(sample_event()).await;
+        // Noop ring: event not pushed (NoopAuditLog doesn't touch the ring).
+        let _ = ring;
     }
 
     #[tokio::test]
@@ -47,8 +63,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut cfg = AuditLogConfig { enabled: true, ..AuditLogConfig::default() };
         cfg.path = dir.path().join("audit.jsonl");
-        let log = AuditLogFactory::from_config(&cfg).await.expect("factory init");
+        let AuditComponents { log, ring } =
+            AuditLogFactory::from_config(&cfg).await.expect("factory init");
         log.record(sample_event()).await;
+        assert_eq!(ring.len(), 1, "ring should contain the recorded event");
         log.shutdown().await;
     }
 }

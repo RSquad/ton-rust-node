@@ -10,6 +10,7 @@ use crate::audit::{
     AuditEvent, AuditLogConfig,
     jsonl_writer::{AuditCommand, AuditWriter},
     log::AuditLog,
+    ring_buffer::AuditEventBuffer,
 };
 use async_trait::async_trait;
 use std::{
@@ -46,6 +47,9 @@ pub struct JsonlAuditLog {
     shutdown_gate: AsyncMutex<()>,
     dropped_events: Arc<AtomicU64>,
     config: Arc<AuditLogConfig>,
+    /// In-memory ring buffer for the REST read-path. Populated in `record()` before
+    /// the channel send so events appear immediately and survive queue overflow.
+    ring: Arc<AuditEventBuffer>,
     /// Writer task handle, consumed by the first [`AuditLog::shutdown`] call so
     /// callers can await the final drain/flush. `None` after shutdown.
     writer: Mutex<Option<JoinHandle<()>>>,
@@ -91,6 +95,11 @@ impl JsonlAuditLog {
         }
     }
 
+    /// Returns a handle to the ring buffer for the REST read-path.
+    pub fn ring(&self) -> Arc<AuditEventBuffer> {
+        self.ring.clone()
+    }
+
     /// Wires the channels and spawns the writer task for an already-opened writer.
     fn spawn_writer(
         config: Arc<AuditLogConfig>,
@@ -100,12 +109,14 @@ impl JsonlAuditLog {
         let (tx, rx) = mpsc::channel(config.queue_capacity.max(1));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = tokio::spawn(writer.run(rx, shutdown_rx));
+        let ring = AuditEventBuffer::new(config.ring_buffer_capacity);
 
         Arc::new(Self {
             sender: tx,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             shutdown_gate: AsyncMutex::new(()),
             dropped_events,
+            ring,
             config,
             writer: Mutex::new(Some(handle)),
         })
@@ -153,6 +164,18 @@ impl AuditLog for JsonlAuditLog {
     }
 
     async fn record(&self, event: AuditEvent) {
+        // Deduplication: drop events whose key already exists in the ring.
+        // Prevents e.g. repeated elections.stake_skipped for the same (node, election, reason).
+        if let Some(key) = event.dedup_key()
+            && self.ring.contains_dedup_key(&key)
+        {
+            return;
+        }
+
+        // Push into ring first: readers see the event immediately and even
+        // queue-dropped events remain accessible on the REST read-path.
+        self.ring.push(event.clone());
+
         let event_id = event.id;
         let source = event.payload.source();
         let cmd = AuditCommand::Event(Box::new(event));
@@ -223,5 +246,40 @@ mod tests {
             started.elapsed() < Duration::from_secs(15),
             "shutdown should not block indefinitely behind queue backpressure"
         );
+    }
+
+    /// Ring buffer must contain the event even when the writer queue is full and
+    /// the event is dropped from the channel (dropped_events increments).
+    ///
+    /// Uses `write_delay = 500ms` so the writer is slow relative to the 10ms
+    /// channel timeout, guaranteeing that most events are dropped from the channel
+    /// while still being captured in the ring (populated before the send attempt).
+    #[tokio::test(flavor = "current_thread")]
+    async fn record_pushes_to_ring_even_when_queue_full() {
+        let dir = tempdir().unwrap();
+        let cfg = AuditLogConfig {
+            path: dir.path().join("audit.jsonl"),
+            queue_capacity: 1,
+            queue_full_timeout_ms: 10,
+            ring_buffer_capacity: 200,
+            batch_interval_ms: 60_000,
+            batch_max_events: 1,
+            ..AuditLogConfig::default()
+        };
+        let log =
+            JsonlAuditLog::start_with_write_delay(cfg, Duration::from_millis(500)).await.unwrap();
+
+        for i in 0..50 {
+            log.record(sample_event(&format!("ev-{i}"))).await;
+        }
+        // Let the runtime settle so the dropped_events counter is up to date.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Ring captures every record() call regardless of channel state.
+        assert_eq!(log.ring().len(), 50, "ring must contain every record() call");
+        // Writer is ~500 ms/event; timeout is 10 ms → most events dropped from channel.
+        assert!(log.dropped_events() > 0, "some events must have been dropped from channel");
+
+        log.shutdown().await;
     }
 }

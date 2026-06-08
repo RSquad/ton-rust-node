@@ -960,7 +960,7 @@ fn default_audit_include_payload() -> bool {
 }
 
 fn default_audit_ring_buffer_capacity() -> usize {
-    10_000
+    100
 }
 
 fn default_audit_enabled() -> bool {

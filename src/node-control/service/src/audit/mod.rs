@@ -15,6 +15,7 @@ pub mod jsonl_log;
 pub mod jsonl_writer;
 pub mod log;
 pub mod participant;
+pub mod ring_buffer;
 
 pub use common::app_config::AuditLogConfig;
 pub use enums::{
@@ -27,3 +28,4 @@ pub use in_memory::InMemoryAuditLog;
 pub use jsonl_log::AuditInitError;
 pub use log::{AuditLog, NoopAuditLog};
 pub use participant::{AuditActor, AuditTarget};
+pub use ring_buffer::AuditEventBuffer;

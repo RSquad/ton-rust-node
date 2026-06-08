@@ -67,13 +67,29 @@ pub struct AuditEvent {
 /// Named payload fields for [`AuditEvent::elections_stake_submitted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectionsStakeSubmittedParams {
-    pub stake_nanotons: String,
+    pub stake: String,
     pub max_factor: u32,
     pub policy: String,
     pub submission_time: u64,
 }
 
 impl AuditEvent {
+    /// Returns a stable deduplication key for events that should appear at most once
+    /// per election in the audit log (e.g. `elections.stake_skipped` with a persistent
+    /// reason like `ElectionsDisabled`).
+    ///
+    /// Returns `None` for events that are always recorded without deduplication.
+    /// The key encodes `(event_category, node_id, election_id, reason)` so that
+    /// the same skip reason for the same node in the same election is written only once.
+    pub fn dedup_key(&self) -> Option<String> {
+        if let AuditEventPayload::ElectionsStakeSkipped { reason, .. } = &self.payload
+            && let AuditTarget::Node { id: node_id, election_id: Some(election_id) } = &self.target
+        {
+            return Some(format!("stake_skipped:{node_id}:{election_id}:{reason:?}"));
+        }
+        None
+    }
+
     /// Internal constructor that stamps `id`/`ts`. Crate-private so call sites
     /// must go through the typed constructors below, which bake the canonical
     /// outcome per event type.
@@ -116,7 +132,7 @@ impl AuditEvent {
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
             AuditEventPayload::ElectionsStakeSubmitted {
-                stake_nanotons: params.stake_nanotons,
+                stake: params.stake,
                 max_factor: params.max_factor,
                 policy: params.policy,
                 submission_time: params.submission_time,
@@ -129,18 +145,14 @@ impl AuditEvent {
         node_id: impl Into<String>,
         election_id: u64,
         reason: StakeSkipReason,
-        required_nanotons: Option<String>,
-        available_nanotons: Option<String>,
+        required: Option<String>,
+        available: Option<String>,
     ) -> Self {
         Self::new(
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Skipped,
-            AuditEventPayload::ElectionsStakeSkipped {
-                reason,
-                required_nanotons,
-                available_nanotons,
-            },
+            AuditEventPayload::ElectionsStakeSkipped { reason, required, available },
         )
     }
 
@@ -162,17 +174,14 @@ impl AuditEvent {
         actor: AuditActor,
         node_id: impl Into<String>,
         election_id: u64,
-        amount_nanotons: impl Into<String>,
+        amount: impl Into<String>,
         msg_hash: Option<String>,
     ) -> Self {
         Self::new(
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
-            AuditEventPayload::ElectionsStakeRecovered {
-                amount_nanotons: amount_nanotons.into(),
-                msg_hash,
-            },
+            AuditEventPayload::ElectionsStakeRecovered { amount: amount.into(), msg_hash },
         )
     }
 
@@ -279,7 +288,7 @@ mod tests {
             AuditActor::service("elections-task"),
             AuditTarget::Node { id: "node1".into(), election_id: Some(1_779_265_552) },
             AuditEventPayload::ElectionsStakeSubmitted {
-                stake_nanotons: "50000000000000".into(),
+                stake: "50000000000000".into(),
                 max_factor: 196_608,
                 policy: "adaptive_split50".into(),
                 submission_time: 1_779_265_400,
@@ -294,7 +303,7 @@ mod tests {
                 "outcome": "success",
                 "event_type": "elections.stake_submitted",
                 "data": {
-                    "stake_nanotons": "50000000000000",
+                    "stake": "50000000000000",
                     "max_factor": 196608,
                     "policy": "adaptive_split50",
                     "submission_time": 1779265400
@@ -313,8 +322,8 @@ mod tests {
             AuditTarget::Node { id: "node6".into(), election_id: Some(1_779_265_552) },
             AuditEventPayload::ElectionsStakeSkipped {
                 reason: StakeSkipReason::LowWalletBalance,
-                required_nanotons: Some("1200000000".into()),
-                available_nanotons: Some("900000000".into()),
+                required: Some("1200000000".into()),
+                available: Some("900000000".into()),
             },
         );
 
@@ -327,8 +336,8 @@ mod tests {
                 "event_type": "elections.stake_skipped",
                 "data": {
                     "reason": "low_wallet_balance",
-                    "required_nanotons": "1200000000",
-                    "available_nanotons": "900000000"
+                    "required": "1200000000",
+                    "available": "900000000"
                 },
                 "actor": { "kind": "service", "id": "elections-task" },
                 "target": { "kind": "node", "id": "node6", "election_id": 1779265552 }
@@ -373,29 +382,29 @@ mod tests {
         vec![
             AuditEventPayload::ElectionsKeyGenerated { pubkey: Some("aabb".into()) },
             AuditEventPayload::ElectionsStakeSubmitted {
-                stake_nanotons: "1".into(),
+                stake: "1".into(),
                 max_factor: 1,
                 policy: "all".into(),
                 submission_time: 1,
             },
-            AuditEventPayload::ElectionsStakeAccepted { stake_nanotons: "50000000000000".into() },
+            AuditEventPayload::ElectionsStakeAccepted { stake: "50000000000000".into() },
             AuditEventPayload::ElectionsStakeSkipped {
                 reason: StakeSkipReason::WithdrawRequestsPending,
-                required_nanotons: None,
-                available_nanotons: None,
+                required: None,
+                available: None,
             },
             AuditEventPayload::ElectionsStakeFailed { reason: "send failed".into() },
             AuditEventPayload::ElectionsWithdrawProcessed { msg_hash: "abc".into() },
             AuditEventPayload::ElectionsWithdrawFailed { reason: "send failed".into() },
             AuditEventPayload::ElectionsStakeRecovered {
-                amount_nanotons: "50000000000000".into(),
+                amount: "50000000000000".into(),
                 msg_hash: Some("def".into()),
             },
             AuditEventPayload::ElectionsStakeRecoverFailed { reason: "send failed".into() },
             AuditEventPayload::RewardsDistributionStarted { recipients_count: 3 },
             AuditEventPayload::RewardsDistributionCompleted {
                 recipients_count: 3,
-                total_nanotons: "9".into(),
+                total: "9".into(),
             },
             AuditEventPayload::RewardsDistributionFailed { reason: "rpc".into() },
             AuditEventPayload::RewardsRecipientSkipped { reason: "below_min".into() },
@@ -467,6 +476,6 @@ mod tests {
         assert!(cfg.include_payload);
         assert!(!cfg.record_client_ip);
         assert!(!cfg.ip_anonymize);
-        assert_eq!(cfg.ring_buffer_capacity, 10_000);
+        assert_eq!(cfg.ring_buffer_capacity, 100);
     }
 }

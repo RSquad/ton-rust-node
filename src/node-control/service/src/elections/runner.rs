@@ -1981,8 +1981,8 @@ async fn elections_audit_stake_skipped(
     election_id: u64,
     node_id: &str,
     reason: StakeSkipReason,
-    required_nanotons: Option<u64>,
-    available_nanotons: Option<u64>,
+    required: Option<u64>,
+    available: Option<u64>,
 ) {
     audit
         .record(AuditEvent::elections_stake_skipped(
@@ -1990,8 +1990,8 @@ async fn elections_audit_stake_skipped(
             node_id,
             election_id,
             reason,
-            required_nanotons.map(nanotons_to_dec_string),
-            available_nanotons.map(nanotons_to_dec_string),
+            required.map(nanotons_to_dec_string),
+            available.map(nanotons_to_dec_string),
         ))
         .await;
 }
@@ -2028,7 +2028,7 @@ async fn elections_audit_stake_submitted(
             node_id,
             participant.election_id,
             ElectionsStakeSubmittedParams {
-                stake_nanotons: nanotons_to_dec_string(stake),
+                stake: nanotons_to_dec_string(stake),
                 max_factor: participant.max_factor,
                 policy: node.stake_policy.to_string(),
                 submission_time,

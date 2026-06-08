@@ -23,7 +23,7 @@ use super::{
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
 use crate::{
-    audit::log::AuditLog,
+    audit::{AuditEventBuffer, log::AuditLog},
     auth::{
         Claims,
         jwt::JwtAuth,
@@ -55,6 +55,9 @@ pub struct AppState {
     /// (entity CRUD, ton-http-api) so the service loop can rebuild caches.
     pub config_changed: Arc<tokio::sync::Notify>,
     pub audit: Arc<dyn AuditLog>,
+    /// In-memory ring buffer for the REST read-path (e.g. GET /v1/elections).
+    /// Never read from disk on the hot path.
+    pub audit_ring: Arc<AuditEventBuffer>,
 }
 
 pub async fn run(
@@ -64,6 +67,7 @@ pub async fn run(
     tasks: HashMap<&'static str, Arc<TaskController>>,
     config_changed: Arc<tokio::sync::Notify>,
     audit: Arc<dyn AuditLog>,
+    audit_ring: Arc<AuditEventBuffer>,
 ) {
     tracing::info!("http-server task started");
 
@@ -122,6 +126,7 @@ pub async fn run(
         login_rate_limiter,
         config_changed,
         audit,
+        audit_ring,
     };
     let app = routes(enable_swagger, state);
 
@@ -1065,6 +1070,7 @@ mod tests {
             login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
             config_changed: Arc::new(tokio::sync::Notify::new()),
             audit: Arc::new(NoopAuditLog),
+            audit_ring: crate::audit::AuditEventBuffer::new(0),
         }
     }
 
