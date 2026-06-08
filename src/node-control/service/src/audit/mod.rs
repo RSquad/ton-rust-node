@@ -20,7 +20,7 @@ pub use common::app_config::AuditLogConfig;
 pub use enums::{
     AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource, ConfigFieldChange, StakeSkipReason,
 };
-pub use event::{AuditEvent, AuditFileHeader};
+pub use event::{AuditEvent, AuditFileHeader, ElectionsStakeSubmittedParams};
 pub use factory::AuditLogFactory;
 #[cfg(test)]
 pub use in_memory::InMemoryAuditLog;

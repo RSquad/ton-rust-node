@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 /// Captures audit events in memory for unit tests.
 pub struct InMemoryAuditLog {
-    pub events: Mutex<Vec<AuditEvent>>,
+    events: Mutex<Vec<AuditEvent>>,
 }
 
 impl InMemoryAuditLog {

@@ -22,9 +22,11 @@ pub(crate) enum AdaptiveDeferReason {
     WaitingForParticipants,
 }
 
-/// Why AdaptiveSplit50 returns zero stake after the defer window has passed.
+/// Why AdaptiveSplit50 returns zero stake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdaptiveStakeZero {
+    /// Sleep or waiting-for-participants gate has not passed yet.
+    Defer(AdaptiveDeferReason),
     /// Stake already meets min effective — no top-up this tick (not an error).
     NoTopUpNeeded,
     /// Free pool balance is below the required delta to min effective stake.
@@ -38,60 +40,9 @@ pub(crate) enum AdaptiveStakeResult {
     Zero(AdaptiveStakeZero),
 }
 
-/// Returns `true` if staking should proceed, `false` if we should defer (return 0).
-pub(crate) fn is_adaptive_split50_ready(
+/// Returns `None` when staking should proceed; otherwise the wait gate that blocks.
+pub(crate) fn adaptive_split50_status(
     node_id: &str,
-    elections_info: &ElectionsInfo,
-    cfg15_start_before: u32,
-    cfg15_end_before: u32,
-    cfg16: &ConfigParam16,
-    sleep_pct: f64,
-    waiting_pct: f64,
-) -> bool {
-    let min_validators = cfg16.min_validators.as_u16() as usize;
-    let participants_count = elections_info.participants.len();
-    let election_duration = cfg15_start_before.saturating_sub(cfg15_end_before) as u64;
-
-    if election_duration == 0 {
-        tracing::warn!(
-            "node [{}] adaptive_split50: election_duration=0, skipping wait logic",
-            node_id
-        );
-        return true;
-    }
-
-    let election_start = elections_info.elect_close.saturating_sub(election_duration);
-    let sleep_deadline = election_start + (election_duration as f64 * sleep_pct) as u64;
-    let wait_deadline = election_start + (election_duration as f64 * waiting_pct) as u64;
-    let now = common::time_format::now();
-
-    // Wait if sleep period hasn't passed yet
-    if now < sleep_deadline {
-        tracing::info!(
-            "node [{}] adaptive_split50: sleep period, now < sleep_deadline={}",
-            node_id,
-            common::time_format::format_ts(sleep_deadline)
-        );
-        return false;
-    }
-
-    // Wait if not enough participants and waiting period hasn't expired
-    if participants_count < min_validators && now < wait_deadline {
-        tracing::info!(
-            "node [{}] adaptive_split50: waiting for participants ({}/{}), deadline={}",
-            node_id,
-            participants_count,
-            min_validators,
-            common::time_format::format_ts(wait_deadline)
-        );
-        return false;
-    }
-
-    true
-}
-
-/// When [`is_adaptive_split50_ready`] would return `false`, reports which wait gate blocked.
-pub(crate) fn adaptive_split50_defer_reason(
     elections_info: &ElectionsInfo,
     cfg15_start_before: u32,
     cfg15_end_before: u32,
@@ -102,7 +53,12 @@ pub(crate) fn adaptive_split50_defer_reason(
     let min_validators = cfg16.min_validators.as_u16() as usize;
     let participants_count = elections_info.participants.len();
     let election_duration = cfg15_start_before.saturating_sub(cfg15_end_before) as u64;
+
     if election_duration == 0 {
+        tracing::warn!(
+            "node [{}] adaptive_split50: election_duration=0, skipping wait logic",
+            node_id
+        );
         return None;
     }
 
@@ -112,11 +68,25 @@ pub(crate) fn adaptive_split50_defer_reason(
     let now = common::time_format::now();
 
     if now < sleep_deadline {
+        tracing::info!(
+            "node [{}] adaptive_split50: sleep period, now < sleep_deadline={}",
+            node_id,
+            common::time_format::format_ts(sleep_deadline)
+        );
         return Some(AdaptiveDeferReason::SleepPeriod);
     }
+
     if participants_count < min_validators && now < wait_deadline {
+        tracing::info!(
+            "node [{}] adaptive_split50: waiting for participants ({}/{}), deadline={}",
+            node_id,
+            participants_count,
+            min_validators,
+            common::time_format::format_ts(wait_deadline)
+        );
         return Some(AdaptiveDeferReason::WaitingForParticipants);
     }
+
     None
 }
 

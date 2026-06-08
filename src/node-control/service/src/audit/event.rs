@@ -64,6 +64,15 @@ pub struct AuditEvent {
     pub target: AuditTarget,
 }
 
+/// Named payload fields for [`AuditEvent::elections_stake_submitted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElectionsStakeSubmittedParams {
+    pub stake_nanotons: String,
+    pub max_factor: u32,
+    pub policy: String,
+    pub submission_time: u64,
+}
+
 impl AuditEvent {
     /// Internal constructor that stamps `id`/`ts`. Crate-private so call sites
     /// must go through the typed constructors below, which bake the canonical
@@ -82,24 +91,6 @@ impl AuditEvent {
         AuditTarget::Node { id: node_id.into(), election_id: Some(election_id) }
     }
 
-    pub fn elections_tick_failed(
-        actor: AuditActor,
-        election_id: Option<u64>,
-        reason: impl Into<String>,
-    ) -> Self {
-        // A tick can fail before the active election id is known; fall back to a
-        // system target in that case (source still resolves to `elections`).
-        let target = election_id
-            .map(|election_id| AuditTarget::Elections { election_id })
-            .unwrap_or(AuditTarget::System);
-        Self::new(
-            actor,
-            target,
-            AuditOutcome::Failure,
-            AuditEventPayload::ElectionsTickFailed { reason: reason.into() },
-        )
-    }
-
     pub fn elections_key_generated(
         actor: AuditActor,
         node_id: impl Into<String>,
@@ -114,25 +105,21 @@ impl AuditEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn elections_stake_submitted(
         actor: AuditActor,
         node_id: impl Into<String>,
         election_id: u64,
-        stake_nanotons: impl Into<String>,
-        max_factor: u32,
-        policy: impl Into<String>,
-        submission_time: u64,
+        params: ElectionsStakeSubmittedParams,
     ) -> Self {
         Self::new(
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
             AuditEventPayload::ElectionsStakeSubmitted {
-                stake_nanotons: stake_nanotons.into(),
-                max_factor,
-                policy: policy.into(),
-                submission_time,
+                stake_nanotons: params.stake_nanotons,
+                max_factor: params.max_factor,
+                policy: params.policy,
+                submission_time: params.submission_time,
             },
         )
     }
@@ -157,39 +144,7 @@ impl AuditEvent {
         )
     }
 
-    pub fn elections_stake_recovered(
-        actor: AuditActor,
-        node_id: impl Into<String>,
-        election_id: u64,
-        amount_nanotons: impl Into<String>,
-        tx_hash: Option<String>,
-    ) -> Self {
-        Self::new(
-            actor,
-            Self::node_target(node_id, election_id),
-            AuditOutcome::Success,
-            AuditEventPayload::ElectionsStakeRecovered {
-                amount_nanotons: amount_nanotons.into(),
-                tx_hash,
-            },
-        )
-    }
-
-    pub fn elections_withdraw_processed(
-        actor: AuditActor,
-        node_id: impl Into<String>,
-        election_id: u64,
-        tx_hash: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            actor,
-            Self::node_target(node_id, election_id),
-            AuditOutcome::Success,
-            AuditEventPayload::ElectionsWithdrawProcessed { tx_hash: tx_hash.into() },
-        )
-    }
-
-    pub fn elections_withdraw_process_failed(
+    pub fn elections_stake_failed(
         actor: AuditActor,
         node_id: impl Into<String>,
         election_id: u64,
@@ -199,7 +154,67 @@ impl AuditEvent {
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Failure,
-            AuditEventPayload::ElectionsWithdrawProcessFailed { reason: reason.into() },
+            AuditEventPayload::ElectionsStakeFailed { reason: reason.into() },
+        )
+    }
+
+    pub fn elections_stake_recovered(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        amount_nanotons: impl Into<String>,
+        msg_hash: Option<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsStakeRecovered {
+                amount_nanotons: amount_nanotons.into(),
+                msg_hash,
+            },
+        )
+    }
+
+    pub fn elections_stake_recover_failed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Failure,
+            AuditEventPayload::ElectionsStakeRecoverFailed { reason: reason.into() },
+        )
+    }
+
+    pub fn elections_withdraw_processed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        msg_hash: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsWithdrawProcessed { msg_hash: msg_hash.into() },
+        )
+    }
+
+    pub fn elections_withdraw_failed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Failure,
+            AuditEventPayload::ElectionsWithdrawFailed { reason: reason.into() },
         )
     }
 
@@ -356,7 +371,6 @@ mod tests {
 
     fn all_payload_variants() -> Vec<AuditEventPayload> {
         vec![
-            AuditEventPayload::ElectionsTickFailed { reason: "tick error".into() },
             AuditEventPayload::ElectionsKeyGenerated { pubkey: Some("aabb".into()) },
             AuditEventPayload::ElectionsStakeSubmitted {
                 stake_nanotons: "1".into(),
@@ -370,12 +384,14 @@ mod tests {
                 required_nanotons: None,
                 available_nanotons: None,
             },
-            AuditEventPayload::ElectionsWithdrawProcessed { tx_hash: "abc".into() },
-            AuditEventPayload::ElectionsWithdrawProcessFailed { reason: "send failed".into() },
+            AuditEventPayload::ElectionsStakeFailed { reason: "send failed".into() },
+            AuditEventPayload::ElectionsWithdrawProcessed { msg_hash: "abc".into() },
+            AuditEventPayload::ElectionsWithdrawFailed { reason: "send failed".into() },
             AuditEventPayload::ElectionsStakeRecovered {
                 amount_nanotons: "50000000000000".into(),
-                tx_hash: Some("def".into()),
+                msg_hash: Some("def".into()),
             },
+            AuditEventPayload::ElectionsStakeRecoverFailed { reason: "send failed".into() },
             AuditEventPayload::RewardsDistributionStarted { recipients_count: 3 },
             AuditEventPayload::RewardsDistributionCompleted {
                 recipients_count: 3,
@@ -391,7 +407,7 @@ mod tests {
                     new: json!(2),
                 }],
             },
-            AuditEventPayload::RestApiAuthLoginSuccess {},
+            AuditEventPayload::RestApiAuthLoginSucceeded {},
             AuditEventPayload::RestApiAuthLoginRejected { reason: "bad password".into() },
             AuditEventPayload::RestApiTokenRejected { reason: "expired".into() },
             AuditEventPayload::VaultKeyCreated {},
@@ -427,10 +443,13 @@ mod tests {
         );
         assert_eq!(skipped.outcome, AuditOutcome::Skipped);
 
-        let failed =
-            AuditEvent::elections_tick_failed(AuditActor::service("elections-task"), None, "boom");
+        let failed = AuditEvent::elections_stake_failed(
+            AuditActor::service("elections-task"),
+            "node1",
+            1,
+            "boom",
+        );
         assert_eq!(failed.outcome, AuditOutcome::Failure);
-        assert_eq!(failed.target, AuditTarget::System);
     }
 
     #[test]
