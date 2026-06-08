@@ -796,10 +796,8 @@ fn print_recent_events_table(body: &serde_json::Value) {
         };
 
         let target = ev.get("target");
-        let node_id = target
-            .and_then(|t| t.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("-");
+        let node_id =
+            target.and_then(|t| t.get("id")).and_then(serde_json::Value::as_str).unwrap_or("-");
 
         let data = ev.get("data");
         let details = format_event_details(short_event, data);
@@ -831,7 +829,12 @@ fn format_event_details(event_type: &str, data: Option<&serde_json::Value>) -> S
                 data.get("required").and_then(serde_json::Value::as_str),
                 data.get("available").and_then(serde_json::Value::as_str),
             ) {
-                format!("reason={} req={} avail={}", reason, display_tons_from_str(req), display_tons_from_str(avail))
+                format!(
+                    "reason={} req={} avail={}",
+                    reason,
+                    display_tons_from_str(req),
+                    display_tons_from_str(avail)
+                )
             } else {
                 format!("reason={}", reason)
             }
