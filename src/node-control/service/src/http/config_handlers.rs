@@ -6,8 +6,12 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::http_server_task::{AppError, AppState};
+use super::{
+    http_server_task::{AppError, AppState},
+    rest_audit,
+};
 use crate::{
+    auth::Claims,
     elections::providers::{DefaultElectionsProvider, ElectionsProvider},
     runtime_config::{RuntimeConfig, TryUpdateSaveError, open_wallet},
 };
@@ -1171,6 +1175,8 @@ fn merge_contracts_automation_update(
 )]
 pub async fn v1_contracts_automation_settings_update_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<ContractsAutomationSettingsUpdateRequest>,
 ) -> Result<axum::Json<ContractsAutomationSettingsResponse>, AppError> {
     let req = req.0;
@@ -1178,15 +1184,28 @@ pub async fn v1_contracts_automation_settings_update_handler(
         return Err(AppError::bad_request("at least one setting is required"));
     }
 
+    let before = state.runtime_cfg.get().automation.clone();
+
     state
         .runtime_cfg
-        .try_update_and_save(move |cfg| {
+        .try_update_and_save(|cfg| {
             let next = merge_contracts_automation_update(&cfg.automation, &req);
             next.validate().map_err(|e| e.to_string())?;
             cfg.automation = next;
             Ok(())
         })
         .map_err(map_try_update_save)?;
+
+    let changes = rest_audit::automation_settings_changes(&before, &req);
+    rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "automation",
+        "automation.settings_updated",
+        changes,
+    )
+    .await;
 
     state.config_changed.notify_one();
 
@@ -1453,6 +1472,8 @@ pub async fn v1_voting_proposals_inspect_handler(
 )]
 pub async fn v1_voting_proposals_add_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<VotingProposalAddRequest>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let req = req.0;
@@ -1495,6 +1516,18 @@ pub async fn v1_voting_proposals_add_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "voting",
+        "voting.proposals.add",
+        format!("voting.proposals.{hash_hex}"),
+        serde_json::Value::Null,
+        serde_json::json!({ "hash": hash_hex }),
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: hash_hex } }))
 }
 
@@ -1514,6 +1547,8 @@ pub async fn v1_voting_proposals_add_handler(
 )]
 pub async fn v1_voting_proposals_rm_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let hash_bytes = parse_voting_proposal_hash_hex(&hash)?;
@@ -1538,6 +1573,18 @@ pub async fn v1_voting_proposals_rm_handler(
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
+
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "voting",
+        "voting.proposals.remove",
+        format!("voting.proposals.{hash_hex}"),
+        serde_json::json!({ "hash": hash_hex }),
+        serde_json::Value::Null,
+    )
+    .await;
 
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: hash_hex } }))
 }
@@ -1568,6 +1615,8 @@ pub async fn v1_voting_proposals_rm_handler(
 )]
 pub async fn v1_nodes_add_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<NodeAddRequest>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let req = req.0;
@@ -1598,6 +1647,18 @@ pub async fn v1_nodes_add_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "nodes",
+        "nodes.add",
+        format!("nodes.{}", req.name),
+        serde_json::Value::Null,
+        serde_json::json!({ "name": req.name }),
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
 
@@ -1616,6 +1677,8 @@ pub async fn v1_nodes_add_handler(
 )]
 pub async fn v1_nodes_rm_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let cfg = state.runtime_cfg.get();
@@ -1636,6 +1699,18 @@ pub async fn v1_nodes_rm_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "nodes",
+        "nodes.remove",
+        format!("nodes.{name}"),
+        serde_json::json!({ "name": name }),
+        serde_json::Value::Null,
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
 
@@ -1654,6 +1729,8 @@ pub async fn v1_nodes_rm_handler(
 )]
 pub async fn v1_wallets_add_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<WalletAddRequest>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let req = req.0;
@@ -1686,6 +1763,18 @@ pub async fn v1_wallets_add_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "wallets",
+        "wallets.add",
+        format!("wallets.{}", req.name),
+        serde_json::Value::Null,
+        serde_json::json!({ "name": req.name }),
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
 
@@ -1705,6 +1794,8 @@ pub async fn v1_wallets_add_handler(
 )]
 pub async fn v1_wallets_rm_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     if name == MASTER_WALLET_RESERVED_NAME {
@@ -1729,6 +1820,18 @@ pub async fn v1_wallets_rm_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "wallets",
+        "wallets.remove",
+        format!("wallets.{name}"),
+        serde_json::json!({ "name": name }),
+        serde_json::Value::Null,
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
 
@@ -1747,6 +1850,8 @@ pub async fn v1_wallets_rm_handler(
 )]
 pub async fn v1_pools_add_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<PoolAddRequest>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let req = req.0;
@@ -1782,6 +1887,18 @@ pub async fn v1_pools_add_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "pools",
+        "pools.add",
+        format!("pools.{}", req.name),
+        serde_json::Value::Null,
+        serde_json::json!({ "name": req.name }),
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
 
@@ -1800,6 +1917,8 @@ pub async fn v1_pools_add_handler(
 )]
 pub async fn v1_pools_add_core_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<PoolAddCoreRequest>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let req = req.0;
@@ -1914,6 +2033,18 @@ pub async fn v1_pools_add_core_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "pools",
+        "pools.core.add",
+        format!("pools.{}.{}", req.name, req.slot),
+        serde_json::Value::Null,
+        serde_json::json!({ "name": req.name, "slot": req.slot }),
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.name } }))
 }
 
@@ -1933,6 +2064,8 @@ pub async fn v1_pools_add_core_handler(
 )]
 pub async fn v1_pools_rm_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let cfg = state.runtime_cfg.get();
@@ -1955,6 +2088,18 @@ pub async fn v1_pools_rm_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "pools",
+        "pools.remove",
+        format!("pools.{name}"),
+        serde_json::json!({ "name": name }),
+        serde_json::Value::Null,
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name } }))
 }
 
@@ -1973,6 +2118,8 @@ pub async fn v1_pools_rm_handler(
 )]
 pub async fn v1_bindings_add_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<BindingAddRequest>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let req = req.0;
@@ -2019,6 +2166,18 @@ pub async fn v1_bindings_add_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "bindings",
+        "bindings.add",
+        format!("bindings.{}", req.node),
+        serde_json::Value::Null,
+        serde_json::json!({ "node": req.node }),
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: req.node } }))
 }
 
@@ -2038,6 +2197,8 @@ pub async fn v1_bindings_add_handler(
 )]
 pub async fn v1_bindings_rm_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(node): axum::extract::Path<String>,
 ) -> Result<axum::Json<EntityRefResponse>, AppError> {
     let cfg = state.runtime_cfg.get();
@@ -2061,6 +2222,18 @@ pub async fn v1_bindings_rm_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "bindings",
+        "bindings.remove",
+        format!("bindings.{node}"),
+        serde_json::json!({ "node": node }),
+        serde_json::Value::Null,
+    )
+    .await;
+
     Ok(axum::Json(EntityRefResponse { ok: true, result: EntityRefDto { name: node } }))
 }
 
@@ -2082,6 +2255,8 @@ pub async fn v1_bindings_rm_handler(
 )]
 pub async fn v1_elections_settings_update_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<ElectionsSettingsUpdateRequest>,
 ) -> Result<axum::Json<ElectionsSettingsResponse>, AppError> {
     let req = req.0;
@@ -2147,13 +2322,16 @@ pub async fn v1_elections_settings_update_handler(
         .ok()
         .and_then(|p| extract_max_factor(p).ok());
 
+    let policy_changed = req.policy.is_some() || req.reset;
     let policy = req.policy;
-    let node = req.node;
+    let node = req.node.clone();
     let reset = req.reset;
     let tick_interval = req.tick_interval;
     let max_factor = req.max_factor;
     let sleep_period_pct = req.sleep_period_pct;
     let waiting_period_pct = req.waiting_period_pct;
+    let before = elections.clone();
+    let node_for_audit = node.clone();
 
     state
         .runtime_cfg
@@ -2192,6 +2370,27 @@ pub async fn v1_elections_settings_update_handler(
         })
         .map_err(map_try_update_save)?;
 
+    let after = state.runtime_cfg.get().elections.as_ref().expect("validated above").clone();
+    let changes = rest_audit::elections_settings_changes(
+        &before,
+        &after,
+        sleep_period_pct,
+        waiting_period_pct,
+        tick_interval,
+        max_factor,
+        policy_changed,
+        node_for_audit.as_deref(),
+    );
+    rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "elections",
+        "elections.settings_updated",
+        changes,
+    )
+    .await;
+
     // Restart elections task so changes take effect immediately.
     let task = state.elections_task.clone();
     tokio::spawn(async move {
@@ -2228,6 +2427,8 @@ pub async fn v1_elections_settings_update_handler(
 )]
 pub async fn v1_ton_http_api_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<TonHttpApiRequest>,
 ) -> Result<axum::Json<TonHttpApiResponse>, AppError> {
     let req = req.0;
@@ -2237,6 +2438,7 @@ pub async fn v1_ton_http_api_handler(
         return Err(AppError::bad_request("at least one non-empty url is required"));
     }
 
+    let before_count = state.runtime_cfg.get().ton_http_api.endpoints().len();
     let api_key = req.api_key;
     let append = req.append;
     state
@@ -2265,6 +2467,21 @@ pub async fn v1_ton_http_api_handler(
     state.config_changed.notify_one();
 
     let endpoints = state.runtime_cfg.get().ton_http_api.endpoints();
+    let operation = if append { "ton_http_api.append" } else { "ton_http_api.replace" };
+    rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "ton_http_api",
+        operation,
+        vec![rest_audit::config_field(
+            "ton_http_api.endpoint_count",
+            serde_json::json!(before_count),
+            serde_json::json!(endpoints.len()),
+        )],
+    )
+    .await;
+
     Ok(axum::Json(TonHttpApiResponse { ok: true, result: TonHttpApiResult { endpoints } }))
 }
 
@@ -2282,6 +2499,8 @@ pub async fn v1_ton_http_api_handler(
 )]
 pub async fn v1_log_set_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<LogSetRequest>,
 ) -> Result<axum::Json<LogResponse>, AppError> {
     let req = req.0;
@@ -2324,6 +2543,12 @@ pub async fn v1_log_set_handler(
         }
     }
 
+    let before = state.runtime_cfg.get().log.clone().unwrap_or_default();
+    let rotation_set = req.rotation.is_some();
+    let output_set = req.output.is_some();
+    let max_size_set = req.max_size_mb.is_some();
+    let max_files_set = req.max_files.is_some();
+
     state
         .runtime_cfg
         .update_and_save(|cfg| {
@@ -2349,6 +2574,60 @@ pub async fn v1_log_set_handler(
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
 
+    let after = state.runtime_cfg.get().log.clone().unwrap_or_default();
+    let mut changes = Vec::new();
+    if level_str.is_some() {
+        changes.push(rest_audit::config_field(
+            "log.level",
+            serde_json::json!(before.level.to_string()),
+            serde_json::json!(after.level.to_string()),
+        ));
+    }
+    if path_str.is_some() {
+        changes.push(rest_audit::config_field(
+            "log.path",
+            serde_json::json!(before.path),
+            serde_json::json!(after.path),
+        ));
+    }
+    if rotation_set {
+        changes.push(rest_audit::config_field(
+            "log.rotation",
+            serde_json::json!(before.rotation),
+            serde_json::json!(after.rotation),
+        ));
+    }
+    if output_set {
+        changes.push(rest_audit::config_field(
+            "log.output",
+            serde_json::json!(before.output),
+            serde_json::json!(after.output),
+        ));
+    }
+    if max_size_set {
+        changes.push(rest_audit::config_field(
+            "log.max_size_mb",
+            serde_json::json!(before.max_size_mb),
+            serde_json::json!(after.max_size_mb),
+        ));
+    }
+    if max_files_set {
+        changes.push(rest_audit::config_field(
+            "log.max_files",
+            serde_json::json!(before.max_files),
+            serde_json::json!(after.max_files),
+        ));
+    }
+    rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "log",
+        "log.settings_updated",
+        changes,
+    )
+    .await;
+
     let config = state.runtime_cfg.get();
     let log = config.log.as_ref().cloned().unwrap_or_default();
     let dto = log_config_to_dto(&log);
@@ -2373,6 +2652,8 @@ pub async fn v1_log_set_handler(
 )]
 pub async fn v1_elections_static_adnl_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<StaticAdnlRequest>,
 ) -> Result<axum::Json<StaticAdnlResponse>, AppError> {
     let node_name = req.0.node;
@@ -2411,6 +2692,18 @@ pub async fn v1_elections_static_adnl_handler(
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
 
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "elections",
+        "elections.static_adnl.set",
+        format!("elections.static_adnl.{node_name}"),
+        serde_json::Value::Null,
+        serde_json::json!({ "node": node_name }),
+    )
+    .await;
+
     tracing::info!("node [{}] static ADNL address set: {}", node_name, adnl_b64);
     Ok(axum::Json(StaticAdnlResponse { ok: true, result: StaticAdnlDto { adnl_addr: adnl_b64 } }))
 }
@@ -2429,6 +2722,8 @@ pub async fn v1_elections_static_adnl_handler(
 )]
 pub async fn v1_elections_static_adnl_disable_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(node_name): axum::extract::Path<String>,
 ) -> Result<axum::Json<OkResponse>, AppError> {
     let cfg = state.runtime_cfg.get();
@@ -2450,6 +2745,18 @@ pub async fn v1_elections_static_adnl_disable_handler(
         })
         .map_err(|e| AppError::internal(e.to_string()))?;
     state.config_changed.notify_one();
+
+    rest_audit::record_entity_mutation(
+        &state,
+        &claims,
+        &headers,
+        "elections",
+        "elections.static_adnl.disable",
+        format!("elections.static_adnl.{node_name}"),
+        serde_json::json!({ "node": node_name }),
+        serde_json::Value::Null,
+    )
+    .await;
 
     tracing::info!("node [{}] static ADNL disabled (ephemeral per cycle)", node_name);
     Ok(axum::Json(OkResponse { ok: true }))

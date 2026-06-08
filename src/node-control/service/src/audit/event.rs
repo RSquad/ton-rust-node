@@ -10,30 +10,29 @@ use crate::audit::{
     enums::{AuditEventPayload, AuditOutcome, StakeSkipReason},
     participant::{AuditActor, AuditTarget},
 };
-use chrono::{DateTime, SecondsFormat, Utc};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use uuid::Uuid;
-
 /// Renders timestamps as RFC3339 with millisecond precision and a trailing `Z`
 /// (e.g. `2026-05-22T12:10:30.123Z`), used for `ts` and `started_at`.
 mod ts_millis_rfc3339 {
-    use super::*;
-
-    pub fn serialize<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&ts.to_rfc3339_opts(SecondsFormat::Millis, true))
+    pub fn serialize<S: serde::Serializer>(
+        ts: &chrono::DateTime<chrono::Utc>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
-        let raw = String::deserialize(d)?;
-        DateTime::parse_from_rfc3339(&raw)
-            .map(|dt| dt.with_timezone(&Utc))
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<chrono::DateTime<chrono::Utc>, D::Error> {
+        let raw = <String as serde::Deserialize>::deserialize(d)?;
+        chrono::DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
             .map_err(serde::de::Error::custom)
     }
 }
 
 /// First JSONL line of every (rotated) audit file. Readers distinguish it from
 /// events by the absence of an `event_type` field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuditFileHeader {
     pub schema_version: u16,
     /// Logical service name, e.g. `"nodectl"`.
@@ -42,7 +41,7 @@ pub struct AuditFileHeader {
     pub service_version: String,
     pub host: String,
     #[serde(with = "ts_millis_rfc3339")]
-    pub started_at: DateTime<Utc>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A single audit record.
@@ -51,12 +50,12 @@ pub struct AuditFileHeader {
 /// (`event_type` + `data`), `actor`, `target`. `severity`/`source` are derived
 /// from the payload at the display layer and `schema_version` lives in
 /// [`AuditFileHeader`], so none of them are stored per event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuditEvent {
     /// UUID v7 — sortable by creation time.
-    pub id: Uuid,
+    pub id: uuid::Uuid,
     #[serde(with = "ts_millis_rfc3339")]
-    pub ts: DateTime<Utc>,
+    pub ts: chrono::DateTime<chrono::Utc>,
     pub outcome: AuditOutcome,
     #[serde(flatten)]
     pub payload: AuditEventPayload,
@@ -99,7 +98,7 @@ impl AuditEvent {
         outcome: AuditOutcome,
         payload: AuditEventPayload,
     ) -> Self {
-        Self { id: Uuid::now_v7(), ts: Utc::now(), outcome, payload, actor, target }
+        Self { id: uuid::Uuid::now_v7(), ts: chrono::Utc::now(), outcome, payload, actor, target }
     }
 
     /// `target` for a per-node election event: always `Node { election_id }`.
@@ -247,6 +246,55 @@ impl AuditEvent {
             },
         )
     }
+
+    pub fn rest_api_config_updated(
+        actor: AuditActor,
+        config_id: impl Into<String>,
+        operation: impl Into<String>,
+        changes: Vec<crate::audit::ConfigFieldChange>,
+    ) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::Config { id: config_id.into() },
+            AuditOutcome::Success,
+            AuditEventPayload::RestApiConfigUpdated { operation: operation.into(), changes },
+        )
+    }
+
+    pub fn rest_api_auth_login_success(actor: AuditActor, user_id: impl Into<String>) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::User { id: user_id.into() },
+            AuditOutcome::Success,
+            AuditEventPayload::RestApiAuthLoginSucceeded {},
+        )
+    }
+
+    pub fn rest_api_auth_login_rejected(
+        actor: AuditActor,
+        user_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::User { id: user_id.into() },
+            AuditOutcome::Failure,
+            AuditEventPayload::RestApiAuthLoginRejected { reason: reason.into() },
+        )
+    }
+
+    pub fn rest_api_token_rejected(
+        actor: AuditActor,
+        user_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::User { id: user_id.into() },
+            AuditOutcome::Failure,
+            AuditEventPayload::RestApiTokenRejected { reason: reason.into() },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -259,11 +307,11 @@ mod tests {
     const FIXTURE_ID: &str = "9b6c2b5a-9f9d-4a9f-bc31-9a89b0e9d111";
     const FIXTURE_TS: &str = "2026-05-22T12:10:30.123Z";
 
-    fn fixture_id() -> Uuid {
+    fn fixture_id() -> uuid::Uuid {
         FIXTURE_ID.parse().unwrap()
     }
 
-    fn fixture_ts() -> DateTime<Utc> {
+    fn fixture_ts() -> chrono::DateTime<chrono::Utc> {
         FIXTURE_TS.parse().unwrap()
     }
 

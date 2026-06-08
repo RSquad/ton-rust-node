@@ -7,7 +7,6 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::audit::{AuditEvent, AuditFileHeader, AuditLogConfig, jsonl_log::AuditInitError};
-use chrono::Utc;
 use std::{
     sync::{
         Arc, Once,
@@ -15,7 +14,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
 
 /// Schema version stamped into the per-file [`AuditFileHeader`].
 const AUDIT_SCHEMA_VERSION: u16 = 1;
@@ -139,7 +137,7 @@ impl AuditWriter {
             service: "nodectl".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             host: self.host.clone(),
-            started_at: Utc::now(),
+            started_at: chrono::Utc::now(),
         }
     }
 
@@ -165,7 +163,7 @@ impl AuditWriter {
 
     async fn drain_pending_commands(
         &mut self,
-        rx: &mut mpsc::Receiver<AuditCommand>,
+        rx: &mut tokio::sync::mpsc::Receiver<AuditCommand>,
         buffered: &mut Vec<AuditEvent>,
     ) {
         let batch_max_events = self.config.batch_max_events.max(1);
@@ -189,7 +187,7 @@ impl AuditWriter {
 
     async fn finish_shutdown(
         &mut self,
-        rx: &mut mpsc::Receiver<AuditCommand>,
+        rx: &mut tokio::sync::mpsc::Receiver<AuditCommand>,
         buffered: &mut Vec<AuditEvent>,
     ) {
         self.drain_pending_commands(rx, buffered).await;
@@ -199,8 +197,8 @@ impl AuditWriter {
 
     pub(crate) async fn run(
         mut self,
-        mut rx: mpsc::Receiver<AuditCommand>,
-        mut shutdown_rx: oneshot::Receiver<()>,
+        mut rx: tokio::sync::mpsc::Receiver<AuditCommand>,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         let interval_ms = self.config.batch_interval_ms.max(1);
         let batch_max_events = self.config.batch_max_events.max(1);
@@ -493,17 +491,17 @@ mod tests {
         f: F,
     ) -> (Arc<AtomicU64>, PathBuf)
     where
-        F: FnOnce(mpsc::Sender<AuditCommand>, PathBuf, Arc<AtomicU64>) -> Fut,
+        F: FnOnce(tokio::sync::mpsc::Sender<AuditCommand>, PathBuf, Arc<AtomicU64>) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         let config = Arc::new(config);
         let dropped = Arc::new(AtomicU64::new(0));
         let path = config.path.clone();
-        let (tx, rx) = mpsc::channel(config.queue_capacity);
+        let (tx, rx) = tokio::sync::mpsc::channel(config.queue_capacity);
         // Keep test shutdown signal unsent; tests stop the writer via
         // `AuditCommand::Shutdown` on the mpsc channel to avoid races with
         // producer commands.
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let writer =
             AuditWriter::open_with_write_delay(config, dropped.clone(), write_delay).await.unwrap();
 
@@ -520,15 +518,15 @@ mod tests {
         (dropped_out, path_out)
     }
 
-    async fn send_event(tx: &mpsc::Sender<AuditCommand>, event: AuditEvent) {
+    async fn send_event(tx: &tokio::sync::mpsc::Sender<AuditCommand>, event: AuditEvent) {
         tx.send(AuditCommand::Event(Box::new(event))).await.unwrap();
     }
 
-    async fn flush(tx: &mpsc::Sender<AuditCommand>) {
+    async fn flush(tx: &tokio::sync::mpsc::Sender<AuditCommand>) {
         tx.send(AuditCommand::Flush).await.unwrap();
     }
 
-    async fn stop(tx: &mpsc::Sender<AuditCommand>) {
+    async fn stop(tx: &tokio::sync::mpsc::Sender<AuditCommand>) {
         tx.send(AuditCommand::Shutdown).await.unwrap();
     }
 
