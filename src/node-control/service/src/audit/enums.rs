@@ -12,9 +12,6 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "event_type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditEventPayload {
-    #[serde(rename = "elections.tick_failed")]
-    ElectionsTickFailed { reason: String },
-
     #[serde(rename = "elections.key_generated")]
     ElectionsKeyGenerated {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,8 +176,7 @@ impl AuditEventPayload {
             | RestApiTokenRejected { .. }
             | SystemAuditEventsDropped { .. } => Warn,
 
-            ElectionsTickFailed { .. }
-            | ElectionsStakeFailed { .. }
+            ElectionsStakeFailed { .. }
             | ElectionsStakeRecoverFailed { .. }
             | ElectionsWithdrawFailed { .. }
             | RewardsDistributionFailed { .. } => Error,
@@ -191,8 +187,7 @@ impl AuditEventPayload {
         use AuditEventPayload::*;
         use AuditSource::*;
         match self {
-            ElectionsTickFailed { .. }
-            | ElectionsKeyGenerated { .. }
+            ElectionsKeyGenerated { .. }
             | ElectionsStakeSubmitted { .. }
             | ElectionsStakeAccepted { .. }
             | ElectionsStakeSkipped { .. }
