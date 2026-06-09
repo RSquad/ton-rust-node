@@ -67,7 +67,7 @@ pub struct AuditEvent {
 /// Named payload fields for [`AuditEvent::elections_stake_submitted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectionsStakeSubmittedParams {
-    pub stake_nanotons: String,
+    pub stake: String,
     pub max_factor: u32,
     pub policy: String,
     pub submission_time: u64,
@@ -132,7 +132,7 @@ impl AuditEvent {
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
             AuditEventPayload::ElectionsStakeSubmitted {
-                stake_nanotons: params.stake_nanotons,
+                stake: params.stake,
                 max_factor: params.max_factor,
                 policy: params.policy,
                 submission_time: params.submission_time,
@@ -174,7 +174,7 @@ impl AuditEvent {
         actor: AuditActor,
         node_id: impl Into<String>,
         election_id: u64,
-        amount_nanotons: impl Into<String>,
+        amount: impl Into<String>,
         msg_hash: Option<String>,
     ) -> Self {
         Self::new(
@@ -182,7 +182,7 @@ impl AuditEvent {
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
             AuditEventPayload::ElectionsStakeRecovered {
-                amount_nanotons: amount_nanotons.into(),
+                amount: amount.into(),
                 msg_hash,
             },
         )
@@ -449,7 +449,7 @@ mod tests {
             AuditEventPayload::ElectionsWithdrawProcessed { msg_hash: "abc".into() },
             AuditEventPayload::ElectionsWithdrawFailed { reason: "send failed".into() },
             AuditEventPayload::ElectionsStakeRecovered {
-                amount_nanotons: "50000000000000".into(),
+                amount: "50000000000000".into(),
                 msg_hash: Some("def".into()),
             },
             AuditEventPayload::ElectionsStakeRecoverFailed { reason: "send failed".into() },

@@ -2028,7 +2028,7 @@ async fn elections_audit_stake_submitted(
             node_id,
             participant.election_id,
             ElectionsStakeSubmittedParams {
-                stake_nanotons: nanotons_to_dec_string(stake),
+                stake: nanotons_to_dec_string(stake),
                 max_factor: participant.max_factor,
                 policy: node.stake_policy.to_string(),
                 submission_time,

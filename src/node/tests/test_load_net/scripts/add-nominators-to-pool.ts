@@ -19,6 +19,8 @@
  *   MASTER_WALLET_ID (default 42)
  *   NOMINATOR_SUBWALLET_BASE (default 10000)
  *   NOMINATOR_WORKCHAIN (default **0** — required by pool; do not use -1 for nominators)
+ *   HIGHLOAD_WORKCHAIN (default **0** — must match nominators; orchestrator deploys nominator wallets in-batch on the same wc)
+ *   HIGHLOAD_BATCH_CHUNK (default 10) — max messages per sendBatch (same wc; avoids huge BOC on singlehost)
  *   NOMINATOR_FUND_EXTRA_TON (default 0.15)
  *   POOL_INFO_DELAY_MS — wait before get_pool_data dump (default 5000)
  *   TONCORE_POOL_INFO_EXTRA — comma-separated extra pool addresses to print after (same API)
@@ -38,6 +40,10 @@ const DEFAULT_COUNT = 40;
 const DEFAULT_SUBWALLET_BASE = 10_000;
 /** Basechain — required by pool.fc for nominator deposit/withdraw. */
 const DEFAULT_NOMINATOR_WORKCHAIN = 0;
+/** Highload orchestrator wc — same as nominators so sendBatch does not cross workchains (MC→0 breaks on singlehost). */
+const DEFAULT_HIGHLOAD_WORKCHAIN = 0;
+/** Max outgoing messages per sendBatch (same wc). */
+const DEFAULT_HIGHLOAD_BATCH_CHUNK = 10;
 /** Attached TON per msg; must be >= on-chain min_nominator_stake + 1 TON pool fee (default min stake 10k → 10001). */
 const DEFAULT_STAKE_TON = "10001";
 const DEFAULT_POOL_INFO_DELAY_MS = 5000;
@@ -145,7 +151,8 @@ async function run() {
         console.error(
             `Default stake: ${DEFAULT_STAKE_TON} TON (override argv or NOMINATOR_STAKE_TON). ` +
                 `Optional: MASTER_WALLET_ID (default 42), NOMINATOR_SUBWALLET_BASE (default ${DEFAULT_SUBWALLET_BASE}), ` +
-                `NOMINATOR_WORKCHAIN (default ${DEFAULT_NOMINATOR_WORKCHAIN}), NOMINATOR_FUND_EXTRA_TON (default 0.15), ` +
+                `NOMINATOR_WORKCHAIN (default ${DEFAULT_NOMINATOR_WORKCHAIN}), HIGHLOAD_WORKCHAIN (default ${DEFAULT_HIGHLOAD_WORKCHAIN}), ` +
+                `HIGHLOAD_BATCH_CHUNK (default ${DEFAULT_HIGHLOAD_BATCH_CHUNK}), NOMINATOR_FUND_EXTRA_TON (default 0.15), ` +
                 `POOL_INFO_DELAY_MS, TONCORE_POOL_INFO_EXTRA`,
         );
         process.exit(1);
@@ -172,6 +179,19 @@ async function run() {
         throw new Error(
             `NOMINATOR_WORKCHAIN must be 0 (basechain). Pool rejects nominator ops from masterchain (see pool.fc throw 61). Got ${nominatorWorkchain}`,
         );
+    }
+    const highloadWorkchain = Number.parseInt(
+        process.env.HIGHLOAD_WORKCHAIN ?? String(DEFAULT_HIGHLOAD_WORKCHAIN),
+        10,
+    );
+    const batchChunk = Number.parseInt(process.env.HIGHLOAD_BATCH_CHUNK ?? String(DEFAULT_HIGHLOAD_BATCH_CHUNK), 10);
+    if (highloadWorkchain !== nominatorWorkchain) {
+        throw new Error(
+            `HIGHLOAD_WORKCHAIN (${highloadWorkchain}) must match NOMINATOR_WORKCHAIN (${nominatorWorkchain}) so batch deploy stays on one workchain`,
+        );
+    }
+    if (!Number.isFinite(batchChunk) || batchChunk < 1 || batchChunk > 40) {
+        throw new Error(`HIGHLOAD_BATCH_CHUNK must be 1..40, got ${batchChunk}`);
     }
 
     const amountPer = toNano(amountTon);
@@ -219,10 +239,19 @@ async function run() {
 
     const highloadTopup = (deployAndFees + amountPer + toNano("1")) * BigInt(count);
 
-    const highloadWallet = new HighloadWalletV3(HighloadWalletV3.newSequence(), publicKey, HIGHLOAD_TIMEOUT_SEC, HighloadWalletV3.DEFAULT_SUBWALLET_ID, -1);
+    const highloadWallet = new HighloadWalletV3(
+        HighloadWalletV3.newSequence(),
+        publicKey,
+        HIGHLOAD_TIMEOUT_SEC,
+        HighloadWalletV3.DEFAULT_SUBWALLET_ID,
+        highloadWorkchain,
+    );
 
-    console.log(`Master wallet: ${masterWallet.address.toString()} (walletId=${masterWalletId})`);
-    console.log(`Highload wallet (orchestrator, mc): ${highloadWallet.address.toString()} (subwalletId=${HighloadWalletV3.DEFAULT_SUBWALLET_ID}, DEFAULT_SUBWALLET_ID)`);
+    console.log(`Master wallet: ${masterWallet.address.toString()} (walletId=${masterWalletId}, wc=-1)`);
+    console.log(
+        `Highload wallet (orchestrator, wc=${highloadWorkchain}): ${highloadWallet.address.toString()} ` +
+            `(subwalletId=${HighloadWalletV3.DEFAULT_SUBWALLET_ID})`,
+    );
     console.log(
         `Pool: ${poolAddr.toString()}, ${count} nominators × ${amountTon} TON, ` +
             `body op=0 action=${TONCORE_ACTION_NOMINATOR_DEPOSIT} ('d'), nominator wc=${nominatorWorkchain}, subwallet base=${subwalletBase}`,
@@ -251,10 +280,10 @@ async function run() {
         });
     }
 
-    const totalOutFromHighload = (deployAndFees + amountPer) * BigInt(count);
-    const valuePerBatch = totalOutFromHighload + toNano("1");
-    /** Enough for `sendBatch` attach + headroom for MC deploy/import fees (not full nominal `highloadTopup`). */
-    const highloadFundedMinBalance = valuePerBatch + toNano("5");
+    const perWalletOut = deployAndFees + amountPer;
+    /** Enough for largest chunk sendBatch + headroom (master→highload cross-wc deploy uses separate topup). */
+    const largestChunk = Math.min(count, batchChunk);
+    const highloadFundedMinBalance = perWalletOut * BigInt(largestChunk) + toNano("6");
 
     const hlDeployed = await client.isContractDeployed(highloadWallet.address).catch(() => false);
     const hlBalance = await client.getBalance(highloadWallet.address);
@@ -268,7 +297,8 @@ async function run() {
                 messages: [
                     internal({
                         to: highloadWallet.address,
-                        value: highloadTopup + toNano("1"), // 1 TON for fees
+                        // Extra TON for masterchain→basechain deploy/import when highload wc=0.
+                        value: highloadTopup + toNano("2"),
                         bounce: false,
                         init: hlDeployed ? undefined : highloadWallet.init,
                     }),
@@ -296,18 +326,31 @@ async function run() {
     }
 
     const highloadContract = client.open(highloadWallet);
-    const createdAt = Math.floor(Date.now() / 1000) - 10;
-    console.log(`  Highload deploy+fund: one sendBatch with ${count} messages (single external)…`);
-    try {
-        await highloadContract.sendBatch(masterKey, {
-            messages: batchMessages,
-            valuePerBatch,
-            createdAt,
-        });
-    } catch (e) {
-        throw new Error(e instanceof Error ? e.message : String(e));
+    let createdAt = Math.floor(Date.now() / 1000) - 10;
+    const batchCount = Math.ceil(count / batchChunk);
+    console.log(
+        `  Highload deploy+fund: ${batchCount} sendBatch chunk(s), up to ${batchChunk} messages each (wc=${highloadWorkchain})…`,
+    );
+    for (let offset = 0; offset < batchMessages.length; offset += batchChunk) {
+        const chunk = batchMessages.slice(offset, offset + batchChunk);
+        const chunkIndex = Math.floor(offset / batchChunk) + 1;
+        const valuePerBatch = perWalletOut * BigInt(chunk.length) + toNano("1");
+        console.log(`  sendBatch chunk ${chunkIndex}/${batchCount}: ${chunk.length} message(s), attach ${fromNano(valuePerBatch)} TON…`);
+        try {
+            await highloadContract.sendBatch(masterKey, {
+                messages: chunk,
+                valuePerBatch,
+                createdAt,
+            });
+        } catch (e) {
+            throw new Error(e instanceof Error ? e.message : String(e));
+        }
+        highloadWallet.sequence.next();
+        createdAt = Math.floor(Date.now() / 1000) - 10;
+        if (offset + batchChunk < batchMessages.length) {
+            await new Promise((r) => setTimeout(r, 3000));
+        }
     }
-    highloadWallet.sequence.next();
     console.log(
         `  Next highload query id (local sequence after sendBatch; reuse same on-chain highload only with matching query id): ${highloadWallet.sequence.current()}`,
     );
@@ -341,7 +384,7 @@ async function run() {
         const lowHl = hlBal < toNano("50");
         const hint = lowHl
             ? `Highload balance ${fromNano(hlBal)} TON is low — top up the master and re-run (intended highload topup this run: ${fromNano(highloadTopup)} TON).`
-            : `Highload still holds ${fromNano(hlBal)} TON — try lowering count if ton-http-api rejects large BOC (HTTP 500), or wait for the chain.`;
+            : `Highload still holds ${fromNano(hlBal)} TON — try lowering HIGHLOAD_BATCH_CHUNK or count, or wait for basechain to import blocks.`;
         throw new Error(
             `Only ${ready}/${count} nominator wallets became active after ${SCRIPT_CHAIN_POLL_MAX_MS} ms. ${hint} Stuck: ${stuck.join("; ")}`,
         );
