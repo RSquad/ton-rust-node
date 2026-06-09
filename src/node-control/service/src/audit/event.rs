@@ -263,10 +263,7 @@ impl AuditEvent {
             actor,
             AuditTarget::Config { id: config_id.into() },
             AuditOutcome::Success,
-            AuditEventPayload::RestApiConfigUpdated {
-                operation: operation.into(),
-                changes,
-            },
+            AuditEventPayload::RestApiConfigUpdated { operation: operation.into(), changes },
         )
     }
 
