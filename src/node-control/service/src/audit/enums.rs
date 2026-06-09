@@ -6,6 +6,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event_type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -177,7 +179,8 @@ impl AuditEventPayload {
             | RestApiTokenRejected { .. }
             | SystemAuditEventsDropped { .. } => Warn,
 
-            ElectionsStakeFailed { .. }
+            ElectionsTickFailed { .. }
+            | ElectionsStakeFailed { .. }
             | ElectionsStakeRecoverFailed { .. }
             | ElectionsWithdrawFailed { .. }
             | RewardsDistributionFailed { .. } => Error,
@@ -188,7 +191,8 @@ impl AuditEventPayload {
         use AuditEventPayload::*;
         use AuditSource::*;
         match self {
-            ElectionsKeyGenerated { .. }
+            ElectionsTickFailed { .. }
+            | ElectionsKeyGenerated { .. }
             | ElectionsStakeSubmitted { .. }
             | ElectionsStakeAccepted { .. }
             | ElectionsStakeSkipped { .. }

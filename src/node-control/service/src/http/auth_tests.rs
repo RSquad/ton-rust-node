@@ -720,7 +720,7 @@ async fn login_success_emits_audit_event() {
 
     let events = audit.drain();
     assert_eq!(events.len(), 1);
-    assert!(matches!(events[0].payload, AuditEventPayload::RestApiAuthLoginSuccess {}));
+    assert!(matches!(events[0].payload, AuditEventPayload::RestApiAuthLoginSucceeded {}));
     let body = serde_json::to_string(&events[0]).unwrap();
     assert!(!body.contains("pass1"));
 }
