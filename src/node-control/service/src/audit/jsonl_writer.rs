@@ -6,26 +6,21 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::audit::{
-    AuditEvent, AuditLogConfig,
-    enums::{
-        AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource,
-        AuditSubjectKind,
-    },
-    jsonl_log::AuditInitError,
-    participant::{AuditActor, AuditSubject},
-};
+use crate::audit::{AuditEvent, AuditFileHeader, AuditLogConfig, jsonl_log::AuditInitError};
 use chrono::Utc;
 use std::{
-    collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Once,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
+
+/// Schema version stamped into the per-file [`AuditFileHeader`].
+const AUDIT_SCHEMA_VERSION: u16 = 1;
+
+static HOSTNAME_FALLBACK_WARNED: Once = Once::new();
 
 #[derive(Debug)]
 pub(crate) enum AuditCommand {
@@ -45,6 +40,8 @@ pub(crate) enum AuditCommand {
 }
 
 pub(crate) struct AuditWriter {
+    /// Host identity stamped into each new file's [`AuditFileHeader`].
+    host: String,
     config: Arc<AuditLogConfig>,
     /// Live append handle. `None` only transiently during rotation (the old
     /// handle is closed before the on-disk rename so the swap is portable to
@@ -122,7 +119,8 @@ impl AuditWriter {
 
         let current_size = file.metadata().await.map_err(AuditInitError::Metadata)?.len();
 
-        Ok(Self {
+        let mut writer = Self {
+            host: resolve_hostname(),
             config,
             file: Some(file),
             current_size,
@@ -130,7 +128,39 @@ impl AuditWriter {
             dropped_events: dropped,
             last_dropped_seen: 0,
             write_delay,
-        })
+        };
+        writer.write_header_if_empty().await.map_err(AuditInitError::FileOpen)?;
+        Ok(writer)
+    }
+
+    fn file_header(&self) -> AuditFileHeader {
+        AuditFileHeader {
+            schema_version: AUDIT_SCHEMA_VERSION,
+            service: "nodectl".into(),
+            service_version: env!("CARGO_PKG_VERSION").into(),
+            host: self.host.clone(),
+            started_at: Utc::now(),
+        }
+    }
+
+    async fn write_header_if_empty(&mut self) -> std::io::Result<()> {
+        if self.current_size != 0 {
+            return Ok(());
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut line = serde_json::to_vec(&self.file_header())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("audit file handle not open"))?;
+        file.write_all(&line).await?;
+        if self.config.fsync_on_batch {
+            file.sync_data().await?;
+        }
+        self.current_size += line.len() as u64;
+        Ok(())
     }
 
     async fn drain_pending_commands(
@@ -393,6 +423,7 @@ impl AuditWriter {
         }
         self.file = Some(file);
         self.current_size = 0;
+        self.write_header_if_empty().await?;
         Ok(())
     }
 
@@ -404,29 +435,27 @@ impl AuditWriter {
         }
         self.last_dropped_seen = current;
 
-        let event = AuditEvent {
-            schema_version: 1,
-            id: Uuid::new_v4(),
-            ts: Utc::now(),
-            source: AuditSource::System,
-            severity: AuditSeverity::Warn,
-            outcome: AuditOutcome::Failure,
-            actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::System,
-                id: None,
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: Some("audit events dropped".into()),
-            payload: AuditEventPayload::SystemAuditEventsDropped {
-                dropped_events: delta,
-                reason: "queue_full_after_timeout".into(),
-            },
-        };
-        let mut buf = vec![event];
+        let mut buf = vec![AuditEvent::system_audit_events_dropped(delta)];
         self.flush(&mut buf).await;
     }
+}
+
+/// Resolves the host identity for audit file headers (`HOSTNAME`, then `COMPUTERNAME`).
+fn resolve_hostname() -> String {
+    if let Some(host) = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|h| !h.is_empty())
+    {
+        return host;
+    }
+    HOSTNAME_FALLBACK_WARNED.call_once(|| {
+        tracing::warn!(
+            "audit log host identity unavailable (HOSTNAME/COMPUTERNAME unset); \
+             file header will use host=\"unknown\" — set HOSTNAME for forensics"
+        );
+    });
+    "unknown".to_string()
 }
 
 #[cfg(test)]
@@ -446,32 +475,11 @@ mod tests {
     }
 
     fn sample_event(tag: &str) -> AuditEvent {
-        AuditEvent {
-            schema_version: 1,
-            id: Uuid::new_v4(),
-            ts: Utc::now(),
-            source: AuditSource::System,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Config,
-                id: Some(tag.into()),
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::SystemServiceStarted { version: tag.into() },
-        }
+        AuditEvent::system_service_started(tag)
     }
 
     fn large_event(payload_kb: usize) -> AuditEvent {
-        let mut event = sample_event("large");
-        event.payload = AuditEventPayload::RestApiConfigUpdated {
-            operation: "update".into(),
-            changes: serde_json::json!({ "blob": "x".repeat(payload_kb * 1024) }),
-        };
-        event
+        AuditEvent::system_service_started("x".repeat(payload_kb * 1024))
     }
 
     fn test_config(dir: &Path, mut cfg: AuditLogConfig) -> AuditLogConfig {
@@ -524,13 +532,15 @@ mod tests {
         tx.send(AuditCommand::Shutdown).await.unwrap();
     }
 
+    /// Reads event lines, skipping the per-file [`AuditFileHeader`] (no `event_type`).
     fn read_json_lines(path: &Path) -> Vec<Value> {
         assert!(path.exists(), "audit file missing at {}", path.display());
         let content = std::fs::read_to_string(path).unwrap();
         content
             .lines()
             .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str(line).expect("valid json line"))
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid json line"))
+            .filter(|value| value.get("event_type").is_some())
             .collect()
     }
 

@@ -25,41 +25,11 @@ impl AuditLog for NoopAuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{
-        AuditEvent,
-        enums::{
-            AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource,
-            AuditSubjectKind,
-        },
-        participant::{AuditActor, AuditSubject},
-    };
-    use chrono::Utc;
-    use std::collections::BTreeMap;
-    use uuid::Uuid;
-
-    fn sample_event() -> AuditEvent {
-        AuditEvent {
-            schema_version: 1,
-            id: Uuid::new_v4(),
-            ts: Utc::now(),
-            source: AuditSource::System,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Config,
-                id: None,
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::SystemServiceStarted { version: "test".into() },
-        }
-    }
+    use crate::audit::AuditEvent;
 
     #[tokio::test]
     async fn noop_audit_log_record_completes() {
         let log = NoopAuditLog;
-        log.record(sample_event()).await;
+        log.record(AuditEvent::system_service_started("test")).await;
     }
 }

@@ -6,28 +6,72 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::audit::enums::{AuditActorKind, AuditSubjectKind};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AuditActor {
-    pub kind: AuditActorKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuditActor {
+    Service {
+        id: String,
+    },
+    User {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ip: Option<String>,
+    },
+    System,
 }
 
+impl AuditActor {
+    pub fn service(id: impl Into<String>) -> Self {
+        Self::Service { id: id.into() }
+    }
+
+    pub fn user(id: impl Into<String>, role: Option<String>, ip: Option<String>) -> Self {
+        Self::User { id: id.into(), role, ip }
+    }
+
+    pub fn system() -> Self {
+        Self::System
+    }
+}
+
+/// What the action was applied to. Internally tagged so per-variant required
+/// fields are enforced by the type system; `#[non_exhaustive]` because new
+/// target kinds are expected as more producers are wired.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AuditSubject {
-    pub kind: AuditSubjectKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub election_id: Option<u64>, // first-class for hot filtering
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AuditTarget {
+    Node {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        election_id: Option<u64>,
+    },
+    Elections {
+        election_id: u64,
+    },
+    Config {
+        id: String,
+    },
+    Wallet {
+        id: String,
+    },
+    VaultKey {
+        id: String,
+    },
+    User {
+        id: String,
+    },
+    RewardRound {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        election_id: Option<u64>,
+    },
+    Recipient {
+        id: String,
+    },
+    System,
 }

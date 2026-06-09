@@ -153,9 +153,8 @@ impl AuditLog for JsonlAuditLog {
     }
 
     async fn record(&self, event: AuditEvent) {
-        // Capture diagnostics up front so a dropped event can still be attributed
-        // to its source/subject after the event is moved into the send future.
-        let (event_id, source, subject) = (event.id, event.source, event.subject.kind);
+        let event_id = event.id;
+        let source = event.payload.source();
         let cmd = AuditCommand::Event(Box::new(event));
 
         match self.sender.try_send(cmd) {
@@ -164,12 +163,14 @@ impl AuditLog for JsonlAuditLog {
                 let timeout = Duration::from_millis(self.config.queue_full_timeout_ms);
                 match tokio::time::timeout(timeout, self.sender.send(cmd)).await {
                     Ok(Ok(())) => return,
-                    _ => {
+                    Ok(Err(_)) => {
+                        tracing::error!("audit log channel closed; service likely shutting down");
+                    }
+                    Err(_) => {
                         self.dropped_events.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             ?event_id,
                             ?source,
-                            ?subject,
                             "audit event dropped: queue full after timeout"
                         );
                     }
@@ -186,38 +187,12 @@ impl AuditLog for JsonlAuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{
-        AuditEvent,
-        enums::{
-            AuditActorKind, AuditEventPayload, AuditOutcome, AuditSeverity, AuditSource,
-            AuditSubjectKind,
-        },
-        log::AuditLog,
-        participant::{AuditActor, AuditSubject},
-    };
-    use chrono::Utc;
-    use std::{collections::BTreeMap, path::PathBuf, time::Instant};
+    use crate::audit::{AuditEvent, log::AuditLog};
+    use std::{path::PathBuf, time::Instant};
     use tempfile::tempdir;
-    use uuid::Uuid;
 
     fn sample_event(tag: &str) -> AuditEvent {
-        AuditEvent {
-            schema_version: 1,
-            id: Uuid::new_v4(),
-            ts: Utc::now(),
-            source: AuditSource::System,
-            severity: AuditSeverity::Info,
-            outcome: AuditOutcome::Success,
-            actor: AuditActor { kind: AuditActorKind::System, id: None, role: None, ip: None },
-            subject: AuditSubject {
-                kind: AuditSubjectKind::Config,
-                id: Some(tag.into()),
-                election_id: None,
-                labels: BTreeMap::new(),
-            },
-            message: None,
-            payload: AuditEventPayload::SystemServiceStarted { version: tag.into() },
-        }
+        AuditEvent::system_service_started(tag)
     }
 
     fn test_config(path: PathBuf) -> AuditLogConfig {

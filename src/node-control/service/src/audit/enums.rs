@@ -14,14 +14,12 @@ use serde::{Deserialize, Serialize};
 pub enum AuditEventPayload {
     #[serde(rename = "elections.key_generated")]
     ElectionsKeyGenerated {
-        election_id: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         pubkey: Option<String>,
     },
 
     #[serde(rename = "elections.stake_submitted")]
     ElectionsStakeSubmitted {
-        election_id: u64,
         stake_nanotons: String,
         max_factor: u32,
         policy: String,
@@ -29,11 +27,10 @@ pub enum AuditEventPayload {
     },
 
     #[serde(rename = "elections.stake_accepted")]
-    ElectionsStakeAccepted { election_id: u64, stake_nanotons: String },
+    ElectionsStakeAccepted { stake_nanotons: String },
 
     #[serde(rename = "elections.stake_skipped")]
     ElectionsStakeSkipped {
-        election_id: u64,
         reason: StakeSkipReason,
         #[serde(skip_serializing_if = "Option::is_none")]
         required_nanotons: Option<String>,
@@ -41,54 +38,111 @@ pub enum AuditEventPayload {
         available_nanotons: Option<String>,
     },
 
-    #[serde(rename = "elections.withdraw_processed")]
-    ElectionsWithdrawProcessed { election_id: u64, tx_hash: String },
+    #[serde(rename = "elections.stake_failed")]
+    ElectionsStakeFailed { reason: String },
 
     #[serde(rename = "elections.stake_recovered")]
     ElectionsStakeRecovered {
-        election_id: u64,
         amount_nanotons: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        tx_hash: Option<String>,
+        msg_hash: Option<String>,
     },
 
+    #[serde(rename = "elections.stake_recover_failed")]
+    ElectionsStakeRecoverFailed { reason: String },
+
+    #[serde(rename = "elections.withdraw_processed")]
+    ElectionsWithdrawProcessed { msg_hash: String },
+
+    #[serde(rename = "elections.withdraw_failed")]
+    ElectionsWithdrawFailed { reason: String },
+
+    // ── rewards (reserved; producers not wired yet) ─────────────────────────
+    #[serde(rename = "rewards.distribution_started")]
+    RewardsDistributionStarted { recipients_count: u32 },
+
+    #[serde(rename = "rewards.distribution_completed")]
+    RewardsDistributionCompleted { recipients_count: u32, total_nanotons: String },
+
+    #[serde(rename = "rewards.distribution_failed")]
+    RewardsDistributionFailed { reason: String },
+
+    #[serde(rename = "rewards.recipient_skipped")]
+    RewardsRecipientSkipped { reason: String },
+
+    // ── rest_api ────────────────────────────────────────────────────────────
     #[serde(rename = "rest_api.config_updated")]
-    RestApiConfigUpdated {
-        operation: String,
-        changes: serde_json::Value, // diff stays free-form
-    },
+    RestApiConfigUpdated { operation: String, changes: Vec<ConfigFieldChange> },
 
-    #[serde(rename = "rest_api.auth_login_success")]
-    RestApiAuthLoginSuccess { username: String },
+    #[serde(rename = "rest_api.auth_login_succeeded")]
+    RestApiAuthLoginSucceeded {},
 
     #[serde(rename = "rest_api.auth_login_rejected")]
-    RestApiAuthLoginRejected { username: String, reason: String },
+    RestApiAuthLoginRejected { reason: String },
 
     #[serde(rename = "rest_api.token_rejected")]
     RestApiTokenRejected { reason: String },
 
+    // ── vault (reserved; producers not wired yet) ───────────────────────────
+    #[serde(rename = "vault.key_created")]
+    VaultKeyCreated {},
+
+    #[serde(rename = "vault.key_removed")]
+    VaultKeyRemoved {},
+
+    // ── system ───────────────────────────────────────────────────────────────
     #[serde(rename = "system.service_started")]
     SystemServiceStarted { version: String },
 
     #[serde(rename = "system.service_stopped")]
-    SystemServiceStopped,
+    SystemServiceStopped {},
 
     #[serde(rename = "system.audit_events_dropped")]
     SystemAuditEventsDropped { dropped_events: u64, reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StakeSkipReason {
     LowWalletBalance,
     WithdrawRequestsPending,
     PoolNotReady,
-    Other,
+    AdaptiveSleepingPeriod,
+    AdaptiveWaitingPeriod,
+    ElectionsDisabled,
+    RecoverPending,
+    InsufficientStakeFunds,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// A single typed field change for `rest_api.config_updated`. Replaces the
+/// previous free-form `serde_json::Value` diff.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigFieldChange {
+    /// Dotted path, e.g. `elections.sleep_period_pct`.
+    pub field: String,
+    pub old: serde_json::Value,
+    pub new: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    Success,
+    Failure,
+    Skipped,
+}
+
+/// Log-level-like severity, derived from the event type at the display layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Originating subsystem, derived from the `event_type` prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditSource {
     Elections,
     Rewards,
@@ -97,42 +151,67 @@ pub enum AuditSource {
     System,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuditSeverity {
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
+impl AuditEventPayload {
+    pub fn severity(&self) -> AuditSeverity {
+        use AuditEventPayload::*;
+        use AuditSeverity::*;
+        match self {
+            ElectionsKeyGenerated { .. }
+            | ElectionsStakeSubmitted { .. }
+            | ElectionsStakeAccepted { .. }
+            | ElectionsStakeRecovered { .. }
+            | ElectionsWithdrawProcessed { .. }
+            | RewardsDistributionStarted { .. }
+            | RewardsDistributionCompleted { .. }
+            | RestApiConfigUpdated { .. }
+            | RestApiAuthLoginSucceeded {}
+            | VaultKeyCreated {}
+            | VaultKeyRemoved {}
+            | SystemServiceStarted { .. }
+            | SystemServiceStopped {} => Info,
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuditOutcome {
-    Success,
-    Failure,
-    Skipped,
-}
+            ElectionsStakeSkipped { .. }
+            | RewardsRecipientSkipped { .. }
+            | RestApiAuthLoginRejected { .. }
+            | RestApiTokenRejected { .. }
+            | SystemAuditEventsDropped { .. } => Warn,
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuditActorKind {
-    Service,
-    User,
-    Scheduler,
-    System,
-}
+            ElectionsStakeFailed { .. }
+            | ElectionsStakeRecoverFailed { .. }
+            | ElectionsWithdrawFailed { .. }
+            | RewardsDistributionFailed { .. } => Error,
+        }
+    }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuditSubjectKind {
-    Node,
-    Elections,
-    Config,
-    Wallet,
-    VaultKey,
-    User,
-    RewardRound,
-    Recipient,
-    System,
+    pub fn source(&self) -> AuditSource {
+        use AuditEventPayload::*;
+        use AuditSource::*;
+        match self {
+            ElectionsKeyGenerated { .. }
+            | ElectionsStakeSubmitted { .. }
+            | ElectionsStakeAccepted { .. }
+            | ElectionsStakeSkipped { .. }
+            | ElectionsStakeFailed { .. }
+            | ElectionsStakeRecovered { .. }
+            | ElectionsStakeRecoverFailed { .. }
+            | ElectionsWithdrawProcessed { .. }
+            | ElectionsWithdrawFailed { .. } => Elections,
+
+            RewardsDistributionStarted { .. }
+            | RewardsDistributionCompleted { .. }
+            | RewardsDistributionFailed { .. }
+            | RewardsRecipientSkipped { .. } => Rewards,
+
+            RestApiConfigUpdated { .. }
+            | RestApiAuthLoginSucceeded {}
+            | RestApiAuthLoginRejected { .. }
+            | RestApiTokenRejected { .. } => RestApi,
+
+            VaultKeyCreated {} | VaultKeyRemoved {} => Vault,
+
+            SystemServiceStarted { .. }
+            | SystemServiceStopped {}
+            | SystemAuditEventsDropped { .. } => System,
+        }
+    }
 }
