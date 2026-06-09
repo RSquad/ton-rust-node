@@ -7,14 +7,17 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::audit::{AuditEvent, log::AuditLog};
+use async_trait::async_trait;
+use std::sync::Mutex;
+
 /// Captures audit events in memory for unit tests.
 pub struct InMemoryAuditLog {
-    pub events: std::sync::Mutex<Vec<AuditEvent>>,
+    events: Mutex<Vec<AuditEvent>>,
 }
 
 impl InMemoryAuditLog {
     pub fn new() -> Self {
-        Self { events: std::sync::Mutex::new(Vec::new()) }
+        Self { events: Mutex::new(Vec::new()) }
     }
 
     pub fn drain(&self) -> Vec<AuditEvent> {
@@ -28,7 +31,7 @@ impl Default for InMemoryAuditLog {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl AuditLog for InMemoryAuditLog {
     async fn record(&self, event: AuditEvent) {
         self.events.lock().expect("in-memory audit lock").push(event);

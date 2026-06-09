@@ -10,29 +10,30 @@ use crate::audit::{
     enums::{AuditEventPayload, AuditOutcome, StakeSkipReason},
     participant::{AuditActor, AuditTarget},
 };
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use uuid::Uuid;
+
 /// Renders timestamps as RFC3339 with millisecond precision and a trailing `Z`
 /// (e.g. `2026-05-22T12:10:30.123Z`), used for `ts` and `started_at`.
 mod ts_millis_rfc3339 {
-    pub fn serialize<S: serde::Serializer>(
-        ts: &chrono::DateTime<chrono::Utc>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    use super::*;
+
+    pub fn serialize<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&ts.to_rfc3339_opts(SecondsFormat::Millis, true))
     }
 
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<chrono::DateTime<chrono::Utc>, D::Error> {
-        let raw = <String as serde::Deserialize>::deserialize(d)?;
-        chrono::DateTime::parse_from_rfc3339(&raw)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let raw = String::deserialize(d)?;
+        DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&Utc))
             .map_err(serde::de::Error::custom)
     }
 }
 
 /// First JSONL line of every (rotated) audit file. Readers distinguish it from
 /// events by the absence of an `event_type` field.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditFileHeader {
     pub schema_version: u16,
     /// Logical service name, e.g. `"nodectl"`.
@@ -41,7 +42,7 @@ pub struct AuditFileHeader {
     pub service_version: String,
     pub host: String,
     #[serde(with = "ts_millis_rfc3339")]
-    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: DateTime<Utc>,
 }
 
 /// A single audit record.
@@ -50,17 +51,26 @@ pub struct AuditFileHeader {
 /// (`event_type` + `data`), `actor`, `target`. `severity`/`source` are derived
 /// from the payload at the display layer and `schema_version` lives in
 /// [`AuditFileHeader`], so none of them are stored per event.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// UUID v7 — sortable by creation time.
-    pub id: uuid::Uuid,
+    pub id: Uuid,
     #[serde(with = "ts_millis_rfc3339")]
-    pub ts: chrono::DateTime<chrono::Utc>,
+    pub ts: DateTime<Utc>,
     pub outcome: AuditOutcome,
     #[serde(flatten)]
     pub payload: AuditEventPayload,
     pub actor: AuditActor,
     pub target: AuditTarget,
+}
+
+/// Named payload fields for [`AuditEvent::elections_stake_submitted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElectionsStakeSubmittedParams {
+    pub stake_nanotons: String,
+    pub max_factor: u32,
+    pub policy: String,
+    pub submission_time: u64,
 }
 
 impl AuditEvent {
@@ -73,30 +83,12 @@ impl AuditEvent {
         outcome: AuditOutcome,
         payload: AuditEventPayload,
     ) -> Self {
-        Self { id: uuid::Uuid::now_v7(), ts: chrono::Utc::now(), outcome, payload, actor, target }
+        Self { id: Uuid::now_v7(), ts: Utc::now(), outcome, payload, actor, target }
     }
 
     /// `target` for a per-node election event: always `Node { election_id }`.
     fn node_target(node_id: impl Into<String>, election_id: u64) -> AuditTarget {
         AuditTarget::Node { id: node_id.into(), election_id: Some(election_id) }
-    }
-
-    pub fn elections_tick_failed(
-        actor: AuditActor,
-        election_id: Option<u64>,
-        reason: impl Into<String>,
-    ) -> Self {
-        // A tick can fail before the active election id is known; fall back to a
-        // system target in that case (source still resolves to `elections`).
-        let target = election_id
-            .map(|election_id| AuditTarget::Elections { election_id })
-            .unwrap_or(AuditTarget::System);
-        Self::new(
-            actor,
-            target,
-            AuditOutcome::Failure,
-            AuditEventPayload::ElectionsTickFailed { reason: reason.into() },
-        )
     }
 
     pub fn elections_key_generated(
@@ -113,25 +105,21 @@ impl AuditEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn elections_stake_submitted(
         actor: AuditActor,
         node_id: impl Into<String>,
         election_id: u64,
-        stake_nanotons: impl Into<String>,
-        max_factor: u32,
-        policy: impl Into<String>,
-        submission_time: u64,
+        params: ElectionsStakeSubmittedParams,
     ) -> Self {
         Self::new(
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
             AuditEventPayload::ElectionsStakeSubmitted {
-                stake_nanotons: stake_nanotons.into(),
-                max_factor,
-                policy: policy.into(),
-                submission_time,
+                stake_nanotons: params.stake_nanotons,
+                max_factor: params.max_factor,
+                policy: params.policy,
+                submission_time: params.submission_time,
             },
         )
     }
@@ -156,39 +144,7 @@ impl AuditEvent {
         )
     }
 
-    pub fn elections_stake_recovered(
-        actor: AuditActor,
-        node_id: impl Into<String>,
-        election_id: u64,
-        amount_nanotons: impl Into<String>,
-        tx_hash: Option<String>,
-    ) -> Self {
-        Self::new(
-            actor,
-            Self::node_target(node_id, election_id),
-            AuditOutcome::Success,
-            AuditEventPayload::ElectionsStakeRecovered {
-                amount_nanotons: amount_nanotons.into(),
-                tx_hash,
-            },
-        )
-    }
-
-    pub fn elections_withdraw_processed(
-        actor: AuditActor,
-        node_id: impl Into<String>,
-        election_id: u64,
-        tx_hash: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            actor,
-            Self::node_target(node_id, election_id),
-            AuditOutcome::Success,
-            AuditEventPayload::ElectionsWithdrawProcessed { tx_hash: tx_hash.into() },
-        )
-    }
-
-    pub fn elections_withdraw_process_failed(
+    pub fn elections_stake_failed(
         actor: AuditActor,
         node_id: impl Into<String>,
         election_id: u64,
@@ -198,7 +154,67 @@ impl AuditEvent {
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Failure,
-            AuditEventPayload::ElectionsWithdrawProcessFailed { reason: reason.into() },
+            AuditEventPayload::ElectionsStakeFailed { reason: reason.into() },
+        )
+    }
+
+    pub fn elections_stake_recovered(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        amount_nanotons: impl Into<String>,
+        msg_hash: Option<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsStakeRecovered {
+                amount_nanotons: amount_nanotons.into(),
+                msg_hash,
+            },
+        )
+    }
+
+    pub fn elections_stake_recover_failed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Failure,
+            AuditEventPayload::ElectionsStakeRecoverFailed { reason: reason.into() },
+        )
+    }
+
+    pub fn elections_withdraw_processed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        msg_hash: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Success,
+            AuditEventPayload::ElectionsWithdrawProcessed { msg_hash: msg_hash.into() },
+        )
+    }
+
+    pub fn elections_withdraw_failed(
+        actor: AuditActor,
+        node_id: impl Into<String>,
+        election_id: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            Self::node_target(node_id, election_id),
+            AuditOutcome::Failure,
+            AuditEventPayload::ElectionsWithdrawFailed { reason: reason.into() },
         )
     }
 
@@ -220,55 +236,6 @@ impl AuditEvent {
                 dropped_events: dropped,
                 reason: "queue_full_after_timeout".into(),
             },
-        )
-    }
-
-    pub fn rest_api_config_updated(
-        actor: AuditActor,
-        config_id: impl Into<String>,
-        operation: impl Into<String>,
-        changes: Vec<crate::audit::ConfigFieldChange>,
-    ) -> Self {
-        Self::new(
-            actor,
-            AuditTarget::Config { id: config_id.into() },
-            AuditOutcome::Success,
-            AuditEventPayload::RestApiConfigUpdated { operation: operation.into(), changes },
-        )
-    }
-
-    pub fn rest_api_auth_login_success(actor: AuditActor, user_id: impl Into<String>) -> Self {
-        Self::new(
-            actor,
-            AuditTarget::User { id: user_id.into() },
-            AuditOutcome::Success,
-            AuditEventPayload::RestApiAuthLoginSuccess {},
-        )
-    }
-
-    pub fn rest_api_auth_login_rejected(
-        actor: AuditActor,
-        user_id: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            actor,
-            AuditTarget::User { id: user_id.into() },
-            AuditOutcome::Failure,
-            AuditEventPayload::RestApiAuthLoginRejected { reason: reason.into() },
-        )
-    }
-
-    pub fn rest_api_token_rejected(
-        actor: AuditActor,
-        user_id: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            actor,
-            AuditTarget::User { id: user_id.into() },
-            AuditOutcome::Failure,
-            AuditEventPayload::RestApiTokenRejected { reason: reason.into() },
         )
     }
 }
@@ -404,7 +371,6 @@ mod tests {
 
     fn all_payload_variants() -> Vec<AuditEventPayload> {
         vec![
-            AuditEventPayload::ElectionsTickFailed { reason: "tick error".into() },
             AuditEventPayload::ElectionsKeyGenerated { pubkey: Some("aabb".into()) },
             AuditEventPayload::ElectionsStakeSubmitted {
                 stake_nanotons: "1".into(),
@@ -418,12 +384,14 @@ mod tests {
                 required_nanotons: None,
                 available_nanotons: None,
             },
-            AuditEventPayload::ElectionsWithdrawProcessed { tx_hash: "abc".into() },
-            AuditEventPayload::ElectionsWithdrawProcessFailed { reason: "send failed".into() },
+            AuditEventPayload::ElectionsStakeFailed { reason: "send failed".into() },
+            AuditEventPayload::ElectionsWithdrawProcessed { msg_hash: "abc".into() },
+            AuditEventPayload::ElectionsWithdrawFailed { reason: "send failed".into() },
             AuditEventPayload::ElectionsStakeRecovered {
                 amount_nanotons: "50000000000000".into(),
-                tx_hash: Some("def".into()),
+                msg_hash: Some("def".into()),
             },
+            AuditEventPayload::ElectionsStakeRecoverFailed { reason: "send failed".into() },
             AuditEventPayload::RewardsDistributionStarted { recipients_count: 3 },
             AuditEventPayload::RewardsDistributionCompleted {
                 recipients_count: 3,
@@ -439,7 +407,7 @@ mod tests {
                     new: json!(2),
                 }],
             },
-            AuditEventPayload::RestApiAuthLoginSuccess {},
+            AuditEventPayload::RestApiAuthLoginSucceeded {},
             AuditEventPayload::RestApiAuthLoginRejected { reason: "bad password".into() },
             AuditEventPayload::RestApiTokenRejected { reason: "expired".into() },
             AuditEventPayload::VaultKeyCreated {},
@@ -475,10 +443,13 @@ mod tests {
         );
         assert_eq!(skipped.outcome, AuditOutcome::Skipped);
 
-        let failed =
-            AuditEvent::elections_tick_failed(AuditActor::service("elections-task"), None, "boom");
+        let failed = AuditEvent::elections_stake_failed(
+            AuditActor::service("elections-task"),
+            "node1",
+            1,
+            "boom",
+        );
         assert_eq!(failed.outcome, AuditOutcome::Failure);
-        assert_eq!(failed.target, AuditTarget::System);
     }
 
     #[test]

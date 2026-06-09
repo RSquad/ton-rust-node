@@ -11,7 +11,10 @@ use super::{
     election_emulator::ParticipantStake,
     providers::{ElectionsProvider, ValidatorConfig, ValidatorEntry},
 };
-use crate::audit::{AuditEvent, StakeSkipReason, log::AuditLog, participant::AuditActor};
+use crate::audit::{
+    AuditEvent, ElectionsStakeSubmittedParams, StakeSkipReason, log::AuditLog,
+    participant::AuditActor,
+};
 use anyhow::Context as _;
 use common::{
     app_config::{BindingStatus, ElectionsConfig, NodeBinding, StakePolicy},
@@ -76,6 +79,20 @@ const WITHDRAW_PROCESS_GAS: u64 = 1_000_000_000; // 1 TON
 const WITHDRAW_PROCESS_LIMIT: u8 = 10;
 
 type OnStatusChange = Arc<dyn Fn(HashMap<String, BindingStatus>) + Send + Sync>;
+
+/// Stake balance guard failed: `available` nanotons are below `required`.
+/// Carried as a typed [`anyhow::Error`] root cause so audit producers read structured
+/// amounts instead of parsing free-form error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "insufficient balance: required={} TON, available={} TON",
+    *required as f64 / 1_000_000_000.0,
+    *available as f64 / 1_000_000_000.0
+)]
+struct InsufficientBalance {
+    required: u64,
+    available: u64,
+}
 
 /// Persists a batch of freshly generated static ADNL addresses (node_id → base64) into the
 /// runtime config under `elections.static_adnls`. Called at most once per tick.
@@ -358,59 +375,17 @@ impl ElectionRunner {
         }
     }
 
-    async fn audit_stake_skipped(
-        &self,
-        election_id: u64,
-        node_id: &str,
-        reason: StakeSkipReason,
-        required_nanotons: Option<u64>,
-        available_nanotons: Option<u64>,
-    ) {
-        elections_audit_stake_skipped(
-            &self.audit,
-            election_id,
-            node_id,
-            reason,
-            required_nanotons,
-            available_nanotons,
-        )
-        .await;
-    }
-
-    /// Classifies stake==0 when [`calc_stake`] did not already supply an adaptive reason
-    /// (defer windows only; adaptive zero cases come from [`calc_adaptive_stake`]).
-    async fn classify_stake_zero(
-        node: &Node,
-        configs: &ConfigParams<'_>,
-        ctx: &StakeContext<'_>,
-    ) -> (StakeSkipReason, Option<u64>, Option<u64>) {
-        if matches!(&node.stake_policy, StakePolicy::AdaptiveSplit50) {
-            if let Some(defer) = adaptive_strategy::adaptive_split50_defer_reason(
-                configs.elections_info,
-                configs.cfg15.elections_start_before,
-                configs.cfg15.elections_end_before,
-                configs.cfg16,
-                ctx.sleep_pct,
-                ctx.waiting_pct,
-            ) {
-                return match defer {
-                    adaptive_strategy::AdaptiveDeferReason::SleepPeriod => {
-                        (StakeSkipReason::AdaptiveSleepPeriod, None, None)
-                    }
-                    adaptive_strategy::AdaptiveDeferReason::WaitingForParticipants => {
-                        (StakeSkipReason::AdaptiveWaitingPeriod, None, None)
-                    }
-                };
-            }
-        }
-        (StakeSkipReason::InsufficientStakeFunds, None, None)
-    }
-
     fn adaptive_zero_to_skip(
         zero: adaptive_strategy::AdaptiveStakeZero,
     ) -> Option<(StakeSkipReason, Option<u64>, Option<u64>)> {
-        use adaptive_strategy::AdaptiveStakeZero::*;
+        use adaptive_strategy::{AdaptiveDeferReason, AdaptiveStakeZero::*};
         match zero {
+            Defer(AdaptiveDeferReason::SleepPeriod) => {
+                Some((StakeSkipReason::AdaptiveSleepingPeriod, None, None))
+            }
+            Defer(AdaptiveDeferReason::WaitingForParticipants) => {
+                Some((StakeSkipReason::AdaptiveWaitingPeriod, None, None))
+            }
             NoTopUpNeeded => None,
             InsufficientFree { required, available } => {
                 Some((StakeSkipReason::InsufficientStakeFunds, Some(required), Some(available)))
@@ -529,17 +504,6 @@ impl ElectionRunner {
                     self.refresh_validator_configs().await;
 
                     if let Err(e) = self.run().await {
-                        let election_id = tick_election_id.or({
-                            let id = self.past_elections_cache_id;
-                            (id > 0).then_some(id)
-                        });
-                        audit
-                            .record(AuditEvent::elections_tick_failed(
-                                elections_audit_actor(),
-                                election_id,
-                                format!("{e:#}"),
-                            ))
-                            .await;
                         tracing::error!("runner tick error: {:#}", e);
                     }
 
@@ -713,7 +677,8 @@ impl ElectionRunner {
             .collect::<Vec<String>>();
         nodes.sort();
         for node_id in &skip_tick_nodes {
-            self.audit_stake_skipped(
+            elections_audit_stake_skipped(
+                &self.audit,
                 election_id,
                 node_id,
                 StakeSkipReason::PoolNotReady,
@@ -746,16 +711,18 @@ impl ElectionRunner {
                     recover_amount as f64 / 1_000_000_000.0
                 );
                 if excluded {
-                    self.audit_stake_skipped(
+                    elections_audit_stake_skipped(
+                        &self.audit,
                         election_id,
                         &node_id,
-                        StakeSkipReason::NodeExcluded,
+                        StakeSkipReason::ElectionsDisabled,
                         None,
                         None,
                     )
                     .await;
                 } else {
-                    self.audit_stake_skipped(
+                    elections_audit_stake_skipped(
+                        &self.audit,
                         election_id,
                         &node_id,
                         StakeSkipReason::RecoverPending,
@@ -777,7 +744,8 @@ impl ElectionRunner {
                         "node [{}] skip participate this tick: withdraw requests sent, awaiting pool drain",
                         node_id
                     );
-                    self.audit_stake_skipped(
+                    elections_audit_stake_skipped(
+                        &self.audit,
                         election_id,
                         &node_id,
                         StakeSkipReason::WithdrawRequestsPending,
@@ -804,6 +772,7 @@ impl ElectionRunner {
                 cfg17: &cfg17,
             };
             if let Err(e) = self.participate(&node_id, election_id, &config_params).await {
+                elections_audit_stake_failed(&self.audit, election_id, &node_id, &e).await;
                 if let Some(node) = self.nodes.get_mut(&node_id) {
                     node.last_error = Some(format!("{:#}", e));
                 }
@@ -987,18 +956,12 @@ impl ElectionRunner {
         let (stake, adaptive_zero) =
             match Self::calc_stake(node, node_id, elections_stake, params, &stake_ctx).await {
                 Ok(v) => v,
-                Err(e) => {
-                    elections_audit_low_balance_if_parsed(&audit, election_id, node_id, &e).await;
-                    return Err(e).context("stake calculation error");
-                }
+                Err(e) => return Err(e).context("stake calculation error"),
             };
 
         if stake == 0 {
             tracing::info!("node [{}] skipping elections this tick (stake=0)", node_id);
-            let skip = match adaptive_zero {
-                Some(z) => Self::adaptive_zero_to_skip(z),
-                None => Some(Self::classify_stake_zero(node, params, &stake_ctx).await),
-            };
+            let skip = adaptive_zero.and_then(Self::adaptive_zero_to_skip);
             if let Some((reason, required, available)) = skip {
                 elections_audit_stake_skipped(
                     &audit,
@@ -1077,7 +1040,6 @@ impl ElectionRunner {
                     ))
                     .await;
                 if let Err(e) = Self::send_stake(node_id, node, stake, to_addr).await {
-                    elections_audit_low_balance_if_parsed(&audit, election_id, node_id, &e).await;
                     return Err(e);
                 }
                 elections_audit_stake_submitted(&audit, node_id, node, stake).await;
@@ -1107,13 +1069,6 @@ impl ElectionRunner {
                                 nanotons_to_tons_f64(stake),
                             );
                             if let Err(e) = Self::send_stake(node_id, node, stake, to_addr).await {
-                                elections_audit_low_balance_if_parsed(
-                                    &audit,
-                                    election_id,
-                                    node_id,
-                                    &e,
-                                )
-                                .await;
                                 return Err(e);
                             }
                             node.participant.as_mut().map(|p| p.stake += stake);
@@ -1126,8 +1081,6 @@ impl ElectionRunner {
                             p.stake = stake;
                         }
                         if let Err(e) = Self::send_stake(node_id, node, stake, to_addr).await {
-                            elections_audit_low_balance_if_parsed(&audit, election_id, node_id, &e)
-                                .await;
                             return Err(e);
                         }
                         elections_audit_stake_submitted(&audit, node_id, node, stake).await;
@@ -1149,19 +1102,16 @@ impl ElectionRunner {
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
         let stake_balance = node.stake_balance(fee).await?;
         if stake_balance < stake {
-            anyhow::bail!(
-                "low stake balance: required={} TON, available={} TON",
-                stake as f64 / 1_000_000_000.0,
-                stake_balance as f64 / 1_000_000_000.0
-            );
+            return Err(InsufficientBalance { required: stake, available: stake_balance }.into());
         }
         let wallet_balance = node.wallet_balance().await?;
-        if wallet_balance < fee + WALLET_COMPUTE_FEE {
-            anyhow::bail!(
-                "low wallet balance: required={} TON, available={} TON",
-                (fee + WALLET_COMPUTE_FEE) as f64 / 1_000_000_000.0,
-                wallet_balance as f64 / 1_000_000_000.0
-            );
+        let wallet_required = fee + WALLET_COMPUTE_FEE;
+        if wallet_balance < wallet_required {
+            return Err(InsufficientBalance {
+                required: wallet_required,
+                available: wallet_balance,
+            }
+            .into());
         }
 
         let send_value = node.pool.as_ref().map(|_| fee).unwrap_or(stake + fee);
@@ -1293,7 +1243,7 @@ impl ElectionRunner {
             .await
             .context("build process_withdraw_requests message")?;
         let msg_boc = write_boc(&msg).context("encode process_withdraw_requests boc")?;
-        let tx_hash = format!("{:x}", msg.repr_hash());
+        let msg_hash = format!("{:x}", msg.repr_hash());
         let send_result = {
             let node = self.nodes.get_mut(node_id).expect("node not found");
             node.api.send_boc(&msg_boc).await.context("send process_withdraw_requests boc")
@@ -1301,7 +1251,7 @@ impl ElectionRunner {
 
         if let Err(e) = send_result {
             self.audit
-                .record(AuditEvent::elections_withdraw_process_failed(
+                .record(AuditEvent::elections_withdraw_failed(
                     elections_audit_actor(),
                     node_id,
                     election_id,
@@ -1322,7 +1272,7 @@ impl ElectionRunner {
                 elections_audit_actor(),
                 node_id,
                 election_id,
-                tx_hash,
+                msg_hash,
             ))
             .await;
         Ok(true)
@@ -1357,16 +1307,30 @@ impl ElectionRunner {
                 .wallet
                 .message(to_addr, RECOVER_FEE, Self::build_recover_stake_payload().await?)
                 .await?;
-            let tx_hash = format!("{:x}", msg.repr_hash());
+            let msg_hash = format!("{:x}", msg.repr_hash());
             let msg_boc = write_boc(&msg)?;
-            node.api.send_boc(&msg_boc).await?;
+            let send_result = {
+                let node = self.nodes.get_mut(node_id).expect("node not found");
+                node.api.send_boc(&msg_boc).await.context("send recover stake boc")
+            };
+            if let Err(e) = send_result {
+                self.audit
+                    .record(AuditEvent::elections_stake_recover_failed(
+                        elections_audit_actor(),
+                        node_id,
+                        election_id,
+                        format!("{e:#}"),
+                    ))
+                    .await;
+                return Err(e);
+            }
             self.audit
                 .record(AuditEvent::elections_stake_recovered(
                     elections_audit_actor(),
                     node_id,
                     election_id,
                     nanotons_to_dec_string(amount),
-                    Some(tx_hash),
+                    Some(msg_hash),
                 ))
                 .await;
         }
@@ -1496,10 +1460,8 @@ impl ElectionRunner {
             total_balance as f64 / 1_000_000_000.0
         );
         if total_balance < min_stake {
-            anyhow::bail!(
-                "not enough funds: available={} TON, required={} TON",
-                total_balance as f64 / 1_000_000_000.0,
-                min_stake as f64 / 1_000_000_000.0
+            return Err(
+                InsufficientBalance { required: min_stake, available: total_balance }.into()
             );
         }
 
@@ -1520,7 +1482,7 @@ impl ElectionRunner {
 
         match &node.stake_policy {
             StakePolicy::AdaptiveSplit50 => {
-                if !adaptive_strategy::is_adaptive_split50_ready(
+                if let Some(defer) = adaptive_strategy::adaptive_split50_status(
                     node_id,
                     configs.elections_info,
                     configs.cfg15.elections_start_before,
@@ -1529,7 +1491,7 @@ impl ElectionRunner {
                     ctx.sleep_pct,
                     ctx.waiting_pct,
                 ) {
-                    return Ok((0, None));
+                    return Ok((0, Some(adaptive_strategy::AdaptiveStakeZero::Defer(defer))));
                 }
                 let current_stake = if node.stake_accepted { elections_stake } else { 0 };
                 let stakes: Vec<_> = configs
@@ -2037,26 +1999,20 @@ async fn elections_audit_stake_skipped(
         .await;
 }
 
-/// Emits `LowWalletBalance` only when `err` matches the `required=` / `available=` format
-/// (calc_stake or send_stake balance guards). Other failures are not audited as skip.
-async fn elections_audit_low_balance_if_parsed(
+async fn elections_audit_stake_failed(
     audit: &Arc<dyn AuditLog>,
     election_id: u64,
     node_id: &str,
-    err: &(impl std::fmt::Display + ?Sized),
+    err: &anyhow::Error,
 ) {
-    let (required, available) = parse_balance_error(&err.to_string());
-    if required.is_some() || available.is_some() {
-        elections_audit_stake_skipped(
-            audit,
-            election_id,
+    audit
+        .record(AuditEvent::elections_stake_failed(
+            elections_audit_actor(),
             node_id,
-            StakeSkipReason::LowWalletBalance,
-            required,
-            available,
-        )
+            election_id,
+            format!("{err:#}"),
+        ))
         .await;
-    }
 }
 
 async fn elections_audit_stake_submitted(
@@ -2074,31 +2030,14 @@ async fn elections_audit_stake_submitted(
             elections_audit_actor(),
             node_id,
             participant.election_id,
-            nanotons_to_dec_string(stake),
-            participant.max_factor,
-            node.stake_policy.to_string(),
-            submission_time,
+            ElectionsStakeSubmittedParams {
+                stake_nanotons: nanotons_to_dec_string(stake),
+                max_factor: participant.max_factor,
+                policy: node.stake_policy.to_string(),
+                submission_time,
+            },
         ))
         .await;
-}
-
-/// Parses `required=` / `available=` TON amounts from runner balance error strings.
-fn parse_balance_error(msg: &str) -> (Option<u64>, Option<u64>) {
-    fn tons_to_nanotons(fragment: &str) -> Option<u64> {
-        let tons: f64 = fragment.trim().parse().ok()?;
-        Some((tons * 1_000_000_000.0).round() as u64)
-    }
-    let required = msg
-        .split("required=")
-        .nth(1)
-        .and_then(|s| s.split(" TON").next())
-        .and_then(tons_to_nanotons);
-    let available = msg
-        .split("available=")
-        .nth(1)
-        .and_then(|s| s.split(" TON").next())
-        .and_then(tons_to_nanotons);
-    (required, available)
 }
 
 async fn find_validator_entries(

@@ -915,6 +915,46 @@ async fn test_recover_stake_returns_funds() {
     assert!(node.participant.is_none(), "should not participate when recovering stake");
 }
 
+#[tokio::test]
+async fn recover_stake_send_failed_emits_audit_event() {
+    let node_id = "node-1";
+    let mut harness = TestHarness::new();
+
+    let returned_amount: u64 = 20_000_000_000_000;
+    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, returned_amount);
+    setup_wallet(&mut harness.wallet_mock);
+
+    let provider = &mut harness.provider_mock;
+    provider.expect_election_parameters().returning(|| Ok(default_cfg15()));
+    provider.expect_validator_config().returning(|| Ok(ValidatorConfig::new()));
+    provider.expect_account().returning(|_| Ok(fake_account(WALLET_BALANCE)));
+    provider
+        .expect_send_boc()
+        .times(1)
+        .returning(|_| Err(anyhow::anyhow!("simulated recover send_boc failure")));
+    provider.expect_config_param_16().returning(|| Ok(default_cfg16()));
+    provider.expect_config_param_17().returning(|| Ok(default_cfg17()));
+    provider.expect_shutdown().returning(|| Ok(()));
+
+    let audit = harness.audit.clone();
+    let mut runner = harness.build(node_id).await;
+    runner.run().await.unwrap();
+
+    let events = audit.drain();
+    let ev = find_audit_event(&events, |p| {
+        matches!(p, AuditEventPayload::ElectionsStakeRecoverFailed { .. })
+    });
+
+    assert_eq!(ev.payload.severity(), AuditSeverity::Error);
+    assert_eq!(ev.outcome, AuditOutcome::Failure);
+    assert_node_target(&ev.target, node_id, ELECTION_ID);
+
+    let AuditEventPayload::ElectionsStakeRecoverFailed { reason } = &ev.payload else {
+        unreachable!();
+    };
+    assert!(reason.contains("simulated recover send_boc failure"));
+}
+
 // =====================================================
 // TEST: recover stake — low wallet balance
 // =====================================================
@@ -1321,6 +1361,7 @@ async fn test_low_stake_balance() {
 
     provider.expect_shutdown().returning(|| Ok(()));
 
+    let audit = harness.audit.clone();
     let mut runner = harness.build(node_id).await;
     let result = runner.run().await;
     // run() itself is Ok, but the node should have an error
@@ -1330,10 +1371,23 @@ async fn test_low_stake_balance() {
     assert!(node.last_error.is_some(), "should have an error for low balance");
     let err = node.last_error.as_ref().unwrap();
     assert!(
-        err.contains("not enough") || err.contains("low stake"),
+        err.contains("insufficient balance"),
         "error should mention insufficient balance, got: {}",
         err
     );
+
+    let events = audit.drain();
+    let ev =
+        find_audit_event(&events, |p| matches!(p, AuditEventPayload::ElectionsStakeFailed { .. }));
+
+    assert_eq!(ev.payload.severity(), AuditSeverity::Error);
+    assert_eq!(ev.outcome, AuditOutcome::Failure);
+    assert_node_target(&ev.target, node_id, ELECTION_ID);
+
+    let AuditEventPayload::ElectionsStakeFailed { reason } = &ev.payload else {
+        unreachable!();
+    };
+    assert!(reason.contains("insufficient balance"));
 }
 
 // =====================================================
@@ -3815,78 +3869,6 @@ async fn cached_prev_min_eff_updates_on_refresh() {
 }
 
 #[tokio::test]
-async fn tick_success_does_not_emit_tick_audit_events() {
-    let node_id = "node-1";
-    let mut harness = TestHarness::new();
-
-    setup_default_elector(&mut harness.elector_mock, ELECTION_ID, 0);
-    setup_default_provider(&mut harness.provider_mock, WALLET_BALANCE, None);
-    setup_wallet(&mut harness.wallet_mock);
-    harness.wallet_mock.expect_message().returning(|_dest, _value, _payload| Ok(dummy_cell()));
-
-    let audit = harness.audit.clone();
-    let mut runner = harness.build(node_id).await;
-    let mut ctx = CancellationCtx::new();
-    let cancel_ctx = ctx.clone();
-    let store = Arc::new(SnapshotStore::new());
-
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        ctx.cancel(CancellationReason::GracefullyShutdown());
-    });
-
-    runner.run_loop(Duration::from_millis(50), cancel_ctx, store, None).await.unwrap();
-
-    let events = audit.drain();
-    assert!(
-        !events.iter().any(|e| matches!(e.payload, AuditEventPayload::ElectionsTickFailed { .. })),
-        "successful ticks must not emit tick_failed audit events"
-    );
-}
-
-#[tokio::test]
-async fn tick_emits_failed_on_error() {
-    let node_id = "node-1";
-    let mut harness = TestHarness::new();
-
-    harness.elector_mock.expect_address().returning(|| Ok(elector_address()));
-    harness.elector_mock.expect_get_active_election_id().returning(|| Ok(ELECTION_ID));
-    harness
-        .elector_mock
-        .expect_elections_info()
-        .returning(|| Err(anyhow::anyhow!("simulated elections_info failure")));
-    harness.elector_mock.expect_past_elections().returning(|| Ok(vec![]));
-    harness.elector_mock.expect_compute_returned_stake().returning(|_| Ok(0));
-    setup_default_provider_without_account(&mut harness.provider_mock, WALLET_BALANCE);
-    setup_wallet(&mut harness.wallet_mock);
-
-    let audit = harness.audit.clone();
-    let mut runner = harness.build(node_id).await;
-    let mut ctx = CancellationCtx::new();
-    let cancel_ctx = ctx.clone();
-    let store = Arc::new(SnapshotStore::new());
-
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        ctx.cancel(CancellationReason::GracefullyShutdown());
-    });
-
-    runner.run_loop(Duration::from_millis(50), cancel_ctx, store, None).await.unwrap();
-
-    let events = audit.drain();
-    let failed =
-        find_audit_event(&events, |p| matches!(p, AuditEventPayload::ElectionsTickFailed { .. }));
-
-    assert_eq!(failed.payload.severity(), AuditSeverity::Error);
-    assert_eq!(failed.outcome, AuditOutcome::Failure);
-    assert_eq!(failed.target, AuditTarget::Elections { election_id: ELECTION_ID });
-    let AuditEventPayload::ElectionsTickFailed { reason } = &failed.payload else {
-        unreachable!();
-    };
-    assert!(reason.contains("simulated elections_info failure"));
-}
-
-#[tokio::test]
 async fn stake_submitted_event_contains_correct_payload() {
     let node_id = "node-1";
     let mut harness = TestHarness::new();
@@ -3953,7 +3935,10 @@ async fn stake_skipped_event_has_skipped_outcome_and_warn_severity() {
     let ev = find_audit_event(&events, |p| {
         matches!(
             p,
-            AuditEventPayload::ElectionsStakeSkipped { reason: StakeSkipReason::NodeExcluded, .. }
+            AuditEventPayload::ElectionsStakeSkipped {
+                reason: StakeSkipReason::ElectionsDisabled,
+                ..
+            }
         )
     });
     payload_stake_skipped(&ev.payload);
@@ -3964,7 +3949,7 @@ async fn stake_skipped_event_has_skipped_outcome_and_warn_severity() {
 }
 
 #[tokio::test]
-async fn withdraw_processed_emits_tx_hash() {
+async fn withdraw_processed_emits_msg_hash() {
     let node_id = "node-1";
     let mut harness = TestHarness::new().with_toncore_nominator_pair();
 
@@ -3999,10 +3984,10 @@ async fn withdraw_processed_emits_tx_hash() {
     assert_eq!(ev.outcome, AuditOutcome::Success);
     assert_node_target(&ev.target, node_id, ELECTION_ID);
 
-    let AuditEventPayload::ElectionsWithdrawProcessed { tx_hash } = &ev.payload else {
+    let AuditEventPayload::ElectionsWithdrawProcessed { msg_hash } = &ev.payload else {
         unreachable!();
     };
-    assert!(!tx_hash.is_empty(), "tx_hash must be the sent message cell hash");
+    assert!(!msg_hash.is_empty(), "msg_hash must be the outbound message cell repr_hash");
 }
 
 #[tokio::test]
@@ -4043,14 +4028,14 @@ async fn withdraw_failed_emits_error_string() {
 
     let events = audit.drain();
     let ev = find_audit_event(&events, |p| {
-        matches!(p, AuditEventPayload::ElectionsWithdrawProcessFailed { .. })
+        matches!(p, AuditEventPayload::ElectionsWithdrawFailed { .. })
     });
 
     assert_eq!(ev.payload.severity(), AuditSeverity::Error);
     assert_eq!(ev.outcome, AuditOutcome::Failure);
     assert_node_target(&ev.target, node_id, ELECTION_ID);
 
-    let AuditEventPayload::ElectionsWithdrawProcessFailed { reason } = &ev.payload else {
+    let AuditEventPayload::ElectionsWithdrawFailed { reason } = &ev.payload else {
         unreachable!();
     };
     assert!(reason.contains("simulated withdraw send_boc failure"));

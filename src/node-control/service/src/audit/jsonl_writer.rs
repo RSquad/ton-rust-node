@@ -7,16 +7,20 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::audit::{AuditEvent, AuditFileHeader, AuditLogConfig, jsonl_log::AuditInitError};
+use chrono::Utc;
 use std::{
     sync::{
-        Arc,
+        Arc, Once,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
+use tokio::sync::{mpsc, oneshot};
 
 /// Schema version stamped into the per-file [`AuditFileHeader`].
 const AUDIT_SCHEMA_VERSION: u16 = 1;
+
+static HOSTNAME_FALLBACK_WARNED: Once = Once::new();
 
 #[derive(Debug)]
 pub(crate) enum AuditCommand {
@@ -36,6 +40,8 @@ pub(crate) enum AuditCommand {
 }
 
 pub(crate) struct AuditWriter {
+    /// Host identity stamped into each new file's [`AuditFileHeader`].
+    host: String,
     config: Arc<AuditLogConfig>,
     /// Live append handle. `None` only transiently during rotation (the old
     /// handle is closed before the on-disk rename so the swap is portable to
@@ -114,6 +120,7 @@ impl AuditWriter {
         let current_size = file.metadata().await.map_err(AuditInitError::Metadata)?.len();
 
         let mut writer = Self {
+            host: resolve_hostname(),
             config,
             file: Some(file),
             current_size,
@@ -126,22 +133,14 @@ impl AuditWriter {
         Ok(writer)
     }
 
-    fn file_header() -> AuditFileHeader {
+    fn file_header(&self) -> AuditFileHeader {
         AuditFileHeader {
             schema_version: AUDIT_SCHEMA_VERSION,
             service: "nodectl".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
-            host: Self::hostname(),
-            started_at: chrono::Utc::now(),
+            host: self.host.clone(),
+            started_at: Utc::now(),
         }
-    }
-
-    fn hostname() -> String {
-        std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .ok()
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| "unknown".to_string())
     }
 
     async fn write_header_if_empty(&mut self) -> std::io::Result<()> {
@@ -149,7 +148,7 @@ impl AuditWriter {
             return Ok(());
         }
         use tokio::io::AsyncWriteExt;
-        let mut line = serde_json::to_vec(&Self::file_header())
+        let mut line = serde_json::to_vec(&self.file_header())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
         let file = self
@@ -439,6 +438,24 @@ impl AuditWriter {
         let mut buf = vec![AuditEvent::system_audit_events_dropped(delta)];
         self.flush(&mut buf).await;
     }
+}
+
+/// Resolves the host identity for audit file headers (`HOSTNAME`, then `COMPUTERNAME`).
+fn resolve_hostname() -> String {
+    if let Some(host) = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|h| !h.is_empty())
+    {
+        return host;
+    }
+    HOSTNAME_FALLBACK_WARNED.call_once(|| {
+        tracing::warn!(
+            "audit log host identity unavailable (HOSTNAME/COMPUTERNAME unset); \
+             file header will use host=\"unknown\" — set HOSTNAME for forensics"
+        );
+    });
+    "unknown".to_string()
 }
 
 #[cfg(test)]

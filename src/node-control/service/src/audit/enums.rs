@@ -39,18 +39,24 @@ pub enum AuditEventPayload {
         available_nanotons: Option<String>,
     },
 
+    #[serde(rename = "elections.stake_failed")]
+    ElectionsStakeFailed { reason: String },
+
     #[serde(rename = "elections.stake_recovered")]
     ElectionsStakeRecovered {
         amount_nanotons: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        tx_hash: Option<String>,
+        msg_hash: Option<String>,
     },
 
-    #[serde(rename = "elections.withdraw_processed")]
-    ElectionsWithdrawProcessed { tx_hash: String },
+    #[serde(rename = "elections.stake_recover_failed")]
+    ElectionsStakeRecoverFailed { reason: String },
 
-    #[serde(rename = "elections.withdraw_process_failed")]
-    ElectionsWithdrawProcessFailed { reason: String },
+    #[serde(rename = "elections.withdraw_processed")]
+    ElectionsWithdrawProcessed { msg_hash: String },
+
+    #[serde(rename = "elections.withdraw_failed")]
+    ElectionsWithdrawFailed { reason: String },
 
     // ── rewards (reserved; producers not wired yet) ─────────────────────────
     #[serde(rename = "rewards.distribution_started")]
@@ -69,8 +75,8 @@ pub enum AuditEventPayload {
     #[serde(rename = "rest_api.config_updated")]
     RestApiConfigUpdated { operation: String, changes: Vec<ConfigFieldChange> },
 
-    #[serde(rename = "rest_api.auth_login_success")]
-    RestApiAuthLoginSuccess {},
+    #[serde(rename = "rest_api.auth_login_succeeded")]
+    RestApiAuthLoginSucceeded {},
 
     #[serde(rename = "rest_api.auth_login_rejected")]
     RestApiAuthLoginRejected { reason: String },
@@ -96,23 +102,23 @@ pub enum AuditEventPayload {
     SystemAuditEventsDropped { dropped_events: u64, reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StakeSkipReason {
     LowWalletBalance,
     WithdrawRequestsPending,
     PoolNotReady,
-    AdaptiveSleepPeriod,
+    AdaptiveSleepingPeriod,
     AdaptiveWaitingPeriod,
-    NodeExcluded,
+    ElectionsDisabled,
     RecoverPending,
     InsufficientStakeFunds,
 }
 
 /// A single typed field change for `rest_api.config_updated`. Replaces the
 /// previous free-form `serde_json::Value` diff.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigFieldChange {
     /// Dotted path, e.g. `elections.sleep_period_pct`.
     pub field: String,
@@ -120,7 +126,7 @@ pub struct ConfigFieldChange {
     pub new: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     Success,
@@ -159,7 +165,7 @@ impl AuditEventPayload {
             | RewardsDistributionStarted { .. }
             | RewardsDistributionCompleted { .. }
             | RestApiConfigUpdated { .. }
-            | RestApiAuthLoginSuccess {}
+            | RestApiAuthLoginSucceeded {}
             | VaultKeyCreated {}
             | VaultKeyRemoved {}
             | SystemServiceStarted { .. }
@@ -171,8 +177,9 @@ impl AuditEventPayload {
             | RestApiTokenRejected { .. }
             | SystemAuditEventsDropped { .. } => Warn,
 
-            ElectionsTickFailed { .. }
-            | ElectionsWithdrawProcessFailed { .. }
+            ElectionsStakeFailed { .. }
+            | ElectionsStakeRecoverFailed { .. }
+            | ElectionsWithdrawFailed { .. }
             | RewardsDistributionFailed { .. } => Error,
         }
     }
@@ -181,14 +188,15 @@ impl AuditEventPayload {
         use AuditEventPayload::*;
         use AuditSource::*;
         match self {
-            ElectionsTickFailed { .. }
-            | ElectionsKeyGenerated { .. }
+            ElectionsKeyGenerated { .. }
             | ElectionsStakeSubmitted { .. }
             | ElectionsStakeAccepted { .. }
             | ElectionsStakeSkipped { .. }
+            | ElectionsStakeFailed { .. }
             | ElectionsStakeRecovered { .. }
+            | ElectionsStakeRecoverFailed { .. }
             | ElectionsWithdrawProcessed { .. }
-            | ElectionsWithdrawProcessFailed { .. } => Elections,
+            | ElectionsWithdrawFailed { .. } => Elections,
 
             RewardsDistributionStarted { .. }
             | RewardsDistributionCompleted { .. }
@@ -196,7 +204,7 @@ impl AuditEventPayload {
             | RewardsRecipientSkipped { .. } => Rewards,
 
             RestApiConfigUpdated { .. }
-            | RestApiAuthLoginSuccess {}
+            | RestApiAuthLoginSucceeded {}
             | RestApiAuthLoginRejected { .. }
             | RestApiTokenRejected { .. } => RestApi,
 
