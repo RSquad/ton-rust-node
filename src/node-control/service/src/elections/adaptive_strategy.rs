@@ -31,7 +31,10 @@ pub(crate) enum AdaptiveStakeResult {
     /// Stake already meets min effective — no top-up this tick (not an error).
     NoTopUpNeeded,
     /// Free pool balance is below the required delta to min effective stake.
-    InsufficientFree { required: u64, available: u64 },
+    InsufficientFree {
+        required: u64,
+        available: u64,
+    },
 }
 
 /// Returns `None` when staking should proceed; otherwise the wait gate that blocks.
@@ -188,10 +191,7 @@ pub(crate) fn calc_adaptive_stake(
             nanotons_to_tons_f64(required),
             nanotons_to_tons_f64(min_eff_stake),
         );
-        return Ok(AdaptiveStakeResult::InsufficientFree {
-            required,
-            available: free_balance,
-        });
+        return Ok(AdaptiveStakeResult::InsufficientFree { required, available: free_balance });
     }
 
     // Decide between staking half or min_eff_stake.

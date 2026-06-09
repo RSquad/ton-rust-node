@@ -181,10 +181,7 @@ impl AuditEvent {
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
-            AuditEventPayload::ElectionsStakeRecovered {
-                amount: amount.into(),
-                msg_hash,
-            },
+            AuditEventPayload::ElectionsStakeRecovered { amount: amount.into(), msg_hash },
         )
     }
 
