@@ -8,7 +8,7 @@
  */
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditEventPayload {
