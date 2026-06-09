@@ -22,22 +22,16 @@ pub(crate) enum AdaptiveDeferReason {
     WaitingForParticipants,
 }
 
-/// Why AdaptiveSplit50 returns zero stake.
+/// Outcome of [`calc_adaptive_stake`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdaptiveStakeZero {
+pub(crate) enum AdaptiveStakeResult {
+    Stake(u64),
     /// Sleep or waiting-for-participants gate has not passed yet.
     Defer(AdaptiveDeferReason),
     /// Stake already meets min effective — no top-up this tick (not an error).
     NoTopUpNeeded,
     /// Free pool balance is below the required delta to min effective stake.
     InsufficientFree { required: u64, available: u64 },
-}
-
-/// Outcome of [`calc_adaptive_stake`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdaptiveStakeResult {
-    Stake(u64),
-    Zero(AdaptiveStakeZero),
 }
 
 /// Returns `None` when staking should proceed; otherwise the wait gate that blocks.
@@ -178,7 +172,7 @@ pub(crate) fn calc_adaptive_stake(
             nanotons_to_tons_f64(current_stake),
             nanotons_to_tons_f64(min_eff_stake)
         );
-        return Ok(AdaptiveStakeResult::Zero(AdaptiveStakeZero::NoTopUpNeeded));
+        return Ok(AdaptiveStakeResult::NoTopUpNeeded);
     }
 
     // Insufficient funds guard — if the pool doesn't have enough free
@@ -194,10 +188,10 @@ pub(crate) fn calc_adaptive_stake(
             nanotons_to_tons_f64(required),
             nanotons_to_tons_f64(min_eff_stake),
         );
-        return Ok(AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree {
+        return Ok(AdaptiveStakeResult::InsufficientFree {
             required,
             available: free_balance,
-        }));
+        });
     }
 
     // Decide between staking half or min_eff_stake.
@@ -221,10 +215,10 @@ pub(crate) fn calc_adaptive_stake(
                 nanotons_to_tons_f64(stake),
                 nanotons_to_tons_f64(free_balance),
             );
-            return Ok(AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree {
+            return Ok(AdaptiveStakeResult::InsufficientFree {
                 required: stake,
                 available: free_balance,
-            }));
+            });
         }
         Ok(AdaptiveStakeResult::Stake(stake))
     } else {
@@ -379,7 +373,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, AdaptiveStakeResult::Zero(AdaptiveStakeZero::NoTopUpNeeded));
+        assert_eq!(result, AdaptiveStakeResult::NoTopUpNeeded);
     }
 
     // ---- insufficient funds guard ----
@@ -409,10 +403,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            result,
-            AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree { .. })
-        ));
+        assert!(matches!(result, AdaptiveStakeResult::InsufficientFree { .. }));
     }
 
     // ---- cap to free_balance when half > free_balance ----
@@ -445,10 +436,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            result,
-            AdaptiveStakeResult::Zero(AdaptiveStakeZero::InsufficientFree { .. })
-        ));
+        assert!(matches!(result, AdaptiveStakeResult::InsufficientFree { .. }));
     }
 
     // ---- curr vs prev selection ----

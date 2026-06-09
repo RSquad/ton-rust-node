@@ -375,11 +375,11 @@ impl ElectionRunner {
         }
     }
 
-    fn adaptive_zero_to_skip(
-        zero: adaptive_strategy::AdaptiveStakeZero,
+    fn adaptive_result_to_skip(
+        result: adaptive_strategy::AdaptiveStakeResult,
     ) -> Option<(StakeSkipReason, Option<u64>, Option<u64>)> {
-        use adaptive_strategy::{AdaptiveDeferReason, AdaptiveStakeZero::*};
-        match zero {
+        use adaptive_strategy::{AdaptiveDeferReason, AdaptiveStakeResult::*};
+        match result {
             Defer(AdaptiveDeferReason::SleepPeriod) => {
                 Some((StakeSkipReason::AdaptiveSleepingPeriod, None, None))
             }
@@ -390,6 +390,7 @@ impl ElectionRunner {
             InsufficientFree { required, available } => {
                 Some((StakeSkipReason::InsufficientStakeFunds, Some(required), Some(available)))
             }
+            Stake(_) => unreachable!("caller must not pass Stake variant"),
         }
     }
 
@@ -958,7 +959,7 @@ impl ElectionRunner {
 
         if stake == 0 {
             tracing::info!("node [{}] skipping elections this tick (stake=0)", node_id);
-            let skip = adaptive_zero.and_then(Self::adaptive_zero_to_skip);
+            let skip = adaptive_zero.and_then(Self::adaptive_result_to_skip);
             if let Some((reason, required, available)) = skip {
                 elections_audit_stake_skipped(
                     &audit,
@@ -1418,7 +1419,7 @@ impl ElectionRunner {
         elections_stake: u64,
         configs: &ConfigParams<'_>,
         ctx: &StakeContext<'_>,
-    ) -> anyhow::Result<(u64, Option<adaptive_strategy::AdaptiveStakeZero>)> {
+    ) -> anyhow::Result<(u64, Option<adaptive_strategy::AdaptiveStakeResult>)> {
         let min_stake = configs.elections_info.min_stake;
         tracing::info!("node [{}] calc stake", node_id);
         let fee = ELECTOR_STAKE_FEE + NPOOL_COMPUTE_FEE;
@@ -1488,7 +1489,7 @@ impl ElectionRunner {
                     ctx.sleep_pct,
                     ctx.waiting_pct,
                 ) {
-                    return Ok((0, Some(adaptive_strategy::AdaptiveStakeZero::Defer(defer))));
+                    return Ok((0, Some(adaptive_strategy::AdaptiveStakeResult::Defer(defer))));
                 }
                 let current_stake = if node.stake_accepted { elections_stake } else { 0 };
                 let stakes: Vec<_> = configs
@@ -1518,7 +1519,7 @@ impl ElectionRunner {
                 )?;
                 Ok(match outcome {
                     adaptive_strategy::AdaptiveStakeResult::Stake(s) => (s, None),
-                    adaptive_strategy::AdaptiveStakeResult::Zero(z) => (0, Some(z)),
+                    other => (0, Some(other)),
                 })
             }
             other => Ok((other.calculate_stake(min_stake, total_balance)?, None)),
