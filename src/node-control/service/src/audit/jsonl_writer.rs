@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::audit::{AuditEvent, AuditFileHeader, AuditLogConfig, jsonl_log::AuditInitError};
+use chrono::Utc;
 use std::{
     sync::{
         Arc, Once,
@@ -14,6 +15,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::{mpsc, oneshot};
 
 /// Schema version stamped into the per-file [`AuditFileHeader`].
 const AUDIT_SCHEMA_VERSION: u16 = 1;
@@ -137,7 +139,7 @@ impl AuditWriter {
             service: "nodectl".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             host: self.host.clone(),
-            started_at: chrono::Utc::now(),
+            started_at: Utc::now(),
         }
     }
 

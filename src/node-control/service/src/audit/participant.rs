@@ -6,7 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditActor {
     Service {
@@ -39,7 +41,7 @@ impl AuditActor {
 /// What the action was applied to. Internally tagged so per-variant required
 /// fields are enforced by the type system; `#[non_exhaustive]` because new
 /// target kinds are expected as more producers are wired.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditTarget {

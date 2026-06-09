@@ -10,29 +10,30 @@ use crate::audit::{
     enums::{AuditEventPayload, AuditOutcome, StakeSkipReason},
     participant::{AuditActor, AuditTarget},
 };
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use uuid::Uuid;
+
 /// Renders timestamps as RFC3339 with millisecond precision and a trailing `Z`
 /// (e.g. `2026-05-22T12:10:30.123Z`), used for `ts` and `started_at`.
 mod ts_millis_rfc3339 {
-    pub fn serialize<S: serde::Serializer>(
-        ts: &chrono::DateTime<chrono::Utc>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    use super::*;
+
+    pub fn serialize<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&ts.to_rfc3339_opts(SecondsFormat::Millis, true))
     }
 
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<chrono::DateTime<chrono::Utc>, D::Error> {
-        let raw = <String as serde::Deserialize>::deserialize(d)?;
-        chrono::DateTime::parse_from_rfc3339(&raw)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let raw = String::deserialize(d)?;
+        DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&Utc))
             .map_err(serde::de::Error::custom)
     }
 }
 
 /// First JSONL line of every (rotated) audit file. Readers distinguish it from
 /// events by the absence of an `event_type` field.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditFileHeader {
     pub schema_version: u16,
     /// Logical service name, e.g. `"nodectl"`.
@@ -41,7 +42,7 @@ pub struct AuditFileHeader {
     pub service_version: String,
     pub host: String,
     #[serde(with = "ts_millis_rfc3339")]
-    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: DateTime<Utc>,
 }
 
 /// A single audit record.
@@ -50,12 +51,12 @@ pub struct AuditFileHeader {
 /// (`event_type` + `data`), `actor`, `target`. `severity`/`source` are derived
 /// from the payload at the display layer and `schema_version` lives in
 /// [`AuditFileHeader`], so none of them are stored per event.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// UUID v7 — sortable by creation time.
-    pub id: uuid::Uuid,
+    pub id: Uuid,
     #[serde(with = "ts_millis_rfc3339")]
-    pub ts: chrono::DateTime<chrono::Utc>,
+    pub ts: DateTime<Utc>,
     pub outcome: AuditOutcome,
     #[serde(flatten)]
     pub payload: AuditEventPayload,
@@ -66,7 +67,7 @@ pub struct AuditEvent {
 /// Named payload fields for [`AuditEvent::elections_stake_submitted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectionsStakeSubmittedParams {
-    pub stake: String,
+    pub stake_nanotons: String,
     pub max_factor: u32,
     pub policy: String,
     pub submission_time: u64,
@@ -98,7 +99,7 @@ impl AuditEvent {
         outcome: AuditOutcome,
         payload: AuditEventPayload,
     ) -> Self {
-        Self { id: uuid::Uuid::now_v7(), ts: chrono::Utc::now(), outcome, payload, actor, target }
+        Self { id: Uuid::now_v7(), ts: Utc::now(), outcome, payload, actor, target }
     }
 
     /// `target` for a per-node election event: always `Node { election_id }`.
@@ -131,7 +132,7 @@ impl AuditEvent {
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
             AuditEventPayload::ElectionsStakeSubmitted {
-                stake: params.stake,
+                stake_nanotons: params.stake_nanotons,
                 max_factor: params.max_factor,
                 policy: params.policy,
                 submission_time: params.submission_time,
@@ -173,14 +174,17 @@ impl AuditEvent {
         actor: AuditActor,
         node_id: impl Into<String>,
         election_id: u64,
-        amount: impl Into<String>,
+        amount_nanotons: impl Into<String>,
         msg_hash: Option<String>,
     ) -> Self {
         Self::new(
             actor,
             Self::node_target(node_id, election_id),
             AuditOutcome::Success,
-            AuditEventPayload::ElectionsStakeRecovered { amount: amount.into(), msg_hash },
+            AuditEventPayload::ElectionsStakeRecovered {
+                amount_nanotons: amount_nanotons.into(),
+                msg_hash,
+            },
         )
     }
 
@@ -226,41 +230,6 @@ impl AuditEvent {
         )
     }
 
-    pub fn system_service_started(version: impl Into<String>) -> Self {
-        Self::new(
-            AuditActor::System,
-            AuditTarget::System,
-            AuditOutcome::Success,
-            AuditEventPayload::SystemServiceStarted { version: version.into() },
-        )
-    }
-
-    pub fn system_audit_events_dropped(dropped: u64) -> Self {
-        Self::new(
-            AuditActor::System,
-            AuditTarget::System,
-            AuditOutcome::Failure,
-            AuditEventPayload::SystemAuditEventsDropped {
-                dropped_events: dropped,
-                reason: "queue_full_after_timeout".into(),
-            },
-        )
-    }
-
-    pub fn rest_api_config_updated(
-        actor: AuditActor,
-        config_id: impl Into<String>,
-        operation: impl Into<String>,
-        changes: Vec<crate::audit::ConfigFieldChange>,
-    ) -> Self {
-        Self::new(
-            actor,
-            AuditTarget::Config { id: config_id.into() },
-            AuditOutcome::Success,
-            AuditEventPayload::RestApiConfigUpdated { operation: operation.into(), changes },
-        )
-    }
-
     pub fn rest_api_auth_login_success(actor: AuditActor, user_id: impl Into<String>) -> Self {
         Self::new(
             actor,
@@ -293,6 +262,41 @@ impl AuditEvent {
             AuditTarget::User { id: user_id.into() },
             AuditOutcome::Failure,
             AuditEventPayload::RestApiTokenRejected { reason: reason.into() },
+        )
+    }
+
+    pub fn rest_api_config_updated(
+        actor: AuditActor,
+        config_id: impl Into<String>,
+        operation: impl Into<String>,
+        changes: Vec<crate::audit::enums::ConfigFieldChange>,
+    ) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::Config { id: config_id.into() },
+            AuditOutcome::Success,
+            AuditEventPayload::RestApiConfigUpdated { operation: operation.into(), changes },
+        )
+    }
+
+    pub fn system_service_started(version: impl Into<String>) -> Self {
+        Self::new(
+            AuditActor::System,
+            AuditTarget::System,
+            AuditOutcome::Success,
+            AuditEventPayload::SystemServiceStarted { version: version.into() },
+        )
+    }
+
+    pub fn system_audit_events_dropped(dropped: u64) -> Self {
+        Self::new(
+            AuditActor::System,
+            AuditTarget::System,
+            AuditOutcome::Failure,
+            AuditEventPayload::SystemAuditEventsDropped {
+                dropped_events: dropped,
+                reason: "queue_full_after_timeout".into(),
+            },
         )
     }
 }
@@ -445,7 +449,7 @@ mod tests {
             AuditEventPayload::ElectionsWithdrawProcessed { msg_hash: "abc".into() },
             AuditEventPayload::ElectionsWithdrawFailed { reason: "send failed".into() },
             AuditEventPayload::ElectionsStakeRecovered {
-                amount: "50000000000000".into(),
+                amount_nanotons: "50000000000000".into(),
                 msg_hash: Some("def".into()),
             },
             AuditEventPayload::ElectionsStakeRecoverFailed { reason: "send failed".into() },

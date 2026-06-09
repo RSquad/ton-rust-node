@@ -6,7 +6,9 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditEventPayload {
@@ -94,7 +96,7 @@ pub enum AuditEventPayload {
     SystemAuditEventsDropped { dropped_events: u64, reason: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StakeSkipReason {
@@ -110,7 +112,7 @@ pub enum StakeSkipReason {
 
 /// A single typed field change for `rest_api.config_updated`. Replaces the
 /// previous free-form `serde_json::Value` diff.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigFieldChange {
     /// Dotted path, e.g. `elections.sleep_period_pct`.
     pub field: String,
@@ -118,7 +120,7 @@ pub struct ConfigFieldChange {
     pub new: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     Success,
