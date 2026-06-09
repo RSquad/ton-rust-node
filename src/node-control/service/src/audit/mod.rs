@@ -16,6 +16,7 @@ pub mod jsonl_log;
 pub mod jsonl_writer;
 pub mod log;
 pub mod participant;
+pub mod projection;
 pub mod ring_buffer;
 
 pub use actor_builder::{AuditActorBuilder, client_ip_from_headers};
@@ -30,4 +31,8 @@ pub use in_memory::InMemoryAuditLog;
 pub use jsonl_log::AuditInitError;
 pub use log::{AuditLog, NoopAuditLog};
 pub use participant::{AuditActor, AuditTarget};
+pub use projection::{
+    ElectionsProjection, collect_recent_election_ids, merge_projection_into_participants,
+    project_elections,
+};
 pub use ring_buffer::AuditEventBuffer;
