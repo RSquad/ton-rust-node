@@ -19,3 +19,5 @@ mod auth_tests;
 mod config_handlers_tests;
 #[cfg(test)]
 mod entity_crud_handlers_tests;
+#[cfg(test)]
+mod test_support;

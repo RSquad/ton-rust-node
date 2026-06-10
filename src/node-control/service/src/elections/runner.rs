@@ -490,9 +490,6 @@ impl ElectionRunner {
             tokio::select! {
                 _ = interval.tick() => {
                     tracing::info!("TICK");
-                    let audit = self.audit.clone();
-                    let tick_election_id =
-                        self.elector.get_active_election_id().await.ok().filter(|&id| id > 0);
 
                     // Clear per-node last_error at the start of the tick (best-effort).
                     for node in self.nodes.values_mut() {

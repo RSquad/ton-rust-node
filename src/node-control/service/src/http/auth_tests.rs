@@ -7,40 +7,18 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    audit::{AuditActorBuilder, AuditEventPayload, in_memory::InMemoryAuditLog, log::AuditLog},
-    auth::{Role, jwt::JwtAuth, user_store::UserStore},
-    http::http_server_task::*,
-    runtime_config::{RuntimeConfig, RuntimeConfigStore},
-    task::task_manager::{ServiceTask, TaskController},
+    audit::{AuditEventPayload, in_memory::InMemoryAuditLog, log::NoopAuditLog},
+    auth::Role,
+    http::{http_server_task::*, test_support},
+    runtime_config::RuntimeConfigStore,
 };
 use argon2::PasswordHasher;
 use axum::body::Body;
 use base64::Engine;
-use common::{
-    app_config::{AuthConfig, UserEntry},
-    snapshot::SnapshotStore,
-    task_cancellation::CancellationCtx,
-};
+use common::app_config::{AuthConfig, UserEntry};
 use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use tower::ServiceExt;
-
-const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
-
-struct Noop;
-
-#[async_trait::async_trait]
-impl ServiceTask for Noop {
-    async fn run(
-        &self,
-        ctx: CancellationCtx,
-        _: Arc<common::app_config::AppConfig>,
-    ) -> anyhow::Result<()> {
-        let mut c = ctx.subscribe();
-        let _ = c.changed().await;
-        Ok(())
-    }
-}
 
 async fn json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -155,62 +133,19 @@ fn auth_config() -> AuthConfig {
     }
 }
 
-fn elections_task(rt: Arc<RuntimeConfigStore>) -> Arc<TaskController> {
-    Arc::new(TaskController::new("elections", Noop, rt))
-}
-
-async fn test_jwt_auth() -> Arc<JwtAuth> {
-    Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap())
-}
-
 async fn state_with_auth() -> AppState {
-    let cfg = auth_config();
-    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(cfg.clone())));
-    AppState {
-        store: Arc::new(SnapshotStore::new()),
-        runtime_cfg: rt.clone(),
-        elections_task: elections_task(rt.clone()),
-        jwt_auth: test_jwt_auth().await,
-        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
-        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
-        config_changed: Arc::new(tokio::sync::Notify::new()),
-        audit: Arc::new(crate::audit::log::NoopAuditLog),
-        actor_builder: Arc::new(AuditActorBuilder::new(rt.clone())),
-    }
+    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(auth_config())));
+    test_support::build_app_state(rt, Arc::new(NoopAuditLog)).await
 }
 
 async fn state_with_auth_audited() -> (AppState, Arc<InMemoryAuditLog>) {
-    let cfg = auth_config();
-    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(cfg.clone())));
-    let audit_mem = Arc::new(InMemoryAuditLog::new());
-    let audit: Arc<dyn AuditLog> = audit_mem.clone();
-    let state = AppState {
-        store: Arc::new(SnapshotStore::new()),
-        runtime_cfg: rt.clone(),
-        elections_task: elections_task(rt.clone()),
-        jwt_auth: test_jwt_auth().await,
-        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
-        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
-        config_changed: Arc::new(tokio::sync::Notify::new()),
-        audit,
-        actor_builder: Arc::new(AuditActorBuilder::new(rt)),
-    };
-    (state, audit_mem)
+    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(auth_config())));
+    test_support::build_app_state_audited(rt).await
 }
 
 async fn state_no_auth() -> AppState {
     let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_no_auth()));
-    AppState {
-        store: Arc::new(SnapshotStore::new()),
-        runtime_cfg: rt.clone(),
-        elections_task: elections_task(rt.clone()),
-        jwt_auth: test_jwt_auth().await,
-        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
-        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
-        config_changed: Arc::new(tokio::sync::Notify::new()),
-        audit: Arc::new(crate::audit::log::NoopAuditLog),
-        actor_builder: Arc::new(AuditActorBuilder::new(rt)),
-    }
+    test_support::build_app_state(rt, Arc::new(NoopAuditLog)).await
 }
 
 fn app(st: AppState) -> axum::Router {
