@@ -12,6 +12,23 @@ pub mod user_store;
 
 pub use common::app_config::Role;
 
+/// Maps JWT verification failures to stable audit reason strings (no token material).
+pub fn token_rejection_reason(err: &jsonwebtoken::errors::Error) -> &'static str {
+    use jsonwebtoken::errors::ErrorKind;
+    match err.kind() {
+        ErrorKind::ExpiredSignature => "expired",
+        ErrorKind::InvalidSignature => "signature_mismatch",
+        ErrorKind::InvalidAlgorithm => "invalid_algorithm",
+        ErrorKind::InvalidToken => "invalid_token",
+        ErrorKind::InvalidIssuer => "invalid_issuer",
+        ErrorKind::InvalidAudience => "invalid_audience",
+        ErrorKind::ImmatureSignature => "immature_signature",
+        ErrorKind::InvalidSubject => "invalid_subject",
+        ErrorKind::MissingRequiredClaim(_) => "missing_required_claim",
+        _ => "invalid_token",
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Claims {
     /// Subject: authenticated username.

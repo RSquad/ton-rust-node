@@ -12,36 +12,18 @@
 //! "not deployed" path (no address) and the "error" path (RPC unreachable),
 //! plus the SNP shape and slot-ordering invariants.
 use crate::{
-    auth::{jwt::JwtAuth, user_store::UserStore},
-    http::http_server_task::*,
-    runtime_config::{RuntimeConfig, RuntimeConfigStore},
-    task::task_manager::{ServiceTask, TaskController},
+    audit::{AuditEventPayload, in_memory::InMemoryAuditLog},
+    http::{http_server_task::*, test_support},
+    runtime_config::RuntimeConfig,
 };
 use axum::body::Body;
-use common::{
-    app_config::{
-        AppConfig, EndpointEntry, HttpConfig, PoolConfig, TonCoreDeployMode, TonCoreInitParams,
-        TonCorePoolConfig, TonHttpApiConfig, VotingConfig,
-    },
-    snapshot::SnapshotStore,
-    task_cancellation::CancellationCtx,
+use common::app_config::{
+    AppConfig, EndpointEntry, HttpConfig, PoolConfig, TonCoreDeployMode, TonCoreInitParams,
+    TonCorePoolConfig, TonHttpApiConfig, VotingConfig,
 };
 use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use tower::ServiceExt;
-
-struct Noop;
-
-#[async_trait::async_trait]
-impl ServiceTask for Noop {
-    async fn run(&self, ctx: CancellationCtx, _: Arc<AppConfig>) -> anyhow::Result<()> {
-        let mut c = ctx.subscribe();
-        let _ = c.changed().await;
-        Ok(())
-    }
-}
-
-const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
 
 fn empty_app_cfg() -> Arc<AppConfig> {
     Arc::new(AppConfig {
@@ -64,18 +46,11 @@ fn empty_app_cfg() -> Arc<AppConfig> {
 }
 
 async fn state_from_cfg(cfg: AppConfig) -> AppState {
-    let rt = Arc::new(RuntimeConfigStore::from_app_config(Arc::new(cfg)));
-    let jwt_auth = Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap());
-    AppState {
-        store: Arc::new(SnapshotStore::new()),
-        runtime_cfg: rt.clone(),
-        elections_task: Arc::new(TaskController::new("elections", Noop, rt.clone())),
-        jwt_auth,
-        user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
-        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
-        config_changed: Arc::new(tokio::sync::Notify::new()),
-        audit: Arc::new(crate::audit::log::NoopAuditLog),
-    }
+    test_support::build_app_state_from_config(cfg).await
+}
+
+async fn state_audited(cfg: AppConfig) -> (AppState, Arc<InMemoryAuditLog>) {
+    test_support::build_app_state_from_config_audited(cfg).await
 }
 
 async fn state_with_pools(pools: HashMap<String, PoolConfig>) -> AppState {
@@ -569,4 +544,24 @@ async fn pools_add_core_rejects_max_nominators_zero() {
     assert_eq!(resp.status(), 400);
     let v = json(resp).await;
     assert!(v["error"]["message"].as_str().unwrap().contains("max_nominators"));
+}
+
+#[tokio::test]
+async fn config_update_emits_audit_event_with_diff() {
+    let mut cfg = (*empty_app_cfg()).clone();
+    cfg.elections = Some(Default::default());
+    let (st, audit) = state_audited(cfg).await;
+
+    let body = serde_json::json!({ "sleep_period_pct": 0.12 });
+    let resp = routes(false, st).oneshot(post_json("/v1/elections/settings", &body)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    let AuditEventPayload::RestApiConfigUpdated { operation, changes } = &events[0].payload else {
+        panic!("expected config_updated payload");
+    };
+    assert_eq!(operation, "elections.settings_updated");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].field, "elections.sleep_period_pct");
 }

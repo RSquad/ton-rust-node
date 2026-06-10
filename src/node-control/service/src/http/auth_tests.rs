@@ -7,39 +7,18 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    auth::{Role, jwt::JwtAuth, user_store::UserStore},
-    http::http_server_task::*,
-    runtime_config::{RuntimeConfig, RuntimeConfigStore},
-    task::task_manager::{ServiceTask, TaskController},
+    audit::{AuditEventPayload, in_memory::InMemoryAuditLog, log::NoopAuditLog},
+    auth::Role,
+    http::{http_server_task::*, test_support},
+    runtime_config::RuntimeConfigStore,
 };
 use argon2::PasswordHasher;
 use axum::body::Body;
 use base64::Engine;
-use common::{
-    app_config::{AuthConfig, UserEntry},
-    snapshot::SnapshotStore,
-    task_cancellation::CancellationCtx,
-};
+use common::app_config::{AuthConfig, UserEntry};
 use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use tower::ServiceExt;
-
-const TEST_JWT_SECRET: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="; // [42u8; 32]
-
-struct Noop;
-
-#[async_trait::async_trait]
-impl ServiceTask for Noop {
-    async fn run(
-        &self,
-        ctx: CancellationCtx,
-        _: Arc<common::app_config::AppConfig>,
-    ) -> anyhow::Result<()> {
-        let mut c = ctx.subscribe();
-        let _ = c.changed().await;
-        Ok(())
-    }
-}
 
 async fn json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -154,41 +133,19 @@ fn auth_config() -> AuthConfig {
     }
 }
 
-fn elections_task(rt: Arc<RuntimeConfigStore>) -> Arc<TaskController> {
-    Arc::new(TaskController::new("elections", Noop, rt))
-}
-
-async fn test_jwt_auth() -> Arc<JwtAuth> {
-    Arc::new(JwtAuth::new(None, Some(TEST_JWT_SECRET)).await.unwrap())
-}
-
 async fn state_with_auth() -> AppState {
-    let cfg = auth_config();
-    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(cfg.clone())));
-    AppState {
-        store: Arc::new(SnapshotStore::new()),
-        runtime_cfg: rt.clone(),
-        elections_task: elections_task(rt.clone()),
-        jwt_auth: test_jwt_auth().await,
-        user_store: Arc::new(UserStore::new(rt as Arc<dyn RuntimeConfig>)),
-        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
-        config_changed: Arc::new(tokio::sync::Notify::new()),
-        audit: Arc::new(crate::audit::log::NoopAuditLog),
-    }
+    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(auth_config())));
+    test_support::build_app_state(rt, Arc::new(NoopAuditLog)).await
+}
+
+async fn state_with_auth_audited() -> (AppState, Arc<InMemoryAuditLog>) {
+    let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_with_auth(auth_config())));
+    test_support::build_app_state_audited(rt).await
 }
 
 async fn state_no_auth() -> AppState {
     let rt = Arc::new(RuntimeConfigStore::from_app_config(app_cfg_no_auth()));
-    AppState {
-        store: Arc::new(SnapshotStore::new()),
-        runtime_cfg: rt.clone(),
-        elections_task: elections_task(rt.clone()),
-        jwt_auth: test_jwt_auth().await,
-        user_store: Arc::new(UserStore::new(rt.clone() as Arc<dyn RuntimeConfig>)),
-        login_rate_limiter: Arc::new(tokio::sync::Mutex::new(Default::default())),
-        config_changed: Arc::new(tokio::sync::Notify::new()),
-        audit: Arc::new(crate::audit::log::NoopAuditLog),
-    }
+    test_support::build_app_state(rt, Arc::new(NoopAuditLog)).await
 }
 
 fn app(st: AppState) -> axum::Router {
@@ -680,4 +637,58 @@ async fn delete_user_via_rest_returns_404() {
 
     let resp = app(st).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+// --- Audit emission ---
+
+#[tokio::test]
+async fn login_success_emits_audit_event() {
+    let (st, audit) = state_with_auth_audited().await;
+    let resp = app(st.clone())
+        .oneshot(post_json(
+            "/auth/login",
+            &LoginRequest { username: "op".into(), password: "pass1".into() },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].payload, AuditEventPayload::RestApiAuthLoginSucceeded {}));
+    let body = serde_json::to_string(&events[0]).unwrap();
+    assert!(!body.contains("pass1"));
+}
+
+#[tokio::test]
+async fn login_failure_emits_rejected_event_without_password() {
+    let (st, audit) = state_with_auth_audited().await;
+    let resp = app(st)
+        .oneshot(post_json(
+            "/auth/login",
+            &LoginRequest { username: "op".into(), password: "wrong".into() },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    let AuditEventPayload::RestApiAuthLoginRejected { reason } = &events[0].payload else {
+        panic!("expected login rejected payload");
+    };
+    assert_eq!(reason, "invalid_credentials");
+    let body = serde_json::to_string(&events[0]).unwrap();
+    assert!(!body.contains("wrong"));
+}
+
+#[tokio::test]
+async fn invalid_token_emits_token_rejected_event() {
+    let (st, audit) = state_with_auth_audited().await;
+    let resp = app(st).oneshot(get_bearer("/v1/elections", "not.a.jwt")).await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let events = audit.drain();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].payload, AuditEventPayload::RestApiTokenRejected { .. }));
 }

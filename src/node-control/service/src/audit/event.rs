@@ -218,6 +218,55 @@ impl AuditEvent {
         )
     }
 
+    pub fn rest_api_auth_login_success(actor: AuditActor, user_id: impl Into<String>) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::User { id: user_id.into() },
+            AuditOutcome::Success,
+            AuditEventPayload::RestApiAuthLoginSucceeded {},
+        )
+    }
+
+    pub fn rest_api_auth_login_rejected(
+        actor: AuditActor,
+        user_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::User { id: user_id.into() },
+            AuditOutcome::Failure,
+            AuditEventPayload::RestApiAuthLoginRejected { reason: reason.into() },
+        )
+    }
+
+    pub fn rest_api_token_rejected(
+        actor: AuditActor,
+        user_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::User { id: user_id.into() },
+            AuditOutcome::Failure,
+            AuditEventPayload::RestApiTokenRejected { reason: reason.into() },
+        )
+    }
+
+    pub fn rest_api_config_updated(
+        actor: AuditActor,
+        config_id: impl Into<String>,
+        operation: impl Into<String>,
+        changes: Vec<crate::audit::enums::ConfigFieldChange>,
+    ) -> Self {
+        Self::new(
+            actor,
+            AuditTarget::Config { id: config_id.into() },
+            AuditOutcome::Success,
+            AuditEventPayload::RestApiConfigUpdated { operation: operation.into(), changes },
+        )
+    }
+
     pub fn system_service_started(version: impl Into<String>) -> Self {
         Self::new(
             AuditActor::System,
@@ -250,11 +299,11 @@ mod tests {
     const FIXTURE_ID: &str = "9b6c2b5a-9f9d-4a9f-bc31-9a89b0e9d111";
     const FIXTURE_TS: &str = "2026-05-22T12:10:30.123Z";
 
-    fn fixture_id() -> Uuid {
+    fn fixture_id() -> uuid::Uuid {
         FIXTURE_ID.parse().unwrap()
     }
 
-    fn fixture_ts() -> DateTime<Utc> {
+    fn fixture_ts() -> chrono::DateTime<chrono::Utc> {
         FIXTURE_TS.parse().unwrap()
     }
 

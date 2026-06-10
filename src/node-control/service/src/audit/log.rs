@@ -7,9 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::audit::AuditEvent;
-use async_trait::async_trait;
-
-#[async_trait]
+#[async_trait::async_trait]
 pub trait AuditLog: Send + Sync {
     async fn record(&self, event: AuditEvent);
     async fn shutdown(&self) {}
@@ -17,7 +15,7 @@ pub trait AuditLog: Send + Sync {
 
 pub struct NoopAuditLog;
 
-#[async_trait]
+#[async_trait::async_trait]
 impl AuditLog for NoopAuditLog {
     async fn record(&self, _event: AuditEvent) {}
 }
