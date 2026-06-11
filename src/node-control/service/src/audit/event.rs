@@ -73,21 +73,31 @@ pub struct ElectionsStakeSubmittedParams {
     pub submission_time: u64,
 }
 
+/// Zero-copy dedup identity for [`AuditEvent::dedup_identity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuditDedupIdentity<'a> {
+    pub node_id: &'a str,
+    pub election_id: u64,
+    pub reason: StakeSkipReason,
+}
+
 impl AuditEvent {
-    /// Returns a stable deduplication key for events that should appear at most once
-    /// per election in the audit log (e.g. `elections.stake_skipped` with a persistent
-    /// reason like `ElectionsDisabled`).
+    /// Non-allocating dedup identity for events that should appear at most once per
+    /// election in the ring buffer (e.g. `elections.stake_skipped`).
     ///
     /// Returns `None` for events that are always recorded without deduplication.
-    /// The key encodes `(event_category, node_id, election_id, reason)` so that
-    /// the same skip reason for the same node in the same election is written only once.
-    pub fn dedup_key(&self) -> Option<String> {
+    pub(crate) fn dedup_identity(&self) -> Option<AuditDedupIdentity<'_>> {
         if let AuditEventPayload::ElectionsStakeSkipped { reason, .. } = &self.payload
-            && let AuditTarget::Node { id: node_id, election_id: Some(election_id) } = &self.target
+            && let AuditTarget::Node { id, election_id: Some(election_id) } = &self.target
         {
-            return Some(format!("stake_skipped:{node_id}:{election_id}:{reason:?}"));
+            Some(AuditDedupIdentity {
+                node_id: id.as_str(),
+                election_id: *election_id,
+                reason: *reason,
+            })
+        } else {
+            None
         }
-        None
     }
 
     /// Internal constructor that stamps `id`/`ts`. Crate-private so call sites

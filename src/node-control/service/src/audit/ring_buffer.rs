@@ -37,7 +37,28 @@ impl AuditEventBuffer {
     /// Appends `event`, evicting the oldest entry when the buffer is at capacity.
     pub fn push(&self, event: AuditEvent) {
         let mut buf = self.inner.write();
-        if buf.len() == self.capacity {
+        Self::push_locked(&mut buf, self.capacity, event);
+    }
+
+    /// Appends `event` unless the buffer already holds an entry with the same
+    /// [`AuditEvent::dedup_identity`]. The contains-check and push run under one write
+    /// lock so concurrent `record()` calls cannot duplicate dedup-keyed events.
+    ///
+    /// Returns `true` if the event was appended, `false` if it was suppressed.
+    /// Events without a dedup identity are always appended.
+    pub fn push_unless_dedup_duplicate(&self, event: AuditEvent) -> bool {
+        let mut buf = self.inner.write();
+        if let Some(key) = event.dedup_identity()
+            && buf.iter().any(|e| e.dedup_identity() == Some(key))
+        {
+            return false;
+        }
+        Self::push_locked(&mut buf, self.capacity, event);
+        true
+    }
+
+    fn push_locked(buf: &mut VecDeque<AuditEvent>, capacity: usize, event: AuditEvent) {
+        if buf.len() == capacity {
             buf.pop_front();
         }
         buf.push_back(event);
@@ -67,20 +88,13 @@ impl AuditEventBuffer {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-
-    /// Returns `true` if the buffer already contains an event with the given
-    /// deduplication key. Used by [`crate::audit::jsonl_log::JsonlAuditLog`] to
-    /// suppress repeated identical `elections.stake_skipped` events within one election.
-    pub fn contains_dedup_key(&self, key: &str) -> bool {
-        self.inner.read().iter().any(|e| e.dedup_key().as_deref() == Some(key))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditEvent, AuditSource};
-    use std::sync::Arc;
+    use crate::audit::{AuditEvent, AuditSource, StakeSkipReason};
+    use std::sync::{Arc, Barrier};
 
     fn ev(tag: &str) -> AuditEvent {
         AuditEvent::system_service_started(tag)
@@ -192,6 +206,57 @@ mod tests {
         }
         // Final state: buffer should be full (800 pushes into cap=50)
         assert_eq!(buf.len(), 50);
+    }
+
+    fn stake_skipped(node_id: &str) -> AuditEvent {
+        AuditEvent::elections_stake_skipped(
+            crate::audit::AuditActor::service("elections-task"),
+            node_id,
+            1_779_265_552,
+            StakeSkipReason::ElectionsDisabled,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn push_unless_dedup_duplicate_allows_first_then_suppresses() {
+        let buf = AuditEventBuffer::new(10);
+        let first = stake_skipped("node-1");
+        let second = stake_skipped("node-1");
+
+        assert!(buf.push_unless_dedup_duplicate(first));
+        assert!(!buf.push_unless_dedup_duplicate(second));
+        assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn push_unless_dedup_duplicate_always_appends_without_dedup_key() {
+        let buf = AuditEventBuffer::new(10);
+        assert!(buf.push_unless_dedup_duplicate(ev("a")));
+        assert!(buf.push_unless_dedup_duplicate(ev("b")));
+        assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn push_unless_dedup_duplicate_is_atomic_under_concurrency() {
+        let buf = AuditEventBuffer::new(10);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let b = buf.clone();
+            let gate = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                gate.wait();
+                b.push_unless_dedup_duplicate(stake_skipped("node-1"));
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+        assert_eq!(buf.len(), 1, "only one concurrent stake_skipped must be retained");
     }
 
     #[test]

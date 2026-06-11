@@ -158,17 +158,12 @@ impl AuditLog for JsonlAuditLog {
     }
 
     async fn record(&self, event: AuditEvent) {
-        // Deduplication: drop events whose key already exists in the ring.
-        // Prevents e.g. repeated elections.stake_skipped for the same (node, election, reason).
-        if let Some(key) = event.dedup_key()
-            && self.ring.contains_dedup_key(&key)
-        {
-            return;
-        }
-
         // Push into ring first: readers see the event immediately and even
         // queue-dropped events remain accessible on the REST read-path.
-        self.ring.push(event.clone());
+        // Dedup check runs atomically inside the ring write lock.
+        if !self.ring.push_unless_dedup_duplicate(event.clone()) {
+            return;
+        }
 
         let event_id = event.id;
         let source = event.payload.source();

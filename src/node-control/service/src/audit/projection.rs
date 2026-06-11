@@ -77,12 +77,19 @@ pub fn collect_recent_election_ids(
     events: &[AuditEvent],
     max: usize,
 ) -> Vec<u64> {
+    if max == 0 {
+        return Vec::new();
+    }
+
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     if let Some(id) = current_election_id {
         seen.insert(id);
         ids.push(id);
+        if ids.len() >= max {
+            return ids;
+        }
     }
 
     for ev in events.iter().rev() {
@@ -271,6 +278,28 @@ mod tests {
 
     fn elections_actor() -> AuditActor {
         AuditActor::service("elections-task")
+    }
+
+    #[test]
+    fn collect_recent_election_ids_returns_empty_when_max_is_zero() {
+        let events = vec![AuditEvent::elections_stake_failed(
+            elections_actor(),
+            NODE_ID,
+            ELECTION_ID,
+            "err",
+        )];
+        assert!(collect_recent_election_ids(Some(ELECTION_ID), &events, 0).is_empty());
+        assert!(collect_recent_election_ids(None, &events, 0).is_empty());
+    }
+
+    #[test]
+    fn collect_recent_election_ids_respects_max_after_current_id() {
+        let events = vec![
+            AuditEvent::elections_stake_failed(elections_actor(), NODE_ID, ELECTION_ID + 1, "a"),
+            AuditEvent::elections_stake_failed(elections_actor(), NODE_ID, ELECTION_ID + 2, "b"),
+        ];
+        let ids = collect_recent_election_ids(Some(ELECTION_ID), &events, 1);
+        assert_eq!(ids, vec![ELECTION_ID]);
     }
 
     #[test]
