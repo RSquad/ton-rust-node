@@ -19,23 +19,18 @@ pub enum AuditEventPayload {
     },
 
     #[serde(rename = "elections.stake_submitted")]
-    ElectionsStakeSubmitted {
-        stake_nanotons: String,
-        max_factor: u32,
-        policy: String,
-        submission_time: u64,
-    },
+    ElectionsStakeSubmitted { stake: String, max_factor: u32, policy: String, submission_time: u64 },
 
     #[serde(rename = "elections.stake_accepted")]
-    ElectionsStakeAccepted { stake_nanotons: String },
+    ElectionsStakeAccepted { stake: String },
 
     #[serde(rename = "elections.stake_skipped")]
     ElectionsStakeSkipped {
         reason: StakeSkipReason,
         #[serde(skip_serializing_if = "Option::is_none")]
-        required_nanotons: Option<String>,
+        required: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        available_nanotons: Option<String>,
+        available: Option<String>,
     },
 
     #[serde(rename = "elections.stake_failed")]
@@ -43,7 +38,7 @@ pub enum AuditEventPayload {
 
     #[serde(rename = "elections.stake_recovered")]
     ElectionsStakeRecovered {
-        amount_nanotons: String,
+        amount: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         msg_hash: Option<String>,
     },
@@ -62,7 +57,7 @@ pub enum AuditEventPayload {
     RewardsDistributionStarted { recipients_count: u32 },
 
     #[serde(rename = "rewards.distribution_completed")]
-    RewardsDistributionCompleted { recipients_count: u32, total_nanotons: String },
+    RewardsDistributionCompleted { recipients_count: u32, total: String },
 
     #[serde(rename = "rewards.distribution_failed")]
     RewardsDistributionFailed { reason: String },
