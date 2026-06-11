@@ -2608,12 +2608,23 @@ impl ReceiverImpl {
         let raw_vote_bytes = crate::utils::serialize_unsigned_vote(&unsigned_vote);
         let signed = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
 
+        // Fail-closed against a degenerate validator set: `threshold_66(0) == 0`
+        // would make the `voted_weight < threshold` quorum check below evaluate
+        // `0 < 0 == false`, accepting a notar response that carries no signatures.
+        // A real session always has a non-empty set with positive total weight,
+        // so reject these shapes outright to keep this signature gate sound.
         let num_validators = sources.len();
+        if num_validators == 0 {
+            return Err("empty validator set".to_string());
+        }
         let mut voted = vec![false; num_validators];
         let mut total_weight: ValidatorWeight = 0;
         let mut voted_weight: ValidatorWeight = 0;
         for s in sources {
             total_weight = total_weight.saturating_add(s.weight);
+        }
+        if total_weight == 0 {
+            return Err("zero total validator weight".to_string());
         }
         let threshold = crate::utils::threshold_66(total_weight);
 

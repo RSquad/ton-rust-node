@@ -1022,6 +1022,58 @@ fn test_validate_repair_notar_signature_set_rejects_insufficient_weight() {
     assert!(err.contains("insufficient weight"), "unexpected error: {err}");
 }
 
+/// An empty validator set must be rejected before the quorum check. Without
+/// this guard `threshold_66(0) == 0` would make the `voted_weight < threshold`
+/// test evaluate `0 < 0 == false`, wrongly accepting a signature-less response.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_empty_validator_set() {
+    let (session_id, sources, _keys) = build_repair_validator_set(0, 100);
+    assert!(sources.is_empty());
+    let slot = SlotIndex::new(19);
+    let block_hash = UInt256::from_slice(&[0xDD; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &[]);
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("empty validator set must be rejected");
+    assert!(err.contains("empty validator set"), "unexpected error: {err}");
+}
+
+/// A validator set whose total weight is zero must be rejected before the
+/// quorum check for the same `threshold_66(0) == 0` reason, even when the
+/// response carries otherwise well-formed signatures.
+#[test]
+fn test_validate_repair_notar_signature_set_rejects_zero_total_weight() {
+    let (session_id, sources, keys) = build_repair_validator_set(4, 0);
+    let slot = SlotIndex::new(20);
+    let block_hash = UInt256::from_slice(&[0xEE; 32]);
+    let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
+
+    // Real signatures from 3 of 4 validators: only the zero total weight makes
+    // this degenerate, proving the guard (not a signature failure) rejects it.
+    let signing: Vec<(u32, &crate::PrivateKey)> =
+        (0..3u32).map(|i| (i, &keys[i as usize])).collect();
+    let notar_bytes = build_notar_signature_set_bytes(&session_id, &vote, &signing);
+
+    let err = super::ReceiverImpl::validate_repair_notar_signature_set(
+        &session_id,
+        &sources,
+        1 << 24,
+        slot,
+        &block_hash,
+        &notar_bytes,
+    )
+    .expect_err("zero total validator weight must be rejected");
+    assert!(err.contains("zero total validator weight"), "unexpected error: {err}");
+}
+
 /// When the notar set is signed for a different `(slot, block_hash)` than the
 /// receiver requested, signature verification cryptographically rejects it
 /// because the `dataToSign` payload binds the session id and the unsigned
