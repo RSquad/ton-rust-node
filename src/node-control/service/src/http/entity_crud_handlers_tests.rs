@@ -141,6 +141,7 @@ async fn app_state(cfg: AppConfig) -> AppState {
         config_changed: Arc::new(tokio::sync::Notify::new()),
         audit: Arc::new(crate::audit::log::NoopAuditLog),
         actor_builder: Arc::new(crate::audit::AuditActorBuilder::new(rt.clone())),
+        audit_ring: crate::audit::AuditEventBuffer::new(0),
     }
 }
 
@@ -161,6 +162,7 @@ async fn app_state_with_path(cfg: AppConfig, path: std::path::PathBuf) -> AppSta
         config_changed: Arc::new(tokio::sync::Notify::new()),
         audit: Arc::new(crate::audit::log::NoopAuditLog),
         actor_builder: Arc::new(crate::audit::AuditActorBuilder::new(rt)),
+        audit_ring: crate::audit::AuditEventBuffer::new(0),
     }
 }
 

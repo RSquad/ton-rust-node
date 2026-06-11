@@ -671,7 +671,7 @@ fn print_elections_table(body: &str) -> anyhow::Result<()> {
 
     println!("\n  {} ({})\n", "Our Participants".cyan().bold(), participants.len());
     println!(
-        "  {} {} {} {} {} {} {} {} {}",
+        "  {} {} {} {} {} {} {} {} {} {}",
         format!("{:<14}", "Node").cyan().bold(),
         format!("{:<13}", "Status").cyan().bold(),
         format!("{:<5}", "Pos").cyan().bold(),
@@ -679,10 +679,11 @@ fn print_elections_table(body: &str) -> anyhow::Result<()> {
         format!("{:<15}", "Accepted TON").cyan().bold(),
         format!("{:<24}", "Submitted At").cyan().bold(),
         format!("{:<6}", "MaxF").cyan().bold(),
+        format!("{:<30}", "Last error").cyan().bold(),
         format!("{:<44}", "Pubkey").cyan().bold(),
         "ADNL".cyan().bold(),
     );
-    println!("  {}", "-".repeat(148).dimmed());
+    println!("  {}", "-".repeat(180).dimmed());
 
     for p in participants {
         let node = binding_str(p, "node_id");
@@ -734,11 +735,14 @@ fn print_elections_table(body: &str) -> anyhow::Result<()> {
             .unwrap_or_else(|| "-".to_string());
 
         let accepted_stake = binding_str(p, "accepted_stake");
+        let last_error = binding_str(p, "last_error");
+        let last_error_display =
+            if last_error == "-" { "-".to_string() } else { last_error.yellow().to_string() };
         let pubkey = binding_str(p, "pubkey");
         let adnl = binding_str(p, "adnl");
 
         println!(
-            "  {:<14} {} {:<5} {:<15} {:<15} {:<24} {:<6} {:<44} {}",
+            "  {:<14} {} {:<5} {:<15} {:<15} {:<24} {:<6} {:<30} {:<44} {}",
             node,
             status,
             position,
@@ -746,11 +750,13 @@ fn print_elections_table(body: &str) -> anyhow::Result<()> {
             display_tons_from_str(&accepted_stake),
             submitted_at,
             max_factor,
+            last_error_display,
             pubkey,
             adnl,
         );
     }
     println!();
+
     Ok(())
 }
 
