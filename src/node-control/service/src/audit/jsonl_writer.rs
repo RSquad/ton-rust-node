@@ -15,6 +15,7 @@ use std::{
     },
     time::Duration,
 };
+
 /// Schema version stamped into the per-file [`AuditFileHeader`].
 const AUDIT_SCHEMA_VERSION: u16 = 1;
 

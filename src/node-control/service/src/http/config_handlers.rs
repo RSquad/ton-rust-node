@@ -2370,7 +2370,16 @@ pub async fn v1_elections_settings_update_handler(
         })
         .map_err(map_try_update_save)?;
 
-    let after = state.runtime_cfg.get().elections.as_ref().expect("validated above").clone();
+    // The closure only mutates the existing `ElectionsConfig` in place — it never
+    // clears `cfg.elections`. Use a fallible read (not `expect`) so a future
+    // regression cannot panic the request handler.
+    let after = state
+        .runtime_cfg
+        .get()
+        .elections
+        .as_ref()
+        .ok_or_else(|| AppError::internal("elections config missing after update"))?
+        .clone();
     let changes = rest_audit::elections_settings_changes(
         &before,
         &after,
@@ -2399,7 +2408,10 @@ pub async fn v1_elections_settings_update_handler(
 
     // Return updated settings (without bindings — use GET for the full view).
     let config = state.runtime_cfg.get();
-    let elections = config.elections.as_ref().expect("validated above");
+    let elections = config
+        .elections
+        .as_ref()
+        .ok_or_else(|| AppError::internal("elections config missing after update"))?;
     let dto = ElectionsSettingsDto {
         stake_policy: elections.policy.clone(),
         policy_overrides: elections.policy_overrides.clone(),
