@@ -1098,10 +1098,12 @@ pub struct ApiDoc;
 mod tests {
     use super::*;
     use crate::{
-        audit::NoopAuditLog, runtime_config::RuntimeConfigStore, task::task_manager::ServiceTask,
+        audit::{InMemoryAuditLog, NoopAuditLog, log::AuditLog},
+        http::test_support,
+        runtime_config::RuntimeConfigStore,
+        task::task_manager::ServiceTask,
     };
     use axum::body::Body;
-    use base64::Engine;
     use common::{
         app_config::{
             AppConfig, ElectionsConfig, HttpConfig, LogConfig, NodeBinding, StakePolicy,
@@ -1138,29 +1140,21 @@ mod tests {
         Arc::new(TaskController::new("elections", NoopTask, runtime_cfg))
     }
 
-    async fn test_jwt_auth() -> Arc<JwtAuth> {
-        let secret = base64::engine::general_purpose::STANDARD.encode([42u8; 32]);
-        Arc::new(JwtAuth::new(None, Some(&secret)).await.unwrap())
-    }
-
     async fn test_state(
         store: Arc<SnapshotStore>,
         runtime_cfg: Arc<RuntimeConfigStore>,
         elections_task: Arc<TaskController>,
     ) -> AppState {
-        let user_store = Arc::new(UserStore::new(runtime_cfg.clone() as Arc<dyn RuntimeConfig>));
-        AppState {
-            store,
-            runtime_cfg: runtime_cfg.clone(),
-            elections_task,
-            jwt_auth: test_jwt_auth().await,
-            user_store,
-            login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
-            config_changed: Arc::new(tokio::sync::Notify::new()),
-            audit: Arc::new(NoopAuditLog),
-            actor_builder: Arc::new(AuditActorBuilder::new(runtime_cfg)),
-            audit_ring: crate::audit::AuditEventBuffer::new(0),
-        }
+        test_state_with_audit(store, runtime_cfg, elections_task, Arc::new(NoopAuditLog)).await
+    }
+
+    async fn test_state_with_audit(
+        store: Arc<SnapshotStore>,
+        runtime_cfg: Arc<RuntimeConfigStore>,
+        elections_task: Arc<TaskController>,
+        audit: Arc<dyn AuditLog>,
+    ) -> AppState {
+        test_support::build_app_state_with(runtime_cfg, audit, store, Some(elections_task)).await
     }
 
     fn test_app_config(policy: StakePolicy) -> Arc<AppConfig> {
@@ -1899,6 +1893,26 @@ mod tests {
         let cfg = runtime_cfg.get();
         assert!(!cfg.bindings["node-a"].enable);
         assert!(cfg.bindings["node-b"].enable);
+    }
+
+    #[tokio::test]
+    async fn config_noop_update_does_not_emit_audit_event() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let audit_mem = Arc::new(InMemoryAuditLog::new());
+        let state =
+            test_state_with_audit(store, runtime_cfg, elections_task, audit_mem.clone()).await;
+
+        let app = routes(false, state);
+        let resp = app
+            .oneshot(post_json("/v1/elections/exclude", &NodeListRequest { nodes: vec![] }))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert!(audit_mem.drain().is_empty(), "empty diff must not emit rest_api.config_updated");
     }
 
     #[tokio::test]

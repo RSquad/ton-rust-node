@@ -52,8 +52,6 @@ async fn require_role_impl(
     next: Next,
     min_role: Role,
 ) -> Response {
-    let headers = req.headers().clone();
-
     // Check live config: when auth is not configured, pass through.
     // This allows auth to be enabled/disabled at runtime via config reload.
     {
@@ -61,6 +59,10 @@ async fn require_role_impl(
         if cfg.http.auth.is_none() {
             // Auth-disabled mode: inject a synthetic identity so mutation handlers
             // can still require `Extension<Claims>` without enabling JWT checks.
+            //
+            // `role` is set to `min_role` (the route gate), not a real user grant.
+            // Audit events will show `sub: "anonymous"` with that role — intentional,
+            // since there is no authenticated identity in this mode.
             req.extensions_mut().insert(Claims {
                 sub: "anonymous".into(),
                 role: min_role,
@@ -79,8 +81,13 @@ async fn require_role_impl(
     let token = match auth_header.and_then(|h| h.strip_prefix("Bearer ")) {
         Some(t) => t,
         None => {
-            rest_audit::record_token_rejected(&state, "unknown", "missing_authorization", &headers)
-                .await;
+            rest_audit::record_token_rejected(
+                &state,
+                "unknown",
+                "missing_authorization",
+                req.headers(),
+            )
+            .await;
             return unauthorized_response("missing or invalid Authorization header");
         }
     };
@@ -92,7 +99,7 @@ async fn require_role_impl(
                 .downcast_ref::<jsonwebtoken::errors::Error>()
                 .map(super::token_rejection_reason)
                 .unwrap_or("invalid_token");
-            rest_audit::record_token_rejected(&state, "unknown", reason, &headers).await;
+            rest_audit::record_token_rejected(&state, "unknown", reason, req.headers()).await;
             return unauthorized_response("invalid or expired token");
         }
     };
@@ -108,7 +115,8 @@ async fn require_role_impl(
                 user = %claims.sub,
                 "token rejected"
             );
-            rest_audit::record_token_rejected(&state, &claims.sub, "missing_user", &headers).await;
+            rest_audit::record_token_rejected(&state, &claims.sub, "missing_user", req.headers())
+                .await;
             return unauthorized_response("invalid or expired token");
         }
     };
@@ -124,7 +132,8 @@ async fn require_role_impl(
             current_role = %user.role,
             "token rejected"
         );
-        rest_audit::record_token_rejected(&state, &claims.sub, "role_mismatch", &headers).await;
+        rest_audit::record_token_rejected(&state, &claims.sub, "role_mismatch", req.headers())
+            .await;
         return unauthorized_response("invalid or expired token");
     }
 
@@ -140,7 +149,7 @@ async fn require_role_impl(
                 revoked_after = revoked_after,
                 "token rejected"
             );
-            rest_audit::record_token_rejected(&state, &claims.sub, "revoked", &headers).await;
+            rest_audit::record_token_rejected(&state, &claims.sub, "revoked", req.headers()).await;
             return unauthorized_response("invalid or expired token");
         }
     }

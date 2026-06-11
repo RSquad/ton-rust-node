@@ -59,6 +59,9 @@ pub async fn record_config_updated(
     operation: &str,
     changes: Vec<ConfigFieldChange>,
 ) {
+    // Intentional: audit records field-level diffs only, not bare update attempts.
+    // A request that results in zero tracked changes (e.g. exclude with an empty
+    // node list) emits no `rest_api.config_updated` event.
     if changes.is_empty() {
         return;
     }

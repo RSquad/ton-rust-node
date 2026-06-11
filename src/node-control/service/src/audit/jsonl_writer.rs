@@ -15,7 +15,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
 
 /// Schema version stamped into the per-file [`AuditFileHeader`].
 const AUDIT_SCHEMA_VERSION: u16 = 1;
