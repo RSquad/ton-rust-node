@@ -23,6 +23,7 @@
   - [Voting Commands](#voting-commands)
 - [REST API Endpoints](#rest-api-endpoints)
 - [Configuration](#configuration)
+- [Audit log](#audit-log)
   - [Config Structure](#config-structure)
   - [Section Descriptions](#section-descriptions)
   - [Default Config Example](#default-config-example)
@@ -2521,9 +2522,18 @@ curl -X POST http://127.0.0.1:8080/v1/task/elections \
 
 ---
 
+## Audit log
+
+nodectl writes a structured audit log of domain events (elections, config
+mutations, auth) to `./logs/audit.jsonl`. See [docs/audit-log.md](docs/audit-log.md)
+for configuration, retention, PII handling, and log analysis.
+
+---
+
 ## Related Setup Guides
 
 - [Hashicorp Vault Dedicated Setup](./docs/hcp-vault-setup.md)
 - [Node Control Service Setup](./docs/nodectl-setup.md)
 - [Contracts automation (auto-deploy / auto-topup)](./docs/contracts-automation.md) — `automation` config, REST and CLI
 - [Security Guide](./docs/nodectl-security.md) — roles, token lifecycle, rate limiting, monitoring
+- [Audit Log](./docs/audit-log.md) — configuration, durability, PII, log analysis
