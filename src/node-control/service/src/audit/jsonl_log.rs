@@ -160,15 +160,12 @@ impl AuditLog for JsonlAuditLog {
     async fn record(&self, event: AuditEvent) {
         // Deduplication: drop events whose key already exists in the ring.
         // Prevents e.g. repeated elections.stake_skipped for the same (node, election, reason).
-        if let Some(key) = event.dedup_key()
-            && self.ring.contains_dedup_key(&key)
-        {
+        // Check + push are atomic under one write lock in push_unless_dedup_duplicate.
+        if !self.ring.push_unless_dedup_duplicate(event.clone()) {
             return;
         }
 
-        // Push into ring first: readers see the event immediately and even
-        // queue-dropped events remain accessible on the REST read-path.
-        self.ring.push(event.clone());
+        // Ring already updated; proceed to the JSONL writer queue.
 
         let event_id = event.id;
         let source = event.payload.source();
@@ -204,7 +201,7 @@ impl AuditLog for JsonlAuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditEvent, log::AuditLog};
+    use crate::audit::{AuditActor, AuditEvent, AuditEventPayload, StakeSkipReason, log::AuditLog};
     use std::{path::PathBuf, time::Instant};
     use tempfile::tempdir;
 
@@ -273,6 +270,78 @@ mod tests {
         assert_eq!(log.ring().len(), 50, "ring must contain every record() call");
         // Writer is ~500 ms/event; timeout is 10 ms → most events dropped from channel.
         assert!(log.dropped_events() > 0, "some events must have been dropped from channel");
+
+        log.shutdown().await;
+    }
+
+    /// Two stake_skipped events with the same (node, election, reason) must leave one
+    /// entry in the ring; a third with a different reason is kept.
+    #[tokio::test(flavor = "current_thread")]
+    async fn record_deduplicates_stake_skipped_by_node_election_and_reason() {
+        let dir = tempdir().unwrap();
+        let cfg = AuditLogConfig {
+            path: dir.path().join("audit.jsonl"),
+            ring_buffer_capacity: 10,
+            batch_interval_ms: 60_000,
+            ..AuditLogConfig::default()
+        };
+        let log = JsonlAuditLog::start(cfg).await.unwrap();
+
+        let actor = AuditActor::service("elections-task");
+        let election_id = 12345;
+
+        log.record(AuditEvent::elections_stake_skipped(
+            actor.clone(),
+            "node0",
+            election_id,
+            StakeSkipReason::ElectionsDisabled,
+            None,
+            None,
+        ))
+        .await;
+        log.record(AuditEvent::elections_stake_skipped(
+            actor.clone(),
+            "node0",
+            election_id,
+            StakeSkipReason::ElectionsDisabled,
+            None,
+            None,
+        ))
+        .await;
+        log.record(AuditEvent::elections_stake_skipped(
+            actor,
+            "node0",
+            election_id,
+            StakeSkipReason::LowWalletBalance,
+            None,
+            None,
+        ))
+        .await;
+
+        let skipped: Vec<_> = log
+            .ring()
+            .snapshot()
+            .into_iter()
+            .filter(|e| matches!(e.payload, AuditEventPayload::ElectionsStakeSkipped { .. }))
+            .collect();
+        assert_eq!(
+            skipped.len(),
+            2,
+            "duplicate (node, election, reason) must be dropped from the ring"
+        );
+
+        let reasons: Vec<_> = skipped
+            .iter()
+            .filter_map(|e| {
+                if let AuditEventPayload::ElectionsStakeSkipped { reason, .. } = &e.payload {
+                    Some(*reason)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(reasons.contains(&StakeSkipReason::ElectionsDisabled));
+        assert!(reasons.contains(&StakeSkipReason::LowWalletBalance));
 
         log.shutdown().await;
     }

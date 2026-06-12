@@ -810,6 +810,11 @@ fn print_recent_events_table(body: &serde_json::Value) {
     println!();
 }
 
+/// Truncate `s` to at most `max_len` bytes without panicking on a non-ASCII boundary.
+fn truncate_preview(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len { s } else { s.get(..max_len).unwrap_or(s) }
+}
+
 fn format_event_details(event_type: &str, data: Option<&serde_json::Value>) -> String {
     let Some(data) = data else { return String::new() };
 
@@ -849,11 +854,11 @@ fn format_event_details(event_type: &str, data: Option<&serde_json::Value>) -> S
         }
         "withdraw_processed" => {
             let hash = data.get("msg_hash").and_then(serde_json::Value::as_str).unwrap_or("-");
-            format!("msg_hash={}", &hash[..hash.len().min(16)])
+            format!("msg_hash={}", truncate_preview(hash, 16))
         }
         "key_generated" => {
             let pubkey = data.get("pubkey").and_then(serde_json::Value::as_str).unwrap_or("-");
-            format!("pubkey={}…", &pubkey[..pubkey.len().min(12)])
+            format!("pubkey={}…", truncate_preview(pubkey, 12))
         }
         _ => String::new(),
     }
@@ -1083,5 +1088,13 @@ mod tests {
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["node_id"], "node1");
+    }
+
+    #[test]
+    fn truncate_preview_shortens_ascii_without_panicking_on_utf8() {
+        assert_eq!(truncate_preview("abcdefgh", 4), "abcd");
+        assert_eq!(truncate_preview("ab", 4), "ab");
+        // Must not panic when max_len falls inside a multi-byte character.
+        let _ = truncate_preview("привет", 3);
     }
 }
