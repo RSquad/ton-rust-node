@@ -42,7 +42,8 @@ use crate::{
     utils::{MetricsDumper, MetricsHandle},
     ActivityNodePtr, AsyncKeyValueStorage, AsyncKeyValueStorageOptions, AsyncKeyValueStoragePtr,
     ConsensusCommonFactory, Result, StorageAsyncResult, StorageAsyncResultPtr, StorageGetCallback,
-    StorageKey, StoragePrefixScanCallback, StorageValue, StorageWriteCallback,
+    StorageKey, StoragePrefixScanCallback, StorageResultAlreadyTaken, StorageValue,
+    StorageWriteCallback,
 };
 use crossbeam::channel::{bounded, Receiver, Sender};
 use std::{
@@ -132,9 +133,9 @@ impl<T: Clone + Send + Sync + 'static> StorageAsyncResult<T> for StorageAsyncRes
                 None
             }
             AsyncResultState::Ready(result) => Some(result),
-            AsyncResultState::Taken => {
-                Some(Err(ton_block::error!("StorageAsyncResult: result already taken")))
-            }
+            // Typed sentinel — see `StorageResultAlreadyTaken` in lib.rs for
+            // the recommended downcast-based detection on the consumer side.
+            AsyncResultState::Taken => Some(Err(StorageResultAlreadyTaken.into())),
         }
     }
 
@@ -158,9 +159,9 @@ impl<T: Clone + Send + Sync + 'static> StorageAsyncResult<T> for StorageAsyncRes
                 }
                 AsyncResultState::Ready(_) => break,
                 AsyncResultState::Taken => {
-                    return Some(Err(ton_block::error!(
-                        "StorageAsyncResult: result already taken"
-                    )));
+                    // Same typed sentinel as `try_get` — see
+                    // `StorageResultAlreadyTaken` in lib.rs.
+                    return Some(Err(StorageResultAlreadyTaken.into()));
                 }
             }
         }
