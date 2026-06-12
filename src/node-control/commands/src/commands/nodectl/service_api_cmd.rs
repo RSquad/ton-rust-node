@@ -661,11 +661,13 @@ fn print_elections_table(body: &str) -> anyhow::Result<()> {
     let Some(participants) = value.get("our_participants").and_then(serde_json::Value::as_array)
     else {
         println!("\n  {}\n", "No participants in response".yellow());
+        print_recent_events_table(&value);
         return Ok(());
     };
 
     if participants.is_empty() {
         println!("\n  {}\n", "No controlled participants".yellow());
+        print_recent_events_table(&value);
         return Ok(());
     }
 
@@ -751,7 +753,115 @@ fn print_elections_table(body: &str) -> anyhow::Result<()> {
         );
     }
     println!();
+
+    print_recent_events_table(&value);
+
     Ok(())
+}
+
+fn print_recent_events_table(body: &serde_json::Value) {
+    let Some(events) = body.get("recent_events").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if events.is_empty() {
+        return;
+    }
+
+    println!("  {} ({})\n", "Recent Audit Events".cyan().bold(), events.len());
+    println!(
+        "  {} {} {} {} {}",
+        format!("{:<24}", "Time").cyan().bold(),
+        format!("{:<35}", "Event").cyan().bold(),
+        format!("{:<14}", "Node").cyan().bold(),
+        format!("{:<9}", "Outcome").cyan().bold(),
+        "Details".cyan().bold(),
+    );
+    println!("  {}", "-".repeat(110).dimmed());
+
+    for ev in events {
+        let ts = ev.get("ts").and_then(serde_json::Value::as_str).unwrap_or("-");
+        // Trim to HH:MM:SS for compactness; full date shown if it fits
+        let ts_display = if ts.len() >= 19 { &ts[..19] } else { ts };
+        let ts_display = ts_display.replace('T', " ");
+
+        let event_type = ev.get("event_type").and_then(serde_json::Value::as_str).unwrap_or("-");
+        let short_event = event_type.trim_start_matches("elections.");
+
+        let outcome_raw = ev.get("outcome").and_then(serde_json::Value::as_str).unwrap_or("-");
+        let outcome = match outcome_raw {
+            "success" => format!("{:<9}", "ok").green().to_string(),
+            "failure" => format!("{:<9}", "fail").red().bold().to_string(),
+            "skipped" => format!("{:<9}", "skipped").yellow().to_string(),
+            other => format!("{:<9}", other),
+        };
+
+        let target = ev.get("target");
+        let node_id =
+            target.and_then(|t| t.get("id")).and_then(serde_json::Value::as_str).unwrap_or("-");
+
+        let data = ev.get("data");
+        let details = format_event_details(short_event, data);
+
+        println!(
+            "  {:<24} {:<35} {:<14} {} {}",
+            ts_display, short_event, node_id, outcome, details
+        );
+    }
+    println!();
+}
+
+/// Truncate `s` to at most `max_len` bytes without panicking on a non-ASCII boundary.
+fn truncate_preview(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len { s } else { s.get(..max_len).unwrap_or(s) }
+}
+
+fn format_event_details(event_type: &str, data: Option<&serde_json::Value>) -> String {
+    let Some(data) = data else { return String::new() };
+
+    match event_type {
+        "stake_submitted" => {
+            let stake = data.get("stake").and_then(serde_json::Value::as_str).unwrap_or("-");
+            let policy = data.get("policy").and_then(serde_json::Value::as_str).unwrap_or("-");
+            format!("stake={} policy={}", display_tons_from_str(stake), policy)
+        }
+        "stake_accepted" => {
+            let stake = data.get("stake").and_then(serde_json::Value::as_str).unwrap_or("-");
+            format!("stake={}", display_tons_from_str(stake))
+        }
+        "stake_skipped" => {
+            let reason = data.get("reason").and_then(serde_json::Value::as_str).unwrap_or("-");
+            if let (Some(req), Some(avail)) = (
+                data.get("required").and_then(serde_json::Value::as_str),
+                data.get("available").and_then(serde_json::Value::as_str),
+            ) {
+                format!(
+                    "reason={} req={} avail={}",
+                    reason,
+                    display_tons_from_str(req),
+                    display_tons_from_str(avail)
+                )
+            } else {
+                format!("reason={}", reason)
+            }
+        }
+        "stake_failed" | "stake_recover_failed" | "withdraw_failed" => {
+            let reason = data.get("reason").and_then(serde_json::Value::as_str).unwrap_or("-");
+            format!("reason={}", reason)
+        }
+        "stake_recovered" => {
+            let amount = data.get("amount").and_then(serde_json::Value::as_str).unwrap_or("-");
+            format!("amount={}", display_tons_from_str(amount))
+        }
+        "withdraw_processed" => {
+            let hash = data.get("msg_hash").and_then(serde_json::Value::as_str).unwrap_or("-");
+            format!("msg_hash={}", truncate_preview(hash, 16))
+        }
+        "key_generated" => {
+            let pubkey = data.get("pubkey").and_then(serde_json::Value::as_str).unwrap_or("-");
+            format!("pubkey={}…", truncate_preview(pubkey, 12))
+        }
+        _ => String::new(),
+    }
 }
 
 fn binding_str(value: &serde_json::Value, key: &str) -> String {
@@ -978,5 +1088,13 @@ mod tests {
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["node_id"], "node1");
+    }
+
+    #[test]
+    fn truncate_preview_shortens_ascii_without_panicking_on_utf8() {
+        assert_eq!(truncate_preview("abcdefgh", 4), "abcd");
+        assert_eq!(truncate_preview("ab", 4), "ab");
+        // Must not panic when max_len falls inside a multi-byte character.
+        let _ = truncate_preview("привет", 3);
     }
 }
