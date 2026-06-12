@@ -1246,7 +1246,11 @@ impl ValidatorGroup {
                         "on_candidate_observed: deserialize_block failed for {}: {}",
                         block_id, e
                     );
-                    return;
+                    // Still record the observation (flags only, no body) so
+                    // later flag updates can OR-merge and a subsequent valid
+                    // body can overwrite the entry, rather than stranding
+                    // resolver waiters on a dropped observation.
+                    None
                 }
             }
         } else {
