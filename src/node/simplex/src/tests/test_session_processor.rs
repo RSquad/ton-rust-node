@@ -6611,6 +6611,14 @@ fn test_process_validated_candidates_before_fsm_timeout() {
 
     // --- Correct order (Fix A): feed candidates, THEN run FSM timeouts ---
     fixture.processor.process_validated_candidates();
+    // `process_validated_candidates()` routes the FSM feed through
+    // `ensure_candidate_info_stored()`: while the candidateInfo persist is still
+    // in flight on the background storage thread, the feed is deferred to the
+    // SXMAIN async-DB-results registry instead of running inline. Drain the
+    // registry so the candidate is fed to the FSM *before* the timeout is
+    // evaluated below; without this the feed races the storage write and the
+    // slot is skip-voted first (the flaky failure this test guards against).
+    fixture.drain_pending_async_db_results();
     fixture.processor.simplex_state.check_all(&fixture.description);
 
     // Collect FSM events produced by the two calls above.
