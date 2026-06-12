@@ -1238,6 +1238,13 @@ impl ValidatorGroup {
                             block_id
                         );
                     }
+                    self.state_resolver_cache.lock().await.upsert_observed_candidate(
+                        block_id,
+                        data,
+                        collated_data,
+                        flags,
+                        block_stuff.block().cloned().ok(),
+                    );
                 }
                 Err(e) => {
                     log::warn!(
@@ -1248,14 +1255,6 @@ impl ValidatorGroup {
                 }
             }
         }
-
-        self.state_resolver_cache.lock().await.upsert_observed_candidate(
-            block_id,
-            data,
-            collated_data,
-            flags,
-            None,
-        );
     }
 
     pub async fn on_generate_slot(

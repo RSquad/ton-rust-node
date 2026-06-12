@@ -56,14 +56,14 @@ use ton_block::{
     AccountStatus, AccountStorageDictProof, AddSub, Augmentation, Block, BlockCreateStats,
     BlockError, BlockExtra, BlockIdExt, BlockInfo, BlockLimits, Cell, CellType, Coins,
     ConfigParamEnum, ConfigParams, ConsensusExtraData, Counters, CreatorStats, CurrencyCollection,
-    DepthBalanceInfo, Deserializable, EnqueuedMsg, FundamentalSmcAddresses, GlobalCapabilities,
-    HashmapAugType, HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt, LibDescr, Libraries,
-    McBlockExtra, McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt,
-    MsgEnvelope, MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result, Serializable,
-    ShardAccount, ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes, ShardIdent,
-    ShardStateUnsplit, SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet, TrComputePhase,
-    Transaction, TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow, WorkchainDescr,
-    INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
+    DepthBalanceInfo, Deserializable, EnqueuedMsg, ExceptionCode, FundamentalSmcAddresses,
+    GlobalCapabilities, HashmapAugType, HashmapType, InMsg, InMsgDescr, KeyExtBlkRef, KeyMaxLt,
+    LibDescr, Libraries, McBlockExtra, McShardRecord, McStateExtra, MerkleProof, MerkleUpdate,
+    Message, MsgAddressInt, MsgEnvelope, MsgMetadata, OutMsg, OutMsgDescr, OutMsgQueueKey, Result,
+    Serializable, ShardAccount, ShardAccountBlocks, ShardAccounts, ShardFeeCreated, ShardHashes,
+    ShardIdent, ShardStateUnsplit, SizeLimitsConfig, SliceData, StateInitLib, TopBlockDescrSet,
+    TrComputePhase, Transaction, TransactionDescr, UInt15, UInt256, ValidatorSet, ValueFlow,
+    WorkchainDescr, INVALID_WORKCHAIN_ID, MASTERCHAIN_ID, MAX_SPLIT_DEPTH,
 };
 #[cfg(feature = "xp25")]
 use ton_block::{ShardDescr, SHARD_FULL};
@@ -3227,11 +3227,19 @@ impl ValidateQuery {
         if prev.out_queue_size <= base.limits.defer_out_queue_size_limit as usize {
             // Check that at least one message was taken from each AccountDispatchQueue
             let mut total_account_dispatch_queues = 0;
-            prev.dispatch_queue().iterate_slices(|_, _| {
+            let res = prev.dispatch_queue().iterate_slices(|_, _| {
                 total_account_dispatch_queues += 1;
                 Ok(total_account_dispatch_queues <= processed_account_dispatch_queues)
-            })?;
-            if total_account_dispatch_queues != processed_account_dispatch_queues {
+            });
+            let have_unprocessed_account_dispatch_queue = if let Err(err) = res {
+                if err.downcast_ref() != Some(&ExceptionCode::PrunedCellAccess) {
+                    return Err(err);
+                }
+                true
+            } else {
+                total_account_dispatch_queues != processed_account_dispatch_queues
+            };
+            if have_unprocessed_account_dispatch_queue {
                 base.result.have_unprocessed_account_dispatch_queue.store(true, Ordering::Relaxed);
             }
         }

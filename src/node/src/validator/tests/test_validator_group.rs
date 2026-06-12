@@ -17,14 +17,23 @@ use std::{
     time::Duration,
 };
 use ton_block::{
-    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, ZeroizingBytes,
+    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, Serializable,
+    ZeroizingBytes,
 };
 
 #[derive(Default)]
 struct DummyEngine;
 
 #[async_trait::async_trait]
-impl EngineOperations for DummyEngine {}
+impl EngineOperations for DummyEngine {
+    // `on_candidate_observed` persists a valid candidate body
+    async fn store_block(
+        &self,
+        _block: &crate::block::BlockStuff,
+    ) -> Result<crate::internal_db::BlockResult> {
+        fail!("dummy engine does not persist blocks")
+    }
+}
 
 #[derive(Default)]
 struct MockSimplexSession {
@@ -141,12 +150,19 @@ async fn test_resolver_cache_bridge_requests_simplex_candidate_availability() {
     let backend: Arc<dyn ResolverBackend> = group.clone();
     group.state_resolver_cache.lock().await.set_backend(Arc::downgrade(&backend));
 
+    // `on_candidate_observed` now skips candidates whose body fails to
+    // deserialize ("Skip invalid candidates"), so feed a real, parseable block
+    // whose root hash matches the observed block id.
+    let mut block = Block::default();
+    block.set_global_id(42);
+    let root_hash = block.serialize().expect("serialize block cell").repr_hash().clone();
+    let block_bytes = block.write_to_bytes().expect("serialize block bytes");
     let block_id =
-        BlockIdExt::with_params(ShardIdent::masterchain(), 77, UInt256::rand(), UInt256::rand());
+        BlockIdExt::with_params(ShardIdent::masterchain(), 77, root_hash, UInt256::rand());
     group
         .on_candidate_observed(
             block_id.clone(),
-            ConsensusCommonFactory::create_block_payload(vec![1, 2, 3]),
+            ConsensusCommonFactory::create_block_payload(block_bytes),
             ConsensusCommonFactory::create_block_payload(Vec::new()),
             CandidateObservedFlags {
                 body_present: true,

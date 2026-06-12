@@ -3162,6 +3162,65 @@ fn test_restart_skip_marks_state() {
 }
 
 #[test]
+fn test_cpp_parity_restart_does_not_skip_voted_final_slot() {
+    // C++-parity GUARD (TN-1414, "don't let a restarted node skip a window that's still
+    // finalizing").
+    //
+    // C++ consensus.cpp start_up() skips only the single window before
+    // first_nonannounced_window, and only slots where !voted_final. A slot the node already
+    // voted_final must NEVER be skip-voted on restart — skip<->final is an equivocation that
+    // can also drop finalize weight below 2/3 and wedge the chain.
+    //
+    // Rust sets is_completed together with voted_final in mark_slot_voted_on_restart, and the
+    // bootstrap sequence applies those local vote flags (step 3) BEFORE generate_restart_skip_votes
+    // (step 4), so a voted_final slot is protected while its non-final sibling is skipped.
+    //
+    // Locks in EXISTING behavior (no production code change); guards against a regression that
+    // would let restart recovery skip a slot the node committed to finalizing.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+
+    let hash = UInt256::from([0x6Bu8; 32]);
+
+    // Replay persisted votes for window 0 (= W-1 when first_nonannounced_window = 1):
+    // slot 0 was finalized locally; slot 1 was only notarized (still finalizing).
+    state.mark_slot_voted_on_restart(
+        &desc,
+        &Vote::Finalize(FinalizeVote { slot: SlotIndex::new(0), block_hash: hash.clone() }),
+    );
+    state.mark_slot_voted_on_restart(
+        &desc,
+        &Vote::Notarize(NotarizeVote { slot: SlotIndex::new(1), block_hash: hash }),
+    );
+
+    // Restart skip generation over window 0 (slots [0, 1]).
+    let queued = state.generate_restart_skip_votes(WindowIndex::new(1), 2);
+    assert_eq!(queued, 1, "only the non-final slot may be skipped on restart");
+
+    let w0 = state.get_window(WindowIndex::new(0)).unwrap();
+    assert!(
+        !w0.slots[0].voted_skip,
+        "a slot we already voted_final must NOT be skip-voted on restart (C++ !voted_final parity)"
+    );
+    assert!(w0.slots[1].voted_skip, "the non-final sibling slot must be skip-voted on restart");
+
+    let mut saw_skip_0 = false;
+    let mut saw_skip_1 = false;
+    while let Some(ev) = state.pull_event() {
+        if let SimplexEvent::BroadcastVote(Vote::Skip(SkipVote { slot })) = ev {
+            if slot == SlotIndex::new(0) {
+                saw_skip_0 = true;
+            }
+            if slot == SlotIndex::new(1) {
+                saw_skip_1 = true;
+            }
+        }
+    }
+    assert!(!saw_skip_0, "must not broadcast Skip for the voted_final slot");
+    assert!(saw_skip_1, "must broadcast Skip for the non-final slot");
+}
+
+#[test]
 fn test_restart_finalize_blocked_by_skip() {
     // After restart with skip vote, try_final() must be blocked by local skip state.
     // Reference: C++ consensus.cpp L230: `!voted_skip && !voted_final && voted_notar==id`.
@@ -3236,6 +3295,73 @@ fn test_cpp_mode_local_notarize_after_skip() {
         }
     }
     assert!(saw_notar, "expected notarize broadcast after local skip in C++ mode");
+}
+
+#[test]
+fn test_cpp_parity_blocker_body_recovery_notarizes_and_finalizes() {
+    // C++-parity GUARD (TN-1414, "pull the body for the finalization blocker").
+    //
+    // Models the releasenet MC blocker shape at the FSM level: the node has OBSERVED a
+    // NotarCert for the blocking slot (>=2/3 of the set notarized it) but is missing the
+    // body and has not voted itself. Once the body is recovered — via a requestCandidate
+    // query response or a relayed broadcast — the node must notarize AND finalize it,
+    // exactly as C++ consensus.cpp handle(CandidateReceived) -> try_notarize ->
+    // try_vote_final does.
+    //
+    // This locks in EXISTING behavior (no production code change). Rust already pulls the
+    // body on observing the cert (session_processor on_certificate / on_vote ->
+    // request_candidate) and routes the recovered body to notarization with C++-parity vote
+    // gating, so it matches/exceeds C++. The guard exists to prevent a future regression
+    // that would re-strand the finalization blocker.
+    let desc = create_test_desc(4, 1);
+    let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
+
+    let slot = SlotIndex::new(0);
+    let hash = UInt256::from([0x5Au8; 32]);
+
+    // Cert observed for the blocker, but no body yet and we have not voted: must NOT finalize
+    // (try_final has no local notar vote to finalize).
+    state.on_block_notarized(&desc, slot, hash.clone());
+    assert!(state.has_notarized_block(slot), "notar cert must be observed for the blocker slot");
+    let mut saw_premature_final = false;
+    while let Some(ev) = state.pull_event() {
+        if matches!(ev, SimplexEvent::BroadcastVote(Vote::Finalize(_))) {
+            saw_premature_final = true;
+        }
+    }
+    assert!(
+        !saw_premature_final,
+        "must not finalize the blocker before the body arrives (no local notar vote yet)"
+    );
+
+    // Body is recovered (genesis-parent blocker): node notarizes, then auto-finalizes because
+    // the cert is present, it has not voted skip, and the slot is not completed.
+    let candidate =
+        create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, /*leader=*/ 0);
+    state.on_candidate(&desc, candidate).expect("on_candidate should succeed");
+
+    let mut saw_notar = false;
+    let mut saw_final = false;
+    while let Some(ev) = state.pull_event() {
+        match ev {
+            SimplexEvent::BroadcastVote(Vote::Notarize(NotarizeVote { slot: s, .. }))
+                if s == slot =>
+            {
+                saw_notar = true;
+            }
+            SimplexEvent::BroadcastVote(Vote::Finalize(FinalizeVote { slot: s, .. }))
+                if s == slot =>
+            {
+                saw_final = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_notar, "recovered blocker body must produce a Notarize vote");
+    assert!(
+        saw_final,
+        "recovered blocker body must auto-finalize (notar cert present, not skipped)"
+    );
 }
 
 #[test]
@@ -3544,6 +3670,60 @@ fn test_tn1401_restart_base_repair_crosses_already_skipped_slot() {
     assert!(
         state.has_available_parent(&desc, SlotIndex::new(2)),
         "next leader must have a parent after skipped-slot base repair"
+    );
+}
+
+#[test]
+fn test_tn1411_foreign_skip_cert_defers_window_publish_until_base_repair() {
+    // Releasenet crash shape:
+    // - recovered cursor is already at the first slot of a new leader window;
+    // - a foreign/persisted skip certificate for that slot arrives before the
+    //   restart base is repaired;
+    // - Rust must not publish LeaderWindowObserved with an unknown base.
+    let desc = create_test_desc(4, 2);
+    let mut state = SimplexState::new(&desc).expect("Failed to create state");
+    let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
+
+    state.set_first_non_finalized_slot(SlotIndex::new(2));
+    state.first_non_progressed_slot = SlotIndex::new(2);
+    state.current_leader_window_idx = WindowIndex::new(0);
+
+    let skip2 = create_test_skip_cert(&desc, SlotIndex::new(2), &signers);
+    state.set_skip_certificate(&desc, SlotIndex::new(2), skip2).unwrap();
+
+    assert_eq!(
+        state.first_non_progressed_slot,
+        SlotIndex::new(2),
+        "base-less skipped progress slot must not advance"
+    );
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(0),
+        "leader window publication must wait for progress-slot base repair"
+    );
+    assert!(
+        !state.has_available_parent(&desc, SlotIndex::new(3)),
+        "successor slot cannot become voteable before the skipped slot has a base"
+    );
+
+    let finalized_parent =
+        CandidateParentInfo { slot: SlotIndex::new(1), hash: UInt256::from([0xD1u8; 32]) };
+    state.set_available_base_after_restart(&desc, finalized_parent.clone());
+
+    assert_eq!(
+        state.get_slot_available_base(&desc, SlotIndex::new(3)),
+        Some(Some(finalized_parent)),
+        "restart base repair must propagate across the already-skipped foreign cert"
+    );
+    assert_eq!(
+        state.first_non_progressed_slot,
+        SlotIndex::new(3),
+        "cursor advances only after the successor base is known"
+    );
+    assert_eq!(
+        state.current_leader_window_idx,
+        WindowIndex::new(1),
+        "window can publish after the repaired cursor base is available"
     );
 }
 

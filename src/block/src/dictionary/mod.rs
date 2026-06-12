@@ -89,6 +89,16 @@ pub struct LabelReader {
 }
 
 impl LabelReader {
+    pub fn with_cell(cell: &Cell) -> Result<Self> {
+        Self::with_gas_consumer(cell, &mut 0)
+    }
+    pub fn with_gas_consumer(cell: &Cell, gas_consumer: &mut dyn GasConsumer) -> Result<Self> {
+        if cell.is_pruned() {
+            fail!(ExceptionCode::PrunedCellAccess)
+        }
+        let cursor = gas_consumer.load_cell(cell.clone())?;
+        Ok(Self { cursor, already_read: false })
+    }
     fn get_label_short(cursor: &mut SliceData, max: &mut usize) -> Result<SliceData> {
         let mut len = 0;
         while cursor.get_next_bit()? {
@@ -141,12 +151,6 @@ impl LabelReader {
             fail!(ExceptionCode::CellUnderflow)
         }
     }
-    pub fn new(cursor: SliceData) -> Self {
-        Self { cursor, already_read: false }
-    }
-    pub fn with_cell(cursor: &Cell) -> Result<Self> {
-        Ok(Self::new(SliceData::load_cell_ref(cursor)?))
-    }
     pub fn next_reader<T: HashmapType + ?Sized>(
         &mut self,
         index: usize,
@@ -155,7 +159,7 @@ impl LabelReader {
         if !self.is_fork::<T>()? {
             fail!("this edge must contain fork")
         }
-        Ok(Self::new(gas_consumer.load_cell(self.reference(index)?)?))
+        Self::with_gas_consumer(&self.reference(index)?, gas_consumer)
     }
     pub fn already_read(&self) -> bool {
         self.already_read
@@ -1037,10 +1041,7 @@ where
             if cell_1 == cell_2 {
                 return Ok(true);
             } else {
-                (
-                    LabelReader::new(SliceData::load_cell(cell_1)?),
-                    LabelReader::new(SliceData::load_cell(cell_2)?),
-                )
+                (LabelReader::with_cell(&cell_1)?, LabelReader::with_cell(&cell_2)?)
             }
         }
         (Some(cell), None) => {
@@ -1869,7 +1870,7 @@ pub trait HashmapSubtree: HashmapRemover + Clone + Sized {
             fail!("Prefix too long {} more than {}", prefix_len, self.bit_len())
         }
         if let Some(root) = self.data() {
-            let mut cursor = LabelReader::new(gas_consumer.load_cell(root.clone())?);
+            let mut cursor = LabelReader::with_gas_consumer(root, gas_consumer)?;
             let (key, prefix_remainder_opt) =
                 down_by_tree::<Self>(prefix, &mut cursor, self.bit_len(), gas_consumer)?;
             Ok(Some((key, cursor.remainder()?, prefix_remainder_opt)))
@@ -1914,9 +1915,9 @@ where
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct HashmapIterator<T: HashmapType + ?Sized> {
-    pos: Vec<(LabelReader, usize, BuilderData)>,
+    pos: Vec<(Result<LabelReader>, usize, BuilderData)>,
     phantom: PhantomData<T>,
 }
 
@@ -1924,15 +1925,14 @@ impl<T: HashmapType + ?Sized> HashmapIterator<T> {
     pub fn from_hashmap(tree: &T) -> Self {
         let mut pos = vec![];
         if let Some(root) = tree.data() {
-            // must be checked here for Pruned cell
-            let cursor = SliceData::load_cell_ref(root).expect("need to check root");
-            pos.push((LabelReader::new(cursor), tree.bit_len(), BuilderData::default()));
+            pos.push((LabelReader::with_cell(root), tree.bit_len(), BuilderData::default()));
         }
         Self { pos, phantom: PhantomData::<T> }
     }
     // is_leaf and is_fork are not used here
     pub fn next_item(&mut self) -> Result<Option<(BuilderData, SliceData)>> {
-        while let Some((mut cursor, mut bit_len, key)) = self.pos.pop() {
+        while let Some((cursor, mut bit_len, key)) = self.pos.pop() {
+            let mut cursor = cursor?;
             let key = cursor.get_label_raw(&mut bit_len, key)?;
             if bit_len == 0 {
                 return Ok(Some((key, cursor.remainder()?)));
@@ -1940,7 +1940,7 @@ impl<T: HashmapType + ?Sized> HashmapIterator<T> {
             for index in 0..2 {
                 let mut key = key.clone();
                 key.append_bit_bool(index == 0)?;
-                let cursor = cursor.next_reader::<T>(1 - index, &mut 0)?;
+                let cursor = cursor.next_reader::<T>(1 - index, &mut 0);
                 self.pos.push((cursor, bit_len - 1, key));
             }
         }

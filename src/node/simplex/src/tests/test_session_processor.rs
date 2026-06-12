@@ -4258,26 +4258,44 @@ fn test_conflicting_second_broadcast_same_slot_is_dropped_by_precheck() {
 }
 
 #[test]
-fn test_broadcast_from_unexpected_sender_is_dropped_by_precheck() {
+fn test_relayed_broadcast_from_non_leader_is_accepted() {
+    // Regression (TN-1414): an authentic, leader-signed broadcast candidate that is
+    // delivered by a relay / gossip peer (sender != slot leader, no attached notar cert)
+    // must be ACCEPTED, not dropped. Dropping it strands any node that missed the leader's
+    // direct delivery: it can never notarize the slot, is forced to skip, and a single such
+    // node is enough to wedge finalization on a notarized slot (releasenet MC stall).
+    //
+    // Before the fix this candidate was dropped with precheck_drop_reason=unexpected_sender;
+    // after the fix it is accepted and authenticated by the leader-signature check.
     let mut fixture = TestFixture::new(4);
     let slot = 0u32;
     let (leader_source, candidate_id, broadcast) =
         make_signed_block_broadcast(&fixture, slot, vec![3u8, 4, 5, 6]);
-    let unexpected_sender = (leader_source + 1) % 4;
 
-    fixture.processor.on_candidate_received(
-        unexpected_sender,
-        broadcast,
-        None, /* broadcast */
-    );
+    // Deliver the leader-signed broadcast from a peer that is NOT the slot leader,
+    // exactly as a relay / gossip hop would (notar_cert = None => broadcast path).
+    let relay_sender = (leader_source + 1) % 4;
+    assert_ne!(relay_sender, leader_source, "relay sender must differ from the slot leader");
+
+    fixture.processor.on_candidate_received(relay_sender, broadcast, None /* broadcast */);
 
     assert!(
-        !fixture.processor.received_candidates.contains_key(&candidate_id),
-        "broadcast from non-leader sender must be dropped by precheck"
+        fixture.processor.received_candidates.contains_key(&candidate_id),
+        "relayed leader-signed broadcast must be accepted into received_candidates"
     );
     assert!(
-        !fixture.processor.candidate_data_cache.contains_key(&candidate_id),
-        "broadcast from non-leader sender must not be persisted"
+        fixture.processor.candidate_data_cache.contains_key(&candidate_id),
+        "relayed leader-signed broadcast must be persisted in candidate_data_cache"
+    );
+    assert_eq!(
+        fixture.processor.seen_broadcast_candidates.get(&SlotIndex::new(slot)).cloned(),
+        Some(candidate_id),
+        "relayed broadcast must update the slot dedup state"
+    );
+    assert_eq!(
+        metrics_counter(&fixture.processor, "simplex_candidate_relayed_broadcast"),
+        1,
+        "relayed broadcast observability counter must increment"
     );
 }
 

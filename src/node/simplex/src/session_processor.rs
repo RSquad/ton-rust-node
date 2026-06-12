@@ -1267,8 +1267,10 @@ pub(crate) struct SessionProcessor {
     candidate_precheck_old_slot_drop_counter: metrics::Counter,
     /// Broadcast precheck drops: too-far-future slot
     candidate_precheck_future_slot_drop_counter: metrics::Counter,
-    /// Broadcast precheck drops: sender is not expected slot leader
-    candidate_precheck_unexpected_sender_drop_counter: metrics::Counter,
+    /// Relayed leader-signed broadcasts observed at precheck (delivering peer != slot
+    /// leader). Counted pre-verification as a relay-hop delivery-volume diagnostic; the
+    /// body is authenticated below by the leader signature in `RawCandidate::from_tl`.
+    candidate_relayed_broadcast_counter: metrics::Counter,
     /// Broadcast precheck drops: conflicting second candidate for same slot
     candidate_precheck_conflicting_slot_drop_counter: metrics::Counter,
     /// Peer-delivered candidate bodies received via broadcast.
@@ -1940,7 +1942,7 @@ impl SessionProcessor {
             health_warnings_counter,
             candidate_precheck_old_slot_drop_counter,
             candidate_precheck_future_slot_drop_counter,
-            candidate_precheck_unexpected_sender_drop_counter,
+            candidate_relayed_broadcast_counter,
             candidate_precheck_conflicting_slot_drop_counter,
             candidate_received_broadcast_counter,
             candidate_received_query_counter,
@@ -2098,7 +2100,7 @@ impl SessionProcessor {
             health_warnings_counter,
             candidate_precheck_old_slot_drop_counter,
             candidate_precheck_future_slot_drop_counter,
-            candidate_precheck_unexpected_sender_drop_counter,
+            candidate_relayed_broadcast_counter,
             candidate_precheck_conflicting_slot_drop_counter,
             candidate_received_broadcast_counter,
             candidate_received_query_counter,
@@ -2222,7 +2224,7 @@ impl SessionProcessor {
         metrics::Counter,    // health_warnings_counter
         metrics::Counter,    // candidate_precheck_old_slot_drop_counter
         metrics::Counter,    // candidate_precheck_future_slot_drop_counter
-        metrics::Counter,    // candidate_precheck_unexpected_sender_drop_counter
+        metrics::Counter,    // candidate_relayed_broadcast_counter
         metrics::Counter,    // candidate_precheck_conflicting_slot_drop_counter
         metrics::Counter,    // candidate_received_broadcast_counter
         metrics::Counter,    // candidate_received_query_counter
@@ -2319,8 +2321,8 @@ impl SessionProcessor {
             sink.register_counter(&"simplex_candidate_precheck_drop_old_slot".into());
         let candidate_precheck_future_slot_drop_counter =
             sink.register_counter(&"simplex_candidate_precheck_drop_future_slot".into());
-        let candidate_precheck_unexpected_sender_drop_counter =
-            sink.register_counter(&"simplex_candidate_precheck_drop_unexpected_sender".into());
+        let candidate_relayed_broadcast_counter =
+            sink.register_counter(&"simplex_candidate_relayed_broadcast".into());
         let candidate_precheck_conflicting_slot_drop_counter =
             sink.register_counter(&"simplex_candidate_precheck_drop_conflicting_slot".into());
         let candidate_received_broadcast_counter =
@@ -2375,7 +2377,7 @@ impl SessionProcessor {
             health_warnings_counter,
             candidate_precheck_old_slot_drop_counter,
             candidate_precheck_future_slot_drop_counter,
-            candidate_precheck_unexpected_sender_drop_counter,
+            candidate_relayed_broadcast_counter,
             candidate_precheck_conflicting_slot_drop_counter,
             candidate_received_broadcast_counter,
             candidate_received_query_counter,
@@ -7154,18 +7156,29 @@ impl SessionProcessor {
             return;
         }
 
+        // NOTE(TN-1414): A broadcast candidate (no attached notar cert) is authenticated
+        // by the slot leader's signature, which is verified against `leader_key` in
+        // `RawCandidate::from_tl(...)` below. The delivering peer (`sender_idx`) may be a
+        // relay / gossip hop rather than the leader itself. Dropping a relayed broadcast
+        // here strands any node that missed the leader's direct delivery: it can never
+        // notarize the slot, is forced to skip, and a single such node is enough to wedge
+        // finalization on a notarized slot (releasenet MC stall, TN-1414).
+        //
+        // C++ parity: overlay broadcasts carry the leader as their signed source (preserved
+        // across relays), and `consensus.cpp handle(CandidateReceived)` applies no
+        // sender==leader gate; the resolver also serves candidate bodies with no
+        // leader-source restriction. We therefore accept relayed broadcasts and let the
+        // leader-signature verification below authenticate the body.
         if is_broadcast_candidate && sender_idx != leader_idx {
-            self.candidate_precheck_unexpected_sender_drop_counter.increment(1);
-            log::warn!(
-                "Session {} on_candidate_received: REJECTED \
-                precheck_drop_reason=unexpected_sender \
-                slot={} leader={} sender={} origin=broadcast",
+            self.candidate_relayed_broadcast_counter.increment(1);
+            log::debug!(
+                "Session {} on_candidate_received: received relayed broadcast candidate \
+                slot={} leader={} sender={} (leader-signature verification pending below)",
                 &self.session_id().to_hex_string()[..8],
                 slot,
                 leader_idx,
                 sender_idx
             );
-            return;
         }
 
         // Broadcast path must reject stale slots eagerly to avoid stale-body/db churn.

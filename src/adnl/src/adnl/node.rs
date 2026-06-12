@@ -1662,6 +1662,7 @@ impl RecvPipeline {
     }
 
     async fn get(&self) -> Option<(PacketBuffer, Subchannel)> {
+        let mut expired_run: u32 = 0;
         'again: loop {
             let ret = if let Some((data, subchannel)) = self.urgent.get() {
                 if data.expired_at <= Version::get() as u32 {
@@ -1690,6 +1691,11 @@ impl RecvPipeline {
                             #[cfg(feature = "telemetry")]
                             self.adnl.telemetry.normal.proc_expired.update(1);
                             self.proc_normal_packets.fetch_sub(1, Ordering::Relaxed);
+                            // Yield periodically to avoid blocking on long expired runs
+                            expired_run += 1;
+                            if expired_run % 100 == 0 {
+                                tokio::task::yield_now().await;
+                            }
                             continue 'again;
                         } else {
                             break Some((data, subchannel));
@@ -2753,6 +2759,7 @@ impl AdnlNode {
                                     &subscribers,
                                     msg,
                                     &peers,
+                                    true,
                                     &AdnlSendMethodDetailed::FastNormal,
                                 )
                                 .await
@@ -3952,6 +3959,7 @@ impl AdnlNode {
         subscribers: &[Arc<dyn Subscriber>],
         mut msg: AdnlMessage,
         peers: &AdnlPeers,
+        has_channel: bool,
         method: &AdnlSendMethodDetailed,
     ) -> Result<()> {
         fn reply(
@@ -4145,6 +4153,12 @@ impl AdnlNode {
             _ => fail!("Unsupported ADNL message {:?}", msg),
         };
 
+        if !has_channel {
+            // Non-channeled packets involve heavy asymmetric crypto (X25519 + Ed25519)
+            // in both decryption and reply. Yield between match and reply to avoid
+            // blocking the worker thread for the entire ~1ms processing.
+            tokio::task::yield_now().await;
+        }
         reply(self, msg, peers, method)
     }
 
@@ -4179,6 +4193,10 @@ impl AdnlNode {
                 (method, channel.local_key.clone(), Some(channel), version)
             }
         };
+        if channel.is_none() {
+            // Non-channeled packets involve heavy crypto: yield to let other tasks run
+            tokio::task::yield_now().await;
+        }
         if let Some(version) = version {
             if version != AdnlNode::VERSION_INITIAL {
                 fail!("Unsupported ADNL version {}", version)
@@ -4197,6 +4215,10 @@ impl AdnlNode {
                 }
                 return Ok(());
             };
+        if channel.is_none() {
+            // Non-channeled packets involve heavy crypto: yield to let other tasks run
+            tokio::task::yield_now().await;
+        }
         #[cfg(feature = "dump")]
         if Self::need_dump(&pkt) {
             if let Some(dump) = self.dump.as_ref() {
@@ -4218,7 +4240,10 @@ impl AdnlNode {
             #[cfg(feature = "telemetry")]
             let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
             #[allow(clippy::let_and_return)]
-            let res = self.clone().process_message(subscribers, msg, &peers, &method).await;
+            let res = self
+                .clone()
+                .process_message(subscribers, msg, &peers, channel.is_some(), &method)
+                .await;
             #[cfg(feature = "telemetry")]
             self.telemetry.drop_check(chk);
             res
@@ -4227,7 +4252,10 @@ impl AdnlNode {
             for msg in msgs {
                 #[cfg(feature = "telemetry")]
                 let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
-                res = self.clone().process_message(subscribers, msg, &peers, &method).await;
+                res = self
+                    .clone()
+                    .process_message(subscribers, msg, &peers, channel.is_some(), &method)
+                    .await;
                 #[cfg(feature = "telemetry")]
                 self.telemetry.drop_check(chk);
                 if res.is_err() {
