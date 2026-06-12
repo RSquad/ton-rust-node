@@ -60,6 +60,7 @@ use crate::{
         ConflictReason, ConflictingVoteType, MisbehaviorProof, VoteDescriptor, VoteResult,
     },
     session_description::SessionDescription,
+    session_processor::{SlotDiagnostic, SlotWaitPhase, WindowDiagnostic},
     RawVoteData, ValidatorWeight,
 };
 use std::{
@@ -71,84 +72,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use ton_block::{error, fail, BlockIdExt, Result, UInt256};
-
-/// Lifecycle phase of a non-finalized slot for stall diagnosis.
-///
-/// Built by [`SimplexState::collect_window_diagnostics`] and consumed by
-/// `SessionProcessor`'s health-dump path. Co-located with its sole producer
-/// (`SimplexState`) so the `simplex_state` ↔ `session_processor` dependency
-/// stays one-way (`session_processor → simplex_state`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum SlotWaitPhase {
-    WaitingForCandidate,
-    WaitingForParentBase,
-    WaitingForNotarization,
-    NotarizedWaitingForFinalization,
-    Skipped,
-    Finalized,
-    TimeoutSkipped,
-}
-
-impl Display for SlotWaitPhase {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WaitingForCandidate => write!(f, "WaitingForCandidate"),
-            Self::WaitingForParentBase => write!(f, "WaitingForParentBase"),
-            Self::WaitingForNotarization => write!(f, "WaitingForNotarization"),
-            Self::NotarizedWaitingForFinalization => write!(f, "NotarizedWaitFinalization"),
-            Self::Skipped => write!(f, "Skipped"),
-            Self::Finalized => write!(f, "Finalized"),
-            Self::TimeoutSkipped => write!(f, "TimeoutSkipped"),
-        }
-    }
-}
-
-/// Per-slot diagnostic for non-finalized slots.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct SlotDiagnostic {
-    pub slot: SlotIndex,
-    pub window_idx: WindowIndex,
-    pub phase: SlotWaitPhase,
-    pub reason: String,
-    pub has_pending_block: bool,
-    pub available_parent: bool,
-    pub voted_notar: bool,
-    pub voted_skip: bool,
-    pub voted_final: bool,
-    pub has_notar_cert: bool,
-    pub has_final_cert: bool,
-    pub has_skip_cert: bool,
-    pub notar_weight_pct: f64,
-    pub final_weight_pct: f64,
-    pub skip_weight_pct: f64,
-    pub notar_or_skip_weight_pct: f64,
-    pub is_timeout_skipped: bool,
-}
-
-/// Window-level summary for dump grouping.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct WindowDiagnostic {
-    pub window_idx: WindowIndex,
-    pub slot_begin: SlotIndex,
-    pub slot_end: SlotIndex,
-    pub leader_idx: ValidatorIndex,
-    pub had_timeouts: bool,
-    pub slots: Vec<SlotDiagnostic>,
-}
-
-/// Defense-in-depth bound for the non-panicking fallback inside
-/// [`SimplexState::find_next_nonskipped_slot`].
-///
-/// The fallback uses `is_slot_skipped_cert`, which returns `false` for any slot
-/// outside the allocated FSM range, so it is naturally bounded by the live
-/// session window count. This cap is a hard upper bound to guarantee
-/// termination even if the slot lookup were ever changed to extend past
-/// allocated slots; under all realistic conditions the loop exits long before
-/// reaching this many iterations.
-const FIND_NEXT_NONSKIPPED_FALLBACK_LIMIT: u32 = 10_000;
 
 /*
     ============================================================================
@@ -1137,27 +1060,6 @@ pub(crate) struct SimplexState {
     /// Throttle counter for `ensure_window_exists` rejection warnings.
     /// Prevents log flooding when standstill re-broadcasts reference far-future windows.
     window_reject_count: u64,
-
-    /// Once-per-session latch for `find_next_nonskipped_slot` invariant violations.
-    ///
-    /// The skip-interval `BTreeSet` is supposed to always contain a
-    /// non-skipped boundary `>= next_slot` whenever `next_slot` is skipped
-    /// (mirrors C++ `pool.cpp::skip_intervals_`). If that invariant is ever
-    /// observed broken (e.g. due to a future regression in skip-interval
-    /// maintenance, or hostile/corrupt state), the function falls back to a
-    /// bounded linear scan and logs an error exactly once per session.
-    /// Linear AC: "Scan-limit fallback returns `None` ... and is logged once
-    /// per session.".
-    skipscan_invariant_warned: bool,
-
-    /// Startup recovery is replaying saved certificates before the session is live.
-    ///
-    /// C++ `pool.cpp::start_up()` stores bootstrap certificates while
-    /// `is_started_ == false`, so `advance_present()` is a no-op until the later
-    /// `Start` event runs it once. Rust recovery uses the same live certificate
-    /// handlers, so this flag preserves that startup ordering without relaxing
-    /// the live invariant checks.
-    startup_replay_active: bool,
 }
 
 impl SimplexState {
@@ -1233,8 +1135,6 @@ impl SimplexState {
             slots_per_leader_window: slots_per_window,
             max_leader_window_desync: desc.opts().max_leader_window_desync,
             window_reject_count: 0,
-            skipscan_invariant_warned: false,
-            startup_replay_active: false,
         };
 
         // Initialize first window with genesis (None) as available base
@@ -3876,71 +3776,6 @@ impl SimplexState {
         self.current_leader_window_idx
     }
 
-    /// Enter C++ startup certificate replay mode.
-    pub(crate) fn begin_startup_replay(&mut self) {
-        self.startup_replay_active = true;
-    }
-
-    /// Leave C++ startup replay mode and run the deferred `advance_present()`.
-    pub(crate) fn finish_startup_replay(&mut self, desc: &SessionDescription) {
-        if !self.startup_replay_active {
-            return;
-        }
-        self.startup_replay_active = false;
-        self.repair_progress_cursor_base_after_startup_replay(desc);
-        self.advance_leader_window_on_progress_cursor(desc);
-    }
-
-    /// Reconstruct the `available_base` for `now_` after persisted certificate replay.
-    ///
-    /// C++ keeps this value in memory while handling saved certificates. Rust rebuilds
-    /// the FSM from persisted certificates, so a restart can recover the progressed
-    /// cursor while the successor slot base was not re-propagated yet.
-    fn repair_progress_cursor_base_after_startup_replay(&mut self, desc: &SessionDescription) {
-        let progress_slot = self.first_non_progressed_slot;
-        if progress_slot.value() == 0 {
-            return;
-        }
-
-        let base_is_missing = self
-            .get_slot_ref(desc, progress_slot)
-            .map(|slot| slot.available_base.is_none())
-            .unwrap_or(true);
-        if !base_is_missing {
-            return;
-        }
-
-        let parent_slot = SlotIndex::new(progress_slot.value() - 1);
-        let Some(parent_info) = self.get_latest_notarized_candidate_up_to(parent_slot) else {
-            log::warn!(
-                "SimplexState: startup replay cannot repair progress cursor base for slot {}: \
-                no notarized/finalized parent <= {}",
-                progress_slot,
-                parent_slot
-            );
-            return;
-        };
-
-        if let Some(slot_state) =
-            self.get_slot_mut(desc, progress_slot, WindowAlloc::BoundedByHorizon)
-        {
-            slot_state.add_available_base_max(Some(parent_info.clone()));
-            log::info!(
-                "SimplexState: startup replay repaired progress cursor base for slot {} \
-                from notarized/finalized parent s{}:{}",
-                progress_slot,
-                parent_info.slot.value(),
-                &parent_info.hash.to_hex_string()[..8],
-            );
-        } else {
-            log::warn!(
-                "SimplexState: startup replay cannot repair progress cursor base: slot {} \
-                is outside the materialized horizon",
-                progress_slot
-            );
-        }
-    }
-
     /// Get tracked slots interval for standstill vote re-broadcast
     ///
     /// Returns `[begin, end)` range of slots that should be included in standstill.
@@ -4031,9 +3866,6 @@ impl SimplexState {
 
     /// Find the latest notarized candidate at or before `up_to_slot`.
     ///
-    /// Final certificates are included because finalization implies notarization, and
-    /// persisted recovery can restore a FinalCert without a separate NotarCert marker.
-    ///
     /// Used by restart recovery when the last finalized slot may be an empty candidate
     /// (which is not persisted on masterchain), but we still must restore the parent/base
     /// chain so new blocks are voteable.
@@ -4047,21 +3879,18 @@ impl SimplexState {
             if slot > up_to_slot {
                 continue;
             }
-            let parent_hash =
-                sv.finalize_certificate.as_ref().map(|cert| cert.vote.block_hash.clone()).or_else(
-                    || sv.notarize_certificate.as_ref().map(|cert| cert.vote.block_hash.clone()),
-                );
-            let Some(parent_hash) = parent_hash else {
+            let Some(cert) = sv.notarize_certificate.as_ref() else {
                 continue;
             };
 
             match &best {
                 None => {
-                    best = Some(CandidateParentInfo { slot, hash: parent_hash });
+                    best = Some(CandidateParentInfo { slot, hash: cert.vote.block_hash.clone() });
                 }
                 Some(current_best) => {
                     if slot > current_best.slot {
-                        best = Some(CandidateParentInfo { slot, hash: parent_hash });
+                        best =
+                            Some(CandidateParentInfo { slot, hash: cert.vote.block_hash.clone() });
                     }
                 }
             }
@@ -4810,34 +4639,17 @@ impl SimplexState {
         desc: &SessionDescription,
         parent_info: CandidateParentInfo,
     ) {
-        // C++ pool.cpp dereferences `next_nonskipped_slot_after(...)` directly.
-        // Rust returns `Option`: on `None` we degrade gracefully: log a warning,
-        // still advance the progress cursor and
-        // re-check pending blocks so that a later cert can repair forward
-        // progress, but skip base propagation for this notarization.
-        if let Some(next_slot) =
-            self.find_next_nonskipped_slot(desc, parent_info.slot, WindowAlloc::BoundedByHorizon)
+        let next_slot =
+            self.find_next_nonskipped_slot(desc, parent_info.slot, WindowAlloc::BoundedByHorizon);
+        if let Some(slot_state) = self.get_slot_mut(desc, next_slot, WindowAlloc::BoundedByHorizon)
         {
-            if let Some(slot_state) =
-                self.get_slot_mut(desc, next_slot, WindowAlloc::BoundedByHorizon)
-            {
-                log::trace!(
-                    "SimplexState: propagating base {}:{} -> slot {} \
-                     (after notarization, max-merge)",
-                    parent_info.slot,
-                    &parent_info.hash.to_hex_string()[..8],
-                    next_slot
-                );
-                slot_state.add_available_base_max(Some(parent_info));
-            }
-        } else {
-            log::warn!(
-                "SimplexState::propagate_base_after_notarization: no next non-skipped slot \
-                 found after notarized slot {} (skip_intervals_len={}); \
-                 skipping base propagation, awaiting later certificate to repair",
+            log::trace!(
+                "SimplexState: propagating base {}:{} -> slot {} (after notarization, max-merge)",
                 parent_info.slot,
-                self.skip_intervals.len()
+                &parent_info.hash.to_hex_string()[..8],
+                next_slot
             );
+            slot_state.add_available_base_max(Some(parent_info));
         }
 
         // Advance progress cursor through any progressed slots
@@ -4875,21 +4687,11 @@ impl SimplexState {
             return;
         }
 
-        let Some(next_slot) = self.find_next_nonskipped_slot(
+        let next_slot = self.find_next_nonskipped_slot(
             desc,
             parent_info.slot,
             WindowAlloc::VerifiedCertificate,
-        ) else {
-            log::warn!(
-                "SimplexState::apply_final_cert_parent_chain_for_verified_certificate: \
-                no next non-skipped slot found after finalized slot {} \
-                (skip_intervals_len={}); skipping base propagation",
-                parent_info.slot,
-                self.skip_intervals.len()
-            );
-            self.check_pending_blocks(desc);
-            return;
-        };
+        );
         if let Some(next_state) =
             self.get_slot_mut(desc, next_slot, WindowAlloc::VerifiedCertificate)
         {
@@ -4979,27 +4781,8 @@ impl SimplexState {
             );
         }
 
-        // C++ pool.cpp::handle_typed_saved_certificate(SkipCertRef) calls
-        // `next_nonskipped_slot_after(i)` and unconditionally erases `i` from
-        // `skip_intervals_`. Rust returns `Option`: if the
-        // invariant is violated, mirror C++'s erase, log + degrade gracefully
-        // without panicking and without overwriting downstream skip-interval
-        // boundaries with bogus values.
-        let Some(first_non_skipped_slot) =
-            self.find_next_nonskipped_slot(desc, slot, WindowAlloc::BoundedByHorizon)
-        else {
-            log::warn!(
-                "SimplexState::propagate_base_after_skip_cert: no next non-skipped slot \
-                 found after skipped slot {} (skip_intervals_len={}); \
-                 dropping stale boundary and deferring base propagation",
-                slot,
-                self.skip_intervals.len()
-            );
-            self.skip_intervals.remove(&slot);
-            self.advance_progress_cursor(desc);
-            self.check_pending_blocks(desc);
-            return;
-        };
+        let first_non_skipped_slot =
+            self.find_next_nonskipped_slot(desc, slot, WindowAlloc::BoundedByHorizon);
         self.update_skip_intervals_after_skip_cert(slot, first_non_skipped_slot);
 
         let Some(base) = self.get_slot_available_base(desc, slot) else {
@@ -5081,129 +4864,40 @@ impl SimplexState {
             .unwrap_or(false)
     }
 
-    /// Find the first non-skipped slot strictly after `slot`.
+    /// Find next non-skipped slot after a given slot.
     ///
-    /// Mirrors C++ `pool.cpp::next_nonskipped_slot_after()`:
+    /// Reference: C++ pool.cpp `next_nonskipped_slot_after()` uses
+    /// `skip_intervals_.lower_bound()`.
     ///
-    /// ```cpp
-    /// State::SlotRef next_nonskipped_slot_after(int slot) {
-    ///   auto next_slot = state_->slot_at(slot + 1);
-    ///   if (next_slot->state->is_skipped()) {
-    ///     next_slot = state_->slot_at(*skip_intervals_.lower_bound(slot + 1));
-    ///   }
-    ///   return *next_slot;
-    /// }
-    /// ```
-    ///
-    /// C++ is invariant-based and never checks for `end()` or for a still-skipped
-    /// boundary; if `skip_intervals_` is broken it crashes via undefined behaviour.
-    /// This Rust port keeps the C++ fast path but replaces the previous
-    /// `panic!` + `assert!` failure mode with a non-panicking fallback that
-    /// returns `None` and logs an error exactly once per session.
-    ///
-    /// `alloc` controls whether inspected slots are materialized:
+    /// `alloc` controls whether the inspected slots are materialized:
     /// - `WindowAlloc::BoundedByHorizon`: read-only walk over existing windows.
     /// - `WindowAlloc::VerifiedCertificate`: materialize on demand so a future
     ///   FinalCert can publish the successor base before moving the progress cursor.
-    ///
-    /// Returns:
-    /// - `Some(next_non_skipped)` on success (fast path or fallback).
-    /// - `None` if no non-skipped slot can be found within the FSM (callers
-    ///   must degrade gracefully and not panic).
     fn find_next_nonskipped_slot(
         &mut self,
         desc: &SessionDescription,
         slot: SlotIndex,
         alloc: WindowAlloc,
-    ) -> Option<SlotIndex> {
+    ) -> SlotIndex {
         let next_slot = slot + 1;
         if !self.is_slot_skipped_cert_at(desc, next_slot, alloc) {
-            return Some(next_slot);
+            return next_slot;
         }
 
-        // Fast path: C++ parity via `skip_intervals_.lower_bound(slot + 1)`.
-        let boundary = self.skip_intervals.range(next_slot..).next().copied();
-        if let Some(b) = boundary {
-            if !self.is_slot_skipped_cert_at(desc, b, alloc) {
-                return Some(b);
-            }
-            self.warn_skipscan_invariant_once(
-                "boundary still skipped",
-                slot,
-                next_slot,
-                Some(b),
-                alloc,
+        let Some(boundary) = self.skip_intervals.range(next_slot..).next().copied() else {
+            panic!(
+                "SimplexState::find_next_nonskipped_slot[{alloc:?}]: skip interval boundary \
+                 missing after slot {} (next_slot={}, first_non_finalized={}, first_non_progressed={})",
+                slot, next_slot, self.first_non_finalized_slot, self.first_non_progressed_slot
             );
-        } else {
-            self.warn_skipscan_invariant_once("boundary missing", slot, next_slot, None, alloc);
-        }
+        };
 
-        // Fallback: bounded linear scan under the same allocation policy.
-        self.fallback_scan_first_non_skipped(
-            desc,
-            next_slot,
-            alloc,
-            FIND_NEXT_NONSKIPPED_FALLBACK_LIMIT,
-        )
-    }
-
-    /// Bounded forward scan for the first non-skipped slot starting at `start`.
-    ///
-    /// Under `WindowAlloc::BoundedByHorizon`, `is_slot_skipped_cert` returns
-    /// `false` for any slot outside the allocated FSM range, so under all
-    /// realistic conditions this loop terminates at the FSM frontier well
-    /// before reaching `limit`. The cap is a defense-in-depth guarantee that
-    /// the function always returns in a bounded number of steps even if slot
-    /// lookup were ever changed to extend past allocated slots.
-    fn fallback_scan_first_non_skipped(
-        &mut self,
-        desc: &SessionDescription,
-        start: SlotIndex,
-        alloc: WindowAlloc,
-        limit: u32,
-    ) -> Option<SlotIndex> {
-        let mut s = start;
-        for _ in 0..limit {
-            if !self.is_slot_skipped_cert_at(desc, s, alloc) {
-                return Some(s);
-            }
-            s = s + 1;
-        }
-        None
-    }
-
-    /// Emit the `find_next_nonskipped_slot` invariant-violation error log
-    /// at most once per session.
-    ///
-    /// Linear AC: "Scan-limit fallback ... is logged once per
-    /// session". Repeating the log on every cert in a degenerate state would
-    /// flood logs without adding diagnostic value; the latch keeps the signal
-    /// loud once and quiet afterwards.
-    fn warn_skipscan_invariant_once(
-        &mut self,
-        reason: &str,
-        slot: SlotIndex,
-        next_slot: SlotIndex,
-        boundary: Option<SlotIndex>,
-        alloc: WindowAlloc,
-    ) {
-        if self.skipscan_invariant_warned {
-            return;
-        }
-        self.skipscan_invariant_warned = true;
-        log::error!(
-            "SimplexState::find_next_nonskipped_slot[{alloc:?}]: invariant violated ({}); \
-             falling back to bounded linear scan from slot {} \
-             (next_slot={}, boundary={:?}, first_non_finalized={}, \
-             first_non_progressed={}, skip_intervals_len={})",
-            reason,
-            slot,
-            next_slot,
-            boundary,
-            self.first_non_finalized_slot,
-            self.first_non_progressed_slot,
-            self.skip_intervals.len()
+        assert!(
+            !self.is_slot_skipped_cert_at(desc, boundary, alloc),
+            "SimplexState::find_next_nonskipped_slot[{alloc:?}]: skip interval boundary {} is still skipped",
+            boundary
         );
+        boundary
     }
 
     /// Policy-aware variant of `is_slot_skipped_cert`.
@@ -5274,17 +4968,6 @@ impl SimplexState {
             advancing leader window",
             self.first_non_progressed_slot,
         );
-
-        if self.startup_replay_active {
-            log::trace!(
-                "SimplexState: deferring leader window advancement during startup recovery \
-                (current={}, target={}, first_non_progressed_slot={})",
-                self.current_leader_window_idx,
-                now_window,
-                self.first_non_progressed_slot
-            );
-            return;
-        }
 
         // C++ parity: materialize the progress slot (state.slot_at(now_)) and read its base.
         let base = self.get_progress_cursor_base_or_panic(desc, now_window);

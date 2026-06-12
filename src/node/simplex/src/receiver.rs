@@ -88,7 +88,7 @@ use ton_api::{
             simplex::{
                 candidateandcert::CandidateAndCert, vote::Vote as TlVote,
                 CandidateAndCert as CandidateAndCertBoxed, Certificate, UnsignedVote,
-                Vote as TlVoteBoxed, VoteSignatureSet as VoteSignatureSetBoxed,
+                Vote as TlVoteBoxed,
             },
             CandidateData, CandidateParent, RequestError as ConsensusRequestError,
         },
@@ -2422,254 +2422,12 @@ impl ReceiverImpl {
         self.task_queues.clone()
     }
 
-    /// Recompute `(slot, candidate_hash)` for a `CandidateData` payload received
-    /// via `requestCandidate` and confirm it equals the requested
-    /// `(requested_slot, requested_hash)`.
-    ///
-    /// The hash is derived through the same `candidateHashDataOrdinary` /
-    /// `candidateHashDataEmpty` path used by the broadcast handler
-    /// (`process_block_broadcast`) and `send_block_broadcast_impl`, so a
-    /// well-formed response from any honest validator that observed the original
-    /// broadcast reproduces the requested identity bit-for-bit.
-    ///
-    /// On success returns the parsed `CandidateData` so the caller does not have
-    /// to deserialize it again when forwarding to the listener.
-    ///
-    /// Any oversize, malformed, or identity-mismatched response is rejected
-    /// here so it never reaches the listener nor the pending-request merge
-    /// state. Exposed as an associated function (not a method) so unit tests
-    /// can exercise it without a full `ReceiverImpl`.
-    fn validate_repair_candidate_identity(
-        session_id: &SessionId,
-        sources: &[SourceStats],
-        slots_per_leader_window: u32,
-        shard: &ShardIdent,
-        max_candidate_size: usize,
-        max_candidate_query_answer_size: u64,
-        proto_version: u32,
-        requested_slot: SlotIndex,
-        requested_hash: &UInt256,
-        candidate_bytes: &[u8],
-    ) -> std::result::Result<CandidateData, String> {
-        if candidate_bytes.len() as u64 > max_candidate_query_answer_size {
-            return Err(format!(
-                "candidate response size {} exceeds answer budget {}",
-                candidate_bytes.len(),
-                max_candidate_query_answer_size,
-            ));
-        }
-
-        let message =
-            deserialize_boxed(candidate_bytes).map_err(|e| format!("deserialize: {e}"))?;
-        let candidate: CandidateData = message
-            .downcast::<CandidateData>()
-            .map_err(|_| "unexpected TL type (expected consensus.CandidateData)".to_string())?;
-
-        let (parsed_slot, parsed_hash, signature): (SlotIndex, UInt256, &[u8]) = match &candidate {
-            CandidateData::Consensus_Block(block) => {
-                if block.candidate.is_empty() {
-                    return Err("consensus.block has empty candidate bytes; use consensus.empty"
-                        .to_string());
-                }
-                if block.candidate.len() > max_candidate_size {
-                    return Err(format!(
-                        "candidate body size {} exceeds max {}",
-                        block.candidate.len(),
-                        max_candidate_size,
-                    ));
-                }
-                let parent_info = match &block.parent {
-                    CandidateParent::Consensus_CandidateWithoutParents => None,
-                    CandidateParent::Consensus_CandidateParent(p) => {
-                        Some((*p.id.slot(), p.id.hash().clone()))
-                    }
-                };
-                let (block_id, collated_file_hash) =
-                    match crate::utils::extract_block_info_from_candidate(
-                        &block.candidate,
-                        shard,
-                        max_candidate_size,
-                        proto_version,
-                    ) {
-                        Ok(Some(info)) => (Some(info.block_id), Some(info.collated_file_hash)),
-                        Ok(None) => (None, None),
-                        Err(e) => return Err(format!("extract block info: {e}")),
-                    };
-                let slot_idx = SlotIndex::new(block.slot as u32);
-                let hash = crate::utils::compute_candidate_id_hash(
-                    slot_idx,
-                    block_id.as_ref(),
-                    collated_file_hash.as_ref(),
-                    parent_info.as_ref().map(|(s, h)| (SlotIndex::new(*s as u32), h)),
-                );
-                (slot_idx, hash, &block.signature)
-            }
-            CandidateData::Consensus_Empty(empty) => {
-                let parent_slot = SlotIndex::new(*empty.parent.slot() as u32);
-                let parent_hash = empty.parent.hash();
-                let hash = crate::utils::compute_candidate_id_hash_empty(
-                    &empty.block,
-                    (parent_slot, parent_hash),
-                );
-                (SlotIndex::new(empty.slot as u32), hash, &empty.signature)
-            }
-        };
-
-        if parsed_slot != requested_slot {
-            return Err(format!(
-                "slot mismatch: response={parsed_slot} requested={requested_slot}",
-            ));
-        }
-        if parsed_hash != *requested_hash {
-            return Err(format!(
-                "candidate hash mismatch: response={} requested={}",
-                parsed_hash.to_hex_string(),
-                requested_hash.to_hex_string(),
-            ));
-        }
-
-        if sources.is_empty() {
-            return Err("empty validator set".to_string());
-        }
-        if slots_per_leader_window == 0 {
-            return Err("slots_per_leader_window must be > 0".to_string());
-        }
-        let leader_window = requested_slot.value() / slots_per_leader_window;
-        let expected_leader_idx = leader_window % (sources.len() as u32);
-        let expected_leader_key = &sources[expected_leader_idx as usize].public_key;
-        if !crate::utils::check_candidate_signature(
-            session_id,
-            requested_slot,
-            requested_hash,
-            signature,
-            expected_leader_key,
-        ) {
-            return Err(format!(
-                "invalid candidate leader signature for leader {expected_leader_idx}"
-            ));
-        }
-        Ok(candidate)
-    }
-
-    /// Validate notar bytes received in a `requestCandidate` response against
-    /// the requested `(slot, block_hash)`.
-    ///
-    /// Mirrors the strict C++ policy implemented by
-    /// `crate::certificate::Certificate::from_tl_signatures` (which is also the
-    /// `SessionProcessor::process_received_notar_cert` acceptance gate):
-    /// - invalid validator indices are rejected;
-    /// - duplicate validator indices are rejected;
-    /// - signatures are verified against the session-scoped `dataToSign(session_id, vote)`
-    ///   bytes for the requested `NotarizeVote{slot, block_hash}`;
-    /// - aggregate weight must reach the 2/3 threshold.
-    ///
-    /// The validator set and weights are passed via `sources`, the same per-source
-    /// data used to construct the canonical `SessionDescription` for this
-    /// session, which keeps the check self-contained inside the receiver thread
-    /// without requiring a description handle to be plumbed in.
-    ///
-    /// Exposed as an associated function (not a method) so unit tests can
-    /// exercise it without a full `ReceiverImpl`.
-    ///
-    /// Notar bytes returned over `requestCandidate` are NOT trusted until this
-    /// verification succeeds, so we never seed the resolver cache or the
-    /// per-request pending state with them until they pass.
-    fn validate_repair_notar_signature_set(
-        session_id: &SessionId,
-        sources: &[SourceStats],
-        max_candidate_query_answer_size: u64,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-        notar_bytes: &[u8],
-    ) -> std::result::Result<(), String> {
-        use crate::{
-            certificate::{ToTlUnsignedVote, VoteSignature},
-            simplex_state::NotarizeVote,
-        };
-
-        if notar_bytes.len() as u64 > max_candidate_query_answer_size {
-            return Err(format!(
-                "notar response size {} exceeds answer budget {}",
-                notar_bytes.len(),
-                max_candidate_query_answer_size,
-            ));
-        }
-
-        let message = deserialize_boxed(notar_bytes)
-            .map_err(|e| format!("deserialize VoteSignatureSet: {e}"))?;
-        let tl_sigs: VoteSignatureSetBoxed =
-            message.downcast::<VoteSignatureSetBoxed>().map_err(|_| {
-                "unexpected TL type for notar bytes (expected VoteSignatureSet)".to_string()
-            })?;
-
-        let vote = NotarizeVote { slot, block_hash: block_hash.clone() };
-        let unsigned_vote =
-            vote.to_tl_unsigned().map_err(|e| format!("build UnsignedVote: {e}"))?;
-        let raw_vote_bytes = crate::utils::serialize_unsigned_vote(&unsigned_vote);
-        let signed = crate::utils::create_data_to_sign(session_id, &raw_vote_bytes);
-
-        // Fail-closed against a degenerate validator set: `threshold_66(0) == 0`
-        // would make the `voted_weight < threshold` quorum check below evaluate
-        // `0 < 0 == false`, accepting a notar response that carries no signatures.
-        // A real session always has a non-empty set with positive total weight,
-        // so reject these shapes outright to keep this signature gate sound.
-        let num_validators = sources.len();
-        if num_validators == 0 {
-            return Err("empty validator set".to_string());
-        }
-        let mut voted = vec![false; num_validators];
-        let mut total_weight: ValidatorWeight = 0;
-        let mut voted_weight: ValidatorWeight = 0;
-        for s in sources {
-            total_weight = total_weight.saturating_add(s.weight);
-        }
-        if total_weight == 0 {
-            return Err("zero total validator weight".to_string());
-        }
-        let threshold = crate::utils::threshold_66(total_weight);
-
-        for tl_sig in tl_sigs.votes().iter() {
-            let sig = VoteSignature::from_tl(tl_sig);
-            let idx = sig.validator_idx.value();
-            if idx as usize >= num_validators {
-                return Err(format!(
-                    "invalid validator index {idx} (num_validators={num_validators})",
-                ));
-            }
-            if voted[idx as usize] {
-                return Err(format!("duplicate validator index {idx}"));
-            }
-            voted[idx as usize] = true;
-            let src = &sources[idx as usize];
-            if src.public_key.verify(&signed, &sig.signature).is_err() {
-                return Err(format!("invalid signature for validator {idx}"));
-            }
-            voted_weight = voted_weight.saturating_add(src.weight);
-        }
-
-        if voted_weight < threshold {
-            return Err(format!("insufficient weight {voted_weight} < threshold {threshold}",));
-        }
-        Ok(())
-    }
-
     /// Merge partial `requestCandidate` response pieces with pending-request state.
     ///
     /// C++ parity:
-    /// - accumulate partial candidate/notar parts as they arrive in the
-    ///   per-request pending state, filling only still-missing fields;
+    /// - cache partial candidate/notar parts as they arrive;
     /// - merge with previously cached parts;
     /// - completion is checked by caller via non-empty merged candidate+notar.
-    ///
-    /// Bytes received in a `requestCandidate` response are NOT trusted
-    /// and MUST be validated by the caller before invoking this helper. As a
-    /// belt-and-braces measure, this function never writes into the shared
-    /// `resolver_cache`; only authenticated/trusted paths (broadcast handling
-    /// after signature+hash verification, startup recovery,
-    /// validated repair-response parts, and the `SessionProcessor`-driven
-    /// `cache_notarization_cert`) may seed that cache.
-    /// The `resolver_cache` is consulted read-only here as a fallback source for
-    /// previously trusted candidate/notar parts for the same `(slot, block_hash)`.
     fn merge_candidate_response_parts(
         resolver_cache: &mut CandidateResolverCache,
         pending_state: Option<&mut CandidateRequestState>,
@@ -2681,20 +2439,25 @@ impl ReceiverImpl {
         let candidate_vec = candidate_bytes.to_vec();
         let notar_vec = notar_bytes.to_vec();
 
+        if !candidate_vec.is_empty() {
+            resolver_cache.cache_candidate(slot, block_hash.clone(), candidate_vec.clone());
+        }
+        if !notar_vec.is_empty() {
+            resolver_cache.cache_notar_cert(slot, block_hash.clone(), notar_vec.clone());
+        }
+
         if let Some(state) = pending_state {
-            if state.cached_candidate.is_none() && !candidate_vec.is_empty() {
+            if !candidate_vec.is_empty() {
                 state.cached_candidate = Some(candidate_vec);
             }
-            if state.cached_notar.is_none() && !notar_vec.is_empty() {
-                state.cached_notar = Some(notar_vec);
+            if !notar_vec.is_empty() {
+                state.cached_notar = Some(notar_vec.clone());
             }
 
-            let merged_candidate = if let Some(cached_candidate) = state.cached_candidate.clone() {
-                cached_candidate
-            } else {
-                resolver_cache.get_candidate(slot, block_hash).cloned().unwrap_or_default()
-            };
-            let merged_notar = if let Some(cached_notar) = state.cached_notar.clone() {
+            let merged_candidate = state.cached_candidate.clone().unwrap_or_default();
+            let merged_notar = if !notar_vec.is_empty() {
+                notar_vec
+            } else if let Some(cached_notar) = state.cached_notar.clone() {
                 cached_notar
             } else {
                 resolver_cache.get_notar_cert(slot, block_hash).cloned().unwrap_or_default()
@@ -2702,17 +2465,12 @@ impl ReceiverImpl {
             return (merged_candidate, merged_notar);
         }
 
-        let merged_candidate = if !candidate_vec.is_empty() {
-            candidate_vec
-        } else {
-            resolver_cache.get_candidate(slot, block_hash).cloned().unwrap_or_default()
-        };
         let merged_notar = if !notar_vec.is_empty() {
             notar_vec
         } else {
             resolver_cache.get_notar_cert(slot, block_hash).cloned().unwrap_or_default()
         };
-        (merged_candidate, merged_notar)
+        (candidate_bytes.to_vec(), merged_notar)
     }
 
     /// Handle response from requestCandidate query
@@ -2814,152 +2572,74 @@ impl ReceiverImpl {
                                 attempt_id
                             );
 
-                            // Validate body identity and notar signatures BEFORE touching the
-                            // per-request merge state. Each part is handled independently: a
-                            // valid body is retained even if the companion notar bytes are
-                            // bad (and vice versa), matching C++'s partial CandidateAndCert
-                            // merge semantics while avoiding cache poisoning.
-                            let (cached_candidate_missing, cached_notar_missing) = self
-                                .pending_requests
-                                .get(&key)
-                                .map(|state| {
-                                    (state.cached_candidate.is_none(), state.cached_notar.is_none())
-                                })
-                                .unwrap_or((true, true));
-                            let trusted_candidate_missing =
-                                self.resolver_cache.get_candidate(slot, &block_hash).is_none();
-                            let trusted_notar_missing =
-                                self.resolver_cache.get_notar_cert(slot, &block_hash).is_none();
+                            let candidate_part_new = !candidate_bytes.is_empty()
+                                && self
+                                    .pending_requests
+                                    .get(&key)
+                                    .and_then(|state| state.cached_candidate.as_ref())
+                                    .map(|cached| cached.as_slice() != candidate_bytes)
+                                    .unwrap_or(true);
+                            let notar_part_new = !notar_bytes.is_empty()
+                                && self
+                                    .pending_requests
+                                    .get(&key)
+                                    .and_then(|state| state.cached_notar.as_ref())
+                                    .map(|cached| cached.as_slice() != notar_bytes)
+                                    .unwrap_or(true);
 
-                            let mut invalid_response_reason: Option<&'static str> = None;
-                            let mut candidate_for_merge: &[u8] = &[];
-                            let mut notar_for_merge: &[u8] = &[];
-
-                            let parsed_candidate = if !candidate_bytes.is_empty() {
-                                match Self::validate_repair_candidate_identity(
-                                    &self.session_id,
-                                    &self.sources,
-                                    self.slots_per_leader_window,
-                                    &self.shard,
-                                    self.max_candidate_size,
-                                    self.max_candidate_query_answer_size,
-                                    self.proto_version,
-                                    slot,
-                                    &block_hash,
-                                    candidate_bytes,
-                                ) {
-                                    Ok(parsed) => Some(parsed),
-                                    Err(reason) => {
-                                        log::warn!(
-                                            "SimplexReceiver {}: rejecting requestCandidate \
-                                            response body slot={slot} hash={} from validator {} \
-                                            (attempt={attempt_id}): {reason}",
-                                            self.session_id.to_hex_string(),
-                                            &block_hash.to_hex_string()[..8],
-                                            source_idx,
-                                        );
-                                        invalid_response_reason =
-                                            Some("invalid_candidate_identity");
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-                            if parsed_candidate.is_some() {
-                                candidate_for_merge = candidate_bytes;
-                            }
-
-                            if !notar_bytes.is_empty() {
-                                match Self::validate_repair_notar_signature_set(
-                                    &self.session_id,
-                                    &self.sources,
-                                    self.max_candidate_query_answer_size,
-                                    slot,
-                                    &block_hash,
-                                    notar_bytes,
-                                ) {
-                                    Ok(()) => {
-                                        notar_for_merge = notar_bytes;
-                                    }
-                                    Err(reason) => {
-                                        log::warn!(
-                                            "SimplexReceiver {}: rejecting requestCandidate response \
-                                            notar slot={slot} hash={} from validator {} \
-                                            (attempt={attempt_id}): {reason}",
-                                            self.session_id.to_hex_string(),
-                                            &block_hash.to_hex_string()[..8],
-                                            source_idx,
-                                        );
-                                        if invalid_response_reason.is_none() {
-                                            invalid_response_reason =
-                                                Some("invalid_notar_signatures");
-                                        }
-                                    }
-                                }
-                            }
-
-                            let candidate_part_new = !candidate_for_merge.is_empty()
-                                && cached_candidate_missing
-                                && trusted_candidate_missing;
-                            let notar_part_new = !notar_for_merge.is_empty()
-                                && cached_notar_missing
-                                && trusted_notar_missing;
-
-                            // C++ CandidateResolver stores validated repair-learned pieces in
-                            // shared per-candidate state and serves future requestCandidate
-                            // queries from that state. Rust's equivalent shared serving state is
-                            // `resolver_cache`, so promote only successfully validated missing
-                            // parts here. Invalid or unexpected bytes never reach the cache.
-                            if !candidate_for_merge.is_empty() && trusted_candidate_missing {
-                                self.resolver_cache.cache_candidate(
-                                    slot,
-                                    block_hash.clone(),
-                                    candidate_for_merge.to_vec(),
-                                );
-                            }
-                            if !notar_for_merge.is_empty() && trusted_notar_missing {
-                                self.resolver_cache.cache_notar_cert(
-                                    slot,
-                                    block_hash.clone(),
-                                    notar_for_merge.to_vec(),
-                                );
-                            }
-
-                            // C++ CandidateAndCert::merge parity: fill missing partial fields
-                            // only. The merge helper itself does not mutate `resolver_cache`;
-                            // cache promotion is limited to the validated parts above.
+                            // C++ CandidateAndCert::merge parity: cache both partial fields.
                             let (merged_candidate_bytes, merged_notar) =
                                 Self::merge_candidate_response_parts(
                                     &mut self.resolver_cache,
                                     self.pending_requests.get_mut(&key),
                                     slot,
                                     &block_hash,
-                                    candidate_for_merge,
-                                    notar_for_merge,
+                                    candidate_bytes,
+                                    notar_bytes,
                                 );
 
                             // Forward newly observed parts immediately. SessionProcessor can merge
-                            // body/notar callbacks in any order. We reuse the candidate parsed
-                            // during pre-validation to avoid double TL decoding.
+                            // body/notar callbacks in any order.
                             if candidate_part_new {
-                                let candidate = match parsed_candidate.clone() {
-                                    Some(c) => c,
-                                    None => {
-                                        log::warn!(
-                                            "SimplexReceiver {}: internal: candidate_part_new but \
-                                            no pre-validated candidate for slot={slot} hash={}",
-                                            self.session_id.to_hex_string(),
-                                            &block_hash.to_hex_string()[..8]
-                                        );
+                                let candidate = match deserialize_boxed(candidate_bytes) {
+                                    Ok(msg) => match msg.downcast::<CandidateData>() {
+                                        Ok(c) => c,
+                                        Err(_) => {
+                                            self.resolver_cache.remove_candidate(slot, &block_hash);
+                                            if let Some(state) = self.pending_requests.get_mut(&key)
+                                            {
+                                                state.cached_candidate = None;
+                                            }
+                                            log::warn!(
+                                                "SimplexReceiver {}: unexpected candidate type in \
+                                                partial response",
+                                                self.session_id.to_hex_string()
+                                            );
+                                            self.retry_candidate_request(
+                                                slot,
+                                                block_hash,
+                                                false,
+                                                "bad_candidate_type_partial",
+                                            );
+                                            return;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        self.resolver_cache.remove_candidate(slot, &block_hash);
                                         if let Some(state) = self.pending_requests.get_mut(&key) {
                                             state.cached_candidate = None;
                                         }
+                                        log::warn!(
+                                            "SimplexReceiver {}: failed to deserialize candidate \
+                                            from partial response: {}",
+                                            self.session_id.to_hex_string(),
+                                            e
+                                        );
                                         self.retry_candidate_request(
                                             slot,
                                             block_hash,
                                             false,
-                                            "missing_prevalidated_candidate",
+                                            "candidate_deserialize_error_partial",
                                         );
                                         return;
                                     }
@@ -2967,7 +2647,7 @@ impl ReceiverImpl {
 
                                 if let Some(listener) = self.listener.upgrade() {
                                     let notar_for_candidate = if notar_part_new {
-                                        Some(notar_for_merge.to_vec())
+                                        Some(notar_bytes.to_vec())
                                     } else {
                                         None
                                     };
@@ -2983,15 +2663,8 @@ impl ReceiverImpl {
                                         source_idx,
                                         slot,
                                         block_hash.clone(),
-                                        notar_for_merge.to_vec(),
+                                        notar_bytes.to_vec(),
                                     );
-                                }
-                            }
-
-                            if let Some(reason) = invalid_response_reason {
-                                if merged_candidate_bytes.is_empty() || merged_notar.is_empty() {
-                                    self.retry_candidate_request(slot, block_hash, false, reason);
-                                    return;
                                 }
                             }
 
@@ -3002,7 +2675,7 @@ impl ReceiverImpl {
                                     self.session_id.to_hex_string(),
                                     slot,
                                     &block_hash.to_hex_string()[..8],
-                                    notar_for_merge.len(),
+                                    notar_bytes.len(),
                                 );
                                 self.retry_candidate_request(
                                     slot,

@@ -3236,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.9.0"
+version = "0.8.3"
 dependencies = [
  "adnl",
  "ahash",
@@ -5034,7 +5034,7 @@ dependencies = [
 
 [[package]]
 name = "simplex"
-version = "0.7.1"
+version = "0.7.0"
 dependencies = [
  "adnl",
  "anyhow",

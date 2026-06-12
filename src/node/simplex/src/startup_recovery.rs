@@ -39,10 +39,9 @@
 
 use crate::{
     block::{RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
-    certificate::{Certificate as SimplexCertificate, FinalCertPtr, SkipCertPtr},
     database::{
-        Bootstrap, CandidateInfoRecord, FinalCertRecord, FinalizedBlockRecord, NotarCertRecord,
-        PoolStateRecord, SkipCertRecord, VoteRecord,
+        Bootstrap, CandidateInfoRecord, FinalizedBlockRecord, NotarCertRecord, PoolStateRecord,
+        VoteRecord,
     },
     misbehavior::VoteResult,
     session_description::SessionDescription,
@@ -55,12 +54,10 @@ use std::{
     sync::Arc,
 };
 use ton_api::{
-    deserialize_boxed, deserialize_typed, serialize_boxed,
+    deserialize_boxed, serialize_boxed,
     ton::consensus::{
-        candidatedata::Empty as CandidateDataEmpty,
-        candidateid::CandidateId,
-        simplex::{Certificate as CertificateBoxed, Vote as TlVoteBoxed},
-        CandidateData, CandidateHashData,
+        candidatedata::Empty as CandidateDataEmpty, candidateid::CandidateId,
+        simplex::Vote as TlVoteBoxed, CandidateData, CandidateHashData,
     },
     IntoBoxed,
 };
@@ -101,13 +98,6 @@ pub(crate) trait SessionStartupRecoveryListener {
     // ========================================================================
     // Bootstrap state restoration
     // ========================================================================
-
-    /// Enter startup replay mode.
-    ///
-    /// Mirrors C++ `pool.cpp::start_up()`: saved certificates and votes are
-    /// applied before the `Start` event, so `advance_present()` must not publish
-    /// leader-window advancement until startup is complete.
-    fn recovery_begin_startup_replay(&mut self);
 
     /// Set the first non-finalized slot boundary.
     ///
@@ -288,23 +278,6 @@ pub(crate) trait SessionStartupRecoveryListener {
         candidate_hash: CandidateHash,
         certificate: crate::certificate::NotarCertPtr,
     );
-
-    /// Seed a restored finalization certificate into `SimplexState`.
-    ///
-    /// C++ Pool replays saved `FinalCert` records during `start_up()` and advances
-    /// the finalized boundary before restart skip votes can be generated.
-    fn recovery_seed_finalize_certificate(
-        &mut self,
-        slot: SlotIndex,
-        candidate_hash: CandidateHash,
-        certificate: FinalCertPtr,
-    );
-
-    /// Seed a restored skip certificate into `SimplexState`.
-    ///
-    /// C++ Pool replays saved `SkipCert` records during `start_up()`, which advances
-    /// the present/progress cursor over skipped slots before live ingress resumes.
-    fn recovery_seed_skip_certificate(&mut self, slot: SlotIndex, certificate: SkipCertPtr);
 
     /// Rebuild Receiver standstill caches on restart (no network send).
     ///
@@ -487,8 +460,6 @@ impl SessionStartupRecoveryProcessor {
             self.session_id.to_hex_string()
         );
 
-        listener.recovery_begin_startup_replay();
-
         // Split bootstrap into session, receiver, and candidate payload parts
         let (session_boot, receiver_boot, candidate_payloads) = bootstrap.split();
 
@@ -509,34 +480,6 @@ impl SessionStartupRecoveryProcessor {
             session_boot.finalized_blocks.len()
         );
         self.apply_finalized_boundary(listener, &session_boot.finalized_blocks)?;
-
-        // Step 2b: Replay persisted FinalCert records before restart skip generation.
-        //
-        // C++ Pool replays saved certificates during startup and FinalCert replay advances
-        // `first_nonfinalized_slot_`. Rust must do the same before it looks at the saved
-        // `first_nonannounced_window`, otherwise a filtered/truncated finalized-block table
-        // can make recovery emit skip votes for slots that already have FinalCerts.
-        log::debug!(
-            target: LOG_TARGET,
-            "Session {}: step 2b/12 - restoring {} final certificates",
-            self.session_id.to_hex_string(),
-            receiver_boot.final_certs.len()
-        );
-        self.restore_final_cert_state(listener, &receiver_boot.final_certs)?;
-
-        // Step 2c: Replay persisted SkipCert records before restart skip generation.
-        //
-        // C++ Pool replays saved certificates during startup and SkipCert replay advances
-        // the present/progress cursor over skipped slots. Rust must restore that cursor
-        // before accepting live ingress; otherwise a restarted validator may reject rescue
-        // candidates as too_far_ahead even though the skipped-slot progress is in DB.
-        log::debug!(
-            target: LOG_TARGET,
-            "Session {}: step 2c/12 - restoring {} skip certificates",
-            self.session_id.to_hex_string(),
-            receiver_boot.skip_certs.len()
-        );
-        self.restore_skip_cert_state(listener, &receiver_boot.skip_certs)?;
 
         // Step 3: Apply local vote flags (prevents double-voting)
         log::debug!(
@@ -672,184 +615,6 @@ impl SessionStartupRecoveryProcessor {
             target: LOG_TARGET,
             "Session {}: bootstrap recovery complete",
             self.session_id.to_hex_string()
-        );
-
-        Ok(())
-    }
-
-    /// Restore skip certificates into SimplexState before restart skips.
-    fn restore_skip_cert_state(
-        &self,
-        listener: &mut dyn SessionStartupRecoveryListener,
-        skip_certs: &[SkipCertRecord],
-    ) -> Result<()> {
-        let mut parsed_count = 0u32;
-        let mut skipped_count = 0u32;
-
-        for cert in skip_certs {
-            let tl_cert: CertificateBoxed = match deserialize_typed(cert.cert_bytes.as_slice()) {
-                Ok(tl_cert) => tl_cert,
-                Err(e) => {
-                    skipped_count += 1;
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "Session {}: failed to deserialize skip cert for slot={}: {}",
-                        self.session_id.to_hex_string(),
-                        cert.slot.value(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let parsed = match SimplexCertificate::<Vote>::from_tl(
-                &tl_cert,
-                self._description.as_ref(),
-                &self.session_id,
-            ) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    skipped_count += 1;
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "Session {}: failed to verify skip cert for slot={}: {}",
-                        self.session_id.to_hex_string(),
-                        cert.slot.value(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let Vote::Skip(skip_vote) = parsed.vote else {
-                skipped_count += 1;
-                log::warn!(
-                    target: LOG_TARGET,
-                    "Session {}: persisted skip cert record decoded as non-skip vote for key=s{}",
-                    self.session_id.to_hex_string(),
-                    cert.slot.value(),
-                );
-                continue;
-            };
-
-            if skip_vote.slot != cert.slot {
-                skipped_count += 1;
-                log::warn!(
-                    target: LOG_TARGET,
-                    "Session {}: persisted skip cert slot mismatch key=s{} vote=s{}",
-                    self.session_id.to_hex_string(),
-                    cert.slot.value(),
-                    skip_vote.slot.value(),
-                );
-                continue;
-            }
-
-            listener.recovery_seed_skip_certificate(
-                skip_vote.slot,
-                Arc::new(SimplexCertificate { vote: skip_vote, signatures: parsed.signatures }),
-            );
-            parsed_count += 1;
-        }
-
-        log::info!(
-            target: LOG_TARGET,
-            "Session {}: restored {} skip certs to simplex_state, {} skipped",
-            self.session_id.to_hex_string(),
-            parsed_count,
-            skipped_count,
-        );
-
-        Ok(())
-    }
-
-    /// Restore full finalization certificates into SimplexState before restart skips.
-    fn restore_final_cert_state(
-        &self,
-        listener: &mut dyn SessionStartupRecoveryListener,
-        final_certs: &[FinalCertRecord],
-    ) -> Result<()> {
-        let mut parsed_count = 0u32;
-        let mut skipped_count = 0u32;
-
-        for cert in final_certs {
-            let tl_cert: CertificateBoxed = match deserialize_typed(cert.cert_bytes.as_slice()) {
-                Ok(tl_cert) => tl_cert,
-                Err(e) => {
-                    skipped_count += 1;
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "Session {}: failed to deserialize final cert for slot={} hash={}: {}",
-                        self.session_id.to_hex_string(),
-                        cert.candidate_id.slot.value(),
-                        &cert.candidate_id.hash.to_hex_string()[..8],
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let parsed = match SimplexCertificate::<Vote>::from_tl(
-                &tl_cert,
-                self._description.as_ref(),
-                &self.session_id,
-            ) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    skipped_count += 1;
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "Session {}: failed to verify final cert for slot={} hash={}: {}",
-                        self.session_id.to_hex_string(),
-                        cert.candidate_id.slot.value(),
-                        &cert.candidate_id.hash.to_hex_string()[..8],
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let Vote::Finalize(final_vote) = parsed.vote else {
-                skipped_count += 1;
-                log::warn!(
-                    target: LOG_TARGET,
-                    "Session {}: persisted final cert record decoded as non-finalize vote \
-                    for key=s{}:{}",
-                    self.session_id.to_hex_string(),
-                    cert.candidate_id.slot.value(),
-                    &cert.candidate_id.hash.to_hex_string()[..8],
-                );
-                continue;
-            };
-
-            if final_vote.slot != cert.candidate_id.slot
-                || final_vote.block_hash != cert.candidate_id.hash
-            {
-                skipped_count += 1;
-                log::warn!(
-                    target: LOG_TARGET,
-                    "Session {}: final cert key mismatch: key=s{}:{} cert=s{}:{}",
-                    self.session_id.to_hex_string(),
-                    cert.candidate_id.slot.value(),
-                    &cert.candidate_id.hash.to_hex_string()[..8],
-                    final_vote.slot.value(),
-                    &final_vote.block_hash.to_hex_string()[..8],
-                );
-                continue;
-            }
-
-            let slot = final_vote.slot;
-            let block_hash = final_vote.block_hash.clone();
-            let final_cert = Arc::new(SimplexCertificate::new(final_vote, parsed.signatures));
-            listener.recovery_seed_finalize_certificate(slot, block_hash, final_cert);
-            parsed_count += 1;
-        }
-
-        log::info!(
-            target: LOG_TARGET,
-            "Session {}: restored {} final certs to simplex_state ({} skipped)",
-            self.session_id.to_hex_string(),
-            parsed_count,
-            skipped_count
         );
 
         Ok(())

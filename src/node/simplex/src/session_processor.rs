@@ -92,10 +92,11 @@ use crate::{
 };
 use consensus_common::{
     check_execution_time, instrument, profiling::ResultStatusCounter, CandidateObservedFlags,
-    EnsureCandidateAvailabilityOptions, StorageAsyncResultPtr, StorageResultAlreadyTaken,
+    EnsureCandidateAvailabilityOptions, StorageAsyncResultPtr,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    fmt::{Display, Formatter},
     mem::discriminant,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -176,44 +177,6 @@ const RESOLVER_AVAILABILITY_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// `BlockIdExt` to `RawCandidateId` for the resolver.
 const RESOLVER_AVAILABILITY_MAX_RETRIES: u32 = 6;
 
-/// Polling cadence for the SXMAIN pending-async-DB-results registry.
-///
-/// When a registered async DB op is not yet ready, `process_pending_async_db_results()`
-/// schedules the next `check_all()` wake at `now + ASYNC_DB_POLL_DELAY` so SXMAIN can
-/// re-poll without blocking. This mirrors the `delayed_actions` cadence pattern.
-const ASYNC_DB_POLL_DELAY: Duration = Duration::from_millis(5);
-
-/// Default deadline for write-durability continuations registered through
-/// `post_async_db_result()`. Long enough to absorb routine RocksDB latency
-/// spikes without false-flagging a stuck write, short enough to surface a
-/// genuinely hung writer well before the next finalization stalls.
-const DEFAULT_ASYNC_DB_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum wall-clock time `SessionProcessor::stop()` waits for the SXMAIN
-/// `pending_async_db_results` registry to drain before forcing teardown.
-///
-/// C++ parity: `bridge.cpp::destroy_inner()` publishes `StopRequested` and then
-/// `co_await`s `bus_->db->close()`, which forces the db actor to drain its
-/// queued `co_await db->set(...)` tasks before the bus is dropped. Mirroring
-/// that here lets continuations registered via `post_async_db_result()` run
-/// (with Ok or Err) on SXMAIN before the session is dropped, instead of being
-/// silently abandoned together with the registry.
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Polling interval used by `drain_pending_async_db_results_for_shutdown()`
-/// while waiting for the storage thread to flush in-flight writes.
-const SHUTDOWN_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-/// Maximum wall-clock time `SessionProcessor::stop()` blocks waiting for
-/// `SimplexDb::sync()` (the underlying `AsyncKeyValueStorage::sync()`).
-///
-/// `SimplexDb::drop()` also calls `sync()` as a safety net (with the storage
-/// layer's `DEFAULT_SYNC_TIMEOUT = 5s`); the longer deadline here is
-/// intentional, because we want a stuck writer to surface at the
-/// SessionProcessor layer (with explicit logging + error counter increment)
-/// instead of being absorbed by the implicit Drop sync.
-const SHUTDOWN_DB_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// SessionProcessor always enforces C++ `WaitForParent` readiness before dispatching validation.
 ///
 /// Masterchain stale-parent protection remains validator-side, matching the C++ split where
@@ -277,6 +240,68 @@ struct HealthFinding {
     kind: HealthFindingKind,
     severity: log::Level,
     summary: String,
+}
+
+/// Lifecycle phase of a non-finalized slot for stall diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SlotWaitPhase {
+    WaitingForCandidate,
+    WaitingForParentBase,
+    WaitingForNotarization,
+    NotarizedWaitingForFinalization,
+    Skipped,
+    Finalized,
+    TimeoutSkipped,
+}
+
+impl Display for SlotWaitPhase {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WaitingForCandidate => write!(f, "WaitingForCandidate"),
+            Self::WaitingForParentBase => write!(f, "WaitingForParentBase"),
+            Self::WaitingForNotarization => write!(f, "WaitingForNotarization"),
+            Self::NotarizedWaitingForFinalization => write!(f, "NotarizedWaitFinalization"),
+            Self::Skipped => write!(f, "Skipped"),
+            Self::Finalized => write!(f, "Finalized"),
+            Self::TimeoutSkipped => write!(f, "TimeoutSkipped"),
+        }
+    }
+}
+
+/// Per-slot diagnostic for non-finalized slots.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct SlotDiagnostic {
+    pub slot: SlotIndex,
+    pub window_idx: WindowIndex,
+    pub phase: SlotWaitPhase,
+    pub reason: String,
+    pub has_pending_block: bool,
+    pub available_parent: bool,
+    pub voted_notar: bool,
+    pub voted_skip: bool,
+    pub voted_final: bool,
+    pub has_notar_cert: bool,
+    pub has_final_cert: bool,
+    pub has_skip_cert: bool,
+    pub notar_weight_pct: f64,
+    pub final_weight_pct: f64,
+    pub skip_weight_pct: f64,
+    pub notar_or_skip_weight_pct: f64,
+    pub is_timeout_skipped: bool,
+}
+
+/// Window-level summary for dump grouping.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct WindowDiagnostic {
+    pub window_idx: WindowIndex,
+    pub slot_begin: SlotIndex,
+    pub slot_end: SlotIndex,
+    pub leader_idx: ValidatorIndex,
+    pub had_timeouts: bool,
+    pub slots: Vec<SlotDiagnostic>,
 }
 
 /// Candidate funnel totals for validation inventory.
@@ -574,53 +599,6 @@ struct DelayedAction {
     handler: TaskPtr,
 }
 
-/*
-    Pending async DB results
-
-    SessionProcessor's central registry for `*_async()` DB operations whose
-    completion must be observed on `SXMAIN` without blocking it on `wait()`.
-
-    Mirrors the `DelayedAction` shape: each entry holds an in-flight async
-    result and a one-shot continuation invoked on completion (or timeout).
-    Drained from `check_all()` next to `process_delayed_actions()`.
-*/
-
-/// Monotonic identifier returned when registering a pending async DB result.
-///
-/// Returned for traceability/diagnostics. Callers may keep the id to dedup
-/// re-entrant register calls (e.g. cert handlers re-fired with the same key).
-pub(crate) type PendingAsyncDbId = u64;
-
-/// Continuation invoked exactly once on result completion (or timeout).
-///
-/// Runs on `SXMAIN` from `process_pending_async_db_results()`.
-type PendingAsyncDbCallback = Box<dyn FnOnce(&mut SessionProcessor, Result<()>) + Send>;
-
-/// Entry in `SessionProcessor::pending_async_db_results`.
-///
-/// Mirrors `DelayedAction` shape: a polled cell + a one-shot continuation.
-struct PendingAsyncDbEntry {
-    /// Monotonic id (assigned by `post_async_db_result()`).
-    id: PendingAsyncDbId,
-    /// Static label for logging, metrics, and timeout error messages
-    /// (e.g. `"persist_our_vote_before_broadcast"`). MUST be `'static` so it can
-    /// safely be embedded in error strings without extra allocation.
-    op_label: &'static str,
-    /// In-flight async DB result. We poll it via `try_get()` from `SXMAIN`.
-    result: StorageAsyncResultPtr<()>,
-    /// Time at which this entry was registered (used for completion-latency metrics).
-    registered_at: SystemTime,
-    /// Session-time deadline. If `now >= deadline` and `try_get()` is still
-    /// pending, the continuation is invoked with `Err(...)` and the entry is
-    /// removed. Both `registered_at` and `deadline` are read from `self.now()`,
-    /// which routes through [`SessionDescription::get_time()`] — i.e. session
-    /// time, which can be manually overridden by deterministic tests (see the
-    /// "Clock model" docs on `Self::now`). It is NOT raw wall-clock time.
-    deadline: SystemTime,
-    /// One-shot continuation invoked on completion (Ok / Err) or timeout (Err).
-    on_ready: PendingAsyncDbCallback,
-}
-
 /// Validated block candidate for finalization
 ///
 /// Contains validated candidate data stored after successful validation.
@@ -870,16 +848,6 @@ pub(crate) struct SessionProcessor {
     last_activity: Vec<Option<SystemTime>>,
     /// List of delayed actions to execute in the future
     delayed_actions: Vec<DelayedAction>,
-    /// Pending async DB result registry, drained from `check_all()` next to
-    /// `process_delayed_actions()`.
-    ///
-    /// Each entry is polled via `try_get()`; if not ready and not timed out,
-    /// `set_next_awake_time(now + ASYNC_DB_POLL_DELAY)` is scheduled and the
-    /// entry stays in the queue. On completion (or timeout), the registered
-    /// `on_ready` continuation runs once on `SXMAIN`.
-    pending_async_db_results: Vec<PendingAsyncDbEntry>,
-    /// Monotonic counter for `PendingAsyncDbId` allocation.
-    next_pending_async_db_id: PendingAsyncDbId,
     /// SimplexState FSM - core consensus state machine
     simplex_state: SimplexState,
     /// Slots for which "missing body" has already been logged (throttle).
@@ -1023,12 +991,6 @@ pub(crate) struct SessionProcessor {
     errors_counter: metrics::Counter,
     /// Gauge for finalized blocks still waiting for candidate body arrival
     finalized_pending_body_gauge: metrics::Gauge,
-    /// Gauge for the size of `pending_async_db_results` after each `check_all()`.
-    async_db_pending_count_gauge: metrics::Gauge,
-    /// Counter for `PendingAsyncDbEntry` deadlines hit before the result became ready.
-    async_db_timeout_counter: metrics::Counter,
-    /// Histogram of registration → completion latency for async DB results (ms).
-    async_db_completion_latency_histogram: metrics::Histogram,
 
     /*
         Error tracking
@@ -1291,67 +1253,15 @@ pub(crate) struct SessionProcessor {
     last_receiver_snapshot: Option<crate::receiver::ReceiverActivitySnapshot>,
 }
 
-/// Returns `true` iff `err` is the typed
-/// [`consensus_common::StorageResultAlreadyTaken`] sentinel emitted by
-/// `StorageAsyncResultImpl::{try_get, wait_timeout}` after the inner
-/// `Result` was consumed by a prior caller (`AsyncResultState::Taken`).
-///
-/// Handler callbacks that may be invoked more than once for the same
-/// `StorageAsyncResultPtr` (typically because `SessionProcessor` holds a dedup
-/// map keyed by slot / candidate-id — `notar_cert_store_results`,
-/// `skip_cert_store_results`, `final_cert_store_results`,
-/// `candidate_info_store_results`) must treat the sentinel as `Ok(())` and
-/// skip their side-effects: the very first callback already observed the real
-/// storage outcome and executed the cache + broadcast + standstill updates.
-/// Bumping `session_errors_count` on the redundant wake would double-count the
-/// benign dedup-hit as a real failure.
-///
-/// Implementation note: detection is via `anyhow::Error::downcast_ref` — no
-/// string allocation, no false positives on unrelated errors that happen to
-/// mention "result already taken".
-///
-/// See `handle_notarization_reached` / `handle_skip_certificate_reached` /
-/// `handle_finalization_reached` callbacks, and
-/// `SessionProcessor::classify_durability_wait_outcome` (candidate-info /
-/// notar-cert durability waits).
-fn is_storage_result_already_taken(err: &Error) -> bool {
-    err.downcast_ref::<StorageResultAlreadyTaken>().is_some()
-}
-
 impl SessionProcessor {
     /// Current session time (real-time or manually overridden for tests/log replay).
     ///
     /// IMPORTANT: SessionProcessor must not call `SystemTime::now()` directly.
     /// All time access goes through `SessionDescription::get_time()` so tests can
-    /// deterministically control time. The single deliberate exception is
-    /// [`Self::wall_now`] — see that method for the rationale and
-    /// allowed call sites.
+    /// deterministically control time.
     #[inline]
     fn now(&self) -> SystemTime {
         self.description.get_time()
-    }
-
-    /// Wall-clock `SystemTime::now()` — the **deliberate** exception to the
-    /// "no direct `SystemTime::now()`" rule documented on [`Self::now`].
-    ///
-    /// Use ONLY for:
-    /// 1. Shutdown drain deadlines / sync timing in [`Self::stop`] and
-    ///    [`Self::drain_pending_async_db_results_for_shutdown`]. These must
-    ///    advance even when tests freeze the manual session clock; otherwise
-    ///    a stuck writer combined with a frozen clock would park shutdown
-    ///    forever and never trip the bounded deadline.
-    /// 2. Future shutdown / teardown timing helpers.
-    ///
-    /// Do NOT use anywhere else. Anything FSM- or protocol-visible (timeouts,
-    /// scheduling, validation deadlines, log timestamps that may drive replay)
-    /// must keep going through `now()` so manual-clock tests stay
-    /// deterministic.
-    ///
-    /// Centralising the call here also makes it greppable / lintable in the
-    /// future if we want to enforce the rule mechanically.
-    #[inline]
-    fn wall_now(&self) -> SystemTime {
-        SystemTime::now()
     }
 
     /// Override session time (used for tests / log replay).
@@ -1949,13 +1859,6 @@ impl SessionProcessor {
 
         let finalized_pending_body_gauge =
             metrics_receiver.sink().register_gauge(&"simplex_finalized_pending_body_count".into());
-        let async_db_pending_count_gauge =
-            metrics_receiver.sink().register_gauge(&"simplex_async_db_pending_count".into());
-        let async_db_timeout_counter =
-            metrics_receiver.sink().register_counter(&"simplex_async_db_timeout_total".into());
-        let async_db_completion_latency_histogram = metrics_receiver
-            .sink()
-            .register_histogram(&"simplex_async_db_completion_latency_ms".into());
 
         let now = description.get_time();
         let num_validators = description.get_total_nodes() as usize;
@@ -1985,8 +1888,6 @@ impl SessionProcessor {
             active_weight: 0,
             last_activity: vec![None; num_validators],
             delayed_actions: Vec::new(),
-            pending_async_db_results: Vec::new(),
-            next_pending_async_db_id: 0,
             simplex_state,
             missing_body_logged: HashSet::new(),
             // Collation state
@@ -2032,9 +1933,6 @@ impl SessionProcessor {
             broadcast_validation_latency_histogram,
             errors_counter,
             finalized_pending_body_gauge,
-            async_db_pending_count_gauge,
-            async_db_timeout_counter,
-            async_db_completion_latency_histogram,
             // Error tracking (includes startup errors from before processor was created)
             session_errors_count: AtomicU32::new(initial_errors),
             // Slot stage tracking
@@ -2552,20 +2450,17 @@ impl SessionProcessor {
             self.first_nonannounced_window,
         );
 
-        // Advance the in-memory cursor first (matches C++ ordering: state advances
-        // before `co_await store_pool_state_to_db()`). Subsequent calls will exit
-        // early via the no-op guard above until the FSM crosses the next window.
+        // Persist "next unannounced window" = current_window + 1 (matches C++).
         self.first_nonannounced_window = current_window + 1;
-        let new_window = self.first_nonannounced_window;
 
-        let record = PoolStateRecord { first_nonannounced_window: new_window };
+        let record = PoolStateRecord { first_nonannounced_window: self.first_nonannounced_window };
         let result = match self.db.save_pool_state_async(&record) {
             Ok(r) => r,
             Err(e) => {
                 log::error!(
                     "Session {} maybe_store_pool_state: failed to create pool_state save ({}): {}",
                     &self.session_id().to_hex_string()[..8],
-                    new_window,
+                    self.first_nonannounced_window,
                     e
                 );
                 self.increment_error();
@@ -2573,252 +2468,187 @@ impl SessionProcessor {
             }
         };
 
-        // C++ `co_await`s this write; the registry runs the continuation on
-        // SXMAIN once RocksDB confirms (or on timeout). The in-memory cursor
-        // is already advanced, so a slow disk no longer parks SXMAIN here.
-        let session_short = self.session_id().to_hex_string()[..8].to_string();
-        self.post_async_db_result(
-            "maybe_store_pool_state",
-            result,
-            DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-            move |processor, res| match res {
-                Ok(()) => {
-                    log::trace!(
-                        "Session {session_short} maybe_store_pool_state: stored pool_state \
-                        (first_nonannounced_window={new_window})",
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "Session {session_short} maybe_store_pool_state: failed to store \
-                        pool_state ({new_window}): {e}",
-                    );
-                    processor.increment_error();
-                }
-            },
+        // C++ awaits this write; we do the same (blocking).
+        let wait_started_at = self.now();
+        log::trace!(
+            "Session {} maybe_store_pool_state: waiting poolState db.set \
+            (first_nonannounced_window={})",
+            &self.session_id().to_hex_string()[..8],
+            self.first_nonannounced_window,
         );
+        if let Err(e) = result.wait() {
+            log::error!(
+                "Session {} maybe_store_pool_state: failed to store pool_state ({}) after {}ms: {}",
+                &self.session_id().to_hex_string()[..8],
+                self.first_nonannounced_window,
+                self.now().duration_since(wait_started_at).map(|d| d.as_millis()).unwrap_or(0),
+                e
+            );
+            self.increment_error();
+        } else {
+            log::trace!(
+                "Session {} maybe_store_pool_state: stored pool_state \
+                (first_nonannounced_window={}) in {}ms",
+                &self.session_id().to_hex_string()[..8],
+                self.first_nonannounced_window,
+                self.now().duration_since(wait_started_at).map(|d| d.as_millis()).unwrap_or(0),
+            );
+        }
     }
 
-    /// Ensure CandidateResolver-related DB writes (candidateInfo / notarCert) are
-    /// durable, then invoke `on_complete` exactly once with `Ok(())` on success
-    /// or `Err(...)` on failure (missing dedup-map entry / storage error).
+    /// Wait for CandidateResolver-related DB writes (candidateInfo / notarCert).
     ///
-    /// Continuation-style replacement for the legacy blocking
-    /// `wait_candidate_info_stored(...) -> bool`. Behaves uniformly across the
-    /// three completion paths:
+    /// Parity with C++ `WaitCandidateInfoStored(id, wait_candidate_info, wait_notar_cert)`.
     ///
-    /// * **Ready inline** — the dedup-map result is already done; the callback
-    ///   runs synchronously before this method returns.
-    /// * **Pending** — the result is still in flight; the wait is handed to the
-    ///   SXMAIN async-DB-results registry via `post_async_db_result(...)` and
-    ///   the callback runs when the registry drains the entry.
-    /// * **Missing dedup-map entry / storage error** — the callback runs
-    ///   immediately with `Err(...)` and `increment_error()` has already been
-    ///   bumped by this method.
-    ///
-    /// "result already taken" (the storage layer's single-take sentinel) is
-    /// treated as `Ok(())` because a prior caller already observed the real
-    /// outcome; the persist itself succeeded (otherwise that prior caller would
-    /// have routed through the `Err` branch and bumped the error counter).
-    ///
-    /// C++ parity (`validator/consensus/simplex/consensus.cpp::try_notarize` +
-    /// `candidate-resolver.cpp::store_candidate`): the consensus actor `co_await`s
-    /// `StoreCandidate` and only then submits the vote / proceeds with FSM
-    /// ingestion. The callback body here corresponds to the code that runs
-    /// *after* the C++ `co_await`, regardless of whether the persist resolved
-    /// inline or required a real wait — same uniform semantic, same caller body
-    /// either way.
-    ///
-    /// # Single-wait callsite assumption
-    ///
-    /// In practice every caller asks for either `wait_candidate_info` xor
-    /// `wait_notar_cert` (never both) — the dual-wait combination has no current
-    /// caller and is `debug_assert!`ed against to surface any future misuse.
-    /// Add chained/parallel handling here (and a test) before lifting the assert.
-    fn ensure_candidate_info_stored<F>(
+    fn wait_candidate_info_stored(
         &mut self,
         id: &RawCandidateId,
         wait_candidate_info: bool,
         wait_notar_cert: bool,
-        on_complete: F,
-    ) where
-        F: FnOnce(&mut SessionProcessor, Result<()>) + Send + 'static,
-    {
-        // Fast-path the no-op case before any hex formatting: callers may invoke
-        // with neither prerequisite requested (so they don't have to special-case
-        // "no wait" themselves), and that path neither logs nor needs the id
-        // prefixes — returning here keeps it allocation-free.
-        if !wait_candidate_info && !wait_notar_cert {
-            on_complete(self, Ok(()));
-            return;
-        }
-
-        // Single allocation per id: keep the `to_hex_string()` buffer and
-        // truncate it in place instead of re-allocating via
-        // `to_hex_string()[..8].to_string()`. `String::truncate` is O(1) on
-        // an ASCII-only hex string (every byte is a single UTF-8 scalar),
-        // so this just clips the length field. The buffer keeps its
-        // original capacity, but no extra heap allocation is needed.
-        let mut session_short = self.session_id().to_hex_string();
-        session_short.truncate(8);
-        let mut block_hash_short = id.hash.to_hex_string();
-        block_hash_short.truncate(8);
-        let slot_v = id.slot.value();
-
-        // Hard-fail at runtime on the unsupported dual-wait combination so a
-        // future caller cannot silently weaken durability under release
-        // builds. `debug_assert!` would have masked this in production. The
-        // legacy (pre-callback) `wait_candidate_info_stored` did support both
-        // simultaneously; if a real caller ever needs that again, implement
-        // the combined wait path here (and add a regression test) before
-        // lifting this guard.
-        if wait_candidate_info && wait_notar_cert {
-            log::error!(
-                "Session {session_short} EnsureCandidateInfoStored: combined wait \
-                 (candidateInfo+notarCert) is not supported for s{slot_v}:{block_hash_short}",
-            );
-            self.increment_error();
-            debug_assert!(
-                false,
-                "ensure_candidate_info_stored: combined wait unsupported (no current caller \
-                 needs both candidateInfo and notarCert in one invocation)",
-            );
-            on_complete(
-                self,
-                Err(error!(
-                    "ensure_candidate_info_stored: combined wait unsupported for \
-                     s{slot_v}:{block_hash_short}"
-                )),
-            );
-            return;
-        }
+    ) -> bool {
+        let mut candidate_info_ok = true;
+        let mut notar_cert_ok = true;
 
         log::trace!(
-            "Session {session_short} EnsureCandidateInfoStored: poll s{slot_v}:{block_hash_short} \
-             info={wait_candidate_info} notar={wait_notar_cert}",
+            "Session {} WaitCandidateInfoStored: start s{}:{} info={} notar={}",
+            &self.session_id().to_hex_string()[..8],
+            id.slot.value(),
+            &id.hash.to_hex_string()[..8],
+            wait_candidate_info,
+            wait_notar_cert
         );
 
-        // Pick the (label, op_label, dedup-map lookup) tuple based on which wait was
-        // requested. Both label strings are `&'static str` so they can be moved into
-        // the deferred continuation closure without an extra allocation.
-        // Exactly one prerequisite is set here: the no-op (neither) and the
-        // unsupported dual-wait (both) cases already returned above.
-        let (label, op_label, result_opt) = if wait_candidate_info {
-            (
-                "candidateInfo",
-                "ensure_candidate_info_stored:candidate_info",
-                self.candidate_info_store_results.get(id).cloned(),
-            )
-        } else {
-            (
-                "notarCert",
-                "ensure_candidate_info_stored:notar_cert",
-                self.notar_cert_store_results.get(id).cloned(),
-            )
-        };
-
-        let res = match result_opt {
-            Some(r) => r,
-            None => {
-                log::error!(
-                    "Session {session_short} EnsureCandidateInfoStored: missing {label} store \
-                     result for s{slot_v}:{block_hash_short}",
-                );
-                self.increment_error();
-                let err = error!("missing {label} store result for s{slot_v}:{block_hash_short}");
-                on_complete(self, Err(err));
-                return;
+        if wait_candidate_info {
+            match self.candidate_info_store_results.get(id) {
+                Some(res) => {
+                    let wait_started_at = self.now();
+                    log::trace!(
+                        "Session {} WaitCandidateInfoStored: waiting candidateInfo db.set for \
+                        s{}:{} (ready={})",
+                        &self.session_id().to_hex_string()[..8],
+                        id.slot.value(),
+                        &id.hash.to_hex_string()[..8],
+                        res.is_ready(),
+                    );
+                    if let Err(e) = res.wait() {
+                        if e.to_string().contains("result already taken") {
+                            log::trace!(
+                                "Session {} WaitCandidateInfoStored: candidateInfo result already \
+                                consumed for s{}:{}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                            );
+                        } else {
+                            log::error!(
+                                "Session {} WaitCandidateInfoStored: candidateInfo wait failed \
+                                for s{}:{} after {}ms: {e}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                                self.now()
+                                    .duration_since(wait_started_at)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0),
+                            );
+                            self.increment_error();
+                            candidate_info_ok = false;
+                        }
+                    } else {
+                        log::trace!(
+                            "Session {} WaitCandidateInfoStored: candidateInfo stored for s{}:{} \
+                            in {}ms",
+                            &self.session_id().to_hex_string()[..8],
+                            id.slot.value(),
+                            &id.hash.to_hex_string()[..8],
+                            self.now()
+                                .duration_since(wait_started_at)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0),
+                        );
+                    }
+                }
+                None => {
+                    // We can't reconstruct CandidateInfo here without additional context.
+                    // Treat as persistence error and let the caller decide whether to abort.
+                    log::error!(
+                        "Session {} WaitCandidateInfoStored: missing candidateInfo store result \
+                        for s{}:{}",
+                        &self.session_id().to_hex_string()[..8],
+                        id.slot.value(),
+                        &id.hash.to_hex_string()[..8],
+                    );
+                    self.increment_error();
+                    candidate_info_ok = false;
+                }
             }
-        };
-
-        if res.is_ready() {
-            // Result already done — consume + classify + dispatch synchronously.
-            // After this `try_get`, any subsequent observer (e.g., a stale registry
-            // entry from a prior call) will see "result already taken" which is
-            // explicitly treated as `Ok(())` everywhere in this codebase.
-            let outcome = self.classify_durability_wait_outcome(
-                res.try_get(),
-                label,
-                &session_short,
-                slot_v,
-                &block_hash_short,
-                /* deferred */ false,
-            );
-            on_complete(self, outcome);
-            return;
         }
 
-        // Defer to the SXMAIN async-DB-results registry; the continuation classifies
-        // the actual storage outcome and invokes `on_complete` from there.
-        log::trace!(
-            "Session {session_short} EnsureCandidateInfoStored: {label} pending for \
-             s{slot_v}:{block_hash_short}, deferring callback",
-        );
-        let session_short_cb = session_short;
-        let block_hash_short_cb = block_hash_short;
-        self.post_async_db_result(
-            op_label,
-            res,
-            DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-            move |processor, registry_res| {
-                // Convert registry's `Result<()>` (raw storage outcome) into the
-                // post-classification `Result<()>` we hand to the caller.
-                let outcome = processor.classify_durability_wait_outcome(
-                    Some(registry_res),
-                    label,
-                    &session_short_cb,
-                    slot_v,
-                    &block_hash_short_cb,
-                    /* deferred */ true,
-                );
-                on_complete(processor, outcome);
-            },
-        );
-    }
-
-    /// Translate a raw `try_get()` / registry callback outcome for a candidateInfo
-    /// or notarCert wait into the `Ok(())` / `Err(...)` value we pass to the
-    /// `ensure_candidate_info_stored` callback. Centralizes the logging + error
-    /// counter side-effects so the inline-Ready and deferred-Pending branches
-    /// stay identical.
-    ///
-    /// `try_get_result == None` only happens on the inline-Ready path when the
-    /// `is_ready()` check raced against a separate consumer; treat as `Ok(())`
-    /// to match `Some(Ok(()))` semantics.
-    fn classify_durability_wait_outcome(
-        &mut self,
-        try_get_result: Option<Result<()>>,
-        label: &'static str,
-        session_short: &str,
-        slot_v: u32,
-        block_hash_short: &str,
-        deferred: bool,
-    ) -> Result<()> {
-        let stage = if deferred { " (deferred)" } else { "" };
-        match try_get_result {
-            Some(Ok(())) | None => {
-                log::trace!(
-                    "Session {session_short} EnsureCandidateInfoStored: {label} stored for \
-                     s{slot_v}:{block_hash_short}{stage}",
-                );
-                Ok(())
-            }
-            Some(Err(e)) if is_storage_result_already_taken(&e) => {
-                log::trace!(
-                    "Session {session_short} EnsureCandidateInfoStored: {label} result already \
-                     consumed for s{slot_v}:{block_hash_short}{stage}",
-                );
-                Ok(())
-            }
-            Some(Err(e)) => {
-                log::error!(
-                    "Session {session_short} EnsureCandidateInfoStored: {label} wait failed for \
-                     s{slot_v}:{block_hash_short}{stage}: {e}",
-                );
-                self.increment_error();
-                Err(e)
+        if wait_notar_cert {
+            match self.notar_cert_store_results.get(id) {
+                Some(res) => {
+                    let wait_started_at = self.now();
+                    log::trace!(
+                        "Session {} WaitCandidateInfoStored: waiting notarCert db.set for s{}:{} \
+                        (ready={})",
+                        &self.session_id().to_hex_string()[..8],
+                        id.slot.value(),
+                        &id.hash.to_hex_string()[..8],
+                        res.is_ready(),
+                    );
+                    if let Err(e) = res.wait() {
+                        if e.to_string().contains("result already taken") {
+                            log::trace!(
+                                "Session {} WaitCandidateInfoStored: notarCert result already \
+                                consumed for s{}:{}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                            );
+                        } else {
+                            log::error!(
+                                "Session {} WaitCandidateInfoStored: notarCert wait failed for \
+                                s{}:{} after {}ms: {e}",
+                                &self.session_id().to_hex_string()[..8],
+                                id.slot.value(),
+                                &id.hash.to_hex_string()[..8],
+                                self.now()
+                                    .duration_since(wait_started_at)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0),
+                            );
+                            self.increment_error();
+                            notar_cert_ok = false;
+                        }
+                    } else {
+                        log::trace!(
+                            "Session {} WaitCandidateInfoStored: notarCert stored for s{}:{} in \
+                            {}ms",
+                            &self.session_id().to_hex_string()[..8],
+                            id.slot.value(),
+                            &id.hash.to_hex_string()[..8],
+                            self.now()
+                                .duration_since(wait_started_at)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0),
+                        );
+                    }
+                }
+                None => {
+                    log::error!(
+                        "Session {} WaitCandidateInfoStored: missing notarCert store result for \
+                        s{}:{}",
+                        &self.session_id().to_hex_string()[..8],
+                        id.slot.value(),
+                        &id.hash.to_hex_string()[..8],
+                    );
+                    self.increment_error();
+                    notar_cert_ok = false;
+                }
             }
         }
+
+        candidate_info_ok && notar_cert_ok
     }
 
     /// Save candidate info to database (fire-and-forget)
@@ -3128,148 +2958,6 @@ impl SessionProcessor {
                 i += 1;
             }
         }
-    }
-
-    /*
-        Pending async DB results
-
-        Generic infrastructure that lets `SessionProcessor` register an in-flight
-        `*_async()` DB result and continue without blocking SXMAIN. The registry
-        is drained from `check_all()` next to `process_delayed_actions()`.
-
-        Lifecycle of an entry:
-        1. caller posts `(label, result, timeout, on_ready)` via
-           `post_async_db_result()` and immediately returns;
-        2. `process_pending_async_db_results()` (run from `check_all()`)
-           polls `result.try_get()` each pass;
-           - Ready: invoke `on_ready` once with `Ok/Err` and remove the entry;
-           - past deadline: invoke `on_ready` with `Err("<label>: timed out")`,
-             bump the timeout counter, and remove the entry;
-           - still pending: leave in the queue and arm
-             `set_next_awake_time(now + ASYNC_DB_POLL_DELAY)`.
-    */
-
-    /// Register an async DB write result for SXMAIN polling.
-    ///
-    /// `on_ready` runs on `SXMAIN` exactly once when the result is ready
-    /// (with `Ok(())` or `Err(...)` from the storage layer) or when `timeout`
-    /// elapses (with `Err(...timed out...)`).
-    ///
-    /// Callers MUST NOT `wait()` on `result` after handing it off — the
-    /// registry takes exclusive ownership of the completion via `try_get()`.
-    ///
-    /// # Arguments
-    /// * `op_label` - Static label for logs / metrics / timeout error message.
-    /// * `result`   - In-flight async DB result handle from `SimplexDb`.
-    /// * `timeout`  - Session-time relative deadline for completion (`deadline =
-    ///                self.now() + timeout`, where `self.now()` routes through
-    ///                [`SessionDescription::get_time()`] — same clock used
-    ///                throughout `SessionProcessor`, not raw wall-clock).
-    /// * `on_ready` - One-shot continuation invoked on `SXMAIN`.
-    ///
-    /// # Returns
-    /// A monotonic id, useful for traceability/dedup; the caller may discard it.
-    pub(crate) fn post_async_db_result<F>(
-        &mut self,
-        op_label: &'static str,
-        result: StorageAsyncResultPtr<()>,
-        timeout: Duration,
-        on_ready: F,
-    ) -> PendingAsyncDbId
-    where
-        F: FnOnce(&mut SessionProcessor, Result<()>) + Send + 'static,
-    {
-        let id = self.next_pending_async_db_id;
-        self.next_pending_async_db_id = self.next_pending_async_db_id.wrapping_add(1);
-
-        let now = self.now();
-        let entry = PendingAsyncDbEntry {
-            id,
-            op_label,
-            result,
-            registered_at: now,
-            deadline: now.checked_add(timeout).unwrap_or(now),
-            on_ready: Box::new(on_ready),
-        };
-
-        log::trace!(
-            "Session {} post_async_db_result: id={id} label='{op_label}' \
-             timeout={}ms (pending_count={})",
-            &self.session_id().to_hex_string()[..8],
-            timeout.as_millis(),
-            self.pending_async_db_results.len() + 1,
-        );
-
-        self.pending_async_db_results.push(entry);
-        // Wake immediately on the next loop iteration; if still pending, the loop
-        // will re-arm `next_awake_time` to `now + ASYNC_DB_POLL_DELAY`.
-        self.set_next_awake_time(now.checked_add(ASYNC_DB_POLL_DELAY).unwrap_or(now));
-
-        id
-    }
-
-    /// Drain ready / timed-out entries from `pending_async_db_results`.
-    ///
-    /// For each entry:
-    /// - `try_get() == Some(res)` (Ready): remove + invoke continuation with `res`.
-    /// - `deadline <= now` (Pending past deadline): remove + invoke continuation
-    ///   with `Err("<label>: db wait timed out")` and bump the timeout counter.
-    /// - Otherwise (Pending, not yet timed out): leave in queue and schedule
-    ///   `set_next_awake_time(now + ASYNC_DB_POLL_DELAY)`.
-    ///
-    /// Mirrors `process_delayed_actions()` shape (swap_remove + non-incrementing index)
-    /// so the loop is trivially auditable. Continuations may register new pending
-    /// entries; those land at the end of the queue and are evaluated by the same
-    /// loop iteration if already ready (matching `process_delayed_actions()` semantics).
-    /// Total work per pass is bounded by `check_all()`'s `check_execution_time!` budget.
-    fn process_pending_async_db_results(&mut self) {
-        let now = self.now();
-        let mut i = 0;
-
-        while i < self.pending_async_db_results.len() {
-            let try_get_result = self.pending_async_db_results[i].result.try_get();
-            let timed_out = self.pending_async_db_results[i].deadline <= now;
-
-            match (try_get_result, timed_out) {
-                (Some(res), _) => {
-                    let entry = self.pending_async_db_results.swap_remove(i);
-                    if let Ok(latency) = now.duration_since(entry.registered_at) {
-                        self.async_db_completion_latency_histogram
-                            .record(latency.as_millis() as f64);
-                    }
-                    log::trace!(
-                        "Session {} process_pending_async_db_results: ready \
-                         id={} label='{}' result_ok={}",
-                        &self.session_id().to_hex_string()[..8],
-                        entry.id,
-                        entry.op_label,
-                        res.is_ok(),
-                    );
-                    (entry.on_ready)(self, res);
-                    // do not advance i — swap_remove moved last entry into this slot
-                }
-                (None, true) => {
-                    let entry = self.pending_async_db_results.swap_remove(i);
-                    self.async_db_timeout_counter.increment(1);
-                    log::warn!(
-                        "Session {} process_pending_async_db_results: TIMEOUT \
-                         id={} label='{}' after {}ms",
-                        &self.session_id().to_hex_string()[..8],
-                        entry.id,
-                        entry.op_label,
-                        now.duration_since(entry.registered_at).map(|d| d.as_millis()).unwrap_or(0),
-                    );
-                    let err = error!("{}: db wait timed out", entry.op_label);
-                    (entry.on_ready)(self, Err(err));
-                }
-                (None, false) => {
-                    self.set_next_awake_time(now + ASYNC_DB_POLL_DELAY);
-                    i += 1;
-                }
-            }
-        }
-
-        self.async_db_pending_count_gauge.set(self.pending_async_db_results.len() as f64);
     }
 
     /*
@@ -4335,7 +4023,6 @@ impl SessionProcessor {
     /// (`LeaderWindowObserved` → `alarm_timestamp()`).  In Rust the
     /// equivalent arming point is this explicit `start()` call.
     pub(crate) fn start(&mut self) {
-        self.simplex_state.finish_startup_replay(&self.description);
         self.simplex_state.reset_timeouts_on_start(&self.description);
 
         log::info!(
@@ -4373,10 +4060,6 @@ impl SessionProcessor {
         // Release delayed gates before evaluating validation readiness so retries
         // can re-enter validation in the same `check_all()` pass.
         self.process_delayed_actions();
-
-        // Drain any async DB results that completed since the last pass.
-        // Continuations registered via `post_async_db_result()` run here.
-        self.process_pending_async_db_results();
 
         // Check validation (process pending validations)
         self.check_validation();
@@ -4428,65 +4111,9 @@ impl SessionProcessor {
         self.log_consensus_state("check_all");
     }
 
-    /// Stop the session processor.
-    ///
-    /// C++ parity (`validator/consensus/bridge.cpp::destroy_inner()`):
-    /// the bridge publishes `StopRequested` and then `co_await`s
-    /// `bus_->db->close()` so the db actor fully drains its queued
-    /// `co_await db->set(...)` tasks before the bus is torn down. The
-    /// equivalent here runs in two phases:
-    ///
-    /// 1. `drain_pending_async_db_results_for_shutdown()` polls the SXMAIN
-    ///    `pending_async_db_results` registry until empty (or
-    ///    `SHUTDOWN_DRAIN_TIMEOUT` elapses), so any continuation registered via
-    ///    `post_async_db_result()` runs on SXMAIN with an Ok / Err result
-    ///    instead of being silently abandoned.
-    /// 2. `db.sync(SHUTDOWN_DB_SYNC_TIMEOUT)` blocks until the underlying
-    ///    `AsyncKeyValueStorage` has flushed every queued write to RocksDB.
-    ///
-    /// `SimplexDb::drop()` also calls `sync()` as a safety net (with the
-    /// storage layer's shorter `DEFAULT_SYNC_TIMEOUT`), but doing the sync
-    /// here surfaces shutdown-time DB latency / failures at the
-    /// SessionProcessor layer — matching the C++ ordering where the bridge
-    /// owns the `co_await db->close()` call and reports its outcome.
+    /// Stop the session processor
     pub fn stop(&mut self, _destroy_db: bool) {
         log::info!("Stopping SessionProcessor for session {}", self.session_id().to_hex_string());
-
-        // Phase 1: drain SXMAIN pending DB-result continuations.
-        let drain_elapsed = self.drain_pending_async_db_results_for_shutdown();
-
-        // Phase 2: flush the storage queue (mirrors `co_await bus_->db->close()`).
-        // Wall-clock used deliberately — see `wall_now()` doc; shutdown timing
-        // must advance even under a frozen manual session clock.
-        let sync_started_at = self.wall_now();
-        match self.db.sync(Some(SHUTDOWN_DB_SYNC_TIMEOUT)) {
-            Ok(()) => {
-                log::info!(
-                    "Session {} stop: db.sync completed in {}ms (after {}ms drain)",
-                    &self.session_id().to_hex_string()[..8],
-                    self.wall_now()
-                        .duration_since(sync_started_at)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0),
-                    drain_elapsed.as_millis(),
-                );
-            }
-            Err(e) => {
-                log::error!(
-                    "Session {} stop: db.sync(timeout={}s) failed after {}ms (drain elapsed {}ms): \
-                     {}",
-                    &self.session_id().to_hex_string()[..8],
-                    SHUTDOWN_DB_SYNC_TIMEOUT.as_secs(),
-                    self.wall_now()
-                        .duration_since(sync_started_at)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0),
-                    drain_elapsed.as_millis(),
-                    e,
-                );
-                self.increment_error();
-            }
-        }
 
         // Stop receiver
         self.receiver.stop();
@@ -4495,71 +4122,6 @@ impl SessionProcessor {
         self.reset_precollations();
 
         // TODO: Optionally destroy database
-    }
-
-    /// Drain the SXMAIN `pending_async_db_results` registry on shutdown.
-    ///
-    /// Polls each entry via `process_pending_async_db_results()` and sleeps
-    /// briefly between passes to let the storage thread make progress. Bounded
-    /// by `SHUTDOWN_DRAIN_TIMEOUT` so a stuck writer cannot park
-    /// `SessionProcessor::stop()` indefinitely; the loop logs a warning if it
-    /// hits the deadline with entries still queued.
-    ///
-    /// Continuations may schedule new entries (e.g., a chained `*_async()`
-    /// write); those land at the end of the queue and are processed by the
-    /// next pass — same semantics as `process_delayed_actions()`.
-    ///
-    /// **Clock source**: deadline + elapsed timing both go through
-    /// [`Self::wall_now`] (real `SystemTime`). The session's manual clock is
-    /// intentionally bypassed here so a test that freezes time cannot also
-    /// freeze the shutdown deadline. Inside the body
-    /// `process_pending_async_db_results()` keeps using `now()` for per-entry
-    /// timeouts so per-entry FSM semantics are unchanged.
-    ///
-    /// Returns the elapsed wall-clock duration for diagnostics.
-    fn drain_pending_async_db_results_for_shutdown(&mut self) -> Duration {
-        let drain_started_at = self.wall_now();
-
-        if self.pending_async_db_results.is_empty() {
-            return Duration::ZERO;
-        }
-
-        let initial_count = self.pending_async_db_results.len();
-        let deadline = drain_started_at + SHUTDOWN_DRAIN_TIMEOUT;
-        log::info!(
-            "Session {} stop: draining {} pending async DB result entries (deadline {}ms)",
-            &self.session_id().to_hex_string()[..8],
-            initial_count,
-            SHUTDOWN_DRAIN_TIMEOUT.as_millis(),
-        );
-
-        while !self.pending_async_db_results.is_empty() {
-            if self.wall_now() >= deadline {
-                log::warn!(
-                    "Session {} stop: drain deadline elapsed after {}ms, {} entries still pending",
-                    &self.session_id().to_hex_string()[..8],
-                    SHUTDOWN_DRAIN_TIMEOUT.as_millis(),
-                    self.pending_async_db_results.len(),
-                );
-                break;
-            }
-
-            self.process_pending_async_db_results();
-
-            if !self.pending_async_db_results.is_empty() {
-                std::thread::sleep(SHUTDOWN_DRAIN_POLL_INTERVAL);
-            }
-        }
-
-        let elapsed = self.wall_now().duration_since(drain_started_at).unwrap_or(Duration::ZERO);
-        log::info!(
-            "Session {} stop: drained pending_async_db_results in {}ms ({} -> {})",
-            &self.session_id().to_hex_string()[..8],
-            elapsed.as_millis(),
-            initial_count,
-            self.pending_async_db_results.len(),
-        );
-        elapsed
     }
 
     /*
@@ -7727,39 +7289,40 @@ impl SessionProcessor {
                     }
                 }
 
-                let session_short = self.session_id().to_hex_string()[..8].to_string();
-                let block_hash_short = block_hash.to_hex_string()[..8].to_string();
-                let block_hash_owned = block_hash.clone();
-                let notar_cert_for_cb = notar_cert_ptr.clone();
-                self.ensure_candidate_info_stored(
-                    &candidate_id,
-                    false,
-                    true,
-                    move |processor, res| match res {
-                        Ok(()) => {
-                            processor.feed_notar_cert_to_fsm(
-                                slot,
-                                &block_hash_owned,
-                                notar_cert_for_cb,
-                            );
-                            // Newly ingested NotarCert can unblock deferred
-                            // recursive-finalization chains where ancestors require
-                            // notar-signature callback mode. Pre-migration this call
-                            // ran from the function tail; here we run it from the
-                            // callback so it observes the cert in the FSM (matters
-                            // when the persist had to defer through the registry).
-                            processor.retry_pending_recursive_finalization();
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Session {session_short} process_received_notar_cert: skipping \
-                                 FSM feed because notar cert is not durable for \
-                                 s{}:{block_hash_short}: {e}",
-                                slot.value(),
-                            );
-                        }
-                    },
+                if !self.wait_candidate_info_stored(&candidate_id, false, true) {
+                    log::warn!(
+                        "Session {} process_received_notar_cert: skipping FSM feed because notar \
+                        cert is not durable yet for slot={} hash={}",
+                        &self.session_id().to_hex_string()[..8],
+                        slot,
+                        &block_hash.to_hex_string()[..8],
+                    );
+                    return;
+                }
+
+                // Store in SimplexState after durability confirmation.
+                let store_result = self.simplex_state.set_notarize_certificate(
+                    &self.description,
+                    slot,
+                    block_hash,
+                    notar_cert_ptr.clone(),
                 );
+                match store_result {
+                    Ok(true) => {
+                        // Cert accepted into FSM; DB persistence is already guaranteed above.
+                    }
+                    Ok(false) => {
+                        // Already stored for the same block - idempotent
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Session {} process_received_notar_cert: notar cert conflict \
+                            slot={slot} hash={}: {e}",
+                            &self.session_id().to_hex_string()[..8],
+                            &block_hash.to_hex_string()[..8],
+                        );
+                    }
+                }
             }
             Err(e) => {
                 log::warn!(
@@ -7768,51 +7331,12 @@ impl SessionProcessor {
                     &self.session_id().to_hex_string()[..8],
                     &block_hash.to_hex_string()[..8],
                 );
-                // Verify-Err path: original code unconditionally ran the recursive
-                // retry at the function tail regardless of cert validity. Preserve
-                // that on this branch only — verify-Ok is fully owned by the
-                // callback above (which runs retry on Ok and skips it on Err).
-                self.retry_pending_recursive_finalization();
             }
         }
-    }
 
-    /// Store a verified notar cert into `SimplexState` and surface FSM conflicts.
-    ///
-    /// Extracted from `process_received_notar_cert` so the same FSM-ingestion logic
-    /// runs whether `ensure_candidate_info_stored`'s callback fires inline (the
-    /// dedup-map result was already done) or from the registry continuation (the
-    /// result was still in flight). Callers MUST route through
-    /// `ensure_candidate_info_stored` first — that's the only place that
-    /// guarantees the notar cert is durable in the DB.
-    fn feed_notar_cert_to_fsm(
-        &mut self,
-        slot: SlotIndex,
-        block_hash: &UInt256,
-        notar_cert_ptr: crate::certificate::NotarCertPtr,
-    ) {
-        let store_result = self.simplex_state.set_notarize_certificate(
-            &self.description,
-            slot,
-            block_hash,
-            notar_cert_ptr,
-        );
-        match store_result {
-            Ok(true) => {
-                // Cert accepted into FSM; DB persistence guaranteed by caller.
-            }
-            Ok(false) => {
-                // Already stored for the same block — idempotent.
-            }
-            Err(e) => {
-                log::warn!(
-                    "Session {} process_received_notar_cert: notar cert conflict slot={slot} \
-                     hash={}: {e}",
-                    &self.session_id().to_hex_string()[..8],
-                    &block_hash.to_hex_string()[..8],
-                );
-            }
-        }
+        // Newly ingested NotarCert can unblock deferred recursive-finalization chains
+        // where ancestors require notar-signature callback mode.
+        self.retry_pending_recursive_finalization();
     }
 
     /// Verify notarization certificate from VoteSignatureSet (C++ wire format)
@@ -8850,45 +8374,30 @@ impl SessionProcessor {
             let candidate_id =
                 RawCandidateId { slot: candidate.id.slot, hash: candidate.id.hash.clone() };
 
-            let session_short = self.session_id().to_hex_string()[..8].to_string();
-            let candidate_id_for_log = candidate_id.clone();
-            self.ensure_candidate_info_stored(&candidate_id, true, false, move |processor, res| {
-                match res {
-                    Ok(()) => processor.feed_validated_candidate_to_fsm(candidate),
-                    Err(e) => log::warn!(
-                        "Session {session_short} process_validated_candidates: skipping \
-                         candidate slot={} hash={} — candidateInfo not durable: {e}",
-                        candidate_id_for_log.slot.value(),
-                        &candidate_id_for_log.hash.to_hex_string()[..8],
-                    ),
-                }
-            });
-            // Loop continues draining the rest of the validated_candidates queue;
-            // each candidate's callback fires either inline or from the registry.
-        }
-    }
+            if !self.wait_candidate_info_stored(&candidate_id, true, false) {
+                log::warn!(
+                    "Session {} process_validated_candidates: skipping candidate due to \
+                    missing candidateInfo durability slot={} hash={}",
+                    self.session_id().to_hex_string(),
+                    candidate_id.slot,
+                    &candidate_id.hash.to_hex_string()[..8],
+                );
+                continue;
+            }
 
-    /// Feed one validated candidate into `SimplexState` and surface FSM rejections.
-    ///
-    /// Extracted from `process_validated_candidates` so the same FSM-feed logic
-    /// runs whether `ensure_candidate_info_stored`'s callback fires inline (the
-    /// `candidateInfo` dedup-map result was already done) or from the registry
-    /// continuation (still in flight). Callers MUST route through
-    /// `ensure_candidate_info_stored` first — that's the only place that
-    /// guarantees the candidateInfo is durable in the DB.
-    fn feed_validated_candidate_to_fsm(&mut self, candidate: crate::block::Candidate) {
-        log::trace!(
-            "Session {} process_validated_candidates: feeding candidate to FSM, slot={}",
-            self.session_id().to_hex_string(),
-            candidate.id.slot,
-        );
-
-        if let Err(e) = self.simplex_state.on_candidate(&self.description, candidate) {
-            log::warn!(
-                "Session {} process_validated_candidates: FSM rejected candidate: {}",
+            log::trace!(
+                "Session {} process_validated_candidates: feeding candidate to FSM, slot={}",
                 self.session_id().to_hex_string(),
-                e
+                candidate.id.slot,
             );
+
+            if let Err(e) = self.simplex_state.on_candidate(&self.description, candidate) {
+                log::warn!(
+                    "Session {} process_validated_candidates: FSM rejected candidate: {}",
+                    self.session_id().to_hex_string(),
+                    e
+                );
+            }
         }
     }
 
@@ -8979,59 +8488,29 @@ impl SessionProcessor {
         // WaitCandidateInfoStored parity (C++ consensus.cpp):
         // - before NotarizeVote: wait candidateInfo stored
         // - before FinalizeVote: wait notarCert stored
-        // - SkipVote: no durability prerequisite
-        //
-        // The wait now runs through the SXMAIN async-DB-results registry via
-        // `ensure_candidate_info_stored(...)` — inline if the dedup-map result is
-        // already done, deferred via `post_async_db_result` if it's still in flight.
-        // Either way, the same callback body runs `broadcast_vote_after_persist(vote)`
-        // on Ok and the abort path on Err.
-        let (id, wait_info, wait_notar) = match &vote {
+        let wait_persist_ok = match &vote {
             Vote::Notarize(v) => {
-                (RawCandidateId { slot: v.slot, hash: v.block_hash.clone() }, true, false)
+                let id = RawCandidateId { slot: v.slot, hash: v.block_hash.clone() };
+                self.wait_candidate_info_stored(&id, true, false)
             }
             Vote::Finalize(v) => {
-                (RawCandidateId { slot: v.slot, hash: v.block_hash.clone() }, false, true)
+                let id = RawCandidateId { slot: v.slot, hash: v.block_hash.clone() };
+                self.wait_candidate_info_stored(&id, false, true)
             }
-            Vote::Skip(_) => {
-                // Skip votes have no durability prerequisite; broadcast immediately.
-                self.broadcast_vote_after_persist(vote);
-                return;
-            }
+            _ => true,
         };
 
-        let session_short = self.session_id().to_hex_string()[..8].to_string();
-        self.ensure_candidate_info_stored(&id, wait_info, wait_notar, move |processor, res| {
-            match res {
-                Ok(()) => processor.broadcast_vote_after_persist(vote),
-                Err(e) => {
-                    log::error!(
-                        "Session {session_short} broadcast_vote: aborting vote send due to \
-                         durability wait failure: {e} ({:?})",
-                        vote,
-                    );
-                    // generic error counter already bumped by ensure_candidate_info_stored
-                    processor.votes_out_persist_fail_counter.increment(1);
-                }
-            }
-        });
-    }
+        if !wait_persist_ok {
+            log::error!(
+                "Session {} broadcast_vote: aborting vote send due to durability wait failure: {:?}",
+                self.session_id().to_hex_string(),
+                vote
+            );
+            self.votes_out_persist_fail_counter.increment(1);
+            self.increment_error();
+            return;
+        }
 
-    /// Sign and send a vote whose durability prerequisites are confirmed.
-    ///
-    /// Extracted from `broadcast_vote()` so the same post-persist path runs
-    /// whether `ensure_candidate_info_stored`'s callback fires inline (the
-    /// dedup-map result was already done, or the vote was a `SkipVote` which
-    /// has no prerequisite) or from the registry continuation (still in flight).
-    /// Callers MUST route through `ensure_candidate_info_stored` first (or
-    /// short-circuit for `SkipVote`) — that's the only place that guarantees
-    /// the vote's durability prerequisites are satisfied.
-    ///
-    /// First-notarize-vote latency tracking lives here (not in `broadcast_vote`)
-    /// so the timestamp reflects the moment we actually send the vote, which is
-    /// the meaningful end-of-latency point — matches the pre-migration ordering
-    /// where the tracking ran after the (synchronous) wait succeeded.
-    fn broadcast_vote_after_persist(&mut self, vote: Vote) {
         // Track first notarize vote in this slot (stage 2 latency)
         if let Vote::Notarize(v) = &vote {
             let vote_slot = v.slot;
@@ -9075,25 +8554,13 @@ impl SessionProcessor {
         self.receiver.send_vote(signed_vote);
     }
 
-    /// Schedule durability persist for a locally produced signed vote (non-blocking).
+    /// Persist a locally produced signed vote to DB before broadcasting it.
     ///
-    /// C++ parity (`validator/consensus/simplex/pool.cpp` + `db.cpp`):
-    /// the consensus actor publishes `BroadcastVote`, which fans out to two independent
-    /// actor handlers — `pool.cpp::handle(BroadcastVote)` runs `handle_our_vote(...)`
-    /// (sign, apply locally, publish `OutgoingProtocolMessage`), and
-    /// `db.cpp::process(BroadcastVote)` `co_await`s `db->set(...)`. The `co_await`
-    /// lives in the db actor only; it does **not** gate pool's `OutgoingProtocolMessage`
-    /// publish. We mirror that here by handing the in-flight result to the SXMAIN
-    /// async-DB-results registry; `broadcast_vote()` invokes `receiver.send_vote(...)`
-    /// immediately after this function returns, so the broadcast no longer parks
-    /// SXMAIN on RocksDB latency.
+    /// This matches C++ ordering where the node ensures its own vote is durably stored
+    /// before publishing it to the network (restart/standstill reconstruction depends on it).
     ///
-    /// On persist failure, `increment_error()` runs from the registry continuation —
-    /// matches C++ where `db.cpp` `CHECK`s the result (and treats `cancelled` from
-    /// group rotation as benign).
-    ///
-    /// Reference: C++ `validator/consensus/simplex/db.cpp::process(BroadcastVote)` —
-    /// `co_await owning_bus()->db->set(std::move(key), std::move(value)).wrap()`.
+    /// Reference: C++ `validator/consensus/simplex/pool.cpp`:
+    /// `handle_our_vote()` awaits `store_vote_to_db(...)` before publishing the outgoing message.
     fn persist_our_vote_before_broadcast(&mut self, tl_vote: &TlVote) {
         let serialized =
             consensus_common::serialize_tl_boxed_object!(&tl_vote.clone().into_boxed());
@@ -9117,36 +8584,29 @@ impl SessionProcessor {
                 return;
             }
         };
-
-        let session_short = self.session_id().to_hex_string()[..8].to_string();
-        let vote_hash_short = record.vote_hash.to_hex_string()[..8].to_string();
-        let node_idx = record.node_idx;
-
+        let wait_started_at = self.now();
         log::trace!(
-            "Session {session_short} broadcast_vote: scheduling vote db.set \
-             (hash={vote_hash_short}, node_idx={node_idx})",
+            "Session {} broadcast_vote: waiting vote db.set before send (hash={}, node_idx={})",
+            &self.session_id().to_hex_string()[..8],
+            &record.vote_hash.to_hex_string()[..8],
+            record.node_idx
         );
-
-        self.post_async_db_result(
-            "persist_our_vote_before_broadcast",
-            result,
-            DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-            move |processor, res| match res {
-                Ok(()) => {
-                    log::trace!(
-                        "Session {session_short} broadcast_vote: stored vote \
-                         (hash={vote_hash_short}, node_idx={node_idx})",
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "Session {session_short} broadcast_vote: failed to store vote \
-                         (hash={vote_hash_short}): {e}",
-                    );
-                    processor.increment_error();
-                }
-            },
-        );
+        if let Err(e) = result.wait() {
+            log::error!(
+                "Session {} broadcast_vote: failed to store vote before send after {}ms: {}",
+                &self.session_id().to_hex_string()[..8],
+                self.now().duration_since(wait_started_at).map(|d| d.as_millis()).unwrap_or(0),
+                e
+            );
+            self.increment_error();
+        } else {
+            log::trace!(
+                "Session {} broadcast_vote: stored vote before send in {}ms (hash={})",
+                &self.session_id().to_hex_string()[..8],
+                self.now().duration_since(wait_started_at).map(|d| d.as_millis()).unwrap_or(0),
+                &record.vote_hash.to_hex_string()[..8],
+            );
+        }
     }
 
     /*
@@ -9845,16 +9305,38 @@ impl SessionProcessor {
                 }
             };
 
-        // Pre-serialize the cached + relayed cert payloads SYNCHRONOUSLY, before posting
-        // the persist. Serialization is cheap and predictable; doing it now keeps the
-        // continuation closure small (no `Arc<NotarCert>.clone()` needed) and surfaces
-        // any malformed-cert errors before we register a wait we cannot satisfy.
-        //
-        // VoteSignatureSet is the C++ wire format for `candidateAndCert.notar`
-        // (see C++ `candidate-resolver.cpp::to_tl()`).
+        // TN-968 wait-for-store guarantee: certificate must be durable before broadcast/cache.
+        if let Err(e) = notar_store_result.wait() {
+            log::error!(
+                "Session {} handle_notarization_reached: failed to store notar cert slot={}: {e}",
+                &self.session_id().to_hex_string()[..8],
+                event.slot,
+            );
+            self.increment_error();
+            return;
+        }
+
+        // Serialize and cache the notarization certificate for query responses
+        // Use VoteSignatureSet (not full Certificate) to match C++ wire format.
+        // Reference: C++ candidate-resolver.cpp to_tl():
+        //   serialized_notar = serialize_tl_object((*notar_cert)->to_tl_vote_signature_set(), true);
         let tl_sigs = event.certificate.to_tl_vote_signature_set();
-        let notar_cert_bytes = match serialize_boxed(&tl_sigs) {
-            Ok(bytes) => bytes,
+        match serialize_boxed(&tl_sigs) {
+            Ok(notar_cert_bytes) => {
+                log::trace!(
+                    "Session {} handle_notarization_reached: caching VoteSignatureSet for slot={} \
+                    hash={} ({}B)",
+                    &self.session_id().to_hex_string()[..8],
+                    event.slot,
+                    &event.block_hash.to_hex_string()[..8],
+                    notar_cert_bytes.len(),
+                );
+                self.receiver.cache_notarization_cert(
+                    event.slot.value(),
+                    event.block_hash.clone(),
+                    notar_cert_bytes,
+                );
+            }
             Err(e) => {
                 log::error!(
                     "Session {} handle_notarization_reached: failed to serialize \
@@ -9862,9 +9344,11 @@ impl SessionProcessor {
                     &self.session_id().to_hex_string()[..8],
                 );
                 self.increment_error();
-                return;
             }
-        };
+        }
+
+        // Broadcast full notarization certificate to all validators
+        // Reference: C++ pool.cpp broadcasts certificate on NotarizationObserved
         let tl_cert = match event.certificate.to_tl() {
             Ok(cert) => cert,
             Err(e) => {
@@ -9877,8 +9361,30 @@ impl SessionProcessor {
                 return;
             }
         };
-        let cert_bytes = match serialize_boxed(&tl_cert) {
-            Ok(bytes) => bytes,
+
+        // Serialize for standstill cache
+        match serialize_boxed(&tl_cert) {
+            Ok(cert_bytes) => {
+                log::trace!(
+                    "Session {} handle_notarization_reached: broadcasting notar cert for slot={} \
+                    ({}B)",
+                    &self.session_id().to_hex_string()[..8],
+                    event.slot,
+                    cert_bytes.len(),
+                );
+
+                // C++ parity (pool.cpp handle_saved_certificate): relay every newly
+                // accepted certificate to all validators. Dedup is in SimplexState.
+                self.certs_relayed_counter.increment(1);
+                self.receiver.send_certificate(tl_cert);
+
+                // Cache for standstill re-broadcast
+                self.receiver.cache_standstill_certificate(
+                    event.slot.value(),
+                    StandstillCertificateType::Notar,
+                    cert_bytes,
+                );
+            }
             Err(e) => {
                 log::error!(
                     "Session {} handle_notarization_reached: failed to serialize certificate: {}",
@@ -9886,78 +9392,8 @@ impl SessionProcessor {
                     e
                 );
                 self.increment_error();
-                return;
             }
-        };
-
-        // Wait-for-store guarantee: certificate must be durable before broadcast/cache.
-        // Hand the wait off to the SXMAIN async-DB-results registry; the continuation runs
-        // the post-persist work (cache notar VoteSignatureSet + relay full cert + cache standstill).
-        //
-        // C++ parity (`pool.cpp::handle_prospective_certificate`):
-        //   co_await owning_bus().publish<SaveCertificate>(cert);
-        //   handle_saved_certificate(*slot, cert);  // broadcast + cache
-        // The persist still gates the broadcast — same as before this migration, just
-        // non-blocking on SXMAIN.
-        let session_short = self.session_id().to_hex_string()[..8].to_string();
-        let block_hash_short = event.block_hash.to_hex_string()[..8].to_string();
-        let slot = event.slot;
-        let block_hash = event.block_hash.clone();
-        self.post_async_db_result(
-            "handle_notarization_reached",
-            notar_store_result,
-            DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-            move |processor, res| {
-                if let Err(e) = res {
-                    if is_storage_result_already_taken(&e) {
-                        // Redundant FSM re-emission: the first callback already
-                        // persisted + broadcast the cert (dedup-map held the same
-                        // `StorageAsyncResultPtr`, whose inner result has already
-                        // been `take`n). Skip side-effects, do NOT bump the error
-                        // counter. Mirrors `classify_durability_wait_outcome`.
-                        log::trace!(
-                            "Session {session_short} handle_notarization_reached: notar cert \
-                             result already consumed for slot={slot} (redundant FSM re-emit, \
-                             skipping cache + broadcast)",
-                        );
-                    } else {
-                        log::error!(
-                            "Session {session_short} handle_notarization_reached: failed to \
-                             store notar cert slot={slot}: {e}",
-                        );
-                        processor.increment_error();
-                    }
-                    return;
-                }
-
-                log::trace!(
-                    "Session {session_short} handle_notarization_reached: caching VoteSignatureSet \
-                     for slot={slot} hash={block_hash_short} ({}B)",
-                    notar_cert_bytes.len(),
-                );
-                processor.receiver.cache_notarization_cert(
-                    slot.value(),
-                    block_hash.clone(),
-                    notar_cert_bytes,
-                );
-
-                log::trace!(
-                    "Session {session_short} handle_notarization_reached: broadcasting notar cert \
-                     for slot={slot} ({}B)",
-                    cert_bytes.len(),
-                );
-                // C++ parity (pool.cpp handle_saved_certificate): relay every newly
-                // accepted certificate to all validators. Dedup is in SimplexState.
-                processor.certs_relayed_counter.increment(1);
-                processor.receiver.send_certificate(tl_cert);
-                // Cache for standstill re-broadcast
-                processor.receiver.cache_standstill_certificate(
-                    slot.value(),
-                    StandstillCertificateType::Notar,
-                    cert_bytes,
-                );
-            },
-        );
+        }
     }
 
     /// Handle skip certificate reached event
@@ -9998,8 +9434,19 @@ impl SessionProcessor {
                 }
             };
 
-        // Pre-serialize the relayed + cached cert payload SYNCHRONOUSLY, before posting
-        // the persist (see `handle_notarization_reached` for rationale).
+        // TN-968 wait-for-store guarantee: certificate must be durable before broadcast/cache.
+        if let Err(e) = skip_store_result.wait() {
+            log::error!(
+                "Session {} handle_skip_certificate_reached: failed to store skip cert slot={}: \
+                {e}",
+                &self.session_id().to_hex_string()[..8],
+                event.slot,
+            );
+            self.increment_error();
+            return;
+        }
+
+        // Convert to TL format
         let tl_cert = match event.certificate.to_tl() {
             Ok(cert) => cert,
             Err(e) => {
@@ -10012,8 +9459,29 @@ impl SessionProcessor {
                 return;
             }
         };
-        let cert_bytes = match serialize_boxed(&tl_cert) {
-            Ok(bytes) => bytes,
+
+        // Serialize for caching
+        match serialize_boxed(&tl_cert) {
+            Ok(cert_bytes) => {
+                log::trace!(
+                    "Session {} handle_skip_certificate_reached: broadcasting skip cert for \
+                    slot={} ({}B)",
+                    &self.session_id().to_hex_string()[..8],
+                    event.slot,
+                    cert_bytes.len(),
+                );
+
+                // Send certificate to all validators
+                self.certs_relayed_counter.increment(1);
+                self.receiver.send_certificate(tl_cert);
+
+                // Cache for standstill re-broadcast
+                self.receiver.cache_standstill_certificate(
+                    event.slot.value(),
+                    StandstillCertificateType::Skip,
+                    cert_bytes,
+                );
+            }
             Err(e) => {
                 log::error!(
                     "Session {} handle_skip_certificate_reached: failed to serialize certificate: \
@@ -10021,58 +9489,8 @@ impl SessionProcessor {
                     &self.session_id().to_hex_string()[..8],
                 );
                 self.increment_error();
-                return;
             }
-        };
-
-        // Wait-for-store guarantee: certificate must be durable before broadcast/cache.
-        // Hand the wait off to the SXMAIN async-DB-results registry; the continuation runs
-        // the post-persist work (relay full cert + cache standstill).
-        //
-        // C++ parity (`pool.cpp::handle_prospective_certificate`): persist gates broadcast.
-        let session_short = self.session_id().to_hex_string()[..8].to_string();
-        let slot = event.slot;
-        self.post_async_db_result(
-            "handle_skip_certificate_reached",
-            skip_store_result,
-            DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-            move |processor, res| {
-                if let Err(e) = res {
-                    if is_storage_result_already_taken(&e) {
-                        // Redundant FSM re-emission: see `handle_notarization_reached`
-                        // callback for the full rationale. Skip broadcast + standstill
-                        // cache without bumping the error counter.
-                        log::trace!(
-                            "Session {session_short} handle_skip_certificate_reached: skip cert \
-                             result already consumed for slot={slot} (redundant FSM re-emit, \
-                             skipping broadcast)",
-                        );
-                    } else {
-                        log::error!(
-                            "Session {session_short} handle_skip_certificate_reached: failed \
-                             to store skip cert slot={slot}: {e}",
-                        );
-                        processor.increment_error();
-                    }
-                    return;
-                }
-
-                log::trace!(
-                    "Session {session_short} handle_skip_certificate_reached: broadcasting skip \
-                     cert for slot={slot} ({}B)",
-                    cert_bytes.len(),
-                );
-                // Send certificate to all validators.
-                processor.certs_relayed_counter.increment(1);
-                processor.receiver.send_certificate(tl_cert);
-                // Cache for standstill re-broadcast.
-                processor.receiver.cache_standstill_certificate(
-                    slot.value(),
-                    StandstillCertificateType::Skip,
-                    cert_bytes,
-                );
-            },
-        );
+        }
     }
 
     /// Handle finalization reached event
@@ -10118,8 +9536,18 @@ impl SessionProcessor {
                 }
             };
 
-        // Pre-serialize the relayed + cached cert payload SYNCHRONOUSLY, before posting
-        // the persist (see `handle_notarization_reached` for rationale).
+        // TN-968 wait-for-store guarantee: certificate must be durable before broadcast/cache.
+        if let Err(e) = final_store_result.wait() {
+            log::error!(
+                "Session {} handle_finalization_reached: failed to store final cert slot={}: {e}",
+                &self.session_id().to_hex_string()[..8],
+                event.slot,
+            );
+            self.increment_error();
+            return;
+        }
+
+        // Convert to TL format
         let tl_cert = match event.certificate.to_tl() {
             Ok(cert) => cert,
             Err(e) => {
@@ -10132,8 +9560,35 @@ impl SessionProcessor {
                 return;
             }
         };
-        let cert_bytes = match serialize_boxed(&tl_cert) {
-            Ok(bytes) => bytes,
+
+        // Serialize for broadcast + caching
+        match serialize_boxed(&tl_cert) {
+            Ok(cert_bytes) => {
+                // C++ parity (pool.cpp handle_saved_certificate): relay every newly
+                // accepted certificate to all validators. Dedup is in SimplexState.
+                log::trace!(
+                    "Session {} handle_finalization_reached: \
+                    broadcasting final cert for slot={} ({}B)",
+                    &self.session_id().to_hex_string()[..8],
+                    event.slot,
+                    cert_bytes.len(),
+                );
+                self.certs_relayed_counter.increment(1);
+                self.receiver.send_certificate(tl_cert);
+
+                // Cache per-slot final certificate (for bundle replay)
+                self.receiver.cache_standstill_certificate(
+                    event.slot.value(),
+                    StandstillCertificateType::Final,
+                    cert_bytes.clone(),
+                );
+
+                // Cache last final certificate (always replayed first on standstill)
+                self.receiver.cache_last_final_certificate(event.slot.value(), cert_bytes);
+
+                // Update standstill state (timer + tracked slots range)
+                self.update_standstill_after_final_cert(event.slot);
+            }
             Err(e) => {
                 log::error!(
                     "Session {} handle_finalization_reached: failed to serialize certificate: {}",
@@ -10141,71 +9596,8 @@ impl SessionProcessor {
                     e
                 );
                 self.increment_error();
-                return;
             }
-        };
-
-        // Wait-for-store guarantee: certificate must be durable before broadcast/cache.
-        // Hand the wait off to the SXMAIN async-DB-results registry; the continuation runs
-        // the post-persist work (relay full cert + cache per-slot standstill + cache last final
-        // + update standstill state).
-        //
-        // C++ parity (`pool.cpp::handle_prospective_certificate` -> `handle_saved_certificate`):
-        // persist gates broadcast and the standstill side-effects. `update_standstill_after_final_cert`
-        // also runs in the continuation so the standstill timer + tracked-slots range update happen
-        // only after the cert is durable, matching the pre-migration ordering.
-        let session_short = self.session_id().to_hex_string()[..8].to_string();
-        let slot = event.slot;
-        self.post_async_db_result(
-            "handle_finalization_reached",
-            final_store_result,
-            DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-            move |processor, res| {
-                if let Err(e) = res {
-                    if is_storage_result_already_taken(&e) {
-                        // Redundant FSM re-emission: see `handle_notarization_reached`
-                        // callback for the full rationale. Skip broadcast +
-                        // standstill cache + last-final cache + standstill state
-                        // update without bumping the error counter.
-                        log::trace!(
-                            "Session {session_short} handle_finalization_reached: final cert \
-                             result already consumed for slot={slot} (redundant FSM re-emit, \
-                             skipping broadcast + standstill side-effects)",
-                        );
-                    } else {
-                        log::error!(
-                            "Session {session_short} handle_finalization_reached: failed to \
-                             store final cert slot={slot}: {e}",
-                        );
-                        processor.increment_error();
-                    }
-                    return;
-                }
-
-                // C++ parity (pool.cpp handle_saved_certificate): relay every newly
-                // accepted certificate to all validators. Dedup is in SimplexState.
-                log::trace!(
-                    "Session {session_short} handle_finalization_reached: broadcasting final cert \
-                     for slot={slot} ({}B)",
-                    cert_bytes.len(),
-                );
-                processor.certs_relayed_counter.increment(1);
-                processor.receiver.send_certificate(tl_cert);
-
-                // Cache per-slot final certificate (for bundle replay).
-                processor.receiver.cache_standstill_certificate(
-                    slot.value(),
-                    StandstillCertificateType::Final,
-                    cert_bytes.clone(),
-                );
-
-                // Cache last final certificate (always replayed first on standstill).
-                processor.receiver.cache_last_final_certificate(slot.value(), cert_bytes);
-
-                // Update standstill state (timer + tracked slots range).
-                processor.update_standstill_after_final_cert(slot);
-            },
-        );
+        }
     }
 
     /// Update standstill state after storing a finalization certificate
@@ -10952,43 +10344,7 @@ impl SessionProcessor {
     /// - persists finalized records for restart recovery
     /// - clears per-slot runtime once finalization is materially applied
     ///
-    /// # Persistence semantics
-    ///
-    /// The masterchain persist used to block SXMAIN on `result.wait()` to gate
-    /// the local apply on durability. It now hands the in-flight write to the
-    /// SXMAIN async-DB-results registry via `post_async_db_result(...)` and
-    /// applies the local state immediately, matching how all other simplex DB
-    /// writes were migrated in this PR. The shard branch was already
-    /// fire-and-forget (`save_finalized_block` queues the write and discards
-    /// the result), so this aligns the two paths.
-    ///
-    /// C++ parity (`validator/consensus/simplex/state-resolver.cpp::do_finalize_blocks`):
-    ///   co_await owning_bus().publish<FinalizeBlock>(candidate, sig_set);  // callback
-    ///   ...
-    ///   co_await bus.db->set(std::move(key), td::BufferSlice());           // persist
-    /// C++ runs the listener callback (`accept_block` in `block-accepter.cpp`)
-    /// before persisting the finalization marker — and consensus progress is
-    /// never gated on the DB write completing. The persist exists purely for
-    /// our restart-recovery story; if it later fails, the FSM rebuild from
-    /// saved votes/certs re-derives the finalization on next start.
-    ///
-    /// # Return semantics
-    ///
-    /// * `true`  — local state applied (and, on MC, persist registered with
-    ///             the registry; the actual write completes asynchronously).
-    /// * `false` — synchronous persist registration failed
-    ///             (`save_finalized_block_async` / `save_finalized_block`
-    ///             returned `Err` immediately). In that case the in-memory
-    ///             state was NOT applied and the caller's existing retry
-    ///             mechanism (`finalized_pending_body`) keeps the trigger
-    ///             queued for a later attempt — preserving the pre-migration
-    ///             behavior exercised by
-    ///             `test_finalized_callback_not_emitted_when_finalized_record_persist_fails`.
-    ///
-    /// Asynchronous persist failures (registry continuation observes `Err`)
-    /// log + `increment_error()` only; the in-memory state is already applied
-    /// and there is no useful rollback (consensus has moved on, the FSM
-    /// dedup'd this candidate via `finalized_blocks`).
+    /// Returns `false` when persistence fails and this candidate must be retried.
     fn maybe_apply_finalized_state(
         &mut self,
         finalized_id: &RawCandidateId,
@@ -11029,47 +10385,30 @@ impl SessionProcessor {
         };
 
         if self.description.get_shard().is_masterchain() {
-            // MC path: register the in-flight write with the SXMAIN async-DB-results
-            // registry instead of `wait()`-ing here. The continuation logs the
-            // outcome on Ok and bumps the error counter on Err; in-memory state
-            // is applied below regardless (matches C++ callback-before-persist
-            // ordering — see method-level doc).
-            let result = match self.db.save_finalized_block_async(&record) {
-                Ok(r) => r,
+            match self.db.save_finalized_block_async(&record) {
+                Ok(result) => {
+                    if let Err(e) = result.wait() {
+                        log::error!(
+                            "Session {} maybe_apply_finalized_state: failed to store finalized block for \
+                            slot={}: {e}",
+                            &self.session_id().to_hex_string()[..8],
+                            slot.value(),
+                        );
+                        self.increment_error();
+                        return false;
+                    }
+                }
                 Err(e) => {
                     log::error!(
-                        "Session {} maybe_apply_finalized_state: failed to create finalized \
-                         block save for slot={}: {e}",
+                        "Session {} maybe_apply_finalized_state: failed to create finalized block save for \
+                        slot={}: {e}",
                         &self.session_id().to_hex_string()[..8],
                         slot.value(),
                     );
                     self.increment_error();
                     return false;
                 }
-            };
-
-            let session_short = self.session_id().to_hex_string()[..8].to_string();
-            let slot_v = slot.value();
-            self.post_async_db_result(
-                "maybe_apply_finalized_state",
-                result,
-                DEFAULT_ASYNC_DB_WRITE_TIMEOUT,
-                move |processor, res| match res {
-                    Ok(()) => {
-                        log::trace!(
-                            "Session {session_short} maybe_apply_finalized_state: stored \
-                             finalized block for slot={slot_v}",
-                        );
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Session {session_short} maybe_apply_finalized_state: failed to \
-                             store finalized block for slot={slot_v}: {e}",
-                        );
-                        processor.increment_error();
-                    }
-                },
-            );
+            }
         } else if let Err(e) = self.db.save_finalized_block(&record) {
             log::error!(
                 "Session {} maybe_apply_finalized_state: failed to store finalized block for slot={}: {e}",
@@ -11568,15 +10907,6 @@ impl Drop for SessionProcessor {
 */
 
 impl SessionStartupRecoveryListener for SessionProcessor {
-    fn recovery_begin_startup_replay(&mut self) {
-        log::trace!(
-            target: "startup_recovery",
-            "Session {}: entering startup replay mode",
-            self.session_id().to_hex_string()
-        );
-        self.simplex_state.begin_startup_replay();
-    }
-
     fn recovery_set_first_non_finalized_slot(&mut self, slot: SlotIndex) {
         log::trace!(
             "Session {}: recovery_set_first_non_finalized_slot({})",
@@ -12037,60 +11367,6 @@ impl SessionStartupRecoveryListener for SessionProcessor {
                 &self.session_id().to_hex_string()[..8],
                 slot.value(),
                 &candidate_hash.to_hex_string()[..8],
-                e
-            );
-            self.increment_error();
-        }
-    }
-
-    fn recovery_seed_finalize_certificate(
-        &mut self,
-        slot: SlotIndex,
-        candidate_hash: CandidateHash,
-        certificate: crate::certificate::FinalCertPtr,
-    ) {
-        log::trace!(
-            "Session {}: recovery_seed_finalize_certificate(slot={}, hash={}, sigs={})",
-            self.session_id().to_hex_string(),
-            slot.value(),
-            &candidate_hash.to_hex_string()[..8],
-            certificate.signatures.len()
-        );
-        if let Err(e) = self.simplex_state.set_finalize_certificate(
-            &self.description,
-            slot,
-            &candidate_hash,
-            certificate,
-        ) {
-            log::error!(
-                "Session {}: recovery_seed_finalize_certificate conflict slot={} hash={}: {}",
-                &self.session_id().to_hex_string()[..8],
-                slot.value(),
-                &candidate_hash.to_hex_string()[..8],
-                e
-            );
-            self.increment_error();
-        }
-    }
-
-    fn recovery_seed_skip_certificate(
-        &mut self,
-        slot: SlotIndex,
-        certificate: crate::certificate::SkipCertPtr,
-    ) {
-        log::trace!(
-            "Session {}: recovery_seed_skip_certificate(slot={}, sigs={})",
-            self.session_id().to_hex_string(),
-            slot.value(),
-            certificate.signatures.len(),
-        );
-        if let Err(e) =
-            self.simplex_state.set_skip_certificate(&self.description, slot, certificate)
-        {
-            log::error!(
-                "Session {}: recovery_seed_skip_certificate conflict slot={}: {}",
-                &self.session_id().to_hex_string()[..8],
-                slot.value(),
                 e
             );
             self.increment_error();
