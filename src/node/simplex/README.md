@@ -1,6 +1,6 @@
 # Simplex Consensus Protocol
 
-**Version**: 0.7.0 (April 21, 2026) | [Changelog](CHANGELOG.md)
+**Version**: 0.7.1 (June 9, 2026) | [Changelog](CHANGELOG.md)
 
 Rust implementation of the Simplex consensus protocol for TON blockchain.
 
@@ -8,7 +8,7 @@ Rust implementation of the Simplex consensus protocol for TON blockchain.
 >
 > **Protocol Spec**: [ton-blockchain/simplex-docs](https://github.com/ton-blockchain/simplex-docs) (`Simplex.md`).
 
-> **Current semantics (Apr 2026, v0.7.0):**
+> **Current semantics (Jun 2026, v0.7.1):**
 > - Simplex is finalized-driven.
 > - Finalized blocks are delivered through `on_block_finalized()` and may arrive out of order.
 > - `on_block_committed()` remains part of the shared listener interface for legacy sequential acceptance, but Simplex must not use it.
@@ -20,6 +20,10 @@ Rust implementation of the Simplex consensus protocol for TON blockchain.
 > - Certificates are persisted before any state transition (`CERT-ORDER-1`) and the cert DB schema is unified under `db.key.vote` + `db.cert` matching the C++ `simplex-work` model (`DB-WAIT-ORDER-1`).
 > - `BadSignatureBanState` mirrors C++ `pool.cpp::ban`: vote / cert / broadcast / requestCandidate ingress from a peer is dropped for `bad_signature_ban_duration` after a cert-verify failure (`SIMPLEX-DOS-HARDENING-1`).
 > - Per-session `MetricsHandle` dumps are republished to the global Prometheus recorder via the new `prometheus_publisher` module, with selectable label cardinality through `SessionOptions::prometheus_labels`.
+> - SYNC-CRITICAL DB persists no longer block the SXMAIN consensus thread: `SessionProcessor::post_async_db_result()` registers a one-shot continuation in the `pending_async_db_results` registry, drained from `check_all()` (5 ms re-poll cadence, `DEFAULT_ASYNC_DB_WRITE_TIMEOUT` = 30 s). The in-memory cursor / local state advances synchronously before the persist; the post-persist side effects (vote broadcast, cert relay, caching, recursive finalized walk) run from the continuation, preserving the persist-before-action ordering. Session stop drains the registry and `db.sync()`s before teardown.
+> - Restart recovery replays persisted skip / final certificates and repairs the progress-cursor `available_base` across already-skipped slots before live ingress is accepted; leader-window publication is suppressed until startup replay completes.
+> - Invariant breaches that previously panicked the validator (broken skipscan boundary, duplicate finalized callback per seqno, far-future FinalCert base) now degrade gracefully via bounded fallbacks and idempotent guards.
+> - Block-candidate propagation can optionally move to a dedicated **block-sync overlay** via `SessionOptions::enable_observers` (`SimplexConfig.enable_observers` / ConfigParam 30, default off, C++ #2380 parity). When enabled, candidate broadcasts arriving on the consensus private overlay are dropped at ingress.
 >
 ## Overview
 
@@ -72,7 +76,8 @@ This crate targets wire-compatibility with the upstream **C++ Simplex** implemen
 ### Protocol parity gaps (from C++ upstream)
 
 - External-aware collation pipeline — callback-driven external wait loop. **MEDIUM**
-- DB-CERT-INDEX follow-up: secondary index for `SimplexDb` cert lookups by `candidate_id` / `slot` to keep `load_*_by_id` / `load_skip_cert_by_slot` O(1) after the cert-storage consolidation. Tracked in [TN-1152](https://rsquad-blockchain-lab.atlassian.net/browse/TN-1152) / [NODE-175](https://linear.app/rsquad/issue/NODE-175/db-cert-index-1-secondary-index-for-simplexdb-cert-lookups-by). **MEDIUM**
+- Block-sync overlay (C++ #2380 / #2382) — opt-in via `SessionOptions::enable_observers`; the simplex receiver already drops candidate broadcasts on the consensus overlay and computes the block-sync overlay short id (`compute_block_sync_overlay_short_id`), but the full dedicated-overlay candidate distribution is still being rolled out. **MEDIUM**
+- DB-CERT-INDEX follow-up: secondary index for `SimplexDb` cert lookups by `candidate_id` / `slot` to keep `load_*_by_id` / `load_skip_cert_by_slot` O(1) after the cert-storage consolidation. **MEDIUM**
 
 ### Implementation parity gaps
 
@@ -82,11 +87,16 @@ This crate targets wire-compatibility with the upstream **C++ Simplex** implemen
 
 ### Resolved (for reference)
 
-- Ghost-parent MC collation deadlock — validator-side `StateResolverCache` (in `node/src/validator/state_resolver_cache.rs`) materializes parent states from cached candidate Merkle updates and races them against `engine.wait_state()`. Simplex bridges via `SimplexSession::ensure_candidate_available` and `SessionListener::on_candidate_observed` (`GHOST-PARENT-1` / `TN-1108` / `TN-1112`).
-- Certificate persistence ordering — every cert handler waits for DB persistence before any state transition or network side effect (`CERT-ORDER-1` / `TN-966`).
-- Deterministic vote replay + cert DB unification under `db.key.vote` + `db.cert` matching C++ `simplex-work` (`DB-WAIT-ORDER-1` / `TN-968`).
-- Anti-spam / DOS hardening — bad-signature peer-ban via `BadSignatureBanState` in receiver, ingress drops, and cert-verify-failure → ban (`SIMPLEX-DOS-HARDENING-1` / `TN-1034`).
-- Bootstrap deadlock on speculative MC parent — explicit Simplex session parents, empty-block parity with parent state, MC seqno-lag tolerance in the speculative parent flow (`BOOTSTRAP-DEADLOCK-1` / `TN-1116`).
+- Async DB persistence parity (v0.7.1) — SYNC-CRITICAL persists are handed to the `pending_async_db_results` registry (`post_async_db_result()`) and completed from a `check_all()` continuation instead of blocking SXMAIN on `result.wait()`, matching the C++ db-actor model where the consensus pool and DB actor never gate each other. Persist-before-action ordering preserved.
+- Restart-recovery base repair (v0.7.1) — startup replays persisted skip / final certificates and repairs `available_base` across already-skipped slots before live ingress, suppressing leader-window publication until replay completes.
+- Non-fatal invariant handling (v0.7.1) — skipscan boundary, duplicate finalized callback per seqno, and far-future FinalCert base no longer panic the validator; they degrade via bounded fallbacks / idempotent guards while preserving the C++ fast-path semantics.
+- requestCandidate repair validation (v0.7.1) — repair responses must carry non-empty candidate bytes and a valid slot-leader candidate signature before they are merged into resolver state or served from cache.
+- Shard collation timing parity (v0.7.1) — shard collation dispatches at `slot_start - target_rate` (block utime still `slot_start`) via `compute_collation_timing()`, matching C++ `block-producer.cpp`; masterchain dispatch unchanged.
+- Ghost-parent MC collation deadlock — validator-side `StateResolverCache` (in `node/src/validator/state_resolver_cache.rs`) materializes parent states from cached candidate Merkle updates and races them against `engine.wait_state()`. Simplex bridges via `SimplexSession::ensure_candidate_available` and `SessionListener::on_candidate_observed` (`GHOST-PARENT-1`).
+- Certificate persistence ordering — every cert handler waits for DB persistence before any state transition or network side effect (`CERT-ORDER-1`).
+- Deterministic vote replay + cert DB unification under `db.key.vote` + `db.cert` matching C++ `simplex-work` (`DB-WAIT-ORDER-1`).
+- Anti-spam / DOS hardening — bad-signature peer-ban via `BadSignatureBanState` in receiver, ingress drops, and cert-verify-failure → ban (`SIMPLEX-DOS-HARDENING-1`).
+- Bootstrap deadlock on speculative MC parent — explicit Simplex session parents, empty-block parity with parent state, MC seqno-lag tolerance in the speculative parent flow (`BOOTSTRAP-DEADLOCK-1`).
 
 - Finalized-driven delivery: Simplex delivers through `on_block_finalized()`, matching C++ out-of-order finalized model.
 - Parent gating aligned with C++ flow: `is_wait_for_parent_ready()` mirrors `pool.cpp::maybe_resolve_request()`.
@@ -276,7 +286,7 @@ node/simplex/
 │   ├── block.rs               # Block candidate types: RawCandidateId, Candidate, etc.
 │   ├── certificate.rs         # Certificate types: VoteSignature, Certificate<T> (crate-private)
 │   ├── database.rs            # DB persistence: unified `db.key.vote` + `db.cert` schema for cert-order parity (crate-private)
-│   ├── simplex_state.rs       # Core consensus FSM with event-based output
+│   ├── simplex_state.rs       # Core consensus FSM with event-based output; owns the slot/window diagnostic types (SlotWaitPhase/SlotDiagnostic/WindowDiagnostic)
 │   ├── session.rs             # Session actor (multi-threaded wrapper, task queues, `ensure_candidate_available` bridge)
 │   ├── session_processor.rs   # Integrates SimplexState with network; emits `on_candidate_observed` (crate-private)
 │   ├── session_description.rs # Session constants and validators info (crate-private)
@@ -399,6 +409,8 @@ Single-threaded consensus algorithm (crate-private):
 - ✅ Startup recovery - bootstrap load, vote replay, receiver cache restore, finalized-boundary restoration
 - ✅ Late-join handling - finalized blocks can be known before body arrival via `finalized_pending_body`
 - ✅ Precollation pipeline - `precollate_block()` chains the next slot off the just-produced candidate; the original cross-window concern was superseded by notarized-parent collation mode (see CHANGELOG 0.5.0). Counters: `simplex_precollation_requests`, `simplex_precollation_results`, `simplex_collates_precollated.*`
+- ✅ Async DB persistence registry - SYNC-CRITICAL persists (pool state, our-vote-before-broadcast, the three cert handlers, candidate-info waits, MC finalized record) are handed to `post_async_db_result()` and completed from a `check_all()` continuation (`process_pending_async_db_results()`) instead of blocking SXMAIN on `result.wait()`; cursors / local state advance synchronously before the persist, post-persist side effects run from the continuation, and the registry is drained + `db.sync()`'d on session stop. Metrics: `simplex_async_db_pending_count`, `simplex_async_db_timeout_total`, `simplex_async_db_completion_latency_ms`
+- ✅ Shard collation timing parity - `compute_collation_timing()` dispatches shard collation at `slot_start - target_rate` (block utime stays `slot_start`), matching C++ `block-producer.cpp`; masterchain dispatch unchanged. Per-dispatch INFO `COLLATION_TIMING` log
 
 **Key methods:**
 - `check_all()` - Main loop entry point, calls FSM and processes events
@@ -410,6 +422,7 @@ Single-threaded consensus algorithm (crate-private):
 - `on_vote()` - Handle incoming vote from network
 - `broadcast_vote()` - Sign and send vote via receiver
 - `process_delayed_actions()` - Execute scheduled closures
+- `post_async_db_result()` / `process_pending_async_db_results()` - Register an async DB persist continuation and drain ready ones from `check_all()` (off the SXMAIN `wait()` path)
 - `process_simplex_events()` - Dispatch FSM events to handlers
 - `init_metrics()` - Initialize all metrics for performance tracking
 
@@ -443,6 +456,7 @@ Single-threaded consensus algorithm (crate-private):
 - `simplex_misbehavior` - Counter for detected misbehavior events
 - `simplex_health_warnings` - Counter for health-finding warnings emitted in dumps
 - `simplex_finalized_pending_body_count` - Gauge for finalized blocks waiting for body arrival
+- `simplex_async_db_pending_count` / `simplex_async_db_timeout_total` / `simplex_async_db_completion_latency_ms` - Gauge/counter/histogram for the async DB persist registry (off the SXMAIN `wait()` path)
 
 ### SimplexState (`simplex_state.rs`)
 
@@ -579,6 +593,7 @@ Cryptographic and utility functions:
 | `sign_vote()` | Sign a vote with session-scoped signature |
 | `verify_vote_signature()` | Verify vote signature |
 | `extract_vote()` | Extract FSM vote from TL signed vote |
+| `compute_block_sync_overlay_short_id()` | Compute the block-sync overlay short id from a session id (C++ `block-sync-overlay.cpp` parity; seed excludes the node list) |
 
 **Session-scoped signatures**: All signatures are wrapped with the session ID using `consensus.dataToSign` TL type to prevent cross-session replay attacks.
 
@@ -599,6 +614,7 @@ Cryptographic and utility functions:
 | `collation_retry_timeout` | `Duration` | 1s | Collation retry timeout |
 | `collation_retry_max_attempts` | `u32` | 3 | Max collation retries |
 | `use_callback_thread` | `bool` | true | Use separate callback thread |
+| `enable_observers` | `bool` | false | `SimplexConfig.enable_observers` (ConfigParam 30): route candidate propagation through the dedicated block-sync overlay and drop candidate broadcasts on the consensus overlay |
 
 ## Integration
 
@@ -674,7 +690,7 @@ impl SessionListener for MyListener {
 
 ## Tests
 
-**Total: 428 tests** (406 lib + 16 integration + 6 doc-tests; lib count is a lower-bound — actual `cargo test -p simplex --lib` output as of v0.7.0 reports 487)
+**Total: ~581 tests** (~559 lib + 16 integration + 6 doc-tests; the lib figure is the static `#[test]` count in `node/simplex/src/` as of v0.7.1, up from ~487 reported by `cargo test -p simplex --lib` at v0.7.0)
 
 **Integration tests**: 13 consensus + 1 collation + 1 validation + 1 restart
 
@@ -694,7 +710,7 @@ Multi-instance consensus tests with in-process overlay.
 | `test_simplex_consensus_shard_with_mc_notifications` | MC finalization forwarding to shards | ✅ |
 | `test_simplex_consensus_adnl_overlay` | ADNL overlay-based consensus | ✅ |
 | `test_simplex_consensus_adnl_net_gremlin` | ADNL net gremlin (packet loss/delay simulation) | ✅ |
-| `test_simplex_consensus_restart_gremlin` | Restart gremlin (stop/restart with DB persistence) | ✅ (residual flakiness tracked in [TN-1085](https://rsquad-blockchain-lab.atlassian.net/browse/TN-1085) / [NODE-136](https://linear.app/rsquad/issue/NODE-136/simplex-restart-gremlin-stability-1-fix-timeout-in-test-simplex)) |
+| `test_simplex_consensus_restart_gremlin` | Restart gremlin (stop/restart with DB persistence) | ✅ (residual flakiness tracked separately) |
 | `test_simplex_consensus_candidate_chaining` | Candidate chaining within leader windows | ✅ |
 | `test_simplex_consensus_candidate_chaining_with_lossy_overlay` | Candidate chaining with packet loss | ✅ |
 | `test_simplex_start_gate` | Session start gate (create/start separation) | ✅ |
@@ -815,6 +831,7 @@ TL schema messages from `tl/ton_api/tl/ton_api.tl`:
 | `consensus.simplex.certificate` | Vote + signatures (for queries) |
 | `consensus.simplex.candidateAndCert` | Candidate + notarization cert (query response) |
 | `consensus.simplex.requestCandidate` | Query for missing candidate (RPC) |
+| `consensus.blockSyncOverlayId` | Block-sync overlay seed (session_id only) for `enable_observers` |
 
 ### Signature Scheme
 
@@ -862,6 +879,7 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_collation_starts` | Unified collation entry attempts across async, retry, precollated, and empty-block paths | `check_collation()`, `invoke_collation()`, `invoke_collation_retry()` |
 | `simplex_precollation_requests` | Precollation requests sent | `invoke_precollation()` |
 | `simplex_precollation_results` | Precollation results received | `precollation_result()` |
+| `simplex_async_db_timeout_total` | Async DB persist continuations that hit their deadline | `process_pending_async_db_results()` |
 
 #### ResultStatusCounters (auto-generate `.total`/`.success`/`.failure`)
 
@@ -884,6 +902,7 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_finalized_pending_body_count` | Finalized blocks waiting for body arrival | `handle_block_finalized()`, cleanup, materialization |
 | `simplex_first_non_finalized_slot` | First non-finalized slot (FSM) | `check_all()` |
 | `simplex_first_non_progressed_slot` | First non-progressed slot (FSM) | `check_all()` |
+| `simplex_async_db_pending_count` | In-flight async DB persist continuations | `process_pending_async_db_results()` |
 
 #### Histograms
 
@@ -897,6 +916,7 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `time:slot_stage2_notarized_latency` | ms | Slot start to first notarize vote |
 | `time:slot_stage3_finalized_latency` | ms | Slot start to first finalize vote |
 | `simplex_batch_commit_size` | count | Blocks applied per finalized batch (legacy metric name) |
+| `simplex_async_db_completion_latency_ms` | ms | Async DB persist continuation completion latency |
 
 #### Receiver Counters
 
@@ -920,6 +940,7 @@ All metrics use the `simplex_` prefix. Latency histograms use `time:` prefix (va
 | `simplex_standstill_triggers` | Standstill detection triggers |
 | `simplex_standstill_votes_rebroadcast` | Votes rebroadcast on standstill |
 | `simplex_standstill_certs_rebroadcast` | Certs rebroadcast on standstill |
+| `simplex_receiver_in_broadcasts_dropped_observers` | Candidate broadcasts dropped on the consensus overlay when `enable_observers` routes candidates through the block-sync overlay |
 
 ### Derivative Metrics
 
@@ -1130,6 +1151,7 @@ Names below omit the `ton_node_simplex_` prefix and the labels.
 - `finalized_pending_body_count`
 - `health_warnings`, `errors`, `misbehavior`, `skip_total`,
   `batch_commits`
+- `async_db_pending_count`, `async_db_timeout_total`
 
 **Latency histograms flattened to `*_avg` / `*_med` / `*_min` / `*_max` / `*_cnt` / `*_last` (session)**
 
@@ -1138,11 +1160,13 @@ Names below omit the `ton_node_simplex_` prefix and the labels.
 - `validation_latency`, `collation_latency`,
   `broadcast_validation_latency`
 - `batch_commit_size` (count, not time)
+- `async_db_completion_latency_ms`
 
 **Receiver counters (receiver thread)**
 
 - `receiver_in_messages_count`, `receiver_out_messages_count`
 - `receiver_in_broadcasts_count`, `receiver_out_broadcasts_count`
+- `receiver_in_broadcasts_dropped_observers`
 - `receiver_in_queries_count`
 - `receiver_in_messages_bytes`, `receiver_out_messages_bytes`
 - `receiver_in_broadcasts_bytes`, `receiver_out_broadcasts_bytes`

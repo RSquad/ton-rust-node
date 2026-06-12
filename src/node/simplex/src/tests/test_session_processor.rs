@@ -698,6 +698,34 @@ impl TestFixture {
     fn drain_receiver_actions(&self) -> Vec<ReceiverAction> {
         self.receiver.drain_actions()
     }
+
+    /// Drain `pending_async_db_results` by polling the registry while the
+    /// background storage thread flushes in-flight writes. Used by tests that
+    /// exercise `*_async()` continuations migrated to the SXMAIN async-DB-results
+    /// registry — without this, post-persist side-effects (broadcast, cache,
+    /// standstill update) would not have run by the time the test asserts on
+    /// receiver actions.
+    fn drain_pending_async_db_results(&mut self) {
+        for _ in 0..200 {
+            self.processor.process_pending_async_db_results();
+            if self.processor.pending_async_db_results.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 200 polls * 5 ms = ~1 s budget (orders of magnitude above the observed
+        // continuation latency). If anything is still queued, a registered
+        // continuation never completed — fail loudly instead of letting the test
+        // assert against half-applied side-effects (the original `break` silently
+        // hid such stalls).
+        assert!(
+            self.processor.pending_async_db_results.is_empty(),
+            "drain_pending_async_db_results: {} entr{} still pending after 200 polls (~1s); \
+             a registered continuation never completed",
+            self.processor.pending_async_db_results.len(),
+            if self.processor.pending_async_db_results.len() == 1 { "y" } else { "ies" },
+        );
+    }
 }
 
 fn metrics_counter(processor: &SessionProcessor, name: &str) -> u64 {
@@ -1237,6 +1265,9 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 
     // First application should store + relay + cache
     fixture.processor.on_certificate(1, tl_cert.clone());
+    // SXMAIN async-DB-results registry: drain so the skip persist continuation runs
+    // (relay + cache happen in the continuation post-migration).
+    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     let send_cert_count =
@@ -1265,6 +1296,7 @@ fn test_on_certificate_relays_and_caches_skip_certificate_once() {
 
     // Second application should be ignored (already have skip certificate), so no relay/caching
     fixture.processor.on_certificate(1, tl_cert);
+    fixture.drain_pending_async_db_results();
     let actions2 = fixture.drain_receiver_actions();
     assert!(
         !actions2.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
@@ -1286,6 +1318,8 @@ fn test_future_certificate_is_not_rejected_like_cpp() {
         build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, slot, &[0, 1, 2]);
 
     fixture.processor.on_certificate(1, tl_cert);
+    // Skip persist + relay are async (registry continuation); drain before asserting.
+    fixture.drain_pending_async_db_results();
 
     assert!(
         fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(slot)),
@@ -1409,6 +1443,9 @@ fn test_handle_finalization_reached_caches_final_certificate_for_standstill() {
 
     fixture.processor.handle_finalization_reached(event);
 
+    // Persist + cache + relay are async (registry continuation); drain before asserting.
+    fixture.drain_pending_async_db_results();
+
     let actions = fixture.drain_receiver_actions();
     assert!(
         actions.iter().any(|a| matches!(
@@ -1448,6 +1485,10 @@ fn test_handle_notarization_reached_persists_before_relay() {
 
     fixture.processor.handle_notarization_reached(event);
 
+    // Drain the SXMAIN async-DB-results registry: storage thread completes the
+    // notar persist, registry continuation runs broadcast + cache.
+    fixture.drain_pending_async_db_results();
+
     assert!(
         fixture
             .processor
@@ -1455,7 +1496,7 @@ fn test_handle_notarization_reached_persists_before_relay() {
             .load_notar_cert_by_id(&candidate_id, Duration::from_secs(1))
             .expect("notar cert lookup must succeed")
             .is_some(),
-        "notar cert must be persisted in DB by the time handler returns"
+        "notar cert must be persisted in DB after the registry continuation runs"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -1484,6 +1525,10 @@ fn test_handle_finalization_reached_persists_before_relay() {
 
     fixture.processor.handle_finalization_reached(event);
 
+    // Drain the SXMAIN async-DB-results registry: storage thread completes the
+    // final persist, registry continuation runs broadcast + cache + standstill update.
+    fixture.drain_pending_async_db_results();
+
     assert!(
         fixture
             .processor
@@ -1491,7 +1536,7 @@ fn test_handle_finalization_reached_persists_before_relay() {
             .load_final_cert_by_id(&candidate_id, Duration::from_secs(1))
             .expect("final cert lookup must succeed")
             .is_some(),
-        "final cert must be persisted in DB by the time handler returns"
+        "final cert must be persisted in DB after the registry continuation runs"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -1517,6 +1562,10 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
 
     fixture.processor.handle_skip_certificate_reached(event);
 
+    // Drain the SXMAIN async-DB-results registry: storage thread completes the
+    // skip persist, registry continuation runs broadcast + cache.
+    fixture.drain_pending_async_db_results();
+
     assert!(
         fixture
             .processor
@@ -1524,7 +1573,7 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
             .load_skip_cert_by_slot(slot, Duration::from_secs(1))
             .expect("skip cert lookup must succeed")
             .is_some(),
-        "skip cert must be persisted in DB by the time handler returns"
+        "skip cert must be persisted in DB after the registry continuation runs"
     );
 
     let actions = fixture.drain_receiver_actions();
@@ -4903,6 +4952,7 @@ fn test_foreign_notarization_cert_is_relayed() {
     };
 
     fixture.processor.handle_notarization_reached(event);
+    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     assert!(
@@ -4935,6 +4985,7 @@ fn test_foreign_finalization_cert_is_relayed() {
     };
 
     fixture.processor.handle_finalization_reached(event);
+    fixture.drain_pending_async_db_results();
 
     let actions = fixture.drain_receiver_actions();
     assert!(
@@ -5166,15 +5217,32 @@ fn test_finalized_callback_not_emitted_when_finalized_record_persist_fails() {
     );
 }
 
+/// Finalized-record persist now happens asynchronously through the SXMAIN
+/// async-DB-results registry (`maybe_apply_finalized_state` migration). The
+/// listener callback fires before the persist completes — matching C++
+/// `state-resolver.cpp::do_finalize_blocks`:
+///
+/// ```text
+///   co_await owning_bus().publish<FinalizeBlock>(candidate, sig_set);  // callback
+///   ...
+///   co_await bus.db->set(std::move(key), td::BufferSlice());           // persist
+/// ```
+///
+/// This test verifies the new ordering invariants:
+/// 1. The `on_block_finalized` callback fires (immediately, with the in-memory
+///    state already applied).
+/// 2. The finalized record is eventually durable in the DB after the SXMAIN
+///    registry continuation drains and the storage queue flushes.
 #[test]
-fn test_finalized_callback_observes_persisted_record() {
-    struct PersistOrderListener {
+fn test_finalized_callback_fires_then_record_eventually_persists() {
+    struct CallbackTracker {
         db: crate::database::SimplexDbPtr,
         candidate_id: RawCandidateId,
-        persisted_visible: Arc<AtomicBool>,
+        callback_invoked: Arc<AtomicBool>,
+        persisted_visible_during_callback: Arc<AtomicBool>,
     }
 
-    impl consensus_common::SessionListener for PersistOrderListener {
+    impl consensus_common::SessionListener for CallbackTracker {
         fn on_candidate(
             &self,
             _source_info: BlockSourceInfo,
@@ -5221,15 +5289,17 @@ fn test_finalized_callback_observes_persisted_record() {
             _signatures: BlockSignaturesVariant,
             _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
         ) {
+            self.callback_invoked.store(true, Ordering::Relaxed);
+            // Snapshot DB visibility at callback time — informational only.
+            // The new ordering does NOT guarantee the record is persisted yet
+            // (matches C++ which `co_await`s FinalizeBlock before db->set).
             let has_record = self
                 .db
                 .load_finalized_blocks()
                 .expect("finalized records load must succeed")
                 .iter()
                 .any(|record| record.candidate_id == self.candidate_id);
-            if has_record {
-                self.persisted_visible.store(true, Ordering::Relaxed);
-            }
+            self.persisted_visible_during_callback.store(has_record, Ordering::Relaxed);
         }
 
         fn get_approved_candidate(
@@ -5241,7 +5311,7 @@ fn test_finalized_callback_observes_persisted_record() {
             _callback: ValidatorBlockCandidateCallback,
         ) {
             panic!(
-                "unexpected legacy get_approved_candidate request in PersistOrderListener (root_hash={})",
+                "unexpected legacy get_approved_candidate request in CallbackTracker (root_hash={})",
                 root_hash.to_hex_string()
             );
         }
@@ -5261,12 +5331,14 @@ fn test_finalized_callback_observes_persisted_record() {
         .expect("candidate must exist")
         .clone();
 
-    let persisted_visible = Arc::new(AtomicBool::new(false));
+    let callback_invoked = Arc::new(AtomicBool::new(false));
+    let persisted_visible_during_callback = Arc::new(AtomicBool::new(false));
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> =
-        Arc::new(PersistOrderListener {
+        Arc::new(CallbackTracker {
             db: fixture.processor.db.clone(),
             candidate_id: candidate_id.clone(),
-            persisted_visible: persisted_visible.clone(),
+            callback_invoked: callback_invoked.clone(),
+            persisted_visible_during_callback: persisted_visible_during_callback.clone(),
         });
     fixture.processor.listener = Arc::downgrade(&listener);
 
@@ -5278,8 +5350,30 @@ fn test_finalized_callback_observes_persisted_record() {
     });
 
     assert!(
-        persisted_visible.load(Ordering::Relaxed),
-        "on_block_finalized callback must observe persisted finalized record"
+        callback_invoked.load(Ordering::Relaxed),
+        "on_block_finalized callback must fire (state applied inline before persist)",
+    );
+    assert!(
+        fixture.processor.finalized_blocks.contains(&candidate_id),
+        "finalized_blocks must contain the candidate after the inline apply",
+    );
+    let _ = persisted_visible_during_callback.load(Ordering::Relaxed);
+
+    // Drain the SXMAIN async-DB-results registry so the persist continuation
+    // runs, then sync the storage queue to flush the actual RocksDB write.
+    fixture.drain_pending_async_db_results();
+    fixture.processor.db.sync(Some(Duration::from_secs(2))).expect("sync must succeed");
+
+    let persisted_visible_after = fixture
+        .processor
+        .db
+        .load_finalized_blocks()
+        .expect("finalized records load must succeed")
+        .iter()
+        .any(|record| record.candidate_id == candidate_id);
+    assert!(
+        persisted_visible_after,
+        "finalized record must be visible in DB once registry drains and storage flushes",
     );
 }
 
@@ -5761,6 +5855,10 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
         &[0, 1, 2],
     );
     fixture.processor.process_received_notar_cert(parent_id.slot, &parent_id.hash, &notar_bytes);
+    // Notar-cert persist + FSM feed + retry_pending_recursive_finalization() now run from
+    // the SXMAIN async-DB-results registry continuation; drain so the recursive retry fires
+    // before we assert on its observable side-effects.
+    fixture.drain_pending_async_db_results();
 
     let finalized_events = drain_finalized_events(&recording);
     assert_eq!(finalized_events.len(), 1);
@@ -6075,36 +6173,101 @@ fn test_recursive_finalization_applied_top_floor_skips_older_ancestor_callbacks(
     );
 }
 
+// ============================================================================
+// `ensure_candidate_info_stored` — direct-API tests
+// ============================================================================
+//
+// These tests target `ensure_candidate_info_stored` directly to verify the three
+// completion paths (Ok inline, Err inline for missing entry, Ok via deferred
+// continuation). End-to-end coverage of the per-caller wiring lives further down
+// next to `broadcast_vote` / `process_received_notar_cert` / `process_validated_candidates`.
+
+/// Capture the `Result<()>` argument the callback receives, so tests can assert
+/// on the outcome after the call returns (inline) or after the registry drains
+/// (deferred). `None` means the callback hasn't fired yet.
+type EnsureCallbackOutcome = Arc<Mutex<Option<std::result::Result<(), String>>>>;
+
+/// Build an `EnsureCallbackOutcome` and a closure suitable for passing to
+/// `ensure_candidate_info_stored`. The closure stores `Ok(())` / `Err(msg)`
+/// into the shared cell; `msg` is the `Display`-formatted error so we don't
+/// have to clone failure errors.
+fn make_ensure_callback() -> (
+    EnsureCallbackOutcome,
+    impl FnOnce(&mut SessionProcessor, ton_block::Result<()>) + Send + 'static,
+) {
+    let outcome: EnsureCallbackOutcome = Arc::new(Mutex::new(None));
+    let outcome_for_cb = outcome.clone();
+    let cb = move |_processor: &mut SessionProcessor, res: ton_block::Result<()>| {
+        let stored = match res {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+        *outcome_for_cb.lock().unwrap() = Some(stored);
+    };
+    (outcome, cb)
+}
+
+/// Missing dedup-map entry → callback fires inline with `Err(...)` and the
+/// session error counter is bumped.
 #[test]
-fn test_wait_candidate_info_stored_returns_false_when_missing_entry() {
+fn test_ensure_candidate_info_stored_callback_fires_inline_with_err_when_missing() {
     let mut fixture = TestFixture::new(4);
     let candidate_id = RawCandidateId { slot: SlotIndex::new(77), hash: UInt256::rand() };
     let errors_before =
         fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
 
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire inline");
+    let err = captured.expect_err("missing candidateInfo entry must surface as Err");
     assert!(
-        !fixture.processor.wait_candidate_info_stored(&candidate_id, true, false),
-        "missing candidateInfo wait must report failure"
+        err.contains("missing candidateInfo store result"),
+        "Err must describe the missing prerequisite, got: {err}",
     );
 
     let errors_after =
         fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         errors_after > errors_before,
-        "missing candidateInfo wait must increment error counter"
+        "missing candidateInfo path must increment error counter (matches abort semantics)",
     );
 }
 
+/// Persisted candidateInfo → callback fires inline with `Ok(())` and the DB is
+/// queryable. No deferred entry is registered.
 #[test]
-fn test_wait_candidate_info_stored_returns_true_when_candidate_info_is_persisted() {
+fn test_ensure_candidate_info_stored_callback_fires_inline_with_ok_when_persisted() {
     let mut fixture = TestFixture::new(4);
     let (leader_source, candidate_id, broadcast) =
         make_signed_block_broadcast(&fixture, 78, vec![1, 2, 3, 4]);
     fixture.processor.on_candidate_received(leader_source, broadcast, None);
 
-    assert!(
-        fixture.processor.wait_candidate_info_stored(&candidate_id, true, false),
-        "persisted candidateInfo must satisfy wait"
+    // Wait for the storage thread to flush the candidateInfo write so the dedup-map
+    // entry's `is_ready()` is true at the time we call `ensure_*`.
+    for _ in 0..200 {
+        let res = fixture
+            .processor
+            .candidate_info_store_results
+            .get(&candidate_id)
+            .expect("save_candidate_info_async must register a dedup-map entry")
+            .clone();
+        if res.is_ready() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let pending_before = fixture.processor.pending_async_db_results.len();
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire inline");
+    captured.expect("inline-Ready callback must surface Ok(())");
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        pending_before,
+        "inline-Ready path must NOT register a deferred entry in the registry",
     );
     assert!(
         fixture
@@ -6113,7 +6276,94 @@ fn test_wait_candidate_info_stored_returns_true_when_candidate_info_is_persisted
             .load_candidate_info_by_id(&candidate_id, Duration::from_secs(1))
             .expect("candidate info lookup must succeed")
             .is_some(),
-        "candidateInfo must be present in DB"
+        "candidateInfo must be present in DB",
+    );
+}
+
+/// In-flight candidateInfo → callback is deferred via the SXMAIN async-DB-results
+/// registry; firing the registry drain only after completing the underlying
+/// result actually invokes the callback.
+#[test]
+fn test_ensure_candidate_info_stored_callback_is_deferred_when_in_flight() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(79), hash: UInt256::rand() };
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.candidate_info_store_results.insert(candidate_id.clone(), pending.clone());
+
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    assert!(
+        outcome.lock().unwrap().is_none(),
+        "callback must NOT fire while the underlying result is still in flight",
+    );
+    let pending_entries: Vec<_> =
+        fixture.processor.pending_async_db_results.iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"ensure_candidate_info_stored:candidate_info"),
+        "deferred path must register a registry entry with the candidate_info op label, \
+         got entries: {pending_entries:?}",
+    );
+
+    // Complete + drain → callback fires with Ok(()).
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire after drain");
+    captured.expect("deferred Ok must surface Ok(())");
+}
+
+/// Deferred path with a real storage error must surface `Err(...)` to the
+/// callback and bump the session error counter from inside the registry
+/// continuation (matches the inline-Err semantic).
+#[test]
+fn test_ensure_candidate_info_stored_callback_surfaces_err_from_deferred_failure() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(80), hash: UInt256::rand() };
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.candidate_info_store_results.insert(candidate_id.clone(), pending.clone());
+
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, true, false, cb);
+
+    pending.complete_err("disk_unavailable");
+    fixture.processor.process_pending_async_db_results();
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire after drain");
+    let err = captured.expect_err("deferred Err must surface Err");
+    assert!(
+        err.contains("disk_unavailable"),
+        "Err message must propagate from the storage layer, got: {err}",
+    );
+    let errors_after =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        errors_after > errors_before,
+        "deferred-failure path must increment the session error counter from the continuation",
+    );
+}
+
+/// `wait_candidate_info=false && wait_notar_cert=false` → callback fires inline
+/// with `Ok(())` and nothing is registered. Lets callers (e.g., a future wrapper
+/// for `SkipVote`) avoid a special case in their own code.
+#[test]
+fn test_ensure_candidate_info_stored_callback_fires_inline_with_ok_when_no_wait_requested() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(81), hash: UInt256::rand() };
+    let pending_before = fixture.processor.pending_async_db_results.len();
+
+    let (outcome, cb) = make_ensure_callback();
+    fixture.processor.ensure_candidate_info_stored(&candidate_id, false, false, cb);
+
+    let captured = outcome.lock().unwrap().clone().expect("callback must fire inline");
+    captured.expect("no-wait path must surface Ok(())");
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        pending_before,
+        "no-wait path must NOT register a deferred entry",
     );
 }
 
@@ -6183,6 +6433,77 @@ fn test_broadcast_skip_vote_bypasses_durability_wait() {
         metrics_counter(&fixture.processor, "simplex_votes_out_persist_fail"),
         persist_fail_before,
         "skip vote path must not increment persist-failure counter"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// `persist_our_vote_before_broadcast` migration to the async-DB-results registry.
+// ----------------------------------------------------------------------------
+//
+// C++ parity: `pool.cpp::handle(BroadcastVote)` publishes `OutgoingProtocolMessage`
+// while `db.cpp::process(BroadcastVote)` persists in a separate actor — the persist
+// `co_await` does NOT gate the broadcast. After this migration, the Rust runtime
+// behaves the same way: `broadcast_vote()` calls `receiver.send_vote(...)` immediately
+// after registering the persist with the async-DB-results registry, instead of parking
+// SXMAIN on `result.wait()`.
+
+/// `broadcast_vote` must register vote persist asynchronously and proceed with the
+/// network send immediately, matching C++ where pool's broadcast publish is not
+/// gated on db's `co_await db->set(...)`.
+#[test]
+fn test_broadcast_vote_registers_async_persist_and_sends_immediately() {
+    let mut fixture = TestFixture::new(4);
+    // Skip votes bypass the (still-synchronous) `wait_candidate_info_stored` path,
+    // so this test isolates the slice-1 (vote-persist) migration.
+    let slot = SlotIndex::new(123);
+    let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote { slot });
+
+    let pending_before = fixture.processor.pending_async_db_results.len();
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    fixture.processor.broadcast_vote(vote);
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote must be sent without blocking on persist completion",
+    );
+
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        pending_before + 1,
+        "persist_our_vote_before_broadcast must register exactly one pending entry",
+    );
+    let entry = fixture
+        .processor
+        .pending_async_db_results
+        .last()
+        .expect("pending entry must exist after broadcast_vote");
+    assert_eq!(
+        entry.op_label, "persist_our_vote_before_broadcast",
+        "pending entry must carry the op label for diagnostics",
+    );
+
+    // Drain the registry — the real RocksDB write completes on the storage thread.
+    // Allow a few polls for the background storage thread to flush.
+    for _ in 0..200 {
+        fixture.processor.process_pending_async_db_results();
+        if fixture.processor.pending_async_db_results.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        0,
+        "registry must drain after the storage thread confirms the write",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful vote persist must not bump the error counter",
     );
 }
 
@@ -6290,6 +6611,14 @@ fn test_process_validated_candidates_before_fsm_timeout() {
 
     // --- Correct order (Fix A): feed candidates, THEN run FSM timeouts ---
     fixture.processor.process_validated_candidates();
+    // `process_validated_candidates()` routes the FSM feed through
+    // `ensure_candidate_info_stored()`: while the candidateInfo persist is still
+    // in flight on the background storage thread, the feed is deferred to the
+    // SXMAIN async-DB-results registry instead of running inline. Drain the
+    // registry so the candidate is fed to the FSM *before* the timeout is
+    // evaluated below; without this the feed races the storage write and the
+    // slot is skip-voted first (the flaky failure this test guards against).
+    fixture.drain_pending_async_db_results();
     fixture.processor.simplex_state.check_all(&fixture.description);
 
     // Collect FSM events produced by the two calls above.
@@ -7362,3 +7691,1227 @@ fn test_mc_walk_stops_after_cert_consumed_by_non_empty_block() {
 // ============================================================================
 // Standstill parity: certificate acceptance feedback
 // =====================================================================
+
+// ============================================================================
+// Pending async DB results registry
+// ============================================================================
+//
+// Cover `post_async_db_result()` / `process_pending_async_db_results()` and
+// the `pending_async_db_results` field on `SessionProcessor`. The registry
+// lets callers register an in-flight `*_async()` DB result with a one-shot
+// continuation that is invoked on completion (or timeout) from `check_all()`,
+// without blocking SXMAIN on `wait()`.
+
+/// Deterministic `StorageAsyncResult<()>` test stub. Starts pending; tests
+/// flip it to Ok / Err via `complete_*()` to exercise the registry.
+struct ManualAsyncResult {
+    state: Mutex<Option<ton_block::Result<()>>>,
+}
+
+impl ManualAsyncResult {
+    fn pending() -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(None) })
+    }
+
+    fn complete_ok(self: &Arc<Self>) {
+        *self.state.lock().unwrap() = Some(Ok(()));
+    }
+
+    fn complete_err(self: &Arc<Self>, msg: &str) {
+        *self.state.lock().unwrap() = Some(Err(error!("{}", msg)));
+    }
+
+    /// Inject the typed [`StorageResultAlreadyTaken`] sentinel — the same
+    /// value that `StorageAsyncResultImpl::{try_get, wait_timeout}` emit when
+    /// the inner result was consumed by a prior caller. Used by the
+    /// "redundant FSM re-emit" regression tests so they exercise the real
+    /// `downcast_ref` detection path used by the cert callbacks instead of
+    /// stringly comparing error messages.
+    fn complete_taken_sentinel(self: &Arc<Self>) {
+        *self.state.lock().unwrap() = Some(Err(consensus_common::StorageResultAlreadyTaken.into()));
+    }
+}
+
+impl consensus_common::StorageAsyncResult<()> for ManualAsyncResult {
+    fn is_ready(&self) -> bool {
+        self.state.lock().unwrap().is_some()
+    }
+
+    fn try_get(&self) -> Option<ton_block::Result<()>> {
+        self.state.lock().unwrap().take()
+    }
+
+    fn wait_timeout(&self, _: Duration) -> Option<ton_block::Result<()>> {
+        self.try_get()
+    }
+}
+
+/// Ready-then-Ok callback fires once and removes the entry.
+#[test]
+fn test_post_async_db_result_invokes_ok_callback_when_ready() {
+    let mut fixture = TestFixture::new(4);
+    let result = ManualAsyncResult::pending();
+
+    let outcome = Arc::new(Mutex::new(None::<bool>));
+    let outcome_cb = outcome.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_ok",
+        result.clone(),
+        Duration::from_secs(60),
+        move |_processor, res| {
+            *outcome_cb.lock().unwrap() = Some(res.is_ok());
+        },
+    );
+
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 1);
+
+    // Drain while pending: callback must NOT fire.
+    fixture.processor.process_pending_async_db_results();
+    assert!(outcome.lock().unwrap().is_none(), "callback must not fire while pending");
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 1);
+
+    // Complete and re-drain: callback fires with Ok and entry is removed.
+    result.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    assert_eq!(*outcome.lock().unwrap(), Some(true), "callback must observe Ok");
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 0);
+}
+
+/// Storage Err propagates verbatim to the continuation.
+#[test]
+fn test_post_async_db_result_propagates_storage_error() {
+    let mut fixture = TestFixture::new(4);
+    let result = ManualAsyncResult::pending();
+
+    let captured = Arc::new(Mutex::new(None::<String>));
+    let captured_cb = captured.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_err",
+        result.clone(),
+        Duration::from_secs(60),
+        move |_processor, res| match res {
+            Ok(()) => panic!("expected error from storage layer"),
+            Err(e) => *captured_cb.lock().unwrap() = Some(e.to_string()),
+        },
+    );
+
+    result.complete_err("disk_full");
+    fixture.processor.process_pending_async_db_results();
+
+    let msg = captured.lock().unwrap().clone().expect("callback must fire");
+    assert!(msg.contains("disk_full"), "error message must reach the continuation: {msg}");
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 0);
+}
+
+/// Deadline elapsed while still pending: continuation receives `Err(...timed out...)`
+/// and the timeout counter increments.
+#[test]
+fn test_post_async_db_result_times_out_when_deadline_passes() {
+    let mut fixture = TestFixture::new(4);
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fixture.processor.set_time(base_time);
+
+    let result = ManualAsyncResult::pending();
+    let outcome = Arc::new(Mutex::new(None::<String>));
+    let outcome_cb = outcome.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_timeout",
+        result.clone(),
+        Duration::from_millis(500),
+        move |_processor, res| match res {
+            Ok(()) => panic!("expected timeout error"),
+            Err(e) => *outcome_cb.lock().unwrap() = Some(e.to_string()),
+        },
+    );
+
+    let timeouts_before = metrics_counter(&fixture.processor, "simplex_async_db_timeout_total");
+
+    // Within deadline: callback must NOT fire.
+    fixture.advance_time(Duration::from_millis(100));
+    fixture.processor.process_pending_async_db_results();
+    assert!(outcome.lock().unwrap().is_none(), "callback must not fire before deadline");
+
+    // Past deadline (> 500ms total): callback fires with Err timeout.
+    fixture.advance_time(Duration::from_millis(500));
+    fixture.processor.process_pending_async_db_results();
+    let msg = outcome.lock().unwrap().clone().expect("callback must fire on timeout");
+    assert!(msg.contains("test_timeout"), "label must appear in timeout error: {msg}");
+    assert!(msg.contains("timed out"), "timeout error must mention 'timed out': {msg}");
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 0);
+    assert_eq!(
+        metrics_counter(&fixture.processor, "simplex_async_db_timeout_total"),
+        timeouts_before + 1,
+        "timeout counter must increment exactly once"
+    );
+}
+
+/// Pending entry causes `next_awake_time` to be advanced to `now + ASYNC_DB_POLL_DELAY`.
+#[test]
+fn test_post_async_db_result_pending_schedules_next_awake() {
+    let mut fixture = TestFixture::new(4);
+    let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fixture.processor.set_time(base_time);
+
+    let result = ManualAsyncResult::pending();
+    fixture.processor.post_async_db_result(
+        "test_awake",
+        result,
+        Duration::from_secs(60),
+        |_processor, _res| {},
+    );
+
+    fixture.processor.reset_next_awake_time();
+    let before = fixture.processor.get_next_awake_time();
+    fixture.processor.process_pending_async_db_results();
+    let after = fixture.processor.get_next_awake_time();
+    assert!(
+        after <= base_time + Duration::from_millis(5),
+        "pending entry must schedule wake at <= now + ASYNC_DB_POLL_DELAY (5ms); got after={:?} before={:?}",
+        after,
+        before,
+    );
+}
+
+/// Continuations may register new pending entries; ready ones are drained by
+/// the same loop pass (matching `process_delayed_actions()` semantics). Pending
+/// continuation registrations stay in the queue for the next `check_all()` pass.
+#[test]
+fn test_pending_async_db_results_drains_chained_ready_continuations_in_one_pass() {
+    let mut fixture = TestFixture::new(4);
+    let outer = ManualAsyncResult::pending();
+    let ready_inner = ManualAsyncResult::pending();
+    ready_inner.complete_ok();
+    let pending_inner = ManualAsyncResult::pending();
+
+    let ready_inner_cb = ready_inner.clone();
+    let pending_inner_cb = pending_inner.clone();
+    let ready_called = Arc::new(AtomicBool::new(false));
+    let pending_called = Arc::new(AtomicBool::new(false));
+    let ready_called_for_cb = ready_called.clone();
+    let pending_called_for_cb = pending_called.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_outer",
+        outer.clone(),
+        Duration::from_secs(60),
+        move |processor, _res| {
+            let ready_cb = ready_called_for_cb.clone();
+            processor.post_async_db_result(
+                "test_inner_ready",
+                ready_inner_cb,
+                Duration::from_secs(60),
+                move |_p, _r| {
+                    ready_cb.store(true, Ordering::SeqCst);
+                },
+            );
+            let pending_cb = pending_called_for_cb.clone();
+            processor.post_async_db_result(
+                "test_inner_pending",
+                pending_inner_cb,
+                Duration::from_secs(60),
+                move |_p, _r| {
+                    pending_cb.store(true, Ordering::SeqCst);
+                },
+            );
+        },
+    );
+
+    outer.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    assert!(
+        ready_called.load(Ordering::SeqCst),
+        "ready continuation registered inside callback must drain in same pass"
+    );
+    assert!(!pending_called.load(Ordering::SeqCst), "pending continuation must wait");
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        1,
+        "only the still-pending continuation entry must remain queued",
+    );
+
+    pending_inner.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    assert!(pending_called.load(Ordering::SeqCst), "pending continuation must fire on next pass");
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 0);
+}
+
+// ----------------------------------------------------------------------------
+// `maybe_store_pool_state` migration to the async-DB-results registry.
+// ----------------------------------------------------------------------------
+
+/// When the FSM has not crossed the next leader window yet, `maybe_store_pool_state`
+/// must be a no-op: no DB write scheduled, no registry entry, cursor unchanged.
+#[test]
+fn test_maybe_store_pool_state_is_noop_when_window_not_advanced() {
+    let mut fixture = TestFixture::new(4);
+    let initial_window = WindowIndex::new(5);
+    fixture.processor.first_nonannounced_window = initial_window;
+    assert_eq!(
+        fixture.processor.simplex_state.get_current_leader_window_idx(),
+        WindowIndex::new(0)
+    );
+
+    fixture.processor.maybe_store_pool_state();
+
+    assert_eq!(
+        fixture.processor.first_nonannounced_window, initial_window,
+        "first_nonannounced_window must not move when current window is behind it",
+    );
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        0,
+        "no-op call must not register a pending DB result",
+    );
+}
+
+/// When the FSM is at-or-past the announced cursor, `maybe_store_pool_state` must:
+/// - advance the in-memory cursor synchronously (matches C++ ordering); and
+/// - register a `PendingAsyncDbEntry` for the durability wait without blocking SXMAIN.
+///
+/// Draining the registry once the write completes must remove the entry without
+/// incrementing the error counter.
+#[test]
+fn test_maybe_store_pool_state_advances_cursor_and_registers_pending_write() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(fixture.processor.first_nonannounced_window, WindowIndex::new(0));
+    assert_eq!(
+        fixture.processor.simplex_state.get_current_leader_window_idx(),
+        WindowIndex::new(0)
+    );
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 0);
+
+    fixture.processor.maybe_store_pool_state();
+
+    assert_eq!(
+        fixture.processor.first_nonannounced_window,
+        WindowIndex::new(1),
+        "in-memory cursor must advance to current_window + 1 synchronously",
+    );
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        1,
+        "the durability wait must be registered, not blocked on inline",
+    );
+    assert_eq!(
+        fixture.processor.pending_async_db_results[0].op_label, "maybe_store_pool_state",
+        "registered entry must carry the op label for diagnostics",
+    );
+
+    // A subsequent call before the write completes must still be a no-op
+    // (cursor already advanced, so the guard kicks in).
+    fixture.processor.maybe_store_pool_state();
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        1,
+        "second call must not enqueue a duplicate write while the first is in flight",
+    );
+
+    // Drain the registry — the real RocksDB write completes within the bench
+    // ManualAsyncResult-equivalent latency window. Allow a few polls for the
+    // background storage thread to flush.
+    for _ in 0..200 {
+        fixture.processor.process_pending_async_db_results();
+        if fixture.processor.pending_async_db_results.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        0,
+        "registry must drain after the storage thread confirms the write",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful pool_state persist must not bump the error counter",
+    );
+}
+
+// ============================================================================
+// `SessionProcessor::stop()` shutdown drain + db.sync() parity
+// ============================================================================
+//
+// C++ parity: `validator/consensus/bridge.cpp::destroy_inner()` publishes
+// `StopRequested` and then `co_await`s `bus_->db->close()`, forcing the db
+// actor to drain its queued `co_await db->set(...)` tasks before the bus is
+// torn down. The Rust equivalent is `SessionProcessor::stop()` which:
+//   1) drains `pending_async_db_results` so any registered continuation runs
+//      on SXMAIN (`drain_pending_async_db_results_for_shutdown`),
+//   2) calls `db.sync(SHUTDOWN_DB_SYNC_TIMEOUT)` to flush the storage queue.
+
+/// `stop()` must not regress when there is nothing in-flight: empty registry,
+/// zero error increments, db.sync() succeeds quickly.
+#[test]
+fn test_stop_completes_with_empty_registry_and_no_errors() {
+    let mut fixture = TestFixture::new(4);
+    assert_eq!(fixture.processor.pending_async_db_results.len(), 0);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    fixture.processor.stop(false);
+
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        0,
+        "no entries to drain on a fresh processor",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful stop must not bump the error counter",
+    );
+}
+
+/// When async-DB-result entries are still in flight at shutdown, `stop()` must
+/// drain them on SXMAIN so registered continuations fire (matches C++
+/// `co_await bus_->db->close()` semantics where queued `db->set(...)` tasks
+/// complete with Ok or `cancelled` before the bus is dropped).
+#[test]
+fn test_stop_drains_pending_async_db_results_with_real_db() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Register a real RocksDB-backed write through the registry and confirm it sits
+    // in the queue (not blocked on inline) before we tear the session down.
+    fixture.processor.maybe_store_pool_state();
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        1,
+        "pool_state write must be queued in the registry",
+    );
+
+    fixture.processor.stop(false);
+
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        0,
+        "stop() must drain pending_async_db_results before returning",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "drained Ok continuation must not bump the error counter",
+    );
+}
+
+/// Continuations chained by another continuation (callback inside callback) must
+/// also drain — matches the in-pass chained-drain semantics of
+/// `process_pending_async_db_results()` and the actor framework's drain-on-close
+/// guarantee in C++.
+#[test]
+fn test_stop_drains_chained_continuations() {
+    let mut fixture = TestFixture::new(4);
+    let outer = ManualAsyncResult::pending();
+    let chained = ManualAsyncResult::pending();
+    chained.complete_ok();
+    let chained_inner_cb = chained.clone();
+    let chained_called = Arc::new(AtomicBool::new(false));
+    let chained_called_for_cb = chained_called.clone();
+
+    fixture.processor.post_async_db_result(
+        "test_outer_for_stop",
+        outer.clone(),
+        Duration::from_secs(60),
+        move |processor, _res| {
+            let cb_marker = chained_called_for_cb.clone();
+            processor.post_async_db_result(
+                "test_chained_for_stop",
+                chained_inner_cb,
+                Duration::from_secs(60),
+                move |_p, _r| {
+                    cb_marker.store(true, Ordering::SeqCst);
+                },
+            );
+        },
+    );
+
+    // Outer becomes ready right before stop() is called. The drain loop must
+    // run the outer continuation (which schedules the chained one) and then
+    // run the chained continuation in the same shutdown pass.
+    outer.complete_ok();
+
+    fixture.processor.stop(false);
+
+    assert!(
+        chained_called.load(Ordering::SeqCst),
+        "chained continuation registered inside another continuation must drain on stop()",
+    );
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        0,
+        "registry must be empty after stop()",
+    );
+}
+
+// ============================================================================
+// Cert handlers cluster: async-DB-results registry migration
+// ============================================================================
+//
+// `handle_notarization_reached`, `handle_skip_certificate_reached`,
+// `handle_finalization_reached` previously blocked SXMAIN on `result.wait()`
+// to enforce wait-for-store-before-relay. They now register the persist
+// in `pending_async_db_results` and run the broadcast / cache / standstill
+// work from the registry continuation.
+//
+// C++ parity (`pool.cpp::handle_prospective_certificate`):
+//   co_await owning_bus().publish<SaveCertificate>(cert);
+//   handle_saved_certificate(*slot, cert);  // broadcast + cache
+// The persist still gates the broadcast — same as before this migration, just
+// non-blocking on SXMAIN.
+
+/// `handle_notarization_reached` must register a `pending_async_db_results` entry,
+/// defer the broadcast/cache to the continuation, and not bump the error counter
+/// on the happy path.
+#[test]
+fn test_handle_notarization_reached_registers_async_persist_and_defers_relay() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(20);
+    let block_hash = UInt256::rand();
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![1]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![2]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![3]),
+    ];
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::NotarizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_notarization_reached(event);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.pending_async_db_results.iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"handle_notarization_reached"),
+        "notarization persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+
+    let actions_before_drain = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before_drain.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "broadcast must be deferred to the registry continuation (not synchronous), got actions: \
+         {actions_before_drain:?}",
+    );
+
+    fixture.drain_pending_async_db_results();
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "notar cert must be relayed once the registry continuation runs",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Notar,
+                ..
+            }
+        )),
+        "notar cert standstill cache must be populated by the continuation",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::CacheNotarizationCert { .. })),
+        "VoteSignatureSet cache must be populated by the continuation",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful notar persist must not bump the error counter",
+    );
+}
+
+/// Same parity check for `handle_skip_certificate_reached`.
+#[test]
+fn test_handle_skip_certificate_reached_registers_async_persist_and_defers_relay() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(21);
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![21]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![22]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![23]),
+    ];
+    let vote = crate::simplex_state::SkipVote { slot };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event = crate::simplex_state::SkipCertificateReachedEvent { slot, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_skip_certificate_reached(event);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.pending_async_db_results.iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"handle_skip_certificate_reached"),
+        "skip cert persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+
+    let actions_before_drain = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before_drain.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "broadcast must be deferred to the registry continuation (not synchronous)",
+    );
+
+    fixture.drain_pending_async_db_results();
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "skip cert must be relayed once the registry continuation runs",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Skip,
+                ..
+            }
+        )),
+        "skip cert standstill cache must be populated by the continuation",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful skip persist must not bump the error counter",
+    );
+}
+
+/// Same parity check for `handle_finalization_reached`, which additionally caches
+/// the last-final cert and runs `update_standstill_after_final_cert` from the
+/// continuation.
+#[test]
+fn test_handle_finalization_reached_registers_async_persist_and_defers_relay() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(22);
+    let block_hash = UInt256::rand();
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![31]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![32]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![33]),
+    ];
+    let vote = crate::simplex_state::FinalizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::FinalizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_finalization_reached(event);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.pending_async_db_results.iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"handle_finalization_reached"),
+        "final cert persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+
+    let actions_before_drain = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before_drain.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "broadcast must be deferred to the registry continuation (not synchronous)",
+    );
+    assert!(
+        !actions_before_drain
+            .iter()
+            .any(|a| matches!(a, ReceiverAction::CacheLastFinalCertificate { .. })),
+        "last-final cache must be deferred to the registry continuation",
+    );
+
+    fixture.drain_pending_async_db_results();
+
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "final cert must be relayed once the registry continuation runs",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Final,
+                ..
+            }
+        )),
+        "final cert standstill cache must be populated by the continuation",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, ReceiverAction::CacheLastFinalCertificate { .. })),
+        "last-final cache must be populated by the continuation \
+         (matches C++ pool.cpp::handle_typed_saved_certificate(FinalCertRef))",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful final persist must not bump the error counter",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Redundant-FSM-re-emit classification for cert handlers
+// ----------------------------------------------------------------------------
+//
+// `handle_notarization_reached` / `handle_skip_certificate_reached` /
+// `handle_finalization_reached` all keep per-slot dedup maps
+// (`notar_cert_store_results`, `skip_cert_store_results`,
+// `final_cert_store_results`) so a single in-flight
+// `StorageAsyncResultPtr<()>` is reused across FSM re-emissions for the same
+// slot. Once the first registry continuation observed the storage outcome,
+// `consensus_common::StorageAsyncResultImpl::try_get()` transitions to
+// `AsyncResultState::Taken` and any subsequent poll returns
+// `Some(Err("StorageAsyncResult: result already taken"))`.
+//
+// That sentinel must be classified as a benign redundant wake:
+//   * NO `increment_error()` — the first callback reported the real outcome;
+//   * NO side-effects (broadcast / standstill cache / last-final cache) —
+//     the first callback already executed them; replaying them would
+//     double-count `certs_relayed_counter` and spam peers on every FSM re-emit.
+//
+// Regression for the 5x5 single-host mixed soak (Apr 25 2026, merged HEAD
+// 84d0b07eb) which showed ~200-290 spurious
+// "handle_notarization_reached: failed to store notar cert ... result already
+// taken" ERROR lines per Rust node over ~6 minutes and a matching bump in
+// `simplex_session_errors_total`.
+
+/// `handle_notarization_reached` must treat the "result already taken"
+/// sentinel as a benign redundant wake: no error-counter bump, no duplicate
+/// relay or cache updates.
+#[test]
+fn test_handle_notarization_reached_treats_result_already_taken_as_ok() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(120);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    // Simulate the real dedup-map state after the first callback already
+    // consumed the persist outcome: inject the typed
+    // `consensus_common::StorageResultAlreadyTaken` sentinel — the same value
+    // `StorageAsyncResultImpl::{try_get, wait_timeout}` emit in production.
+    // This exercises the real `downcast_ref` detection path used by the
+    // cert callbacks (no string matching).
+    let taken = ManualAsyncResult::pending();
+    taken.complete_taken_sentinel();
+    fixture.processor.notar_cert_store_results.insert(candidate_id.clone(), taken);
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![1]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![2]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![3]),
+    ];
+    let vote = crate::simplex_state::NotarizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::NotarizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_notarization_reached(event);
+    fixture.drain_pending_async_db_results();
+
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "redundant FSM re-emit (result already taken) must NOT bump the error counter",
+    );
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "redundant emit must NOT re-broadcast the notar cert, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::CacheNotarizationCert { .. })),
+        "redundant emit must NOT re-populate the VoteSignatureSet cache, got actions: \
+         {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Notar,
+                ..
+            }
+        )),
+        "redundant emit must NOT re-populate the standstill cache, got actions: {actions:?}",
+    );
+}
+
+/// Same regression for `handle_skip_certificate_reached`.
+#[test]
+fn test_handle_skip_certificate_reached_treats_result_already_taken_as_ok() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(121);
+
+    let taken = ManualAsyncResult::pending();
+    taken.complete_taken_sentinel();
+    fixture.processor.skip_cert_store_results.insert(slot, taken);
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![21]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![22]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![23]),
+    ];
+    let vote = crate::simplex_state::SkipVote { slot };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event = crate::simplex_state::SkipCertificateReachedEvent { slot, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_skip_certificate_reached(event);
+    fixture.drain_pending_async_db_results();
+
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "redundant FSM re-emit (result already taken) must NOT bump the error counter",
+    );
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "redundant emit must NOT re-broadcast the skip cert, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Skip,
+                ..
+            }
+        )),
+        "redundant emit must NOT re-populate the standstill cache, got actions: {actions:?}",
+    );
+}
+
+/// Same regression for `handle_finalization_reached` — also verifies the
+/// last-final cache + `update_standstill_after_final_cert` side-effects are
+/// suppressed on the redundant wake.
+#[test]
+fn test_handle_finalization_reached_treats_result_already_taken_as_ok() {
+    let mut fixture = TestFixture::new(4);
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slot = crate::block::SlotIndex::new(122);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    let taken = ManualAsyncResult::pending();
+    taken.complete_taken_sentinel();
+    fixture.processor.final_cert_store_results.insert(candidate_id.clone(), taken);
+
+    let signatures = vec![
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(0), vec![31]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(1), vec![32]),
+        crate::certificate::VoteSignature::new(ValidatorIndex::new(2), vec![33]),
+    ];
+    let vote = crate::simplex_state::FinalizeVote { slot, block_hash: block_hash.clone() };
+    let cert = Arc::new(crate::certificate::Certificate { vote, signatures });
+    let event =
+        crate::simplex_state::FinalizationReachedEvent { slot, block_hash, certificate: cert };
+
+    fixture.drain_receiver_actions();
+    fixture.processor.handle_finalization_reached(event);
+    fixture.drain_pending_async_db_results();
+
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "redundant FSM re-emit (result already taken) must NOT bump the error counter",
+    );
+    let actions = fixture.drain_receiver_actions();
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
+        "redundant emit must NOT re-broadcast the final cert, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            ReceiverAction::CacheStandstillCertificate {
+                kind: crate::receiver::StandstillCertificateType::Final,
+                ..
+            }
+        )),
+        "redundant emit must NOT re-populate the standstill cache, got actions: {actions:?}",
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, ReceiverAction::CacheLastFinalCertificate { .. })),
+        "redundant emit must NOT re-populate the last-final cache, got actions: {actions:?}",
+    );
+}
+
+// ============================================================================
+// `ensure_candidate_info_stored` migration to async-DB-results registry
+// ============================================================================
+//
+// `process_received_notar_cert`, `process_validated_candidates`, and
+// `broadcast_vote` previously blocked SXMAIN on `wait_candidate_info_stored`
+// (which itself called `result.wait()`). They now use the callback-style
+// `ensure_candidate_info_stored(...)` and defer their post-persist work to the
+// SXMAIN async-DB-results registry continuation when a wait is still in flight.
+// Either way, the same caller callback runs (Ok branch on success, Err branch
+// on failure) — eliminating the inline-vs-deferred branching pattern callers
+// had with the previous status-enum API.
+//
+// C++ parity: `consensus.cpp::try_notarize` `co_await`s `store_candidate`
+// before publishing the vote; `candidate-resolver.cpp::store_candidate`
+// `co_await`s the db actor. Persist-before-FSM/relay invariant preserved.
+
+/// `broadcast_vote` (Notarize variant) must defer the network send to the
+/// registry continuation when candidateInfo persist is still pending.
+#[test]
+fn test_broadcast_vote_defers_send_when_candidate_info_pending() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(80);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    // Inject a manually-controlled pending result into the dedup map so the poll
+    // returns Pending instead of Ready/NotFound.
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.candidate_info_store_results.insert(candidate_id.clone(), pending.clone());
+
+    let vote = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
+        slot,
+        block_hash,
+    });
+
+    fixture.drain_receiver_actions();
+    fixture.processor.broadcast_vote(vote);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.pending_async_db_results.iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"ensure_candidate_info_stored:candidate_info"),
+        "broadcast_vote(Notarize) must register a pending continuation when candidateInfo \
+         is in flight, got entries: {pending_entries:?}",
+    );
+
+    let actions_before = fixture.drain_receiver_actions();
+    assert!(
+        !actions_before.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote send must be deferred to the continuation while persist is pending",
+    );
+
+    // Complete the persist; drain registry; verify vote is now sent.
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+
+    let actions_after = fixture.drain_receiver_actions();
+    assert!(
+        actions_after.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote must be sent once the persist continuation runs",
+    );
+}
+
+/// `broadcast_vote` (Notarize variant) must abort with a persist-fail bump when
+/// the candidateInfo persist completes with a real error.
+#[test]
+fn test_broadcast_vote_aborts_when_pending_persist_completes_with_error() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(81);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.candidate_info_store_results.insert(candidate_id.clone(), pending.clone());
+
+    let vote = crate::simplex_state::Vote::Notarize(crate::simplex_state::NotarizeVote {
+        slot,
+        block_hash,
+    });
+    let persist_fail_before = metrics_counter(&fixture.processor, "simplex_votes_out_persist_fail");
+
+    fixture.drain_receiver_actions();
+    fixture.processor.broadcast_vote(vote);
+
+    pending.complete_err("disk_unavailable");
+    fixture.processor.process_pending_async_db_results();
+
+    let actions_after = fixture.drain_receiver_actions();
+    assert!(
+        !actions_after.iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
+        "vote must NOT be sent when the deferred persist completes with an error",
+    );
+    assert_eq!(
+        metrics_counter(&fixture.processor, "simplex_votes_out_persist_fail"),
+        persist_fail_before + 1,
+        "persist-fail counter must bump from the continuation's failure path",
+    );
+}
+
+/// `process_validated_candidates` must defer the FSM feed to the registry
+/// continuation when candidateInfo persist is still pending.
+#[test]
+fn test_process_validated_candidates_defers_feed_when_candidate_info_pending() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(0);
+
+    let (leader_source, candidate_id, broadcast) =
+        make_signed_block_broadcast(&fixture, slot.value(), vec![5, 6, 7, 8]);
+    fixture.processor.on_candidate_received(leader_source, broadcast, None);
+
+    // Force the candidateInfo dedup-map entry to be Pending by overwriting the
+    // real RocksDB-backed one with our ManualAsyncResult.
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.candidate_info_store_results.insert(candidate_id.clone(), pending.clone());
+
+    let now = fixture.description.get_time();
+    fixture.processor.candidate_decision_ok_internal(candidate_id.clone(), slot, now);
+
+    fixture.processor.process_validated_candidates();
+
+    // FSM feed must be deferred — no Notarize vote has been emitted yet.
+    let mut has_notarize_before = false;
+    fixture.processor.simplex_state.check_all(&fixture.description);
+    while let Some(event) = fixture.processor.simplex_state.pull_event() {
+        if let crate::simplex_state::SimplexEvent::BroadcastVote(
+            crate::simplex_state::Vote::Notarize(v),
+        ) = event
+        {
+            if v.slot == slot {
+                has_notarize_before = true;
+            }
+        }
+    }
+    assert!(
+        !has_notarize_before,
+        "FSM must not emit Notarize for this slot while candidateInfo persist is pending",
+    );
+
+    // Complete the persist; drain registry; verify the FSM is fed.
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+    fixture.processor.simplex_state.check_all(&fixture.description);
+
+    let mut has_notarize_after = false;
+    while let Some(event) = fixture.processor.simplex_state.pull_event() {
+        if let crate::simplex_state::SimplexEvent::BroadcastVote(
+            crate::simplex_state::Vote::Notarize(v),
+        ) = event
+        {
+            if v.slot == slot {
+                has_notarize_after = true;
+            }
+        }
+    }
+    assert!(
+        has_notarize_after,
+        "FSM must emit Notarize for this slot once the deferred candidate is fed by the \
+         registry continuation",
+    );
+}
+
+/// `process_received_notar_cert` must defer the FSM feed and the
+/// `retry_pending_recursive_finalization()` call to the registry continuation
+/// when the notar-cert persist is still pending.
+#[test]
+fn test_process_received_notar_cert_defers_fsm_feed_when_persist_pending() {
+    let mut fixture = TestFixture::new(4);
+    let slot = SlotIndex::new(85);
+    let block_hash = UInt256::rand();
+    let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
+
+    // Build a valid notar VoteSignatureSet payload + inject a pending dedup-map entry
+    // for the notar-cert wait so the poll returns Pending.
+    let notar_bytes = make_notar_vote_signature_set_bytes(
+        fixture.processor.session_id(),
+        &fixture.nodes,
+        slot,
+        block_hash.clone(),
+        &[0, 1, 2],
+    );
+    let pending = ManualAsyncResult::pending();
+    fixture.processor.notar_cert_store_results.insert(candidate_id.clone(), pending.clone());
+
+    fixture.processor.process_received_notar_cert(slot, &block_hash, &notar_bytes);
+
+    let pending_entries: Vec<_> =
+        fixture.processor.pending_async_db_results.iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"ensure_candidate_info_stored:notar_cert"),
+        "process_received_notar_cert must register a pending continuation when notar-cert \
+         persist is in flight, got entries: {pending_entries:?}",
+    );
+
+    // FSM feed deferred → no notar-cert recorded yet for this (slot, hash).
+    assert!(
+        fixture.processor.simplex_state.get_notarize_certificate(slot, &block_hash).is_none(),
+        "FSM must not have the notar cert recorded while persist is pending",
+    );
+
+    pending.complete_ok();
+    fixture.processor.process_pending_async_db_results();
+
+    assert!(
+        fixture.processor.simplex_state.get_notarize_certificate(slot, &block_hash).is_some(),
+        "FSM must record the notar cert once the deferred continuation runs",
+    );
+}
+
+// ============================================================================
+// `maybe_apply_finalized_state` migration to async-DB-results registry
+// ============================================================================
+//
+// Pre-migration the masterchain branch blocked SXMAIN on
+// `save_finalized_block_async().wait()` to gate the local apply on durability.
+// It now hands the in-flight write to the SXMAIN async-DB-results registry via
+// `post_async_db_result(...)` and applies the local state immediately —
+// matching C++ `state-resolver.cpp::do_finalize_blocks` where `co_await
+// FinalizeBlock` (callback) runs before `co_await db->set(...)` (persist).
+//
+// Sync-Err registration (`save_finalized_block_async()` returns Err
+// synchronously) still returns `false` and leaves in-memory state untouched —
+// see `test_finalized_callback_not_emitted_when_finalized_record_persist_fails`
+// for that path.
+
+/// Masterchain `maybe_apply_finalized_state` must register an async-DB-results
+/// entry, apply local state inline, and return `true` so the recursive walk
+/// continues. The persist outcome is reported from the registry continuation.
+#[test]
+fn test_maybe_apply_finalized_state_registers_async_persist_on_masterchain() {
+    let mut fixture = TestFixture::new(4);
+    assert!(
+        fixture.description.get_shard().is_masterchain(),
+        "TestFixture must run on masterchain to exercise the async persist path",
+    );
+
+    let (_leader, candidate_id, broadcast) =
+        make_signed_block_broadcast(&fixture, 200, vec![0xaa, 0xbb, 0xcc]);
+    fixture.processor.on_candidate_received(_leader, broadcast, None);
+
+    let pending_before = fixture.processor.pending_async_db_results.len();
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let applied = fixture.processor.maybe_apply_finalized_state(&candidate_id, true);
+    assert!(applied, "successful registration must return true");
+
+    let pending_entries: Vec<_> =
+        fixture.processor.pending_async_db_results.iter().map(|e| e.op_label).collect();
+    assert!(
+        pending_entries.contains(&"maybe_apply_finalized_state"),
+        "MC persist must be registered in the SXMAIN async-DB-results registry, \
+         got entries: {pending_entries:?}",
+    );
+    assert_eq!(
+        fixture.processor.pending_async_db_results.len(),
+        pending_before + 1,
+        "exactly one new registry entry must be added per call",
+    );
+    assert!(
+        fixture.processor.finalized_blocks.contains(&candidate_id),
+        "in-memory state must be applied inline (matches C++ callback-before-persist)",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "happy-path registration must not bump the error counter",
+    );
+
+    fixture.drain_pending_async_db_results();
+    fixture.processor.db.sync(Some(Duration::from_secs(2))).expect("sync must succeed");
+
+    assert!(
+        fixture
+            .processor
+            .db
+            .load_finalized_blocks()
+            .expect("finalized records load must succeed")
+            .iter()
+            .any(|record| record.candidate_id == candidate_id),
+        "finalized record must be durable in DB after registry drain + db.sync",
+    );
+    assert_eq!(
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed),
+        errors_before,
+        "successful async persist must not bump the error counter from the continuation",
+    );
+}
+
+/// Async persist failure (continuation observes `Err`) must bump the session
+/// error counter. The in-memory state was already applied inline; the
+/// `finalized_blocks` dedup keeps the candidate from being retried.
+#[test]
+fn test_maybe_apply_finalized_state_async_persist_failure_increments_error_counter() {
+    let mut fixture = TestFixture::new(4);
+    let candidate_id = RawCandidateId { slot: SlotIndex::new(201), hash: UInt256::rand() };
+
+    // Pre-seed a `received_candidates` entry the function expects (slot/seqno
+    // bookkeeping) — minimal real candidate is enough; the test doesn't exercise
+    // the FSM, only the registry plumbing.
+    let (_leader, real_id, broadcast) =
+        make_signed_block_broadcast(&fixture, 201, vec![0x11, 0x22, 0x33]);
+    fixture.processor.on_candidate_received(_leader, broadcast, None);
+
+    let errors_before =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    let applied = fixture.processor.maybe_apply_finalized_state(&real_id, true);
+    assert!(applied, "registration must succeed (synchronous step)");
+    assert!(
+        fixture.processor.finalized_blocks.contains(&real_id),
+        "in-memory state is applied inline regardless of eventual persist outcome",
+    );
+
+    // Swap the registered registry entry's `result` with a manually-failed one
+    // to simulate the storage thread reporting Err for this write — without
+    // having to inject a deterministic disk failure into RocksDB.
+    let real_entry_idx = fixture
+        .processor
+        .pending_async_db_results
+        .iter()
+        .position(|e| e.op_label == "maybe_apply_finalized_state")
+        .expect("the MC persist must be registered before we can simulate its failure");
+    let failed = ManualAsyncResult::pending();
+    failed.complete_err("simulated_disk_failure");
+    fixture.processor.pending_async_db_results[real_entry_idx].result = failed.clone();
+
+    fixture.processor.process_pending_async_db_results();
+
+    assert_eq!(
+        fixture
+            .processor
+            .pending_async_db_results
+            .iter()
+            .filter(|e| e.op_label == "maybe_apply_finalized_state")
+            .count(),
+        0,
+        "async-Err path must remove the entry from the registry",
+    );
+    let errors_after =
+        fixture.processor.session_errors_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        errors_after > errors_before,
+        "async persist failure must bump the session error counter from the continuation \
+         (matches `increment_error()` in the Ok/Err match arm)",
+    );
+    assert!(
+        fixture.processor.finalized_blocks.contains(&real_id),
+        "in-memory state must NOT be rolled back on async-Err (matches the migration design)",
+    );
+
+    // Silence unused-variable warning on `candidate_id` — used here as a guard
+    // against accidental reuse of the same id across the two test cases above.
+    let _ = candidate_id;
+}
