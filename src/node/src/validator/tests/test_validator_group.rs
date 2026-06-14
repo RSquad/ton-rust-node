@@ -17,14 +17,23 @@ use std::{
     time::Duration,
 };
 use ton_block::{
-    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, ZeroizingBytes,
+    signature::SigPubKey, validators::ValidatorDescr, Ed25519KeyOption, KeyId, Serializable,
+    ZeroizingBytes,
 };
 
 #[derive(Default)]
 struct DummyEngine;
 
 #[async_trait::async_trait]
-impl EngineOperations for DummyEngine {}
+impl EngineOperations for DummyEngine {
+    // `on_candidate_observed` persists a valid candidate body
+    async fn store_block(
+        &self,
+        _block: &crate::block::BlockStuff,
+    ) -> Result<crate::internal_db::BlockResult> {
+        fail!("dummy engine does not persist blocks")
+    }
+}
 
 #[derive(Default)]
 struct MockSimplexSession {
@@ -141,12 +150,19 @@ async fn test_resolver_cache_bridge_requests_simplex_candidate_availability() {
     let backend: Arc<dyn ResolverBackend> = group.clone();
     group.state_resolver_cache.lock().await.set_backend(Arc::downgrade(&backend));
 
+    // Feed a real, parseable block whose root hash matches the observed block
+    // id so the body-present success path stores the deserialized body and
+    // extracted parent ids.
+    let mut block = Block::default();
+    block.set_global_id(42);
+    let root_hash = block.serialize().expect("serialize block cell").repr_hash().clone();
+    let block_bytes = block.write_to_bytes().expect("serialize block bytes");
     let block_id =
-        BlockIdExt::with_params(ShardIdent::masterchain(), 77, UInt256::rand(), UInt256::rand());
+        BlockIdExt::with_params(ShardIdent::masterchain(), 77, root_hash, UInt256::rand());
     group
         .on_candidate_observed(
             block_id.clone(),
-            ConsensusCommonFactory::create_block_payload(vec![1, 2, 3]),
+            ConsensusCommonFactory::create_block_payload(block_bytes),
             ConsensusCommonFactory::create_block_payload(Vec::new()),
             CandidateObservedFlags {
                 body_present: true,
@@ -180,6 +196,40 @@ async fn test_resolver_cache_bridge_requests_simplex_candidate_availability() {
         assert!(attempts < 50, "timed out waiting for resolver bridge request");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// A candidate whose body fails to deserialize must still be recorded in the
+/// resolver cache (flags only, no body), so later flag updates can OR-merge and
+/// a subsequent valid body can overwrite the entry instead of stranding
+/// resolver waiters on a dropped observation.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_on_candidate_observed_caches_observation_when_body_deserialize_fails() {
+    let group = make_simplex_group_for_resolver_tests();
+
+    let block_id =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 88, UInt256::rand(), UInt256::rand());
+    group
+        .on_candidate_observed(
+            block_id.clone(),
+            // Not a valid BOC, so both `deserialize_block` and the cache's
+            // fallback re-parse fail and no body is stored.
+            ConsensusCommonFactory::create_block_payload(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ConsensusCommonFactory::create_block_payload(Vec::new()),
+            CandidateObservedFlags {
+                body_present: true,
+                parent_ready: true,
+                local_collated: false,
+            },
+        )
+        .await;
+
+    let cache = group.state_resolver_cache.lock().await;
+    let entry = cache
+        .try_get_entry(&block_id)
+        .expect("observation must be cached even when the body fails to deserialize");
+    assert!(entry.data.is_none(), "invalid body must not be stored");
+    assert!(entry.flags.body_present, "body_present flag must be preserved");
+    assert!(entry.flags.parent_ready, "parent_ready flag must be preserved");
 }
 
 #[test]

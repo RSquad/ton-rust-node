@@ -1076,3 +1076,21 @@ async fn test_collated_data_validate_unchanged_account() {
     let bundle = CollatorTestBundle::load(path).unwrap();
     try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
 }
+
+#[cfg(not(feature = "xp25"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_validate_pruned_dispatch_queue() {
+    init_test_log();
+    let path = "src/tests/static/0.8000000000000000_76770988_db9fc78e_collator_test_bundle";
+    let bundle = CollatorTestBundle::load(path).unwrap();
+    try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
+}
+
+#[cfg(not(feature = "xp25"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_collated_data_add_removed_cells_to_proof() {
+    init_test_log();
+    let path = "src/tests/static/0.e000000000000000_67704975_6cea4ad1_collator_test_bundle";
+    let bundle = CollatorTestBundle::load(path).unwrap();
+    try_collate_by_bundle(Arc::new(bundle), false).await.unwrap();
+}

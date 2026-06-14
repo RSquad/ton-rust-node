@@ -78,63 +78,116 @@ pub(super) fn tl_tag_name(tag: u32) -> &'static str {
     }
 }
 
-/// Aggregate error counters for the QUIC transport layer (lock-free, reset on each stats dump).
+/// One transport event counter: a per-period window for the stats dump plus
+/// an instantly incremented cumulative Prometheus counter. The Prometheus
+/// counter is resolved by name on every `inc()` (not cached as a handle) so
+/// it binds to whatever recorder is installed at event time
+pub(super) struct EventCounter {
+    window: AtomicU64,
+    name: &'static str,
+}
+
+impl EventCounter {
+    fn new(name: &'static str) -> Self {
+        Self { window: AtomicU64::new(0), name }
+    }
+
+    pub fn inc(&self) {
+        self.window.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(self.name).increment(1);
+    }
+
+    /// Take the per-period value and reset the window to zero.
+    /// The Prometheus counter is cumulative and never reset
+    fn take(&self) -> u64 {
+        self.window.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Aggregate error counters for the QUIC transport layer (lock-free; the
+/// per-period windows are reset on each stats dump).
 pub(super) struct TransportErrors {
     /// send_via_stream / send_via_stream_nowait failures (stream open, write, finish errors)
-    pub send_failed: AtomicU64,
+    pub send_failed: EventCounter,
     /// query timeouts (deadline exceeded waiting for response)
-    pub query_timeout: AtomicU64,
+    pub query_timeout: EventCounter,
     /// connection establishment failures (connect / handshake errors)
-    pub connect_failed: AtomicU64,
+    pub connect_failed: EventCounter,
     /// messages dropped because the per-peer send queue was full
-    pub queue_full: AtomicU64,
+    pub queue_full: EventCounter,
     /// dead connections removed (by checker or on send failure)
-    pub dead_conn_removed: AtomicU64,
+    pub dead_conn_removed: EventCounter,
     /// connections rejected by per-IP rate limiter
-    pub rate_limited_per_ip: AtomicU64,
+    pub rate_limited_per_ip: EventCounter,
     /// connections rejected by global rate limiter
-    pub rate_limited_global: AtomicU64,
+    pub rate_limited_global: EventCounter,
     /// stateless Retry packets sent
-    pub retry_sent: AtomicU64,
+    pub retry_sent: EventCounter,
     /// connections accepted into handle_connection()
-    pub accepted: AtomicU64,
+    pub accepted: EventCounter,
     /// connections that went through the delayed accept path
-    pub delayed: AtomicU64,
+    pub delayed: EventCounter,
     /// connections refused because the delayed-accept limit was reached
-    pub delayed_refused: AtomicU64,
+    pub delayed_refused: EventCounter,
 }
 
 impl TransportErrors {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            send_failed: AtomicU64::new(0),
-            query_timeout: AtomicU64::new(0),
-            connect_failed: AtomicU64::new(0),
-            queue_full: AtomicU64::new(0),
-            dead_conn_removed: AtomicU64::new(0),
-            rate_limited_per_ip: AtomicU64::new(0),
-            rate_limited_global: AtomicU64::new(0),
-            retry_sent: AtomicU64::new(0),
-            accepted: AtomicU64::new(0),
-            delayed: AtomicU64::new(0),
-            delayed_refused: AtomicU64::new(0),
+            send_failed: EventCounter::new("ton_node_quic_send_failed_total"),
+            query_timeout: EventCounter::new("ton_node_quic_query_timeout_total"),
+            connect_failed: EventCounter::new("ton_node_quic_connect_failed_total"),
+            queue_full: EventCounter::new("ton_node_quic_queue_full_total"),
+            dead_conn_removed: EventCounter::new("ton_node_quic_dead_conn_removed_total"),
+            rate_limited_per_ip: EventCounter::new("ton_node_quic_per_ip_rejected_total"),
+            rate_limited_global: EventCounter::new("ton_node_quic_global_rejected_total"),
+            retry_sent: EventCounter::new("ton_node_quic_retry_sent_total"),
+            accepted: EventCounter::new("ton_node_quic_accepted_total"),
+            delayed: EventCounter::new("ton_node_quic_delayed_total"),
+            delayed_refused: EventCounter::new("ton_node_quic_delayed_refused_total"),
         })
     }
 
-    /// Atomically take current values and reset all counters to zero.
+    fn counters(&self) -> [&EventCounter; 11] {
+        [
+            &self.send_failed,
+            &self.query_timeout,
+            &self.connect_failed,
+            &self.queue_full,
+            &self.dead_conn_removed,
+            &self.rate_limited_per_ip,
+            &self.rate_limited_global,
+            &self.retry_sent,
+            &self.accepted,
+            &self.delayed,
+            &self.delayed_refused,
+        ]
+    }
+
+    /// Pre-register all Prometheus counters with a zero increment so they
+    /// appear in the exporter output before the first real event. A no-op
+    /// when no recorder is installed yet; counters then register lazily on
+    /// the first real event instead
+    pub fn register_metrics(&self) {
+        for counter in self.counters() {
+            metrics::counter!(counter.name).increment(0);
+        }
+    }
+
+    /// Atomically take current per-period values and reset all windows to zero.
     pub fn take(&self) -> TransportErrorsSnapshot {
         TransportErrorsSnapshot {
-            send_failed: self.send_failed.swap(0, Ordering::Relaxed),
-            query_timeout: self.query_timeout.swap(0, Ordering::Relaxed),
-            connect_failed: self.connect_failed.swap(0, Ordering::Relaxed),
-            queue_full: self.queue_full.swap(0, Ordering::Relaxed),
-            dead_conn_removed: self.dead_conn_removed.swap(0, Ordering::Relaxed),
-            rate_limited_per_ip: self.rate_limited_per_ip.swap(0, Ordering::Relaxed),
-            rate_limited_global: self.rate_limited_global.swap(0, Ordering::Relaxed),
-            retry_sent: self.retry_sent.swap(0, Ordering::Relaxed),
-            accepted: self.accepted.swap(0, Ordering::Relaxed),
-            delayed: self.delayed.swap(0, Ordering::Relaxed),
-            delayed_refused: self.delayed_refused.swap(0, Ordering::Relaxed),
+            send_failed: self.send_failed.take(),
+            query_timeout: self.query_timeout.take(),
+            connect_failed: self.connect_failed.take(),
+            queue_full: self.queue_full.take(),
+            dead_conn_removed: self.dead_conn_removed.take(),
+            rate_limited_per_ip: self.rate_limited_per_ip.take(),
+            rate_limited_global: self.rate_limited_global.take(),
+            retry_sent: self.retry_sent.take(),
+            accepted: self.accepted.take(),
+            delayed: self.delayed.take(),
+            delayed_refused: self.delayed_refused.take(),
         }
     }
 }

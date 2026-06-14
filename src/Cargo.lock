@@ -39,6 +39,7 @@ dependencies = [
  "lockfree",
  "log",
  "log4rs",
+ "metrics",
  "mio",
  "num-traits",
  "num_cpus",

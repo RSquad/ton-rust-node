@@ -322,8 +322,12 @@ impl AccountStorageStat {
         };
 
         if removed {
+            // Use `reference` (not `reference_without_usage`) so that removed cells are marked as
+            // visited in the `UsageTree` and therefore included in the resulting proof.
+            // This path is only hit for incremental removals (the initial full dict build uses
+            // `add_cell`), so we avoid traversing the full build with usage tracking.
             for i in 0..cell.references_count() {
-                self.remove_cell(&cell.reference_without_usage(i)?)?;
+                self.remove_cell(&cell.reference(i)?)?;
             }
             self.total_cells -= 1;
             self.total_bits -= cell.bit_length() as u64;

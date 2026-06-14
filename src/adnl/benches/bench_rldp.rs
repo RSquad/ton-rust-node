@@ -6,8 +6,6 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-#[cfg(feature = "debug")]
-use adnl::rldp::{Chunk, LossFn};
 use adnl::{
     common::{
         AdnlPeers, Answer, QueryAnswer, QueryResult, Subscriber, TaggedByteSlice, TaggedByteVec,
@@ -15,9 +13,11 @@ use adnl::{
     node::AdnlNode,
     RldpNode,
 };
+#[cfg(feature = "debug")]
+use adnl::{Chunk, LossFn};
 use rand::Rng;
 #[cfg(feature = "debug")]
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 #[cfg(not(feature = "debug"))]
 use std::time::Instant;
@@ -145,21 +145,18 @@ fn create_rldp_node(
 
     #[cfg(feature = "debug")]
     fn loss_function(_chunk: &Chunk) -> bool {
-        static CNT: AtomicU32 = AtomicU32::new(0);
-        let cnt = CNT.fetch_add(1, Ordering::Relaxed);
         let loss = LOSS_PERCENTAGE.load(Ordering::Relaxed);
-        if loss > 0 {
-            (cnt % (100u32 / (loss as u32))) == 0
-        } else {
-            false
+        if loss == 0 {
+            return false;
         }
+        rand::thread_rng().gen_bool(loss as f64 / 100.0)
     }
 
     #[cfg(feature = "debug")]
     let (loss_fn, timeout) = loss_percentage.map_or((None, None), |loss_percentage| {
         LOSS_PERCENTAGE.store(loss_percentage, Ordering::Relaxed);
         let loss_fn = Some(loss_function as LossFn);
-        (loss_fn, Some(1000))
+        (loss_fn, Some(2000))
     });
 
     let key = adnl.key_by_tag(key_tag).unwrap();

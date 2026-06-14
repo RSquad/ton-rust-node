@@ -15,7 +15,9 @@ use crate::{
 use std::{
     cmp::min,
     collections::HashMap,
+    future::Future,
     ops::Range,
+    pin::Pin,
     sync::{
         atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
@@ -33,6 +35,55 @@ use ton_api::{
     IntoBoxed, RldpChunk,
 };
 use ton_block::{fail, Result, UInt256};
+
+type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+// Pool decoupling task count from in-flight transfers; workers spawn on first submit.
+pub(crate) struct SendWorkerPool {
+    queue: Arc<lockfree::queue::Queue<BoxedFut>>,
+    sem: Arc<tokio::sync::Semaphore>,
+    spawned: std::sync::OnceLock<()>,
+}
+
+impl SendWorkerPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: Arc::new(lockfree::queue::Queue::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(0)),
+            spawned: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn submit<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawned.get_or_init(|| {
+            let n = num_cpus::get().min(8).max(1);
+            for _ in 0..n {
+                let queue = self.queue.clone();
+                let sem = self.sem.clone();
+                tokio::spawn(async move {
+                    while let Ok(permit) = sem.acquire().await {
+                        permit.forget();
+                        if let Some(fut) = queue.pop() {
+                            fut.await;
+                        }
+                    }
+                });
+            }
+        });
+        self.queue.push(Box::pin(fut));
+        self.sem.add_permits(1);
+    }
+}
+
+impl Drop for SendWorkerPool {
+    fn drop(&mut self) {
+        // Wakes workers with Err; they exit after current future.
+        self.sem.close();
+    }
+}
 
 /// RaptorQ encoder
 pub struct RaptorqEncoder {
@@ -490,15 +541,20 @@ impl SendPartV2 {
         peer.stats.on_drop(self.in_flight_symbols)
     }
 
-    pub(crate) fn on_send(&mut self, info: SendInfoV2, peer: &Arc<RldpPeer>) -> Result<()> {
-        let timestamp_micros = peer.stats.timestamp_micros();
+    // sent_at_micros captured by caller before send_custom().await
+    pub(crate) fn on_send(
+        &mut self,
+        info: SendInfoV2,
+        sent_at_micros: u64,
+        peer: &Arc<RldpPeer>,
+    ) -> Result<()> {
         let first_sent_at_micros = self
             .seqno_min_sent
             .as_ref()
             .and_then(|seqno_min_sent| {
                 self.packets.get(seqno_min_sent).map(|packet| packet.sent_at_micros)
             })
-            .unwrap_or(timestamp_micros);
+            .unwrap_or(sent_at_micros);
         let bandwidth_info = peer.stats.on_send(info.is_probe, first_sent_at_micros)?;
         /*
         void RldpSender::on_send(td::uint32 seqno, td::Timestamp now, bool is_probe, const RttStats &rtt_stats,
@@ -518,7 +574,7 @@ impl SendPartV2 {
         } else {
             self.probe_k = Self::MIN_PROBE_K
         }
-        let packet = SendPacketV2 { bandwidth_info, sent_at_micros: timestamp_micros };
+        let packet = SendPacketV2 { bandwidth_info, sent_at_micros };
         if self.packets.insert(info.seqno, packet).is_none() {
             self.in_flight_symbols += 1;
             self.seqno_min_sent.get_or_insert(info.seqno);
@@ -630,7 +686,6 @@ pub(crate) struct SendPartContextV2 {
 }
 
 struct SendPartState {
-    ping: tokio::sync::mpsc::UnboundedSender<()>,
     seqno_send: AtomicU32,
 }
 
@@ -653,6 +708,7 @@ declare_counted!(
     pub(crate) struct SendPartStateV1 {
         core: SendPartState,
         part: AtomicU32,
+        ping: tokio::sync::mpsc::UnboundedSender<()>,
         seqno_recv: AtomicU32,
         total: usize,
     }
@@ -689,7 +745,7 @@ impl SendPartStateV1 {
         {
             self.seqno_recv.store(0, Ordering::Relaxed);
             self.core.seqno_send.store(0, Ordering::Relaxed);
-            self.core.ping.send(()).ok();
+            self.ping.send(()).ok();
         }
     }
 
@@ -702,7 +758,7 @@ impl SendPartStateV1 {
                     .compare_exchange(seqno_recv, seqno, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    self.core.ping.send(()).ok();
+                    self.ping.send(()).ok();
                 }
             }
         }
@@ -748,10 +804,6 @@ impl SendPartStateV2 {
         self.part
     }
 
-    pub(crate) fn ping(&self) {
-        self.core.ping.send(()).ok();
-    }
-
     #[cfg(feature = "debug")]
     pub(crate) fn seqno_send(&self) -> u32 {
         self.core.seqno_send()
@@ -761,7 +813,6 @@ impl SendPartStateV2 {
         self.status
             .store(if ok { Self::STATUS_SUCCESS } else { Self::STATUS_FAILURE }, Ordering::Relaxed);
         self.ack_ping();
-        self.ping()
     }
 
     pub(crate) fn set_recv_info(&self, max_seqno: u32, received_count: u32, received_mask: u32) {
@@ -794,11 +845,11 @@ impl SendTransfer {
         if v2 {
             let mut parts = Vec::new();
             let mut states = Vec::new();
-            let mut create_part = |data, range, part, transfer_id, counter, ping| -> Result<()> {
+            let mut create_part = |data, range, part, transfer_id, counter| -> Result<()> {
                 let (ack_ping, ack_pong) = tokio::sync::mpsc::unbounded_channel();
                 let state = SendPartStateV2 {
                     ack_ping,
-                    core: SendPartState { seqno_send: AtomicU32::new(0), ping },
+                    core: SendPartState { seqno_send: AtomicU32::new(0) },
                     part,
                     status: AtomicU8::new(SendPartStateV2::STATUS_IDLE),
                     counter,
@@ -825,7 +876,6 @@ impl SendTransfer {
                     i as u32,
                     transfer_id.clone(),
                     counter.clone().into(),
-                    ping.clone(),
                 )?;
             }
             let len = data.len();
@@ -835,13 +885,13 @@ impl SendTransfer {
                 offsets.len() as u32 - 1,
                 transfer_id,
                 counter.into(),
-                ping,
             )?;
             Ok((Self::V2(parts), SendTransferState::V2(Arc::new(states))))
         } else {
             let state = SendPartStateV1 {
-                core: SendPartState { ping, seqno_send: AtomicU32::new(0) },
+                core: SendPartState { seqno_send: AtomicU32::new(0) },
                 part: AtomicU32::new(0),
+                ping,
                 seqno_recv: AtomicU32::new(0),
                 total: data.len(),
                 counter: counter.into(),

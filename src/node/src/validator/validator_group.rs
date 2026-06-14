@@ -1218,7 +1218,7 @@ impl ValidatorGroup {
         // when this node actually validated the candidate. With the block-sync
         // overlay carrying candidate bodies, simplex may receive a body it does
         // not validate (consensus quorum already reached)
-        if flags.body_present {
+        let block = if flags.body_present {
             let block_bytes = data.data().to_vec();
             match crate::block::BlockStuff::deserialize_block(
                 block_id.clone(),
@@ -1238,6 +1238,7 @@ impl ValidatorGroup {
                             block_id
                         );
                     }
+                    block_stuff.block().cloned().ok()
                 }
                 Err(e) => {
                     log::warn!(
@@ -1245,16 +1246,23 @@ impl ValidatorGroup {
                         "on_candidate_observed: deserialize_block failed for {}: {}",
                         block_id, e
                     );
+                    // Still record the observation (flags only, no body) so
+                    // later flag updates can OR-merge and a subsequent valid
+                    // body can overwrite the entry, rather than stranding
+                    // resolver waiters on a dropped observation.
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         self.state_resolver_cache.lock().await.upsert_observed_candidate(
             block_id,
             data,
             collated_data,
             flags,
-            None,
+            block,
         );
     }
 

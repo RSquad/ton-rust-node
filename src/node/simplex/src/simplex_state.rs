@@ -3136,7 +3136,7 @@ impl SimplexState {
             // - propagate `available_base` forward
             // - advance progress cursor (`first_non_progressed_slot`)
             // Reference: C++ pool.cpp on_skip() → slot.skipped=true, propagate base if needed
-            self.propagate_base_after_skip_cert(desc, slot_id);
+            let skip_progress_repaired = self.propagate_base_after_skip_cert(desc, slot_id);
 
             log::trace!(
                 "SimplexState::check_thresholds: ({}/{}) window advancement after skip: \
@@ -3148,7 +3148,9 @@ impl SimplexState {
             );
             // C++ parity: `propagate_base_after_skip_cert()` already runs the
             // `advance_present()` equivalent for skip certificates.
-            self.advance_leader_window_on_progress_cursor(desc);
+            if skip_progress_repaired {
+                self.advance_leader_window_on_progress_cursor(desc);
+            }
         }
     }
 
@@ -4690,13 +4692,15 @@ impl SimplexState {
         }
 
         // Propagate base after skip (C++ pool.cpp parity)
-        self.propagate_base_after_skip_cert(desc, slot);
+        let skip_progress_repaired = self.propagate_base_after_skip_cert(desc, slot);
 
         // C++ parity: skip certificates do NOT advance first_non_finalized_slot.
         // Only finalization advances it (C++ state.h notify_finalized()).
         // `propagate_base_after_skip_cert()` already performs the `advance_present()`
         // equivalent by calling `advance_progress_cursor()`.
-        self.advance_leader_window_on_progress_cursor(desc);
+        if skip_progress_repaired {
+            self.advance_leader_window_on_progress_cursor(desc);
+        }
 
         // Emit SlotSkipped event so SessionProcessor can progress/cleanup state.
         // This mirrors the threshold-driven path which emits SlotSkipped when the
@@ -4945,8 +4949,10 @@ impl SimplexState {
         // recovery Rust may learn the skip certificate before this boundary base,
         // so repair the skipped run immediately after seeding it.
         if slot_was_skipped {
-            self.propagate_base_after_skip_cert(desc, next_slot);
-            self.advance_leader_window_on_progress_cursor(desc);
+            let skip_progress_repaired = self.propagate_base_after_skip_cert(desc, next_slot);
+            if skip_progress_repaired {
+                self.advance_leader_window_on_progress_cursor(desc);
+            }
         } else {
             self.check_pending_blocks(desc);
         }
@@ -4968,7 +4974,11 @@ impl SimplexState {
     /// successor.
     ///
     /// This is always called when a slot is skipped.
-    fn propagate_base_after_skip_cert(&mut self, desc: &SessionDescription, slot: SlotIndex) {
+    fn propagate_base_after_skip_cert(
+        &mut self,
+        desc: &SessionDescription,
+        slot: SlotIndex,
+    ) -> bool {
         // Mark slot as skipped (skip certificate reached)
         if let Some(slot_state) = self.get_slot_mut(desc, slot, WindowAlloc::BoundedByHorizon) {
             slot_state.skipped = true;
@@ -4998,7 +5008,7 @@ impl SimplexState {
             self.skip_intervals.remove(&slot);
             self.advance_progress_cursor(desc);
             self.check_pending_blocks(desc);
-            return;
+            return false;
         };
         self.update_skip_intervals_after_skip_cert(slot, first_non_skipped_slot);
 
@@ -5011,7 +5021,7 @@ impl SimplexState {
                 self.first_non_progressed_slot
             );
             self.check_pending_blocks(desc);
-            return;
+            return false;
         };
 
         if let Some(next_state) =
@@ -5037,6 +5047,7 @@ impl SimplexState {
 
         // Base propagation can make pending blocks voteable immediately.
         self.check_pending_blocks(desc);
+        true
     }
 
     /// Advance progress cursor through all progressed slots.
