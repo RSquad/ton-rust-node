@@ -351,6 +351,11 @@ pub struct ElectionsResponse {
     pub result: Option<ElectionsSnapshot>,
     pub next_elections: Option<TimeRange>,
     pub our_participants: Vec<OurElectionParticipant>,
+    /// Most recent elections audit events, newest first. Populated from the
+    /// in-memory ring buffer; empty when audit is disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub recent_events: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -517,6 +522,7 @@ pub async fn v1_elections_handler(
         status: view.status,
         next_elections: view.next_elections,
         our_participants,
+        recent_events: Vec::new(),
     })
 }
 
