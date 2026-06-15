@@ -49,17 +49,19 @@ Each event contains:
 ## File layout
 
 ```
-./logs/audit.jsonl       ← current file (line 0 is a file header, not an event)
+./logs/audit.jsonl       ← current file (line 0 is a system.service_started event)
 ./logs/audit.jsonl.1     ← most-recent rotation
 ./logs/audit.jsonl.2
 …
 ./logs/audit.jsonl.9
 ```
 
-The first line of every file is a **header** (no `event_type` field):
+The first line of every (rotated) file is a regular `system.service_started`
+event whose `data` carries the service `version` and `host`. There is no
+special header format — every line is a uniform JSONL event:
 
 ```json
-{"schema_version":1,"service":"nodectl","service_version":"0.7.0","host":"validator-1","started_at":"2026-05-22T12:00:00.000Z"}
+{"id":"019ecb64-...","ts":"2026-05-22T12:00:00.000Z","outcome":"success","event_type":"system.service_started","data":{"version":"0.7.0","host":"validator-1"},"actor":{"kind":"system"},"target":{"kind":"system"}}
 ```
 
 Defaults: 100 MiB per file, 10 files → ~1 GiB total history.

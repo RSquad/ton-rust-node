@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 /// Renders timestamps as RFC3339 with millisecond precision and a trailing `Z`
-/// (e.g. `2026-05-22T12:10:30.123Z`), used for `ts` and `started_at`.
+/// (e.g. `2026-05-22T12:10:30.123Z`), used for the `ts` field.
 mod ts_millis_rfc3339 {
     use super::*;
 
@@ -31,26 +31,11 @@ mod ts_millis_rfc3339 {
     }
 }
 
-/// First JSONL line of every (rotated) audit file. Readers distinguish it from
-/// events by the absence of an `event_type` field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AuditFileHeader {
-    pub schema_version: u16,
-    /// Logical service name, e.g. `"nodectl"`.
-    pub service: String,
-    /// Service semver.
-    pub service_version: String,
-    pub host: String,
-    #[serde(with = "ts_millis_rfc3339")]
-    pub started_at: DateTime<Utc>,
-}
-
 /// A single audit record.
 ///
 /// Wire shape: `id`, `ts`, `outcome`, the flattened payload
 /// (`event_type` + `data`), `actor`, `target`. `severity`/`source` are derived
-/// from the payload at the display layer and `schema_version` lives in
-/// [`AuditFileHeader`], so none of them are stored per event.
+/// from the payload at the display layer, so they are not stored per event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// UUID v7 — sortable by creation time.
@@ -287,12 +272,12 @@ impl AuditEvent {
         )
     }
 
-    pub fn system_service_started(version: impl Into<String>) -> Self {
+    pub fn system_service_started(version: impl Into<String>, host: impl Into<String>) -> Self {
         Self::new(
             AuditActor::System,
             AuditTarget::System,
             AuditOutcome::Success,
-            AuditEventPayload::SystemServiceStarted { version: version.into() },
+            AuditEventPayload::SystemServiceStarted { version: version.into(), host: host.into() },
         )
     }
 
@@ -339,6 +324,31 @@ mod tests {
         payload: AuditEventPayload,
     ) -> AuditEvent {
         AuditEvent { id: fixture_id(), ts: fixture_ts(), outcome, payload, actor, target }
+    }
+
+    #[test]
+    fn serializes_service_started_to_expected_json() {
+        let event = fixed(
+            AuditOutcome::Success,
+            AuditActor::System,
+            AuditTarget::System,
+            AuditEventPayload::SystemServiceStarted {
+                version: "0.5.1".into(),
+                host: "node-host".into(),
+            },
+        );
+        assert_json_eq(
+            &event,
+            json!({
+                "id": FIXTURE_ID,
+                "ts": FIXTURE_TS,
+                "outcome": "success",
+                "event_type": "system.service_started",
+                "data": { "version": "0.5.1", "host": "node-host" },
+                "actor": { "kind": "system" },
+                "target": { "kind": "system" }
+            }),
+        );
     }
 
     #[test]
@@ -405,30 +415,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_header_serializes_with_millis_ts() {
-        let header = AuditFileHeader {
-            schema_version: 1,
-            service: "nodectl".into(),
-            service_version: "0.5.1".into(),
-            host: "node-host".into(),
-            started_at: fixture_ts(),
-        };
-        let value = serde_json::to_value(&header).expect("serialize header");
-        assert_eq!(
-            value,
-            json!({
-                "schema_version": 1,
-                "service": "nodectl",
-                "service_version": "0.5.1",
-                "host": "node-host",
-                "started_at": FIXTURE_TS
-            })
-        );
-        // Header has no event_type — that is how readers tell it apart from events.
-        assert!(value.get("event_type").is_none());
-    }
-
     fn sample_event(payload: AuditEventPayload) -> AuditEvent {
         fixed(
             AuditOutcome::Success,
@@ -481,7 +467,10 @@ mod tests {
             AuditEventPayload::RestApiTokenRejected { reason: "expired".into() },
             AuditEventPayload::VaultKeyCreated {},
             AuditEventPayload::VaultKeyRemoved {},
-            AuditEventPayload::SystemServiceStarted { version: "0.5.0".into() },
+            AuditEventPayload::SystemServiceStarted {
+                version: "0.5.0".into(),
+                host: "test-host".into(),
+            },
             AuditEventPayload::SystemServiceStopped {},
             AuditEventPayload::SystemAuditEventsDropped {
                 dropped_events: 3,

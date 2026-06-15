@@ -46,7 +46,7 @@ mod tests {
     #[tokio::test]
     async fn records_and_drains_events() {
         let log = InMemoryAuditLog::new();
-        let event = AuditEvent::system_service_started("test");
+        let event = AuditEvent::system_service_started("test", "");
         log.record(event.clone()).await;
         let drained = log.drain();
         assert_eq!(drained.len(), 1);
