@@ -16,9 +16,9 @@ use std::{collections::VecDeque, sync::Arc};
 /// JSONL writer task. Events are available immediately and remain visible even when the
 /// writer queue is full.
 ///
-/// `parking_lot::RwLock` is used intentionally: the critical section is purely in-memory
-/// (no IO, no `.await`), so a synchronous lock is correct and avoids the overhead of an
-/// async lock. The lock is **never held across an `.await` point**.
+/// Uses `parking_lot::RwLock` for a short, purely in-memory critical section — no I/O,
+/// no `.await`, so a synchronous lock is appropriate (a `Mutex` would work equally well).
+/// The lock is **never held across an `.await` point**.
 pub struct AuditEventBuffer {
     inner: RwLock<VecDeque<AuditEvent>>,
     capacity: usize,
@@ -40,12 +40,11 @@ impl AuditEventBuffer {
         Self::push_locked(&mut buf, self.capacity, event);
     }
 
-    /// Appends `event` unless the buffer already holds an entry with the same
-    /// [`AuditEvent::dedup_identity`]. The contains-check and push run under one write
-    /// lock so concurrent `record()` calls cannot duplicate dedup-keyed events.
+    /// Atomically checks deduplication and pushes under one write lock.
     ///
-    /// Returns `true` if the event was appended, `false` if it was suppressed.
-    /// Events without a dedup identity are always appended.
+    /// Returns `false` when an event with the same [`AuditEvent::dedup_identity`] is already
+    /// buffered (e.g. repeated `elections.stake_skipped` for the same node/election/reason).
+    /// Returns `true` when the event was appended.
     pub fn push_unless_dedup_duplicate(&self, event: AuditEvent) -> bool {
         let mut buf = self.inner.write();
         if let Some(key) = event.dedup_identity()
@@ -93,7 +92,7 @@ impl AuditEventBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditEvent, AuditSource, StakeSkipReason};
+    use crate::audit::{AuditActor, AuditEvent, AuditSource, StakeSkipReason};
     use std::sync::{Arc, Barrier};
 
     fn ev(tag: &str) -> AuditEvent {
@@ -210,7 +209,7 @@ mod tests {
 
     fn stake_skipped(node_id: &str) -> AuditEvent {
         AuditEvent::elections_stake_skipped(
-            crate::audit::AuditActor::service("elections-task"),
+            AuditActor::service("elections-task"),
             node_id,
             1_779_265_552,
             StakeSkipReason::ElectionsDisabled,
@@ -257,6 +256,43 @@ mod tests {
             h.join().expect("thread panicked");
         }
         assert_eq!(buf.len(), 1, "only one concurrent stake_skipped must be retained");
+    }
+
+    #[test]
+    fn push_unless_dedup_duplicate_keeps_one_per_node_election_reason() {
+        let buf = AuditEventBuffer::new(10);
+        let actor = AuditActor::service("elections-task");
+        let election_id = 99;
+
+        let first = AuditEvent::elections_stake_skipped(
+            actor.clone(),
+            "node0",
+            election_id,
+            StakeSkipReason::ElectionsDisabled,
+            None,
+            None,
+        );
+        let duplicate = AuditEvent::elections_stake_skipped(
+            actor.clone(),
+            "node0",
+            election_id,
+            StakeSkipReason::ElectionsDisabled,
+            None,
+            None,
+        );
+        let different_reason = AuditEvent::elections_stake_skipped(
+            actor,
+            "node0",
+            election_id,
+            StakeSkipReason::LowWalletBalance,
+            None,
+            None,
+        );
+
+        assert!(buf.push_unless_dedup_duplicate(first));
+        assert!(!buf.push_unless_dedup_duplicate(duplicate));
+        assert!(buf.push_unless_dedup_duplicate(different_reason));
+        assert_eq!(buf.len(), 2);
     }
 
     #[test]
