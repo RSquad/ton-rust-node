@@ -10,7 +10,7 @@
 //! [`AppState`] so field additions don't drift across test modules.
 
 use crate::{
-    audit::{AuditActorBuilder, InMemoryAuditLog, NoopAuditLog, log::AuditLog},
+    audit::{AuditActorBuilder, AuditEventBuffer, InMemoryAuditLog, NoopAuditLog, log::AuditLog},
     auth::{jwt::JwtAuth, user_store::UserStore},
     http::{http_server_task::AppState, login_rate_limiter::LoginRateLimiter},
     runtime_config::{RuntimeConfig, RuntimeConfigStore},
@@ -68,6 +68,7 @@ pub async fn build_app_state_with(
         config_changed: Arc::new(tokio::sync::Notify::new()),
         audit,
         actor_builder: Arc::new(AuditActorBuilder::new(runtime_cfg)),
+        audit_ring: AuditEventBuffer::new(0),
     }
 }
 

@@ -3895,16 +3895,12 @@ async fn stake_submitted_event_contains_correct_payload() {
     assert_eq!(ev.outcome, AuditOutcome::Success);
     assert_node_target(&ev.target, node_id, ELECTION_ID);
 
-    let AuditEventPayload::ElectionsStakeSubmitted {
-        stake_nanotons,
-        max_factor,
-        policy,
-        submission_time,
-    } = &ev.payload
+    let AuditEventPayload::ElectionsStakeSubmitted { stake, max_factor, policy, submission_time } =
+        &ev.payload
     else {
         unreachable!();
     };
-    assert_eq!(stake_nanotons, &expected_stake.to_string());
+    assert_eq!(stake, &expected_stake.to_string());
     assert_eq!(*max_factor, 196608);
     assert_eq!(policy, "split50");
     assert!(*submission_time > 0);

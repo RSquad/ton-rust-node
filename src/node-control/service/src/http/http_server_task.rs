@@ -23,7 +23,7 @@ use super::{
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
 use crate::{
-    audit::{AuditActorBuilder, log::AuditLog},
+    audit::{AuditActorBuilder, AuditEventBuffer, log::AuditLog},
     auth::{
         Claims,
         jwt::JwtAuth,
@@ -56,6 +56,9 @@ pub struct AppState {
     pub config_changed: Arc<tokio::sync::Notify>,
     pub audit: Arc<dyn AuditLog>,
     pub actor_builder: Arc<AuditActorBuilder>,
+    /// In-memory ring buffer for the REST read-path (e.g. GET /v1/elections).
+    /// Never read from disk on the hot path.
+    pub audit_ring: Arc<AuditEventBuffer>,
 }
 
 pub async fn run(
@@ -65,6 +68,7 @@ pub async fn run(
     tasks: HashMap<&'static str, Arc<TaskController>>,
     config_changed: Arc<tokio::sync::Notify>,
     audit: Arc<dyn AuditLog>,
+    audit_ring: Arc<AuditEventBuffer>,
 ) {
     tracing::info!("http-server task started");
 
@@ -125,6 +129,7 @@ pub async fn run(
         config_changed,
         audit,
         actor_builder,
+        audit_ring,
     };
     let app = routes(enable_swagger, state);
 
@@ -346,6 +351,11 @@ pub struct ElectionsResponse {
     pub result: Option<ElectionsSnapshot>,
     pub next_elections: Option<TimeRange>,
     pub our_participants: Vec<OurElectionParticipant>,
+    /// Most recent elections audit events, newest first. Populated from the
+    /// in-memory ring buffer; empty when audit is disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub recent_events: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -486,14 +496,26 @@ pub async fn v1_elections_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ElectionsQuery>,
 ) -> axum::Json<ElectionsResponse> {
+    use crate::audit::AuditSource;
+
     let include_participants = query.include_participants.unwrap_or(false);
     let view = state.store.get_elections_view(include_participants);
+
+    let recent_events: Vec<serde_json::Value> = state
+        .audit_ring
+        .filter_collect(|e| e.payload.source() == AuditSource::Elections)
+        .into_iter()
+        .rev()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+
     axum::Json(ElectionsResponse {
         ok: true,
         result: view.elections,
         status: view.status,
         next_elections: view.next_elections,
         our_participants: view.our_participants,
+        recent_events,
     })
 }
 
@@ -1082,7 +1104,6 @@ mod tests {
         task::task_manager::ServiceTask,
     };
     use axum::body::Body;
-    use base64::Engine;
     use common::{
         app_config::{
             AppConfig, ElectionsConfig, HttpConfig, LogConfig, NodeBinding, StakePolicy,

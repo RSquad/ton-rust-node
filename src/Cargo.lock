@@ -4939,6 +4939,7 @@ dependencies = [
  "http-body-util",
  "jsonwebtoken",
  "mockall",
+ "parking_lot",
  "secrets-vault",
  "serde",
  "serde_json",

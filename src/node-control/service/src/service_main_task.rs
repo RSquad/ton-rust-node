@@ -7,7 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    audit::AuditLogFactory,
+    audit::{AuditLogFactory, factory::AuditComponents},
     elections::election_task::BindingStatusCallback,
     http::http_server_task,
     runtime_config::RuntimeConfigStore,
@@ -54,7 +54,7 @@ pub async fn run_with_config(
         .context("initialize runtime config store")?;
     let runtime_cfg = Arc::new(runtime_cfg);
 
-    let audit =
+    let AuditComponents { log: audit, ring: audit_ring } =
         AuditLogFactory::from_config(&app_cfg.audit_log).await.context("audit log init failed")?;
 
     let store = Arc::new(SnapshotStore::new());
@@ -124,6 +124,7 @@ pub async fn run_with_config(
         tasks.clone(),
         config_changed.clone(),
         audit.clone(),
+        audit_ring,
     ));
 
     let max_wait = std::time::Duration::from_secs(10);
