@@ -8,6 +8,16 @@
  */
 use super::*;
 
+fn make_test_config_handler() -> NodeConfigHandler {
+    let (sender, _reader) = tokio::sync::mpsc::unbounded_channel();
+    NodeConfigHandler {
+        runtime_handle: tokio::runtime::Handle::current(),
+        sender,
+        key_ring: Arc::new(lockfree::map::Map::new()),
+        validator_keys: Arc::new(ValidatorKeys::new()),
+    }
+}
+
 #[tokio::test]
 async fn test_custom_overlays_serde() -> Result<()> {
     for _ in 0..100 {
@@ -55,5 +65,51 @@ async fn test_custom_overlays_serde() -> Result<()> {
         let _ = std::fs::remove_file(path);
         assert_eq!(format!("{:?}", coc), format!("{:?}", loaded_coc));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_actual_validator_key_ids_uses_validator_key_order() -> Result<()> {
+    let config_handler = make_test_config_handler();
+
+    let key_a = Ed25519KeyOption::<ZeroizingBytes>::generate()?;
+    let key_b = Ed25519KeyOption::<ZeroizingBytes>::generate()?;
+    let key_c = Ed25519KeyOption::<ZeroizingBytes>::generate()?;
+
+    // Intentionally add keys in election order that differs from validator key order.
+    config_handler.validator_keys.add(ValidatorKeysJson {
+        expire_at: i32::MAX,
+        election_id: 30,
+        validator_key_id: base64_encode(key_b.id().data()),
+        validator_adnl_key_id: None,
+    })?;
+    config_handler.validator_keys.add(ValidatorKeysJson {
+        expire_at: i32::MAX,
+        election_id: 10,
+        validator_key_id: base64_encode(key_c.id().data()),
+        validator_adnl_key_id: None,
+    })?;
+    config_handler.validator_keys.add(ValidatorKeysJson {
+        expire_at: i32::MAX,
+        election_id: 20,
+        validator_key_id: base64_encode(key_a.id().data()),
+        validator_adnl_key_id: None,
+    })?;
+    // Duplicate key in another election is still one local validator key.
+    config_handler.validator_keys.add(ValidatorKeysJson {
+        expire_at: i32::MAX,
+        election_id: 40,
+        validator_key_id: base64_encode(key_b.id().data()),
+        validator_adnl_key_id: None,
+    })?;
+
+    let mut expected = vec![*key_a.id().data(), *key_b.id().data(), *key_c.id().data()];
+    expected.sort_unstable();
+    expected.dedup();
+
+    let actual = config_handler.get_actual_validator_key_ids()?;
+    let actual: Vec<[u8; 32]> = actual.iter().map(|key_id| *key_id.data()).collect();
+
+    assert_eq!(actual, expected);
     Ok(())
 }

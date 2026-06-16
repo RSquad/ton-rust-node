@@ -59,13 +59,15 @@
 
 use crate::{
     receiver::{ReceiverListener, ReceiverListenerPtr},
+    receiver_callbacks::ReceiverCallbacks,
+    session_callbacks::SessionCallbacks,
     session_description::SessionDescription,
     session_processor::SessionProcessor,
-    startup_recovery::{SessionStartupRecoveryOptions, SessionStartupRecoveryProcessor},
+    startup_recovery::SessionStartupRecoveryProcessor,
     task_queue::{CallbackTaskPtr, CallbackTaskQueuePtr, TaskPtr, TaskQueue, TaskQueuePtr},
     ActivityNodePtr, ConsensusOverlayManagerPtr, ConsensusSession, LogReplayOptions, MetricsHandle,
-    PrivateKey, RawVoteData, SessionId, SessionListenerPtr, SessionNode, SessionOptions,
-    SessionPtr, SessionReplayListenerPtr, SimplexSession, ValidatorWeight,
+    PrivateKey, SessionId, SessionListenerPtr, SessionNode, SessionOptions, SessionPtr,
+    SessionReplayListenerPtr, SimplexSession,
 };
 use consensus_common::{
     check_execution_time,
@@ -89,11 +91,7 @@ use std::{
     thread,
     time::{Duration, SystemTime},
 };
-use ton_api::ton::consensus::{
-    simplex::{Certificate, Vote},
-    CandidateData,
-};
-use ton_block::{error, BlockIdExt, Error, Result, ShardIdent, UInt256};
+use ton_block::{error, BlockIdExt, Error, Result, ShardIdent};
 
 /*
     Constants
@@ -109,109 +107,6 @@ const SESSION_HEALTH_CHECK_PERIOD_MS: u64 = 20000;
 //LK: for debugging only; need to be removed in future
 const SESSION_MAX_LEADER_WINDOW_DESYNC_MARGIN: u32 = 0;
 const LOG_TARGET_PROFILING: &str = "simplex_profiling"; // log target for profiling
-
-/*
-===================================================================================================
-    ReceiverListenerImpl - bridge between Receiver and SessionProcessor
-===================================================================================================
-*/
-
-/// Implementation of ReceiverListener that posts callbacks to the main task queue.
-struct ReceiverListenerImpl {
-    task_queue: TaskQueuePtr,
-    session_id: SessionId,
-}
-
-impl ReceiverListener for ReceiverListenerImpl {
-    /// Handle incoming vote from the network
-    fn on_vote(&self, source_idx: u32, vote: Vote, raw_vote: RawVoteData) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.on_vote(source_idx, vote, raw_vote);
-        }));
-    }
-
-    /// Handle incoming block candidate (from broadcast or query response)
-    fn on_candidate_received(
-        &self,
-        source_idx: u32,
-        candidate: CandidateData,
-        notar_cert: Option<Vec<u8>>,
-    ) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.on_candidate_received(source_idx, candidate, notar_cert);
-        }));
-    }
-
-    fn on_candidate_notar_received(
-        &self,
-        source_idx: u32,
-        slot: crate::block::SlotIndex,
-        block_hash: UInt256,
-        notar_cert: Vec<u8>,
-    ) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.on_candidate_notar_received(source_idx, slot, block_hash, notar_cert);
-        }));
-    }
-
-    /// Handle activity updates from the receiver
-    fn on_activity(
-        &self,
-        active_weight: ValidatorWeight,
-        last_activity: Vec<Option<SystemTime>>,
-        snapshot: crate::receiver::ReceiverActivitySnapshot,
-    ) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.on_activity(active_weight, last_activity, snapshot);
-        }));
-    }
-
-    fn on_standstill_trigger(&self, notification: crate::receiver::StandstillTriggerNotification) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.on_standstill_trigger(notification);
-        }));
-    }
-
-    /// Handle incoming certificate from network
-    fn on_certificate(&self, source_idx: u32, certificate: Certificate) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.on_certificate(source_idx, certificate);
-        }));
-    }
-
-    /// Handle RequestCandidate cache miss by delegating to SessionProcessor
-    fn on_candidate_query_fallback(
-        &self,
-        slot: crate::block::SlotIndex,
-        block_hash: UInt256,
-        want_candidate: bool,
-        want_notar: bool,
-        response_callback: consensus_common::QueryResponseCallback,
-    ) {
-        self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
-            processor.handle_candidate_query_fallback(
-                slot,
-                block_hash,
-                want_candidate,
-                want_notar,
-                response_callback,
-            );
-        }));
-    }
-}
-
-impl ReceiverListenerImpl {
-    /// Create new ReceiverListenerImpl
-    fn create(task_queue: TaskQueuePtr, session_id: SessionId) -> Arc<Self> {
-        Arc::new(Self { task_queue, session_id })
-    }
-}
-
-impl Drop for ReceiverListenerImpl {
-    fn drop(&mut self) {
-        log::debug!("Dropped ReceiverListenerImpl for session {}", self.session_id.to_hex_string());
-    }
-}
 
 /*
 ===================================================================================================
@@ -391,8 +286,12 @@ pub(crate) struct SessionImpl {
     /// Task queue for main thread tasks processing
     #[allow(dead_code)]
     main_task_queue: TaskQueuePtr,
-    /// Task queue for session callbacks processing
-    _callbacks_task_queue: CallbackTaskQueuePtr,
+    /// Per-session callback delivery aspect (see
+    /// [`crate::session_callbacks`]). Owns the `SXCB` callback task
+    /// queue and the worker thread it drives, kept here as a sibling
+    /// `Arc` so the queue's `flush()` runs in the correct order
+    /// relative to `SessionProcessor` teardown.
+    _callbacks: Arc<SessionCallbacks>,
     /// Session identifier
     session_id: SessionId,
     /// Activity node for session lifetime tracking
@@ -539,13 +438,12 @@ impl SessionImpl {
         deferred_start_info: Arc<Mutex<Option<(Vec<BlockIdExt>, BlockIdExt)>>>,
         panicked_flag: Arc<AtomicBool>,
         task_queue: TaskQueuePtr,
-        callbacks_task_queue: CallbackTaskQueuePtr,
+        callbacks: Arc<SessionCallbacks>,
         mut options: SessionOptions,
         session_id: SessionId,
         shard: ShardIdent,
         ids: Vec<SessionNode>,
         local_key: PrivateKey,
-        listener: SessionListenerPtr,
         overlay_manager: ConsensusOverlayManagerPtr,
         receiver_listener: ReceiverListenerPtr,
         max_candidate_size: usize,
@@ -778,15 +676,13 @@ impl SessionImpl {
         let mut processor = match SessionProcessor::new(
             description,
             session_start_prev_blocks,
-            listener,
             task_queue.clone(),
-            callbacks_task_queue.clone(),
-            overlay_manager,
             receiver,
             should_stop_flag.clone(),
             db,
             startup_errors.get(),
             health_counters,
+            callbacks,
         ) {
             Ok(p) => p,
             Err(err) => {
@@ -799,12 +695,9 @@ impl SessionImpl {
         // This replays votes, sets finalized boundary, applies local flags,
         // generates skip votes, and restores receiver cache.
         if !is_fresh_start {
-            let recovery_options = SessionStartupRecoveryOptions { initial_block_seqno };
-
             let recovery_processor = SessionStartupRecoveryProcessor::new(
                 session_id.clone(),
                 description_for_recovery,
-                recovery_options,
                 bootstrap,
             );
 
@@ -979,67 +872,6 @@ impl SessionImpl {
 
         log::info!(
             "SimplexSession main loop is finished (session_id is {})",
-            session_id.to_hex_string()
-        );
-
-        is_stopped_flag.store(true, Ordering::Release);
-    }
-
-    fn callbacks_loop(
-        should_stop_flag: Arc<AtomicBool>,
-        is_stopped_flag: Arc<AtomicBool>,
-        task_queue: CallbackTaskQueuePtr,
-        session_id: SessionId,
-        metrics_receiver: MetricsHandle,
-    ) {
-        log::info!(
-            "SimplexSession callbacks processing loop is started (session_id is {})",
-            session_id.to_hex_string()
-        );
-
-        let activity_node = consensus_common::ConsensusCommonFactory::create_activity_node(
-            format!("SimplexCallbacks_{}", session_id.to_hex_string()),
-        );
-
-        // Configure metrics
-        let loop_counter =
-            metrics_receiver.sink().register_counter(&"simplex_callbacks_loop_iterations".into());
-        let loop_overloads_counter =
-            metrics_receiver.sink().register_counter(&"simplex_callbacks_loop_overloads".into());
-
-        // Callbacks processing loop
-        let mut last_warn_dump_time = SystemTime::now();
-
-        loop {
-            activity_node.tick();
-            loop_counter.increment(1);
-
-            // Check if the loop should be stopped
-            if should_stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Check overload flag
-            if task_queue.is_overloaded() {
-                loop_overloads_counter.increment(1);
-            }
-
-            // Handle session callback event with timeout
-            const MAX_TIMEOUT: Duration = Duration::from_millis(100);
-
-            let task = task_queue.pull_closure(MAX_TIMEOUT, &mut last_warn_dump_time);
-
-            if let Some(task) = task {
-                check_execution_time!(100_000);
-                task();
-            }
-        }
-
-        // Finishing routines
-        task_queue.flush();
-
-        log::info!(
-            "SimplexSession callbacks processing loop is finished (session_id is {})",
             session_id.to_hex_string()
         );
 
@@ -1316,10 +1148,24 @@ impl SessionImpl {
         let callbacks_processing_thread_stopped = Arc::new(AtomicBool::new(false));
         let panicked_flag = Arc::new(AtomicBool::new(false));
 
-        // Create receiver listener (posts callbacks to main task queue)
-        // Note: Receiver itself is created in main_loop after bootstrap loading
+        // Create callbacks aspect. Owns the SXCB callback task queue, the
+        // shutdown-suppression gate (via stop_flag) and the use_callback_thread
+        // routing flag; the worker thread is spawned below when the flag is
+        // set. Kept here as an Arc so SessionProcessor can dispatch
+        // notifications without going through the SessionImpl borrow.
+        let callbacks = Arc::new(SessionCallbacks::new(
+            session_id.clone(),
+            stop_flag.clone(),
+            options.use_callback_thread,
+            callbacks_task_queue.clone(),
+            listener,
+        ));
+
+        // Create receiver-callback adapter (posts SXRCV events onto SXMAIN).
+        // Symmetric counterpart of SessionCallbacks (SXMAIN -> SXCB listener).
+        // Receiver itself is created in main_loop after bootstrap loading.
         let receiver_listener: Arc<dyn ReceiverListener + Send + Sync> =
-            ReceiverListenerImpl::create(main_task_queue.clone(), session_id.clone());
+            ReceiverCallbacks::create(main_task_queue.clone(), session_id.clone());
         let receiver_listener_weak: ReceiverListenerPtr = Arc::downgrade(&receiver_listener);
 
         // Compute max candidate size for receiver (local validation guard, +1KB slack)
@@ -1338,7 +1184,7 @@ impl SessionImpl {
             callbacks_processing_thread_stopped: callbacks_processing_thread_stopped.clone(),
             panicked_flag: panicked_flag.clone(),
             main_task_queue: main_task_queue.clone(),
-            _callbacks_task_queue: callbacks_task_queue.clone(),
+            _callbacks: callbacks.clone(),
             session_id: session_id.clone(),
             _activity_node: session_activity_node.clone(),
             _receiver_listener: receiver_listener,
@@ -1349,7 +1195,7 @@ impl SessionImpl {
         // Clone variables for threads
         let stop_flag_for_main_loop = stop_flag.clone();
         let stop_flag_for_callbacks_loop = stop_flag.clone();
-        let callbacks_task_queue_for_callbacks_loop = callbacks_task_queue.clone();
+        let callbacks_for_worker_loop = callbacks.clone();
         let local_key_clone = local_key.clone();
         let session_id_clone = session_id.clone();
         let options_clone = *options;
@@ -1380,13 +1226,12 @@ impl SessionImpl {
                         deferred_start_info,
                         panicked_flag_for_main_loop,
                         main_task_queue,
-                        callbacks_task_queue,
+                        callbacks,
                         options_clone,
                         session_id_clone,
                         shard_clone,
                         ids,
                         local_key_clone,
-                        listener,
                         overlay_manager,
                         receiver_listener_weak,
                         max_candidate_size,
@@ -1444,13 +1289,12 @@ impl SessionImpl {
         }
 
         // Conditionally start callbacks thread based on use_callback_thread option
-        if options.use_callback_thread {
+        if callbacks_for_worker_loop.use_callback_thread() {
             log::info!(
                 "SimplexSession {}: Starting callback processing thread (use_callback_thread=true)",
                 session_id.to_hex_string()
             );
 
-            let session_id_clone = session_id.clone();
             let _callbacks_processing_thread = thread::Builder::new()
                 .name(format!("{}:{}", CALLBACKS_LOOP_NAME, session_id.to_hex_string()))
                 .spawn(move || {
@@ -1461,11 +1305,9 @@ impl SessionImpl {
                     let panicked_flag_for_panic = panicked_flag_for_callbacks_loop.clone();
 
                     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        SessionImpl::callbacks_loop(
+                        callbacks_for_worker_loop.run_worker_loop(
                             stop_flag_for_callbacks_loop,
                             callbacks_processing_thread_stopped,
-                            callbacks_task_queue_for_callbacks_loop,
-                            session_id_clone,
                             metrics_receiver,
                         );
                     }));

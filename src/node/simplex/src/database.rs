@@ -1712,8 +1712,46 @@ impl SimplexDb {
         self.storage.sync(timeout)
     }
 
+    /// Explicitly close the underlying async storage.
+    ///
+    /// Thin wrapper over `AsyncKeyValueStorage::close()` that:
+    /// 1. Drains queued writes under `timeout`.
+    /// 2. Flips the `is_closed` gate so later `set_*` / `get_*` calls fail
+    ///    fast with `DB_CLOSED_ERROR` instead of silently queueing tasks
+    ///    onto a thread that is about to exit.
+    /// 3. Is idempotent: a second `close()` is a cheap `Ok(())`.
+    ///
+    /// Called from `SessionProcessor::stop()` as part of the
+    /// `CONSENSUS-DB-CLEANUP-1` shutdown flow (C++ parity with
+    /// `td::KeyValueAsync::close()` / `bridge.cpp::destroy_inner()`).
+    ///
+    /// `Drop` keeps a safety-net `sync()` so an accidental drop without a
+    /// prior `close()` still flushes the WAL before rocksdb is torn down.
+    pub fn close(&self, timeout: Option<Duration>) -> Result<()> {
+        log::info!(
+            target: TARGET,
+            "SimplexDb {}: close (timeout={:?})",
+            self.storage_id,
+            timeout
+        );
+        self.storage.close(timeout)
+    }
+
+    /// Returns `true` once the underlying async storage has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.storage.is_closed()
+    }
+
+    /// Returns the on-disk path of the underlying storage.
+    ///
+    /// Used by tests + shutdown logging to correlate a SimplexDb with its
+    /// `consensus.{wc}.{shard}.{cc_seqno}.{session}` directory.
+    #[allow(dead_code)] // Consumed by unit tests (test_database.rs / test_session_processor.rs).
+    pub fn get_path(&self) -> &Path {
+        self.storage.get_path()
+    }
+
     /// Mark database for destruction on drop.
-    #[allow(dead_code)] // Used by unit tests in `node/simplex/src/tests/test_database.rs`.
     pub fn mark_for_destroy(&self) {
         log::info!(
             target: TARGET,
@@ -1732,20 +1770,36 @@ impl Drop for SimplexDb {
             self.storage_id
         );
 
-        // Force sync to flush all pending writes before closing
-        if let Err(e) = self.sync(Some(DEFAULT_SYNC_TIMEOUT)) {
-            log::error!(
-                target: TARGET,
-                "SimplexDb {}: sync on drop failed: {}",
-                self.storage_id,
-                e
-            );
-        } else {
-            log::info!(
-                target: TARGET,
-                "SimplexDb {}: sync complete",
-                self.storage_id
-            );
+        // Safety-net drain: if `close()` was already called (the normal
+        // `SessionProcessor::stop()` path), `sync()` short-circuits with
+        // `DB_CLOSED_ERROR` and we log-and-continue. If nobody called
+        // `close()` (e.g. a panic tore the session down early), the
+        // `AsyncKeyValueStorage` Drop impl still runs its own safety-net
+        // drain before joining threads, so the WAL stays consistent.
+        match self.sync(Some(DEFAULT_SYNC_TIMEOUT)) {
+            Ok(()) => {
+                log::info!(
+                    target: TARGET,
+                    "SimplexDb {}: sync complete",
+                    self.storage_id
+                );
+            }
+            Err(e) if self.is_closed() => {
+                log::debug!(
+                    target: TARGET,
+                    "SimplexDb {}: Drop sync short-circuited by prior close(): {}",
+                    self.storage_id,
+                    e
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    target: TARGET,
+                    "SimplexDb {}: sync on drop failed: {}",
+                    self.storage_id,
+                    e
+                );
+            }
         }
     }
 }

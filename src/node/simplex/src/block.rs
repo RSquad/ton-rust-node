@@ -79,7 +79,6 @@ use crate::{PrivateKey, PublicKey, SessionId};
 use std::{
     fmt,
     ops::{Add, AddAssign, Mul, Rem, Sub},
-    sync::Arc,
 };
 use ton_api::{
     ton::{
@@ -518,18 +517,6 @@ impl RawCandidateId {
         );
         Self { slot, hash }
     }
-
-    /// Convert to CandidateParentInfo for FSM operations
-    #[allow(dead_code)]
-    pub fn as_parent_info(&self) -> CandidateParentInfo {
-        CandidateParentInfo { slot: self.slot, hash: self.hash.clone() }
-    }
-
-    /// Create from slot and hash directly (for deserialization)
-    #[allow(dead_code)]
-    pub fn from_parts(slot: SlotIndex, hash: UInt256) -> Self {
-        Self { slot, hash }
-    }
 }
 
 impl fmt::Debug for RawCandidateId {
@@ -577,12 +564,6 @@ impl CandidateId {
     pub fn to_raw(&self) -> RawCandidateId {
         RawCandidateId { slot: self.slot, hash: self.hash.clone() }
     }
-
-    /// Convert to CandidateParentInfo for FSM operations
-    #[allow(dead_code)]
-    pub fn as_parent_info(&self) -> CandidateParentInfo {
-        CandidateParentInfo { slot: self.slot, hash: self.hash.clone() }
-    }
 }
 
 impl From<CandidateId> for RawCandidateId {
@@ -620,10 +601,6 @@ impl fmt::Display for CandidateId {
         )
     }
 }
-
-/// Type alias for optional resolved parent
-#[allow(dead_code)]
-pub type ParentId = Option<CandidateId>;
 
 /// Block candidate data
 ///
@@ -687,15 +664,6 @@ impl CandidateBlockData {
         match self {
             CandidateBlockData::Empty(_) => None,
             CandidateBlockData::NonEmpty(block) => Some(block),
-        }
-    }
-
-    /// Get BlockIdExt if this is an empty block
-    #[allow(dead_code)]
-    pub fn as_empty(&self) -> Option<&BlockIdExt> {
-        match self {
-            CandidateBlockData::Empty(id) => Some(id),
-            CandidateBlockData::NonEmpty(_) => None,
         }
     }
 }
@@ -1204,14 +1172,6 @@ impl RawCandidate {
         Ok(Self::new_empty(id, parent, leader_idx, referenced_block, signature))
     }
 }
-
-/// Pointer type for RawCandidate
-#[allow(dead_code)]
-pub type RawCandidatePtr = Arc<RawCandidate>;
-
-/// Pointer type for Candidate
-#[allow(dead_code)]
-pub type CandidatePtr = Arc<Candidate>;
 
 /// Resolved candidate with full parent information
 ///

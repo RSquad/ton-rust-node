@@ -789,36 +789,21 @@ impl PrivateOverlayOperations for NodeNetwork {
             return Ok(ValidatorListOutcome::NotValidator);
         };
 
+        let (local_validator_key, election_id) = self
+            .config_handler
+            .get_validator_key(local_validator.public_key.id())
+            .await
+            .ok_or_else(|| error!("validator key not found!"))?;
+
         let mut matching_local_keys = Vec::with_capacity(local_validators.len());
-        let mut election_id = None;
         for validator in &local_validators {
-            let (validator_key, current_election_id) = self
+            let (validator_key, _) = self
                 .config_handler
                 .get_validator_key(validator.public_key.id())
                 .await
                 .ok_or_else(|| error!("validator key not found!"))?;
-            if let Some(first_eid) = election_id {
-                if first_eid != current_election_id {
-                    fail!(
-                        "set_validator_list {:x}: election_id mismatch among matching local \
-                         keys: first key election_id={}, this key election_id={} (key_id={}). \
-                         Each election_id must map to exactly one (validator_key, adnl_id) tuple.",
-                        validator_list_id,
-                        first_eid,
-                        current_election_id,
-                        hex::encode(validator.public_key.id().data()),
-                    );
-                }
-            } else {
-                election_id = Some(current_election_id);
-            }
             matching_local_keys.push(validator_key);
         }
-        let local_validator_key = matching_local_keys
-            .first()
-            .cloned()
-            .ok_or_else(|| error!("validator key not found!"))?;
-        let election_id = election_id.ok_or_else(|| error!("validator election id not found!"))?;
 
         if pubkey_matched_but_adnl_missing {
             log::warn!(

@@ -36,15 +36,18 @@
 //! This matches C++ reference implementation (`consensus-types.cpp`).
 //!
 
-use crate::{PrivateKey, PublicKey, SessionId, ValidatorWeight};
+use crate::{AsyncRequest, PrivateKey, PublicKey, SessionId, ValidatorWeight};
 use std::{
     any::Any,
     backtrace::Backtrace,
     cmp::max,
     panic,
-    sync::{Arc, Once},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Once,
+    },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use ton_api::{
     ton::{
@@ -953,4 +956,66 @@ pub fn compute_block_sync_overlay_short_id(session_id: &SessionId) -> Result<Arc
     let serialized = consensus_common::serialize_tl_boxed_object!(&overlay_seed.into_boxed());
     let overlay_pubkey = Overlay { name: serialized }.into_boxed();
     Ok(KeyId::from_data(adnl::common::hash_boxed(&overlay_pubkey)?))
+}
+
+// ======================================================================
+// Async-request handle
+// ======================================================================
+//
+// Generic cancellable async-request handle. Used by `CollationController` to
+// track in-flight collation / parent-candidate requests; lives here rather than
+// on a controller because it carries no session state — just an id, a creation
+// timestamp, and a shared cancellation flag.
+
+/// Async request implementation for tracking collation requests
+pub(crate) struct AsyncRequestImpl {
+    /// Request identifier
+    request_id: u32,
+    /// Time when request was created
+    creation_time: SystemTime,
+    /// Flag indicating request was cancelled
+    cancelled: Arc<AtomicBool>,
+    /// Whether to cancel on drop
+    cancel_on_drop: bool,
+}
+
+impl AsyncRequestImpl {
+    pub(crate) fn new(
+        request_id: u32,
+        cancel_on_drop: bool,
+        creation_time: SystemTime,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            request_id,
+            creation_time,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_on_drop,
+        })
+    }
+}
+
+impl AsyncRequest for AsyncRequestImpl {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    fn get_request_id(&self) -> u32 {
+        self.request_id
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    fn get_creation_time(&self) -> SystemTime {
+        self.creation_time
+    }
+}
+
+impl Drop for AsyncRequestImpl {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
 }

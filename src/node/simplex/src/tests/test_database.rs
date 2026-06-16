@@ -613,3 +613,137 @@ fn test_db_path_format() {
 
     db.mark_for_destroy();
 }
+
+// ============================================================================
+// Close / Destroy Regression Tests (CONSENSUS-DB-CLEANUP-1, TN-1035)
+// ============================================================================
+//
+// These tests exercise the `SimplexDb::close()` wrapper introduced in
+// CONSENSUS-DB-CLEANUP-1. They assert:
+//
+// 1. `close()` drains queued writes before flipping the gate.
+// 2. Post-close writes are rejected (the gate propagates down to
+//    `AsyncKeyValueStorage`).
+// 3. `close()` is idempotent.
+// 4. `close()` + `mark_for_destroy()` removes on-disk state.
+// 5. `Drop` without `close()` still flushes pending writes (safety net).
+
+#[test]
+fn test_simplexdb_close_drains_and_gates() {
+    let (db_path, db) = create_test_db("test_simplexdb_close_drains_and_gates");
+
+    // Kick off a batch of fire-and-forget writes. We chain parents so
+    // `filter_finalized_chain()` (applied by `load_finalized_blocks`) keeps
+    // every record instead of pruning all but the chain root.
+    const N: u32 = 20;
+    for i in 0..N {
+        db.save_finalized_block(&FinalizedBlockRecord {
+            candidate_id: create_candidate_id(i, (i & 0xff) as u8),
+            block_id: create_block_id(2000 + i),
+            parent: if i == 0 {
+                None
+            } else {
+                Some(create_candidate_id(i - 1, ((i - 1) & 0xff) as u8))
+            },
+            is_final: true,
+        })
+        .unwrap();
+    }
+
+    assert!(!db.is_closed(), "is_closed must be false before close()");
+
+    db.close(Some(Duration::from_secs(5))).expect("close must drain and flip gate");
+    assert!(db.is_closed(), "is_closed must be true after close()");
+
+    // Subsequent sync() must short-circuit with DB_CLOSED_ERROR.
+    let sync_err = db.sync(Some(Duration::from_secs(1))).expect_err("post-close sync must fail");
+    assert!(
+        sync_err.to_string().contains("db is closed"),
+        "expected DB_CLOSED_ERROR from post-close sync, got: {}",
+        sync_err
+    );
+
+    // Reopen from the same path / storage_id and verify every pre-close write
+    // actually landed. This proves close() drained the queue before flipping
+    // the gate.
+    let storage_id = create_test_session_id(0x42).to_hex_string();
+    drop(db);
+    let reopened = SimplexDb::open(&db_path, &storage_id).unwrap();
+    let records = reopened.load_finalized_blocks().unwrap();
+    assert_eq!(records.len() as u32, N, "every pre-close write must persist across close()");
+    reopened.mark_for_destroy();
+}
+
+#[test]
+fn test_simplexdb_close_is_idempotent() {
+    let (_db_path, db) = create_test_db("test_simplexdb_close_is_idempotent");
+
+    db.close(Some(Duration::from_secs(5))).expect("first close");
+    db.close(Some(Duration::from_secs(5))).expect("second close is Ok");
+    db.close(None).expect("third close is Ok");
+
+    assert!(db.is_closed());
+
+    db.mark_for_destroy();
+}
+
+#[test]
+fn test_simplexdb_close_then_destroy_removes_dir() {
+    let (db_path, db) = create_test_db("test_simplexdb_close_then_destroy_removes_dir");
+
+    db.save_finalized_block(&FinalizedBlockRecord {
+        candidate_id: create_candidate_id(1, 0xAA),
+        block_id: create_block_id(3000),
+        parent: None,
+        is_final: true,
+    })
+    .unwrap();
+    db.close(Some(Duration::from_secs(5))).unwrap();
+    db.mark_for_destroy();
+
+    drop(db);
+
+    // Removal happens on the DB thread after `stop_internal` unwinds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while db_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !db_path.exists(),
+        "DB directory must be removed after close()+mark_for_destroy()+drop"
+    );
+}
+
+#[test]
+fn test_simplexdb_drop_without_close_still_flushes() {
+    let db_root = create_test_db_root("test_simplexdb_drop_without_close_still_flushes");
+    let shard = create_test_shard();
+    let session_id = create_test_session_id(0xCD);
+    let catchain_seqno = 7;
+    let storage_id = session_id.to_hex_string();
+    let db_path = make_test_db_path(&db_root, &shard, catchain_seqno, &session_id);
+
+    {
+        let db = SimplexDb::open(&db_path, &storage_id).unwrap();
+        for i in 0..10u32 {
+            db.save_finalized_block(&FinalizedBlockRecord {
+                candidate_id: create_candidate_id(i, (i & 0xff) as u8),
+                block_id: create_block_id(4000 + i),
+                parent: if i == 0 {
+                    None
+                } else {
+                    Some(create_candidate_id(i - 1, ((i - 1) & 0xff) as u8))
+                },
+                is_final: true,
+            })
+            .unwrap();
+        }
+        // Drop without close(): the safety-net drain in SimplexDb::Drop +
+        // RocksDbAsyncKeyValueStorage::Drop must still land every write.
+    }
+
+    let reopened = SimplexDb::open(&db_path, &storage_id).unwrap();
+    let records = reopened.load_finalized_blocks().unwrap();
+    assert_eq!(records.len(), 10, "every write must persist across drop-without-close");
+    reopened.mark_for_destroy();
+}

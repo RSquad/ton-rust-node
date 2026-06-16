@@ -145,18 +145,28 @@
 
 /// Modules
 mod block;
+mod candidate_book;
 mod certificate;
+mod collation_controller;
+mod consensus_controller;
+mod controller_queue;
 mod database;
+mod database_controller;
 mod misbehavior;
 mod prometheus_publisher;
 mod receiver;
+mod receiver_callbacks;
 mod session;
+mod session_callbacks;
 mod session_description;
 mod session_processor;
+mod session_runtime;
+mod session_telemetry;
 mod simplex_state;
 mod startup_recovery;
 mod task_queue;
 pub mod utils;
+mod validation_controller;
 
 /// Internal tests (private unit tests with crate access)
 #[cfg(test)]
@@ -264,7 +274,7 @@ impl RawVoteData {
         Self(Arc::new(data))
     }
 
-    /// Create from Vec<u8>
+    /// Create from `Vec<u8>`
     pub fn from_vec(data: Vec<u8>) -> Self {
         Self(Arc::new(data.into()))
     }
