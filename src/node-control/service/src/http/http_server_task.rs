@@ -351,11 +351,6 @@ pub struct ElectionsResponse {
     pub result: Option<ElectionsSnapshot>,
     pub next_elections: Option<TimeRange>,
     pub our_participants: Vec<OurElectionParticipant>,
-    /// Most recent elections audit events, newest first. Populated from the
-    /// in-memory ring buffer; empty when audit is disabled.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schema(value_type = Vec<Object>)]
-    pub recent_events: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Default, serde::Deserialize)]
@@ -496,23 +491,17 @@ pub async fn v1_elections_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ElectionsQuery>,
 ) -> axum::Json<ElectionsResponse> {
-    use crate::audit::{
-        AuditSource, collect_recent_election_ids, merge_projection_into_participants,
-        project_elections,
-    };
+    use crate::audit::{AuditSource, merge_projection_into_participants, project_elections};
 
     let include_participants = query.include_participants.unwrap_or(false);
     let view = state.store.get_elections_view(include_participants);
     let current_election_id = view.elections.as_ref().map(|e| e.election_id);
 
-    // Single snapshot of the ring; `project_elections` filters by `recent_ids` internally.
-    let elections_events =
-        state.audit_ring.filter_collect(|e| e.payload.source() == AuditSource::Elections);
-    let recent_ids = collect_recent_election_ids(current_election_id, &elections_events, 3);
-    let projection = project_elections(&elections_events, &recent_ids);
-
     let mut our_participants = view.our_participants;
     if let Some(election_id) = current_election_id {
+        let elections_events =
+            state.audit_ring.filter_collect(|e| e.payload.source() == AuditSource::Elections);
+        let projection = project_elections(&elections_events, &[election_id]);
         merge_projection_into_participants(&mut our_participants, &projection, election_id);
     }
 
@@ -522,7 +511,6 @@ pub async fn v1_elections_handler(
         status: view.status,
         next_elections: view.next_elections,
         our_participants,
-        recent_events: Vec::new(),
     })
 }
 

@@ -31,8 +31,5 @@ pub use in_memory::InMemoryAuditLog;
 pub use jsonl_log::AuditInitError;
 pub use log::{AuditLog, NoopAuditLog};
 pub use participant::{AuditActor, AuditTarget};
-pub use projection::{
-    ElectionsProjection, collect_recent_election_ids, merge_projection_into_participants,
-    project_elections,
-};
+pub use projection::{ElectionsProjection, merge_projection_into_participants, project_elections};
 pub use ring_buffer::AuditEventBuffer;
