@@ -166,7 +166,6 @@ impl AuditLog for JsonlAuditLog {
         }
 
         // Ring already updated; proceed to the JSONL writer queue.
-
         let event_id = event.id;
         let source = event.payload.source();
         let cmd = AuditCommand::Event(Box::new(event));

@@ -93,7 +93,7 @@ impl AuditEventBuffer {
 mod tests {
     use super::*;
     use crate::audit::{AuditActor, AuditEvent, AuditSource, StakeSkipReason};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     fn ev(tag: &str) -> AuditEvent {
         AuditEvent::system_service_started(tag)
@@ -207,15 +207,55 @@ mod tests {
         assert_eq!(buf.len(), 50);
     }
 
+    fn stake_skipped(node_id: &str) -> AuditEvent {
+        AuditEvent::elections_stake_skipped(
+            AuditActor::service("elections-task"),
+            node_id,
+            1_779_265_552,
+            StakeSkipReason::ElectionsDisabled,
+            None,
+            None,
+        )
+    }
+
     #[test]
-    fn zero_capacity_buffer_silently_drops() {
-        // capacity=0 is normalised to 1 internally; no crash, snapshot is non-empty after push
-        let buf = AuditEventBuffer::new(0);
-        assert_eq!(buf.capacity(), 1, "capacity normalised to 1");
-        buf.push(ev("a"));
-        buf.push(ev("b")); // evicts first, keeps second
-        let snap = buf.snapshot();
-        assert_eq!(snap.len(), 1, "only the latest event is retained");
+    fn push_unless_dedup_duplicate_allows_first_then_suppresses() {
+        let buf = AuditEventBuffer::new(10);
+        let first = stake_skipped("node-1");
+        let second = stake_skipped("node-1");
+
+        assert!(buf.push_unless_dedup_duplicate(first));
+        assert!(!buf.push_unless_dedup_duplicate(second));
+        assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn push_unless_dedup_duplicate_always_appends_without_dedup_key() {
+        let buf = AuditEventBuffer::new(10);
+        assert!(buf.push_unless_dedup_duplicate(ev("a")));
+        assert!(buf.push_unless_dedup_duplicate(ev("b")));
+        assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn push_unless_dedup_duplicate_is_atomic_under_concurrency() {
+        let buf = AuditEventBuffer::new(10);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let b = buf.clone();
+            let gate = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                gate.wait();
+                b.push_unless_dedup_duplicate(stake_skipped("node-1"));
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+        assert_eq!(buf.len(), 1, "only one concurrent stake_skipped must be retained");
     }
 
     #[test]
@@ -253,5 +293,16 @@ mod tests {
         assert!(!buf.push_unless_dedup_duplicate(duplicate));
         assert!(buf.push_unless_dedup_duplicate(different_reason));
         assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn zero_capacity_buffer_silently_drops() {
+        // capacity=0 is normalised to 1 internally; no crash, snapshot is non-empty after push
+        let buf = AuditEventBuffer::new(0);
+        assert_eq!(buf.capacity(), 1, "capacity normalised to 1");
+        buf.push(ev("a"));
+        buf.push(ev("b")); // evicts first, keeps second
+        let snap = buf.snapshot();
+        assert_eq!(snap.len(), 1, "only the latest event is retained");
     }
 }
