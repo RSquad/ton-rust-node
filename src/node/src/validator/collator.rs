@@ -4452,7 +4452,8 @@ impl Collator {
         // assert_eq!(visited.len(), visited_from_root.len());
 
         #[cfg(test)]
-        let need_full_state_update = self.collator_settings.is_bundle;
+        let need_full_state_update =
+            self.collator_settings.is_bundle || self.collator_settings.requires_real_state_update;
         #[cfg(not(test))]
         let need_full_state_update = true;
         let state_update;

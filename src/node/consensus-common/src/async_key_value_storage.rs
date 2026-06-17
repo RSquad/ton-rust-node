@@ -81,6 +81,23 @@ const THREAD_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// Periodic log interval during stop wait
 const STOP_LOG_INTERVAL: Duration = Duration::from_millis(300);
 
+/// Sentinel error message returned by every op once `close()` has flipped the
+/// `is_closed` gate.
+///
+/// Callers that share a storage instance (e.g. `SimplexDb`) match on this
+/// substring when they need to distinguish benign post-shutdown noise from
+/// real storage failures. Stays stable across releases: C++ parity pair with
+/// `Status(653, "db is closed")` in `td/db/KeyValueAsync.h`.
+const DB_CLOSED_ERROR: &str = "AsyncKeyValueStorage: db is closed";
+
+/// Hard cap for `stop_internal()` spin-wait.
+///
+/// Without it a panicking DB processing thread that never flipped
+/// `db_thread_stopped` would stall `Drop` forever. The value is comfortably
+/// larger than the largest observed drain latency on mixed 5x5 soaks
+/// (< 200 ms) so a healthy shutdown never hits the ceiling.
+const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ============================================================================
 // StorageAsyncResult Implementation (Hidden)
 // ============================================================================
@@ -278,6 +295,14 @@ pub struct RocksDbAsyncKeyValueStorage {
     pending_count: Arc<AtomicUsize>,
     /// Stop request flag
     is_stop_requested: Arc<AtomicBool>,
+    /// Closed gate: once `true`, every public op short-circuits with
+    /// `DB_CLOSED_ERROR` without touching the DB thread.
+    ///
+    /// Flipped at most once by `close()` and defensively re-flipped by
+    /// `Drop`. The check is not synchronized with `post_task`; a late op may
+    /// slip through and enqueue after `close()`'s drain, but `Drop` always
+    /// re-runs `sync_internal` so the late task is still persisted.
+    is_closed: Arc<AtomicBool>,
     /// DB processing thread stopped flag
     db_thread_stopped: Arc<AtomicBool>,
     /// Callback thread stopped flag (always present, set true immediately if no callback thread)
@@ -346,6 +371,7 @@ impl RocksDbAsyncKeyValueStorage {
 
         // Create atomic flags
         let is_stop_requested = Arc::new(AtomicBool::new(false));
+        let is_closed = Arc::new(AtomicBool::new(false));
         let db_thread_stopped = Arc::new(AtomicBool::new(false));
         let mark_for_destroy = Arc::new(AtomicBool::new(false));
         let pending_count = Arc::new(AtomicUsize::new(0));
@@ -453,6 +479,7 @@ impl RocksDbAsyncKeyValueStorage {
             callback_tx,
             pending_count,
             is_stop_requested,
+            is_closed,
             db_thread_stopped,
             callback_thread_stopped,
             mark_for_destroy,
@@ -587,7 +614,29 @@ impl RocksDbAsyncKeyValueStorage {
             }
         }
 
-        // Cleanup
+        // Optional destroy phase — C++ parity with `bridge.cpp::destroy_inner()`:
+        //
+        // ```cpp
+        // auto S = td::RocksDb::destroy(db_path() + "/db/");
+        // td::rmrf(db_path()).ignore();
+        // ```
+        //
+        // `td::RocksDb::destroy()` removes rocksdb-owned artefacts (MANIFEST,
+        // CURRENT, SST, LOG*) inside the data dir; `td::rmrf()` recursively
+        // removes the parent directory. The Rust pair `drop(db) +
+        // std::fs::remove_dir_all(&path)` is semantically equivalent:
+        //
+        // 1. `drop(db)` releases every rocksdb file handle (including LOCK),
+        //    mirroring what `td::RocksDb::destroy()` does implicitly by
+        //    closing the DB before unlinking.
+        // 2. `remove_dir_all(&path)` recursively unlinks every file under
+        //    the DB path, covering both the rocksdb artefacts and any
+        //    sibling files. This is strictly a superset of `DestroyDB()`.
+        //
+        // Ordering matters: unlinking before `drop(db)` would race with
+        // rocksdb's own file-close on some POSIX filesystems and can leave
+        // a stale LOCK file (observed historically on restart-recovery
+        // soaks pre-CONSENSUS-DB-CLEANUP-1).
         if mark_for_destroy.load(Ordering::SeqCst) {
             log::info!(
                 target: LOG_TARGET,
@@ -682,8 +731,16 @@ impl RocksDbAsyncKeyValueStorage {
         }
     }
 
-    /// Internal stop - called from Drop
-    fn stop_internal(&self) {
+    /// Internal stop - called from Drop. Returns `true` if both worker threads
+    /// stopped cleanly within `STOP_WAIT_TIMEOUT`, `false` on timeout.
+    ///
+    /// Bounded by `STOP_WAIT_TIMEOUT` so that a hung or panicked DB thread
+    /// cannot stall a validator shutdown. On timeout we return `false`; `Drop`
+    /// then *skips* joining the worker threads (it `take()`s the handles and
+    /// detaches them instead of blocking on `join()`), so a wedged thread can
+    /// no longer hold up shutdown. The detached threads — and their rocksdb
+    /// handles — are left to be reclaimed by the OS at process exit.
+    fn stop_internal(&self) -> bool {
         log::debug!(
             target: LOG_TARGET,
             "AsyncKeyValueStorage {}: stopping...",
@@ -692,14 +749,26 @@ impl RocksDbAsyncKeyValueStorage {
 
         self.is_stop_requested.store(true, Ordering::SeqCst);
 
-        // Wait for both threads with periodic logging
+        let stop_start = Instant::now();
         let mut last_log_time = SystemTime::now();
-        loop {
+        let stopped_cleanly = loop {
             let db_stopped = self.db_thread_stopped.load(Ordering::SeqCst);
             let callback_stopped = self.callback_thread_stopped.load(Ordering::SeqCst);
 
             if db_stopped && callback_stopped {
-                break;
+                break true;
+            }
+
+            if stop_start.elapsed() >= STOP_WAIT_TIMEOUT {
+                log::error!(
+                    target: LOG_TARGET,
+                    "AsyncKeyValueStorage {}: stop timed out after {:?} (db_stopped={}, callback_stopped={}) - proceeding with Drop anyway",
+                    self.storage_id,
+                    STOP_WAIT_TIMEOUT,
+                    db_stopped,
+                    callback_stopped
+                );
+                break false;
             }
 
             std::thread::sleep(Duration::from_millis(10));
@@ -721,19 +790,124 @@ impl RocksDbAsyncKeyValueStorage {
                 }
                 last_log_time = SystemTime::now();
             }
-        }
+        };
 
         log::debug!(
             target: LOG_TARGET,
-            "AsyncKeyValueStorage {}: stopped",
-            self.storage_id
+            "AsyncKeyValueStorage {}: stopped in {:?}",
+            self.storage_id,
+            stop_start.elapsed()
         );
+        stopped_cleanly
     }
 
     /// Helper to format key for trace logs (first 16 bytes as hex)
     fn format_key(key: &[u8]) -> String {
         let len = std::cmp::min(key.len(), 16);
         hex::encode(&key[..len])
+    }
+
+    /// Returns an already-resolved `Err(DB_CLOSED_ERROR)` result.
+    ///
+    /// Used by every public op to short-circuit when `close()` has flipped
+    /// the `is_closed` gate, so that no new task is posted to a DB thread
+    /// that is about to exit.
+    fn closed_error_result<T: Clone + Send + Sync + 'static>() -> StorageAsyncResultPtr<T> {
+        let result = StorageAsyncResultImpl::<T>::new();
+        result.set(Err(ton_block::error!("{}", DB_CLOSED_ERROR)));
+        result
+    }
+
+    /// Internal sync variant that does NOT check the `is_closed` gate.
+    ///
+    /// Invariant: caller is either `sync()` (which has already rejected the
+    /// call if the gate is set) or `close()` (which owns the one-shot
+    /// transition into the closed state and therefore must still be able
+    /// to drain the queue once).
+    fn sync_internal(&self, timeout: Option<Duration>) -> Result<()> {
+        log::debug!(
+            target: LOG_TARGET,
+            "AsyncKeyValueStorage {}: sync started",
+            self.storage_id
+        );
+
+        let start_time = std::time::Instant::now();
+
+        // 1. Wait for DB queue to drain
+        let db_sync = StorageAsyncResultImpl::<()>::new();
+        let db_sync_clone = db_sync.clone();
+        let storage_id = self.storage_id.clone();
+
+        self.post_task(Box::new(move |_db, metrics, _callback_tx| {
+            metrics.syncs.increment(1);
+            log::trace!(
+                target: LOG_TARGET,
+                "AsyncKeyValueStorage {}: DB sync marker reached",
+                storage_id
+            );
+            db_sync_clone.set(Ok(()));
+        }));
+
+        // Wait for DB queue with optional timeout
+        match timeout {
+            Some(t) => {
+                db_sync.wait_timeout(t).ok_or_else(|| {
+                    ton_block::error!("sync: timeout expired waiting for DB queue")
+                })??;
+            }
+            None => {
+                db_sync.wait()?;
+            }
+        }
+
+        // 2. Wait for callback queue to drain (if enabled)
+        // Uses same StorageAsyncResultImpl pattern as DB queue (DRY principle)
+        if let Some(ref callback_tx) = self.callback_tx {
+            // Calculate remaining timeout
+            let remaining_timeout = timeout.map(|t| {
+                let elapsed = start_time.elapsed();
+                t.saturating_sub(elapsed)
+            });
+
+            // Check if timeout already expired
+            if let Some(t) = remaining_timeout {
+                if t.is_zero() {
+                    return Err(ton_block::error!(
+                        "sync: timeout expired waiting for callback queue"
+                    ));
+                }
+            }
+
+            let callback_sync = StorageAsyncResultImpl::<()>::new();
+            let callback_sync_clone = callback_sync.clone();
+
+            if let Some(ref counter) = self.callback_queue_posts {
+                counter.increment(1);
+            }
+            let _ = callback_tx.send(Box::new(move || {
+                callback_sync_clone.set(Ok(()));
+            }));
+
+            // Wait for callback queue with optional timeout
+            match remaining_timeout {
+                Some(t) => {
+                    callback_sync
+                        .wait_timeout(t)
+                        .ok_or_else(|| ton_block::error!("sync: callback queue timeout"))??;
+                }
+                None => {
+                    callback_sync.wait()?;
+                }
+            }
+        }
+
+        log::debug!(
+            target: LOG_TARGET,
+            "AsyncKeyValueStorage {}: sync completed",
+            self.storage_id
+        );
+
+        Ok(())
     }
 }
 
@@ -743,6 +917,13 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
         key: StorageKey,
         on_complete: Option<StorageGetCallback>,
     ) -> StorageAsyncResultPtr<Option<StorageValue>> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            if let Some(callback) = on_complete {
+                callback(Err(ton_block::error!("{}", DB_CLOSED_ERROR)));
+            }
+            return Self::closed_error_result();
+        }
+
         log::trace!(
             target: LOG_TARGET,
             "AsyncKeyValueStorage {}: get key={}...",
@@ -802,6 +983,13 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
         prefix: StorageKey,
         on_complete: Option<StoragePrefixScanCallback>,
     ) -> StorageAsyncResultPtr<Vec<(StorageKey, StorageValue)>> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            if let Some(callback) = on_complete {
+                callback(Err(ton_block::error!("{}", DB_CLOSED_ERROR)));
+            }
+            return Self::closed_error_result();
+        }
+
         log::trace!(
             target: LOG_TARGET,
             "AsyncKeyValueStorage {}: get_by_prefix prefix={}...",
@@ -885,6 +1073,13 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
         value: StorageValue,
         on_complete: Option<StorageWriteCallback>,
     ) -> StorageAsyncResultPtr<()> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            if let Some(callback) = on_complete {
+                callback(Err(ton_block::error!("{}", DB_CLOSED_ERROR)));
+            }
+            return Self::closed_error_result();
+        }
+
         log::trace!(
             target: LOG_TARGET,
             "AsyncKeyValueStorage {}: set key={}... value_len={}",
@@ -935,6 +1130,13 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
         key: StorageKey,
         on_complete: Option<StorageWriteCallback>,
     ) -> StorageAsyncResultPtr<()> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            if let Some(callback) = on_complete {
+                callback(Err(ton_block::error!("{}", DB_CLOSED_ERROR)));
+            }
+            return Self::closed_error_result();
+        }
+
         log::trace!(
             target: LOG_TARGET,
             "AsyncKeyValueStorage {}: erase key={}...",
@@ -980,87 +1182,58 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
     }
 
     fn sync(&self, timeout: Option<Duration>) -> Result<()> {
-        log::debug!(
-            target: LOG_TARGET,
-            "AsyncKeyValueStorage {}: sync started",
-            self.storage_id
-        );
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Err(ton_block::error!("{}", DB_CLOSED_ERROR));
+        }
+        self.sync_internal(timeout)
+    }
 
-        let start_time = std::time::Instant::now();
-
-        // 1. Wait for DB queue to drain
-        let db_sync = StorageAsyncResultImpl::<()>::new();
-        let db_sync_clone = db_sync.clone();
-        let storage_id = self.storage_id.clone();
-
-        self.post_task(Box::new(move |_db, metrics, _callback_tx| {
-            metrics.syncs.increment(1);
-            log::trace!(
+    fn close(&self, timeout: Option<Duration>) -> Result<()> {
+        // One-shot transition: first caller flips the gate; later callers
+        // (including repeated `close()`) short-circuit to Ok.
+        if self.is_closed.swap(true, Ordering::SeqCst) {
+            log::debug!(
                 target: LOG_TARGET,
-                "AsyncKeyValueStorage {}: DB sync marker reached",
-                storage_id
+                "AsyncKeyValueStorage {}: close: already closed",
+                self.storage_id
             );
-            db_sync_clone.set(Ok(()));
-        }));
-
-        // Wait for DB queue with optional timeout
-        match timeout {
-            Some(t) => {
-                db_sync.wait_timeout(t).ok_or_else(|| {
-                    ton_block::error!("sync: timeout expired waiting for DB queue")
-                })??;
-            }
-            None => {
-                db_sync.wait()?;
-            }
+            return Ok(());
         }
 
-        // 2. Wait for callback queue to drain (if enabled)
-        // Uses same StorageAsyncResultImpl pattern as DB queue (DRY principle)
-        if let Some(ref callback_tx) = self.callback_tx {
-            // Calculate remaining timeout
-            let remaining_timeout = timeout.map(|t| {
-                let elapsed = start_time.elapsed();
-                t.saturating_sub(elapsed)
-            });
-
-            // Check if timeout already expired
-            if let Some(t) = remaining_timeout {
-                if t.is_zero() {
-                    return Err(ton_block::error!("sync: timeout expired waiting for DB queue"));
-                }
-            }
-
-            let callback_sync = StorageAsyncResultImpl::<()>::new();
-            let callback_sync_clone = callback_sync.clone();
-
-            if let Some(ref counter) = self.callback_queue_posts {
-                counter.increment(1);
-            }
-            let _ = callback_tx.send(Box::new(move || {
-                callback_sync_clone.set(Ok(()));
-            }));
-
-            // Wait for callback queue with optional timeout
-            match remaining_timeout {
-                Some(t) => {
-                    callback_sync
-                        .wait_timeout(t)
-                        .ok_or_else(|| ton_block::error!("sync: callback queue timeout"))??;
-                }
-                None => {
-                    callback_sync.wait()?;
-                }
-            }
-        }
-
-        log::debug!(
+        log::info!(
             target: LOG_TARGET,
-            "AsyncKeyValueStorage {}: sync completed",
-            self.storage_id
+            "AsyncKeyValueStorage {}: close: draining queues (timeout={:?})",
+            self.storage_id,
+            timeout
         );
 
-        Ok(())
+        // NOTE: `is_closed` stays `true` even on drain failure. `Drop`'s
+        // safety-net unconditionally re-runs `sync_internal`, so a partial
+        // drain is not lost. Flipping the bool back to `false` here would let
+        // new user ops sneak in after `close()` returned Err.
+        //
+        // A late op that loaded `is_closed == false` and then enqueues after
+        // our marker is also fine: it lands in the FIFO channel before any
+        // future `Drop`-side marker, so `Drop` persists it.
+        let result = self.sync_internal(timeout);
+        match &result {
+            Ok(()) => log::info!(
+                target: LOG_TARGET,
+                "AsyncKeyValueStorage {}: close: drained, gate set",
+                self.storage_id
+            ),
+            Err(e) => log::error!(
+                target: LOG_TARGET,
+                "AsyncKeyValueStorage {}: close: drain failed: {} (Drop will re-run safety-net drain)",
+                self.storage_id,
+                e
+            ),
+        }
+        result
+    }
+
+    fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::SeqCst)
     }
 
     fn pending_count(&self) -> usize {
@@ -1094,15 +1267,66 @@ impl Drop for RocksDbAsyncKeyValueStorage {
             self.path.display()
         );
 
-        // Stop threads
-        self.stop_internal();
-
-        // Join threads
-        if let Some(handle) = self.db_thread_handle.take() {
-            let _ = handle.join();
+        // Safety-net drain on every Drop.
+        //
+        // Always runs `sync_internal` regardless of whether `close()` was
+        // called or what it returned:
+        //
+        // * If `close()` was never called, this is the only drain — required
+        //   so a panic-induced unwind still persists queued writes before
+        //   rocksdb is torn down (otherwise a restart would replay a torn
+        //   suffix of the WAL).
+        // * If `close()` was called and returned `Ok`, this is a cheap
+        //   no-op: the queue is empty and the sync marker round-trips
+        //   immediately.
+        // * If `close()` returned `Err` mid-drain (e.g. timeout), this is
+        //   the retry path — without it, queued writes posted before the
+        //   close gate could be lost on `stop_internal()`.
+        // * It also absorbs the gate/`post_task` race: any op that observed
+        //   `is_closed == false` and enqueued its task after `close()`'s
+        //   marker is still FIFO-ordered before this marker, so it gets
+        //   persisted.
+        //
+        // The `Arc<dyn AsyncKeyValueStorage>` strong count is 0 by the time
+        // `Drop` runs, so no further `post_task` calls can race with us.
+        let was_already_closed = self.is_closed.swap(true, Ordering::SeqCst);
+        if !was_already_closed {
+            log::warn!(
+                target: LOG_TARGET,
+                "AsyncKeyValueStorage {}: dropping without prior close() - running safety-net drain",
+                self.storage_id
+            );
         }
-        if let Some(handle) = self.callback_thread_handle.take() {
-            let _ = handle.join();
+        if let Err(e) = self.sync_internal(Some(STOP_WAIT_TIMEOUT)) {
+            log::error!(
+                target: LOG_TARGET,
+                "AsyncKeyValueStorage {}: safety-net drain failed: {}",
+                self.storage_id,
+                e
+            );
+        }
+
+        // Stop threads
+        let stopped_cleanly = self.stop_internal();
+
+        if stopped_cleanly {
+            // Join threads only when both stop flags were observed; otherwise
+            // bounded-shutdown guarantee would be violated by a blocking join
+            // on a wedged thread handle.
+            if let Some(handle) = self.db_thread_handle.take() {
+                let _ = handle.join();
+            }
+            if let Some(handle) = self.callback_thread_handle.take() {
+                let _ = handle.join();
+            }
+        } else {
+            log::error!(
+                target: LOG_TARGET,
+                "AsyncKeyValueStorage {}: skip join after stop timeout (bounded shutdown mode)",
+                self.storage_id
+            );
+            let _ = self.db_thread_handle.take();
+            let _ = self.callback_thread_handle.take();
         }
 
         log::info!(

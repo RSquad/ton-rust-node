@@ -51,7 +51,6 @@
 //! Per-slot HashMap tracks received votes by `(source_idx, vote_hash)` to prevent
 //! reprocessing duplicate messages from the network.
 
-#![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
 use crate::{
@@ -1079,14 +1078,12 @@ impl SourceStats {
 #[derive(Clone, Debug)]
 pub(crate) struct SourceActivitySnapshot {
     pub source_idx: u32,
-    pub weight: ValidatorWeight,
     pub adnl_id_base64: String,
     pub in_messages: u64,
     pub out_messages: u64,
     pub in_broadcasts: u64,
     pub out_broadcasts: u64,
     pub last_recv_time: Option<SystemTime>,
-    pub last_send_time: Option<SystemTime>,
     pub votes_in_notarize: u64,
     pub votes_in_finalize: u64,
     pub votes_in_skip: u64,
@@ -1107,8 +1104,6 @@ pub(crate) struct SourceActivitySnapshot {
 /// Aggregate snapshot of receiver activity for session dump.
 #[derive(Clone, Debug)]
 pub(crate) struct ReceiverActivitySnapshot {
-    pub active_weight: ValidatorWeight,
-    pub last_activity: Vec<Option<SystemTime>>,
     pub sources: Vec<SourceActivitySnapshot>,
 }
 
@@ -1141,10 +1136,6 @@ enum StandstillReplayItem {
 pub(crate) struct ReceiverImpl {
     /// Session ID
     session_id: SessionId,
-    /// Overlay ID (incarnation)
-    overlay_id: SessionId,
-    /// Overlay short ID
-    overlay_short_id: PublicKeyHash,
     /// Overlay for sending messages
     overlay: ConsensusOverlayPtr,
     /// Local validator key
@@ -1186,12 +1177,9 @@ pub(crate) struct ReceiverImpl {
     proto_version: u32,
     /// Candidate resolver runtime config sourced from SessionOptions.
     candidate_resolve_config: CandidateResolveConfig,
-    /// Metrics
-    in_messages_bytes: metrics::Counter,
+    /// Outbound byte metrics (inbound bytes are counted in `OverlayListenerImpl`).
     out_messages_bytes: metrics::Counter,
-    in_broadcasts_bytes: metrics::Counter,
     out_broadcasts_bytes: metrics::Counter,
-    in_bytes: metrics::Counter,
     out_bytes: metrics::Counter,
     /// Metrics (counts)
     out_messages_count: metrics::Counter,
@@ -2043,17 +2031,6 @@ impl ReceiverImpl {
             CANDIDATE_QUERY_RATE_LIMIT_WINDOW,
             self.candidate_resolve_config.rate_limit,
         )
-    }
-
-    /// Cache candidate data for resolver queries
-    fn cache_candidate(&mut self, slot: SlotIndex, block_hash: UInt256, data: Vec<u8>) {
-        log::trace!(
-            "SimplexReceiver {}: caching candidate for slot={} hash={}",
-            self.session_id.to_hex_string(),
-            slot,
-            &block_hash.to_hex_string()[..8]
-        );
-        self.resolver_cache.cache_candidate(slot, block_hash, data);
     }
 
     /// Cache notarization certificate for resolver queries
@@ -3791,24 +3768,18 @@ impl ReceiverImpl {
             .collect()
     }
 
-    fn build_activity_snapshot(
-        &self,
-        active_weight: ValidatorWeight,
-        last_activity: Vec<Option<SystemTime>>,
-    ) -> ReceiverActivitySnapshot {
+    fn build_activity_snapshot(&self) -> ReceiverActivitySnapshot {
         let sources = self
             .sources
             .iter()
             .map(|s| SourceActivitySnapshot {
                 source_idx: s.source_idx,
-                weight: s.weight,
                 adnl_id_base64: key_to_base64(&s.adnl_id),
                 in_messages: s.in_messages,
                 out_messages: s.out_messages,
                 in_broadcasts: s.in_broadcasts,
                 out_broadcasts: s.out_broadcasts,
                 last_recv_time: s.last_recv_time,
-                last_send_time: s.last_send_time,
                 votes_in_notarize: s.votes_in_notarize,
                 votes_in_finalize: s.votes_in_finalize,
                 votes_in_skip: s.votes_in_skip,
@@ -3826,7 +3797,7 @@ impl ReceiverImpl {
                 duplicate_broadcasts: s.duplicate_broadcasts,
             })
             .collect();
-        ReceiverActivitySnapshot { active_weight, last_activity, sources }
+        ReceiverActivitySnapshot { sources }
     }
 
     /// Debug dump of receiver state
@@ -4280,98 +4251,6 @@ impl ReceiverImpl {
         self.last_final_cert = Some((slot, cert_bytes));
     }
 
-    /// Re-broadcast cached certificates during standstill
-    ///
-    /// Sends all cached certificates to all validators:
-    /// 1. Last finalization certificate (always, even if outside tracked range)
-    /// 2. All cached certificates in tracked range [begin, end)
-    ///
-    /// Reference: C++ pool.cpp alarm() iterates certs.serialize_to(messages)
-    ///
-    /// Returns the number of certificates sent.
-    fn rebroadcast_standstill_certificates(&mut self, begin: u32, end: u32) -> u32 {
-        // Collect all certificate bytes to send (avoid borrow conflicts)
-        let mut cert_bytes_list: Vec<Vec<u8>> = Vec::new();
-
-        // 1. Last final certificate (always, even if outside tracked range)
-        // Reference: C++ pool.cpp alarm() always includes last_final_cert_ first
-        if let Some((slot, bytes)) = &self.last_final_cert {
-            log::trace!(
-                "SimplexReceiver {}: standstill re-broadcast last_final_cert slot={} ({}B)",
-                self.session_id.to_hex_string(),
-                slot,
-                bytes.len()
-            );
-            cert_bytes_list.push(bytes.clone());
-        }
-
-        // 2. All cached certificates in tracked range [begin, end)
-        //
-        // C++ iterates slots linearly in `[begin,end)` and serializes per-slot cert bundle.
-        // Here we iterate only cached bundles to avoid range work when the range is
-        // sparsely populated (receiver initializes with a wide range before FSM sync).
-        let mut slots: Vec<u32> = self
-            .standstill_certs
-            .keys()
-            .copied()
-            .filter(|slot| *slot >= begin && *slot < end)
-            .collect();
-        slots.sort_unstable();
-        for slot in slots {
-            if let Some(bundle) = self.standstill_certs.get(&slot) {
-                if let Some(bytes) = &bundle.notar {
-                    cert_bytes_list.push(bytes.clone());
-                }
-                if let Some(bytes) = &bundle.skip {
-                    cert_bytes_list.push(bytes.clone());
-                }
-                if let Some(bytes) = &bundle.final_ {
-                    cert_bytes_list.push(bytes.clone());
-                }
-            }
-        }
-
-        let cert_count = cert_bytes_list.len() as u32;
-        if cert_count == 0 {
-            return 0;
-        }
-
-        // Calculate total bytes and recipient count for metrics
-        let total_bytes: u64 = cert_bytes_list.iter().map(|b| b.len() as u64).sum();
-        let recipient_count =
-            self.send_order.iter().filter(|&&idx| idx != self.local_idx).count() as u64;
-
-        // Update metrics (each cert sent to each recipient)
-        self.out_messages_bytes.increment(total_bytes * recipient_count);
-        self.out_bytes.increment(total_bytes * recipient_count);
-        self.out_messages_count.increment(cert_count as u64 * recipient_count);
-
-        // Send each certificate to all validators
-        for bytes in cert_bytes_list {
-            let payload = ConsensusCommonFactory::create_block_payload(bytes.into());
-
-            for &target_idx in &self.send_order {
-                if target_idx == self.local_idx {
-                    continue;
-                }
-
-                if let Some(stats) = self.sources.get_mut(target_idx as usize) {
-                    stats.out_messages += 1;
-                    stats.last_send_time = Some(SystemTime::now());
-
-                    self.overlay.send_message(
-                        &stats.adnl_id,
-                        &self.local_adnl_id,
-                        &payload,
-                        false, // is_retransmission=false for simplex
-                    );
-                }
-            }
-        }
-
-        cert_count
-    }
-
     /*
         Delayed Actions
     */
@@ -4621,10 +4500,6 @@ pub(crate) struct ReceiverWrapper {
     task_queues: Arc<ReceiverTaskQueues>,
     receiver_threads: ReceiverThreads,
     _metrics_receiver: MetricsHandle,
-    out_messages_bytes: metrics::Counter,
-    out_broadcasts_bytes: metrics::Counter,
-    out_bytes: metrics::Counter,
-    local_adnl_id: PublicKeyHash,
     _local_key: PrivateKey,
     overlay: ConsensusOverlayPtr,
     overlay_short_id: PublicKeyHash,
@@ -4956,11 +4831,8 @@ impl ReceiverWrapper {
         let listener_clone = listener.clone();
         let local_key_clone = local_key.clone();
         let metrics_receiver_clone = metrics_receiver.clone();
-        let in_messages_bytes_clone = in_messages_bytes.clone();
         let out_messages_bytes_clone = out_messages_bytes.clone();
-        let in_broadcasts_bytes_clone = in_broadcasts_bytes.clone();
         let out_broadcasts_bytes_clone = out_broadcasts_bytes.clone();
-        let in_bytes_clone = in_bytes.clone();
         let out_bytes_clone = out_bytes.clone();
         let out_messages_count_clone = out_messages_count.clone();
         let out_broadcasts_count_clone = out_broadcasts_count.clone();
@@ -4978,8 +4850,6 @@ impl ReceiverWrapper {
                 // Create ReceiverImpl inside the processing thread
                 let mut receiver_impl = ReceiverImpl {
                     session_id: session_id_clone.clone(),
-                    overlay_id,
-                    overlay_short_id,
                     overlay: overlay_clone,
                     local_key: local_key_clone,
                     local_adnl_id: local_adnl_id.clone(),
@@ -4997,11 +4867,8 @@ impl ReceiverWrapper {
                     max_candidate_query_answer_size,
                     proto_version,
                     candidate_resolve_config,
-                    in_messages_bytes: in_messages_bytes_clone,
                     out_messages_bytes: out_messages_bytes_clone,
-                    in_broadcasts_bytes: in_broadcasts_bytes_clone,
                     out_broadcasts_bytes: out_broadcasts_bytes_clone,
-                    in_bytes: in_bytes_clone,
                     out_bytes: out_bytes_clone,
                     out_messages_count: out_messages_count_clone,
                     out_broadcasts_count: out_broadcasts_count_clone,
@@ -5182,10 +5049,7 @@ impl ReceiverWrapper {
                         let active_weight =
                             receiver_impl.calculate_active_weight(ACTIVITY_THRESHOLD);
                         let last_activity = receiver_impl.get_last_activity();
-                        let snapshot = receiver_impl.build_activity_snapshot(
-                            active_weight,
-                            last_activity.clone(),
-                        );
+                        let snapshot = receiver_impl.build_activity_snapshot();
                         if let Some(listener) = receiver_impl.listener.upgrade() {
                             listener.on_activity(active_weight, last_activity, snapshot);
                         }
@@ -5251,10 +5115,6 @@ impl ReceiverWrapper {
             task_queues,
             receiver_threads,
             _metrics_receiver: metrics_receiver,
-            out_messages_bytes,
-            out_broadcasts_bytes,
-            out_bytes,
-            local_adnl_id: ids[local_idx as usize].adnl_id.clone(),
             _local_key: local_key.clone(),
             overlay,
             overlay_short_id: overlay_short_id_for_wrapper,
@@ -5265,13 +5125,6 @@ impl ReceiverWrapper {
         log::info!("Created SimplexReceiver for session {}", wrapper.session_id.to_hex_string());
 
         Ok(Arc::new(wrapper))
-    }
-
-    /// Compute block-sync overlay short id from `session_id`
-    /// (C++ `block-sync-overlay.cpp:48-50`; seed excludes the node list,
-    /// so the short id differs from the consensus overlay's)
-    fn compute_block_sync_overlay_short_id(session_id: &SessionId) -> Result<PublicKeyHash> {
-        crate::utils::compute_block_sync_overlay_short_id(session_id)
     }
 
     /// Compute overlay ID matching C++ consensus.overlayId

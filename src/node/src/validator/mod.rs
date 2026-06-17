@@ -53,6 +53,16 @@ pub struct BlockCandidate {
     pub created_by: UInt256,
 }
 
+/// Serde default for [`CollatorSettings::requires_real_state_update`].
+///
+/// Production always requires a real state update (the `#[cfg(not(test))]`
+/// path in `ValidatorGroup` hard-codes `true`), so a deserialized config that
+/// omits the field must default to `true` rather than the cfg(test) fast-path
+/// value (`bool::default() == false`).
+fn default_requires_real_state_update() -> bool {
+    true
+}
+
 #[derive(Clone, Default, serde::Deserialize)]
 pub struct CollatorSettings {
     pub want_split: Option<bool>,
@@ -60,6 +70,12 @@ pub struct CollatorSettings {
     pub is_fake: bool,
     #[cfg(test)]
     pub is_bundle: bool,
+    #[serde(default = "default_requires_real_state_update")]
+    // Consumed only on the `#[cfg(test)]` collator path; production hard-codes the
+    // full-state-update decision (see `default_requires_real_state_update`), so the
+    // field is write-only in non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub requires_real_state_update: bool,
     // produce blocks identical to cpp-node - mostly for tests
     pub lt_compatible: bool,
     // true when running under simplex consensus (passed from ValidatorGroup)

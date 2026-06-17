@@ -573,18 +573,18 @@ impl ValidatorGroupImpl {
             .block_sync_overlay_params
             .clone()
             .map(|p| p.with_identity(g.shard.clone(), g.session_id.clone()));
-        let overlay_manager: ConsensusOverlayManagerPtr =
-            Arc::new(ConsensusOverlayManagerImpl::new(
-                g.engine.validator_network(),
-                g.validator_list_id.clone(),
-                block_sync_params_with_identity,
-            ));
 
         let db_root = format!("{}/catchains", g.engine.db_root_dir()?);
         let is_masterchain = g.shard.is_masterchain();
 
         match &g.consensus_options {
             ConsensusOptions::Catchain(catchain_options) => {
+                let overlay_manager: ConsensusOverlayManagerPtr =
+                    Arc::new(ConsensusOverlayManagerImpl::new(
+                        g.engine.validator_network(),
+                        g.validator_list_id.clone(),
+                        block_sync_params_with_identity,
+                    ));
                 ConsensusFactory::create_catchain_based_session(
                     catchain_options,
                     &g.session_id,
@@ -599,6 +599,12 @@ impl ValidatorGroupImpl {
                 )
             }
             ConsensusOptions::Simplex(simplex_options) => {
+                let overlay_manager: ConsensusOverlayManagerPtr =
+                    Arc::new(ConsensusOverlayManagerImpl::new(
+                        g.engine.validator_network(),
+                        g.validator_list_id.clone(),
+                        block_sync_params_with_identity,
+                    ));
                 ConsensusFactory::create_simplex_based_session(
                     simplex_options,
                     &g.session_id,
@@ -608,6 +614,17 @@ impl ValidatorGroupImpl {
                     db_root,
                     g.general_session_info.catchain_seqno,
                     overlay_manager,
+                    listener,
+                )
+            }
+            #[cfg(test)]
+            ConsensusOptions::Emulator(emulator_options) => {
+                ConsensusFactory::create_emulator_based_session(
+                    emulator_options,
+                    &g.session_id,
+                    &g.shard,
+                    nodes,
+                    &g.local_key,
                     listener,
                 )
             }
@@ -926,7 +943,12 @@ impl ValidatorGroup {
     }
 
     pub fn is_simplex(&self) -> bool {
-        matches!(self.consensus_options, ConsensusOptions::Simplex(_))
+        match &self.consensus_options {
+            ConsensusOptions::Simplex(_) => true,
+            #[cfg(test)]
+            ConsensusOptions::Emulator(_) => true,
+            ConsensusOptions::Catchain(_) => false,
+        }
     }
 
     pub async fn snapshot(&self) -> SessionSnapshot {
@@ -1081,7 +1103,7 @@ impl ValidatorGroup {
                     .await,
             );
 
-            if matches!(self.consensus_options, ConsensusOptions::Simplex(_)) {
+            if self.is_simplex() {
                 // Bind cache backend only for simplex sessions.
                 // Catchain mode must not request non-finalized parents via simplex.
                 self.state_resolver_cache.lock().await.set_backend(
@@ -1317,7 +1339,7 @@ impl ValidatorGroup {
             .await;
         let min_ts = min_ts.max(request.get_creation_time());
 
-        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
+        let is_simplex = self.is_simplex();
         if is_simplex {
             match &parent {
                 CollationParentHint::Implicit => {
@@ -1466,10 +1488,31 @@ impl ValidatorGroup {
             ConsensusOptions::Simplex(opts) => {
                 opts.slots_per_leader_window.saturating_sub(1) as usize
             }
+            #[cfg(test)]
+            ConsensusOptions::Emulator(opts) => {
+                opts.simplex_options.slots_per_leader_window.saturating_sub(1) as usize
+            }
         };
         let request_clone = request.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
+        // Whether the collator must compute a real (full) `MerkleUpdate`
+        // when finalizing the candidate. In production this is consulted
+        // under `#[cfg(not(test))]` in `Collator::create_merkle_update`
+        // and is hard-coded to `true`, so the value passed here is
+        // effectively only meaningful in test builds. In tests we only
+        // need a real `MerkleUpdate` on the emulator-backed real-engine
+        // path (`ConsensusOptions::Emulator`); pure Catchain / pure
+        // Simplex unit tests keep the historical empty-default fast
+        // path. Without this gating, every cfg(test) collation pays the
+        // full Merkle-update cost — the original review feedback noted
+        // it slowed the whole node test suite when the flag was
+        // unconditionally `true`.
+        #[cfg(test)]
+        let requires_real_state_update =
+            matches!(self.consensus_options, ConsensusOptions::Emulator(_));
+        #[cfg(not(test))]
+        let requires_real_state_update = true;
 
         let collation_task = tokio::spawn(async move {
             log::info!(
@@ -1510,6 +1553,7 @@ impl ValidatorGroup {
                                 validator_set.clone(),
                                 engine.clone(),
                                 is_simplex,
+                                requires_real_state_update,
                             )
                             .await
                             {
@@ -1712,7 +1756,7 @@ impl ValidatorGroup {
         let last_validation_time = self.last_validation_time.clone();
         let cc_seqno = self.general_session_info.catchain_seqno;
         let is_masterchain = self.shard.is_masterchain();
-        let is_simplex = matches!(self.consensus_options, ConsensusOptions::Simplex(_));
+        let is_simplex = self.is_simplex();
         let (expected_current_round, prev_block_ids, mc_block_id_opt, min_ts) = group_impl
             .execute_sync(|group_impl| {
                 (

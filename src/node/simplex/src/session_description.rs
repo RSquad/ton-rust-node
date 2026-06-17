@@ -317,12 +317,6 @@ impl SessionDescription {
         slot.window_index(self.options.slots_per_leader_window)
     }
 
-    /// Get first slot of the window containing the given slot
-    #[allow(dead_code)]
-    pub fn get_window_start_slot(&self, slot: SlotIndex) -> SlotIndex {
-        slot.window_start(self.options.slots_per_leader_window)
-    }
-
     /// Get slot offset within the window (0-based)
     pub fn get_slot_offset_in_window(&self, slot: SlotIndex) -> u32 {
         slot.offset_in_window(self.options.slots_per_leader_window)
@@ -365,12 +359,6 @@ impl SessionDescription {
 
         let micros_u64 = u64::try_from(micros).unwrap_or(u64::MAX - 1);
         self.replay_time_us.store(micros_u64.saturating_add(1), Ordering::Relaxed);
-    }
-
-    /// Clear replay time and return to real-time mode.
-    #[allow(dead_code)]
-    pub fn clear_time(&self) {
-        self.replay_time_us.store(0, Ordering::Relaxed);
     }
 
     /// Get current time (SystemTime::now() for real-time, or replayed time)

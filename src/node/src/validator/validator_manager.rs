@@ -8,6 +8,8 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+#[cfg(test)]
+use super::consensus::EmulatorConsensusOptions;
 use super::consensus::{
     serialize_tl_boxed_object, CatchainSessionOptions, ConsensusNode, ConsensusOptions, PublicKey,
     RawBuffer, SimplexSessionOptions,
@@ -29,6 +31,8 @@ use crate::{
         },
     },
 };
+#[cfg(test)]
+use consensus_common::EmulatorDelaySpec;
 use std::{
     cmp::max,
     collections::{HashMap, HashSet},
@@ -805,6 +809,39 @@ impl ValidatorManagerImpl {
         }
     }
 
+    #[cfg(test)]
+    fn override_with_emulator_consensus_options(
+        &self,
+        shard: &ShardIdent,
+        original_consensus: &str,
+        simplex_options: Option<SimplexSessionOptions>,
+    ) -> Option<ConsensusOptions> {
+        let emulator_config = self.config.test_emulator_consensus.as_ref()?;
+        assert!(
+            !emulator_config.validator_keys.is_empty(),
+            "test emulator consensus requires at least one validator key"
+        );
+
+        log::warn!(
+            target: "validator_manager",
+            "TEST CONSENSUS OVERRIDE: forcing emulator consensus for shard={} \
+             original_consensus={}",
+            shard,
+            original_consensus
+        );
+        let mut emulator_options =
+            EmulatorConsensusOptions::fixed_local(emulator_config.validator_keys.clone());
+        emulator_options.emulator_options.initial_params.slot_interval = EmulatorDelaySpec::new(
+            emulator_config.slot_interval_min_ms,
+            emulator_config.slot_interval_max_ms,
+            emulator_config.slot_interval_reliability,
+        );
+        if let Some(simplex_options) = simplex_options {
+            emulator_options.simplex_options = simplex_options;
+        }
+        Some(ConsensusOptions::Emulator(emulator_options))
+    }
+
     fn load_destroyed_sessions(&mut self) -> Result<()> {
         let persisted = self.engine.load_destroyed_session_ids()?;
         self.destroyed_sessions = persisted.into_iter().collect();
@@ -1389,6 +1426,12 @@ impl ValidatorManagerImpl {
                     "Could not get config_params from mc_state: {}, using catchain",
                     e
                 );
+                #[cfg(test)]
+                if let Some(options) =
+                    self.override_with_emulator_consensus_options(shard, "catchain", None)
+                {
+                    return Ok((options, None));
+                }
                 return Ok((ConsensusOptions::Catchain(catchain_options.clone()), None));
             }
         };
@@ -1419,6 +1462,12 @@ impl ValidatorManagerImpl {
             // TODO: C++ also applies per-shard/cc_seqno overrides here via
             // get_noncritical_params() in validator-options.hpp.
             let opts = build_runtime_simplex_session_options(shard, &cfg, catchain_options);
+            #[cfg(test)]
+            if let Some(options) =
+                self.override_with_emulator_consensus_options(shard, "simplex", Some(opts.clone()))
+            {
+                return Ok((options, None));
+            }
 
             // when enable_observers=true for this shard, compute the
             // block-sync overlay membership + authorization from the masterchain
@@ -1459,6 +1508,12 @@ impl ValidatorManagerImpl {
             "No simplex config for {}, using catchain",
             shard
         );
+        #[cfg(test)]
+        if let Some(options) =
+            self.override_with_emulator_consensus_options(shard, "catchain", None)
+        {
+            return Ok((options, None));
+        }
         Ok((ConsensusOptions::Catchain(catchain_options.clone()), None))
     }
 
@@ -1808,6 +1863,8 @@ impl ValidatorManagerImpl {
                     None => {
                         let consensus_name = match &consensus_options {
                             ConsensusOptions::Simplex(_) => "simplex",
+                            #[cfg(test)]
+                            ConsensusOptions::Emulator(_) => "emulator",
                             ConsensusOptions::Catchain(_) => "catchain",
                         };
                         log::info!(target: "validator_manager",
@@ -2297,6 +2354,8 @@ impl ValidatorManagerImpl {
                     .or_insert_with(|| {
                         let consensus_name = match &consensus_options {
                             ConsensusOptions::Simplex(_) => "simplex",
+                            #[cfg(test)]
+                            ConsensusOptions::Emulator(_) => "emulator",
                             ConsensusOptions::Catchain(_) => "catchain",
                         };
                         log::info!(target: "validator_manager",
@@ -2949,4 +3008,8 @@ pub fn start_validator_manager(
 
 #[cfg(test)]
 #[path = "tests/test_session_id.rs"]
-mod tests;
+mod test_session_id;
+
+#[cfg(test)]
+#[path = "tests/emulator_network_bootstrap.rs"]
+mod emulator_network_bootstrap;

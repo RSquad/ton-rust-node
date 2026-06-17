@@ -457,6 +457,9 @@ impl FileMap {
             "Searching for file description (elements count = {})",
             guard.len()
         );
+        if guard.is_empty() {
+            return None;
+        }
         let index = match guard.binary_search_by(f) {
             Ok(index) => index,
             Err(index) => (guard.len() - 1).min(index),
