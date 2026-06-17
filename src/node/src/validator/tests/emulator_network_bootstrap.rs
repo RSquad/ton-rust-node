@@ -872,7 +872,7 @@ impl EngineOperations for BootstrapTestEngine {
         self.db.load_block_handle(id)
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         self.blocks
             .read()
             .unwrap()

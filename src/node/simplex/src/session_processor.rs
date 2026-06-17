@@ -9,12 +9,12 @@
 //! Session processor implementation for Simplex consensus
 //!
 //! `SessionProcessor` is the single-threaded (SXMAIN) coordinator that wires the
-//! [`SimplexState`](crate::simplex_state::SimplexState) FSM kernel to the network
-//! layer and the higher-level validator callbacks. It owns no consensus *policy*
-//! of its own: each consensus phase lives on a dedicated controller, and the
-//! cross-cutting session state lives on focused aspects. The processor drives the
-//! main loop, routes FSM events, and keeps only the orchestration that genuinely
-//! spans subsystems. This module is crate-private.
+//! [`SimplexState`] FSM kernel to the network layer and the higher-level
+//! validator callbacks. It owns no consensus *policy* of its own: each consensus
+//! phase lives on a dedicated controller, and the cross-cutting session state
+//! lives on focused aspects. The processor drives the main loop, routes FSM
+//! events, and keeps only the orchestration that genuinely spans subsystems.
+//! This module is crate-private.
 //!
 //! C++ cross-reference: [ton-blockchain/ton](https://github.com/ton-blockchain/ton)
 //! `validator/consensus/simplex` (testnet). The main-loop analogue is
@@ -23,27 +23,20 @@
 //!
 //! # Composition
 //!
-//! - Kernel — [`SimplexState`](crate::simplex_state::SimplexState): the
-//!   deterministic FSM (votes/certs in,
-//!   [`SimplexEvent`](crate::simplex_state::SimplexEvent)s out).
+//! - Kernel — [`SimplexState`]: the deterministic FSM (votes/certs in,
+//!   [`SimplexEvent`]s out).
 //! - Phase controllers, reached through the `with_*_backend` split-borrow seams:
-//!   - [`CollationController`](crate::collation_controller::CollationController) —
-//!     block generation, precollation, candidate publishing.
-//!   - [`ValidationController`](crate::validation_controller::ValidationController) —
-//!     the candidate-validation pipeline.
-//!   - [`ConsensusController`](crate::consensus_controller::ConsensusController) —
-//!     vote/cert ingress + outbound, FSM finalization handlers, the recursive
-//!     finalization walk, and MC applied-top tracking.
-//! - Session aspects, reached through accessors:
-//!   [`SessionRuntime`](crate::session_runtime::SessionRuntime) (slot map,
+//!   - [`CollationController`] — block generation, precollation, candidate
+//!     publishing.
+//!   - [`ValidationController`] — the candidate-validation pipeline.
+//!   - [`ConsensusController`] — vote/cert ingress + outbound, FSM finalization
+//!     handlers, the recursive finalization walk, and MC applied-top tracking.
+//! - Session aspects, reached through accessors: [`SessionRuntime`] (slot map,
 //!   delayed-action scheduler, wake horizon, bootstrap handles),
-//!   [`SessionTelemetry`](crate::session_telemetry::SessionTelemetry) (metrics +
-//!   diagnostics), [`CandidateBook`](crate::candidate_book::CandidateBook)
-//!   (received candidates + data caches),
-//!   [`DatabaseController`](crate::database_controller::DatabaseController)
-//!   (async-DB write registry + DB handle), and
-//!   [`SessionCallbacks`](crate::session_callbacks::SessionCallbacks) (listener
-//!   dispatch). Network I/O lives on [`crate::receiver`].
+//!   [`SessionTelemetry`] (metrics + diagnostics), [`CandidateBook`] (received
+//!   candidates + data caches), [`DatabaseController`] (async-DB write registry +
+//!   DB handle), and [`SessionCallbacks`] (listener dispatch). Network I/O lives
+//!   on [`crate::receiver`].
 //!
 //! ```text
 //!   network ─▶ Receiver ─▶ ReceiverListener
@@ -109,7 +102,10 @@ use crate::simplex_state::BlockFinalizedEvent;
 #[cfg(test)]
 use crate::task_queue::TaskPtr;
 use crate::{
-    block::{RawCandidate, RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
+    block::{
+        CandidateId as BlockCandidateId, RawCandidate, RawCandidateId, SlotIndex, ValidatorIndex,
+        WindowIndex,
+    },
     candidate_book::{
         CandidateBook, ParentTipResolution, ReceivedCandidate, EMPTY_CHAIN_WARN_DEPTH,
         MAX_CHAIN_DEPTH,
@@ -134,6 +130,7 @@ use crate::{
     },
     startup_recovery::StartupRecoveryBackend,
     task_queue::TaskQueuePtr,
+    trace_collector::TraceCollector,
     utils::extract_consensus_gen_utime_ms,
     validation_controller::{ValidationBackend, ValidationController},
     MetricsHandle, RawVoteData, SessionId, ValidatorWeight,
@@ -338,6 +335,13 @@ pub(crate) struct SessionProcessor {
     /// queue, driven via `with_validation_backend` and the `self.validation.*`
     /// accessors.
     validation: ValidationController,
+
+    /// Trace collector for recording consensus lifecycle events. `None` when
+    /// stats collection is disabled. Held by `SessionProcessor` only for the
+    /// session-identity event (`record_id` at construction) and the
+    /// session-end event (`record_session_end` in `Drop`); the per-event hot
+    /// path lives on the controllers, which each hold their own clone
+    trace_collector: Option<TraceCollector>,
 }
 
 // ======================================================================
@@ -366,6 +370,8 @@ impl SessionProcessor {
         initial_errors: u32,
         receiver_health_counters: Arc<crate::receiver::ReceiverHealthCounters>,
         callbacks: Arc<SessionCallbacks>,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
     ) -> Result<Self> {
         // Extract immutable values from description before it's moved
         let session_id = description.get_session_id().clone();
@@ -431,6 +437,11 @@ impl SessionProcessor {
         // first_nonannounced_window starts at 0, set via recovery_set_first_nonannounced_window()
         let first_nonannounced_window = WindowIndex::default();
 
+        // Emit session identity event (once at session start)
+        if let Some(tc) = &trace_collector {
+            tc.record_id(&session_id, &description, catchain_seqno);
+        }
+
         // Build the telemetry aspect: all metric handles, stall cursors,
         // health-alert dedup state, error counters, and stall-debug bookkeeping.
         // Seeds `errors_counter` with `initial_errors` for metric consistency.
@@ -480,6 +491,10 @@ impl SessionProcessor {
         let consensus_callbacks = callbacks.clone();
         let consensus_description = description.clone();
         let consensus_telemetry = telemetry.clone();
+        // Trace collector handle (mpsc sender + Arc) cloned for each controller
+        let collation_trace_collector = trace_collector.clone();
+        let validation_trace_collector = trace_collector.clone();
+        let consensus_trace_collector = trace_collector.clone();
         // Generic deferred-work handle for the validation controller. The
         // adapter projects `&mut SessionProcessor -> &mut p.validation`, so the
         // controller can post follow-up / async work without naming this type.
@@ -515,6 +530,7 @@ impl SessionProcessor {
                 // seqno, seeded from the block before session start.
                 initial_block_seqno.checked_sub(1),
                 initial_block_seqno.saturating_sub(1),
+                consensus_trace_collector,
             ),
             // Candidate request tracking
             requested_candidates: HashMap::new(),
@@ -534,13 +550,16 @@ impl SessionProcessor {
                 collation_callbacks,
                 collation_description,
                 collation_telemetry,
+                collation_trace_collector,
             ),
             validation: ValidationController::new(
                 validation_queue,
                 validation_callbacks,
                 validation_description,
                 validation_telemetry,
+                validation_trace_collector,
             ),
+            trace_collector,
         };
 
         if initial_errors > 0 {
@@ -561,7 +580,11 @@ impl SessionProcessor {
 
 impl Drop for SessionProcessor {
     fn drop(&mut self) {
-        log::info!("Dropping SessionProcessor for session {}", self.session_id().to_hex_string());
+        let session_id = self.session_id();
+        log::info!("Dropping SessionProcessor for session {}", session_id.to_hex_string());
+        if let Some(tc) = &self.trace_collector {
+            tc.record_session_end(session_id);
+        }
     }
 }
 
@@ -1204,13 +1227,13 @@ impl SessionProcessor {
             return;
         }
 
-        // NOTE(TN-1414): A broadcast candidate (no attached notar cert) is authenticated
+        // NOTE: A broadcast candidate (no attached notar cert) is authenticated
         // by the slot leader's signature, which is verified against `leader_key` in
         // `RawCandidate::from_tl(...)` below. The delivering peer (`sender_idx`) may be a
         // relay / gossip hop rather than the leader itself. Dropping a relayed broadcast
         // here strands any node that missed the leader's direct delivery: it can never
         // notarize the slot, is forced to skip, and a single such node is enough to wedge
-        // finalization on a notarized slot (releasenet MC stall, TN-1414).
+        // finalization on a notarized slot.
         //
         // C++ parity: overlay broadcasts carry the leader as their signed source (preserved
         // across relays), and `consensus.cpp handle(CandidateReceived)` applies no
@@ -1404,6 +1427,28 @@ impl SessionProcessor {
         // Reference: validator-session/src/session_processor.rs set_block_candidate
         let receive_time = self.now();
         let block_id = raw_candidate.block.block_id();
+
+        // Trace: candidate received from network (also fires for self-loop after own block)
+        if let Some(tc) = &self.trace_collector {
+            let trace_id = BlockCandidateId {
+                slot: raw_candidate.id.slot,
+                hash: raw_candidate.id.hash.clone(),
+                block: block_id.clone(),
+            };
+            let trace_parent = raw_candidate.parent_id.as_ref().map(|p| BlockCandidateId {
+                slot: p.slot,
+                hash: p.hash.clone(),
+                block: ton_block::BlockIdExt::default(),
+            });
+            tc.record_candidate_received(
+                self.session_id(),
+                &trace_id,
+                trace_parent.as_ref(),
+                Some(block_id),
+                false,
+            );
+        }
+
         let root_hash = block_id.root_hash.clone();
         let file_hash = block_id.file_hash.clone();
 
@@ -2516,7 +2561,7 @@ impl SessionProcessor {
     /// FSM state — invokes `f`, then drops the backend (RAII). Mirrors
     /// [`Self::with_validation_backend`]; the single place that assembles the
     /// collation controller's backend view from `SessionProcessor`. Used by the
-    /// collation retry-gate re-entry in [`Self::on_collation_failed_impl`] and by
+    /// collation retry-gate re-entry in [`CollationController::on_collation_failed_impl`] and by
     /// the `check_collation` policy gates (pacing, stale-window, stale
     /// precollations, pipeline fill).
     fn with_collation_backend<R>(
@@ -3570,6 +3615,14 @@ impl SessionProcessor {
 
             match event {
                 SimplexEvent::BroadcastVote(vote) => {
+                    // Trace: if this is a finalize vote, it means notarize cert was observed
+                    if let (Vote::Finalize(ref fv), Some(tc)) = (&vote, &self.trace_collector) {
+                        let notarize_vote = Vote::Notarize(crate::simplex_state::NotarizeVote {
+                            slot: fv.slot,
+                            block_hash: fv.block_hash.clone(),
+                        });
+                        tc.record_cert_observed(self.session_id(), &notarize_vote);
+                    }
                     // Send vote to receiver which will:
                     // 1. Sign it with session-scoped signature
                     // 2. Broadcast to all validators

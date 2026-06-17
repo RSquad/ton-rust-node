@@ -479,6 +479,8 @@ pub struct TonNodeConfig {
     #[serde(default)]
     accelerated_consensus_disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    session_logs_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     archival_mode: Option<ArchivalModeConfig>,
     #[serde(skip)]
     custom_overlays: CustomOverlaysConfigBoxed,
@@ -846,6 +848,10 @@ impl TonNodeConfig {
 
     pub fn is_accelerated_consensus_disabled(&self) -> bool {
         self.accelerated_consensus_disabled
+    }
+
+    pub fn session_logs_file(&self) -> Option<String> {
+        self.session_logs_file.clone()
     }
 
     pub fn quic_address(&self) -> Option<SocketAddr> {

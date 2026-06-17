@@ -65,6 +65,7 @@ use crate::{
     session_processor::SessionProcessor,
     startup_recovery::SessionStartupRecoveryProcessor,
     task_queue::{CallbackTaskPtr, CallbackTaskQueuePtr, TaskPtr, TaskQueue, TaskQueuePtr},
+    trace_collector::TraceCollector,
     ActivityNodePtr, ConsensusOverlayManagerPtr, ConsensusSession, LogReplayOptions, MetricsHandle,
     PrivateKey, SessionId, SessionListenerPtr, SessionNode, SessionOptions, SessionPtr,
     SessionReplayListenerPtr, SimplexSession,
@@ -93,9 +94,11 @@ use std::{
 };
 use ton_block::{error, BlockIdExt, Error, Result, ShardIdent};
 
-/*
-    Constants
-*/
+// ======================================================================
+// Constants
+// ======================================================================
+// Thread names, task-queue latency thresholds, and the metrics /
+// profiling / health dump periods.
 
 const MAIN_LOOP_NAME: &str = "SXMAIN"; // Simplex main processing thread
 const CALLBACKS_LOOP_NAME: &str = "SXCB"; // Simplex callbacks thread
@@ -108,11 +111,11 @@ const SESSION_HEALTH_CHECK_PERIOD_MS: u64 = 20000;
 const SESSION_MAX_LEADER_WINDOW_DESYNC_MARGIN: u32 = 0;
 const LOG_TARGET_PROFILING: &str = "simplex_profiling"; // log target for profiling
 
-/*
-===================================================================================================
-    TaskQueue Implementation
-===================================================================================================
-*/
+// ======================================================================
+// Task queue implementation
+// ======================================================================
+// The crossbeam-backed `TaskQueueImpl` (with `TaskDesc` and the
+// `DefaultTaskFactory` seam) used for the SXMAIN / SXCB worker queues.
 
 trait DefaultTaskFactory<FuncPtr: Send + 'static> {
     fn create_default_task() -> FuncPtr;
@@ -255,11 +258,12 @@ where
     }
 }
 
-/*
-===================================================================================================
-    Session Implementation
-===================================================================================================
-*/
+// ======================================================================
+// Session handle
+// ======================================================================
+// `SessionImpl`: the multi-threaded session wrapper holding the stop /
+// start / panic flags, deferred start payload, task queues, callbacks
+// aspect, and the receiver-listener keep-alive.
 
 /// Simplex session implementation
 pub(crate) struct SessionImpl {
@@ -301,6 +305,12 @@ pub(crate) struct SessionImpl {
     _receiver_listener: Arc<dyn ReceiverListener + Send + Sync>,
 }
 
+// ======================================================================
+// ConsensusSession & SimplexSession API
+// ======================================================================
+// Public session surface: start / stop / status (`ConsensusSession`) plus
+// the Simplex-specific MC-finalized notification, candidate-availability
+// repair, and stop / panic probes (`SimplexSession`).
 impl ConsensusSession for SessionImpl {
     fn start(&self, prev_blocks: Vec<BlockIdExt>, min_masterchain_block_id: BlockIdExt) {
         assert!(
@@ -377,6 +387,10 @@ impl SimplexSession for SessionImpl {
     }
 }
 
+// ======================================================================
+// Display & Drop
+// ======================================================================
+// Compact `Display` and the `Drop` guard that triggers session stop.
 impl fmt::Display for SessionImpl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SimplexSession({:x?})", self.session_id)
@@ -391,10 +405,14 @@ impl Drop for SessionImpl {
     }
 }
 
+// ======================================================================
+// Construction, lifecycle & threads
+// ======================================================================
+// Session construction (`create` / `create_replay`), the SXMAIN main
+// loop, task-queue factories, the metrics dumper, and stop sequencing.
+// Finer groups are marked with lightweight comments.
 impl SessionImpl {
-    /*
-        Session stopping
-    */
+    // ---- Session stopping ----
 
     fn stop_impl(&self, destroy_db: bool) {
         if destroy_db {
@@ -425,9 +443,7 @@ impl SessionImpl {
         );
     }
 
-    /*
-        Main loop & session callbacks processing loop
-    */
+    // ---- Main loop & session callbacks processing loop ----
 
     #[allow(clippy::too_many_arguments)]
     fn main_loop(
@@ -453,6 +469,8 @@ impl SessionImpl {
         session_creation_time: SystemTime,
         metrics_receiver: MetricsHandle,
         init_result_sender: Sender<Result<()>>,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
     ) {
         log::info!(
             "SimplexSession main loop is started (session_id is {}); \
@@ -683,6 +701,8 @@ impl SessionImpl {
             startup_errors.get(),
             health_counters,
             callbacks,
+            trace_collector,
+            catchain_seqno,
         ) {
             Ok(p) => p,
             Err(err) => {
@@ -878,9 +898,7 @@ impl SessionImpl {
         is_stopped_flag.store(true, Ordering::Release);
     }
 
-    /*
-        Metrics configuration
-    */
+    // ---- Metrics configuration ----
 
     /// Create metrics dumper for Simplex session
     ///
@@ -1053,9 +1071,7 @@ impl SessionImpl {
         metrics_dumper
     }
 
-    /*
-        Task queue creation
-    */
+    // ---- Task queue creation ----
 
     pub(crate) fn create_task_queue(
         name: impl ToString,
@@ -1099,9 +1115,7 @@ impl SessionImpl {
         task_queue
     }
 
-    /*
-        Session creation
-    */
+    // ---- Session creation ----
 
     #[allow(clippy::too_many_arguments)]
     pub fn create(
@@ -1113,6 +1127,8 @@ impl SessionImpl {
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
     ) -> Result<SessionPtr> {
         log::info!(
             "Creating SimplexSession (session_id is {}, shard={}, nodes_count={}, db_path={})",
@@ -1241,6 +1257,8 @@ impl SessionImpl {
                         session_creation_time,
                         metrics_receiver_clone,
                         init_result_sender,
+                        trace_collector,
+                        catchain_seqno,
                     );
                 }));
 

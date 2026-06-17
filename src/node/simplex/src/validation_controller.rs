@@ -86,13 +86,13 @@
 //! candidateInfo is durable. The controller exposes the FIFO via
 //! `push_validated` / `pop_validated`.
 //!
-//! ## Out of scope (deferred to Phase 7 — `ConsensusController`)
+//! ## Out of scope (owned by `ConsensusController`)
 //!
 //! Vote/cert ingress + outbound, FSM event handlers (`NotarizationReached`,
 //! `SkipCertificateReached`, `FinalizationReached`, `BlockFinalized`),
 //! recursive finalization walk, MC-applied-top tracking, and
-//! `misbehavior_reports` move to `ConsensusController` in Phase 7 —
-//! **not** here. Phase 5 `ValidationController` is candidate-validation-only.
+//! `misbehavior_reports` live in `ConsensusController` —
+//! **not** here. `ValidationController` is candidate-validation-only.
 //!
 //! ## Boundary
 //!
@@ -122,7 +122,8 @@
 
 use crate::{
     block::{
-        Candidate, CandidateParentInfo, RawCandidate, RawCandidateId, SlotIndex, ValidatorIndex,
+        Candidate, CandidateId as BlockCandidateId, CandidateParentInfo, RawCandidate,
+        RawCandidateId, SlotIndex, ValidatorIndex,
     },
     candidate_book::ParentTipResolution,
     controller_queue::{Controlled, ControllerQueueExt, ControllerQueuePtr},
@@ -131,6 +132,7 @@ use crate::{
     session_runtime::SessionRuntime,
     session_telemetry::SessionTelemetry,
     simplex_state::SimplexState,
+    trace_collector::TraceCollector,
     BlockCandidatePriority, BlockHash, BlockPayloadPtr, BlockSourceInfo, SessionId,
     ValidatorBlockCandidateDecisionCallback, SIMPLEX_ROUNDLESS,
 };
@@ -310,6 +312,11 @@ pub(crate) struct ValidationController {
     /// Validated candidates ready for FSM submission. Consumed by
     /// `process_validated_candidates` in FIFO order.
     validated_candidates: VecDeque<Candidate>,
+    /// Trace collector for recording validation lifecycle events. `None` when
+    /// stats collection is disabled - every hot-path call site is guarded with
+    /// `if let Some(tc) = &self.trace_collector`. Cheap-to-clone handle cloned
+    /// from `SessionProcessor` at construction
+    trace_collector: Option<TraceCollector>,
 }
 
 // ======================================================================
@@ -344,6 +351,7 @@ impl ValidationController {
         callbacks: Arc<SessionCallbacks>,
         description: Arc<SessionDescription>,
         telemetry: Arc<SessionTelemetry>,
+        trace_collector: Option<TraceCollector>,
     ) -> Self {
         Self {
             queue,
@@ -357,6 +365,7 @@ impl ValidationController {
             approved: HashMap::new(),
             validation_attempt_map: HashMap::new(),
             validated_candidates: VecDeque::new(),
+            trace_collector,
         }
     }
 
@@ -981,6 +990,17 @@ impl ValidationController {
             return;
         }
 
+        // Trace: validation started (just before the candidate is marked pending-approval)
+        if let Some(tc) = &self.trace_collector {
+            let block_id = self
+                .pending_validation(candidate_id)
+                .map(|p| p.raw_candidate.block.block_id().clone())
+                .unwrap_or_default();
+            let trace_id =
+                BlockCandidateId { slot, hash: candidate_id.hash.clone(), block: block_id };
+            tc.record_validation_started(self.session_id(), &trace_id);
+        }
+
         // Mark as pending approval
         self.insert_pending_approve(candidate_id.clone());
         self.bump_or_init_validation_attempt(candidate_id.clone());
@@ -1188,6 +1208,27 @@ impl ValidationController {
     /// `&mut self`; counters and the self-collation funnel use the held
     /// `telemetry` handle.
     ///
+    /// Emit a `validationFailed` trace record, fully guarded so no work (id
+    /// build, clones) happens when stats collection is disabled. The candidate
+    /// id's `block` field is ignored by the TL conversion (only slot+hash are
+    /// serialized), so a default is used here instead of a `pending_validation`
+    /// lookup on this callback path.
+    fn trace_validation_failed(
+        &self,
+        slot: SlotIndex,
+        candidate_id: &RawCandidateId,
+        reason: &str,
+    ) {
+        if let Some(tc) = &self.trace_collector {
+            let trace_id = BlockCandidateId {
+                slot,
+                hash: candidate_id.hash.clone(),
+                block: ton_block::BlockIdExt::default(),
+            };
+            tc.record_validation_failed(self.session_id(), &trace_id, reason);
+        }
+    }
+
     /// Reference: validator-session/src/session_processor.rs candidate_decision_ok()
     pub(crate) fn candidate_decision_ok(
         &mut self,
@@ -1239,6 +1280,12 @@ impl ValidationController {
         // has round gating; in roundless Simplex we gate by "still pending").
         if !self.pending_validation_contains(&candidate_id) {
             self.telemetry.validation_late_callback_counter.increment(1);
+            // Trace: validation failed (late callback without pending entry)
+            self.trace_validation_failed(
+                slot,
+                &candidate_id,
+                "late_callback: validation_late_callback_without_pending_entry",
+            );
             self.telemetry.note_generated_candidate_validation_missed(
                 &candidate_id,
                 "validation_late_callback_without_pending_entry",
@@ -1257,6 +1304,12 @@ impl ValidationController {
                 .and_then(|p| p.raw_candidate.block.as_block().map(|b| b.id.seq_no)),
         ) {
             if cand_seqno <= finalized_seqno {
+                // Trace: validation failed (block finalized during validation)
+                self.trace_validation_failed(
+                    slot,
+                    &candidate_id,
+                    &format!("finalized_during_validation finalized_seqno={finalized_seqno} cand_seqno={cand_seqno}: validation_succeeded_after_finalization"),
+                );
                 self.telemetry.note_generated_candidate_validation_missed(
                     &candidate_id,
                     format!(
@@ -1341,6 +1394,16 @@ impl ValidationController {
 
         self.telemetry.mark_generated_candidate_validation_succeeded(&candidate_id);
 
+        // Trace: validation finished (candidate successfully validated, about to be stored/queued)
+        if let Some(tc) = &self.trace_collector {
+            let trace_id = BlockCandidateId {
+                slot: _slot,
+                hash: candidate_id.hash.clone(),
+                block: pending.raw_candidate.block.block_id().clone(),
+            };
+            tc.record_validation_finished(self.session_id(), &trace_id);
+        }
+
         let now = self.now();
         self.insert_approved(
             candidate_id,
@@ -1381,6 +1444,8 @@ impl ValidationController {
         // has round gating; in roundless Simplex we gate by "still pending").
         if !self.pending_validation_contains(&candidate_id) {
             self.telemetry.validation_late_callback_counter.increment(1);
+            // Trace: validation failed (late callback without pending entry)
+            self.trace_validation_failed(slot, &candidate_id, &format!("late_callback: {reason}"));
             let now = self.now();
             self.telemetry.note_generated_candidate_validation_missed(
                 &candidate_id,
@@ -1406,6 +1471,14 @@ impl ValidationController {
                 candidate_id,
             );
             if cand_seqno <= finalized_seqno {
+                // Trace: validation failed (block finalized during validation)
+                self.trace_validation_failed(
+                    slot,
+                    &candidate_id,
+                    &format!(
+                        "finalized_during_validation finalized_seqno={finalized_seqno} cand_seqno={cand_seqno}: {reason}"
+                    ),
+                );
                 let now = self.now();
                 self.telemetry.note_generated_candidate_validation_missed(
                     &candidate_id,
@@ -1440,6 +1513,18 @@ impl ValidationController {
                     retry_timeout.as_millis(),
                 );
 
+                // Trace: validation failed (retry scheduled)
+                self.trace_validation_failed(
+                    slot,
+                    &candidate_id,
+                    &format!(
+                        "retry_scheduled (attempt {}/{}): {}",
+                        attempt_idx,
+                        self.description.opts().validation_retry_attempts,
+                        reason
+                    ),
+                );
+
                 let candidate_id_copy = candidate_id.clone();
                 self.queue.post_delayed(expiration_time, move |controller, backend| {
                     log::trace!(
@@ -1462,6 +1547,8 @@ impl ValidationController {
             candidate_id,
             reason,
         );
+        // Trace: validation failed (terminal rejection, no attempts left)
+        self.trace_validation_failed(slot, &candidate_id, &format!("rejected: {reason}"));
         let now = self.now();
         self.telemetry.note_generated_candidate_validation_missed(
             &candidate_id,

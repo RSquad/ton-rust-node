@@ -1264,12 +1264,12 @@ impl AddSub for CurrencyCollection {
         })
     }
     fn add(&mut self, other: &Self) -> Result<bool> {
-        self.coins.add(&other.coins)?;
+        let mut ok = self.coins.add(&other.coins)?;
         let mut result = self.other.clone();
         other.other.iterate_with_keys(|key: u32, b| -> Result<bool> {
             match self.other.get(&key)? {
                 Some(mut a) => {
-                    a.add(&b)?;
+                    ok &= a.add(&b)?;
                     result.set(&key, &a)?;
                 }
                 None => {
@@ -1279,7 +1279,7 @@ impl AddSub for CurrencyCollection {
             Ok(true)
         })?;
         self.other = result;
-        Ok(true)
+        Ok(ok)
     }
 }
 

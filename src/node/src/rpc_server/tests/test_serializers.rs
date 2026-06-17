@@ -8,7 +8,7 @@
  */
 use super::*;
 use crate::rpc_server::ApiError;
-use ton_block::error;
+use ton_block::{error, BuilderData, InternalMessageHeader};
 
 #[derive(Debug, serde::Deserialize)]
 struct StackWrapper {
@@ -333,6 +333,80 @@ fn serialize_raw_transaction_omits_account_field() {
             "@type": "accountAddress",
             "account_address": "Ef_K84tU4k7-7s19BeYm_qdSPDkjgSiZUpf6c9xMFZoBzGbk",
         })
+    );
+}
+
+#[test]
+fn serialize_ext_message_decodes_text_comment() {
+    let text = "https://t.me/test";
+    let mut body = vec![0, 0, 0, 0];
+    body.extend_from_slice(text.as_bytes());
+    let body = BuilderData::with_raw(body, (4 + text.len()) * 8).unwrap();
+    let body = SliceData::load_builder(body).unwrap();
+    let msg = Message::with_int_header_and_body(InternalMessageHeader::default(), body);
+    let msg_cell = msg.serialize().unwrap();
+
+    let json =
+        serialize_message(msg_cell, Some("source"), Some("destination"), false, MessageFormat::Ext)
+            .expect("message should serialize");
+
+    pretty_assertions::assert_eq!(json["message"], serde_json::json!(text));
+    pretty_assertions::assert_eq!(json["msg_data"]["@type"], serde_json::json!("msg.dataText"));
+    pretty_assertions::assert_eq!(
+        json["msg_data"]["text"],
+        serde_json::json!(base64_encode(text.as_bytes()))
+    );
+}
+
+fn snake_text_comment_body(head: &str, tail: &str) -> SliceData {
+    let mut head_bytes = vec![0, 0, 0, 0];
+    head_bytes.extend_from_slice(head.as_bytes());
+    let mut body = BuilderData::with_raw(head_bytes, (4 + head.len()) * 8).unwrap();
+    let tail = BuilderData::with_raw(tail.as_bytes().to_vec(), tail.len() * 8)
+        .unwrap()
+        .into_cell()
+        .unwrap();
+    body.checked_append_reference(tail).unwrap();
+    SliceData::load_builder(body).unwrap()
+}
+
+#[test]
+fn serialize_ext_message_decodes_text_comment_from_ref() {
+    let text = "p:3:kTC-Qd4x6q0h1g3XxwNa";
+    let body = snake_text_comment_body("", text);
+    let msg = Message::with_int_header_and_body(InternalMessageHeader::default(), body);
+    let msg_cell = msg.serialize().unwrap();
+
+    let json =
+        serialize_message(msg_cell, Some("source"), Some("destination"), false, MessageFormat::Ext)
+            .expect("message should serialize");
+
+    pretty_assertions::assert_eq!(json["message"], serde_json::json!(text));
+    pretty_assertions::assert_eq!(json["msg_data"]["@type"], serde_json::json!("msg.dataText"));
+    pretty_assertions::assert_eq!(
+        json["msg_data"]["text"],
+        serde_json::json!(base64_encode(text.as_bytes()))
+    );
+}
+
+#[test]
+fn serialize_raw_message_decodes_split_snake_text_comment() {
+    let head = "Telegram Premium for 3 months\n\nRef";
+    let tail = "#fKqSbhawc";
+    let text = format!("{head}{tail}");
+    let body = snake_text_comment_body(head, tail);
+    let msg = Message::with_int_header_and_body(InternalMessageHeader::default(), body);
+    let msg_cell = msg.serialize().unwrap();
+
+    let json =
+        serialize_message(msg_cell, Some("source"), Some("destination"), false, MessageFormat::Raw)
+            .expect("message should serialize");
+
+    assert!(json.get("message").is_none(), "raw.message must not contain message field");
+    pretty_assertions::assert_eq!(json["msg_data"]["@type"], serde_json::json!("msg.dataText"));
+    pretty_assertions::assert_eq!(
+        json["msg_data"]["text"],
+        serde_json::json!(base64_encode(text.as_bytes()))
     );
 }
 

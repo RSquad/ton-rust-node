@@ -40,7 +40,7 @@
 //! `ReceivedCandidate` and its fields stay `pub(crate)` so the
 //! `#[path]`-included tests in `tests/test_session_processor.rs` and the
 //! future `tests/test_candidate_book.rs` can construct fixtures and inspect
-//! state without widening the public API. This mirrors the Phase 3
+//! state without widening the public API. This mirrors the
 //! `SessionRuntime` / `SlotRuntime` visibility convention.
 
 use crate::{

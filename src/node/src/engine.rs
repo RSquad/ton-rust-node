@@ -157,6 +157,10 @@ pub struct Engine {
     telemetry_printer: TelemetryPrinter,
 
     tps_counter: TpsCounter,
+    /// `None` when `session_logs_file` is not set in config. Avoids spawning
+    /// the collector worker thread in deployments that don't need consensus
+    /// stats
+    trace_collector: Option<simplex::TraceCollector>,
 }
 
 struct DownloadContext<'a, T> {
@@ -590,6 +594,15 @@ impl Engine {
         let boot_from_zerostate = general_config.boot_from_zerostate();
         let global_config = general_config.load_global_config()?;
         let test_bundles_config = general_config.test_bundles_config().clone();
+        let session_logs_file = general_config.session_logs_file();
+        // Spawn the trace collector worker only when an on-disk session-stats
+        // file is configured. Otherwise leave it as `None` so we don't run an
+        // idle background thread
+        let trace_collector = if session_logs_file.is_some() {
+            Some(simplex::TraceCollector::new(session_logs_file))
+        } else {
+            None
+        };
         let external_messages_maximum_queue_length =
             collator_config.external_messages_maximum_queue_length;
 
@@ -793,6 +806,7 @@ impl Engine {
                 metrics,
             ),
             tps_counter: TpsCounter::default(),
+            trace_collector,
             storage_dicts_cache: parking_lot::Mutex::new((0, lru::LruCache::unbounded())),
         });
 
@@ -862,6 +876,9 @@ impl Engine {
         // wait while all node's services will stop
         self.stopper.clone().wait_stop().await;
         self.network.stop_adnl().await;
+        if let Some(tc) = &self.trace_collector {
+            tc.stop();
+        }
     }
 
     pub fn stopper(&self) -> &Stopper {
@@ -1065,6 +1082,10 @@ impl Engine {
 
     pub fn tps_counter(&self) -> &TpsCounter {
         &self.tps_counter
+    }
+
+    pub fn get_trace_collector(&self) -> Option<&simplex::TraceCollector> {
+        self.trace_collector.as_ref()
     }
 
     pub fn get_candidate_table(&self, session_id: &SessionId) -> Result<Arc<CandidateDb>> {

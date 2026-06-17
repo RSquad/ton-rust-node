@@ -369,6 +369,10 @@ impl BlockHandle {
         self.set_flag(FLAG_MOVED_TO_ARCHIVE)
     }
 
+    pub fn reset_archived(&self) {
+        self.meta.reset(FLAG_MOVED_TO_ARCHIVE, false)
+    }
+
     /*
         pub fn fetched(&self) -> bool {
             self.meta().fetched()

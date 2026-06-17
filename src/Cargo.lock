@@ -5035,10 +5035,11 @@ dependencies = [
 
 [[package]]
 name = "simplex"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "adnl",
  "anyhow",
+ "base64 0.22.1",
  "bincode",
  "chrono",
  "colored",
@@ -5051,6 +5052,7 @@ dependencies = [
  "metrics",
  "rand 0.8.5",
  "serde",
+ "serde_json",
  "spin 0.7.1",
  "tokio",
  "ton_api",

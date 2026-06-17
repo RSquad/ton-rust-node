@@ -11,8 +11,7 @@
 //! Per-session runtime context that will own both the immutable bootstrap
 //! handles (description, session-start parents, stop flag) and the mutable
 //! cross-controller scratch state (slot map, delayed-action queue, next-wake
-//! bookkeeping, receiver-activity mirror). Pairs with
-//! [`SessionDescription`](crate::session_description::SessionDescription),
+//! bookkeeping, receiver-activity mirror). Pairs with [`SessionDescription`],
 //! which keeps the immutable protocol/topology config.
 //!
 //! ## Boundary

@@ -295,7 +295,7 @@ fn make_telemetry(description: &SessionDescription) -> Arc<SessionTelemetry> {
 fn mk_ctrl(description: Arc<SessionDescription>) -> CollationController {
     let callbacks = make_callbacks();
     let telemetry = make_telemetry(&description);
-    CollationController::new(test_collation_queue(), callbacks, description, telemetry)
+    CollationController::new(test_collation_queue(), callbacks, description, telemetry, None)
 }
 
 /// Build a fresh controller for the state-mechanics / pure-policy tests

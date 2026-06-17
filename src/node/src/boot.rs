@@ -668,6 +668,7 @@ pub async fn warm_boot(
     hardfork_path: impl AsRef<Path>,
 ) -> Result<BlockIdExt> {
     log::info!(target: "boot", "Warm boot");
+    ensure_block_chain_for_state(&engine, &block_id).await?;
     if let Some(block_id) = check_hardforks(&engine, &block_id, hardfork_path).await? {
         return Ok(block_id);
     }
@@ -684,11 +685,63 @@ pub async fn warm_boot(
         CHECK!(handle.has_prev1());
         block_id = engine.load_block_prev1(&block_id)?;
     }
+    // walk forward via next1 to find the most recent applied block
+    // (LAST_APPLIED_MC_BLOCK pointer may lag behind actual applied state after crash)
+    loop {
+        let handle = engine
+            .load_block_handle(&block_id)?
+            .ok_or_else(|| error!("Cannot load handle for block {}", block_id))?;
+        if !handle.has_next1() {
+            break;
+        }
+        let next_id = engine.load_block_next1(&block_id)?;
+        let Some(next_handle) = engine.load_block_handle(&next_id)? else {
+            break;
+        };
+        if !next_handle.is_applied() {
+            break;
+        }
+        block_id = next_id;
+    }
+    engine.save_last_applied_mc_block_id(&block_id)?;
     log::info!(target: "boot", "last applied block id = {}", block_id);
     let state = engine.load_state(&block_id).await?;
     let init_block_id = engine.init_mc_block_id();
     CHECK!(&block_id == init_block_id || state.has_prev_block(init_block_id)?);
     Ok(block_id)
+}
+
+async fn ensure_block_chain_for_state(engine: &Arc<Engine>, start: &BlockIdExt) -> Result<()> {
+    let mut id = start.clone();
+    loop {
+        let handle = engine
+            .load_block_handle(&id)?
+            .ok_or_else(|| error!("Cannot load handle for block {}", id))?;
+        if handle.has_saved_state() {
+            return Ok(());
+        }
+        let needs_download = if !handle.has_data() {
+            true
+        } else {
+            match engine.load_block_raw(&handle).await {
+                Ok(_) => false,
+                Err(e) => {
+                    log::warn!(target: "boot", "Block {id} read failed: {e}, will re-download");
+                    true
+                }
+            }
+        };
+        if needs_download {
+            log::warn!(target: "boot", "Block {id} data is missing, downloading");
+            let (block, proof) = engine.download_block(&id, None).await?;
+            let h = engine.store_block(&block).await?.to_any();
+            engine.store_block_proof(&id, Some(h), &proof).await?;
+        }
+        if !handle.has_prev1() {
+            fail!("ensure_block_chain_for_state: no prev1 for {id}")
+        }
+        id = engine.load_block_prev1(&id)?;
+    }
 }
 
 async fn check_hardforks(

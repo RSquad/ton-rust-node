@@ -93,9 +93,10 @@ use ton_api::{
 };
 use ton_block::{error, sha256_digest, BlockIdExt, Result, UInt256};
 
-// ============================================================================
+// ======================================================================
 // Constants
-// ============================================================================
+// ======================================================================
+// Log target and the default blocking-read sync timeout.
 
 /// Log target for database operations (matches simplex crate log target)
 const TARGET: &str = "simplex";
@@ -103,9 +104,11 @@ const TARGET: &str = "simplex";
 /// Default sync timeout for blocking reads
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 
-// ============================================================================
-// TL Constructor IDs (for prefix scanning)
-// ============================================================================
+// ======================================================================
+// TL constructor IDs (for prefix scanning)
+// ======================================================================
+// Key-prefix accessors returning each record type's TL constructor tag,
+// used to range-scan the column family by record kind.
 
 /// Get key prefix for finalized blocks
 fn prefix_finalized_block() -> u32 {
@@ -135,9 +138,11 @@ fn prefix_candidate_payload() -> u32 {
     CandidatePayloadKey::constructor_const()
 }
 
-// ============================================================================
-// Record Types
-// ============================================================================
+// ======================================================================
+// Record types
+// ======================================================================
+// Owned record structs persisted to / loaded from the DB (finalized
+// blocks, candidate info, votes, certificates, pool state, payloads).
 
 /// Finalized block record loaded from DB
 #[derive(Debug, Clone)]
@@ -224,9 +229,11 @@ pub struct PoolStateRecord {
     pub first_nonannounced_window: WindowIndex,
 }
 
-// ============================================================================
-// Bootstrap Structures
-// ============================================================================
+// ======================================================================
+// Bootstrap structures
+// ======================================================================
+// Aggregated startup state (`Bootstrap`) assembled from persisted records
+// and `split()` into per-controller bootstrap views.
 
 /// Complete bootstrap data loaded from DB at session startup.
 ///
@@ -313,9 +320,11 @@ impl Bootstrap {
     }
 }
 
-// ============================================================================
-// TL Conversion Helpers
-// ============================================================================
+// ======================================================================
+// TL conversion helpers
+// ======================================================================
+// Conversions between domain record types and their TL key / value wire
+// representations.
 
 /// Convert RawCandidateId to TL CandidateId
 fn raw_candidate_id_to_tl(id: &RawCandidateId) -> CandidateId {
@@ -327,9 +336,11 @@ fn raw_candidate_id_from_tl(tl: CandidateId) -> RawCandidateId {
     RawCandidateId { slot: SlotIndex::new(tl.slot as u32), hash: tl.hash }
 }
 
-// ============================================================================
-// Serialization Functions
-// ============================================================================
+// ======================================================================
+// Serialization functions
+// ======================================================================
+// (De)serialization of records, keys, and certificates to / from TL
+// bytes for storage.
 
 fn serialize_finalized_block_key(candidate_id: &RawCandidateId) -> Result<Vec<u8>> {
     let key = FinalizedBlockKey { candidateId: raw_candidate_id_to_tl(candidate_id) };
@@ -582,9 +593,11 @@ fn filter_finalized_chain(mut records: Vec<FinalizedBlockRecord>) -> Vec<Finaliz
     filtered
 }
 
-// ============================================================================
+// ======================================================================
 // SimplexDb
-// ============================================================================
+// ======================================================================
+// The RocksDB-backed store: async fire-and-forget writes, blocking
+// startup reads, the vote-seqno counter, and the typed record APIs.
 
 /// Pointer to SimplexDb
 pub type SimplexDbPtr = Arc<SimplexDb>;
@@ -1721,8 +1734,8 @@ impl SimplexDb {
     ///    onto a thread that is about to exit.
     /// 3. Is idempotent: a second `close()` is a cheap `Ok(())`.
     ///
-    /// Called from `SessionProcessor::stop()` as part of the
-    /// `CONSENSUS-DB-CLEANUP-1` shutdown flow (C++ parity with
+    /// Called from `SessionProcessor::stop()` as part of the database
+    /// shutdown flow (C++ parity with
     /// `td::KeyValueAsync::close()` / `bridge.cpp::destroy_inner()`).
     ///
     /// `Drop` keeps a safety-net `sync()` so an accidental drop without a
@@ -1804,9 +1817,10 @@ impl Drop for SimplexDb {
     }
 }
 
-// ============================================================================
+// ======================================================================
 // Tests
-// ============================================================================
+// ======================================================================
+// Unit tests for serialization round-trips and the DB record APIs.
 
 #[cfg(test)]
 #[path = "tests/test_database.rs"]

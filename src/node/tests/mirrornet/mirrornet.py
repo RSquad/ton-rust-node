@@ -81,8 +81,15 @@ def stop_nodes():
     print("Stopping nodes...")
     procs = []
     for node in config["nodes"]:
-        bin_name = node["node_bin_path"].split("/")[-1]
-        cmd = f"pkill {bin_name}; while pgrep {bin_name} > /dev/null; do sleep 1; done;"
+        bin_name = Path(node["node_bin_path"]).name
+        # -x: exact match against process name (comm); escalate to SIGKILL after timeout
+        cmd = (
+            f'pkill -x {bin_name} || true; '
+            f'for i in $(seq 1 30); do pgrep -x {bin_name} > /dev/null || exit 0; sleep 1; done; '
+            f'pkill -9 -x {bin_name} || true; '
+            f'for i in $(seq 1 10); do pgrep -x {bin_name} > /dev/null || exit 0; sleep 1; done; '
+            f'exit 1'
+        )
         ssh = prepare_ssh_command(node, cmd)
         p = subprocess.Popen(
             ssh, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -90,15 +97,18 @@ def stop_nodes():
         procs.append((node, p))
 
     for node, p in procs:
-        _out, err = p.communicate()
+        try:
+            _out, err = p.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            raise RuntimeError(f"Timeout stopping node {node['ip']}")
         if p.returncode != 0:
             print(f"  ❌ error stopping node {node['ip']}: {p.returncode}\n{err}")
             raise RuntimeError(f"Failed to stop node {node['ip']}")
-        else:
-            print(f"  ✅ stopped node {node['ip']}")
+        print(f"  ✅ stopped node {node['ip']}")
 
 
-def update_node_configs() -> tuple[list[dict], str]:
+def update_node_configs(backed_up_nodes: list[dict]) -> tuple[list[dict], str]:
     print("Updating node configs...")
     validator_configs = []
     election_id = int(time.time())
@@ -109,6 +119,7 @@ def update_node_configs() -> tuple[list[dict], str]:
         cmd = f"cp -n {node['node_configs_path']}/config.json {backup_path}"
         ssh = prepare_ssh_command(node, cmd)
         run_command(ssh)
+        backed_up_nodes.append(node)
 
         # download config.json
         cmd = f"cat {node['node_configs_path']}/config.json"
@@ -117,17 +128,20 @@ def update_node_configs() -> tuple[list[dict], str]:
         config_json = json.loads(result.stdout)
 
         # generate new keypair
-        result = run_command([config["utils_path"] + "/keygen"], capture_output=True)
+        result = run_command([config["utils_path"] + "/crypto", "gen", "key"], capture_output=True)
         new_key = json.loads(result.stdout)
         config_json["validator_keys"] = [
             {
                 "expire_at": int(time.time()) + 365 * 24 * 3600,
                 "election_id": election_id,
-                "validator_key_id": new_key["keyhash"],
+                "validator_key_id": new_key["adnlId"],
             }
         ]
         config_json["validator_key_ring"] = {
-            new_key["keyhash"]: new_key["private"],
+            new_key["adnlId"]: {
+                "type_id": 1209251014,
+                "pvt_key": new_key["secret"],
+            },
         }
 
         old_global_config_name = config_json["ton_global_config_name"]
@@ -175,7 +189,7 @@ def generate_hardfork_config(validator_configs: list[dict]) -> str:
     new_config["p35"]["total_weight"] = len(validator_configs) * 10
     validators = []
     for conf in validator_configs:
-        pubkey = base64.b64decode(conf["new_key"]["public"]["pub_key"]).hex()
+        pubkey = base64.b64decode(conf["new_key"]["pubkey"]).hex()
         validator_entry = {
             "public_key": pubkey,
             "weight": "10",
@@ -287,14 +301,14 @@ def build_global_config(
         if dht_key is None:
             raise RuntimeError("DHT key not found in config")
 
-        gendht_tool_path = Path(config["utils_path"]) / "gendht"
+        gendht_tool_path = Path(config["utils_path"]) / "crypto"
         ip = node_conf["adnl_node"]["ip_address"].split(":")[0]
         if ip == "0.0.0.0":
             ip = config["nodes"][inode]["ip"]
         inode += 1
         port = node_conf["adnl_node"]["ip_address"].split(":")[1]
         ip_address = f"{ip}:{port}"
-        cmd = [str(gendht_tool_path), f"{ip_address}", dht_key]
+        cmd = [str(gendht_tool_path), "gen", "dht", "--addr", f"{ip_address}", "--key", dht_key]
         node = json.loads(run_command(cmd).stdout.strip())
         nodes.append(node)
     print(" ✅ done")
@@ -335,6 +349,21 @@ def distribute_global_config(global_config: str, validator_configs: list[dict]):
     os.remove("global_config.json")
 
 
+def restore_node_configs(nodes_to_restore: list[dict]):
+    print("Rolling back: restoring original config.json on backed-up nodes...")
+    for node in nodes_to_restore:
+        print(f"  {node['ip']}...", end="")
+        try:
+            backup_path = f"{node['node_configs_path']}/config.json.bak"
+            target_path = f"{node['node_configs_path']}/config.json"
+            cmd = f"cp {backup_path} {target_path}"
+            ssh = prepare_ssh_command(node, cmd)
+            run_command(ssh)
+            print(" ✅ done")
+        except RuntimeError as e:
+            print(f" ❌ failed: {e}")
+
+
 def run_nodes():
     print("Starting nodes...")
     for node in config["nodes"]:
@@ -353,19 +382,25 @@ def main():
     if not load_config():
         return
 
-    # start_time = time.time()
+    backed_up_nodes: list[dict] = []
+    try:
+        validator_configs, old_global_config_name = update_node_configs(backed_up_nodes)
+        hardfork_config = generate_hardfork_config(validator_configs)
+        hardfork_info = build_hardfork(
+            hardfork_config, config["nodes"][0], validator_configs[0]["config"]
+        )
+        distribute_hardfork(hardfork_info)
+        global_config = build_global_config(
+            hardfork_info, validator_configs, old_global_config_name
+        )
+        distribute_global_config(global_config, validator_configs)
+    except Exception as e:
+        print(f"\n❌ Error during mirrornet setup: {e}")
+        if backed_up_nodes:
+            restore_node_configs(backed_up_nodes)
+        raise
 
     stop_nodes()
-    validator_configs, old_global_config_name = update_node_configs()
-    hardfork_config = generate_hardfork_config(validator_configs)
-    hardfork_info = build_hardfork(
-        hardfork_config, config["nodes"][0], validator_configs[0]["config"]
-    )
-    distribute_hardfork(hardfork_info)
-    global_config = build_global_config(
-        hardfork_info, validator_configs, old_global_config_name
-    )
-    distribute_global_config(global_config, validator_configs)
     run_nodes()
 
 

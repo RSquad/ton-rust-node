@@ -12,7 +12,7 @@
 //! network events onto the `SXMAIN` main task queue so that all
 //! [`SessionProcessor`] state mutations happen on a single thread.
 //!
-//! ## Symmetry with [`SessionCallbacks`]
+//! ## Symmetry with [`SessionCallbacks`](crate::session_callbacks::SessionCallbacks)
 //!
 //! ```text
 //!  SXRCV (Receiver)  ──ReceiverCallbacks──►  SXMAIN (SessionProcessor)
@@ -35,9 +35,9 @@
 //!
 //! Naming-only adapter today (verbatim move of the prior
 //! `ReceiverListenerImpl` from `session.rs`). Future receiver-runtime
-//! work (Phase 6 of the architecture rework) may split bounds /
-//! dedup / rate-limit / signature-ban gating into a dedicated
-//! `IngressGate` aspect; that work is intentionally out of scope here.
+//! work may split bounds / dedup / rate-limit / signature-ban gating
+//! into a dedicated `IngressGate` aspect; that work is intentionally
+//! out of scope here.
 
 use crate::{
     receiver::{ReceiverActivitySnapshot, ReceiverListener, StandstillTriggerNotification},
@@ -65,6 +65,11 @@ pub(crate) struct ReceiverCallbacks {
     session_id: SessionId,
 }
 
+// ======================================================================
+// Construction & teardown
+// ======================================================================
+// Build the `Arc<ReceiverCallbacks>` handle bound to the main task queue;
+// `Drop` only logs.
 impl ReceiverCallbacks {
     /// Create a fresh `Arc<ReceiverCallbacks>` bound to the given main
     /// task queue.
@@ -73,6 +78,18 @@ impl ReceiverCallbacks {
     }
 }
 
+impl Drop for ReceiverCallbacks {
+    fn drop(&mut self) {
+        log::debug!("Dropped ReceiverCallbacks for session {}", self.session_id.to_hex_string());
+    }
+}
+
+// ======================================================================
+// ReceiverListener — SXRCV → SXMAIN bridge
+// ======================================================================
+// Each inbound network event is serialised into a single
+// `processor.on_X(...)` closure posted onto the main task queue, so all
+// state mutation happens on the SXMAIN thread.
 impl ReceiverListener for ReceiverCallbacks {
     /// Handle incoming vote from the network
     fn on_vote(&self, source_idx: u32, vote: Vote, raw_vote: RawVoteData) {
@@ -148,11 +165,5 @@ impl ReceiverListener for ReceiverCallbacks {
                 response_callback,
             );
         }));
-    }
-}
-
-impl Drop for ReceiverCallbacks {
-    fn drop(&mut self) {
-        log::debug!("Dropped ReceiverCallbacks for session {}", self.session_id.to_hex_string());
     }
 }

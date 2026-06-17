@@ -118,7 +118,7 @@ impl EngineOperations for TestPipelineCollatorEngine {
         Ok(handle)
     }
 
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         if let Some(s) = self.blocks.get(handle.id()) {
             return Ok(s.val().clone());
         }
@@ -1073,6 +1073,18 @@ async fn test_collated_data_xp25() {
 async fn test_collated_data_validate_unchanged_account() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_66163599_2bc2034d_collator_test_bundle";
+    let bundle = CollatorTestBundle::load(path).unwrap();
+    try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
+}
+
+// full-collated-data validation where a subtree shared with the new state is pruned in
+// the old proof. Without `add_hint` the storage-stat recalc walks into a pruned dict branch and
+// fails with "cell underflow". Bundle from `build_minimized_bundle`.
+#[cfg(not(feature = "xp25"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_validate_pruned_shared_subtree_storage_stat() {
+    init_test_log();
+    let path = "src/tests/static/0.8000000000000000_76189835_5ca9034e_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
     try_validate_by_bundle(Arc::new(bundle)).await.unwrap();
 }

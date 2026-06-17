@@ -80,6 +80,12 @@ pub(crate) struct SessionCallbacks {
     listener: SessionListenerPtr,
 }
 
+// ======================================================================
+// Construction & dispatch
+// ======================================================================
+// Build the aspect (plus the test-only listener swap), expose the
+// callback-thread flag, and the private `invoke` primitive that
+// suppresses-on-shutdown and routes sync vs SXCB-queue dispatch.
 impl SessionCallbacks {
     /// Construct a fresh callbacks aspect.
     ///
@@ -151,7 +157,15 @@ impl SessionCallbacks {
             callback();
         }
     }
+}
 
+// ======================================================================
+// Listener notifications
+// ======================================================================
+// The four `notify_*` wrappers (candidate, candidate-observed,
+// generate-slot, block-finalized). Each clones the weak listener and
+// dispatches a pre-built payload through `invoke`.
+impl SessionCallbacks {
     /// Notify listener about a block candidate for validation.
     ///
     /// Called when a block broadcast is received and the candidate
@@ -302,7 +316,15 @@ impl SessionCallbacks {
             }
         });
     }
+}
 
+// ======================================================================
+// SXCB worker loop
+// ======================================================================
+// The callback-thread main loop: pull + execute queued listener closures
+// until stopped, then flush and signal stopped. Only spawned when
+// `use_callback_thread=true`.
+impl SessionCallbacks {
     /// Run the `SXCB` worker loop.
     ///
     /// Pulls callback closures from `task_queue` and executes them on
@@ -369,6 +391,10 @@ impl SessionCallbacks {
     }
 }
 
+// ======================================================================
+// Debug
+// ======================================================================
+// Non-exhaustive `Debug` exposing identity and dispatch-mode fields.
 impl std::fmt::Debug for SessionCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionCallbacks")
@@ -379,16 +405,12 @@ impl std::fmt::Debug for SessionCallbacks {
     }
 }
 
-/*
-    ============================================================================
-    Unit tests
-    ============================================================================
-
-    Tests live in a sibling file but are included directly via `#[path]` so
-    they can reach the private `invoke` helper without widening visibility.
-    Mirrors `session_telemetry.rs`/`session_runtime.rs`.
-*/
-
+// ======================================================================
+// Tests
+// ======================================================================
+// Tests live in a sibling file but are included directly via `#[path]` so
+// they can reach the private `invoke` helper without widening visibility.
+// Mirrors `session_telemetry.rs` / `session_runtime.rs`.
 #[cfg(test)]
 #[path = "tests/test_session_callbacks.rs"]
 mod tests;

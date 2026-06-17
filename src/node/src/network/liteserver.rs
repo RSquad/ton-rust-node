@@ -83,66 +83,107 @@ use ton_vm::{smart_contract_info::convert_stack, stack::StackItem};
 
 const SEQNO_ANY: u32 = u32::MAX;
 
-const RUN_SMC_METHOD_PROOFS: i32 = 0x1;
-const RUN_SMC_METHOD_STATE_PROOF: i32 = 0x2;
-const RUN_SMC_METHOD_RESULT: i32 = 0x4;
-const RUN_SMC_METHOD_INIT_C7: i32 = 0x8;
-const RUN_SMC_METHOD_LIB_EXTRAS: i32 = 0x10;
-const RUN_SMC_METHOD_FULL_C7: i32 = 0x20;
-const RUN_SMC_METHOD_SUPPORTED: i32 = 0x3f;
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RunSmcMethodMode: i32 {
+        const PROOFS = 0x01;
+        const STATE_PROOF = 0x02;
+        const RESULT = 0x04;
+        const INIT_C7 = 0x08;
+        const LIB_EXTRAS = 0x10;
+        const FULL_C7 = 0x20;
+    }
+}
 const RUN_SMC_METHOD_ERROR_CODE: i32 = -0x100;
 
 pub type LookupMode = i32;
 
-pub const LOOKUP_BY_SEQNO: i32 = 0x1;
-pub const LOOKUP_BY_LT: i32 = 0x2;
-pub const LOOKUP_BY_UTIME: i32 = 0x4;
-pub const LOOKUP_INCLUDE_PREV: i32 = 0x8;
-pub const LOOKUP_BY_MASK: i32 =
-    LOOKUP_BY_SEQNO | LOOKUP_BY_LT | LOOKUP_BY_UTIME | LOOKUP_INCLUDE_PREV;
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LookupBlockMode: i32 {
+        const BY_SEQNO = 0x01;
+        const BY_LT = 0x02;
+        const BY_UTIME = 0x04;
+        const INCLUDE_PREV = 0x08;
+    }
+}
+
+const LOOKUP_BLOCK_SELECTOR_MASK: LookupBlockMode =
+    LookupBlockMode::BY_SEQNO.union(LookupBlockMode::BY_LT).union(LookupBlockMode::BY_UTIME);
 
 #[inline]
-fn lkp_check(mode: LookupMode) -> Result<()> {
-    let by = mode & LOOKUP_BY_MASK;
-    if by == 0 || (by & (by - 1)) != 0 {
+fn lkp_check(mode: LookupBlockMode) -> Result<()> {
+    let by = mode & LOOKUP_BLOCK_SELECTOR_MASK;
+    if by.bits().count_ones() != 1 {
         fail!("exactly one of LookupBySeqno, LookupByLt, LookupByUtime must be set");
     }
     Ok(())
 }
 
-#[inline]
-fn lkp_has(mode: LookupMode, flag: i32) -> bool {
-    (mode & flag) != 0
-}
-
 pub const MAX_TRANSACTION_COUNT: usize = 16;
 
-const FILTER_BY_SHARD: i32 = 1;
-
-const WANT_PROOF: i32 = 0x20;
-const REVERSE_ORDER: i32 = 0x40;
-const AFTER_PRESENT: i32 = 0x80;
 const LS_VERSION: i32 = 0x101;
 const LS_CAPABILITIES: i64 = 15;
 const SKIP_EXTERNALS_QUEUE_SIZE: i32 = 1000;
 
-const MC_INFO_EXT_SHARD_CLIENT_STATE: i32 = 0x1;
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct OutMsgQueueSizesMode: i32 {
+        const FILTER_BY_SHARD = 0x01;
+    }
+}
 
-const CFG_NEED_PREV_BLOCKS: i32 = 0x80;
-const CFG_FROM_PREV_KEY_BLOCK: i32 = 0x8000; // read the config from the previous key block
-const CFG_VISIT_PARAMS: i32 = 0x10000; // enable the listed parameters (list)
-const CFG_VISIT_ROOT: i32 = 0x20000; // enable the config root (all at once)
-const CFG_MODE_MASK_RET: i32 = 0xFFFF; // the mask of the lower 16 bits to be returned
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ListBlockTransactionsMode: i32 {
+        const WANT_PROOF = 0x20;
+        const REVERSE_ORDER = 0x40;
+        const AFTER_PRESENT = 0x80;
+    }
+}
 
-const TID_ACCOUNT: i32 = 1 << 0;
-const TID_LT: i32 = 1 << 1;
-const TID_HASH: i32 = 1 << 2;
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct MasterchainInfoExtMode: i32 {
+        const SHARD_CLIENT_STATE = 0x01;
+    }
+}
 
-const LIB_MODE_SKIP_DATA: i32 = 1 << 1; // 2 — if set, we do not return the cell data.
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ConfigMode: i32 {
+        const NEED_PREV_BLOCKS = 0x80;
+        const FROM_PREV_KEY_BLOCK = 0x8000;
+        const VISIT_PARAMS = 0x10000;
+        const VISIT_ROOT = 0x20000;
+    }
+}
+const CONFIG_MODE_RETURN_MASK: i32 = 0xFFFF;
 
-const WANT_PROOF_BIT: i32 = 0x1;
-const ONE_ACCOUNT_BIT: i32 = 0x2;
-const MESSAGES_BOC_BIT: i32 = 0x4;
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TransactionIdMode: i32 {
+        const ACCOUNT = 1 << 0;
+        const LT = 1 << 1;
+        const HASH = 1 << 2;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LibrariesMode: i32 {
+        const SKIP_DATA = 1 << 1;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DispatchQueueMessagesMode: i32 {
+        const WANT_PROOF = 0x01;
+        const ONE_ACCOUNT = 0x02;
+        const MESSAGES_BOC = 0x04;
+    }
+}
 
 fn make_liteserver_error(code: i32, message: String) -> TLObject {
     ErrorEnum::LiteServer_Error(LSError { code, message }).into_tl_object()
@@ -803,7 +844,7 @@ impl LiteServerQuerySubscriber {
 
     async fn run_smc_method(
         engine: &Arc<dyn EngineOperations>,
-        mode: i32,
+        raw_mode: i32,
         block_id: BlockIdExt,
         account_id: AccountIdTl,
         method_id: i64,
@@ -815,9 +856,8 @@ impl LiteServerQuerySubscriber {
         if params.len() >= 65536 {
             fail!("more than 64k parameter bytes passed");
         }
-        if mode & !RUN_SMC_METHOD_SUPPORTED != 0 {
-            fail!("unsupported mode in runSmcMethod");
-        }
+        let mode = RunSmcMethodMode::from_bits(raw_mode)
+            .ok_or_else(|| error!("unsupported mode in runSmcMethod"))?;
 
         let account_address = MsgAddressInt::AddrStd(MsgAddrStd {
             anycast: None,
@@ -830,16 +870,16 @@ impl LiteServerQuerySubscriber {
             block_id,
             &account_address,
             account_id.workchain,
-            mode & RUN_SMC_METHOD_PROOFS != 0,
+            mode.contains(RunSmcMethodMode::PROOFS),
         )
         .await?;
         let mc_state_root = resolved.mc_state.state().root_cell().clone();
 
         let lib_extras =
-            if mode & RUN_SMC_METHOD_LIB_EXTRAS != 0 { Some(Vec::new()) } else { None };
+            if mode.contains(RunSmcMethodMode::LIB_EXTRAS) { Some(Vec::new()) } else { None };
 
         let make_result = move |exit_code, result, state_proof, init_c7| RunMethodResult {
-            mode,
+            mode: raw_mode,
             id: resolved.id.into(),
             shardblk: resolved.shardblk.into(),
             shard_proof: resolved.shard_proof,
@@ -851,15 +891,19 @@ impl LiteServerQuerySubscriber {
             result,
         };
 
-        let empty_result = if mode & RUN_SMC_METHOD_RESULT != 0 { Some(Vec::new()) } else { None };
+        let empty_result =
+            if mode.contains(RunSmcMethodMode::RESULT) { Some(Vec::new()) } else { None };
         let empty_init_c7 =
-            if mode & RUN_SMC_METHOD_INIT_C7 != 0 { Some(Vec::new()) } else { None };
+            if mode.contains(RunSmcMethodMode::INIT_C7) { Some(Vec::new()) } else { None };
 
         let account_cell = match resolved.account_cell {
             Some(cell) => cell,
             None => {
-                let empty_state_proof =
-                    if mode & RUN_SMC_METHOD_STATE_PROOF != 0 { Some(Vec::new()) } else { None };
+                let empty_state_proof = if mode.contains(RunSmcMethodMode::STATE_PROOF) {
+                    Some(Vec::new())
+                } else {
+                    None
+                };
                 return Ok(make_result(
                     RUN_SMC_METHOD_ERROR_CODE,
                     empty_result,
@@ -870,7 +914,7 @@ impl LiteServerQuerySubscriber {
         };
 
         tokio::task::spawn_blocking(move || -> Result<RunMethodResult> {
-            let account_usage = if mode & RUN_SMC_METHOD_STATE_PROOF != 0 {
+            let account_usage = if mode.contains(RunSmcMethodMode::STATE_PROOF) {
                 Some(UsageTree::with_params(account_cell.clone(), true))
             } else {
                 None
@@ -909,16 +953,17 @@ impl LiteServerQuerySubscriber {
 
             // Always serialize stack when state_proof is requested — serialization
             // visits data cells referenced from the result, capturing them in the usage tree
-            let result = if mode & (RUN_SMC_METHOD_RESULT | RUN_SMC_METHOD_STATE_PROOF) != 0 {
-                let cell = serialize_vm_stack(&run.stack)?;
-                if mode & RUN_SMC_METHOD_RESULT != 0 {
-                    Some(write_boc(&cell)?)
+            let result =
+                if mode.intersects(RunSmcMethodMode::RESULT | RunSmcMethodMode::STATE_PROOF) {
+                    let cell = serialize_vm_stack(&run.stack)?;
+                    if mode.contains(RunSmcMethodMode::RESULT) {
+                        Some(write_boc(&cell)?)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             let state_proof = account_usage
                 .map(|usage| {
@@ -926,9 +971,9 @@ impl LiteServerQuerySubscriber {
                 })
                 .transpose()?;
 
-            let init_c7 = if mode & RUN_SMC_METHOD_INIT_C7 != 0 {
+            let init_c7 = if mode.contains(RunSmcMethodMode::INIT_C7) {
                 let mut smc_info = run.smc_info;
-                if mode & RUN_SMC_METHOD_FULL_C7 == 0 {
+                if !mode.contains(RunSmcMethodMode::FULL_C7) {
                     smc_info.config_params = Default::default();
                 }
                 Some(serialize_vm_stack_value_boc(&smc_info.as_temp_data_item())?)
@@ -1184,18 +1229,19 @@ impl LiteServerQuerySubscriber {
 
     async fn get_config_params(
         engine: &Arc<dyn EngineOperations>,
-        mode: i32,
+        raw_mode: i32,
         id: BlockIdExt,
         mut param_list: Vec<i32>,
     ) -> Result<ConfigInfo> {
+        let mode = ConfigMode::from_bits_truncate(raw_mode);
         if !id.is_masterchain() {
             fail!("id must be a full masterchain block");
         }
-        if param_list.is_empty() && (mode & CFG_VISIT_ROOT) == 0 {
+        if param_list.is_empty() && !mode.contains(ConfigMode::VISIT_ROOT) {
             fail!("empty param_list: pass ids or call GetConfigAll");
         }
 
-        let from_key_block = (mode & CFG_FROM_PREV_KEY_BLOCK) != 0;
+        let from_key_block = mode.contains(ConfigMode::FROM_PREV_KEY_BLOCK);
         let mut subtrees = HashSet::new();
 
         let (id, state_proof, cfg, usage) = if from_key_block {
@@ -1225,11 +1271,11 @@ impl LiteServerQuerySubscriber {
                 .read_custom()
                 .map_err(|e| error!("read_custom({id}) failed: {e}"))?
                 .ok_or_else(|| error!("No custom in masterchain state {id}"))?;
-            if mode & CFG_NEED_PREV_BLOCKS != 0 {
+            if mode.contains(ConfigMode::NEED_PREV_BLOCKS) {
                 visit_prev_blocks_info(&custom, &ss)?;
                 param_list.push(8);
             }
-            if (mode & CFG_VISIT_ROOT) != 0 {
+            if mode.contains(ConfigMode::VISIT_ROOT) {
                 let stats_hash = custom
                     .block_create_stats
                     .as_ref()
@@ -1241,7 +1287,7 @@ impl LiteServerQuerySubscriber {
             (id, state_proof, custom.config, usage)
         };
 
-        if (mode & CFG_VISIT_ROOT) != 0 {
+        if mode.contains(ConfigMode::VISIT_ROOT) {
             subtrees.insert(
                 cfg.root()
                     .ok_or_else(|| error!("No config root in state {id}"))?
@@ -1269,7 +1315,7 @@ impl LiteServerQuerySubscriber {
         })
         .await??;
 
-        Ok(ConfigInfo { mode: (mode & CFG_MODE_MASK_RET), id, state_proof, config_proof })
+        Ok(ConfigInfo { mode: raw_mode & CONFIG_MODE_RETURN_MASK, id, state_proof, config_proof })
     }
 
     async fn get_dispatch_queue_info(
@@ -1343,12 +1389,13 @@ impl LiteServerQuerySubscriber {
 
     async fn get_dispatch_queue_messages(
         engine: &Arc<dyn EngineOperations>,
-        mode: i32,
+        raw_mode: i32,
         id: BlockIdExt,
         addr: UInt256,
         after_lt: i64,
         max_messages: i32,
     ) -> Result<DispatchQueueMessages> {
+        let mode = DispatchQueueMessagesMode::from_bits_truncate(raw_mode);
         if id.root_hash.is_zero() || id.file_hash.is_zero() {
             fail!("invalid BlockIdExt");
         }
@@ -1356,9 +1403,9 @@ impl LiteServerQuerySubscriber {
             fail!("invalid max_messages");
         }
 
-        let want_proof = (mode & WANT_PROOF_BIT) != 0;
-        let one_account = (mode & ONE_ACCOUNT_BIT) != 0;
-        let messages_boc_flag = (mode & MESSAGES_BOC_BIT) != 0;
+        let want_proof = mode.contains(DispatchQueueMessagesMode::WANT_PROOF);
+        let one_account = mode.contains(DispatchQueueMessagesMode::ONE_ACCOUNT);
+        let messages_boc_flag = mode.contains(DispatchQueueMessagesMode::MESSAGES_BOC);
 
         let after_lt = after_lt.max(0) as u64;
         let limit = if messages_boc_flag {
@@ -1506,7 +1553,7 @@ impl LiteServerQuerySubscriber {
                 if messages_boc_flag { Some(write_boc_multi(message_roots)?) } else { None };
 
             Ok(DispatchQueueMessages {
-                mode,
+                mode: raw_mode,
                 id,
                 messages: messages.into(),
                 complete: complete.into(),
@@ -1520,13 +1567,14 @@ impl LiteServerQuerySubscriber {
     async fn get_libraries_with_proof(
         engine: &Arc<dyn EngineOperations>,
         id: BlockIdExt,
-        mode: i32,
+        raw_mode: i32,
         mut library_list: Vec<UInt256>,
     ) -> Result<LibraryResultWithProof> {
+        let mode = LibrariesMode::from_bits_truncate(raw_mode);
         if library_list.is_empty() {
             return Ok(LibraryResultWithProof {
                 id,
-                mode,
+                mode: raw_mode,
                 result: Vec::new(),
                 state_proof: Vec::new(),
                 data_proof: Vec::new(),
@@ -1545,7 +1593,7 @@ impl LiteServerQuerySubscriber {
                 let usage = UsageTree::with_root(state_root.clone());
                 let ss_u = ShardStateUnsplit::construct_from_cell(usage.root_cell())?;
                 let libs_u = ss_u.libraries();
-                let include_data = (mode & LIB_MODE_SKIP_DATA) == 0;
+                let include_data = !mode.contains(LibrariesMode::SKIP_DATA);
 
                 let mut result = Vec::new();
                 for hash in library_list {
@@ -1569,7 +1617,7 @@ impl LiteServerQuerySubscriber {
             header_proof(blk.root_cell(), HeaderProofKind::Full)?.write_to_bytes()
         })
         .await??;
-        Ok(LibraryResultWithProof { id, mode, result, state_proof, data_proof })
+        Ok(LibraryResultWithProof { id, mode: raw_mode, result, state_proof, data_proof })
     }
 
     async fn get_masterchain_info(engine: &Arc<dyn EngineOperations>) -> Result<MasterchainInfo> {
@@ -1589,15 +1637,15 @@ impl LiteServerQuerySubscriber {
 
     async fn get_masterchain_info_ext(
         engine: &Arc<dyn EngineOperations>,
-        mode: i32,
+        raw_mode: i32,
     ) -> Result<MasterchainInfoExt> {
-        if mode & !MC_INFO_EXT_SHARD_CLIENT_STATE != 0 {
+        let Some(mode) = MasterchainInfoExtMode::from_bits(raw_mode) else {
             fail!(BlockError::InvalidArg(format!(
-                "unsupported getMasterchainInfoExt mode: {mode:#x}"
+                "unsupported getMasterchainInfoExt mode: {raw_mode:#x}"
             )));
-        }
+        };
 
-        let mc_block_id = if mode & MC_INFO_EXT_SHARD_CLIENT_STATE != 0 {
+        let mc_block_id = if mode.contains(MasterchainInfoExtMode::SHARD_CLIENT_STATE) {
             engine
                 .load_shard_client_mc_block_id()?
                 .ok_or_else(|| error!("shard client state is not ready"))?
@@ -1618,7 +1666,7 @@ impl LiteServerQuerySubscriber {
         let now = engine.now() as i32;
 
         Ok(MasterchainInfoExt {
-            mode,
+            mode: raw_mode,
             version: LS_VERSION,
             capabilities: LS_CAPABILITIES,
             last: (*mc_block_id).clone(),
@@ -1694,15 +1742,16 @@ impl LiteServerQuerySubscriber {
 
     async fn get_out_msg_queue_sizes(
         engine: &Arc<dyn EngineOperations>,
-        mode: i32,
+        raw_mode: i32,
         wc: Option<i32>,
         shard: Option<i64>,
     ) -> Result<OutMsgQueueSizes> {
+        let mode = OutMsgQueueSizesMode::from_bits_truncate(raw_mode);
         let mc_block_id = get_last_liteserver_state_block(engine)?;
         let mc_state = engine.load_state(&mc_block_id).await?;
         let shard_hashes = mc_state.shard_state_extra()?.shards();
 
-        let filter = if (mode & FILTER_BY_SHARD) != 0 {
+        let filter = if mode.contains(OutMsgQueueSizesMode::FILTER_BY_SHARD) {
             let wc =
                 wc.ok_or_else(|| error!("wc is required for getOutMsgQueueSizes with mode bit0"))?;
             let shard = shard.ok_or_else(|| {
@@ -2070,7 +2119,7 @@ impl LiteServerQuerySubscriber {
     async fn list_block_transactions_internal(
         engine: &Arc<dyn EngineOperations>,
         id: BlockIdExt,
-        mode: i32,
+        mode: ListBlockTransactionsMode,
         count: i32,
         after: Option<TransactionId3>,
         ext: bool,
@@ -2086,21 +2135,22 @@ impl LiteServerQuerySubscriber {
             let extra = block.read_extra()?;
             let acc_blocks = extra.read_account_blocks()?;
 
-            let reverse = mode & REVERSE_ORDER != 0;
+            let reverse = mode.contains(ListBlockTransactionsMode::REVERSE_ORDER);
             let forward = !reverse;
             let need = count as usize;
             let boundary_lt: u64 = if reverse { u64::MAX } else { 0 };
 
             // Determine starting point
-            let (mut cur_addr, mut cur_lt): (AccountId, u64) = if mode & AFTER_PRESENT != 0 {
-                let after_id =
-                    after.ok_or_else(|| error!("AFTER_PRESENT flag is set but `after` is None"))?;
-                (AccountId::from(&after_id.account), after_id.lt as u64)
-            } else if reverse {
-                (AccountId::from([0xFF; 32]), u64::MAX)
-            } else {
-                (AccountId::from([0x00; 32]), 0u64)
-            };
+            let (mut cur_addr, mut cur_lt): (AccountId, u64) =
+                if mode.contains(ListBlockTransactionsMode::AFTER_PRESENT) {
+                    let after_id = after
+                        .ok_or_else(|| error!("AFTER_PRESENT flag is set but `after` is None"))?;
+                    (AccountId::from(&after_id.account), after_id.lt as u64)
+                } else if reverse {
+                    (AccountId::from([0xFF; 32]), u64::MAX)
+                } else {
+                    (AccountId::from([0x00; 32]), 0u64)
+                };
 
             let mut result_txs: Vec<(UInt256, u64, Cell)> = Vec::new();
             let mut allow_same = true;
@@ -2147,7 +2197,7 @@ impl LiteServerQuerySubscriber {
                 }
             }
 
-            let proof_bytes = if mode & WANT_PROOF != 0 {
+            let proof_bytes = if mode.contains(ListBlockTransactionsMode::WANT_PROOF) {
                 MerkleProof::create_by_usage_tree(&root, &usage)?.write_to_bytes()?
             } else {
                 Vec::new()
@@ -2156,9 +2206,11 @@ impl LiteServerQuerySubscriber {
             let ids: Vec<TransactionId> = result_txs
                 .iter()
                 .map(|(account, lt, cell)| {
-                    let flags = TID_ACCOUNT | TID_LT | TID_HASH;
+                    let flags = TransactionIdMode::ACCOUNT
+                        | TransactionIdMode::LT
+                        | TransactionIdMode::HASH;
                     TransactionId {
-                        mode: flags,
+                        mode: flags.bits(),
                         account: Some(account.clone()),
                         lt: Some(*lt as i64),
                         hash: Some(cell.repr_hash().clone()),
@@ -2201,7 +2253,7 @@ impl LiteServerQuerySubscriber {
         count: i32,
         after: Option<TransactionId3>,
     ) -> Result<BlockTransactions> {
-        let mode = mode & (WANT_PROOF | REVERSE_ORDER | AFTER_PRESENT);
+        let mode = ListBlockTransactionsMode::from_bits_truncate(mode);
         let tl =
             Self::list_block_transactions_internal(engine, id, mode, count, after, false).await?;
         let enum_obj =
@@ -2219,7 +2271,7 @@ impl LiteServerQuerySubscriber {
         count: i32,
         after: Option<TransactionId3>,
     ) -> Result<BlockTransactionsExt> {
-        let mode = mode & (REVERSE_ORDER | AFTER_PRESENT | WANT_PROOF);
+        let mode = ListBlockTransactionsMode::from_bits_truncate(mode);
         let tl =
             Self::list_block_transactions_internal(engine, id, mode, count, after, true).await?;
         let enum_obj =
@@ -2248,20 +2300,21 @@ impl LiteServerQuerySubscriber {
 
     async fn lookup_block_stuff(
         engine: &Arc<dyn EngineOperations>,
-        mode: i32,
+        raw_mode: i32,
         id: BlockId,
         lt_opt: Option<i64>,
         utime_opt: Option<i32>,
     ) -> Result<BlockStuff> {
-        let by_seq = (mode & 0x1) != 0;
-        let by_lt = (mode & 0x2) != 0;
-        let by_utime = (mode & 0x4) != 0;
-        let bits = (by_seq as u8) + (by_lt as u8) + (by_utime as u8);
-        if bits > 1 {
+        let mode = LookupBlockMode::from_bits_truncate(raw_mode);
+        let selector = mode & LOOKUP_BLOCK_SELECTOR_MASK;
+        if selector.bits().count_ones() > 1 {
             fail!(BlockError::InvalidArg(
                 "lookup_block: incompatible mode flags (seq/lt/utime)".into()
             ))
         }
+        let by_seq = selector.contains(LookupBlockMode::BY_SEQNO);
+        let by_lt = selector.contains(LookupBlockMode::BY_LT);
+        let by_utime = selector.contains(LookupBlockMode::BY_UTIME);
         let shard_ident = ShardIdent::with_tagged_prefix(id.workchain, id.shard as u64)
             .map_err(|e| error!("invalid shard ident: {e}"))?;
         let prefix: AccountIdPrefixFull = shard_ident.account_id_prefix();
@@ -2372,7 +2425,7 @@ impl LiteServerQuerySubscriber {
         lt_opt: Option<i64>,
         utime_opt: Option<i32>,
     ) -> Result<LookupBlockResult> {
-        let mode = mode_raw & LOOKUP_BY_MASK;
+        let mode = LookupBlockMode::from_bits_truncate(mode_raw);
         lkp_check(mode)?;
 
         if !mc_block_id.is_masterchain() || !mc_block_id.shard().is_full() {
@@ -2397,14 +2450,14 @@ impl LiteServerQuerySubscriber {
             .map_err(|e| error!("invalid shard ident: {e}"))?;
         let prefix: AccountIdPrefixFull = target_shard.account_id_prefix();
         // Lookup target block
-        let (target_id, target_root) = if lkp_has(mode, LOOKUP_BY_LT) {
+        let (target_id, target_root) = if mode.contains(LookupBlockMode::BY_LT) {
             let lt = lt_opt.ok_or_else(|| error!("mode=LookupByLt, but `lt` missing"))?;
             let (bid, data) = engine
                 .lookup_block_by_lt(&prefix, lt as u64)
                 .await?
                 .ok_or_else(|| error!("no block found by lt={lt}"))?;
             (bid, spawn_and_read_boc(data).await?)
-        } else if lkp_has(mode, LOOKUP_BY_UTIME) {
+        } else if mode.contains(LookupBlockMode::BY_UTIME) {
             let ut = utime_opt.ok_or_else(|| error!("mode=LookupByUtime, but `utime` missing"))?;
             let mut found: Option<(BlockIdExt, Vec<u8>)> = None;
             engine
@@ -2513,7 +2566,9 @@ impl LiteServerQuerySubscriber {
                 .await??;
         }
 
-        let want_prev = (mode & (LOOKUP_INCLUDE_PREV | LOOKUP_BY_LT | LOOKUP_BY_UTIME)) != 0;
+        let want_prev = mode.intersects(
+            LookupBlockMode::INCLUDE_PREV | LookupBlockMode::BY_LT | LookupBlockMode::BY_UTIME,
+        );
         let mut prev_header = Vec::new();
         if want_prev {
             let p1 = engine.load_block_prev1(&target_id).ok();
@@ -2551,7 +2606,7 @@ impl LiteServerQuerySubscriber {
         .await??;
         Ok(LookupBlockResult {
             id: target_id,
-            mode: mode,
+            mode: mode.bits(),
             mc_block_id: ret_mc_id,
             client_mc_state_proof,
             mc_block_proof,
@@ -2708,14 +2763,14 @@ impl LiteServerQuerySubscriber {
             GetConfigAll =>
                 |q| Self::get_config_params(
                     engine,
-                    (q.mode & CFG_MODE_MASK_RET) | CFG_VISIT_ROOT,
+                    (q.mode & CONFIG_MODE_RETURN_MASK) | ConfigMode::VISIT_ROOT.bits(),
                     q.id,
                     Vec::new(),
                 ),
             GetConfigParams =>
                 |q| Self::get_config_params(
                     engine,
-                    (q.mode & CFG_MODE_MASK_RET) | CFG_VISIT_PARAMS,
+                    (q.mode & CONFIG_MODE_RETURN_MASK) | ConfigMode::VISIT_PARAMS.bits(),
                     q.id,
                     q.param_list
                 ),

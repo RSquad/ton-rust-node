@@ -361,7 +361,7 @@ async fn test_sync() -> Result<()> {
             &[]
         }
 
-        async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+        async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
             let Some(block) = self.blocks.get(handle.id()) else {
                 fail!("Cannot load block {}", handle.id())
             };

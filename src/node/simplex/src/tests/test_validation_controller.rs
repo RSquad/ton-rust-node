@@ -424,6 +424,7 @@ fn new_controller_starts_empty() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
 
     assert_eq!(ctrl.pending_validation_count(), 0);
@@ -442,6 +443,7 @@ fn accessor_roundtrips_across_maps() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
 
     let id = make_candidate_id(4, 0xA0);
@@ -492,6 +494,7 @@ fn prune_below_drops_stale_slots_across_all_maps() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
 
     // Two cohorts: slot 3 (below cutoff) and slot 7 (kept).
@@ -558,6 +561,7 @@ fn evaluate_wait_for_parent_ready_for_genesis_candidate() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let state = SimplexState::new(&desc).unwrap();
 
@@ -576,6 +580,7 @@ fn evaluate_wait_for_parent_rejects_parent_at_or_after_candidate_slot() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let state = SimplexState::new(&desc).unwrap();
 
@@ -599,6 +604,7 @@ fn evaluate_wait_for_parent_waits_for_unnotarized_parent() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let state = SimplexState::new(&desc).unwrap();
 
@@ -626,6 +632,7 @@ fn check_validation_terminally_rejects_failing_wait_for_parent() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let backend = FakeValidationBackend::new(&desc);
 
@@ -659,6 +666,7 @@ fn check_validation_skips_when_attempts_exhausted() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let backend = FakeValidationBackend::new(&desc);
 
@@ -688,6 +696,7 @@ fn check_validation_dispatches_ready_normal_candidate() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let backend = FakeValidationBackend::new(&desc);
 
@@ -732,6 +741,7 @@ fn try_approve_block_empty_auto_approves_on_matching_tip() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
 
     let referenced = make_block_id(7, 0x30);
@@ -771,6 +781,7 @@ fn try_approve_block_empty_rejects_on_tip_mismatch() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
 
     // Referenced block differs from the resolved expected tip; with default
@@ -810,6 +821,7 @@ fn try_approve_block_empty_requests_missing_parent_and_stays_pending() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
 
     let missing = make_candidate_id(1, 0x0E);
@@ -856,6 +868,7 @@ fn candidate_decision_ok_approves_enqueues_and_wakes() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let backend = FakeValidationBackend::new(&desc);
 
@@ -890,6 +903,7 @@ fn candidate_decision_ok_drops_late_callback_without_pending_entry() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let backend = FakeValidationBackend::new(&desc);
 
@@ -923,6 +937,7 @@ fn candidate_decision_ok_drops_already_finalized_candidate() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     // Candidate at slot 0 has block seqno 1; a finalized head at seqno 5 is
     // strictly ahead, so the verdict must be dropped.
@@ -957,6 +972,7 @@ fn candidate_decision_fail_terminally_rejects_when_attempts_exhausted() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let backend = FakeValidationBackend::new(&desc);
 
@@ -990,6 +1006,7 @@ fn candidate_decision_fail_retries_through_queue_while_attempts_remain() {
         make_callbacks(),
         desc.clone(),
         make_telemetry(&desc),
+        None,
     );
     let backend = FakeValidationBackend::new(&desc);
 

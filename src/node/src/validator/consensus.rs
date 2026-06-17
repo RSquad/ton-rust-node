@@ -566,6 +566,7 @@ impl ConsensusFactory {
         catchain_seqno: u32,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
+        trace_collector: Option<simplex::TraceCollector>,
     ) -> consensus_common::Result<SessionHolderPtr> {
         let mut options = options.clone();
         options.use_callback_thread = false;
@@ -581,6 +582,8 @@ impl ConsensusFactory {
             db_path,
             overlay_manager,
             listener,
+            trace_collector,
+            catchain_seqno,
         )?;
 
         Ok(Arc::new(SessionHolder::simplex(simplex_session)))
@@ -763,6 +766,8 @@ impl ConsensusFactory {
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
+        trace_collector: Option<simplex::TraceCollector>,
+        catchain_seqno: u32,
     ) -> consensus_common::Result<SimplexSessionPtr> {
         simplex::SessionFactory::create_session(
             options,
@@ -773,6 +778,8 @@ impl ConsensusFactory {
             db_path,
             overlay_manager,
             listener,
+            trace_collector,
+            catchain_seqno,
         )
     }
 }

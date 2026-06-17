@@ -4,6 +4,76 @@ All notable changes to the Simplex Consensus Protocol implementation will be doc
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-16
+
+First stable release of the Rust Simplex consensus crate. Wire-compatible with
+the upstream C++ implementation and validated in mixed Rust/C++ validator
+networks. This release consolidates the controller-based session architecture,
+candidate-relay liveness and restart-safety parity fixes, the canonical source
+reorganization, and a full documentation overhaul aligned to the protocol spec,
+the C++ baseline, and the shipping Rust code.
+
+**C++ baseline**: unchanged from [0.7.1] — upstream
+[ton-blockchain/ton](https://github.com/ton-blockchain/ton)
+`testnet/validator/consensus/simplex`. No breaking on-wire protocol changes vs
+0.7.1; this is an architecture, quality, and documentation milestone.
+
+### Changed
+
+#### Session architecture: kernel + coordinator + controllers + aspects
+
+- `SessionProcessor` is now a thin SXMAIN coordinator that owns no consensus
+  policy. Each consensus phase moved to a dedicated controller reached through a
+  `with_*_backend` split-borrow seam:
+  - `CollationController` (`collation_controller.rs`) — collation, precollation,
+    empty-block recovery, collation pacing.
+  - `ValidationController` (`validation_controller.rs`) — candidate-validation
+    pipeline and missing-parent repair scheduling.
+  - `ConsensusController` (`consensus_controller.rs`) — vote/cert ingress and
+    egress, FSM finalization handlers, the recursive finalization walk, and the
+    masterchain applied-top tracking.
+  - `ControllerQueue` (`controller_queue.rs`) — re-entrancy-safe task posting so
+    controllers bounce re-entrant work onto SXMAIN instead of recursing.
+- Cross-cutting session state moved to data-owning aspects: `SessionRuntime`,
+  `SessionTelemetry`, `CandidateBook`, `DatabaseController`, `SessionCallbacks`,
+  and the SXRCV -> SXMAIN `ReceiverCallbacks` adapter.
+- Every extracted module was sectioned, had its visibility minimized, and had
+  dead code / stale `#[allow(dead_code)]` attributes removed.
+
+#### Canonical source reorganization
+
+- Canonical section banners across `simplex/src`, concern-grouped `impl` splits,
+  and value-ranked method ordering in the large files.
+- `simplex_state.rs` and `receiver.rs` fully reordered into lifecycle-layered
+  sections (verified pure relocation via code-line multiset comparison), with
+  the slot/window diagnostic types co-located with the FSM.
+- Removed dead `SlotDiagnostic` / `WindowDiagnostic` fields surfaced after
+  dropping the masking `#[allow(dead_code)]` attributes.
+
+#### Documentation overhaul for 1.0.0
+
+- `README.md` rewritten to the shipping architecture: a kernel / coordinator /
+  controllers / aspects component map, corrected quorum thresholds
+  (`(W*2)/3 + 1` and `W/3 + 1`), the full `SessionOptions` table, a metrics
+  catalog reconciled against `session_telemetry.rs`, the spec Rule 1-8
+  concept-to-code map, and a refreshed test inventory (734 unit + 16 integration
+  + 6 doctests).
+- Pruned changelog-style history and cosmetic doc comments from the README and
+  rustdoc, repaired intra-doc links, and cross-linked
+  README <-> CHANGELOG <-> spec <-> C++ <-> source.
+- Bumped the crate version to `1.0.0`.
+
+### Fixed
+
+- **Candidate-relay liveness.** Accept relayed leader-signed
+  candidates for C++ parity; reject empty / zero-weight validator sets in repair
+  notar verification; restart no longer skips a `voted_final` slot; recover the
+  body of a finalization-blocking candidate.
+- **Skip-base panic.** Defer skip-window publication until the
+  progress-cursor base repair completes.
+- **Consensus DB cleanup.** Log-level, doc, and test fixes in the
+  consensus DB path.
+
 ## [0.7.1] - 2026-06-09
 
 Maintenance + parity release: **async DB persistence moved off the SXMAIN
@@ -175,7 +245,7 @@ for the mixed Rust/C++ 5x5 simplex network acceptance test
 
 - `SlotWaitPhase`, `SlotDiagnostic`, `WindowDiagnostic` (and `Display for
   SlotWaitPhase`) moved from `session_processor.rs` to `simplex_state.rs`
-  as `pub(crate)` siblings of `SimplexState` (Phase 1 of the Simplex architecture rework),
+  as `pub(crate)` siblings of `SimplexState`,
   breaking the `simplex_state` ↔ `session_processor` import cycle. No
   behavioral change.
 - `Ed25519KeyOptionFactory` removed; crate crypto helpers refactored off
@@ -1059,6 +1129,7 @@ Major release focusing on candidate resolution, certificate system, and operatio
 
 | Version | Date | Tag | Description |
 |---------|------|-----|-------------|
+| 1.0.0 | 2026-06-16 | `simplex-1.0.0` | First stable release: controller-based session architecture (kernel + coordinator + controllers + aspects), candidate-relay liveness & restart-safety parity fixes, canonical source reorganization, full documentation overhaul aligned to spec + C++ + code |
 | 0.7.1 | 2026-06-09 | `simplex-0.7.1` | Async DB persistence off the SXMAIN thread, restart-recovery hardening (skip/final-cert replay + base repair), non-fatal invariant handling (skipscan / finalized dedup / far-future FinalCert), requestCandidate repair validation, shard collation timing parity, opt-in block-sync overlay (observers) |
 | 0.7.0 | 2026-04-21 | `simplex-0.7.0` | State resolver for ghost-parent collation, cert order + DB-wait-order durability, bootstrap-deadlock fixes, bad-signature peer-ban DoS hardening, per-session Prometheus republishing |
 | 0.6.0 | 2026-04-08 | `simplex-0.6.0` | Finalized-driven delivery, C++ parity overhaul, legacy mode removal, stall diagnostics |

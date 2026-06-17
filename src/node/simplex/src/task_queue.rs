@@ -16,9 +16,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-/*
-    Task types
-*/
+// ======================================================================
+// Task types
+// ======================================================================
+// Boxed-closure task aliases for the two Simplex worker queues: the SXMAIN
+// main processing queue (`TaskPtr`) and the SXCB listener-callback queue
+// (`CallbackTaskPtr`), each with its `Arc<dyn TaskQueue<…>>` handle alias.
 
 /// Task of main processing task queue
 pub(crate) type TaskPtr = Box<dyn FnOnce(&mut SessionProcessor) + Send>;
@@ -32,9 +35,11 @@ pub(crate) type CallbackTaskPtr = Box<dyn FnOnce() + Send>;
 /// Pointer to session callback task queue
 pub(crate) type CallbackTaskQueuePtr = Arc<dyn TaskQueue<CallbackTaskPtr>>;
 
-/*
-    TaskQueue trait
-*/
+// ======================================================================
+// TaskQueue trait
+// ======================================================================
+// The generic worker-queue interface: overload / empty probes, closure
+// posting, blocking pull-with-timeout, and flush.
 
 /// Task queue interface
 pub(crate) trait TaskQueue<FuncPtr: Send + 'static>: Send + Sync {
@@ -59,9 +64,11 @@ pub(crate) trait TaskQueue<FuncPtr: Send + 'static>: Send + Sync {
     fn flush(&self);
 }
 
-/*
-    Helper functions
-*/
+// ======================================================================
+// Helper functions
+// ======================================================================
+// Generic wrappers that box a closure onto the SXMAIN main queue
+// (`post_closure`) or the SXCB callback queue (`post_callback_closure`).
 
 /// Post closure to be run in a main processing thread
 pub(crate) fn post_closure<F>(queue: &TaskQueuePtr, task_fn: F)

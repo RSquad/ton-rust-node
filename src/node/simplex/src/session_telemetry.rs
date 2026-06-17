@@ -33,11 +33,9 @@
 //!
 //! ## History
 //!
-//! Extracted from `SessionProcessor` under the consensus-controller split
-//! (TN-998 / TN-1342): all recorder, health-check, and dump logic now lives
-//! here, and `SessionProcessor` builds neutral snapshots from its private maps
-//! and delegates through `self.telemetry.X`. See the architecture artifact:
-//! `docs/local-docs/features/simplex-consensus/architecture/simplex-architecture-rework-plan.md`.
+//! Extracted from `SessionProcessor`: all recorder, health-check, and dump
+//! logic now lives here, and `SessionProcessor` builds neutral snapshots from
+//! its private maps and delegates through `self.telemetry.X`.
 
 use crate::{
     block::{RawCandidateId, SlotIndex, ValidatorIndex},

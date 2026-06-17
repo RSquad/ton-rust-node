@@ -1883,6 +1883,7 @@ impl ValidatorManagerImpl {
                             session_id.clone(),
                             validator_list_id.clone(),
                             vsubset.clone(),
+                            full_validator_set.utime_since(),
                             consensus_options.clone(),
                             engine,
                             allow_unsafe_self_blocks_resync,
@@ -2098,9 +2099,13 @@ impl ValidatorManagerImpl {
         // Shards that will eventually be started (in later masterstates): need to prepare
         let mut future_shards: HashSet<ShardIdent> = HashSet::new();
         // Validator sets for shards that will eventually be started
+        // Tuple: (subset, next_cc_seqno, validator_list_id, epoch_utime_since)
+        // where epoch_utime_since is the governing validator set's utime_since
+        // (used for lifecycle epoch routing; the subset itself is built with a
+        // zeroed utime_since to keep session_id hashing C++-compatible).
         let mut our_future_shards: HashMap<
             ShardIdent,
-            (ValidatorSubsetInfo, u32, ValidatorListHash),
+            (ValidatorSubsetInfo, u32, ValidatorListHash, u32),
         > = HashMap::new();
         let mut blocks_before_split: HashSet<BlockIdExt> = HashSet::new();
 
@@ -2250,7 +2255,10 @@ impl ValidatorManagerImpl {
                 }
             };
 
-            our_future_shards.insert(ident.clone(), (next_subset, next_cc_seqno, vnext_list_id));
+            our_future_shards.insert(
+                ident.clone(),
+                (next_subset, next_cc_seqno, vnext_list_id, future_validator_set.utime_since()),
+            );
             log::trace!(
                 target: "validator_manager",
                 "Future shard {}: computing next subset with cc_seqno {} -- done",
@@ -2280,7 +2288,9 @@ impl ValidatorManagerImpl {
 
         // Iterate over future shards and create all future sessions
         let mut owned_future_shards = 0usize;
-        for (ident, (wc, next_cc_seqno, next_val_list_id)) in our_future_shards.iter() {
+        for (ident, (wc, next_cc_seqno, next_val_list_id, epoch_utime_since)) in
+            our_future_shards.iter()
+        {
             if ident.is_masterchain() {
                 mc_validators.append(&mut wc.validators.clone());
             }
@@ -2373,6 +2383,7 @@ impl ValidatorManagerImpl {
                             session_id.clone(),
                             next_val_list_id.clone(),
                             vsubset.clone(),
+                            *epoch_utime_since,
                             consensus_options.clone(),
                             self.engine.clone(),
                             self.config.unsafe_resync_catchains.contains(next_cc_seqno),

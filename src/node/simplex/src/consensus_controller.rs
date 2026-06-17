@@ -36,19 +36,21 @@
 //! handlers dispatched by `SessionProcessor::process_simplex_events` (which
 //! stays the event pump):
 //!
-//! - [`Self::handle_notarization_reached`] / [`Self::handle_skip_certificate_reached`]
-//!   / [`Self::handle_finalization_reached`] react to certificate observation:
-//!   record milestones, request missing bodies, emit candidate-observed, and
-//!   persist+relay the cert (the persist/relay/standstill IO is the synchronous
-//!   [`ConsensusBackend::persist_notar_cert_then_relay`] /
+//! - [`ConsensusController::handle_notarization_reached`] /
+//!   [`ConsensusController::handle_skip_certificate_reached`] /
+//!   [`ConsensusController::handle_finalization_reached`] react to certificate
+//!   observation: record milestones, request missing bodies, emit
+//!   candidate-observed, and persist+relay the cert (the persist/relay/standstill
+//!   IO is the synchronous [`ConsensusBackend::persist_notar_cert_then_relay`] /
 //!   `persist_skip_cert_then_relay` / `persist_final_cert_then_relay` effect,
 //!   which registers the durability wait on the SXMAIN async-DB registry — the
 //!   continuation stays `SessionProcessor`-side).
-//! - [`Self::handle_block_finalized`] records the trigger in
+//! - [`ConsensusController::handle_block_finalized`] records the trigger in
 //!   `finalized_pending_body` and kicks the recursive walk.
-//! - [`Self::try_finalize_recursive_chain`] /
-//!   [`Self::try_emit_recursive_finalized_callback`] /
-//!   [`Self::maybe_apply_finalized_state`] are the recursive parent-chain walk:
+//! - [`ConsensusController::try_finalize_recursive_chain`] /
+//!   [`ConsensusController::try_emit_recursive_finalized_callback`] /
+//!   [`ConsensusController::maybe_apply_finalized_state`] are the recursive
+//!   parent-chain walk:
 //!   they apply local finalized state (persist via
 //!   [`ConsensusBackend::persist_finalized_block`], advance the accepted normal
 //!   head, update the head cursor) and emit the at-most-once
@@ -94,7 +96,7 @@
 //! and metric recording need no per-call threading.
 
 use crate::{
-    block::{RawCandidateId, SlotIndex, ValidatorIndex},
+    block::{CandidateId as BlockCandidateId, RawCandidateId, SlotIndex, ValidatorIndex},
     candidate_book::{CandidateBook, ReceivedCandidate, EMPTY_CHAIN_WARN_DEPTH, MAX_CHAIN_DEPTH},
     database::{FinalizedBlockRecord, VoteRecord},
     misbehavior::{MisbehaviorReport, VoteResult},
@@ -108,6 +110,7 @@ use crate::{
         BlockFinalizedEvent, FinalizationReachedEvent, NotarizationReachedEvent, SimplexState,
         SkipCertificateReachedEvent, Vote,
     },
+    trace_collector::TraceCollector,
     utils::{extract_vote_and_signature, sign_vote, threshold_66, verify_vote_signature},
     BlockCandidatePriority, BlockHash, BlockPayloadPtr, BlockSourceInfo, PublicKeyHash,
     RawVoteData, SessionId, SIMPLEX_ROUNDLESS,
@@ -164,8 +167,8 @@ struct FinalizedSeqnoRecord {
 /// Reads available from handles the controller already holds are NOT duplicated
 /// here: session id / shard / weights / timing come from the owned
 /// `description`, and counters from the owned `telemetry`. The applied-top floor
-/// and accepted-normal-head cursor are now controller-owned state (TN-1408
-/// Phase 7 Sub-PR 2), so what remains are the FSM / candidate-book reads and the
+/// and accepted-normal-head cursor are now controller-owned state, so what
+/// remains are the FSM / candidate-book reads and the
 /// `SessionProcessor`-mediated effects below.
 ///
 /// ## Effect timing
@@ -324,7 +327,7 @@ pub(crate) struct ConsensusController {
 
     /*
         ====================================================================
-        Masterchain applied-top tracking (TN-1408 Phase 7, Sub-PR 2)
+        Masterchain applied-top tracking
 
         The validator-manager finalization pipeline. Seeded from
         `initial_block_seqno - 1` and advanced by `set_mc_finalized_block`
@@ -352,9 +355,15 @@ pub(crate) struct ConsensusController {
 
     /// Misbehavior proofs collected from vote ingress (`SimplexState::on_vote`
     /// returning [`VoteResult::Misbehavior`]). Write-only accumulator today —
-    /// kept for the future ValidatorGroup slashing/reporting hook; moved here
-    /// with vote ingress in TN-1408 Phase 7 Sub-PR 3.
+    /// kept for the future ValidatorGroup slashing/reporting hook.
     misbehavior_reports: Vec<MisbehaviorReport>,
+
+    /// Trace collector for recording vote / certificate / finalization
+    /// lifecycle events. `None` when stats collection is disabled — every
+    /// hot-path call site is guarded with `if let Some(tc) =
+    /// &self.trace_collector`. Cheap-to-clone handle cloned from
+    /// `SessionProcessor` at construction
+    trace_collector: Option<TraceCollector>,
 }
 
 // ======================================================================
@@ -380,6 +389,7 @@ impl ConsensusController {
         last_consensus_finalized_seqno: Option<u32>,
         last_mc_finalized_seqno: Option<u32>,
         accepted_normal_head_seqno: u32,
+        trace_collector: Option<TraceCollector>,
     ) -> Self {
         Self {
             callbacks,
@@ -399,6 +409,7 @@ impl ConsensusController {
             accepted_normal_head_seqno,
             accepted_normal_head_block_id: None,
             misbehavior_reports: Vec::new(),
+            trace_collector,
         }
     }
 
@@ -695,6 +706,17 @@ impl ConsensusController {
                 source_idx
             );
             return false;
+        }
+
+        // Trace: record the verified incoming vote for other validators (skip our own loopback).
+        if let Some(tc) = &self.trace_collector {
+            if source_idx != self.description.get_self_idx() {
+                tc.record_vote_received(
+                    self.session_id(),
+                    source_idx.value() as i32,
+                    tl_vote.vote().clone(),
+                );
+            }
         }
 
         // Extract FSM vote AND signature from TL (signature stored for certificate creation)
@@ -1211,6 +1233,11 @@ impl ConsensusController {
                     );
                 }
             }
+        }
+
+        // Trace: record our own outbound vote just before signing.
+        if let Some(tc) = &self.trace_collector {
+            tc.record_voted(self.session_id(), &vote);
         }
 
         // Sign the vote with the session-scoped signature.
@@ -2075,6 +2102,21 @@ impl ConsensusController {
         }
 
         self.finalized_blocks.insert(finalized_id.clone());
+
+        // Trace: a FinalCert was observed and this block is now accepted/materialized.
+        if let Some(tc) = &self.trace_collector {
+            let trace_id = BlockCandidateId {
+                slot: finalized_id.slot,
+                hash: finalized_id.hash.clone(),
+                block: received.block_id.clone(),
+            };
+            let finalize_vote = Vote::Finalize(crate::simplex_state::FinalizeVote {
+                slot: finalized_id.slot,
+                block_hash: finalized_id.hash.clone(),
+            });
+            tc.record_cert_observed(self.session_id(), &finalize_vote);
+            tc.record_block_accepted(self.session_id(), &trace_id);
+        }
 
         self.telemetry.last_finalized_slot_gauge.set(slot.0 as f64);
         let now = self.now();

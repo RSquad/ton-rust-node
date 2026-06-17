@@ -471,6 +471,8 @@ fn run_single_node_restart_test(test_name: &str) {
         db_path.clone(),
         overlay_manager.clone(),
         Arc::downgrade(&session_listener),
+        None,
+        0,
     )
     .expect("Failed to create session (phase 1)");
     let (prev_blocks_1, min_masterchain_block_id_1) =
@@ -531,6 +533,8 @@ fn run_single_node_restart_test(test_name: &str) {
         db_path,
         overlay_manager,
         Arc::downgrade(&session_listener),
+        None,
+        0,
     )
     .expect("Failed to create session (phase 2)");
     let (prev_blocks_2, min_masterchain_block_id_2) =

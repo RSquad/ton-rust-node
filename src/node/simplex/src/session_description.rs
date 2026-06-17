@@ -25,9 +25,11 @@ use std::{
 };
 use ton_block::{error, fail, Result, ShardIdent};
 
-/*
-    Source node description
-*/
+// ======================================================================
+// Source node
+// ======================================================================
+// Per-validator source record (id, public key, ADNL id, stake weight)
+// backing `SessionDescription`'s validator set.
 
 /// Validator source node description
 struct Source {
@@ -41,10 +43,6 @@ struct Source {
     /// Node's weight according to stake
     weight: ValidatorWeight,
 }
-
-/*
-    SessionDescription implementation
-*/
 
 /// Session description for Simplex consensus
 ///
@@ -85,11 +83,12 @@ pub(crate) struct SessionDescription {
     metrics_receiver: MetricsHandle,
 }
 
+// ======================================================================
+// Construction
+// ======================================================================
+// Build the immutable session description from the validator set: compute
+// weights, sources and the reverse index, and resolve `self_idx`.
 impl SessionDescription {
-    /*
-        Constructor
-    */
-
     /// Create new session description
     ///
     /// # Parameters
@@ -197,7 +196,15 @@ impl SessionDescription {
             metrics_receiver,
         })
     }
+}
 
+// ======================================================================
+// Accessors & runtime helpers
+// ======================================================================
+// Read-only access to identity, options, the validator set, weights /
+// thresholds, slot / leader-window mapping, replay-aware time, and the
+// metrics handle. Finer groups are marked with lightweight comments.
+impl SessionDescription {
     /*
         Session identity
     */
@@ -392,10 +399,10 @@ impl SessionDescription {
     }
 }
 
-/*
-    Display implementation
-*/
-
+// ======================================================================
+// Display
+// ======================================================================
+// Compact one-line summary (node count, total weight, self index).
 impl fmt::Display for SessionDescription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

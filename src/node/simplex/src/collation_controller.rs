@@ -184,12 +184,16 @@
 //! accessor surface and never inspect raw fields.
 
 use crate::{
-    block::{CandidateParentInfo, RawCandidateId, SlotIndex, ValidatorIndex, WindowIndex},
+    block::{
+        CandidateId as BlockCandidateId, CandidateParentInfo, RawCandidateId, SlotIndex,
+        ValidatorIndex, WindowIndex,
+    },
     candidate_book::CandidateBook,
     controller_queue::{Controlled, ControllerQueueExt, ControllerQueuePtr},
     session_callbacks::SessionCallbacks,
     session_description::SessionDescription,
     session_telemetry::SessionTelemetry,
+    trace_collector::TraceCollector,
     utils::AsyncRequestImpl,
     SessionId, ValidatorBlockCandidatePtr,
 };
@@ -703,6 +707,11 @@ pub(crate) struct CollationController {
     /// alongside `generated_parent_cache` whenever the window-local chain
     /// head is invalidated.
     generated_parent_gen_utime_ms_cache: HashMap<RawCandidateId, u64>,
+    /// Trace collector for recording collation lifecycle events. `None` when
+    /// stats collection is disabled — every hot-path call site is guarded with
+    /// `if let Some(tc) = &self.trace_collector`. Cheap-to-clone handle cloned
+    /// from `SessionProcessor` at construction
+    trace_collector: Option<TraceCollector>,
 }
 
 // ======================================================================
@@ -734,6 +743,7 @@ impl CollationController {
         callbacks: Arc<SessionCallbacks>,
         description: Arc<SessionDescription>,
         telemetry: Arc<SessionTelemetry>,
+        trace_collector: Option<TraceCollector>,
     ) -> Self {
         Self {
             queue,
@@ -748,6 +758,7 @@ impl CollationController {
             last_generated_slot: None,
             generated_parent_cache: HashMap::new(),
             generated_parent_gen_utime_ms_cache: HashMap::new(),
+            trace_collector,
         }
     }
 
@@ -1581,6 +1592,11 @@ impl CollationController {
         clear_pending_generate_on_not_ready: bool,
         enforce_progress_slot_invariant: bool,
     ) {
+        // Trace: collation attempt started for this slot (fires on every attempt).
+        if let Some(tc) = &self.trace_collector {
+            tc.record_collate_started(self.session_id(), slot);
+        }
+
         let session_start_prev_blocks = backend.session_start_prev_blocks();
         let prepared =
             match self.prepare_collation(parent.as_ref(), backend, &session_start_prev_blocks) {
@@ -2019,6 +2035,14 @@ impl CollationController {
                 self.session_id().to_hex_string(),
                 slot
             );
+            // Trace: collation failed because the slot progressed during the attempt.
+            if let Some(tc) = &self.trace_collector {
+                tc.record_collate_failed(
+                    self.session_id(),
+                    slot,
+                    "slot_progressed_past_during_attempt",
+                );
+            }
             self.telemetry.record_self_collation_final_failure(
                 slot,
                 "slot_progressed_past_during_attempt",
@@ -2043,6 +2067,14 @@ impl CollationController {
                 err,
                 request_id
             );
+            // Trace: collation failed after exhausting all retries.
+            if let Some(tc) = &self.trace_collector {
+                tc.record_collate_failed(
+                    self.session_id(),
+                    slot,
+                    &format!("max_retries_exhausted: {}", err),
+                );
+            }
             self.telemetry.record_self_collation_final_failure(
                 slot,
                 &format!("max_retries_exhausted: {}", err),
@@ -2051,6 +2083,20 @@ impl CollationController {
             );
             self.remove_precollated_block(slot);
             return;
+        }
+
+        // Trace: per-attempt failure, a retry is being scheduled.
+        if let Some(tc) = &self.trace_collector {
+            tc.record_collate_failed(
+                self.session_id(),
+                slot,
+                &format!(
+                    "retry_scheduled (attempt {}/{}): {}",
+                    retry_count + 1,
+                    retry_max + 1,
+                    err
+                ),
+            );
         }
 
         log::info!(
@@ -2189,6 +2235,17 @@ impl CollationController {
                 slot_window,
                 current_window
             );
+            // Trace: generated candidate discarded because its leader window is stale.
+            if let Some(tc) = &self.trace_collector {
+                tc.record_collate_failed(
+                    self.session_id(),
+                    slot,
+                    &format!(
+                        "stale_leader_window slot_window={} current_window={}",
+                        slot_window, current_window
+                    ),
+                );
+            }
             self.telemetry.note_generated_candidate_validation_missed_for_slot(
                 slot,
                 format!(
@@ -2243,6 +2300,10 @@ impl CollationController {
                 self.session_id().to_hex_string(),
                 slot
             );
+            // Trace: empty block could not be built because no parent is available.
+            if let Some(tc) = &self.trace_collector {
+                tc.record_collate_failed(self.session_id(), slot, "empty_block_no_parent");
+            }
             self.telemetry.increment_error();
             return;
         }
@@ -2266,6 +2327,14 @@ impl CollationController {
                     slot,
                     e
                 );
+                // Trace: preparing/building the generated candidate errored.
+                if let Some(tc) = &self.trace_collector {
+                    tc.record_collate_failed(
+                        self.session_id(),
+                        slot,
+                        &format!("prepare_failed: {}", e),
+                    );
+                }
                 self.telemetry.increment_error();
                 return;
             }
@@ -2283,6 +2352,34 @@ impl CollationController {
                 self_idx,
                 candidate_hash_data_bytes,
                 signature,
+            );
+        }
+
+        // Trace: own candidate successfully generated, persisted, and about to be
+        // published. `prepared` is a `GeneratedBlockDesc` (candidate_hash +
+        // block_id_ext); `parent` is `Option<CandidateParentInfo>` (slot + hash).
+        if let Some(tc) = &self.trace_collector {
+            let trace_id = BlockCandidateId {
+                slot,
+                hash: prepared.candidate_hash.clone(),
+                block: prepared.block_id_ext.clone(),
+            };
+            let parent_id = parent.as_ref().map(|p| BlockCandidateId {
+                slot: p.slot,
+                hash: p.hash.clone(),
+                block: ton_block::BlockIdExt::default(),
+            });
+            if is_empty {
+                tc.record_collated_empty(self.session_id(), &trace_id);
+            } else {
+                tc.record_collate_finished(self.session_id(), slot, &trace_id);
+            }
+            tc.record_candidate_received(
+                self.session_id(),
+                &trace_id,
+                parent_id.as_ref(),
+                Some(&prepared.block_id_ext),
+                true,
             );
         }
 
