@@ -45,7 +45,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn sample_event() -> AuditEvent {
-        AuditEvent::system_service_started("test")
+        AuditEvent::system_service_started("test", "")
     }
 
     #[tokio::test]

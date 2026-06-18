@@ -87,7 +87,7 @@ pub enum AuditEventPayload {
 
     // ── system ───────────────────────────────────────────────────────────────
     #[serde(rename = "system.service_started")]
-    SystemServiceStarted { version: String },
+    SystemServiceStarted { version: String, host: String },
 
     #[serde(rename = "system.service_stopped")]
     SystemServiceStopped {},

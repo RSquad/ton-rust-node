@@ -96,7 +96,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     fn ev(tag: &str) -> AuditEvent {
-        AuditEvent::system_service_started(tag)
+        AuditEvent::system_service_started(tag, "")
     }
 
     // ── original tests ────────────────────────────────────────────────────────
@@ -185,7 +185,7 @@ mod tests {
             let b = buf.clone();
             handles.push(std::thread::spawn(move || {
                 for i in 0..100u32 {
-                    b.push(AuditEvent::system_service_started(&format!("t{t}-{i}")));
+                    b.push(AuditEvent::system_service_started(&format!("t{t}-{i}"), ""));
                 }
             }));
         }
