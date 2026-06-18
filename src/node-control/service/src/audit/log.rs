@@ -28,6 +28,6 @@ mod tests {
     #[tokio::test]
     async fn noop_audit_log_record_completes() {
         let log = NoopAuditLog;
-        log.record(AuditEvent::system_service_started("test")).await;
+        log.record(AuditEvent::system_service_started("test", "")).await;
     }
 }

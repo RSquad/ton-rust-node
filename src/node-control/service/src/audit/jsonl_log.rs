@@ -205,7 +205,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn sample_event(tag: &str) -> AuditEvent {
-        AuditEvent::system_service_started(tag)
+        AuditEvent::system_service_started(tag, "")
     }
 
     fn test_config(path: PathBuf) -> AuditLogConfig {

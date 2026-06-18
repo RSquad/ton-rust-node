@@ -6,8 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::audit::{AuditEvent, AuditFileHeader, AuditLogConfig, jsonl_log::AuditInitError};
-use chrono::Utc;
+use crate::audit::{AuditEvent, AuditLogConfig, jsonl_log::AuditInitError};
 use std::{
     sync::{
         Arc, Once,
@@ -15,9 +14,6 @@ use std::{
     },
     time::Duration,
 };
-
-/// Schema version stamped into the per-file [`AuditFileHeader`].
-const AUDIT_SCHEMA_VERSION: u16 = 1;
 
 static HOSTNAME_FALLBACK_WARNED: Once = Once::new();
 
@@ -39,7 +35,7 @@ pub(crate) enum AuditCommand {
 }
 
 pub(crate) struct AuditWriter {
-    /// Host identity stamped into each new file's [`AuditFileHeader`].
+    /// Host identity written as `data.host` into the first [`AuditEvent`] of each file segment.
     host: String,
     config: Arc<AuditLogConfig>,
     /// Live append handle. `None` only transiently during rotation (the old
@@ -128,26 +124,22 @@ impl AuditWriter {
             last_dropped_seen: 0,
             write_delay,
         };
-        writer.write_header_if_empty().await.map_err(AuditInitError::FileOpen)?;
+        writer.write_startup_event_if_new().await.map_err(AuditInitError::FileOpen)?;
         Ok(writer)
     }
 
-    fn file_header(&self) -> AuditFileHeader {
-        AuditFileHeader {
-            schema_version: AUDIT_SCHEMA_VERSION,
-            service: "nodectl".into(),
-            service_version: env!("CARGO_PKG_VERSION").into(),
-            host: self.host.clone(),
-            started_at: Utc::now(),
-        }
-    }
-
-    async fn write_header_if_empty(&mut self) -> std::io::Result<()> {
+    /// Writes a `system.service_started` event as the very first line of a new file segment.
+    ///
+    /// Called on fresh open (empty file) and after rotation. Every segment starts with this
+    /// event so readers always know which service version and host produced the following lines,
+    /// with no special-case header format to distinguish.
+    async fn write_startup_event_if_new(&mut self) -> std::io::Result<()> {
         if self.current_size != 0 {
             return Ok(());
         }
         use tokio::io::AsyncWriteExt;
-        let mut line = serde_json::to_vec(&self.file_header())
+        let ev = AuditEvent::system_service_started(env!("CARGO_PKG_VERSION"), self.host.as_str());
+        let mut line = serde_json::to_vec(&ev)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
         let file = self
@@ -422,7 +414,7 @@ impl AuditWriter {
         }
         self.file = Some(file);
         self.current_size = 0;
-        self.write_header_if_empty().await?;
+        self.write_startup_event_if_new().await?;
         Ok(())
     }
 
@@ -474,11 +466,11 @@ mod tests {
     }
 
     fn sample_event(tag: &str) -> AuditEvent {
-        AuditEvent::system_service_started(tag)
+        AuditEvent::system_service_started(tag, "")
     }
 
     fn large_event(payload_kb: usize) -> AuditEvent {
-        AuditEvent::system_service_started("x".repeat(payload_kb * 1024))
+        AuditEvent::system_service_started("x".repeat(payload_kb * 1024), "")
     }
 
     fn test_config(dir: &Path, mut cfg: AuditLogConfig) -> AuditLogConfig {
@@ -531,16 +523,24 @@ mod tests {
         tx.send(AuditCommand::Shutdown).await.unwrap();
     }
 
-    /// Reads event lines, skipping the per-file [`AuditFileHeader`] (no `event_type`).
+    /// Reads all event lines, skipping only the very first `system.service_started` line
+    /// that the writer automatically prepends to every new file segment. Test events of
+    /// the same type (if any) are preserved so counting assertions stay correct.
     fn read_json_lines(path: &Path) -> Vec<Value> {
         assert!(path.exists(), "audit file missing at {}", path.display());
         let content = std::fs::read_to_string(path).unwrap();
-        content
+        let mut lines: Vec<Value> = content
             .lines()
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_str::<Value>(line).expect("valid json line"))
-            .filter(|value| value.get("event_type").is_some())
-            .collect()
+            .collect();
+        // Drop only the first line when it is the writer-injected startup event.
+        if lines.first().and_then(|v| v.get("event_type")).and_then(|t| t.as_str())
+            == Some("system.service_started")
+        {
+            lines.remove(0);
+        }
+        lines
     }
 
     fn count_rotated_files(dir: &Path) -> usize {
