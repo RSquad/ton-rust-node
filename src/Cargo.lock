@@ -4931,6 +4931,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "common",
  "contracts",
  "control-client",
@@ -4938,16 +4939,19 @@ dependencies = [
  "http-body-util",
  "jsonwebtoken",
  "mockall",
+ "parking_lot",
  "secrets-vault",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "ton-http-api-client",
  "ton_block",
  "tower",
  "tracing",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

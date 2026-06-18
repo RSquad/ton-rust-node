@@ -139,6 +139,7 @@ impl GenerateCmd {
             tick_interval: 40,
             automation: Default::default(),
             log: Some(LogConfig::default()),
+            audit_log: Default::default(),
         };
 
         save_config(&config, path)?;

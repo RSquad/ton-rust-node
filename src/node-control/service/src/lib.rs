@@ -6,6 +6,7 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+pub mod audit;
 pub mod auth;
 pub mod contracts;
 pub mod elections;

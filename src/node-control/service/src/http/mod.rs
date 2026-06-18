@@ -9,6 +9,7 @@
 pub mod config_handlers;
 pub mod http_server_task;
 pub(crate) mod login_rate_limiter;
+pub(crate) mod rest_audit;
 
 pub use http_server_task::run;
 
@@ -18,3 +19,5 @@ mod auth_tests;
 mod config_handlers_tests;
 #[cfg(test)]
 mod entity_crud_handlers_tests;
+#[cfg(test)]
+mod test_support;

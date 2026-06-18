@@ -7,6 +7,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    audit::{AuditLogFactory, factory::AuditComponents},
     elections::election_task::BindingStatusCallback,
     http::http_server_task,
     runtime_config::RuntimeConfigStore,
@@ -52,6 +53,10 @@ pub async fn run_with_config(
         .await
         .context("initialize runtime config store")?;
     let runtime_cfg = Arc::new(runtime_cfg);
+
+    let AuditComponents { log: audit, ring: audit_ring } =
+        AuditLogFactory::from_config(&app_cfg.audit_log).await.context("audit log init failed")?;
+
     let store = Arc::new(SnapshotStore::new());
 
     // Status callback: when the elections runner detects binding status changes,
@@ -83,7 +88,12 @@ pub async fn run_with_config(
         "elections",
         Arc::new(TaskController::new(
             "elections",
-            ElectionsTask::new(runtime_cfg.clone(), store.clone(), Some(on_status_change)),
+            ElectionsTask::new(
+                runtime_cfg.clone(),
+                store.clone(),
+                Some(on_status_change),
+                audit.clone(),
+            ),
             runtime_cfg.clone(),
         )),
     );
@@ -113,6 +123,8 @@ pub async fn run_with_config(
         runtime_cfg.clone(),
         tasks.clone(),
         config_changed.clone(),
+        audit.clone(),
+        audit_ring,
     ));
 
     let max_wait = std::time::Duration::from_secs(10);
@@ -156,6 +168,12 @@ pub async fn run_with_config(
     for task in tasks.values() {
         let _ = task.disable().await;
     }
-    let _ = http_task_handle.await;
+    if let Err(e) = http_task_handle.await {
+        tracing::error!("http server task join failed during shutdown: {e}");
+    }
+
+    // Drain and flush the audit log after all producers have stopped, so the
+    // final batch is persisted before the process exits.
+    audit.shutdown().await;
     Ok(())
 }

@@ -26,6 +26,7 @@
   - [Config Structure](#config-structure)
   - [Section Descriptions](#section-descriptions)
   - [Default Config Example](#default-config-example)
+- [Audit log](#audit-log)
 - [Service Mode (Daemon)](#service-mode-daemon)
   - [Elections Task](#elections-task)
   - [Logging](#logging)
@@ -2158,7 +2159,7 @@ Each binding resolves its effective stake policy by checking for a per-node over
 
 > **TONCore nominator caveat.** `Split50` and `AdaptiveSplit50` are ignored on bindings backed by a TONCore nominator — the two pools stake in different rounds, so there is nothing to split. The runner stakes the full liquid balance of the selected pool instead (still floored at `min_stake`). Use `Fixed` or `Minimum` if you need to cap per-round exposure on TONCore.
 
-> **TONCore nominator: process pending withdraws before staking.** Every tick, the elections runner probes the active TONCore pool's `has_withdraw_requests` getter. When the queue is non-empty it sends `process_withdraw_requests` (op = 2, limit = 10, message value = 1 TON) between `recover_stake` and `participate`, then skips this tick's stake submission to let the pool drain; the next tick re-probes and either resends op = 2 (new requests appeared) or proceeds to stake. This frees up locked liquidity from nominators who already requested withdrawal so it does not get re-staked. The corresponding participant status surfaced in the snapshot is `processing_withdraw_requests`. The step is a no-op for SNP and direct staking.
+> **TONCore nominator: process pending withdraws before staking.** Every tick, the elections runner probes the active TONCore pool's `has_withdraw_requests` getter. When the queue is non-empty it sends `process_withdraw_requests` (op = 2, limit = min(queue_len, 10), message value = 0.22 TON × limit) between `recover_stake` and `participate`, then skips this tick's stake submission to let the pool drain; the next tick re-probes and either resends op = 2 (new requests appeared) or proceeds to stake. This frees up locked liquidity from nominators who already requested withdrawal so it does not get re-staked. The corresponding participant status surfaced in the snapshot is `processing_withdraw_requests`. The step is a no-op for SNP and direct staking.
 
 #### Cache refresh
 
@@ -2521,9 +2522,18 @@ curl -X POST http://127.0.0.1:8080/v1/task/elections \
 
 ---
 
+## Audit log
+
+nodectl writes a structured audit log of domain events (elections, config
+mutations, auth) to `./logs/audit.jsonl`. See [docs/audit-log.md](docs/audit-log.md)
+for configuration, retention, PII handling, and log analysis.
+
+---
+
 ## Related Setup Guides
 
 - [Hashicorp Vault Dedicated Setup](./docs/hcp-vault-setup.md)
 - [Node Control Service Setup](./docs/nodectl-setup.md)
 - [Contracts automation (auto-deploy / auto-topup)](./docs/contracts-automation.md) — `automation` config, REST and CLI
 - [Security Guide](./docs/nodectl-security.md) — roles, token lifecycle, rate limiting, monitoring
+- [Audit Log](./docs/audit-log.md) — configuration, durability, PII, log analysis

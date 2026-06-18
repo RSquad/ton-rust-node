@@ -8,7 +8,7 @@
  */
 use crate::{SmartContract, TonWallet};
 use std::sync::Arc;
-use ton_block::{Cell, MsgAddressInt, StateInit};
+use ton_block::{Cell, HashmapE, HashmapType, MsgAddressInt, StateInit};
 
 /// Minimum TON to keep in an SNP pool (or validator wallet for direct staking) for storage.
 /// Matches the `MIN_TONS_FOR_STORAGE` constant in the single-nominator contract (~1 TON).
@@ -142,4 +142,15 @@ pub struct PoolData {
     /// the dict is non-empty (≥1 nominator has a pending withdraw request); `None` means the
     /// queue is empty or unsupported by the pool kind.
     pub withdraw_requests: Option<Cell>,
+}
+
+/// Returns the number of entries in a TONCore `withdraw_requests` udict (256-bit keys).
+pub fn withdraw_requests_queue_len(withdraw_requests: Option<&Cell>) -> anyhow::Result<u32> {
+    match withdraw_requests {
+        None => Ok(0),
+        Some(cell) => {
+            let dict = HashmapE::with_hashmap(256, Some(cell.clone()));
+            Ok(dict.len()?.min(u32::MAX as usize) as u32)
+        }
+    }
 }

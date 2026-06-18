@@ -714,6 +714,7 @@ mod tests {
             tick_interval: 30,
             automation: Default::default(),
             log: None,
+            audit_log: Default::default(),
         })
     }
 

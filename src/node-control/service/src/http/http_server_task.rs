@@ -23,6 +23,7 @@ use super::{
     login_rate_limiter::{LoginRateLimiter, login_limiter_key},
 };
 use crate::{
+    audit::{AuditActorBuilder, AuditEventBuffer, log::AuditLog},
     auth::{
         Claims,
         jwt::JwtAuth,
@@ -53,6 +54,11 @@ pub struct AppState {
     /// Signalled by mutation handlers after structural config changes
     /// (entity CRUD, ton-http-api) so the service loop can rebuild caches.
     pub config_changed: Arc<tokio::sync::Notify>,
+    pub audit: Arc<dyn AuditLog>,
+    pub actor_builder: Arc<AuditActorBuilder>,
+    /// In-memory ring buffer for the REST read-path (e.g. GET /v1/elections).
+    /// Never read from disk on the hot path.
+    pub audit_ring: Arc<AuditEventBuffer>,
 }
 
 pub async fn run(
@@ -61,6 +67,8 @@ pub async fn run(
     runtime_cfg: Arc<RuntimeConfigStore>,
     tasks: HashMap<&'static str, Arc<TaskController>>,
     config_changed: Arc<tokio::sync::Notify>,
+    audit: Arc<dyn AuditLog>,
+    audit_ring: Arc<AuditEventBuffer>,
 ) {
     tracing::info!("http-server task started");
 
@@ -110,6 +118,7 @@ pub async fn run(
     let elections_task = tasks.get("elections").cloned().expect("elections task is not registered");
 
     let login_rate_limiter = Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default()));
+    let actor_builder = Arc::new(AuditActorBuilder::new(runtime_cfg.clone()));
     let state = AppState {
         store,
         runtime_cfg,
@@ -118,6 +127,9 @@ pub async fn run(
         user_store,
         login_rate_limiter,
         config_changed,
+        audit,
+        actor_builder,
+        audit_ring,
     };
     let app = routes(enable_swagger, state);
 
@@ -479,14 +491,26 @@ pub async fn v1_elections_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ElectionsQuery>,
 ) -> axum::Json<ElectionsResponse> {
+    use crate::audit::{AuditSource, merge_projection_into_participants, project_elections};
+
     let include_participants = query.include_participants.unwrap_or(false);
     let view = state.store.get_elections_view(include_participants);
+    let current_election_id = view.elections.as_ref().map(|e| e.election_id);
+
+    let mut our_participants = view.our_participants;
+    if let Some(election_id) = current_election_id {
+        let elections_events =
+            state.audit_ring.filter_collect(|e| e.payload.source() == AuditSource::Elections);
+        let projection = project_elections(&elections_events, &[election_id]);
+        merge_projection_into_participants(&mut our_participants, &projection, election_id);
+    }
+
     axum::Json(ElectionsResponse {
         ok: true,
         result: view.elections,
         status: view.status,
         next_elections: view.next_elections,
-        our_participants: view.our_participants,
+        our_participants,
     })
 }
 
@@ -504,6 +528,8 @@ pub async fn v1_elections_handler(
 )]
 pub async fn v1_elections_exclude_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<NodeListRequest>,
 ) -> Result<axum::Json<ElectionsExcludeResponse>, AppError> {
     if state.runtime_cfg.get().elections.is_none() {
@@ -537,6 +563,26 @@ pub async fn v1_elections_exclude_handler(
         .collect();
     tracing::info!("elections excluded: {}", excluded.join(", "));
 
+    let changes: Vec<_> = to_exclude
+        .iter()
+        .map(|node| {
+            super::rest_audit::config_field(
+                format!("bindings.{node}.enable"),
+                serde_json::json!(true),
+                serde_json::json!(false),
+            )
+        })
+        .collect();
+    super::rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "elections",
+        "elections.exclude",
+        changes,
+    )
+    .await;
+
     let applied = ElectionsExcludeResult { excluded, updated_at: state.runtime_cfg.updated_at() };
     Ok(axum::Json(ElectionsExcludeResponse { ok: true, result: applied }))
 }
@@ -555,6 +601,8 @@ pub async fn v1_elections_exclude_handler(
 )]
 pub async fn v1_elections_include_handler(
     state: axum::extract::State<AppState>,
+    claims: axum::Extension<Claims>,
+    headers: axum::http::HeaderMap,
     req: axum::Json<NodeListRequest>,
 ) -> Result<axum::Json<ElectionsExcludeResponse>, AppError> {
     if state.runtime_cfg.get().elections.is_none() {
@@ -587,6 +635,26 @@ pub async fn v1_elections_include_handler(
         .map(|(name, _)| name.clone())
         .collect();
     tracing::info!("elections excluded: {}", excluded.join(", "));
+
+    let changes: Vec<_> = to_include
+        .iter()
+        .map(|node| {
+            super::rest_audit::config_field(
+                format!("bindings.{node}.enable"),
+                serde_json::json!(false),
+                serde_json::json!(true),
+            )
+        })
+        .collect();
+    super::rest_audit::record_config_updated(
+        &state,
+        &claims,
+        &headers,
+        "elections",
+        "elections.include",
+        changes,
+    )
+    .await;
 
     let applied = ElectionsExcludeResult { excluded, updated_at: state.runtime_cfg.updated_at() };
     Ok(axum::Json(ElectionsExcludeResponse { ok: true, result: applied }))
@@ -724,6 +792,13 @@ pub async fn login_handler(
                 rate_limit_key = %limiter_key,
                 "login rejected"
             );
+            super::rest_audit::record_login_rejected(
+                &state,
+                &req.username,
+                "rate_limited",
+                &headers,
+            )
+            .await;
             return Err(AppError::too_many_requests("too many login attempts, try again later"));
         }
     }
@@ -761,6 +836,13 @@ pub async fn login_handler(
                     rate_limit_key = %limiter_key,
                     "login rejected"
                 );
+                super::rest_audit::record_login_rejected(
+                    &state,
+                    &req.username,
+                    "rate_limited",
+                    &headers,
+                )
+                .await;
                 return Err(AppError::too_many_requests(
                     "too many login attempts, try again later",
                 ));
@@ -774,6 +856,13 @@ pub async fn login_handler(
                 rate_limit_key = %limiter_key,
                 "login rejected"
             );
+            super::rest_audit::record_login_rejected(
+                &state,
+                &req.username,
+                "invalid_credentials",
+                &headers,
+            )
+            .await;
             return Err(AppError::unauthorized("invalid username or password"));
         }
     };
@@ -794,6 +883,9 @@ pub async fn login_handler(
         );
         AppError::internal("token generation failed")
     })?;
+
+    super::rest_audit::record_login_success(&state, &req.username, &role.to_string(), &headers)
+        .await;
 
     Ok(axum::Json(LoginResponse { ok: true, token, expires_in, role: role.to_string() }))
 }
@@ -1000,9 +1092,13 @@ pub struct ApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime_config::RuntimeConfigStore, task::task_manager::ServiceTask};
+    use crate::{
+        audit::{InMemoryAuditLog, NoopAuditLog, log::AuditLog},
+        http::test_support,
+        runtime_config::RuntimeConfigStore,
+        task::task_manager::ServiceTask,
+    };
     use axum::body::Body;
-    use base64::Engine;
     use common::{
         app_config::{
             AppConfig, ElectionsConfig, HttpConfig, LogConfig, NodeBinding, StakePolicy,
@@ -1039,26 +1135,67 @@ mod tests {
         Arc::new(TaskController::new("elections", NoopTask, runtime_cfg))
     }
 
-    async fn test_jwt_auth() -> Arc<JwtAuth> {
-        let secret = base64::engine::general_purpose::STANDARD.encode([42u8; 32]);
-        Arc::new(JwtAuth::new(None, Some(&secret)).await.unwrap())
-    }
-
     async fn test_state(
         store: Arc<SnapshotStore>,
         runtime_cfg: Arc<RuntimeConfigStore>,
         elections_task: Arc<TaskController>,
     ) -> AppState {
-        let user_store = Arc::new(UserStore::new(runtime_cfg.clone() as Arc<dyn RuntimeConfig>));
-        AppState {
-            store,
-            runtime_cfg,
-            elections_task,
-            jwt_auth: test_jwt_auth().await,
-            user_store,
-            login_rate_limiter: Arc::new(tokio::sync::Mutex::new(LoginRateLimiter::default())),
-            config_changed: Arc::new(tokio::sync::Notify::new()),
-        }
+        test_state_with_audit(store, runtime_cfg, elections_task, Arc::new(NoopAuditLog)).await
+    }
+
+    async fn test_state_with_ring(
+        store: Arc<SnapshotStore>,
+        runtime_cfg: Arc<RuntimeConfigStore>,
+        elections_task: Arc<TaskController>,
+        audit_ring: Arc<crate::audit::AuditEventBuffer>,
+    ) -> AppState {
+        let mut state =
+            test_state_with_audit(store, runtime_cfg, elections_task, Arc::new(NoopAuditLog)).await;
+        state.audit_ring = audit_ring;
+        state
+    }
+
+    async fn test_state_with_audit(
+        store: Arc<SnapshotStore>,
+        runtime_cfg: Arc<RuntimeConfigStore>,
+        elections_task: Arc<TaskController>,
+        audit: Arc<dyn AuditLog>,
+    ) -> AppState {
+        test_support::build_app_state_with(runtime_cfg, audit, store, Some(elections_task)).await
+    }
+
+    async fn test_state_with_audit_and_ring(
+        store: Arc<SnapshotStore>,
+        runtime_cfg: Arc<RuntimeConfigStore>,
+        elections_task: Arc<TaskController>,
+        audit: Arc<dyn AuditLog>,
+        audit_ring: Arc<crate::audit::AuditEventBuffer>,
+    ) -> AppState {
+        let mut state = test_state_with_audit(store, runtime_cfg, elections_task, audit).await;
+        state.audit_ring = audit_ring;
+        state
+    }
+
+    const PROJECTION_ELECTION_ID: u64 = 1_779_265_552;
+
+    fn elections_store_with_participant(participant: OurElectionParticipant) -> Arc<SnapshotStore> {
+        let store = Arc::new(SnapshotStore::new());
+        store.update_with(|s| {
+            s.elections_status = ElectionsStatus::Active;
+            s.elections = Some(ElectionsSnapshot {
+                election_id: PROJECTION_ELECTION_ID,
+                ..Default::default()
+            });
+            s.our_participants.push(participant);
+        });
+        store
+    }
+
+    async fn call_elections_handler(state: AppState) -> serde_json::Value {
+        let app = routes(false, state);
+        let resp = app.oneshot(get_request("/v1/elections")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        body_json(resp).await
     }
 
     fn test_app_config(policy: StakePolicy) -> Arc<AppConfig> {
@@ -1082,6 +1219,7 @@ mod tests {
             tick_interval: 30,
             automation: Default::default(),
             log: Some(LogConfig::default()),
+            audit_log: Default::default(),
         })
     }
 
@@ -1099,6 +1237,7 @@ mod tests {
             tick_interval: 30,
             automation: Default::default(),
             log: Some(LogConfig::default()),
+            audit_log: Default::default(),
         })
     }
 
@@ -1657,6 +1796,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_returns_unchanged_response_when_ring_empty() {
+        let store = elections_store_with_participant(OurElectionParticipant {
+            node_id: "node-1".to_string(),
+            stake_accepted: true,
+            stake_submissions: vec![StakeSubmission {
+                stake: "100".to_string(),
+                max_factor: 3.0,
+                submission_time: 12345,
+                submission_time_utc: "2024-01-01T00:00:00Z".to_string(),
+            }],
+            accepted_stake: Some("100".to_string()),
+            last_error: Some("snapshot error".to_string()),
+            ..Default::default()
+        });
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let state = test_state_with_ring(
+            store,
+            runtime_cfg,
+            test_elections_task(),
+            crate::audit::AuditEventBuffer::new(10),
+        )
+        .await;
+
+        let v = call_elections_handler(state).await;
+        let participant = &v["our_participants"][0];
+        assert_eq!(participant["node_id"], "node-1");
+        assert_eq!(participant["stake_accepted"], true);
+        assert_eq!(participant["accepted_stake"], "100");
+        assert_eq!(participant["last_error"], "snapshot error");
+        assert_eq!(participant["stake_submissions"].as_array().unwrap().len(), 1);
+        assert!(v.get("recent_events").is_none());
+    }
+
+    #[tokio::test]
+    async fn handler_includes_stake_submissions_from_audit() {
+        use crate::audit::{AuditEvent, AuditEventBuffer};
+
+        let store = elections_store_with_participant(OurElectionParticipant {
+            node_id: "node-1".to_string(),
+            ..Default::default()
+        });
+        let audit_ring = AuditEventBuffer::new(50);
+        audit_ring.push(AuditEvent::elections_stake_submitted(
+            crate::audit::AuditActor::service("elections-task"),
+            "node-1",
+            PROJECTION_ELECTION_ID,
+            crate::audit::ElectionsStakeSubmittedParams {
+                stake: "300000000000".into(),
+                max_factor: 196_608,
+                policy: "split50".into(),
+                submission_time: 1_700_000_000,
+            },
+        ));
+
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let state =
+            test_state_with_ring(store, runtime_cfg, test_elections_task(), audit_ring).await;
+
+        let v = call_elections_handler(state).await;
+        let submissions = v["our_participants"][0]["stake_submissions"].as_array().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0]["stake"], "300000000000");
+        assert_eq!(submissions[0]["max_factor"], 3.0);
+        assert_eq!(submissions[0]["submission_time"], 1_700_000_000);
+        assert!(v["our_participants"][0].get("last_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn handler_marks_last_error_from_stake_skipped() {
+        use crate::audit::{AuditEvent, AuditEventBuffer, StakeSkipReason};
+
+        let store = elections_store_with_participant(OurElectionParticipant {
+            node_id: "node-1".to_string(),
+            ..Default::default()
+        });
+        let audit_ring = AuditEventBuffer::new(50);
+        audit_ring.push(AuditEvent::elections_stake_skipped(
+            crate::audit::AuditActor::service("elections-task"),
+            "node-1",
+            PROJECTION_ELECTION_ID,
+            StakeSkipReason::AdaptiveSleepingPeriod,
+            None,
+            None,
+        ));
+
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let state =
+            test_state_with_ring(store, runtime_cfg, test_elections_task(), audit_ring).await;
+
+        let v = call_elections_handler(state).await;
+        assert_eq!(
+            v["our_participants"][0]["last_error"].as_str(),
+            Some("stake skipped: adaptive_sleeping_period")
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_merges_withdraw_outcomes() {
+        use crate::audit::{AuditEvent, AuditEventBuffer};
+
+        let store = elections_store_with_participant(OurElectionParticipant {
+            node_id: "node-1".to_string(),
+            ..Default::default()
+        });
+        let audit_ring = AuditEventBuffer::new(50);
+        audit_ring.push(AuditEvent::elections_withdraw_processed(
+            crate::audit::AuditActor::service("elections-task"),
+            "node-1",
+            PROJECTION_ELECTION_ID,
+            "abc123",
+        ));
+        audit_ring.push(AuditEvent::elections_withdraw_failed(
+            crate::audit::AuditActor::service("elections-task"),
+            "node-1",
+            PROJECTION_ELECTION_ID,
+            "send failed",
+        ));
+
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let state =
+            test_state_with_ring(store, runtime_cfg, test_elections_task(), audit_ring).await;
+
+        let v = call_elections_handler(state).await;
+        assert_eq!(
+            v["our_participants"][0]["last_error"].as_str(),
+            Some("withdraw failed: send failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_projects_events_recorded_through_jsonl_audit_log() {
+        use crate::audit::{
+            AuditEvent, AuditLogConfig, StakeSkipReason, jsonl_log::JsonlAuditLog, log::AuditLog,
+        };
+        use tempfile::tempdir;
+
+        let store = elections_store_with_participant(OurElectionParticipant {
+            node_id: "node-1".to_string(),
+            ..Default::default()
+        });
+
+        let dir = tempdir().unwrap();
+        let cfg = AuditLogConfig {
+            path: dir.path().join("audit.jsonl"),
+            ring_buffer_capacity: 50,
+            batch_interval_ms: 60_000,
+            ..AuditLogConfig::default()
+        };
+        let log = JsonlAuditLog::start(cfg).await.unwrap();
+        let audit_ring = log.ring();
+
+        log.record(AuditEvent::elections_stake_submitted(
+            crate::audit::AuditActor::service("elections-task"),
+            "node-1",
+            PROJECTION_ELECTION_ID,
+            crate::audit::ElectionsStakeSubmittedParams {
+                stake: "500000000000".into(),
+                max_factor: 196_608,
+                policy: "all".into(),
+                submission_time: 1_700_000_500,
+            },
+        ))
+        .await;
+        log.record(AuditEvent::elections_stake_skipped(
+            crate::audit::AuditActor::service("elections-task"),
+            "node-1",
+            PROJECTION_ELECTION_ID,
+            StakeSkipReason::PoolNotReady,
+            None,
+            None,
+        ))
+        .await;
+
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let state = test_state_with_audit_and_ring(
+            store,
+            runtime_cfg,
+            test_elections_task(),
+            log,
+            audit_ring,
+        )
+        .await;
+
+        let v = call_elections_handler(state).await;
+        let participant = &v["our_participants"][0];
+        let submissions = participant["stake_submissions"].as_array().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0]["stake"], "500000000000");
+        assert_eq!(participant["last_error"].as_str(), Some("stake skipped: pool_not_ready"));
+        assert!(v.get("recent_events").is_none());
+    }
+
+    #[tokio::test]
     async fn validators_returns_empty_snapshot() {
         let store = Arc::new(SnapshotStore::new());
         let runtime_cfg =
@@ -1795,6 +2132,26 @@ mod tests {
         let cfg = runtime_cfg.get();
         assert!(!cfg.bindings["node-a"].enable);
         assert!(cfg.bindings["node-b"].enable);
+    }
+
+    #[tokio::test]
+    async fn config_noop_update_does_not_emit_audit_event() {
+        let store = Arc::new(SnapshotStore::new());
+        let runtime_cfg =
+            Arc::new(RuntimeConfigStore::from_app_config(test_app_config(StakePolicy::Minimum)));
+        let elections_task = test_elections_task();
+        let audit_mem = Arc::new(InMemoryAuditLog::new());
+        let state =
+            test_state_with_audit(store, runtime_cfg, elections_task, audit_mem.clone()).await;
+
+        let app = routes(false, state);
+        let resp = app
+            .oneshot(post_json("/v1/elections/exclude", &NodeListRequest { nodes: vec![] }))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert!(audit_mem.drain().is_empty(), "empty diff must not emit rest_api.config_updated");
     }
 
     #[tokio::test]
