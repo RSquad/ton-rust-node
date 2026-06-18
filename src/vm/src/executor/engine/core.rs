@@ -899,6 +899,11 @@ impl Engine {
         self.cstate
     }
 
+    /// Cells loaded during execution, used as the storage-stat `add_hint`.
+    pub fn take_visited_cells(&mut self) -> HashSet<UInt256> {
+        std::mem::take(&mut self.visited_cells)
+    }
+
     pub fn get_actions(&self) -> StackItem {
         match self.ctrls.get(5) {
             Some(x) => x.clone(),

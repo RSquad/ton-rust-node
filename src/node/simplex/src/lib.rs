@@ -143,7 +143,11 @@
 
 #![allow(clippy::too_many_arguments)]
 
-/// Modules
+// ======================================================================
+// Modules
+// ======================================================================
+// Crate-private module tree, the public `utils` module, and the
+// crate-internal `#[cfg(test)]` test module.
 mod block;
 mod candidate_book;
 mod certificate;
@@ -165,16 +169,25 @@ mod session_telemetry;
 mod simplex_state;
 mod startup_recovery;
 mod task_queue;
+pub mod trace_collector;
 pub mod utils;
 mod validation_controller;
+
+pub use trace_collector::{
+    LifecycleFinalStatus, LifecycleStarted, LifecycleStopped, LifecycleValidator, TraceCollector,
+};
 
 /// Internal tests (private unit tests with crate access)
 #[cfg(test)]
 mod tests;
 
-/*
-    Imported consensus dependencies from consensus-common
-*/
+// ======================================================================
+// Re-exports from consensus-common
+// ======================================================================
+// Convenience re-exports of the `consensus-common` types that form this
+// crate's public surface (listener trait, payload pointers, overlay
+// manager, key types, …), followed by the crate's `std` / `ton_block`
+// imports.
 /// Metrics handle for profiling
 pub use consensus_common::utils::MetricsHandle;
 /// Activity node for liveness tracking
@@ -255,9 +268,11 @@ use std::{
 };
 use ton_block::{fail, BlockIdExt, Result, ShardIdent};
 
-/*
-    Shared Raw Vote Data (memory-efficient storage)
-*/
+// ======================================================================
+// Shared raw vote data
+// ======================================================================
+// `RawVoteData`: an `Arc<RawBuffer>` wrapper for sharing serialized vote
+// bytes across structures (vote storage, misbehavior proofs) cheaply.
 
 /// Shared raw vote data for memory-efficient storage.
 ///
@@ -331,18 +346,22 @@ impl AsRef<[u8]> for RawVoteData {
     }
 }
 
-/*
-    TL types for simplex consensus
-*/
+// ======================================================================
+// TL types
+// ======================================================================
+// Re-export of the generated TL consensus / simplex types under `ton`.
 
 /// Module with TL types for simplex consensus
 pub mod ton {
     pub use ton_api::ton::consensus::{simplex::*, *};
 }
 
-/*
-    Simplex Roundless Mode Constants
-*/
+// ======================================================================
+// Roundless-mode constant
+// ======================================================================
+// `SIMPLEX_ROUNDLESS`: the sentinel `round` value that tells
+// `ValidatorGroup` to bypass round-based invariants for slot-native
+// Simplex.
 
 /// Sentinel value indicating Simplex roundless mode.
 ///
@@ -370,9 +389,11 @@ pub mod ton {
 /// `unreachable!()` to assert this.
 pub const SIMPLEX_ROUNDLESS: u32 = u32::MAX;
 
-/*
-    Simplex-specific types
-*/
+// ======================================================================
+// Session pointers & aliases
+// ======================================================================
+// Public pointer aliases for the session, its listener, and the replay
+// listener.
 
 /// Pointer to Simplex Session
 pub type SessionPtr = Arc<dyn SimplexSession + Send + Sync>;
@@ -383,9 +404,11 @@ pub type SessionListenerPtr = Weak<dyn SessionListener + Send + Sync>;
 /// Log replay listener pointer
 pub type SessionReplayListenerPtr = consensus_common::ConsensusReplayListenerPtr;
 
-/*
-    SessionOptions for Simplex consensus
-*/
+// ======================================================================
+// Session options
+// ======================================================================
+// `SessionOptions` (immutable per-session configuration) plus the
+// Prometheus-labelling strategy, `Default`, and validation.
 
 /// Simplex session options
 #[derive(Clone, Copy, Debug)]
@@ -681,9 +704,11 @@ impl SessionOptions {
     }
 }
 
-/*
-    SimplexSession trait (Simplex-specific operations)
-*/
+// ======================================================================
+// SimplexSession trait
+// ======================================================================
+// The Simplex-specific extension of `Session`: MC-finalized notification,
+// candidate-availability repair, and stop / panic probes.
 
 /// Simplex-specific session operations
 ///
@@ -769,9 +794,11 @@ pub trait SimplexSession: ConsensusSession {
     fn is_panicked(&self) -> bool;
 }
 
-/*
-    SessionFactory
-*/
+// ======================================================================
+// Session factory
+// ======================================================================
+// `SessionFactory`: entry points to build overlay managers and create
+// live / log-replay sessions.
 
 /// Factory for creating Simplex sessions and related objects
 pub struct SessionFactory;
@@ -831,6 +858,8 @@ impl SessionFactory {
         db_path: String,
         overlay_manager: ConsensusOverlayManagerPtr,
         listener: SessionListenerPtr,
+        trace_collector: Option<TraceCollector>,
+        catchain_seqno: u32,
     ) -> Result<SessionPtr> {
         session::SessionImpl::create(
             options,
@@ -841,6 +870,8 @@ impl SessionFactory {
             db_path,
             overlay_manager,
             listener,
+            trace_collector,
+            catchain_seqno,
         )
     }
 

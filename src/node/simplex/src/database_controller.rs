@@ -134,9 +134,8 @@ pub(crate) enum PendingDrainStep {
 
 /// Per-session persistence-ordering controller.
 ///
-/// Owned by
-/// [`SessionProcessor`](crate::session_processor::SessionProcessor) as
-/// `self.database`; all access goes through the accessor methods below.
+/// Owned by [`SessionProcessor`] as `self.database`; all access goes through the
+/// accessor methods below.
 pub(crate) struct DatabaseController {
     /// The underlying `SimplexDb` handle. Exposed through [`Self::db`] so
     /// existing persistence call sites keep their

@@ -12,18 +12,35 @@ use ton_block::{base64_decode, error, read_single_root_boc, Cell, Result, SliceD
 type Extractor = fn(&Cell) -> WalletResult;
 type WalletResult = Result<serde_json::Map<String, serde_json::Value>>;
 
+const WALLET_V3_ACCOUNT_STATE: &str = "wallet.v3.accountState";
+const WALLET_V4_ACCOUNT_STATE: &str = "wallet.v4.accountState";
+
+#[derive(Clone, Copy)]
+pub(crate) struct WalletAccountStateInfo {
+    pub(crate) tl_type: &'static str,
+    pub(crate) revision: u32,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct WalletInfo {
     wallet_type: &'static str,
     extractor: Extractor,
+    account_state: Option<WalletAccountStateInfo>,
 }
 
 impl WalletInfo {
-    const fn new(wallet_type: &'static str, extractor: Extractor) -> Self {
-        Self { wallet_type, extractor }
+    const fn new(
+        wallet_type: &'static str,
+        extractor: Extractor,
+        account_state: Option<WalletAccountStateInfo>,
+    ) -> Self {
+        Self { wallet_type, extractor, account_state }
     }
     pub(crate) fn wallet_type(&self) -> &'static str {
         self.wallet_type
+    }
+    pub(crate) fn account_state_info(&self) -> Option<WalletAccountStateInfo> {
+        self.account_state
     }
     pub(crate) fn extract(&self, data: &Cell) -> WalletResult {
         (self.extractor)(data)
@@ -43,7 +60,14 @@ impl WalletLibrary {
             let cell = read_single_root_boc(&bytes)
                 .map_err(|e| error!("invalid wallet code boc {}: {e}", descriptor.wallet_type))?;
             let hash = *cell.repr_hash().as_array();
-            wallets.insert(hash, WalletInfo::new(descriptor.wallet_type, descriptor.extractor));
+            wallets.insert(
+                hash,
+                WalletInfo::new(
+                    descriptor.wallet_type,
+                    descriptor.extractor,
+                    descriptor.account_state,
+                ),
+            );
         }
         Ok(Self { wallets })
     }
@@ -66,6 +90,7 @@ struct WalletCodeDescriptor {
     code_boc: &'static str,
     wallet_type: &'static str,
     extractor: Extractor,
+    account_state: Option<WalletAccountStateInfo>,
 }
 
 const fn descriptor(
@@ -73,7 +98,22 @@ const fn descriptor(
     wallet_type: &'static str,
     extractor: Extractor,
 ) -> WalletCodeDescriptor {
-    WalletCodeDescriptor { code_boc, wallet_type, extractor }
+    WalletCodeDescriptor { code_boc, wallet_type, extractor, account_state: None }
+}
+
+const fn account_state_descriptor(
+    code_boc: &'static str,
+    wallet_type: &'static str,
+    extractor: Extractor,
+    tl_type: &'static str,
+    revision: u32,
+) -> WalletCodeDescriptor {
+    WalletCodeDescriptor {
+        code_boc,
+        wallet_type,
+        extractor,
+        account_state: Some(WalletAccountStateInfo { tl_type, revision }),
+    }
 }
 
 fn empty_extractor(_: &Cell) -> WalletResult {
@@ -227,10 +267,34 @@ const WALLET_CODES: &[WalletCodeDescriptor] = &[
     descriptor(WALLET_V1_R3, "wallet v1 r3", seqno_extractor),
     descriptor(WALLET_V2_R1, "wallet v2 r1", seqno_extractor),
     descriptor(WALLET_V2_R2, "wallet v2 r2", seqno_extractor),
-    descriptor(WALLET_V3_R1, "wallet v3 r1", v3_extractor),
-    descriptor(WALLET_V3_R2, "wallet v3 r2", v3_extractor),
-    descriptor(WALLET_V4_R1, "wallet v4 r1", v3_extractor),
-    descriptor(WALLET_V4_R2, "wallet v4 r2", v3_extractor),
+    account_state_descriptor(
+        WALLET_V3_R1,
+        "wallet v3 r1",
+        v3_extractor,
+        WALLET_V3_ACCOUNT_STATE,
+        1,
+    ),
+    account_state_descriptor(
+        WALLET_V3_R2,
+        "wallet v3 r2",
+        v3_extractor,
+        WALLET_V3_ACCOUNT_STATE,
+        2,
+    ),
+    account_state_descriptor(
+        WALLET_V4_R1,
+        "wallet v4 r1",
+        v3_extractor,
+        WALLET_V4_ACCOUNT_STATE,
+        1,
+    ),
+    account_state_descriptor(
+        WALLET_V4_R2,
+        "wallet v4 r2",
+        v3_extractor,
+        WALLET_V4_ACCOUNT_STATE,
+        2,
+    ),
     descriptor(WALLET_V5_R1, "wallet v5 r1", v5_extractor),
     descriptor(NOMINATOR_POOL_V1, "nominator pool v1", empty_extractor),
 ];

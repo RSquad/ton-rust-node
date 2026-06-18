@@ -55,6 +55,7 @@ node = [ 'external-ip' ]
 server = [  ]
 static_workers = [  ]
 telemetry = [  ]
+tokio-monitor = [  ]
 xp25 = [  ]
 
 [[bench]]

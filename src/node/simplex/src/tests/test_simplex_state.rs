@@ -3085,7 +3085,7 @@ fn drain_events(state: &mut SimplexState) -> Vec<SimplexEvent> {
 
 /*
     ========================================================================
-    Restart Support (Phase 6)
+    Restart Support
     ========================================================================
 */
 
@@ -3163,7 +3163,7 @@ fn test_restart_skip_marks_state() {
 
 #[test]
 fn test_cpp_parity_restart_does_not_skip_voted_final_slot() {
-    // C++-parity GUARD (TN-1414, "don't let a restarted node skip a window that's still
+    // C++-parity GUARD ("don't let a restarted node skip a window that's still
     // finalizing").
     //
     // C++ consensus.cpp start_up() skips only the single window before
@@ -3299,7 +3299,7 @@ fn test_cpp_mode_local_notarize_after_skip() {
 
 #[test]
 fn test_cpp_parity_blocker_body_recovery_notarizes_and_finalizes() {
-    // C++-parity GUARD (TN-1414, "pull the body for the finalization blocker").
+    // C++-parity GUARD ("pull the body for the finalization blocker").
     //
     // Models the releasenet MC blocker shape at the FSM level: the node has OBSERVED a
     // NotarCert for the blocking slot (>=2/3 of the set notarized it) but is missing the
@@ -5545,7 +5545,7 @@ fn test_finalization_prunes_skip_intervals_before_tracked_range_cpp_parity() {
 
 /*
     ========================================================================
-    SIMPLEX-SKIPSCAN-1 (TN-979 / NODE-186)
+    Skip-scan invariant fallback
 
     Coverage for the non-panicking semantics of `find_next_nonskipped_slot`:
     - C++ parity fast path (next_slot not skipped, skip_intervals lower_bound)
@@ -5556,7 +5556,7 @@ fn test_finalization_prunes_skip_intervals_before_tracked_range_cpp_parity() {
     - caller paths (`propagate_base_after_*`) degrade without panicking.
 
     Mirrors C++ `pool.cpp::next_nonskipped_slot_after()` for the happy path
-    while extending it with safe fallback semantics required by Linear AC.
+    while extending it with safe non-panicking fallback semantics.
     ========================================================================
 */
 
@@ -5617,7 +5617,7 @@ fn test_find_next_nonskipped_slot_no_panic_when_skip_intervals_missing_boundary(
     // Invariant violation: next_slot is skipped but skip_intervals has no
     // boundary at or after it. The fast path is impossible, so the function
     // must fall back to a bounded forward scan via is_slot_skipped_cert.
-    // Linear AC: must NOT panic.
+    // Must NOT panic.
     let desc = create_test_desc(4, 8);
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
 
@@ -5668,7 +5668,7 @@ fn test_find_next_nonskipped_slot_no_panic_when_skip_intervals_boundary_still_sk
 
 #[test]
 fn test_find_next_nonskipped_slot_warn_latched_to_once_per_session() {
-    // Linear AC: "is logged once per session". Two consecutive invariant
+    // Logged once per session: two consecutive invariant
     // violations must not re-emit the warning.
     let desc = create_test_desc(4, 8);
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
@@ -5722,7 +5722,7 @@ fn test_find_next_nonskipped_slot_terminates_at_fsm_frontier_without_panic() {
 
 #[test]
 fn test_fallback_scan_first_non_skipped_returns_none_when_limit_exhausted() {
-    // Linear AC (NODE-186): "Scan-limit fallback returns `None`".
+    // Scan-limit fallback returns `None`.
     //
     // The natural FSM frontier means the production cap (10_000) is
     // effectively unreachable — `is_slot_skipped_cert` returns `false` for

@@ -44,6 +44,8 @@ pub(crate) fn write_boc(root_cell: &Cell) -> ton_block::Result<Vec<u8>> {
 }
 
 fn decode_comment_from_body(body: &SliceData) -> Option<String> {
+    const MAX_COMMENT_SNAKE_CELLS: usize = 1024;
+
     let mut slice = body.clone();
     if slice.remaining_bits() < 32 {
         return None;
@@ -54,17 +56,21 @@ fn decode_comment_from_body(body: &SliceData) -> Option<String> {
         return None;
     }
 
-    let bits_left = slice.remaining_bits();
-    if bits_left == 0 {
-        return Some(String::new());
-    }
-    if bits_left % 8 != 0 {
-        return None;
-    }
+    let mut bytes = Vec::new();
+    for _ in 0..MAX_COMMENT_SNAKE_CELLS {
+        let bits = slice.remaining_bits();
+        if bits % 8 != 0 {
+            return None;
+        }
+        bytes.extend(slice.get_next_bytes(bits / 8).ok()?);
 
-    let bytes_len = bits_left / 8;
-    let bytes = slice.get_next_bytes(bytes_len).ok()?;
-    String::from_utf8(bytes).ok()
+        match slice.remaining_references() {
+            0 => return String::from_utf8(bytes).ok(),
+            1 => slice = SliceData::load_cell(slice.checked_drain_reference().ok()?).ok()?,
+            _ => return None,
+        }
+    }
+    None
 }
 
 pub(crate) fn serialize_block_id(block_id: &BlockIdExt) -> serde_json::Value {
@@ -214,19 +220,14 @@ fn serialize_message(
         "init_state": &init_state,
     });
 
-    if let Some(body) = &body_opt {
-        if let Some(text) = decode_comment_from_body(body) {
-            let text_b64 = base64_encode(text.as_bytes());
-            msg_data_json = serde_json::json!({
-                "@type": "msg.dataText",
-                "text": text_b64,
-            });
-        }
+    let body_comment = body_opt.as_ref().and_then(|body| decode_comment_from_body(body));
+    if let Some(text) = &body_comment {
+        let text_b64 = base64_encode(text.as_bytes());
+        msg_data_json = serde_json::json!({
+            "@type": "msg.dataText",
+            "text": text_b64,
+        });
     }
-    let message = body_opt
-        .as_ref()
-        .map(|body| format!("{}\n", base64_encode(body.get_bytestring(0).as_slice())))
-        .unwrap_or_default();
 
     let (msg_type, source, destination) = match format {
         MessageFormat::Raw => (
@@ -245,7 +246,7 @@ fn serialize_message(
         }
     };
 
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "@type": msg_type,
         "hash": serialize_uint256(&hash),
         "source": source,
@@ -257,8 +258,22 @@ fn serialize_message(
         "created_lt": int_header.created_lt.to_string(),
         "body_hash": serialize_uint256(&body_hash),
         "msg_data": msg_data_json,
-        "message": message,
-    }))
+    });
+
+    if matches!(format, MessageFormat::Ext) {
+        let message = body_comment.unwrap_or_else(|| {
+            body_opt
+                .as_ref()
+                .map(|body| format!("{}\n", base64_encode(body.get_bytestring(0).as_slice())))
+                .unwrap_or_default()
+        });
+        result
+            .as_object_mut()
+            .expect("serialize_message returns an object")
+            .insert("message".to_string(), serde_json::Value::String(message));
+    }
+
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,6 +623,20 @@ where
     stack.into_iter().map(|e| serialize_stack_entry(&e.into())).collect()
 }
 
+pub(crate) fn serialize_stack_std<Item>(stack: impl IntoIterator<Item = Item>) -> JsonResult
+where
+    Item: Into<StackEntry>,
+{
+    let values = stack
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.into();
+            serde_json::json!(StackEntryJson::from(&entry))
+        })
+        .collect();
+    Ok(serde_json::Value::Array(values))
+}
+
 fn serialize_stack_entry(entry: &StackEntry) -> JsonResult {
     let result = match entry {
         StackEntry::Tvm_StackEntryNumber(value) => {
@@ -644,6 +673,26 @@ pub(crate) enum RPCStackEntry {
     Tvm_StackEntryNumber(stackentry::StackEntryNumber),
     Tvm_StackEntrySlice(stackentry::StackEntrySlice),
     Tvm_StackEntryTuple(stackentry::StackEntryTuple),
+}
+
+#[derive(Debug)]
+pub(crate) struct RPCStackEntryStd(StackEntry);
+
+impl From<RPCStackEntryStd> for StackEntry {
+    fn from(value: RPCStackEntryStd) -> Self {
+        value.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RPCStackEntryStd {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let entry = <StackEntryJson as serde::Deserialize>::deserialize(deserializer)?;
+        let entry = entry.try_into().map_err(serde::de::Error::custom)?;
+        Ok(Self(entry))
+    }
 }
 
 impl Into<StackEntry> for RPCStackEntry {

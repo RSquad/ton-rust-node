@@ -50,13 +50,13 @@ use std::{
 };
 use ton_block::{
     error, fail, Account, AccountDispatchQueue, AccountId, AccountStorageDictProof, AddSub,
-    BlkPrevInfo, Block, BlockCreateStats, BlockExtra, BlockIdExt, BlockInfo, BocFlags, BocWriter,
-    Cell, ChildCell, Coins, CommonMsgInfo, ConfigParamEnum, ConfigParams, CreatorStats,
-    CurrencyCollection, Deserializable, Error, ExtBlkRef, FutureSplitMerge, GlobalCapabilities,
-    GlobalVersion, HashmapAugType, HashmapRemover, HashmapType, InMsg, InMsgDescr,
-    InternalMessageHeader, KeyExtBlkRef, KeyMaxLt, Libraries, McBlockExtra, McShardRecord,
-    McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgMetadata, OutMsg,
-    OutMsgDescr, OutMsgQueueKey, ParamLimitIndex, ProcessedInfoKey, ProcessedUpto, Result,
+    Augmentation, BlkPrevInfo, Block, BlockCreateStats, BlockExtra, BlockIdExt, BlockInfo,
+    BocFlags, BocWriter, Cell, ChildCell, Coins, CommonMsgInfo, ConfigParamEnum, ConfigParams,
+    CreatorStats, CurrencyCollection, Deserializable, Error, ExtBlkRef, FutureSplitMerge,
+    GlobalCapabilities, GlobalVersion, HashmapAugType, HashmapRemover, HashmapType, InMsg,
+    InMsgDescr, InternalMessageHeader, KeyExtBlkRef, KeyMaxLt, Libraries, McBlockExtra,
+    McShardRecord, McStateExtra, MerkleProof, MerkleUpdate, Message, MsgAddressInt, MsgMetadata,
+    OutMsg, OutMsgDescr, OutMsgQueueKey, ParamLimitIndex, ProcessedInfoKey, ProcessedUpto, Result,
     Serializable, ShardAccount, ShardAccountBlocks, ShardAccounts, ShardDescr, ShardFees,
     ShardHashes, ShardIdent, ShardStateSplit, ShardStateUnsplit, SliceData, StorageStatDict,
     TopBlockDescrSet, Transaction, TransactionTickTock, UInt256, UsageTree, ValidatorSet,
@@ -75,6 +75,15 @@ pub const SPLIT_MERGE_DELAY: u32 = 100; // prepare (delay) split/merge for 100 s
 pub const SPLIT_MERGE_INTERVAL: u32 = 100; // split/merge is enabled during 60 second interval
 pub const MAX_ERROR_ATTEMPTS: u32 = 5;
 pub const PREV_STATE_WAIT_TIMEOUT_MS: u64 = 1_000;
+
+/// Overrides supplied by the hardfork crafter utility to the collator.
+#[derive(Clone, Default)]
+pub struct HardforkData {
+    /// New configuration parameters to merge into the masterchain config.
+    pub config: Option<ConfigParams>,
+    /// Accounts whose state must be replaced wholesale (without any transaction).
+    pub patched_accounts: Vec<(AccountId, Account)>,
+}
 
 pub struct CycleVec<'a, T> {
     items: Vec<Option<&'a T>>,
@@ -773,8 +782,10 @@ impl CollatorData {
 
 type MessageSender = tokio::sync::mpsc::UnboundedSender<(Arc<AsyncMessage>, Option<MsgMetadata>)>;
 struct ExecutionManager {
-    changed_accounts:
-        BTreeMap<AccountId, (MessageSender, tokio::task::JoinHandle<Result<ShardAccountStuff>>)>,
+    changed_accounts: BTreeMap<
+        AccountId,
+        (MessageSender, tokio::task::JoinHandle<Result<Option<ShardAccountStuff>>>),
+    >,
 
     receive_tr: tokio::sync::mpsc::UnboundedReceiver<
         Option<(Arc<AsyncMessage>, Option<MsgMetadata>, Result<Transaction>)>,
@@ -916,7 +927,7 @@ impl ExecutionManager {
         account_id: AccountId,
         shard_acc: ShardAccount,
         collator_data: &CollatorData,
-    ) -> Result<(MessageSender, tokio::task::JoinHandle<Result<ShardAccountStuff>>)> {
+    ) -> Result<(MessageSender, tokio::task::JoinHandle<Result<Option<ShardAccountStuff>>>)> {
         log::trace!("{}: start_account_job: {:x}", self.collated_block_descr, account_id);
 
         let lt = collator_data.last_dispatch_queue_emitted_lt(&account_id);
@@ -941,7 +952,9 @@ impl ExecutionManager {
         let handle = tokio::spawn(async move {
             let lt = lt.max(min_lt.load(Ordering::Relaxed));
             let full_collated_data = config.has_capability(GlobalCapabilities::CapFullCollatedData);
-            let init = tokio::task::spawn_blocking(move || {
+            let log_account_id = account_id.clone();
+            // init can be long in case of storage dict calculation
+            let mut init = tokio::task::spawn_blocking(move || {
                 ShardAccountStuff::init(
                     &engine,
                     account_id,
@@ -951,38 +964,68 @@ impl ExecutionManager {
                     lt_compatible,
                     dict_hash_min_cells,
                 )
-            })
-            .await
-            .map_err(|join_err| join_err.into())
-            .flatten();
-            let mut shard_acc = match init {
-                Ok(shard_acc) => shard_acc,
-                Err(err) => {
-                    receiver.close();
-                    // If initialization of shard account stuff failed, we should respond to all pending messages and exit.
-                    while receiver.recv().await.is_some() {
-                        wait_tr.respond(None);
-                    }
-                    return Err(err);
-                }
+            });
+            let mut account_stuff: Option<ShardAccountStuff> = None;
+            let log_cutoff_drop = |ext_msg_id: &UInt256, stage: &str| {
+                log::debug!(
+                    target: EXT_MESSAGES_TRACE_TARGET,
+                    "{}: account {:x} ext message {:x} cancelled by cutoff timeout {}",
+                    collated_block_descr, log_account_id, ext_msg_id, stage,
+                );
             };
             while let Some((new_msg, msg_metadata)) = receiver.recv().await {
+                let ext_msg_id = if let AsyncMessage::Ext(_, _, id) = &*new_msg {
+                    Some(id.clone())
+                } else {
+                    None
+                };
+
+                // External messages are dropped once the cutoff fires, so we
+                // don't wait for init to discard them; internal messages must be processed
+                let shard_acc = if let Some(stuff) = account_stuff.as_mut() {
+                    stuff
+                } else {
+                    let init_res = if let Some(ext_msg_id) = &ext_msg_id {
+                        tokio::select! {
+                            res = &mut init => res,
+                            _ = cancel_ext.cancelled() => {
+                                log_cutoff_drop(ext_msg_id, "while init");
+                                wait_tr.respond(None);
+                                continue;
+                            }
+                        }
+                    } else {
+                        (&mut init).await
+                    };
+                    match init_res.map_err(|join_err| join_err.into()).flatten() {
+                        Ok(acc) => {
+                            account_stuff = Some(acc);
+                            account_stuff.as_mut().unwrap()
+                        }
+                        Err(err) => {
+                            wait_tr.respond(None);
+                            receiver.close();
+                            while receiver.recv().await.is_some() {
+                                wait_tr.respond(None);
+                            }
+                            return Err(err);
+                        }
+                    }
+                };
+
+                if let Some(ext_msg_id) = &ext_msg_id {
+                    if cancel_ext.is_cancelled() {
+                        log_cutoff_drop(ext_msg_id, "before exec");
+                        wait_tr.respond(None);
+                        continue;
+                    }
+                }
+
                 log::trace!(
                     "{}: new message for {:x}",
                     collated_block_descr,
                     shard_acc.account_id()
                 );
-                if cancel_ext.is_cancelled() {
-                    if let AsyncMessage::Ext(_, _, msg_id) = &*new_msg {
-                        log::debug!(
-                            target: EXT_MESSAGES_TRACE_TARGET,
-                            "{}: account {:x} ext message {:x} cancelled by cutoff timeout before exec",
-                            collated_block_descr, shard_acc.account_id(), msg_id,
-                        );
-                        wait_tr.respond(None);
-                        continue;
-                    }
-                }
 
                 let config = config.clone(); // TODO: use Arc
 
@@ -1013,18 +1056,12 @@ impl ExecutionManager {
                     )
                 });
 
-                let ext_msg_id =
-                    if let AsyncMessage::Ext(_, _, id) = &*new_msg { Some(id) } else { None };
-
-                let (mut transaction_res, account, duration) = if let Some(msg_id) = ext_msg_id {
+                let (mut transaction_res, account, duration) = if let Some(ext_msg_id) = &ext_msg_id
+                {
                     tokio::select! {
                         res = task => res?,
                         _ = cancel_ext.cancelled() => {
-                            log::debug!(
-                                target: EXT_MESSAGES_TRACE_TARGET,
-                                "{}: account {:x} ext message {:x} cancelled by cutoff timeout in-flight",
-                                collated_block_descr, shard_acc.account_id(), msg_id,
-                            );
+                            log_cutoff_drop(ext_msg_id, "in-flight");
                             wait_tr.respond(None);
                             continue;
                         }
@@ -1051,7 +1088,7 @@ impl ExecutionManager {
                 max_lt.fetch_max(shard_acc.lt(), Ordering::Relaxed);
                 wait_tr.respond(Some((new_msg, msg_metadata, transaction_res)));
             }
-            Ok(shard_acc)
+            Ok(account_stuff)
         });
         Ok((sender, handle))
     }
@@ -4091,12 +4128,17 @@ impl Collator {
         let mut new_config_opt = None;
         for (account_id, (sender, handle)) in mem::take(&mut exec_manager.changed_accounts) {
             mem::drop(sender);
-            let mut shard_acc = tokio::select! {
+            let shard_acc = tokio::select! {
                 biased;
                 _ = self.stop_flag.cancelled() => fail!("Stop flag was set on account {account_id:x}"),
                 res = handle => res.map_err(|err| {
                     error!("account {:x} thread didn't finish: {}", account_id, err)
                 })??,
+            };
+            // `None` means the account was never initialized: the cutoff dropped all its
+            // (external) messages before init finished, so it is simply not part of this block.
+            let Some(mut shard_acc) = shard_acc else {
+                continue;
             };
             if let Some(addr) = &config_addr {
                 if addr == &account_id {
@@ -4124,11 +4166,17 @@ impl Collator {
             }
         }
 
-        if let Some(hardfork_config) = self.engine.get_config_for_hardfork() {
-            let mut new_config =
-                new_config_opt.unwrap_or_else(|| collator_data.config.raw_config().clone());
-            self.apply_hardfork_config(&hardfork_config, &mut new_config)?;
-            new_config_opt = Some(new_config);
+        let hardfork_data = self.engine.get_hardfork_data();
+        if let Some(hardfork_data) = &hardfork_data {
+            if let Some(hardfork_config) = &hardfork_data.config {
+                let mut new_config =
+                    new_config_opt.unwrap_or_else(|| collator_data.config.raw_config().clone());
+                self.apply_hardfork_config(hardfork_config, &mut new_config)?;
+                new_config_opt = Some(new_config);
+            }
+            for (account_id, new_account) in &hardfork_data.patched_accounts {
+                self.apply_hardfork_patched_account(account_id, new_account, &mut new_accounts)?;
+            }
         }
 
         log::debug!("{}: finalize_block: calc value flow", self.collated_block_descr);
@@ -4232,7 +4280,7 @@ impl Collator {
                 self.update_public_libraries(exec_manager.libraries.clone(), &changed_accounts)?;
         }
         new_state.write_custom(mc_state_extra.as_ref())?;
-        if self.engine.get_config_for_hardfork().is_some() {
+        if hardfork_data.as_ref().and_then(|d| d.config.as_ref()).is_some() {
             new_state.update_config_smc()?;
         }
 
@@ -4436,6 +4484,45 @@ impl Collator {
         })?;
         // Config smart contract will be updated further,
         // see 'new_state.update_config_smc()?;' in 'finalize_block'
+        Ok(())
+    }
+
+    /// Replace an account in the shard accounts dictionary with the supplied
+    /// patched copy, preserving the existing `last_trans_hash` and
+    /// `last_trans_lt`. No `AccountBlock`/transaction is produced - this is
+    /// intentional and only valid inside a trusted hardfork block.
+    fn apply_hardfork_patched_account(
+        &self,
+        account_id: &AccountId,
+        new_account: &Account,
+        new_accounts: &mut ShardAccounts,
+    ) -> Result<()> {
+        match new_account.get_id() {
+            Some(new_acc_id) if *new_acc_id == *account_id => {}
+            Some(new_acc_id) => fail!(
+                "hardfork patch: account_id mismatch: expected {:x}, got {:x} from patched account",
+                account_id,
+                new_acc_id,
+            ),
+            None => fail!("hardfork patch: patched account for {:x} has no address", account_id),
+        }
+        let current = new_accounts.account(account_id)?.ok_or_else(|| {
+            error!("hardfork patch: account {:x} is not present in shard accounts", account_id)
+        })?;
+        let last_trans_hash = current.last_trans_hash().clone();
+        let last_trans_lt = current.last_trans_lt();
+        let new_shard_acc =
+            ShardAccount::with_params(new_account, last_trans_hash.clone(), last_trans_lt)?;
+        let value = new_shard_acc.write_to_new_cell()?;
+        let aug = new_account.aug()?;
+        new_accounts.set_builder_serialized(account_id.clone(), &value, &aug)?;
+        log::info!(
+            "{}: hardfork patch: replaced account {:x} (last_trans_lt = {}, last_trans_hash = {:x})",
+            self.collated_block_descr,
+            account_id,
+            last_trans_lt,
+            last_trans_hash,
+        );
         Ok(())
     }
 
@@ -5218,7 +5305,11 @@ impl Collator {
                             account_stuff.account_id(),
                         );
                     }
-                } else if account_stuff.has_root_change() {
+                } else if account_stuff.has_root_change() || account_stuff.storage_dict().is_some()
+                {
+                    // Root changed, or a dict was built from scratch (backfill: `storage_dict` set
+                    // but nothing imported). The validator rebuilds it from the state, so the full
+                    // state must be in the proof.
                     log::debug!("Added full account state {:x} ", account_stuff.account_id());
                     roots_to_include.insert(account_stuff.original_root().repr_hash());
                 }

@@ -68,14 +68,12 @@ use ton_api::{
 };
 use ton_block::{fail, Result, UInt256};
 
-/*
-    ============================================================================
-    Vote Signature
-    ============================================================================
-
-    Single vote signature from a validator.
-    Reference: C++ `Certificate<T>::VoteSignature` in `certificate.h`
-*/
+// ======================================================================
+// Vote signature
+// ======================================================================
+// A single validator's signature over a vote: a compact validator index
+// plus Ed25519 bytes, with TL conversion. Reference: C++
+// `Certificate<T>::VoteSignature` in `certificate.h`.
 
 /// Single vote signature from a validator
 ///
@@ -139,14 +137,12 @@ impl VoteSignature {
     }
 }
 
-/*
-    ============================================================================
-    Certificate
-    ============================================================================
-
-    Aggregated vote signatures meeting 2/3 threshold.
-    Reference: C++ `Certificate<T>` template struct in `certificate.h`
-*/
+// ======================================================================
+// Certificate type & aliases
+// ======================================================================
+// The generic `Certificate<T>` (a vote plus its >= 2/3-weight aggregated
+// signatures) and the Notar / Final / Skip cert + `Arc` pointer aliases.
+// Reference: C++ `Certificate<T>` template struct in `certificate.h`.
 
 /// Certificate of aggregated vote signatures
 ///
@@ -208,6 +204,11 @@ pub(crate) type FinalCertPtr = Arc<FinalCert>;
 #[allow(dead_code)]
 pub(crate) type SkipCertPtr = Arc<SkipCert>;
 
+// ======================================================================
+// Construction & accessors
+// ======================================================================
+// Unverified construction (`new`, `from_tl_bytes_for_candidate`), weight
+// accounting, and the signature-set TL projection.
 impl NotarCert {
     /// Deserialize NotarCert from TL VoteSignatureSet bytes.
     ///
@@ -295,11 +296,11 @@ impl<T: Clone> Certificate<T> {
     }
 }
 
-/*
-    ============================================================================
-    Vote Type Trait for TL Conversion
-    ============================================================================
-*/
+// ======================================================================
+// Vote-type TL conversion
+// ======================================================================
+// `ToTlUnsignedVote`: convert FSM vote types to a TL `UnsignedVote` (and
+// back to the `Vote` enum), implemented for each concrete vote type.
 
 /// Trait for converting FSM vote types to TL
 pub(crate) trait ToTlUnsignedVote: Clone {
@@ -351,11 +352,10 @@ impl ToTlUnsignedVote for Vote {
     }
 }
 
-/*
-    ============================================================================
-    Certificate TL Serialization
-    ============================================================================
-*/
+// ======================================================================
+// TL serialization
+// ======================================================================
+// `Certificate::to_tl` for any certifiable vote type.
 
 impl<T: ToTlUnsignedVote> Certificate<T> {
     /// Convert to TL Certificate
@@ -375,11 +375,11 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
     }
 }
 
-/*
-    ============================================================================
-    Certificate Deserialization with Verification
-    ============================================================================
-*/
+// ======================================================================
+// Deserialization with verification
+// ======================================================================
+// `from_tl_signatures`: rebuild and fully verify a typed certificate
+// (index bounds, duplicate detection, signatures, >= 2/3 weight).
 
 impl<T: ToTlUnsignedVote> Certificate<T> {
     /// Deserialize from TL VoteSignatureSet with signature verification
@@ -469,11 +469,11 @@ impl<T: ToTlUnsignedVote> Certificate<T> {
     }
 }
 
-/*
-    ============================================================================
-    Certificate from Generic Vote (for parsing TL Certificate)
-    ============================================================================
-*/
+// ======================================================================
+// Generic-vote parse & verify
+// ======================================================================
+// `Certificate<Vote>::from_tl`: parse and verify a TL certificate whose
+// vote variant is not known at compile time (C++-strict reject policy).
 
 impl Certificate<Vote> {
     /// Parse and verify certificate from TL Certificate
@@ -492,7 +492,7 @@ impl Certificate<Vote> {
     /// * `session_id` - Session ID for signature verification
     ///
     /// # Returns
-    /// Ok(Certificate<Vote>) if valid, Err with description if rejected
+    /// `Ok(Certificate<Vote>)` if valid, `Err` with a description if rejected
     pub fn from_tl(
         tl_cert: &CertificateBoxed,
         desc: &SessionDescription,

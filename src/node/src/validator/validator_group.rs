@@ -30,7 +30,7 @@ use crate::{
         mutex_wrapper::MutexWrapper,
         state_resolver_cache::{ResolverBackend, StateResolverCache},
         validator_utils::{
-            prevs_to_string, validator_query_candidate_to_validator_block_candidate,
+            get_adnl_id, prevs_to_string, validator_query_candidate_to_validator_block_candidate,
             validatordescr_to_session_node, ValidatorListHash,
         },
     },
@@ -357,6 +357,88 @@ impl PipelineContext {
     }
 }
 
+/// Pre-built context for emitting `consensus.lifecycle.*` records for this
+/// session. Captured once at `ValidatorGroup::new` (where the validator set,
+/// local key, and trace collector are all in scope) so the stop / never_ran /
+/// aborted records can be emitted from `stop()` and `Drop` without the outer
+/// `ValidatorGroup`. The epoch is captured here so a never-ran future (which
+/// never reaches `start()`) still routes to the correct epoch file
+pub(crate) struct LifecycleStopCtx {
+    tc: simplex::TraceCollector,
+    workchain: i32,
+    shard_hex: String,
+    cc_seqno: u32,
+    session_id_hex: String,
+    our_idx: u32,
+    our_pubkey: String,
+    epoch_utime_since: u32,
+}
+
+impl LifecycleStopCtx {
+    fn emit_stopped(&self, final_status: simplex::LifecycleFinalStatus) {
+        self.tc.record_lifecycle_stopped(simplex::LifecycleStopped {
+            ts: 0.0,
+            workchain: self.workchain,
+            shard_hex: self.shard_hex.clone(),
+            cc_seqno: self.cc_seqno,
+            session_id: self.session_id_hex.clone(),
+            our_idx: self.our_idx,
+            our_pubkey: self.our_pubkey.clone(),
+            epoch_utime_since: self.epoch_utime_since,
+            final_status,
+        });
+    }
+}
+
+/// Build the lifecycle stop-context for a member session. Returns `None` when
+/// no trace collector is configured or the local key is not found in the set.
+///
+/// `epoch_utime_since` is the `utime_since` of the governing validator set
+/// (ConfigParam 34 cur/next). It MUST be passed explicitly: the per-session
+/// `validator_set` here is the calc_subset result built with `utime_since = 0`
+/// (zeroed to keep session_id/opts hashing matching C++), so reading
+/// `validator_set.utime_since()` would always yield 0
+fn build_lifecycle_ctx(
+    tc: simplex::TraceCollector,
+    shard: &ShardIdent,
+    cc_seqno: u32,
+    session_id: &SessionId,
+    local_key: &PrivateKey,
+    validator_set: &ValidatorSet,
+    epoch_utime_since: u32,
+) -> Option<LifecycleStopCtx> {
+    let our_pubkey = match local_key.pub_key() {
+        Ok(k) => hex::encode(k),
+        Err(e) => {
+            log::warn!(target: "validator", "lifecycle: cannot read local pubkey: {e}");
+            return None;
+        }
+    };
+    let local_id = local_key.id();
+    let our_idx = validator_set
+        .list()
+        .iter()
+        .position(|d| d.compute_node_id_short().as_slice() == local_id.data());
+    let our_idx = match our_idx {
+        Some(i) => i as u32,
+        None => {
+            log::warn!(target: "validator",
+                "lifecycle: local key not found in validator set for session {:x}", session_id);
+            return None;
+        }
+    };
+    Some(LifecycleStopCtx {
+        tc,
+        workchain: shard.workchain_id(),
+        shard_hex: format!("{:016x}", shard.shard_prefix_with_tag()),
+        cc_seqno,
+        session_id_hex: session_id.to_hex_string(),
+        our_idx,
+        our_pubkey,
+        epoch_utime_since,
+    })
+}
+
 pub struct ValidatorGroupImpl {
     local_id: PublicKeyHash,
     prev_block_ids: PrevBlockHistory, //Vec<BlockIdExt>,
@@ -392,6 +474,19 @@ pub struct ValidatorGroupImpl {
     /// Highest external MC-finalized notification seqno delivered via `notify_mc_finalized`.
     /// Used to suppress stale finalized block rebroadcasts (`block-accepter.cpp` parity).
     last_notified_mc_finalized_seqno: Option<u32>,
+
+    /// Lifecycle JSONL emission context (`None` when stats collection is off or
+    /// the local key is not in the set). The flags make `sessionStarted` /
+    /// `sessionStopped` emission idempotent across the multiple GC paths and the
+    /// `Drop` safety net.
+    lifecycle: Option<LifecycleStopCtx>,
+    /// Set once `start()` runs (session began validating). Decides `aborted`
+    /// (started) vs `never_ran` (never started) at `Drop`.
+    ever_started: bool,
+    /// `sessionStarted` already emitted (avoid duplicate started records).
+    started_emitted: bool,
+    /// A terminal `sessionStopped` record was already emitted.
+    stopped_emitted: bool,
 }
 
 impl Drop for ValidatorGroupImpl {
@@ -401,6 +496,21 @@ impl Drop for ValidatorGroupImpl {
             "SESSION_LIFECYCLE: dropped shard={} cc_seqno={} session_id={:x} final_status={} \
              has_engine={}",
             self.shard, self.cc_seqno, self.session_id, self.status, self.session.is_some());
+        // Lifecycle safety net: a member/future group can be dropped without a
+        // clean stop() (e.g. a pre-created future removed from the map, or live
+        // sessions at process shutdown). Emit the terminal record exactly once.
+        // never_ran if it never validated, otherwise aborted (trace incomplete).
+        if !self.stopped_emitted {
+            if let Some(ctx) = self.lifecycle.as_ref() {
+                let status = if self.ever_started {
+                    simplex::LifecycleFinalStatus::Aborted
+                } else {
+                    simplex::LifecycleFinalStatus::NeverRan
+                };
+                ctx.emit_stopped(status);
+            }
+            self.stopped_emitted = true;
+        }
     }
 }
 
@@ -504,6 +614,41 @@ impl ValidatorGroupImpl {
         log::debug!(target: "validator",
             "Validation queue spawned for shard={} cc_seqno={}, options={:?}",
             self.shard, self.cc_seqno, g.consensus_options);
+
+        // Lifecycle: emit sessionStarted at the -> Sync transition (the member
+        // session begins validating). Build the full validator set from the
+        // session's ValidatorSet. Idempotent per process via started_emitted.
+        if self.lifecycle.is_some() && !self.started_emitted {
+            if let Some(ctx) = self.lifecycle.as_ref() {
+                let validators = g
+                    .validator_set
+                    .list()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| simplex::LifecycleValidator {
+                        idx: i as u32,
+                        pubkey: hex::encode(d.public_key.key_bytes()),
+                        adnl: Some(hex::encode(get_adnl_id(d).data())),
+                        weight: d.weight.to_string(),
+                    })
+                    .collect();
+                ctx.tc.record_lifecycle_started(simplex::LifecycleStarted {
+                    ts: 0.0,
+                    workchain: ctx.workchain,
+                    shard_hex: ctx.shard_hex.clone(),
+                    cc_seqno: ctx.cc_seqno,
+                    session_id: ctx.session_id_hex.clone(),
+                    our_idx: ctx.our_idx,
+                    our_pubkey: ctx.our_pubkey.clone(),
+                    epoch_utime_since: ctx.epoch_utime_since,
+                    validators,
+                });
+            }
+            self.started_emitted = true;
+        }
+        if self.lifecycle.is_some() {
+            self.ever_started = true;
+        }
 
         self.status = ValidatorGroupStatus::Sync;
         Ok(())
@@ -615,6 +760,7 @@ impl ValidatorGroupImpl {
                     g.general_session_info.catchain_seqno,
                     overlay_manager,
                     listener,
+                    g.engine.trace_collector(),
                 )
             }
             #[cfg(test)]
@@ -654,7 +800,7 @@ impl ValidatorGroupImpl {
     }
 
     // Initializes structure
-    pub fn new(
+    pub(crate) fn new(
         local_id: &PublicKeyHash,
         shard: ShardIdent,
         cc_seqno: u32,
@@ -662,6 +808,7 @@ impl ValidatorGroupImpl {
         is_accelerated_consensus_enabled: bool,
         is_pipeline_context_enabled: bool,
         consensus_type: ConsensusType,
+        lifecycle: Option<LifecycleStopCtx>,
     ) -> ValidatorGroupImpl {
         log::info!(target: "validator",
             "SESSION_LIFECYCLE: created shard={} cc_seqno={} session_id={:x} consensus={} local_id={}",
@@ -692,6 +839,10 @@ impl ValidatorGroupImpl {
             last_accepted_mc_seqno: None,
             last_accepted_mc_block_id: None,
             last_notified_mc_finalized_seqno: None,
+            lifecycle,
+            ever_started: false,
+            started_emitted: false,
+            stopped_emitted: false,
         }
     }
 
@@ -873,6 +1024,7 @@ impl ValidatorGroup {
         session_id: SessionId,
         validator_list_id: ValidatorListHash,
         validator_set: ValidatorSet,
+        epoch_utime_since: u32,
         consensus_options: ConsensusOptions,
         engine: Arc<dyn EngineOperations>,
         allow_unsafe_self_blocks_resync: bool,
@@ -882,6 +1034,20 @@ impl ValidatorGroup {
         let is_accelerated = consensus_options.is_accelerated_consensus_enabled();
         let is_pipeline_context_enabled = consensus_options.is_pipeline_context_enabled();
 
+        // Capture the lifecycle stop-context now (validator set, local key, and
+        // trace collector are all in scope). Carried into the impl so stop() /
+        // Drop can emit terminal records without the outer ValidatorGroup.
+        let lifecycle = engine.trace_collector().and_then(|tc| {
+            build_lifecycle_ctx(
+                tc,
+                &general_session_info.shard,
+                general_session_info.catchain_seqno,
+                &session_id,
+                &local_key,
+                &validator_set,
+                epoch_utime_since,
+            )
+        });
         let group_impl = ValidatorGroupImpl::new(
             local_key.id(),
             general_session_info.shard.clone(),
@@ -890,6 +1056,7 @@ impl ValidatorGroup {
             is_accelerated,
             is_pipeline_context_enabled,
             consensus_type,
+            lifecycle,
         );
         let id = format!("Val. group {} {:x}", general_session_info.shard, session_id);
         let (listener, receiver) = ValidatorSessionListener::create(
@@ -1152,6 +1319,31 @@ impl ValidatorGroup {
                 log::info!(target: "validator",
                     "SESSION_LIFECYCLE: stopped shard={} cc_seqno={} destroy_db={}",
                     shard, cc_seqno, destroy_database);
+
+                // Lifecycle: emit sessionStopped after the session is torn down.
+                // A pre-created future that never validated (e.g. a stale future
+                // culled via cull_stale_future / gc_future) is `never_ran`, NOT
+                // `stopped` -- the deterministic session_id may be reused by the
+                // real promoted session later, so mislabeling it `stopped`
+                // produces a spurious stop-before-start for that id. A session
+                // that did start gets `stopped`. The worker flushes the trace
+                // file before writing the stop line ("stop record present =>
+                // trace complete"). Idempotent via stopped_emitted.
+                group_impl
+                    .execute_sync(|gi| {
+                        if !gi.stopped_emitted {
+                            if let Some(ctx) = gi.lifecycle.as_ref() {
+                                let status = if gi.ever_started {
+                                    simplex::LifecycleFinalStatus::Stopped
+                                } else {
+                                    simplex::LifecycleFinalStatus::NeverRan
+                                };
+                                ctx.emit_stopped(status);
+                            }
+                            gi.stopped_emitted = true;
+                        }
+                    })
+                    .await;
             }
         });
         Ok(())

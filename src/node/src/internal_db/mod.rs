@@ -641,19 +641,33 @@ impl InternalDb {
         Ok(result)
     }
 
-    pub async fn load_block_data(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    pub async fn load_block_data(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         let _tc = time_checker!(|| format!("load_block_data {}", handle.id()), 100);
         let raw_block = self.load_block_data_raw(handle).await?;
         BlockStuff::deserialize_block(handle.id().clone(), Arc::new(raw_block))
     }
 
-    pub async fn load_block_data_raw(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
+    pub async fn load_block_data_raw(&self, handle: &Arc<BlockHandle>) -> Result<Vec<u8>> {
         let _tc = time_checker!(|| format!("load_block_data_raw {}", handle.id()), 100);
         if !handle.has_data() {
-            fail!("This block is not stored yet: {:?}", handle);
+            fail!("This block is not stored yet: {handle:?}");
         }
         let entry_id = PackageEntryId::Block(handle.id());
-        self.archive_manager.get_file(handle, &entry_id).await
+        match self.archive_manager.get_file(handle, &entry_id).await {
+            Ok(data) => Ok(data),
+            Err(e) if handle.is_archived() => {
+                let id = handle.id();
+                log::error!(
+                    "Archive corrupted for block {id}: {e}. \
+                    Resetting data/archived flags for retry."
+                );
+                handle.reset_data();
+                handle.reset_archived();
+                self.store_block_handle(handle, None)?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn lookup_block_by_seqno(
@@ -744,7 +758,7 @@ impl InternalDb {
 
     pub async fn load_block_proof(
         &self,
-        handle: &BlockHandle,
+        handle: &Arc<BlockHandle>,
         is_link: bool,
     ) -> Result<BlockProofStuff> {
         let _tc = time_checker!(
@@ -757,7 +771,7 @@ impl InternalDb {
 
     pub async fn load_block_proof_raw(
         &self,
-        handle: &BlockHandle,
+        handle: &Arc<BlockHandle>,
         is_link: bool,
     ) -> Result<Vec<u8>> {
         let _tc = time_checker!(
@@ -771,20 +785,39 @@ impl InternalDb {
         self.load_block_proof_raw_(handle, is_link).await
     }
 
-    async fn load_block_proof_raw_(&self, handle: &BlockHandle, is_link: bool) -> Result<Vec<u8>> {
+    async fn load_block_proof_raw_(
+        &self,
+        handle: &Arc<BlockHandle>,
+        is_link: bool,
+    ) -> Result<Vec<u8>> {
         let (entry_id, inited) = if is_link {
             (PackageEntryId::ProofLink(handle.id()), handle.has_proof_link())
         } else {
             (PackageEntryId::Proof(handle.id()), handle.has_proof())
         };
         if !inited {
-            fail!(
-                "This proof{} is not in the archive: {:?}",
-                if is_link { "link" } else { "" },
-                handle
-            );
+            let suffix = if is_link { "link" } else { "" };
+            fail!("This proof{suffix} is not in the archive: {handle:?}");
         }
-        self.archive_manager.get_file(handle, &entry_id).await
+        match self.archive_manager.get_file(handle, &entry_id).await {
+            Ok(data) => Ok(data),
+            Err(e) if handle.is_archived() => {
+                let id = handle.id();
+                let kind = if is_link { "proof link" } else { "proof" };
+                log::error!(
+                    "Archive corrupted for {kind} of {id}: {e}. Resetting flags for retry."
+                );
+                if is_link {
+                    handle.reset_proof_link();
+                } else {
+                    handle.reset_proof();
+                }
+                handle.reset_archived();
+                self.store_block_handle(handle, None)?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn store_shard_state_dynamic(

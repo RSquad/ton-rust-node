@@ -22,7 +22,7 @@ use crate::{
     shard::ShardIdent,
     signature::{BlockSignatures, BlockSignaturesSimplex, BlockSignaturesVariant},
     transactions::ShardAccountBlocks,
-    types::{ChildCell, CurrencyCollection, InRefValue},
+    types::{AddSub, ChildCell, CurrencyCollection, InRefValue},
     validators::ValidatorSet,
     BuilderData, Cell, Deserializable, ExceptionCode, IBitstring, Result, Serializable, SliceData,
     UInt256,
@@ -1050,6 +1050,26 @@ impl ValueFlow {
         self.minted.remove_zero_currencies()?;
         self.burned.remove_zero_currencies()?;
         Ok(())
+    }
+
+    // from_prev_blk + imported + fees_imported + created + minted + recovered
+    //  == to_next_blk + exported + fees_collected + burned
+    pub fn validate(&self) -> Result<bool> {
+        // treat an arithmetic overflow during summation (add returns false) as an invalid flow
+        let mut ok = true;
+        let mut lhs = self.from_prev_blk.clone();
+        ok &= lhs.add(&self.imported)?;
+        ok &= lhs.add(&self.fees_imported)?;
+        ok &= lhs.add(&self.created)?;
+        ok &= lhs.add(&self.minted)?;
+        ok &= lhs.add(&self.recovered)?;
+
+        let mut rhs = self.to_next_blk.clone();
+        ok &= rhs.add(&self.exported)?;
+        ok &= rhs.add(&self.fees_collected)?;
+        ok &= rhs.add(&self.burned)?;
+
+        Ok(ok && lhs == rhs)
     }
 }
 

@@ -677,6 +677,8 @@ impl TestFixture {
             0,
             health_counters,
             callbacks,
+            None,
+            0,
         )
         .unwrap();
 
@@ -1125,6 +1127,8 @@ fn test_should_generate_empty_block_uses_committed_head_at_session_start() {
         0,
         health_counters,
         callbacks,
+        None,
+        0,
     )
     .unwrap();
 
@@ -1263,7 +1267,7 @@ fn test_out_of_order_finalized_delivery_emits_when_body_arrives_late_and_dedups(
         certificate: make_test_final_cert(candidate_id.slot, candidate_id.hash.clone()),
     };
     fixture.processor.handle_block_finalized(event.clone());
-    // TN-1408: drain the deferred `request_candidate` bounce onto SXMAIN.
+    // Drain the deferred `request_candidate` bounce onto SXMAIN.
     fixture.run_pending_tasks();
 
     assert!(
@@ -1326,7 +1330,7 @@ fn test_out_of_order_mode_does_not_run_commit_chain_recovery_for_missing_body() 
         certificate: make_test_final_cert(slot, block_hash),
     };
     fixture.processor.handle_block_finalized(event);
-    // TN-1408: drain the deferred `request_candidate` bounce onto SXMAIN.
+    // Drain the deferred `request_candidate` bounce onto SXMAIN.
     fixture.run_pending_tasks();
 
     assert!(
@@ -1528,10 +1532,10 @@ fn test_future_certificate_is_not_rejected_like_cpp() {
 }
 
 // ============================================================================
-// TN-1034 SIMPLEX-DOS-HARDENING-1 — bad-signature peer-ban tests
+// Bad-signature peer-ban tests
 // ============================================================================
 
-/// TN-1034 / NODE-75: a certificate that fails `Certificate::from_tl` verification
+/// A certificate that fails `Certificate::from_tl` verification
 /// (e.g. signed against the wrong session) must trigger a temporary peer ban for
 /// the source via `receiver.ban_source_for_bad_signature(source_idx)`.
 ///
@@ -1583,7 +1587,7 @@ fn test_on_certificate_bad_signature_triggers_temporary_ban() {
     );
 }
 
-/// TN-1034 / NODE-75: well-signed certificates must NOT result in peer-ban side
+/// Well-signed certificates must NOT result in peer-ban side
 /// effects, even if dispatched repeatedly. This guards against false-positive
 /// bans during legitimate standstill rebroadcasts.
 #[test]
@@ -1775,7 +1779,7 @@ fn test_handle_skip_certificate_reached_persists_before_relay() {
     );
 }
 
-/// Regression for TN-1386: do not prune the seqno-keyed callback dedup while
+/// Regression: do not prune the seqno-keyed callback dedup while
 /// old `received_candidates` are still retained.
 ///
 /// The original panic happened after `cleanup_old_slots` pruned the slot-keyed
@@ -1842,7 +1846,7 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
     );
     assert!(
         fixture.processor.consensus.finalized_delivery_sent_seqno_contains(old_block_id.seq_no()),
-        "TN-1386: seqno-keyed dedup must remain while old candidate metadata remains reachable"
+        "seqno-keyed dedup must remain while old candidate metadata remains reachable"
     );
 
     let mut complete = true;
@@ -1869,7 +1873,7 @@ fn test_cleanup_old_slots_keeps_seqno_dedup_while_received_candidates_are_retain
     assert!(fixture.processor.consensus.finalized_delivery_sent_contains(&old_candidate_id));
 }
 
-/// Regression for TN-1386: `try_emit_recursive_finalized_callback` must treat a
+/// Regression: `try_emit_recursive_finalized_callback` must treat a
 /// second emit attempt for the **same** `block_id` at the same seqno as
 /// idempotent (no panic, no double-callback) and only assert when a
 /// **different** `block_id` would be reported for an already-delivered seqno.
@@ -2146,7 +2150,7 @@ fn test_handle_notarization_reached_requests_missing_candidate_body() {
 
     // Act: should schedule requestCandidate for missing body.
     fixture.processor.handle_notarization_reached(event);
-    // TN-1408: `request_candidate` is a deferred ConsensusBackend effect bounced
+    // `request_candidate` is a deferred ConsensusBackend effect bounced
     // onto SXMAIN; drain the queue so the real request runs before asserting.
     fixture.run_pending_tasks();
 
@@ -3822,6 +3826,8 @@ fn test_health_check_configurable_cooldown() {
         0,
         health_counters,
         callbacks,
+        None,
+        0,
     )
     .unwrap();
 
@@ -4602,7 +4608,7 @@ fn test_conflicting_second_broadcast_same_slot_is_dropped_by_precheck() {
 
 #[test]
 fn test_relayed_broadcast_from_non_leader_is_accepted() {
-    // Regression (TN-1414): an authentic, leader-signed broadcast candidate that is
+    // Regression: an authentic, leader-signed broadcast candidate that is
     // delivered by a relay / gossip peer (sender != slot leader, no attached notar cert)
     // must be ACCEPTED, not dropped. Dropping it strands any node that missed the leader's
     // direct delivery: it can never notarize the slot, is forced to skip, and a single such
@@ -5436,7 +5442,7 @@ fn test_apply_bootstrap_replays_final_certs_repairs_boundary() {
 
     run_apply_bootstrap(&mut fixture, bootstrap);
 
-    // TN-1410: replaying the persisted FinalCert during recovery repairs the
+    // Replaying the persisted FinalCert during recovery repairs the
     // finalized boundary BEYOND the filtered finalized_blocks (slot 31 -> 737),
     // which suppresses restart-skip generation for the already-finalized slot.
     assert_eq!(
@@ -5475,7 +5481,7 @@ fn test_apply_bootstrap_replays_skip_certs() {
 
     run_apply_bootstrap(&mut fixture, bootstrap);
 
-    // TN-1410: persisted SkipCert must be replayed/seeded during recovery (before
+    // Persisted SkipCert must be replayed/seeded during recovery (before
     // restart-skip generation) so the skipped-slot progress cursor is restored.
     assert!(
         fixture.processor.simplex_state.has_skip_certificate(skip_slot),
@@ -6449,7 +6455,7 @@ fn test_recursive_finalization_defers_until_missing_parent_body_arrives() {
         block_id: Some(child_block.clone()),
         certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
     });
-    // TN-1408: drain the deferred `request_candidate` bounce so the missing-parent
+    // Drain the deferred `request_candidate` bounce so the missing-parent
     // repair request reaches the (fake) receiver before we inspect its actions.
     fixture.run_pending_tasks();
 
@@ -6540,7 +6546,7 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
         block_id: Some(child_block.clone()),
         certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
     });
-    // TN-1408: drain the deferred `request_candidate` bounce so the missing-ancestor
+    // Drain the deferred `request_candidate` bounce so the missing-ancestor
     // repair request reaches the (fake) receiver before we inspect its actions.
     fixture.run_pending_tasks();
 
@@ -9661,7 +9667,7 @@ fn test_maybe_apply_finalized_state_async_persist_failure_increments_error_count
     let _ = candidate_id;
 }
 
-// TN-998 Phase 2 Commit 5: snapshot builders for `SessionTelemetry`
+// Snapshot builders for `SessionTelemetry`
 //
 // Each builder produces a neutral, owned snapshot that the telemetry aspect
 // will consume read-only in later commits. Tests assert that the builders
@@ -9759,7 +9765,7 @@ fn build_full_dump_snapshot_skips_standstill_dump_when_not_stalled() {
 }
 
 // ============================================================================
-// `SessionProcessor::stop()` — close()/destroy_db wiring (CONSENSUS-DB-CLEANUP-1)
+// `SessionProcessor::stop()` — close()/destroy_db wiring
 // ============================================================================
 //
 // These tests assert the shutdown contract the migrated session paths rely on:

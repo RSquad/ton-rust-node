@@ -2286,9 +2286,14 @@ impl ValidateQuery {
             base.next_block_descr,
             base.value_flow
         );
-        // if !base.value_flow.validate() {
-        //     reject_query!("ValueFlow of block {} is invalid (in-balance is not equal to out-balance)", base.block_id())
-        // }
+        if !base.value_flow.validate().map_err(|err| {
+            error!("Cannot validate ValueFlow of block {}: {err}", base.block_id())
+        })? {
+            reject_query!(
+                "ValueFlow of block {} is invalid (in-balance is not equal to out-balance)",
+                base.block_id()
+            )
+        }
         if !base.shard().is_masterchain() && !base.value_flow.minted.is_zero()? {
             reject_query!(
                 "ValueFlow of block {} \
@@ -5558,8 +5563,16 @@ impl ValidateQuery {
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
                 // For an account whose storage roots are unchanged we can just update `used` info
-                // without dictionary reconstruction
-                if account.precalc_storage_stat()?.map(|stat| stat.is_changed()).unwrap_or(false) {
+                // without dictionary reconstruction — UNLESS the account is large enough to need a
+                // dict but still has none.
+                let stat_changed =
+                    account.precalc_storage_stat()?.is_some_and(|stat| stat.is_changed());
+                let needs_initial_dict = !base.shard().is_masterchain()
+                    && account.dict_hash().is_none()
+                    && account
+                        .storage_info()
+                        .is_some_and(|info| info.used().cells() >= dict_hash_min_cells as u64);
+                if stat_changed || needs_initial_dict {
                     *storage_dict = account.calc_storage_stat_dict(dict_hash_min_cells)?;
                 }
                 #[cfg(test)]

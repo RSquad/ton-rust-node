@@ -11,26 +11,27 @@ use crate::{
     rpc_server::{
         serializers::{
             serialize_block_id, serialize_cell_opt, serialize_shard_account, serialize_stack,
-            serialize_transaction, serialize_uint256, RPCStackEntry,
+            serialize_stack_std, serialize_transaction, serialize_uint256, RPCStackEntry,
+            RPCStackEntryStd,
         },
         token::{
             parse_jetton_master_data, parse_jetton_wallet_data, parse_nft_collection,
             parse_nft_item_data,
         },
-        ApiError, Ctx, JsonResult, RpcRegistryBuilder,
+        ApiError, Ctx, JsonResult, RpcRegistryBuilder, TON_TESTNET_GLOBAL_ID,
     },
     shard_states_keeper::PinnedShardStateGuard,
 };
 use std::{str::FromStr, sync::Arc};
 use ton_api::ton::{lite_server::BlockLink, tvm::StackEntry, Bool};
 use ton_block::{
-    address_crc, base64_decode, base64_decode_url_safe, base64_encode, error, fail,
-    read_single_root_boc, ton_method_id, write_boc, Account, AccountIdPrefixFull, AccountStatus,
-    Block, BlockIdExt, Cell, Coins, Deserializable, ExtBlkRef, ExternalInboundMessageHeader,
-    HashmapAugType, HashmapE, HashmapType, KeyExtBlkRef, LibDescr, Message, MsgAddressInt, Result,
-    Serializable, ShardAccount, ShardIdent, SliceData, StateInit, StorageUsageCalc, Transaction,
-    TransactionDescr, UInt256, UnixTime, ADDR_FORMAT_BOUNCE, ADDR_FORMAT_TESTNET,
-    ADDR_FORMAT_URL_SAFE,
+    address_crc, base64_decode, base64_decode_url_safe, base64_encode, base64_encode_url_safe,
+    error, fail, read_single_root_boc, ton_method_id, write_boc, Account, AccountIdPrefixFull,
+    AccountStatus, Block, BlockIdExt, BlockSignaturesVariant, Cell, Coins, CryptoSignaturePair,
+    Deserializable, ExtBlkRef, ExternalInboundMessageHeader, HashmapAugType, HashmapE, HashmapType,
+    KeyExtBlkRef, LibDescr, Message, MsgAddressInt, Result, Serializable, ShardAccount, ShardIdent,
+    SliceData, StateInit, StorageUsageCalc, Transaction, TransactionDescr, UInt256, UnixTime,
+    ADDR_FORMAT_BOUNCE, ADDR_FORMAT_TESTNET, ADDR_FORMAT_URL_SAFE,
 };
 use ton_executor::{
     BlockchainConfig, ExecuteParams, OrdinaryTransactionExecutor, TransactionExecutor,
@@ -43,14 +44,17 @@ pub(crate) fn register(registry: &mut RpcRegistryBuilder) {
     // -- [ accounts ] --
     registry.add_jsonrpc("getAddressInformation", get_address_information, true);
     registry.add_jsonrpc("getExtendedAddressInformation", get_extended_address_information, true);
+    registry.add_jsonrpc("getShardAccountCell", get_shard_account_cell, true);
     registry.add_jsonrpc("getWalletInformation", get_wallet_information, true);
     registry.add_jsonrpc("getTransactions", get_transactions, true);
+    registry.add_jsonrpc("getTransactionsStd", get_transactions_std, true);
     registry.add_jsonrpc("getAddressBalance", get_address_balance, true);
     registry.add_jsonrpc("getAddressState", get_address_state, true);
     registry.add_jsonrpc("packAddress", pack_address, true);
     registry.add_jsonrpc("unpackAddress", unpack_address, true);
     registry.add_jsonrpc("getTokenData", get_token_data, true);
     registry.add_jsonrpc("detectAddress", detect_address, true);
+    registry.add_jsonrpc("detectHash", detect_hash, true);
 
     // -- [ blocks ] --
     registry.add_jsonrpc("getMasterchainInfo", get_masterchain_info, true);
@@ -58,11 +62,13 @@ pub(crate) fn register(registry: &mut RpcRegistryBuilder) {
     registry.add_jsonrpc("getConsensusBlock", get_consensus_block, true);
     registry.add_jsonrpc("getShardBlockProof", get_shard_proof, true);
     registry.add_jsonrpc("lookupBlock", lookup_block, true);
+    registry.add_jsonrpc("getShards", get_shards, true);
     registry.add_jsonrpc("shards", get_shards, true);
     registry.add_jsonrpc("getBlockTransactions", get_block_transactions, true);
     registry.add_jsonrpc("getBlockTransactionsExt", get_block_transactions_ext, true);
     registry.add_jsonrpc("getBlockHeader", get_block_header, true);
     registry.add_jsonrpc("getBlock", get_block, true);
+    registry.add_jsonrpc("getOutMsgQueueSize", get_out_msg_queue_size, true);
     registry.add_jsonrpc("getOutMsgQueueSizes", get_out_msg_queue_sizes, true);
 
     // -- [ transactions ] --
@@ -72,11 +78,13 @@ pub(crate) fn register(registry: &mut RpcRegistryBuilder) {
 
     // -- [ get config ] --
     registry.add_jsonrpc("getConfigParam", get_config_param, true);
+    registry.add_jsonrpc("getConfigAll", get_config_all, true);
     registry.add_jsonrpc("getLibraries", get_libraries, true);
     registry.add_jsonrpc("getLibrariesExt", get_libraries_ext, true);
 
     // -- [ run method ] --
     registry.add_jsonrpc("runGetMethod", run_get_method, false);
+    registry.add_jsonrpc("runGetMethodStd", run_get_method_std, false);
 
     // -- [ send ] --
     registry.add_jsonrpc("sendBoc", send_boc, false);
@@ -167,7 +175,7 @@ impl AccountContext {
     }
 
     fn is_testnet(&self) -> Result<bool> {
-        Ok(self.mc_state.state().state()?.global_id() < 0)
+        Ok(self.mc_state.state().state()?.global_id() == TON_TESTNET_GLOBAL_ID)
     }
 }
 
@@ -177,13 +185,61 @@ const MAX_TRANSACTION_COUNT: u32 = 16;
 struct GetTransactionsParams {
     address: String,
     limit: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
     lt: Option<u64>,
     hash: Option<String>,
-    _to_lt: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    to_lt: Option<u64>,
+    #[serde(default, rename = "archival")]
     _archival: Option<bool>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum U64OrString {
+    UInt(u64),
+    String(String),
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<U64OrString> as serde::Deserialize>::deserialize(deserializer)?;
+    match value {
+        Some(U64OrString::UInt(value)) => Ok(Some(value)),
+        Some(U64OrString::String(value)) => value.parse().map(Some).map_err(|err| {
+            serde::de::Error::custom(format!("invalid u64 string `{value}`: {err}"))
+        }),
+        None => Ok(None),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TransactionsFormat {
+    Ext,
+    Std,
+}
+
 async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
+    let (transactions, _) = get_transactions_impl(p, ctx, TransactionsFormat::Ext).await?;
+    Ok(serde_json::json!(transactions))
+}
+
+async fn get_transactions_std(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
+    let (transactions, (lt, hash)) = get_transactions_impl(p, ctx, TransactionsFormat::Std).await?;
+    Ok(serde_json::json!({
+        "@type": "raw.transactions",
+        "transactions": transactions,
+        "previous_transaction_id": serialize_transaction_id(lt, &hash),
+    }))
+}
+
+async fn get_transactions_impl(
+    p: GetTransactionsParams,
+    ctx: Ctx,
+    format: TransactionsFormat,
+) -> Result<(Vec<serde_json::Value>, (u64, UInt256))> {
     if let Some(x) = p.limit {
         //Mimic toncenter behaviour
         if x > 100 {
@@ -195,6 +251,7 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
     let workchain_id = acc_ctx.address.workchain_id();
     let account_id = acc_ctx.address.address();
     let mut remaining = p.limit.unwrap_or(10).min(MAX_TRANSACTION_COUNT);
+    let to_lt = p.to_lt.unwrap_or_default();
     let (mut lt, mut expected_hash) = match p.lt.zip(p.hash) {
         Some((lt, hash)) => (lt, hash.parse()?),
         None => acc_ctx.last_transaction(),
@@ -213,6 +270,9 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
     let prefix = AccountIdPrefixFull::prefix(&acc_ctx.address)?;
 
     'main: while remaining != 0 && lt != 0 {
+        if to_lt != 0 && lt <= to_lt {
+            break;
+        }
         // abort_getTransactions: if you haven't found anything yet, it's an error;
         // otherwise, we finish with a partial result
         let Some((block_id, data)) = ctx.engine.lookup_block_by_lt(&prefix, lt).await? else {
@@ -267,25 +327,31 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
                 fail!("previous transaction time is not less than the current one")
             }
             found_any_in_this_block = true;
+            let (type_name, account) = match format {
+                TransactionsFormat::Ext => ("ext.transaction", Some(raw_account.as_str())),
+                TransactionsFormat::Std => ("raw.transaction", None),
+            };
             export.push(serialize_transaction(
                 &tr,
                 tr_cell,
                 &account_address,
-                "ext.transaction",
-                Some(&raw_account),
+                type_name,
+                account,
                 is_testnet,
             )?);
+            let prev_lt = tr.prev_trans_lt();
+            let prev_hash = tr.prev_trans_hash().clone();
             remaining -= 1;
-            if remaining == 0 {
-                break 'main;
-            }
 
             // Step back up the chain
-            lt = tr.prev_trans_lt();
-            if lt == 0 {
+            lt = prev_lt;
+            expected_hash = prev_hash;
+            if remaining == 0 || lt == 0 {
                 break 'main;
             }
-            expected_hash = tr.prev_trans_hash().clone();
+            if to_lt != 0 && lt <= to_lt {
+                break 'main;
+            }
         }
         // exact-behaivor: block by lt, by tx not
         if !found_any_in_this_block {
@@ -296,7 +362,15 @@ async fn get_transactions(p: GetTransactionsParams, ctx: Ctx) -> JsonResult {
     if export.is_empty() {
         fail!(ApiError::NotFound(format!("cannot locate transaction for account {account_id:x}")));
     }
-    Ok(serde_json::json!(export))
+    Ok((export, (lt, expected_hash)))
+}
+
+fn serialize_transaction_id(lt: u64, hash: &UInt256) -> serde_json::Value {
+    serde_json::json!({
+        "@type": "internal.transactionId",
+        "lt": lt.to_string(),
+        "hash": serialize_uint256(hash),
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -307,8 +381,9 @@ async fn get_consensus_block(_: NoParams, ctx: Ctx) -> JsonResult {
         fail!("Cannot load load_last_applied_mc_block_id")
     };
     Ok(serde_json::json!({
+        "@type": "ext.blocks.consensusBlock",
         "consensus_block": mc_block_id.seq_no(),
-        "timestamp": UnixTime::now_f64(),
+        "timestamp": UnixTime::now(),
     }))
 }
 
@@ -353,13 +428,24 @@ async fn get_account(p: GetAddressInformationParams, ctx: Ctx) -> JsonResult {
     Ok(serde_json::json!(base64_encode(&boc_bytes)))
 }
 
+async fn get_shard_account_cell(p: GetAddressInformationParams, ctx: Ctx) -> JsonResult {
+    let acc_ctx = AccountContext::with_address(&ctx, &p.address, p.seqno).await?;
+    let cell = acc_ctx.shard_account.write_to_new_cell()?.into_cell()?;
+    Ok(serde_json::json!({
+        "@type": "tvm.cell",
+        "bytes": base64_encode(write_boc(&cell)?),
+    }))
+}
+
 async fn get_extended_address_information(p: GetAddressInformationParams, ctx: Ctx) -> JsonResult {
     let acc_ctx = AccountContext::with_address(&ctx, &p.address, p.seqno).await?;
     let account = acc_ctx.read_account()?;
+    let sync_utime = acc_ctx.acc_state.state().state()?.gen_time();
 
     let balance = account.balance().cloned().unwrap_or_default();
     let frozen_hash =
         account.frozen_hash().map_or(String::new(), |h| serialize_uint256(h).to_string());
+    let (account_state, revision) = extended_account_state(&ctx, &account, &frozen_hash)?;
 
     let result = serde_json::json!({
           "@type": "fullAccountState",
@@ -371,17 +457,64 @@ async fn get_extended_address_information(p: GetAddressInformationParams, ctx: C
           "extra_currencies": [],
           "last_transaction_id": serialize_shard_account(&acc_ctx.shard_account),
           "block_id": serialize_block_id(&acc_ctx.mc_block_id),
-          "sync_utime": account.last_paid(),
-          "account_state": {
+          "sync_utime": sync_utime,
+          "account_state": account_state,
+          "revision": revision,
+    });
+
+    Ok(result)
+}
+
+fn extended_account_state(
+    ctx: &Ctx,
+    account: &Account,
+    frozen_hash: &str,
+) -> Result<(serde_json::Value, u32)> {
+    if account.status() != AccountStatus::AccStateActive {
+        return Ok((
+            serde_json::json!({
+                "@type": "uninited.accountState",
+                "frozen_hash": frozen_hash,
+            }),
+            0,
+        ));
+    }
+
+    if let Some(code) = account.code() {
+        if let Some(info) = ctx
+            .wallet_library
+            .find_by_code(code)
+            .map_err(|err| error!("failed to detect wallet contract: {err}"))?
+        {
+            if let (Some(account_state), Some(data)) = (info.account_state_info(), account.data()) {
+                let mut state = info
+                    .extract(data)
+                    .map_err(|err| error!("failed to extract wallet data: {err}"))?;
+                state.insert(
+                    "@type".into(),
+                    serde_json::Value::String(account_state.tl_type.into()),
+                );
+                if let Some(wallet_id) = state.get("wallet_id").and_then(serde_json::Value::as_u64)
+                {
+                    state.insert(
+                        "wallet_id".into(),
+                        serde_json::Value::String(wallet_id.to_string()),
+                    );
+                }
+                return Ok((serde_json::Value::Object(state), account_state.revision));
+            }
+        }
+    }
+
+    Ok((
+        serde_json::json!({
             "@type": "raw.accountState",
             "code": serialize_cell_opt(account.code()),
             "data": serialize_cell_opt(account.data()),
             "frozen_hash": frozen_hash,
-          },
-          "revision": 0,
-    });
-
-    Ok(result)
+        }),
+        0,
+    ))
 }
 
 async fn get_address_state(p: GetAddressInformationParams, ctx: Ctx) -> JsonResult {
@@ -399,9 +532,10 @@ async fn get_wallet_information(p: GetAddressInformationParams, ctx: Ctx) -> Jso
     let state = account_status(&account.status());
 
     let mut result = serde_json::Map::new();
+    result
+        .insert("@type".into(), serde_json::Value::String("ext.accounts.walletInformation".into()));
     result.insert("wallet".into(), serde_json::Value::Bool(false));
     result.insert("balance".into(), serde_json::Value::String(balance.coins.to_string()));
-    result.insert("extra_currencies".into(), serde_json::Value::Array(Vec::new()));
     result.insert("account_state".into(), serde_json::Value::String(state.into()));
     result.insert("last_transaction_id".into(), serialize_shard_account(&acc_ctx.shard_account));
 
@@ -409,7 +543,6 @@ async fn get_wallet_information(p: GetAddressInformationParams, ctx: Ctx) -> Jso
     {
         "wallet": true,
         "balance": "9645905685270316",
-        "extra_currencies": [],
         "account_state": "active",
         "wallet_type": "wallet v3 r2",
         "seqno": 160,
@@ -451,10 +584,21 @@ async fn get_wallet_information(p: GetAddressInformationParams, ctx: Ctx) -> Jso
 async fn get_address_information(p: GetAddressInformationParams, ctx: Ctx) -> JsonResult {
     let acc_ctx = AccountContext::with_address(&ctx, &p.address, p.seqno).await?;
     let account = acc_ctx.read_account()?;
+    let sync_utime = acc_ctx.acc_state.state().state()?.gen_time();
+    let mc_sync_utime = acc_ctx.mc_state.state().state()?.gen_time();
     let balance = account.balance().cloned().unwrap_or_default();
     let frozen_hash =
         account.frozen_hash().map_or(String::new(), |h| serialize_uint256(h).to_string());
     let state = account_status(&account.status());
+    let suspended = acc_ctx
+        .mc_state
+        .state()
+        .shard_state_extra()?
+        .config()
+        .suspended_address_list()?
+        .map(|list| list.is_address_suspended(&acc_ctx.address, mc_sync_utime))
+        .transpose()?
+        .unwrap_or(false);
     let result = serde_json::json!({
         "@type": "raw.fullAccountState",
         "balance": balance.coins.to_string(),
@@ -464,8 +608,9 @@ async fn get_address_information(p: GetAddressInformationParams, ctx: Ctx) -> Js
         "last_transaction_id": serialize_shard_account(&acc_ctx.shard_account),
         "block_id": serialize_block_id(&acc_ctx.mc_block_id),
         "frozen_hash": frozen_hash,
-        "sync_utime": account.last_paid(),
+        "sync_utime": sync_utime,
         "state": state,
+        "suspended": suspended,
     });
     Ok(result)
 }
@@ -492,8 +637,33 @@ struct RunGetMethodParams {
 }
 
 async fn run_get_method(p: RunGetMethodParams, ctx: Ctx) -> JsonResult {
-    let acc_ctx = AccountContext::with_address(&ctx, &p.address, p.seqno).await?;
-    let method_id = match p.method {
+    let stack = p.stack.into_iter().map(Into::into).collect();
+    run_get_method_impl(p.address, p.method, stack, p.seqno, ctx, false).await
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RunGetMethodStdParams {
+    address: String,
+    method: UIntOrStr,
+    stack: Vec<RPCStackEntryStd>,
+    seqno: Option<u32>,
+}
+
+async fn run_get_method_std(p: RunGetMethodStdParams, ctx: Ctx) -> JsonResult {
+    let stack = p.stack.into_iter().map(Into::into).collect();
+    run_get_method_impl(p.address, p.method, stack, p.seqno, ctx, true).await
+}
+
+async fn run_get_method_impl(
+    address: String,
+    method: UIntOrStr,
+    stack: Vec<StackEntry>,
+    seqno: Option<u32>,
+    ctx: Ctx,
+    std_stack: bool,
+) -> JsonResult {
+    let acc_ctx = AccountContext::with_address(&ctx, &address, seqno).await?;
+    let method_id = match method {
         UIntOrStr::Str(s) => ton_method_id(&s),
         UIntOrStr::Int(i) => i,
     };
@@ -501,20 +671,59 @@ async fn run_get_method(p: RunGetMethodParams, ctx: Ctx) -> JsonResult {
     let gen_utime = acc_ctx.acc_state.state().state()?.gen_time();
     let gen_lt = acc_ctx.acc_state.state().state()?.gen_lt();
     let account = acc_ctx.shard_account.read_account()?;
-    let stack = p.stack.into_iter().map(|e| e.into()).collect();
+    if account.status() != AccountStatus::AccStateActive {
+        return Ok(run_get_method_inactive_response(&acc_ctx, method_id, std_stack));
+    }
     let result =
         ton_vm::run_smc_method(&account, mc_state_cell, method_id, stack, gen_utime, gen_lt)?
             .into_run_result()?;
-    let stack = serialize_stack(result.stack)?;
+    let stack =
+        if std_stack { serialize_stack_std(result.stack)? } else { serialize_stack(result.stack)? };
 
-    Ok(serde_json::json!({
-        "@type": "smc.runResult",
-        "gas_used":  result.gas_used,
-        "stack": stack,
-        "exit_code": result.exit_code,
-        "block_id": serialize_block_id(&acc_ctx.mc_block_id),
-        "last_transaction_id": serialize_shard_account(&acc_ctx.shard_account),
-    }))
+    Ok(serialize_run_result(&acc_ctx, result.gas_used, result.exit_code, stack, std_stack))
+}
+
+fn run_get_method_inactive_response(
+    acc_ctx: &AccountContext,
+    method_id: u32,
+    std_stack: bool,
+) -> serde_json::Value {
+    let stack = if std_stack {
+        serde_json::json!([{
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+                "@type": "tvm.numberDecimal",
+                "number": method_id.to_string(),
+            }
+        }])
+    } else {
+        serde_json::json!([["num", format!("0x{method_id:x}")]])
+    };
+
+    serialize_run_result(acc_ctx, 0, -13, stack, std_stack)
+}
+
+/// Builds the `smc.runResult` JSON response shared by the active and inactive
+/// execution paths. The extended (non-std) format additionally carries
+/// `block_id` and `last_transaction_id`.
+fn serialize_run_result(
+    acc_ctx: &AccountContext,
+    gas_used: i64,
+    exit_code: i32,
+    stack: serde_json::Value,
+    std_stack: bool,
+) -> serde_json::Value {
+    let mut response = serde_json::Map::new();
+    response.insert("@type".into(), serde_json::Value::String("smc.runResult".into()));
+    response.insert("gas_used".into(), serde_json::Value::from(gas_used));
+    response.insert("stack".into(), stack);
+    response.insert("exit_code".into(), serde_json::Value::from(exit_code));
+    if !std_stack {
+        response.insert("block_id".into(), serialize_block_id(&acc_ctx.mc_block_id));
+        response
+            .insert("last_transaction_id".into(), serialize_shard_account(&acc_ctx.shard_account));
+    }
+    serde_json::Value::Object(response)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -578,9 +787,7 @@ async fn lookup_block(p: LookupBlockParams, ctx: Ctx) -> JsonResult {
         fail!("at least one of lt, unixtime, seqno must be specified")
     };
     let Some((block_id, _data)) = result else { fail!("no block found with specified parameters") };
-    Ok(serde_json::json!({
-        "block_id": serialize_block_id(&block_id),
-    }))
+    Ok(serialize_block_id(&block_id))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -605,24 +812,48 @@ async fn get_masterchain_block_signatures(p: MasterchainSeqnoParams, ctx: Ctx) -
     let Some(handle) = ctx.engine.load_block_handle(&mc_block_id)? else {
         fail!("cannot load block handle {mc_block_id}")
     };
-    let block = ctx.engine.load_block(&handle).await?;
-    let Some(custom) = block.block()?.read_extra()?.read_custom()? else {
-        fail!("no custom extra in block {mc_block_id}")
-    };
-    let mut signatures = Vec::new();
-    custom.prev_blk_signatures().iterate(|descr| {
-        signatures.push(serde_json::json!({
-            "@type": "blocks.signature",
-            "node_id_short": serialize_uint256(&descr.node_id_short),
-            "signature": base64_encode(descr.sign.as_bytes())
-        }));
-        Ok(true)
-    })?;
-    Ok(serde_json::json!({
-        "@type": "blocks.blockSignatures",
-        "id": serialize_block_id(&mc_block_id),
-        "signatures": signatures
-    }))
+    let signatures = ctx.engine.load_block_proof(&handle, false).await?.drain_signatures()?;
+    serialize_block_signatures(&mc_block_id, signatures)
+}
+
+fn serialize_block_signature_pairs(
+    signatures: &BlockSignaturesVariant,
+) -> Result<Vec<serde_json::Value>> {
+    let mut result = Vec::with_capacity(signatures.pure_signatures().count() as usize);
+    signatures.pure_signatures().signatures().iterate_slices(
+        |_key, mut value| -> Result<bool> {
+            let pair = CryptoSignaturePair::construct_from(&mut value)?;
+            result.push(serde_json::json!({
+                "@type": "blocks.signature",
+                "node_id_short": serialize_uint256(&pair.node_id_short),
+                "signature": base64_encode(pair.sign.as_bytes()),
+            }));
+            Ok(true)
+        },
+    )?;
+    Ok(result)
+}
+
+fn serialize_block_signatures(
+    block_id: &BlockIdExt,
+    signatures: BlockSignaturesVariant,
+) -> JsonResult {
+    let signature_pairs = serialize_block_signature_pairs(&signatures)?;
+    match signatures {
+        BlockSignaturesVariant::Ordinary(_) => Ok(serde_json::json!({
+            "@type": "blocks.blockSignatures",
+            "id": serialize_block_id(block_id),
+            "signatures": signature_pairs,
+        })),
+        BlockSignaturesVariant::Simplex(simplex) => Ok(serde_json::json!({
+            "@type": "blocks.blockSignatures.simplex",
+            "id": serialize_block_id(block_id),
+            "signatures": signature_pairs,
+            "session_id": serialize_uint256(&simplex.session_id),
+            "slot": simplex.slot,
+            "candidate": base64_encode(simplex.candidate_data_bytes()?),
+        })),
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -630,6 +861,7 @@ struct GetShardBlockProofParams {
     workchain: IntOrStr,
     shard: IntOrStr,
     seqno: u32,
+    #[serde(default, alias = "from_seqno")]
     from: Option<u32>,
 }
 
@@ -655,7 +887,10 @@ async fn get_shard_proof(p: GetShardBlockProofParams, ctx: Ctx) -> JsonResult {
             .ok_or_else(|| error!("cannot find masterchain block with seqno {from}"))?
             .0
     } else {
-        (*get_last_liteserver_state_block(&ctx.engine)?).clone()
+        (*engine
+            .load_last_applied_mc_block_id()?
+            .ok_or_else(|| error!("Cannot load last applied mc block id"))?)
+        .clone()
     };
 
     if mc_id.seq_no > from_id.seq_no {
@@ -773,26 +1008,25 @@ async fn estimate_fee(p: EstimateFeeParams, ctx: Ctx) -> JsonResult {
     if !p.init_code.is_empty() || !p.init_data.is_empty() {
         let mut init = StateInit::default();
         if !p.init_code.is_empty() {
-            let code_cell = read_single_root_boc_from_base64(&p.body, "init_code")?;
+            let code_cell = read_single_root_boc_from_base64(&p.init_code, "init_code")?;
             init.set_code(code_cell);
         };
         if !p.init_data.is_empty() {
-            let data_cell = read_single_root_boc_from_base64(&p.body, "init_data")?;
+            let data_cell = read_single_root_boc_from_base64(&p.init_data, "init_data")?;
             init.set_data(data_cell);
         };
         msg.set_state_init(init);
     }
     let in_msg_cell = msg.serialize()?;
 
-    let config = acc_ctx.mc_state.state().shard_state_extra()?.config().clone();
-    let config = BlockchainConfig::with_config(config)?;
+    let raw_config = acc_ctx.mc_state.state().shard_state_extra()?.config().clone();
+    let config = BlockchainConfig::with_config(raw_config)?;
     let limits = config.size_limits_config();
     let mut calc =
         StorageUsageCalc::with_limits(limits.max_msg_cells as u64, limits.max_msg_bits as u64);
     let _max_merkle_depth = calc.append_cell(&in_msg_cell, false, &mut 0)?;
     let fwd_prices = config.get_fwd_prices(acc_ctx.address.is_masterchain());
     let in_fwd_fee = fwd_prices.calc_fwd_fee(calc.bits(), calc.cells());
-    let executor = OrdinaryTransactionExecutor::new(config);
     let last_tr_lt = acc_ctx.shard_account.last_trans_lt() + 1;
     let behavior_modifiers = Some(BehaviorModifiers { chksig_always_succeed: p.ignore_chksig });
     let prev_blocks_info = PrevBlocksInfo::Raw(
@@ -807,9 +1041,10 @@ async fn estimate_fee(p: EstimateFeeParams, ctx: Ctx) -> JsonResult {
         },
         acc_ctx.mc_state.state().shard_state_extra()?.prev_blocks.clone(),
     );
+    let block_unixtime = ctx.engine.now();
     let params = ExecuteParams {
         state_libs: acc_ctx.mc_state.state().state()?.libraries().clone().inner(),
-        block_unixtime: ctx.engine.now(),
+        block_unixtime,
         block_lt: last_tr_lt,
         last_tr_lt,
         behavior_modifiers,
@@ -817,18 +1052,26 @@ async fn estimate_fee(p: EstimateFeeParams, ctx: Ctx) -> JsonResult {
         ..Default::default()
     };
     let mut account = acc_ctx.read_account()?;
-    let Ok(tr) = executor.execute_with_params(Some(in_msg_cell), &mut account, params) else {
-        return Ok(serde_json::json!({
-            "@type": "query.fees",
-            "source_fees": {
-                "@type": "fees",
-                "in_fwd_fee": in_fwd_fee,
-                "storage_fee": 0,
-                "gas_fee": 0,
-                "fwd_fee": 0
-            },
-            "destination_fees": [],
-        }));
+    let has_storage_info = account.storage_info().is_some();
+    let fallback_storage_fee =
+        estimate_fee_storage_fee(&acc_ctx.address, &account, &config, block_unixtime)?;
+    let executor = OrdinaryTransactionExecutor::new(config);
+    let tr = match executor.execute_with_params(Some(in_msg_cell), &mut account, params) {
+        Ok(tr) => tr,
+        Err(err) => {
+            log::debug!("estimateFee execution failed, returning source-only fees: {err}");
+            return Ok(serde_json::json!({
+                "@type": "query.fees",
+                "source_fees": {
+                    "@type": "fees",
+                    "in_fwd_fee": in_fwd_fee,
+                    "storage_fee": fallback_storage_fee.as_u128(),
+                    "gas_fee": 0,
+                    "fwd_fee": 0
+                },
+                "destination_fees": [],
+            }));
+        }
     };
 
     let TransactionDescr::Ordinary(descr) = tr.read_description()? else {
@@ -851,12 +1094,51 @@ async fn estimate_fee(p: EstimateFeeParams, ctx: Ctx) -> JsonResult {
         "source_fees": {
             "@type": "fees",
             "in_fwd_fee": in_fwd_fee,
-            "storage_fee": storage_fee.as_u128(),
+            "storage_fee": estimate_fee_storage_floor(&acc_ctx.address, has_storage_info, storage_fee),
             "gas_fee": gas_fee.as_u128(),
             "fwd_fee": fwd_fee.as_u128()
         },
         "destination_fees": [],
     }))
+}
+
+fn estimate_fee_storage_fee(
+    address: &MsgAddressInt,
+    account: &Account,
+    config: &BlockchainConfig,
+    block_unixtime: u32,
+) -> Result<Coins> {
+    let is_masterchain = address.is_masterchain();
+    let is_special = config.is_special_account(is_masterchain, address.address())?;
+    let mut fee = match account.storage_info() {
+        Some(storage_info) if !is_special => {
+            config.calc_storage_fees(storage_info, is_masterchain, block_unixtime)?
+        }
+        _ => Coins::zero(),
+    };
+    if let Some(due_payment) = account.due_payment() {
+        fee += due_payment.clone();
+    }
+
+    let balance = account.balance().map(|balance| balance.coins.clone()).unwrap_or_default();
+    if balance >= fee {
+        Ok(fee)
+    } else {
+        Ok(balance)
+    }
+}
+
+fn estimate_fee_storage_floor(
+    address: &MsgAddressInt,
+    has_storage_info: bool,
+    storage_fee: Coins,
+) -> u128 {
+    let storage_fee = storage_fee.as_u128();
+    if storage_fee == 0 && !address.is_masterchain() && has_storage_info {
+        1
+    } else {
+        storage_fee
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -881,11 +1163,11 @@ async fn send_query(p: SendQueryParams, ctx: Ctx) -> JsonResult {
     if !p.init_code.is_empty() || !p.init_data.is_empty() {
         let mut init = StateInit::default();
         if !p.init_code.is_empty() {
-            let code_cell = read_single_root_boc_from_base64(&p.body, "init_code")?;
+            let code_cell = read_single_root_boc_from_base64(&p.init_code, "init_code")?;
             init.set_code(code_cell);
         };
         if !p.init_data.is_empty() {
-            let data_cell = read_single_root_boc_from_base64(&p.body, "init_data")?;
+            let data_cell = read_single_root_boc_from_base64(&p.init_data, "init_data")?;
             init.set_data(data_cell);
         };
         msg.set_state_init(init);
@@ -1171,15 +1453,12 @@ async fn get_block_data(p: GetBlockParams, ctx: Ctx) -> Result<(BlockIdExt, Vec<
 async fn get_block_header(p: GetBlockParams, ctx: Ctx) -> JsonResult {
     let (block_id, data) = get_block_data(p, ctx).await?;
     let block = Block::construct_from_bytes(&data)?;
-    let extra = block.read_extra()?;
-    let created_by = extra.created_by();
     let info = block.read_info()?;
     Ok(serde_json::json!({
         "@type": "blocks.header",
         "id": serialize_block_id(&block_id),
-        "global_id": info.gen_software().map_or(0, |v| v.version),
+        "global_id": block.global_id(),
         "version": info.version(),
-        "flags": info.flags(),
         "after_merge": info.after_merge(),
         "after_split": info.after_split(),
         "before_split": info.before_split(),
@@ -1193,7 +1472,6 @@ async fn get_block_header(p: GetBlockParams, ctx: Ctx) -> JsonResult {
         "start_lt": info.start_lt().to_string(),
         "end_lt": info.end_lt().to_string(),
         "gen_utime": info.gen_utime(),
-        "created_by": base64_encode(created_by.as_slice()),
         "prev_blocks": info.read_prev_ids()?.iter().map(|id| serialize_block_id(id)).collect::<Vec<_>>(),
     }))
 }
@@ -1207,9 +1485,9 @@ async fn get_block(p: GetBlockParams, ctx: Ctx) -> JsonResult {
 }
 
 const FILTER_BY_SHARD: i32 = 1;
-const SKIP_EXTERNALS_QUEUE_SIZE: i32 = 1000;
+const SKIP_EXTERNALS_QUEUE_SIZE: i32 = 8000;
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct GetOutMsgQueueSizesParams {
     #[serde(default)]
     mode: Option<i32>,
@@ -1219,7 +1497,26 @@ struct GetOutMsgQueueSizesParams {
     shard: Option<IntOrStr>,
 }
 
+async fn get_out_msg_queue_size(_: NoParams, ctx: Ctx) -> JsonResult {
+    get_out_msg_queue_sizes_with_type(
+        GetOutMsgQueueSizesParams::default(),
+        ctx,
+        "blocks.outMsgQueueSizes",
+        Some("blocks.outMsgQueueSize"),
+    )
+    .await
+}
+
 async fn get_out_msg_queue_sizes(p: GetOutMsgQueueSizesParams, ctx: Ctx) -> JsonResult {
+    get_out_msg_queue_sizes_with_type(p, ctx, "liteServer.outMsgQueueSizes", None).await
+}
+
+async fn get_out_msg_queue_sizes_with_type(
+    p: GetOutMsgQueueSizesParams,
+    ctx: Ctx,
+    type_name: &str,
+    item_type_name: Option<&str>,
+) -> JsonResult {
     let mode = p.mode.unwrap_or(0);
     let mc_id = get_last_liteserver_state_block(&ctx.engine)?;
     let mc_state = ctx.engine.load_state(&mc_id).await?;
@@ -1266,14 +1563,18 @@ async fn get_out_msg_queue_sizes(p: GetOutMsgQueueSizesParams, ctx: Ctx) -> Json
         let size_usize = if queue_size > 0 { queue_size } else { info.out_queue().len()? };
         let size = i32::try_from(size_usize)
             .map_err(|_| error!("out_msg_queue_size overflow: {size_usize}"))?;
-        shards.push(serde_json::json!({
+        let mut shard = serde_json::json!({
             "id": serialize_block_id(&id),
             "size": size,
-        }));
+        });
+        if let Some(item_type_name) = item_type_name {
+            shard.as_object_mut().unwrap().insert("@type".to_string(), item_type_name.into());
+        }
+        shards.push(shard);
     }
 
     Ok(serde_json::json!({
-        "@type": "liteServer.outMsgQueueSizes",
+        "@type": type_name,
         "shards": shards,
         "ext_msg_queue_size_limit": SKIP_EXTERNALS_QUEUE_SIZE,
     }))
@@ -1302,6 +1603,34 @@ async fn get_config_param(p: GetConfigParamParams, ctx: Ctx) -> JsonResult {
         base64_encode(write_boc(&cell)?)
     } else {
         "".to_string()
+    };
+    Ok(serde_json::json!({
+        "@type": "configInfo",
+        "config": {
+            "@type": "tvm.cell",
+            "bytes": bytes
+        }
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GetConfigAllParams {
+    #[serde(default)]
+    seqno: Option<u32>,
+}
+
+async fn get_config_all(p: GetConfigAllParams, ctx: Ctx) -> JsonResult {
+    let mc_block_id = get_last_liteserver_state_block(&ctx.engine)?;
+    let mut mc_state = ctx.engine.load_and_pin_state(&mc_block_id).await?;
+    if let Some(seqno) = p.seqno {
+        let mc_block_id = mc_state.state().find_block_id(seqno)?;
+        mc_state = ctx.engine.load_and_pin_state(&mc_block_id).await?;
+    }
+
+    let config = mc_state.state().shard_state_extra()?.config();
+    let bytes = match config.root() {
+        Some(root) => base64_encode(write_boc(root)?),
+        None => String::new(),
     };
     Ok(serde_json::json!({
         "@type": "configInfo",
@@ -1382,7 +1711,7 @@ struct DetectAddressParams {
     address: String,
 }
 
-async fn detect_address(p: DetectAddressParams, ctx: Ctx) -> JsonResult {
+async fn detect_address(p: DetectAddressParams, _ctx: Ctx) -> JsonResult {
     let input = p.address.trim();
     if input.is_empty() {
         fail!(ApiError::bad_request("address parameter is required"))
@@ -1396,32 +1725,75 @@ async fn detect_address(p: DetectAddressParams, ctx: Ctx) -> JsonResult {
                 if bounceable { "friendly_bounceable" } else { "friendly_non_bounceable" };
             (address, given_type, testnet)
         } else {
-            let testnet = ctx.is_testnet().await;
             let address: MsgAddressInt = input
                 .parse()
                 .map_err(|e| ApiError::bad_request(format!("Invalid address: {e}")))?;
-            (address, "raw_form", testnet)
+            (address, "raw_form", false)
         };
 
     let addr_mode = if testnet { ADDR_FORMAT_TESTNET } else { 0 };
+    let non_bounceable_b64url = address.to_string_custom(addr_mode | ADDR_FORMAT_URL_SAFE)?;
+    let non_bounceable_b64 = base64_encode(base64_decode_url_safe(&non_bounceable_b64url)?);
     Ok(serde_json::json!({
+        "@type": "ext.utils.detectedAddress",
         "raw_form": address.to_string(),
         "bounceable": {
+            "@type": "ext.utils.detectedAddressVariant",
             "b64": address.to_string_custom(addr_mode | ADDR_FORMAT_BOUNCE)?,
             "b64url": address.to_string_custom(
                 addr_mode | ADDR_FORMAT_BOUNCE | ADDR_FORMAT_URL_SAFE
             )?,
         },
         "non_bounceable": {
-            "b64": address.to_string_custom(addr_mode | ADDR_FORMAT_URL_SAFE)?,
-            "b64url": address.to_string_custom(addr_mode | ADDR_FORMAT_URL_SAFE)?,
+            "@type": "ext.utils.detectedAddressVariant",
+            "b64": non_bounceable_b64,
+            "b64url": non_bounceable_b64url,
         },
         "given_type": given_type,
-        "testnet": testnet,
+        "test_only": testnet,
     }))
 }
 
-async fn pack_address(p: DetectAddressParams, ctx: Ctx) -> JsonResult {
+#[derive(Debug, serde::Deserialize)]
+struct DetectHashParams {
+    hash: String,
+}
+
+async fn detect_hash(p: DetectHashParams, _ctx: Ctx) -> JsonResult {
+    let hash = parse_hash(&p.hash)?;
+
+    Ok(serde_json::json!({
+        "@type": "ext.utils.detectedHash",
+        "b64": base64_encode(hash.as_slice()),
+        "b64url": base64_encode_url_safe(hash.as_slice()).trim_end_matches('=').to_string(),
+        "hex": hash.as_hex_string(),
+    }))
+}
+
+fn parse_hash(input: &str) -> Result<UInt256> {
+    let input = input.trim();
+    if input.is_empty() {
+        fail!(ApiError::bad_request("hash parameter is required"))
+    }
+
+    if let Ok(hash) = input.parse::<UInt256>() {
+        return Ok(hash);
+    }
+
+    let decoded = base64_decode_url_safe(input).map_err(|_| {
+        ApiError::bad_request("Invalid hash: expected 32-byte hex/base64/base64url")
+    })?;
+    if decoded.len() != 32 {
+        fail!(ApiError::bad_request(format!(
+            "Invalid hash length: expected 32 bytes, got {}",
+            decoded.len()
+        )))
+    }
+
+    Ok(UInt256::from(decoded))
+}
+
+async fn pack_address(p: DetectAddressParams, _ctx: Ctx) -> JsonResult {
     let input = p.address.trim();
     if input.is_empty() {
         fail!(ApiError::bad_request("address parameter is required"))
@@ -1430,15 +1802,8 @@ async fn pack_address(p: DetectAddressParams, ctx: Ctx) -> JsonResult {
     let (address, testnet) = if let Some(fa) = parse_friendly_address(input)? {
         (fa.address, fa.testnet)
     } else {
-        let testnet = ctx.is_testnet().await;
         let address = parse_address(input)?;
-        // let address: MsgAddressInt = input.parse().map_err(|e| ApiError {
-        //     jsonrpc_http_status: http::StatusCode::RANGE_NOT_SATISFIABLE,
-        //     http_status: http::StatusCode::RANGE_NOT_SATISFIABLE,
-        //     jsonrpc_code: 416,
-        //     message: format!("Invalid address {input}: {e}").into(),
-        // })?;
-        (address, testnet)
+        (address, false)
     };
 
     let addr_mode = if testnet { ADDR_FORMAT_TESTNET } else { 0 };
@@ -1459,7 +1824,7 @@ async fn unpack_address(p: DetectAddressParams, _ctx: Ctx) -> JsonResult {
         parse_address(input)?
     };
 
-    Ok(serde_json::json!(address.to_string()))
+    Ok(serde_json::json!(address.to_string().to_uppercase()))
 }
 
 struct FriendlyAddressData {

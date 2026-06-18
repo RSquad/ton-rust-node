@@ -11,10 +11,10 @@
 //!
 //! # Overview
 //!
-//! Each Simplex session keeps its own private [`MetricsHandle`] (one for the
-//! `SessionProcessor`, one for the `Receiver`) and dumps it through
+//! Each Simplex session keeps its own private [`crate::MetricsHandle`] (one for
+//! the `SessionProcessor`, one for the `Receiver`) and dumps it through
 //! [`MetricsDumper`] every 15 s / 30 s. Those dumps live only in the log
-//! stream; nothing reaches the global [`metrics_exporter_prometheus`] recorder
+//! stream; nothing reaches the global `metrics_exporter_prometheus` recorder
 //! that backs the node's `/metrics` HTTP endpoint.
 //!
 //! [`publish_snapshot`] bridges the two: it walks the dumper's most-recent
@@ -44,10 +44,16 @@
 use crate::PrometheusLabels;
 use consensus_common::utils::{MetricUsage, MetricsDumper};
 
+// ======================================================================
+// Constants & session identity
+// ======================================================================
+// The shared `ton_node_simplex_` name prefix, the `.speed` skip tag, and
+// the borrowed per-session labelling identity.
+
 /// Metric-name prefix for every Simplex series republished to Prometheus.
 ///
 /// Matches the `ton_node_*` convention used by other engine-level metrics
-/// declared in [`init_prometheus_recorder`](../node/src/engine.rs).
+/// declared in `init_prometheus_recorder` (node crate `src/engine.rs`).
 const METRIC_PREFIX: &str = "ton_node_simplex_";
 
 /// Tag identifying a `.speed` derivative key in the dumper output. Such keys
@@ -70,6 +76,12 @@ pub(crate) struct SessionIdentity<'a> {
     pub session_id8: &'a str,
 }
 
+// ======================================================================
+// Public entry point
+// ======================================================================
+// The thread-safe `publish_snapshot` facade that drives the pipeline
+// against the global recorder.
+
 /// Republish every metric in `dumper`'s latest snapshot to the global
 /// Prometheus recorder, attaching labels derived from `identity` and
 /// `strategy`.
@@ -91,6 +103,12 @@ pub(crate) fn publish_snapshot(
 ) {
     publish_with_sink(dumper, strategy, identity, &mut GlobalMetricsSink);
 }
+
+// ======================================================================
+// Metrics sink
+// ======================================================================
+// The `MetricsSink` seam decoupling publication from the recorder, plus
+// the production `GlobalMetricsSink` that forwards to `metrics::*`.
 
 /// Internal sink so that unit tests can capture the published metrics without
 /// touching the global recorder. Production code uses [`GlobalMetricsSink`].
@@ -120,6 +138,11 @@ impl MetricsSink for GlobalMetricsSink {
     }
 }
 
+// ======================================================================
+// Pipeline & name/label mapping
+// ======================================================================
+// The sink-generic snapshot walk plus the pure helpers that build the
+// label set and sanitise internal keys into `ton_node_simplex_*` names.
 fn publish_with_sink<S: MetricsSink>(
     dumper: &MetricsDumper,
     strategy: PrometheusLabels,
@@ -203,6 +226,11 @@ fn is_invalid(ch: char) -> bool {
     matches!(ch, '.' | ':')
 }
 
+// ======================================================================
+// Tests
+// ======================================================================
+// Unit tests capturing publication through a recording `MetricsSink`
+// without touching the global recorder.
 #[cfg(test)]
 #[path = "tests/test_prometheus_publisher.rs"]
 mod tests;

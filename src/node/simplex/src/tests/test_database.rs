@@ -615,11 +615,10 @@ fn test_db_path_format() {
 }
 
 // ============================================================================
-// Close / Destroy Regression Tests (CONSENSUS-DB-CLEANUP-1, TN-1035)
+// Close / Destroy Regression Tests
 // ============================================================================
 //
-// These tests exercise the `SimplexDb::close()` wrapper introduced in
-// CONSENSUS-DB-CLEANUP-1. They assert:
+// These tests exercise the `SimplexDb::close()` wrapper. They assert:
 //
 // 1. `close()` drains queued writes before flipping the gate.
 // 2. Post-close writes are rejected (the gate propagates down to

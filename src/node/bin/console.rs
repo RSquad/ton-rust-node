@@ -1583,7 +1583,7 @@ mod test {
                 .ok_or_else(|| error!("Wrong block ID {}", block_id))?;
             PinnedShardStateGuard::new(state, Arc::new(AllowStateGcSmartResolver::new(10)))
         }
-        async fn load_block_raw(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
+        async fn load_block_raw(&self, handle: &Arc<BlockHandle>) -> Result<Vec<u8>> {
             if handle.has_data() {
                 if let Some(data) = self.blocks.get(handle.id()) {
                     return Ok(data.clone());

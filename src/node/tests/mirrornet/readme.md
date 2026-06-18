@@ -23,11 +23,13 @@ pip install pyright
 
 # Usage
 
+To run Mirrornet the node binary must be compiled with the `mirrornet` feature.
+
 Firstly run the script to generate blank config files for all nodes:
 ```bash
 python mirrornet.py
 ```
-Then fill in the generated `mirrornet.json` file with appropriate values.
+Then fill in the generated `mirrornet.json` file with appropriate values. `utils_path` should be a local path with the `crypto` utility.
 
 All the nodes you added to the `mirrornet.json` have to be synced to the network you want to mirror. 
 The script will stop all the nodes, generate new nodes and global configs, and run Mirrornet as a hardfork of the base network.

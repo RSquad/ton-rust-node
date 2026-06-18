@@ -103,7 +103,7 @@ fn test_create_ext_message() {
 #[test]
 fn test_message_keeper() {
     let m = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
-    let mk = MessageKeeper::new(Arc::new(m), Default::default()).unwrap();
+    let mk = MessageKeeper::new(Arc::new(m), Default::default(), 0).unwrap();
 
     assert!(mk.check_active(10000));
 
@@ -137,7 +137,7 @@ fn test_message_keeper() {
 #[test]
 fn test_message_keeper_multithread() {
     let m = Message::with_ext_in_header(ExternalInboundMessageHeader::default());
-    let mk = Arc::new(MessageKeeper::new(Arc::new(m), Default::default()).unwrap());
+    let mk = Arc::new(MessageKeeper::new(Arc::new(m), Default::default(), 0).unwrap());
 
     let mut hs = vec![];
     for _ in 0..50 {
@@ -280,6 +280,146 @@ fn test_messages_pool() {
         .get_messages(&ShardIdent::with_tagged_prefix(0, 0x1000_0000_0000_0000).unwrap(), 601)
         .unwrap();
     assert_eq!(m1.len(), 0);
+}
+
+// Remove + re-add into a NEWER bucket leaves a stale slot in the old bucket
+// that still resolves to the re-added (live) keeper, so the same id is
+// reachable through two slots in different buckets. The iterator must dedup by
+// id and yield it only once.
+#[test]
+fn test_remove_and_readd_does_not_double_yield() {
+    let mp = Arc::new(MessagesPool::new(0, None).0);
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+
+    let msg = create_external_message(1, vec![42]);
+    let id = msg.hash().unwrap();
+
+    mp.new_message(&id, msg.clone(), 1).unwrap();
+    mp.complete_messages(&[], &[id.clone()], 1).unwrap();
+    // Check removal without iterating: an iter() here would sweep the stale t=1
+    // slot as a tombstone and the test would no longer exercise the bug.
+    assert_eq!(mp.total_messages(), 0);
+
+    // Re-add at t=2 (a different `order` bucket) before any iteration, so the
+    // stale t=1 slot survives and still resolves to the live keeper.
+    mp.new_message(&id, msg, 2).unwrap();
+    assert_eq!(mp.clone().iter(shard, 2, u64::MAX).count(), 1);
+}
+
+// Remove + re-add at the SAME timestamp with no iteration in between leaves two
+// slots in the same `order` bucket, both resolving to the re-added keeper. The
+// iterator must still yield it only once.
+#[test]
+fn test_remove_and_readd_same_timestamp_does_not_double_yield() {
+    let mp = Arc::new(MessagesPool::new(0, None).0);
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+
+    let msg = create_external_message(1, vec![99]);
+    let id = msg.hash().unwrap();
+
+    mp.new_message(&id, msg.clone(), 1).unwrap();
+    mp.complete_messages(&[], &[id.clone()], 1).unwrap();
+    // No iteration here, so the stale slot at seqno=0 is not swept.
+    mp.new_message(&id, msg, 1).unwrap();
+
+    assert_eq!(mp.clone().iter(shard, 1, u64::MAX).count(), 1);
+}
+
+// A message removed and re-added in a newer bucket must survive expiry of the
+// old bucket: its stale slot there must not evict the re-added keeper.
+#[test]
+fn test_readd_survives_old_bucket_expiry() {
+    let mp = Arc::new(MessagesPool::new(0, None).0);
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+
+    let msg = create_external_message(1, vec![7]);
+    let id = msg.hash().unwrap();
+
+    // Add at t=1, then remove -> leaves a stale slot in bucket t=1.
+    mp.new_message(&id, msg.clone(), 1).unwrap();
+    mp.complete_messages(&[], &[id.clone()], 1).unwrap();
+
+    // Re-add in bucket t=100 (home_ts = 100). Don't iterate before the sweep:
+    // a full iter would reach bucket t=1 and drop the stale slot itself, hiding
+    // the early-eviction path through clear_expired_messages.
+    mp.new_message(&id, msg, 100).unwrap();
+    assert_eq!(mp.total_messages(), 1);
+
+    // Sweep the old t=1 bucket. The stale slot there points at id, but the live
+    // keeper's home_ts is 100, so it must not be evicted.
+    mp.clear_expired_messages(1, u64::MAX);
+    assert_eq!(
+        mp.clone().iter(shard, 100, u64::MAX).count(),
+        1,
+        "re-added message must survive old-bucket expiry"
+    );
+}
+
+// A cross-bucket stale slot (remove + re-add into a newer bucket) must be
+// dropped by the iterator, not left to be re-scanned every pass until TTL.
+#[test]
+fn test_iter_drops_cross_bucket_stale_slot() {
+    let mp = Arc::new(MessagesPool::new(0, None).0);
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+
+    let msg = create_external_message(1, vec![5]);
+    let id = msg.hash().unwrap();
+
+    mp.new_message(&id, msg.clone(), 1).unwrap(); // slot in bucket t=1
+    mp.complete_messages(&[], &[id.clone()], 1).unwrap(); // remove -> stale slot at t=1
+    mp.new_message(&id, msg, 2).unwrap(); // re-add into bucket t=2
+
+    // The stale slot still sits in bucket t=1 until something walks it.
+    let before = mp.order.get(&1).map(|g| g.val().map.iter().count()).unwrap_or(0);
+    assert_eq!(before, 1, "stale slot should still be present before iteration");
+
+    // One iteration pass yields the message once and removes the stale slot.
+    assert_eq!(mp.clone().iter(shard, 2, u64::MAX).count(), 1);
+    let after = mp.order.get(&1).map(|g| g.val().map.iter().count()).unwrap_or(0);
+    assert_eq!(after, 0, "iterator must drop the stale cross-bucket slot");
+}
+
+// Concurrent submissions of the same id must collapse to one keeper and one
+// order slot: dedup losers must not double-yield or inflate the bucket seqno.
+#[test]
+fn test_concurrent_same_id_dedup() {
+    use std::sync::Barrier;
+
+    let mp = Arc::new(MessagesPool::new(0, None).0);
+    let shard = ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap();
+
+    let msg = create_external_message(1, vec![21]);
+    let id = msg.hash().unwrap();
+
+    let n = 8;
+    let barrier = Arc::new(Barrier::new(n));
+    let handles: Vec<_> = (0..n)
+        .map(|_| {
+            let mp = mp.clone();
+            let msg = msg.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                mp.new_message(&id, msg, 1).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(mp.total_messages(), 1, "concurrent same-id must yield a single keeper");
+    assert_eq!(mp.clone().iter(shard, 1, u64::MAX).count(), 1, "iter must yield exactly one");
+    // Only the winner reaches the order insert, so the bucket holds one slot and
+    // its seqno counter was not inflated by the losing admissions.
+    let guard = mp.order.get(&1).expect("bucket t=1 exists");
+    assert_eq!(guard.val().map.iter().count(), 1, "exactly one order slot");
+    assert_eq!(
+        guard.val().seqno.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "seqno counter not inflated"
+    );
 }
 
 async fn check_messages(

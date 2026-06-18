@@ -26,9 +26,10 @@ use crate::{
 use http_body_util::BodyExt;
 use std::{collections::HashMap, sync::Arc};
 use ton_block::{
-    base64_decode, base64_encode, error, read_single_root_boc, Account, AccountIdPrefixFull,
-    BlockIdExt, BuilderData, ConfigParam8, ConfigParamEnum, ConfigParams, Deserializable,
-    GlobalVersion, HashmapE, LibDescr, Libraries, MsgAddressInt, Result, ShardIdent, UInt256,
+    base64_decode, base64_encode, error, read_single_root_boc, write_boc, Account,
+    AccountIdPrefixFull, BlockIdExt, BuilderData, Cell, ConfigParam8, ConfigParamEnum,
+    ConfigParams, Deserializable, GlobalVersion, HashmapE, LibDescr, Libraries, MsgAddressInt,
+    Result, ShardAccount, ShardIdent, SuspendedAddressList, UInt256,
 };
 use warp::Reply;
 
@@ -81,6 +82,10 @@ impl MockEngine {
         self.confirmed_block_events.clone()
     }
 }
+
+struct NoStateEngine;
+
+impl EngineOperations for NoStateEngine {}
 
 #[async_trait::async_trait]
 impl EngineOperations for MockEngine {
@@ -141,7 +146,10 @@ fn make_master_state(account: &Account) -> Arc<ShardStateStuff> {
     let mut config = ConfigParams::default();
     let global_version = GlobalVersion { version: 17, capabilities: 0x1ee };
     config.set_config(ConfigParamEnum::ConfigParam8(ConfigParam8 { global_version })).unwrap();
+    make_master_state_with_config(account, config)
+}
 
+fn make_master_state_with_config(account: &Account, config: ConfigParams) -> Arc<ShardStateStuff> {
     let publisher = account.get_id().unwrap().clone();
     let mut libraries = Libraries::new();
     let code = BuilderData::with_raw(vec![0x77], 1).unwrap().into_cell().unwrap(); // PUSHINT 1
@@ -166,6 +174,17 @@ fn account_address(account: &Account) -> String {
     MsgAddressInt::with_standart(None, -1, account.get_id().unwrap().clone()).unwrap().to_string()
 }
 
+fn empty_cell_boc_base64() -> String {
+    base64_encode(&write_boc(&Cell::default()).unwrap())
+}
+
+fn uninit_test_account() -> Account {
+    let account = gen_test_account();
+    let address =
+        MsgAddressInt::with_standart(None, -1, account.get_id().unwrap().clone()).unwrap();
+    Account::with_address(address)
+}
+
 fn build_registry(account: &Account) -> (RpcRegistry, Arc<ShardStateStuff>) {
     let master_state = make_master_state(account);
     let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state.clone()]));
@@ -178,6 +197,10 @@ fn dummy_ctx() -> Ctx {
     let master_state = make_master_state(&account);
     let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
     ctx_with_engine(engine)
+}
+
+fn no_state_ctx() -> Ctx {
+    Ctx { engine: Arc::new(NoStateEngine), wallet_library: Arc::new(WalletLibrary::new().unwrap()) }
 }
 
 async fn call_jsonrpc(
@@ -226,6 +249,23 @@ async fn get_masterchain_info_returns_state_metadata() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn get_consensus_block_matches_toncenter_shape() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state.clone()]));
+    let ctx = ctx_with_engine(engine);
+
+    let response = get_consensus_block(NoParams {}, ctx).await.unwrap();
+
+    pretty_assertions::assert_eq!(response["@type"], "ext.blocks.consensusBlock");
+    pretty_assertions::assert_eq!(
+        response["consensus_block"],
+        serde_json::json!(master_state.block_id().seq_no())
+    );
+    assert!(response["timestamp"].as_u64().is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn get_address_information_reads_account_state() {
     let account = gen_test_account();
     let master_state = make_master_state(&account);
@@ -241,6 +281,7 @@ async fn get_address_information_reads_account_state() {
         serde_json::json!(account.balance().unwrap().coins.to_string())
     );
     pretty_assertions::assert_eq!(response["state"], "active");
+    pretty_assertions::assert_eq!(response["suspended"], serde_json::json!(false));
     pretty_assertions::assert_eq!(
         response["block_id"],
         serialize_block_id(master_state.block_id())
@@ -253,6 +294,113 @@ async fn get_address_information_reads_account_state() {
         response["data"],
         serde_json::json!(serialize_cell_opt(account.data()))
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_address_information_reads_suspended_config() {
+    let account = gen_test_account();
+    let address =
+        MsgAddressInt::with_standart(None, -1, account.get_id().unwrap().clone()).unwrap();
+    let mut suspended = SuspendedAddressList::default();
+    suspended.add_suspended_address(address.workchain_id(), address.address().clone()).unwrap();
+    suspended.set_suspended_until(u32::MAX);
+
+    let mut config = ConfigParams::default();
+    config.set_config(ConfigParamEnum::ConfigParam44(suspended)).unwrap();
+    let master_state = make_master_state_with_config(&account, config);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+    let ctx = ctx_with_engine(engine);
+    let params = GetAddressInformationParams { address: account_address(&account), seqno: None };
+
+    let response = get_address_information(params, ctx).await.unwrap();
+
+    pretty_assertions::assert_eq!(response["suspended"], serde_json::json!(true));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_wallet_information_matches_toncenter_shape() {
+    let account = gen_test_account();
+    let master_state = make_master_state(&account);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+    let ctx = ctx_with_engine(engine);
+    let params = GetAddressInformationParams { address: account_address(&account), seqno: None };
+
+    let response = get_wallet_information(params, ctx).await.unwrap();
+
+    pretty_assertions::assert_eq!(response["@type"], "ext.accounts.walletInformation");
+    pretty_assertions::assert_eq!(response["wallet"], serde_json::json!(false));
+    pretty_assertions::assert_eq!(response["account_state"], serde_json::json!("active"));
+    assert!(response.get("extra_currencies").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_extended_address_information_returns_uninited_state_for_uninit_account() {
+    let account = uninit_test_account();
+    let master_state = make_master_state(&account);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+    let ctx = ctx_with_engine(engine);
+    let params = GetAddressInformationParams { address: account_address(&account), seqno: None };
+
+    let response = get_extended_address_information(params, ctx).await.unwrap();
+
+    pretty_assertions::assert_eq!(response["account_state"]["@type"], "uninited.accountState");
+    pretty_assertions::assert_eq!(response["account_state"]["frozen_hash"], "");
+    pretty_assertions::assert_eq!(response["revision"], 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_get_method_returns_toncenter_fallback_for_uninit_account() {
+    let account = uninit_test_account();
+    let master_state = make_master_state(&account);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+    let ctx = ctx_with_engine(engine);
+    let params = RunGetMethodParams {
+        address: account_address(&account),
+        method: UIntOrStr::Str("seqno".to_string()),
+        stack: Vec::new(),
+        seqno: None,
+    };
+
+    let response = run_get_method(params, ctx).await.unwrap();
+
+    pretty_assertions::assert_eq!(response["@type"], "smc.runResult");
+    pretty_assertions::assert_eq!(response["gas_used"], 0);
+    pretty_assertions::assert_eq!(response["exit_code"], -13);
+    pretty_assertions::assert_eq!(response["stack"], serde_json::json!([["num", "0x14c97"]]));
+    assert!(response["block_id"].is_object());
+    assert!(response["last_transaction_id"].is_object());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_get_method_std_returns_toncenter_fallback_for_uninit_account() {
+    let account = uninit_test_account();
+    let master_state = make_master_state(&account);
+    let engine: Arc<dyn EngineOperations> = Arc::new(MockEngine::new(vec![master_state]));
+    let ctx = ctx_with_engine(engine);
+    let params = RunGetMethodStdParams {
+        address: account_address(&account),
+        method: UIntOrStr::Str("seqno".to_string()),
+        stack: Vec::new(),
+        seqno: None,
+    };
+
+    let response = run_get_method_std(params, ctx).await.unwrap();
+
+    pretty_assertions::assert_eq!(response["@type"], "smc.runResult");
+    pretty_assertions::assert_eq!(response["gas_used"], 0);
+    pretty_assertions::assert_eq!(response["exit_code"], -13);
+    pretty_assertions::assert_eq!(
+        response["stack"],
+        serde_json::json!([{
+            "@type": "tvm.stackEntryNumber",
+            "number": {
+                "@type": "tvm.numberDecimal",
+                "number": "85143"
+            }
+        }])
+    );
+    assert!(response.get("block_id").is_none());
+    assert!(response.get("last_transaction_id").is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -315,6 +463,25 @@ async fn jsonrpc_get_account_returns_boc() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn jsonrpc_get_shard_account_cell_returns_shard_account_boc() {
+    let account = gen_test_account();
+    let (registry, master_state) = build_registry(&account);
+    let address = account_address(&account);
+
+    let response =
+        call_jsonrpc(&registry, "getShardAccountCell", serde_json::json!({ "address": address }))
+            .await;
+
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    pretty_assertions::assert_eq!(response["result"]["@type"], serde_json::json!("tvm.cell"));
+    let boc = response["result"]["bytes"].as_str().unwrap();
+    let cell = read_single_root_boc(base64_decode(boc).unwrap()).unwrap();
+    let parsed = ShardAccount::construct_from_cell(cell).unwrap();
+    let expected = master_state.shard_account(account.get_id().unwrap()).unwrap().unwrap();
+    pretty_assertions::assert_eq!(parsed, expected);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn get_block_accepts_string_shard_in_jsonrpc() {
     let account = gen_test_account();
     let master_state = make_master_state(&account);
@@ -354,6 +521,45 @@ async fn get_block_accepts_string_shard_in_jsonrpc() {
     pretty_assertions::assert_eq!(response["boc"], serde_json::json!(base64_encode(&block_data)));
 }
 
+#[test]
+fn get_transactions_params_accepts_lt_strings() {
+    let params: GetTransactionsParams = serde_json::from_value(serde_json::json!({
+        "address": "0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8",
+        "lt": "74115866000002",
+        "to_lt": "74115866000000"
+    }))
+    .unwrap();
+
+    pretty_assertions::assert_eq!(params.lt, Some(74115866000002));
+    pretty_assertions::assert_eq!(params.to_lt, Some(74115866000000));
+}
+
+#[test]
+fn get_transactions_params_still_accepts_numeric_lt() {
+    let params: GetTransactionsParams = serde_json::from_value(serde_json::json!({
+        "address": "0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8",
+        "lt": 74115866000002u64,
+        "to_lt": 74115866000000u64
+    }))
+    .unwrap();
+
+    pretty_assertions::assert_eq!(params.lt, Some(74115866000002));
+    pretty_assertions::assert_eq!(params.to_lt, Some(74115866000000));
+}
+
+#[test]
+fn get_shard_block_proof_params_accepts_from_seqno() {
+    let params: GetShardBlockProofParams = serde_json::from_value(serde_json::json!({
+        "workchain": -1,
+        "shard": "-9223372036854775808",
+        "seqno": 10,
+        "from_seqno": 9,
+    }))
+    .unwrap();
+
+    pretty_assertions::assert_eq!(params.from, Some(9));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn jsonrpc_get_block_not_found_returns_404() {
     let account = gen_test_account();
@@ -378,6 +584,26 @@ async fn jsonrpc_get_block_not_found_returns_404() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn jsonrpc_get_out_msg_queue_size_returns_blocks_shape() {
+    let account = gen_test_account();
+    let (registry, master_state) = build_registry(&account);
+
+    let response = call_jsonrpc(&registry, "getOutMsgQueueSize", serde_json::json!({})).await;
+
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(true));
+    let result = &response["result"];
+    pretty_assertions::assert_eq!(result["@type"], serde_json::json!("blocks.outMsgQueueSizes"));
+    pretty_assertions::assert_eq!(result["ext_msg_queue_size_limit"], serde_json::json!(8000));
+    let shards = result["shards"].as_array().unwrap();
+    let mc_queue = shards
+        .iter()
+        .find(|shard| shard["id"] == serialize_block_id(master_state.block_id()))
+        .expect("masterchain queue size");
+    pretty_assertions::assert_eq!(mc_queue["@type"], serde_json::json!("blocks.outMsgQueueSize"));
+    assert!(mc_queue["size"].as_i64().is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn jsonrpc_send_boc() {
     let account = gen_test_account();
     let (registry, _) = build_registry(&account);
@@ -392,6 +618,61 @@ async fn jsonrpc_send_boc() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn jsonrpc_send_query_rejects_invalid_init_code() {
+    let account = gen_test_account();
+    let (registry, _) = build_registry(&account);
+
+    let response = call_jsonrpc(
+        &registry,
+        "sendQuery",
+        serde_json::json!({
+            "address": account_address(&account),
+            "body": empty_cell_boc_base64(),
+            "init_code": "%%%not-base64%%%",
+        }),
+    )
+    .await;
+
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(false));
+    let message = response["error"].as_str().unwrap_or_default();
+    assert!(message.contains("init_code"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn jsonrpc_estimate_fee_rejects_invalid_init_data() {
+    let account = gen_test_account();
+    let (registry, _) = build_registry(&account);
+
+    let response = call_jsonrpc(
+        &registry,
+        "estimateFee",
+        serde_json::json!({
+            "address": account_address(&account),
+            "body": empty_cell_boc_base64(),
+            "init_data": "%%%not-base64%%%",
+        }),
+    )
+    .await;
+
+    pretty_assertions::assert_eq!(response["ok"], serde_json::Value::Bool(false));
+    let message = response["error"].as_str().unwrap_or_default();
+    assert!(message.contains("init_data"));
+}
+
+#[test]
+fn estimate_fee_storage_fee_includes_due_payment_for_fallback() {
+    let mut account = gen_test_account();
+    account.set_due_payment(Some(2.into()));
+    let address =
+        MsgAddressInt::with_standart(None, -1, account.get_id().unwrap().clone()).unwrap();
+    let config = BlockchainConfig::default();
+
+    let fee = estimate_fee_storage_fee(&address, &account, &config, account.last_paid()).unwrap();
+
+    pretty_assertions::assert_eq!(fee.as_u128(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn detect_address_from_friendly() {
     let ctx = dummy_ctx();
     let params = DetectAddressParams {
@@ -403,17 +684,20 @@ async fn detect_address_from_friendly() {
     pretty_assertions::assert_eq!(
         response,
         serde_json::json!({
+            "@type": "ext.utils.detectedAddress",
             "raw_form": "0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8",
             "bounceable": {
+                "@type": "ext.utils.detectedAddressVariant",
                 "b64": "EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N",
                 "b64url": "EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N",
             },
             "non_bounceable": {
+                "@type": "ext.utils.detectedAddressVariant",
                 "b64": "UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI",
                 "b64url": "UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI",
             },
             "given_type": "friendly_bounceable",
-            "testnet": false,
+            "test_only": false,
         })
     );
 }
@@ -430,19 +714,58 @@ async fn detect_address_from_raw() {
     pretty_assertions::assert_eq!(
         response,
         serde_json::json!({
+            "@type": "ext.utils.detectedAddress",
             "raw_form": "0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8",
             "bounceable": {
+                "@type": "ext.utils.detectedAddressVariant",
                 "b64": "EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N",
                 "b64url": "EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N",
             },
             "non_bounceable": {
+                "@type": "ext.utils.detectedAddressVariant",
                 "b64": "UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI",
                 "b64url": "UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI",
             },
             "given_type": "raw_form",
-            "testnet": false,
+            "test_only": false,
         })
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detect_address_from_raw_is_not_network_test_only() {
+    let params = DetectAddressParams {
+        address: "0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8".to_string(),
+    };
+
+    let response = detect_address(params, no_state_ctx()).await.unwrap();
+
+    pretty_assertions::assert_eq!(
+        response["bounceable"]["b64url"],
+        serde_json::json!("EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N")
+    );
+    pretty_assertions::assert_eq!(response["test_only"], serde_json::json!(false));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detect_hash_normalizes_hash_forms() {
+    let expected = serde_json::json!({
+        "@type": "ext.utils.detectedHash",
+        "b64": "87U/zzgYvessUhpUS2FPD+sDSf8FO0cZArvjjYGlT1w=",
+        "b64url": "87U_zzgYvessUhpUS2FPD-sDSf8FO0cZArvjjYGlT1w",
+        "hex": "f3b53fcf3818bdeb2c521a544b614f0feb0349ff053b471902bbe38d81a54f5c",
+    });
+
+    for hash in [
+        "87U/zzgYvessUhpUS2FPD+sDSf8FO0cZArvjjYGlT1w=",
+        "87U_zzgYvessUhpUS2FPD-sDSf8FO0cZArvjjYGlT1w=",
+        "f3b53fcf3818bdeb2c521a544b614f0feb0349ff053b471902bbe38d81a54f5c",
+        "0xf3b53fcf3818bdeb2c521a544b614f0feb0349ff053b471902bbe38d81a54f5c",
+    ] {
+        let response =
+            detect_hash(DetectHashParams { hash: hash.to_string() }, dummy_ctx()).await.unwrap();
+        pretty_assertions::assert_eq!(response, expected);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -461,6 +784,18 @@ async fn pack_address_handles_friendly_and_raw() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn pack_address_from_raw_is_not_network_test_only() {
+    let raw = "0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8".to_string();
+
+    let packed = pack_address(DetectAddressParams { address: raw }, no_state_ctx()).await.unwrap();
+
+    pretty_assertions::assert_eq!(
+        packed,
+        serde_json::json!("EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn unpack_address_handles_friendly_and_raw() {
     let ctx = dummy_ctx();
     let friendly = "EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N".to_string();
@@ -468,11 +803,11 @@ async fn unpack_address_handles_friendly_and_raw() {
 
     let unpacked_from_friendly =
         unpack_address(DetectAddressParams { address: friendly }, ctx.clone()).await.unwrap();
-    pretty_assertions::assert_eq!(unpacked_from_friendly, serde_json::json!(raw));
+    pretty_assertions::assert_eq!(unpacked_from_friendly, serde_json::json!(raw.to_uppercase()));
 
     let unpacked_from_raw =
         unpack_address(DetectAddressParams { address: raw.clone() }, ctx).await.unwrap();
-    pretty_assertions::assert_eq!(unpacked_from_raw, serde_json::json!(raw));
+    pretty_assertions::assert_eq!(unpacked_from_raw, serde_json::json!(raw.to_uppercase()));
 }
 
 fn prepare_http_server_with_config(
@@ -738,6 +1073,24 @@ async fn test_get_config_param() {
     let config = response["config"].as_object().unwrap();
     pretty_assertions::assert_eq!(config["@type"], "tvm.cell");
     pretty_assertions::assert_eq!(config["bytes"], "");
+}
+
+#[tokio::test]
+async fn test_get_config_all() {
+    let account = gen_test_account();
+    let (registry, master_state) = build_registry(&account);
+    let ctx = registry.ctx;
+
+    let response =
+        get_config_all(serde_json::from_value(serde_json::json!({})).unwrap(), ctx).await.unwrap();
+    pretty_assertions::assert_eq!(response["@type"].as_str().unwrap(), "configInfo");
+    let config = response["config"].as_object().unwrap();
+    pretty_assertions::assert_eq!(config["@type"], "tvm.cell");
+
+    let bytes = config["bytes"].as_str().unwrap();
+    let cell = read_single_root_boc(base64_decode(bytes).unwrap()).unwrap();
+    let expected = master_state.shard_state_extra().unwrap().config().root().unwrap();
+    pretty_assertions::assert_eq!(cell.repr_hash(), expected.repr_hash());
 }
 
 #[tokio::test]

@@ -96,6 +96,7 @@ fn make_group_impl_for_start_tests() -> ValidatorGroupImpl {
         false,
         false,
         ConsensusType::Catchain,
+        None,
     )
 }
 
@@ -125,6 +126,7 @@ fn make_simplex_group_for_resolver_tests() -> Arc<ValidatorGroup> {
         UInt256::rand(),
         UInt256::rand(),
         validator_set,
+        0,
         ConsensusOptions::Simplex(Default::default()),
         Arc::new(DummyEngine),
         false,

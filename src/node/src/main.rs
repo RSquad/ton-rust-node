@@ -558,4 +558,10 @@ fn main() {
             }
         }
     });
+
+    // Shut down all tokio runtimes with a 5sec timeout
+    let shutdown_timeout = std::time::Duration::from_secs(5);
+    runtime.shutdown_timeout(shutdown_timeout);
+    validator_runtime.shutdown_timeout(shutdown_timeout);
+    liteserver_runtime.shutdown_timeout(shutdown_timeout);
 }

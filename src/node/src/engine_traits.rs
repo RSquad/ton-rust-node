@@ -18,7 +18,7 @@ use crate::{
     shard_state::ShardStateStuff,
     shard_states_keeper::PinnedShardStateGuard,
     types::top_block_descr::{TopBlockDescrId, TopBlockDescrStuff},
-    validator::validator_manager::ValidationStatus,
+    validator::{collator::HardforkData, validator_manager::ValidationStatus},
 };
 #[cfg(feature = "telemetry")]
 use crate::{
@@ -254,7 +254,7 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
-    fn get_config_for_hardfork(&self) -> Option<ConfigParams> {
+    fn get_hardfork_data(&self) -> Option<HardforkData> {
         None
     }
 
@@ -298,7 +298,7 @@ pub trait EngineOperations: Sync + Send {
     fn load_block_handle(&self, id: &BlockIdExt) -> Result<Option<Arc<BlockHandle>>> {
         unimplemented!()
     }
-    async fn load_applied_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_applied_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         unimplemented!()
     }
     async fn wait_applied_block(
@@ -308,10 +308,10 @@ pub trait EngineOperations: Sync + Send {
     ) -> Result<Arc<BlockHandle>> {
         unimplemented!()
     }
-    async fn load_block(&self, handle: &BlockHandle) -> Result<BlockStuff> {
+    async fn load_block(&self, handle: &Arc<BlockHandle>) -> Result<BlockStuff> {
         unimplemented!()
     }
-    async fn load_block_raw(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
+    async fn load_block_raw(&self, handle: &Arc<BlockHandle>) -> Result<Vec<u8>> {
         unimplemented!()
     }
     async fn wait_next_applied_mc_block(
@@ -507,7 +507,11 @@ pub trait EngineOperations: Sync + Send {
     ) -> Result<BlockProofStuff> {
         unimplemented!()
     }
-    async fn load_block_proof_raw(&self, handle: &BlockHandle, is_link: bool) -> Result<Vec<u8>> {
+    async fn load_block_proof_raw(
+        &self,
+        handle: &Arc<BlockHandle>,
+        is_link: bool,
+    ) -> Result<Vec<u8>> {
         unimplemented!()
     }
 
@@ -1012,6 +1016,10 @@ pub trait EngineOperations: Sync + Send {
     }
 
     fn add_account_storage_dict(&self, _dict: Cell, _size: u64) {}
+
+    fn trace_collector(&self) -> Option<simplex::TraceCollector> {
+        None
+    }
 
     async fn update_custom_overlays(&self, _configs: Option<&[CustomOverlay]>) -> Result<()> {
         unimplemented!();

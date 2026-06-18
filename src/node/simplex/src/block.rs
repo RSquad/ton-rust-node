@@ -94,11 +94,12 @@ use ton_api::{
 };
 use ton_block::{error, fail, BlockIdExt, Result, ShardIdent, UInt256};
 
-/*
-    Index Newtypes
-
-    These provide type safety to prevent parameter mixing bugs.
-*/
+// ======================================================================
+// Index newtypes
+// ======================================================================
+// Type-safe `u32` wrappers (`SlotIndex`, `WindowIndex`, `ValidatorIndex`)
+// with their arithmetic / conversion / formatting impls, preventing
+// parameter-mixing bugs.
 
 /// Consensus slot index
 ///
@@ -456,6 +457,12 @@ impl Rem<u32> for ValidatorIndex {
     }
 }
 
+// ======================================================================
+// Candidate identifiers
+// ======================================================================
+// Hash-based `RawCandidateId` and resolved `CandidateId` (plus the
+// `RawParentId` alias) keying candidates before / after parent resolution.
+
 /// Raw candidate ID (hash-based, before parent resolution)
 ///
 /// Reference: C++ `RawCandidateId` in `consensus-types.h`
@@ -602,6 +609,12 @@ impl fmt::Display for CandidateId {
     }
 }
 
+// ======================================================================
+// Candidate data & bodies
+// ======================================================================
+// `BlockCandidate` (block body + collated data) and the
+// `CandidateBlockData` empty / non-empty content variant.
+
 /// Block candidate data
 ///
 /// Contains the actual block data and metadata.
@@ -667,6 +680,12 @@ impl CandidateBlockData {
         }
     }
 }
+
+// ======================================================================
+// Raw candidate
+// ======================================================================
+// `RawCandidate` as received from the network (parent possibly
+// unresolved): construction, signing, hashing, and TL (de)serialization.
 
 /// Raw candidate from network (parent may be unresolved)
 ///
@@ -1173,6 +1192,12 @@ impl RawCandidate {
     }
 }
 
+// ======================================================================
+// Validated candidate
+// ======================================================================
+// `Candidate`: a fully parent-resolved candidate with invariant-checked
+// construction.
+
 /// Resolved candidate with full parent information
 ///
 /// # Invariants
@@ -1259,6 +1284,12 @@ impl Candidate {
         }
     }
 }
+
+// ======================================================================
+// Candidate parent info
+// ======================================================================
+// `CandidateParentInfo` (slot + hash) and the `CandidateParent` alias --
+// the lightweight parent reference used in FSM slot state.
 
 /// Lightweight parent info for FSM operations
 ///

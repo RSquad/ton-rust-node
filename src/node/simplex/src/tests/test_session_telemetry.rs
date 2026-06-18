@@ -12,7 +12,7 @@
 //! reach private internals without widening visibility. Mirrors the
 //! convention used by `test_simplex_state.rs`.
 //!
-//! Per-commit test surface (see TN-998 Phase 2 plan):
+//! Per-commit test surface:
 //! - Commit 1: smoke test asserting `SessionTelemetry::new` constructs
 //!   cleanly and metric handles are registered.
 //! - Commit 2: neutral snapshot type construction tests.
@@ -140,7 +140,7 @@ fn session_telemetry_seeds_initial_errors() {
 //
 // These tests assert each snapshot can be assembled from typed scalars without
 // any string preformatting or `SessionProcessor` private types, validating the
-// Phase 2 boundary contract before behavior moves.
+// snapshot boundary contract before behavior moves.
 // ============================================================================
 
 #[test]

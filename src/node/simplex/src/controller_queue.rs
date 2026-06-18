@@ -46,6 +46,13 @@
 
 use std::{sync::Arc, time::SystemTime};
 
+// ======================================================================
+// Seam traits & task alias
+// ======================================================================
+// The object-safe core of the controller-queue seam: the `Controlled`
+// backend-view trait, the higher-ranked `ControllerTask` alias, the
+// object-safe `ControllerQueue` vtable, and its cheap-to-clone handle.
+
 /// A controller that can be re-entered by the queue with a transient backend.
 ///
 /// `Backend<'b>` is the borrowing view a deferred task receives (by `&mut`)
@@ -92,6 +99,13 @@ pub(crate) trait ControllerQueue<C: Controlled>: Send + Sync {
 /// Cheap-to-clone handle a controller stores. Names only `C`.
 pub(crate) type ControllerQueuePtr<C> = Arc<dyn ControllerQueue<C>>;
 
+// ======================================================================
+// Ergonomic posting
+// ======================================================================
+// Generic `post` / `post_delayed` sugar layered over the object-safe
+// vtable via a blanket-implemented extension trait, so call sites avoid
+// hand-boxing and spelling the `for<'b>` backend lifetime.
+
 /// Ergonomic generic posting layered over the object-safe [`ControllerQueue`].
 ///
 /// Blanket-implemented for every `ControllerQueue<C>` (including
@@ -124,6 +138,11 @@ pub(crate) trait ControllerQueueExt<C: Controlled>: ControllerQueue<C> {
 
 impl<C: Controlled, Q: ControllerQueue<C> + ?Sized> ControllerQueueExt<C> for Q {}
 
+// ======================================================================
+// Tests
+// ======================================================================
+// Seam unit tests driving a controller via a recording fake backend, with
+// no `SessionProcessor` present.
 #[cfg(test)]
 #[path = "tests/test_controller_queue.rs"]
 mod tests;

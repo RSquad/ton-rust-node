@@ -24,7 +24,7 @@
 //! │  3) ReceiverWrapper::create(...)                                │
 //! │  4) SessionProcessor::new(...)                                  │
 //! │  5) recovery.apply_bootstrap(&mut processor)                    │
-//! │     - vote replay (Phase 6.6 order)                             │
+//! │     - vote replay (ordered passes)                              │
 //! │     - set finalized boundary + apply local flags                │
 //! │     - restore receiver caches                                   │
 //! └─────────────────────────────────────────────────────────────────┘
@@ -242,7 +242,7 @@ impl SessionStartupRecoveryProcessor {
     /// Apply bootstrap state and run startup recovery.
     ///
     /// This method:
-    /// 1. Replays votes (Phase 6.6 order: global pass, set boundary, local flags)
+    /// 1. Replays votes (order: global pass, set boundary, local flags)
     /// 2. Generates restart skip votes
     /// 3. Drains startup events (keeps BroadcastVote only)
     /// 4. Restores receiver caches (notar certs, candidate bytes)
@@ -969,7 +969,7 @@ impl SessionStartupRecoveryProcessor {
         );
     }
 
-    /// Notify about the last finalized block (Phase 6.5a).
+    /// Notify about the last finalized block.
     ///
     /// C++ equivalent: `consensus.cpp::load_from_db()` publishes
     /// `BlockFinalized(last_known_finalized_block, true)` after loading.

@@ -32,7 +32,7 @@
                 }
             ],
             "p8": {
-                "version": 11,
+                "version": 13,
                 "capabilities": "494"
             },
             "p9": [
@@ -235,6 +235,22 @@
                 "catchain_max_deps": 8,
                 "max_block_bytes": 2097152,
                 "max_collated_bytes": 2097152
+            },
+            "p30": {
+                "mc": {
+                    "target_rate_ms": 500,
+                    "slots_per_leader_window": 4,
+                    "first_block_timeout_ms": 3000,
+                    "max_leader_window_desync": 2,
+                    "use_quic": 1
+                },
+                "shard": {
+                    "target_rate_ms": 500,
+                    "slots_per_leader_window": 4,
+                    "first_block_timeout_ms": 3000,
+                    "max_leader_window_desync": 2,
+                    "use_quic": 1
+                }
             },
             "p31": [
                 "0000000000000000000000000000000000000000000000000000000000000000",

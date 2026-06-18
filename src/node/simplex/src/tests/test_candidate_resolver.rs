@@ -491,7 +491,7 @@ fn test_sliding_window_rate_limiter_enforces_window_limit() {
 }
 
 // ============================================================================
-// TN-1034 / NODE-75: BadSignatureBanState (temporary peer ban) tests
+// BadSignatureBanState (temporary peer ban) tests
 // ============================================================================
 //
 // C++ parity: PoolImpl::bad_signature_bans_ in pool.cpp arms a ban for

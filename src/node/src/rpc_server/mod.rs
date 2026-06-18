@@ -32,6 +32,7 @@ mod wallets;
 /// This bounds the size of any BOC accepted via the public API.
 const MAX_BODY_SIZE: u64 = 16 << 20;
 const SSE_PENDING_EVENT_CAPACITY: usize = 16;
+pub(crate) const TON_TESTNET_GLOBAL_ID: i32 = -3;
 
 pub struct RpcServer {
     shutdown: tokio::sync::oneshot::Sender<()>,
@@ -90,7 +91,7 @@ impl Ctx {
     async fn is_testnet(&self) -> bool {
         if let Ok(state) = self.engine.load_last_applied_mc_state().await {
             if let Ok(st) = state.state() {
-                return st.global_id() < 0;
+                return st.global_id() == TON_TESTNET_GLOBAL_ID;
             }
         }
         true
